@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use abi::role::awaits::{self, Answer, Ticket, TicketRow};
-use abi::role::{programs, validators};
+use abi::role::{self, programs, validators};
 use abi::{BlobId, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, reason};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Finished, Plan};
@@ -44,14 +44,13 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 fn genesis() -> Genesis {
     Genesis {
         network: b"net".to_vec(),
-        roles: Roles {
-            programs: "programs".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-            blobs: "blobs".into(),
-            awaits: "awaits".into(),
-            egress: None,
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+        ]),
         validators: vec![validators::Member {
             key: b"v1".to_vec(),
             address: Some("v1:1".into()),

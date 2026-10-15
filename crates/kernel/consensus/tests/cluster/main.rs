@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use abi::{HostOp, Root, role::validators};
+use abi::{HostOp, Root, role, role::validators};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_p2p::simulated::{self, Link, Oracle};
 use commonware_runtime::{Quota, Runner as _, Spawner as _, Supervisor as _, deterministic};
@@ -85,14 +85,13 @@ fn enroll(key: &ed25519::PrivateKey) -> Vec<u8> {
 fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles {
-            programs: "programs".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-            blobs: "blobs".into(),
-            awaits: "awaits".into(),
-            egress: None,
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+        ]),
         validators: members.to_vec(),
         programs: vec![
             Founding {

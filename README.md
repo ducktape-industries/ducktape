@@ -58,7 +58,7 @@ block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
-[roles]                       # the founding program the kernel calls in each role; egress optional, the rest required
+[roles]                       # one row per role: its name = the founding program that fills it; egress optional, the rest required
 programs = "programs"         # registers and swaps programs
 validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
@@ -101,10 +101,15 @@ fuel = 1000000000
 memory_bytes = 268435456
 ```
 
-The kernel calls programs by role, never by id. Founding refuses a role bound
-to a program the file does not list, and every frame's env carries the
-bindings (`Env.roles`). As the kernel admits a program, at founding or later
-off the programs role, it gives the program an account: the identity role's
+The kernel calls programs by role, never by id. The roles are a table, a map
+from role name to program (`abi::Roles`; the names are constants in
+`abi::role`), so a new role is a new row. Founding refuses a role bound to a
+program the file does not list, and a table missing a role the kernel calls
+(programs, validators, identity, blobs, awaits), naming the missing role. Every
+frame's env carries the table (`Env.roles`); a program looks a role up by name
+and gets nothing for a role the network does not bind. As the kernel admits a
+program, at founding or later off the programs role, it gives the program an
+account: the identity role's
 `RegisterProgram`, executed with the `System` origin. Once per frame the host
 asks the identity role who the frame acts as, `Account(key)` for a signed
 frame and `OfProgram(program)` for a message or a reply, and passes the answer

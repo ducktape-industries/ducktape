@@ -3,7 +3,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::role::validators;
+    use abi::role::{self, validators};
     use abi::{Env, Origin, Principal, Refusal, Scan, reason};
     use blob::contract::{
         Bundle, Custody, Entry, Holding, NEXT, Op, Query as Ask, Reply, bundle_key, index_key,
@@ -47,8 +47,10 @@ mod program {
                 "a validator's key receipts",
             ));
         };
-        let validators::Reply::Validators(seated) =
-            ctx.ask(env.roles.validators.clone(), &validators::Query::Validators)?
+        let validators::Reply::Validators(seated) = ctx.ask(
+            env.roles.bound(role::VALIDATORS)?.clone(),
+            &validators::Query::Validators,
+        )?
         else {
             return Err(Refusal::new(reason::UNEXPECTED_REPLY, "validators"));
         };

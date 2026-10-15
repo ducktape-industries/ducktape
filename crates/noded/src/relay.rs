@@ -72,7 +72,7 @@ pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<Pu
         let frame = message.as_ref().to_vec();
         let (taken, role) = {
             let mut node = daemon.node.lock().await;
-            let role = node.host().roles().blobs.clone();
+            let role = node.host().roles().get(abi::role::BLOBS).cloned();
             let taken = node
                 .submit(frame.clone(), Source::Peer, Preconfirm::Off)
                 .await;
@@ -81,7 +81,7 @@ pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<Pu
         match taken {
             Ok(Ok(Taken::New(_))) => {
                 tracing::debug!(target: "ducktape::relay", %peer, "took a relayed frame");
-                sent(&daemon, &role, &frame, &peer);
+                sent(&daemon, role.as_deref(), &frame, &peer);
             }
             Ok(Ok(Taken::Held(_))) => tracing::debug!(
                 target: "ducktape::relay",
@@ -105,11 +105,11 @@ pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<Pu
     }
 }
 
-fn sent<E: Context>(daemon: &Daemon<E>, role: &str, frame: &[u8], peer: &PublicKey) {
+fn sent<E: Context>(daemon: &Daemon<E>, role: Option<&str>, frame: &[u8], peer: &PublicKey) {
     let Ok(submission) = node::verify(frame, &daemon.descriptor.id()) else {
         return;
     };
-    let to_the_blobs_program = submission.target == role;
+    let to_the_blobs_program = role == Some(submission.target.as_str());
     if !to_the_blobs_program {
         return;
     }

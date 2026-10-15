@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -158,7 +159,7 @@ pub struct Founding {
     /// the file leaves it out.
     #[serde(default = "default_member_cap")]
     pub member_cap: u32,
-    pub roles: RoleIds,
+    pub roles: BTreeMap<String, String>,
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
     #[serde(default)]
@@ -171,18 +172,6 @@ pub struct Founding {
 
 fn default_member_cap() -> u32 {
     16
-}
-
-/// Which founding program fills each role the kernel calls.
-#[derive(Debug, Deserialize)]
-pub struct RoleIds {
-    pub programs: String,
-    pub validators: String,
-    pub identity: String,
-    pub blobs: String,
-    pub awaits: String,
-    #[serde(default)]
-    pub egress: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -296,14 +285,7 @@ impl Founding {
             .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
-            roles: Roles {
-                programs: self.roles.programs.clone(),
-                validators: self.roles.validators.clone(),
-                identity: self.roles.identity.clone(),
-                blobs: self.roles.blobs.clone(),
-                awaits: self.roles.awaits.clone(),
-                egress: self.roles.egress.clone(),
-            },
+            roles: self.roles.iter().collect::<Roles>(),
             validators,
             programs,
             views,
@@ -353,6 +335,21 @@ mod tests {
          [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\nblobs = \"b\"\nawaits = \"a\"\n\
          [[validators]]\nkey = \"00\"\nhalo = \"n0.example.org:1\"\n\
          [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
+
+    #[test]
+    fn the_founding_file_binds_each_role_row_it_names() {
+        let genesis = genesis_of(
+            &FILE
+                .replace("HOOKS", "")
+                .replace("awaits = \"a\"\n", "awaits = \"a\"\nlater = \"l\"\n"),
+        );
+        assert_eq!(genesis.roles.get("later").map(String::as_str), Some("l"));
+        assert_eq!(
+            genesis.roles.get(abi::role::AWAITS).map(String::as_str),
+            Some("a")
+        );
+        assert_eq!(genesis.roles.get(abi::role::EGRESS), None);
+    }
 
     #[test]
     fn the_founding_file_names_its_hooks_or_none() {

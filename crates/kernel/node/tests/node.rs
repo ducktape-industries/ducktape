@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use abi::{HostOp, HostReply, Message, Outcome, reason, role::validators};
+use abi::{HostOp, HostReply, Message, Outcome, reason, role, role::validators};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -49,14 +49,13 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles {
-            programs: "programs".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-            blobs: "blobs".into(),
-            awaits: "awaits".into(),
-            egress: None,
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+        ]),
         validators,
         programs: vec![
             founding("programs", PROGRAMS, Vec::new()),

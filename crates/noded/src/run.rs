@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use abi::Outcome;
 use abi::Scan;
+use abi::role;
 use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
 use blob::contract::{BUNDLES, Bundle};
 use commonware_codec::DecodeExt as _;
@@ -209,7 +210,10 @@ async fn adopt<E: Context>(
         status.network.as_bytes(),
         status.anchor(),
         Some(salt),
-        &status.roles.validators,
+        status
+            .roles
+            .bound(role::VALIDATORS)
+            .map_err(Error::Refused)?,
         abi::encode(&enroll),
     );
     let (_, receipt) = source.land(&frame).await?;
@@ -439,7 +443,7 @@ async fn start<E: Context>(
 }
 
 fn bundles<E: Context>(node: &Node<E>) -> Result<Vec<(u64, Bundle)>> {
-    let role = &node.host().roles().blobs;
+    let role = node.host().role(role::BLOBS)?;
     let entries = node
         .view(Layer::Confirmed)
         .scan(role, &Scan::prefix(BUNDLES))
@@ -457,7 +461,7 @@ async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec
     let validators = node.epoch_validators(epoch)?.ok_or(Error::Corrupt(format!(
         "the state records no validators for epoch {epoch}"
     )))?;
-    let role = node.host().roles().validators.clone();
+    let role = node.host().role(role::VALIDATORS)?.clone();
     let asked = abi::encode(&validators::Query::Members);
     let answer = node
         .query(Layer::Confirmed, abi::Origin::System, &role, asked)
@@ -628,7 +632,7 @@ async fn receipt_for<E: Context>(
     bundle: u64,
 ) -> Result<Option<Vec<u8>>> {
     let tip = node.tip()?;
-    let role = node.host().roles().blobs.clone();
+    let role = node.host().role(role::BLOBS)?.clone();
     let receipt = Frame::sign(
         &daemon.key,
         &daemon.descriptor.id(),
@@ -703,13 +707,14 @@ async fn applied<E: Context>(
             let receipts = std::mem::take(&mut applied.submissions);
             daemon.record(&node, block, ran, Some(receipts)).await?;
             daemon.publish(&applied);
-            let roles = node.host().roles();
+            let validators = node.host().role(role::VALIDATORS)?;
             let members_written = applied
                 .writes
                 .programs
-                .get(&roles.validators)
+                .get(validators)
                 .is_some_and(|writes| !writes.is_empty());
-            let writes = applied.writes.programs.get(&roles.blobs).cloned();
+            let blobs = node.host().role(role::BLOBS)?;
+            let writes = applied.writes.programs.get(blobs).cloned();
             let due = daemon
                 .blobs
                 .applied(block.height, &writes.unwrap_or_default());
