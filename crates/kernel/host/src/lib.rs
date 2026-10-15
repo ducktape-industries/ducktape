@@ -1577,13 +1577,17 @@ where
                 }
             }
         }
+        let mut dropped = BTreeSet::new();
         for program in running.keys() {
-            let dropped = !wanted.contains(program);
-            if dropped {
+            if !wanted.contains(program) {
                 overlay.delete(PROGRAMS, program.clone().into_bytes());
                 self.loaded.unload(program);
                 changed.push(program.clone());
+                dropped.insert(program.clone());
             }
+        }
+        if !dropped.is_empty() {
+            self.unbind_dropped(&dropped, overlay)?;
         }
         for program in changed {
             let cancelled = self
@@ -1592,6 +1596,28 @@ where
             receipts.extend(cancelled);
         }
         Ok(receipts)
+    }
+
+    /// The roles table names only running programs: a role bound to a program
+    /// this block drops is unbound in the same block. A role in `REQUIRED`
+    /// keeps its row, so a reopen still finds the table filled; the kernel
+    /// refuses every frame that asks the missing program until a swap brings
+    /// it back.
+    fn unbind_dropped(&self, dropped: &BTreeSet<ProgramId>, overlay: &mut Overlay) -> Result<()> {
+        let view = View::new(self.store.storage(), vec![&*overlay]);
+        let roles = view
+            .get(NETWORK, namespace::ROLES)?
+            .ok_or_else(|| Error::Corrupt("the network records no roles".into()))?;
+        let roles: Roles = abi::decode(&roles).map_err(corrupt)?;
+        let kept: Roles = roles
+            .iter()
+            .filter(|(role, program)| role::REQUIRED.contains(role) || !dropped.contains(*program))
+            .map(|(role, program)| (role, program.clone()))
+            .collect();
+        if kept != roles {
+            overlay.set(NETWORK, namespace::ROLES.to_vec(), abi::encode(&kept));
+        }
+        Ok(())
     }
 
     async fn admit(

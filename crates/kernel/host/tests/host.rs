@@ -685,6 +685,74 @@ fn a_bind_motion_moves_the_roles_table_at_its_height_and_never_a_required_role()
     });
 }
 
+#[test]
+fn dropping_a_program_unbinds_every_role_it_filled_in_the_same_block() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+        let relay = host.programs().unwrap()["ping"];
+        host.apply(block(
+            1,
+            vec![submit("programs", change("echo", relay, Vec::new()))],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(2, Vec::new())).await.unwrap();
+        let bind = |role: &str, program: &str| validators::Motion::Bind {
+            role: role.into(),
+            program: Some(program.into()),
+        };
+        output(&vote(&mut host, 3, bind(role::SCHEDULER, "echo")).await);
+        output(&vote(&mut host, 4, bind(role::EGRESS, "echo")).await);
+        output(&vote(&mut host, 5, bind("ledger", "pong")).await);
+        assert_eq!(
+            host.roles().get(role::SCHEDULER).map(String::as_str),
+            Some("echo")
+        );
+
+        host.apply(block(
+            6,
+            vec![submit(
+                "programs",
+                abi::encode(&Change::Remove("echo".into())),
+            )],
+        ))
+        .await
+        .unwrap();
+        let applied = host.apply(block(7, Vec::new())).await.unwrap();
+        assert!(!host.programs().unwrap().contains_key("echo"));
+        let table_written = applied
+            .writes
+            .programs
+            .get(NETWORK)
+            .is_some_and(|written| written.contains_key(b"roles".as_slice()));
+        assert!(
+            table_written,
+            "the block that drops echo rewrites the roles table"
+        );
+        assert_eq!(host.roles().get(role::SCHEDULER), None);
+        assert_eq!(host.roles().get(role::EGRESS), None);
+        assert_eq!(host.roles().get("ledger").map(String::as_str), Some("pong"));
+        assert_eq!(
+            host.roles().get(role::HALO).map(String::as_str),
+            Some("halo")
+        );
+        let names: Vec<&str> = host.roles().iter().map(|(role, _)| role).collect();
+        assert_eq!(
+            names,
+            [
+                "awaits",
+                "blobs",
+                "halo",
+                "identity",
+                "ledger",
+                "programs",
+                "validators"
+            ]
+        );
+    });
+}
+
 /// The validators' vote on `op` at `height`, through the fixture valset: its receipt.
 async fn halo_vote(host: &mut Host<Ctx>, height: u64, op: &halo::Op) -> Receipt {
     let motion = validators::Motion::Role {
