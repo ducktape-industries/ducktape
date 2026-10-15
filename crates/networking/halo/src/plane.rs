@@ -49,7 +49,8 @@ struct Shared<T: Transport> {
     transport: Arc<T>,
     members: Arc<Members>,
     pacer: Pacer,
-    lanes: RwLock<Vec<Lane>>,
+    /// `None` until the first table.
+    lanes: RwLock<Option<Vec<Lane>>>,
     streams: Mutex<HashMap<String, Backlog<T::Stream>>>,
     datagrams: Mutex<HashMap<String, Arc<Queues>>>,
 }
@@ -60,6 +61,7 @@ impl<T: Transport> Shared<T> {
             .read()
             .expect("the table lock is never poisoned")
             .iter()
+            .flatten()
             .find(|lane| lane.enabled && serves(lane))
             .cloned()
     }
@@ -79,6 +81,7 @@ impl<T: Transport> Shared<T> {
             .read()
             .expect("the table lock is never poisoned")
             .iter()
+            .flatten()
             .any(|lane| lane.name == name)
     }
 }
@@ -118,13 +121,48 @@ impl<T: Transport> Plane<T> {
         &self.shared.pacer
     }
 
-    /// Serves `lanes` from now on, in place of the table before: what the halo role lists.
+    /// Serves `lanes` from now on, in place of the table before: what the halo role lists. A
+    /// table that replaces one warns for each enabled name nothing on this node binds; the first
+    /// is taken before the node's services bind, so it says nothing.
     pub fn lanes(&self, lanes: Vec<Lane>) {
-        *self
+        let served: Vec<String> = lanes
+            .iter()
+            .filter(|lane| lane.enabled)
+            .map(|lane| lane.name.clone())
+            .collect();
+        let before = self
             .shared
             .lanes
             .write()
-            .expect("the table lock is never poisoned") = lanes;
+            .expect("the table lock is never poisoned")
+            .replace(lanes);
+        let first = before.is_none();
+        if first {
+            return;
+        }
+        for name in served {
+            let bound = self.bound(&name);
+            if !bound {
+                tracing::warn!(target: "ducktape::halo", event = "halo_unserved", lane = name, reason = "unbound", "the lane table serves a lane nothing on this node binds");
+            }
+        }
+    }
+
+    /// Whether a handler on this node binds the lane `name`, for streams or datagrams.
+    fn bound(&self, name: &str) -> bool {
+        let streams = self
+            .shared
+            .streams
+            .lock()
+            .expect("the lanes lock is never poisoned")
+            .contains_key(name);
+        let datagrams = self
+            .shared
+            .datagrams
+            .lock()
+            .expect("the lanes lock is never poisoned")
+            .contains_key(name);
+        streams || datagrams
     }
 
     /// Binds the streams of the lane `name`, at any time: it is served while the table lists it
@@ -174,7 +212,7 @@ impl<T: Transport> Plane<T> {
     fn unlisted(&self, name: &str) {
         let listed = self.shared.listed(name);
         if !listed {
-            tracing::debug!(target: "ducktape::halo", lane = name, reason = "unlisted", "halo bound a lane the table does not list yet");
+            tracing::warn!(target: "ducktape::halo", event = "halo_unlisted", lane = name, reason = "unlisted", "halo bound a lane the table does not list; it is served once the table lists it");
         }
     }
 }

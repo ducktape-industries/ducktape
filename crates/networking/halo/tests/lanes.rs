@@ -2,7 +2,7 @@
 // lane's name, at the id and cap the table gives it, and a table change reaches the next open and
 // the next arrival while a stream already open runs on.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
@@ -215,5 +215,58 @@ async fn a_datagram_is_handed_to_the_handler_bound_by_its_lanes_name() {
     assert_eq!(
         payload, b"mapped",
         "a datagram for an id the table does not map is dropped"
+    );
+}
+
+/// What `during` logs at warn and above on this thread, as text.
+fn warned(during: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, during);
+    String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+}
+
+#[tokio::test]
+async fn a_table_that_replaces_one_warns_for_each_served_name_nothing_binds() {
+    let pair = pair();
+    let table = vec![
+        lane(LANE, 0, Class::Critical, true),
+        lane("idle", 1, Class::Critical, true),
+        lane("paused", 2, Class::Critical, false),
+    ];
+    let first = warned(|| pair.serving.lanes(table.clone()));
+    assert_eq!(first, "", "the first table is taken before anything binds");
+
+    let _bound = pair.serving.streams(LANE, 4).unwrap();
+    let again = warned(|| pair.serving.lanes(table));
+    let unserved: Vec<&str> = again
+        .lines()
+        .filter(|line| line.contains("halo_unserved"))
+        .collect();
+    assert_eq!(unserved.len(), 1, "{again}");
+    assert!(unserved[0].contains("idle"), "{again}");
+
+    let unlisted = warned(|| {
+        pair.serving.datagrams("nowhere", 4).unwrap();
+    });
+    assert!(
+        unlisted.contains("halo_unlisted") && unlisted.contains("nowhere"),
+        "{unlisted}"
     );
 }
