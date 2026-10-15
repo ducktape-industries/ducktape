@@ -1,5 +1,5 @@
 //! The node's egress worker: after each applied block it reads the program bound to the egress
-//! role and answers, expires and serves through it with the node's key. Spawned by `run.rs`.
+//! role and answers and serves through it with the node's key. Spawned by `run.rs`.
 mod call;
 mod config;
 mod desk;
@@ -7,7 +7,7 @@ mod desk;
 use std::sync::Arc;
 
 use abi::role::egress::{Answer, Op, Query, Reply, RequestRow};
-use abi::{BlobId, Origin, ProgramId, reason};
+use abi::{BlobId, Origin, ProgramId, reason, role};
 use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -39,7 +39,14 @@ pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Client
 }
 
 async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clients) {
-    let bound = daemon.node.lock().await.host().roles().egress.clone();
+    let bound = daemon
+        .node
+        .lock()
+        .await
+        .host()
+        .roles()
+        .get(role::EGRESS)
+        .cloned();
     let Some(role) = bound else {
         let unused = !config.served().is_empty();
         if unused {
@@ -129,7 +136,6 @@ impl<E: Context> Worker<E> {
         let assigned = self
             .requests(&node, &Query::Assigned { key: key.clone() })
             .await?;
-        let overdue = self.requests(&node, &Query::Overdue).await?;
         let Reply::Node(row) = self.ask(&node, &Query::Node { key: key.clone() }).await? else {
             return Err(Error::Corrupt(
                 "the egress program answered a node with something else".into(),
@@ -143,7 +149,6 @@ impl<E: Context> Worker<E> {
         serving.sort();
         Ok(Reading {
             assigned,
-            overdue,
             serving,
             member,
         })

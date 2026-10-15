@@ -2,6 +2,7 @@ mod crypto;
 mod namespace;
 mod parked;
 mod parking;
+mod scheduling;
 mod unit;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,8 +13,8 @@ use std::path::Path;
 pub use abi::Roles;
 use abi::{
     BlobId, Cause, Env, HashKind, Invocation, ItemRef, Message, Origin, Outcome, Principal,
-    ProgramCall, ProgramId, Refusal, Root, Scan, hook, reason,
-    role::{identity, programs, validators},
+    ProgramCall, ProgramId, Receipt, Refusal, Root, Scan, hook, reason,
+    role::{self, identity, programs, validators},
 };
 use blob::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -39,7 +40,7 @@ const CODE_KIND: &str = "program";
 pub const MAX_DEPTH: u32 = 8;
 pub const ANCHOR_WINDOW: u64 = 256;
 pub const HOOK_FUEL: u64 = 2_000_000;
-const HOOK_LOG_EVERY: u64 = 64;
+const STREAK_LOG_EVERY: u64 = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -63,10 +64,9 @@ pub enum Error {
         refusal: Refusal,
     },
     #[error("genesis binds the {role} role to {program:?}, which is not a founding program")]
-    Unbound {
-        role: &'static str,
-        program: ProgramId,
-    },
+    Unbound { role: String, program: ProgramId },
+    #[error("the network binds no program to the {role} role, which the kernel calls")]
+    Unfilled { role: String },
     #[error("genesis hooks {0:?}, which is not a founding program")]
     Unhooked(ProgramId),
     #[error("no network was founded here")]
@@ -152,18 +152,6 @@ impl Submission {
     }
 }
 
-/// One frame's run. A rejected receipt's run wrote nothing: the outcome
-/// is the refusal of the run itself or, propagated, of a run nested in it.
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct Receipt {
-    pub program: ProgramId,
-    pub outcome: Outcome,
-    pub events: Vec<Vec<u8>>,
-    /// A nested receipt's `Applied` and events stand only when every
-    /// receipt above it was applied too: an ancestor's rejection undid it.
-    pub nested: Vec<Receipt>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     pub height: u64,
@@ -190,6 +178,7 @@ where
     loaded: Loaded,
     preconfirmed: Overlay,
     hook_streaks: BTreeMap<ProgramId, u64>,
+    scheduler_streak: u64,
 }
 
 enum Submitted {
@@ -305,11 +294,14 @@ where
             })
             .collect();
         let roles = &genesis.roles;
-        for (role, program) in roles.named() {
+        if let Some(role) = roles.unfilled() {
+            return Err(Error::Unfilled { role: role.into() });
+        }
+        for (role, program) in roles.iter() {
             let founded = entries.iter().any(|entry| entry.program == *program);
             if !founded {
                 return Err(Error::Unbound {
-                    role,
+                    role: role.into(),
                     program: program.clone(),
                 });
             }
@@ -321,11 +313,15 @@ where
             }
         }
         let founding_roles = [
-            &roles.programs,
-            &roles.validators,
-            &roles.identity,
-            &roles.blobs,
-        ];
+            role::PROGRAMS,
+            role::VALIDATORS,
+            role::IDENTITY,
+            role::BLOBS,
+        ]
+        .into_iter()
+        .map(|role| bound(roles, role))
+        .collect::<Result<Vec<_>>>()?;
+        let validators_role = bound(roles, role::VALIDATORS)?;
         entries.sort_by_key(|entry| {
             founding_roles
                 .iter()
@@ -337,7 +333,7 @@ where
             member_cap: genesis.member_cap,
         });
         for entry in entries.iter_mut() {
-            if entry.program == roles.validators {
+            if entry.program == *validators_role {
                 entry.params = params.clone();
             }
         }
@@ -392,6 +388,7 @@ where
             loaded: Loaded::new(genesis.limits),
             preconfirmed: Overlay::default(),
             hook_streaks: BTreeMap::new(),
+            scheduler_streak: 0,
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -490,6 +487,7 @@ where
             loaded: Loaded::new(limits),
             preconfirmed: Overlay::default(),
             hook_streaks: BTreeMap::new(),
+            scheduler_streak: 0,
         };
         host.sync_code()?;
         Ok(host)
@@ -580,6 +578,10 @@ where
 
     pub fn roles(&self) -> &Roles {
         &self.roles
+    }
+
+    pub fn role(&self, role: &str) -> Result<&ProgramId> {
+        bound(&self.roles, role)
     }
 
     pub fn root(&self) -> Result<Root> {
@@ -783,7 +785,7 @@ where
             stage,
             &[],
             Origin::System,
-            self.roles.validators.clone(),
+            self.role(role::VALIDATORS)?.clone(),
             abi::encode(&query),
             &mut self.loaded.limits().fuel,
         )
@@ -866,6 +868,10 @@ where
             submissions.push(receipt);
         }
         self.log_hooks(block.height, hooks);
+        let refusals = self
+            .run_scheduled(block.height, block.time, &mut overlay, &mut stage)
+            .await?;
+        self.log_scheduler(block.height, refusals);
         let epoch_length = self.epoch_length()?;
         let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
         if ends_an_epoch {
@@ -958,7 +964,7 @@ where
             stage,
             &[],
             Origin::System,
-            self.roles.programs.clone(),
+            self.role(role::PROGRAMS)?.clone(),
             abi::encode(&programs::Query::Hooks(height)),
             &mut self.loaded.limits().fuel,
         )
@@ -1070,7 +1076,7 @@ where
             };
             let blocks = self.hook_streaks.entry(program.clone()).or_default();
             *blocks += 1;
-            let due = *blocks == 1 || blocks.is_multiple_of(HOOK_LOG_EVERY);
+            let due = *blocks == 1 || blocks.is_multiple_of(STREAK_LOG_EVERY);
             if due {
                 tracing::warn!(
                     target: "ducktape::hook",
@@ -1189,7 +1195,7 @@ where
             stage,
             &[],
             Origin::System,
-            self.roles.identity.clone(),
+            self.role(role::IDENTITY)?.clone(),
             abi::encode(&asked),
             fuel,
         )
@@ -1513,7 +1519,7 @@ where
             &*stage,
             &[],
             Origin::System,
-            self.roles.programs.clone(),
+            self.role(role::PROGRAMS)?.clone(),
             abi::encode(&programs::Query::At(height)),
             &mut self.loaded.limits().fuel,
         )
@@ -1644,11 +1650,12 @@ where
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Receipt> {
+        let identity = self.role(role::IDENTITY)?;
         let env = Env {
             network: self.network.clone(),
             height,
             time,
-            me: self.roles.identity.clone(),
+            me: identity.clone(),
             origin: Origin::System,
             sender: Some(Principal::System),
             roles: self.roles.clone(),
@@ -1658,7 +1665,7 @@ where
             program: program.to_owned(),
         };
         self.run(
-            &self.roles.identity,
+            identity,
             ProgramCall::Execute(abi::encode(&op)),
             env,
             overlay,
@@ -1874,6 +1881,12 @@ fn member_cap_of(view: &View<'_>) -> Result<u32> {
         )));
     }
     Ok(cap)
+}
+
+fn bound<'r>(roles: &'r Roles, role: &str) -> Result<&'r ProgramId> {
+    roles
+        .get(role)
+        .ok_or_else(|| Error::Unfilled { role: role.into() })
 }
 
 fn corrupt(refusal: Refusal) -> Error {

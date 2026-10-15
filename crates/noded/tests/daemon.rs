@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use abi::role::halo;
 use abi::role::validators::{Motion, Op};
-use abi::{BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason};
+use abi::{BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason, role};
 use blob::contract::Entry;
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
@@ -166,6 +166,11 @@ impl Seat {
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
                 let logs = Logs::install("info").unwrap();
+                let cadence = workspace
+                    .descriptor()
+                    .unwrap()
+                    .cadence(consensus::Timeouts::default())
+                    .unwrap();
                 let running = noded::run(
                     context,
                     &workspace,
@@ -173,6 +178,7 @@ impl Seat {
                     listen,
                     HaloConfig::default(),
                     load,
+                    cadence,
                 )
                 .await
                 .unwrap();
@@ -300,7 +306,7 @@ async fn membership(client: &Client, key: &ed25519::PrivateKey, op: Op) -> u64 {
     height
 }
 
-async fn preconfirmed(client: &Client, frame: Vec<u8>) -> host::Receipt {
+async fn preconfirmed(client: &Client, frame: Vec<u8>) -> abi::Receipt {
     match client.submit(frame, Preconfirm::On).await.unwrap() {
         Submitted::Preconfirmed(receipt) => receipt,
         Submitted::Pooled => panic!("a preconfirmed submit answers its prediction"),
@@ -374,8 +380,14 @@ fn a_validator_serves_its_network_over_http() {
             node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0,
             "the genesis digest a client salts the network name with"
         );
-        assert_eq!(status.roles.validators, "valset");
-        assert_eq!(status.roles.halo, "halo");
+        assert_eq!(
+            status.roles.get(role::VALIDATORS).map(String::as_str),
+            Some("valset")
+        );
+        assert_eq!(
+            status.roles.get(role::HALO).map(String::as_str),
+            Some("halo")
+        );
         let pins: Vec<(String, bool)> = lanes(&client, &seat.identity)
             .await
             .into_iter()
@@ -830,6 +842,11 @@ fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
     let workspace = seat.workspace.clone();
     let refused = runner(&workspace.runtime_dir()).start(|context| async move {
         let logs = Logs::install("info").unwrap();
+        let cadence = workspace
+            .descriptor()
+            .unwrap()
+            .cadence(consensus::Timeouts::default())
+            .unwrap();
         noded::run(
             context,
             &workspace,
@@ -837,6 +854,7 @@ fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
             listen,
             HaloConfig::default(),
             LoadConfig::default(),
+            cadence,
         )
         .await
         .err()
@@ -1309,7 +1327,7 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
     client_runtime().block_on(async {
         let client = &live[0].client;
         let status = client.status().await.unwrap();
-        let role = status.roles.blobs.clone();
+        let role = status.roles.get(role::BLOBS).unwrap().clone();
         let entries = vec![
             blob::file_entry("page", &small).unwrap(),
             blob::file_entry("page", &big).unwrap(),
@@ -1396,7 +1414,7 @@ fn put_frame(status: &noded::wire::Status, blobs: Vec<Entry>, salt: u64) -> Fram
         NETWORK.as_bytes(),
         status.anchor(),
         Some(salt),
-        &status.roles.blobs,
+        status.roles.get(role::BLOBS).unwrap(),
         abi::encode(&blob::contract::Op::Put { blobs }),
     )
 }
@@ -1479,7 +1497,14 @@ fn a_lane_the_validators_vote_open_is_served_from_its_block() {
         assert_eq!(lanes(client, &taker.identity).await, [opened]);
 
         let (id, bundle) = put_page(client, &page, 1).await;
-        let role = client.status().await.unwrap().roles.blobs;
+        let role = client
+            .status()
+            .await
+            .unwrap()
+            .roles
+            .bound(role::BLOBS)
+            .unwrap()
+            .clone();
         ::tokio::time::timeout(Duration::from_secs(60), live[1].client.held(&role, bundle))
             .await
             .expect("the gatherer gathers and receipts the bundle over the lane the vote opened")
@@ -1509,7 +1534,15 @@ fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_di
     let runtime = client_runtime();
     runtime.block_on(async {
         let (id, bundle) = put_page(&live[2].client, &page, 1).await;
-        let role = live[2].client.status().await.unwrap().roles.blobs;
+        let role = live[2]
+            .client
+            .status()
+            .await
+            .unwrap()
+            .roles
+            .get(role::BLOBS)
+            .unwrap()
+            .clone();
         ::tokio::time::timeout(Duration::from_secs(120), live[2].client.held(&role, bundle))
             .await
             .expect("both members that can be dialed gather the bundle from the one that cannot")
@@ -1553,7 +1586,14 @@ fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
             },
         )
         .await;
-        let role = client.status().await.unwrap().roles.blobs;
+        let role = client
+            .status()
+            .await
+            .unwrap()
+            .roles
+            .get(role::BLOBS)
+            .unwrap()
+            .clone();
         let since = ::tokio::time::timeout(Duration::from_secs(300), client.held(&role, bundle))
             .await
             .expect("the hidden member gathers the bundle once it dials the moved address")

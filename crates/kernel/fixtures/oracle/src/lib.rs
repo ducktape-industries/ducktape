@@ -58,8 +58,7 @@ mod program {
             ));
         }
         ctx.delete(owed_key(ticket));
-        ctx.resolve(env, ticket, answer);
-        Ok(())
+        ctx.resolve(env, ticket, answer)
     }
 
     impl Program for Oracle {

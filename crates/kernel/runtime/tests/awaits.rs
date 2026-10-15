@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use abi::{
     Cause, Env, HostOp, HostReply, Invocation, Origin, Principal, ProgramCall, Refusal, Roles,
-    reason,
+    reason, role,
 };
 use fixture_awaiter::{ANSWERS, Finished, Plan};
 use runtime::{Fault, Host, Limits, PAGE_BYTES, Ran, Runtime, Suspended};
@@ -57,15 +57,14 @@ fn at(height: u64, call: ProgramCall) -> Invocation {
             me: "awaiter".into(),
             origin: Origin::External(vec![7; 32]),
             sender: Some(Principal::Account(1)),
-            roles: Roles {
-                programs: "programs".into(),
-                validators: "validators".into(),
-                identity: "identity".into(),
-                blobs: "blobs".into(),
-                awaits: "awaits".into(),
-                egress: None,
-                halo: "halo".into(),
-            },
+            roles: Roles::from_iter([
+                (role::PROGRAMS, "programs"),
+                (role::VALIDATORS, "validators"),
+                (role::IDENTITY, "identity"),
+                (role::BLOBS, "blobs"),
+                (role::AWAITS, "awaits"),
+                (role::HALO, "halo"),
+            ]),
             cause: Cause::Direct,
         },
         call,

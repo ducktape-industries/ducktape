@@ -47,7 +47,10 @@ impl<E: crate::Context> Chain for Shared<E> {
         let key = key.to_vec();
         Box::pin(async move {
             let node = self.lock().await;
-            let identity = node.host().roles().identity.clone();
+            let Ok(identity) = node.host().role(abi::role::IDENTITY) else {
+                return None;
+            };
+            let identity = identity.clone();
             let asked = abi::encode(&identity::Query::Account(key));
             let answered = node
                 .query(Layer::Confirmed, Origin::System, &identity, asked)

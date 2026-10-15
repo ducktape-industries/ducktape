@@ -125,7 +125,7 @@ mod program {
                 Op::Vote(motion) => {
                     let forwarded = roster.enact(motion)?;
                     if let Some(op) = forwarded {
-                        ctx.emit(env.roles.halo.clone(), op, false);
+                        ctx.emit(env.roles.bound(abi::role::HALO)?.clone(), op, false);
                     }
                     ctx.output(abi::encode(&Voted::Enacted));
                 }

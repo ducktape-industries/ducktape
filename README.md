@@ -58,7 +58,7 @@ block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
-[roles]                       # the founding program the kernel calls in each role; egress optional, the other six required
+[roles]                       # one row per role: its name = the founding program that fills it; egress and scheduler optional, the rest required
 programs = "programs"         # registers and swaps programs
 validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
@@ -66,6 +66,7 @@ blobs = "blobs"               # records each bundle of blobs put and which valid
 awaits = "awaits"             # keeps the tickets of frames that await a call, and hands each its answer
 egress = "egress"             # optional: answers programs' calls outside the chain; nodes read it, the kernel never calls it
 halo = "halo"                 # holds the lane table halo serves: each lane's wire id, class cap, whether it is served and whether it is pinned
+scheduler = "scheduler"       # optional: keeps the runs programs schedule for later heights; the kernel runs each at the end of its block
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
@@ -107,10 +108,15 @@ fuel = 1000000000
 memory_bytes = 268435456
 ```
 
-The kernel calls programs by role, never by id. Founding refuses a role bound
-to a program the file does not list, and every frame's env carries the
-bindings (`Env.roles`). As the kernel admits a program, at founding or later
-off the programs role, it gives the program an account: the identity role's
+The kernel calls programs by role, never by id. The roles are a table, a map
+from role name to program (`abi::Roles`; the names are constants in
+`abi::role`), so a new role is a new row. Founding refuses a role bound to a
+program the file does not list, and a table missing a role the kernel calls
+(programs, validators, identity, blobs, awaits), naming the missing role. Every
+frame's env carries the table (`Env.roles`); a program looks a role up by name
+and gets nothing for a role the network does not bind. As the kernel admits a
+program, at founding or later off the programs role, it gives the program an
+account: the identity role's
 `RegisterProgram`, executed with the `System` origin. Once per frame the host
 asks the identity role who the frame acts as, `Account(key)` for a signed
 frame and `OfProgram(program)` for a message or a reply, and passes the answer
@@ -120,7 +126,7 @@ runs as no one (`None`). A program may send a message as another account
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so an agent account its manager hands to a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
-validators, identity, awaits, egress, halo}`; the programs repository's `docs/roles.md` walks through them.
+validators, identity, awaits, egress, scheduler, halo}`; the programs repository's `docs/roles.md` walks through them.
 
 A program can wait for another program's answer. Its `execute` is an async
 Rust function (the program SDK's `awaiting_program!`), and each
@@ -136,15 +142,31 @@ instance, and tells the awaits role which tickets the frame waits on. Later
 the called program sends `resolve`, a message to the awaits role. That role
 checks that the sender is the program the ticket called, and the host
 restores the memory and resumes the program inside the resolver's
-submission, on the resolver's fuel. A ticket nobody answers expires after
-`EXPIRY_BLOCKS`: anyone may then send the awaits role `Expire`, and the
-program resumes with a refusal. A frame that finishes answers whoever waited
+submission, on the resolver's fuel. A ticket stays open until the called
+program answers it; the kernel puts no deadline on a wait. A frame that finishes answers whoever waited
 on it: the emitter of a message that wanted a reply gets its `Completion`
 then, and a waiting caller gets its answer. When the programs role gives a
 program new code, the host ends every frame that program had parked and
 answers each waiter with a refusal. Each run between two waits is its own
 transaction, so a refusal undoes only the run it ends. Storing a frame and
 restoring it each cost `PAGE_FUEL` per stored page.
+
+A program can schedule a run for a later block through the program bound to
+the scheduler role (`abi::role::scheduler`), an optional row. It sends that
+program `Schedule { height, target, payload }` (the program SDK's
+`ctx.schedule`) and gets back an entry id; the scheduler records the sending
+program as the entry's owner, so a program schedules only as itself, and it
+refuses a height that is not later than the current one. Only the owner may
+`Cancel` an entry, and only before it runs. At the end of each block, after
+its submissions and hooks and before the epoch step, the host asks the
+scheduler `Due { height }` page by page and runs each entry still due: a
+frame from `Origin::Program(owner)`, acting as the owner's account, with
+`Cause::Scheduled { entry }`, executing `payload` on `target` under the
+network's per-frame limits. A refused run undoes only its own writes. The
+host then sends the scheduler `Ran { entry, receipt }` from the `System`
+origin, and the scheduler keeps the receipt on the entry; the block does not
+carry the receipts of scheduled runs. A scheduled run may schedule entries
+for later heights. On a network that binds no scheduler role nothing runs.
 
 A hook is a program the kernel tells of every frame a block carries, after
 the frame has run: at each block it asks the programs role `Hooks(height)` and,
@@ -191,7 +213,7 @@ leave. Each prints the block that carried it.
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
 from, the address its HTTP surface bound, the runtime's storage and, when the
-operator writes one, `egress.toml`.
+operator writes them, `node.toml` and `egress.toml`.
 
 ## Answer calls outside the chain
 
@@ -206,10 +228,17 @@ Any other service is registered on chain by an account, which then assigns the
 node keys that may serve it; the chain elects among the assigned members that
 serve it.
 
-The node does this itself. After each block it applies, it asks the egress
-program which open requests the chain elected it for and which are past their
-deadline. It calls each new one and signs the answer with its own key, and it
-sends `Expire` for each overdue one. It also sends `Serve` while the chain's
+A request waits `wait` blocks for its answer, `DEFAULT_WAIT` (64) when the
+caller names none. The egress program schedules its own expiry through the
+scheduler role when it records the request, and cancels that entry when the
+answer comes. If the expiry runs first, egress drops the request and the
+caller's call ends with a refusal saying the request expired; a later answer
+is refused. A network that binds egress without a scheduler refuses every
+request. No node signs anything to expire a request.
+
+The node answers requests itself. After each block it applies, it asks the
+egress program which open requests the chain elected it for. It calls each new
+one and signs the answer with its own key. It also sends `Serve` while the chain's
 record of the services it serves differs from its `egress.toml`. It submits each
 of these frames again every block until a block carries it, and signs one again
 when its anchor grows old. An answer larger than a block carries goes out as a
@@ -240,6 +269,64 @@ an HTTP proxy in both directions: it forwards no hop-by-hop header
 (`connection` and every header it names, `proxy-connection`, `keep-alive`, `te`,
 `transfer-encoding`, `upgrade`, `proxy-authenticate`, `proxy-authorization`),
 so none of them is sent upstream or written into an answer.
+
+## Configure a node
+
+`ducktape run` reads `node.toml` from the workspace. The file is optional,
+and every key in it is too. Every `ducktape run` flag has a key, named like
+the flag with `_` for `-`. A flag overrides the file, and the file overrides
+the built-in default. `listen` and `halo` have no default, so the node
+refuses to start unless the flag or the file names each. A key the file does
+not know is an error, so a misspelled key stops the node instead of being
+ignored. `egress.toml` stays its own file.
+
+```toml
+listen = "127.0.0.1:9000"     # --listen; no default
+http = "127.0.0.1:8844"       # --http; default 127.0.0.1:0
+tls = "127.0.0.1:9443"        # --tls; default none
+halo = "0.0.0.0:9100"         # --halo; no default
+live = "0.0.0.0:9200"         # --live; default none: desktop clients take the websocket on the http port
+log = "info"                  # --log; default info
+
+[load]
+halo_egress = 10000000        # --halo-egress; default unlimited
+halo_inbound_streams = 512    # --halo-inbound-streams
+halo_datagrams = 2048         # --halo-datagrams
+reads_in_flight = 128         # --reads-in-flight
+uploads_in_flight = 16        # --uploads-in-flight
+blob_serves_in_flight = 32    # --blob-serves-in-flight
+blob_backlog = 128            # --blob-backlog
+blob_gatherers = 8            # --blob-gatherers
+
+[consensus]
+leader_timeout_ms = 5000          # --leader-timeout-ms; default 20 block times
+certification_timeout_ms = 7500   # --certification-timeout-ms; default 30 block times
+timeout_retry_ms = 2500           # --timeout-retry-ms; default 10 block times
+```
+
+The top level says where the node is reached and what it logs. `[load]`
+says how much work the node takes on at once and how fast it sends over
+halo; "Reach a node" describes each of its keys, and `ducktape run --help`
+shows each default. A count in `[load]` is above zero, and every count but
+`blob_gatherers` is at most what a tokio semaphore holds. `[consensus]`
+holds the consensus timeouts.
+
+The block time is the network's, from the founding file, so the defaults
+follow it. A view gives up on its leader after the leader timeout and on
+certifying a proposal after the certification timeout. Once a view has timed
+out, the node resends its timeout vote every retry interval. The node skips a
+view after the certification timeout plus one block time, and gives up on a
+fetch after one block time. `ducktape run` refuses to start unless the leader
+timeout is above zero, the certification timeout exceeds the leader timeout,
+and the retry interval is above zero and below the skip timeout.
+
+The leader timeout also bounds how long a silent peer link lives. A link
+that carries nothing for one leader timeout is dropped and dialed again, and
+the node pings each peer every quarter of its leader timeout so a healthy
+link is never silent that long. A peer reads one ping per eighth of its own
+leader timeout and waits out faster ones, so keep every node's leader timeout
+within a factor of two of the others'. The node's `node_started` log event
+carries the effective timeouts, the link timeout and the ping interval.
 
 ## Reach a node
 
@@ -285,7 +372,7 @@ uploads (submit, blob put) it serves together; the rest wait their turn.
 `--blob-serves-in-flight` and `--blob-gatherers` are the blobs it sends to
 members and gathers from members together. `--blob-backlog` is how many
 members' blob requests wait for a send; past it a request is refused.
-`ducktape run --help` shows each default.
+`ducktape run --help` shows each default and its `node.toml` key.
 
 Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). The halo
 role's program holds the lane table: each lane's name, the id its streams and datagrams carry

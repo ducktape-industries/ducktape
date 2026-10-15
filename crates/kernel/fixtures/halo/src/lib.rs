@@ -110,7 +110,8 @@ mod program {
         }
 
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
-            let voted = env.origin == Origin::Program(env.roles.validators.clone());
+            let voted =
+                env.origin == Origin::Program(env.roles.bound(abi::role::VALIDATORS)?.clone());
             if !voted {
                 return Err(Refusal::new(
                     reason::UNAUTHORIZED,

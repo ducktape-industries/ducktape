@@ -4,7 +4,7 @@ use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::role::identity::AccountNumber;
 use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
-    ProgramCall, ProgramId, Refusal, Roles, reason,
+    ProgramCall, ProgramId, Receipt, Refusal, Roles, reason, role,
 };
 use blob::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
@@ -12,7 +12,7 @@ use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Ran, Runtime, Suspended};
 use state::{Overlay, Storage, Store, View};
 
-use crate::{Error, Receipt, Result, crypto, namespace, parked};
+use crate::{Error, Result, crypto, namespace, parked};
 
 pub struct Loaded {
     runtime: Runtime,
@@ -408,7 +408,7 @@ where
         stage,
         stack,
         Origin::System,
-        world.roles.blobs.clone(),
+        crate::bound(world.roles, role::BLOBS)?.clone(),
         abi::encode(&asked),
         fuel,
     )
@@ -522,7 +522,7 @@ where
     }
 
     fn resume(&mut self, frame: FrameId, ticket: Ticket, answer: Answer) -> Result<HostReply> {
-        let from_the_role = self.env.me == self.world.roles.awaits;
+        let from_the_role = self.world.roles.get(role::AWAITS) == Some(&self.env.me);
         if !from_the_role {
             return Ok(HostReply::Refused(Refusal::new(
                 reason::UNAUTHORIZED,

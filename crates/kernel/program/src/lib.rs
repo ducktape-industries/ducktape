@@ -400,9 +400,11 @@ mod context {
             env: &Env,
             ticket: abi::role::awaits::Ticket,
             answer: abi::role::awaits::Answer,
-        ) {
+        ) -> Result<(), Refusal> {
+            let awaits = env.roles.bound(abi::role::AWAITS)?.clone();
             let op = abi::role::awaits::Op::Resolve { ticket, answer };
-            self.emit(env.roles.awaits.clone(), abi::encode(&op), false);
+            self.emit(awaits, abi::encode(&op), false);
+            Ok(())
         }
     }
 

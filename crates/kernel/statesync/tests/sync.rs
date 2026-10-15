@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use abi::{
-    HostOp,
+    HostOp, role,
     role::{halo, validators},
 };
 use commonware_consensus::marshal::Start;
@@ -54,15 +54,14 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
 fn genesis(members: &[validators::Member]) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles {
-            programs: "programs".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-            blobs: "blobs".into(),
-            awaits: "awaits".into(),
-            egress: None,
-            halo: "halo".into(),
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
+        ]),
         validators: members.to_vec(),
         programs: vec![
             Founding {

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use abi::{BlobId, Origin, ProgramId, Refusal, reason};
+use abi::Receipt;
+use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -12,7 +13,6 @@ use axum::routing::{get, post};
 use borsh::BorshSerialize;
 use futures::channel::mpsc;
 use futures::{SinkExt as _, StreamExt as _};
-use host::Receipt;
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use node::{BLOCK_BYTES, Preconfirm, Source, Taken};
 use statesync::Request as SyncRequest;
@@ -312,7 +312,18 @@ async fn blob_put<E: Context>(
         Ok(submission) => submission,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let role = daemon.node.lock().await.host().roles().blobs.clone();
+    let bound = daemon
+        .node
+        .lock()
+        .await
+        .host()
+        .roles()
+        .bound(role::BLOBS)
+        .cloned();
+    let role = match bound {
+        Ok(role) => role,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
     let entries = match put_entries(&role, &submission) {
         Ok(entries) => entries,
         Err(refusal) => return Reply::Refused(refusal),
