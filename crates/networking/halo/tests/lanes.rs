@@ -255,12 +255,12 @@ async fn a_table_that_replaces_one_warns_for_each_served_name_nothing_binds() {
 
     let _bound = pair.serving.streams(LANE, 4).unwrap();
     let again = warned(|| pair.serving.lanes(table));
-    let unserved: Vec<&str> = again
+    let unbound: Vec<&str> = again
         .lines()
-        .filter(|line| line.contains("halo_unserved"))
+        .filter(|line| line.contains("halo_unbound"))
         .collect();
-    assert_eq!(unserved.len(), 1, "{again}");
-    assert!(unserved[0].contains("idle"), "{again}");
+    assert_eq!(unbound.len(), 1, "{again}");
+    assert!(unbound[0].contains("idle"), "{again}");
 
     let unlisted = warned(|| {
         pair.serving.datagrams("nowhere", 4).unwrap();
