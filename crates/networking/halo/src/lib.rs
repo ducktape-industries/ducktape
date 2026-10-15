@@ -1,6 +1,7 @@
 //! halo: the network between members, off consensus. It carries lanes of streams and
 //! datagrams between current members over QUIC, at the halo address each member registers,
-//! at a priority class capped by who asks.
+//! at a priority class capped by who asks and by the lane. Which lanes exist, and each one's
+//! wire id and cap, is the halo role's table; this crate names none.
 
 pub mod class;
 pub mod links;
@@ -19,11 +20,12 @@ use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::Metrics;
 
+pub use abi::role::halo::{Lane, LaneId};
 pub use class::Class;
 pub use links::{Carried, Links};
 pub use members::{Members, Seat};
 pub use pacer::{Paced, Pacer};
-pub use plane::{Datagrams, Inbound, Lane, Plane, Streams, Taken};
+pub use plane::{Datagrams, Inbound, Plane, Streams, Taken};
 pub use transport::{Error, Transport};
 
 const EGRESS_BURST: u64 = 256 << 10;

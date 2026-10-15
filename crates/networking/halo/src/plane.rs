@@ -1,11 +1,14 @@
-//! halo's lanes over one medium. A stream opens with a hello naming its lane, its class and a
-//! short meta; the accepting side admits only current members on registered lanes, caps the
-//! class by who asked and paces its writes. Datagrams carry their lane in the first byte and
-//! wait in a short queue per sender that drops the oldest.
+//! halo's lanes over one medium. A handler binds a lane by name; the lane table the halo role
+//! holds gives each served name its wire id and class cap. A stream opens with a hello naming
+//! its lane's id, its class and a short meta; the accepting side admits only current members on
+//! lanes it serves, caps the class by who asked and by the lane, and paces its writes. Datagrams
+//! carry their lane's id in the first byte and wait in a short queue per sender that drops the
+//! oldest. A table change reaches the next open and the next arrival; a stream already open
+//! keeps its class and runs on.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,24 +17,18 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::class::Class;
+use crate::class::{Class, capped, claimed};
 use crate::members::Members;
 use crate::pacer::{Paced, Pacer};
 use crate::transport::{Error, Transport};
+use crate::{Lane, LaneId};
 
 const HELLO_WAIT: Duration = Duration::from_secs(5);
 pub const META_BYTES: usize = 1 << 10;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Lane(pub u8);
-
-impl Lane {
-    pub const BLOBS: Lane = Lane(6);
-}
-
 #[derive(Debug, thiserror::Error)]
-#[error("lane {0:?} is already registered")]
-pub struct Taken(pub Lane);
+#[error("lane {0} is already bound")]
+pub struct Taken(pub String);
 
 pub struct Inbound<S> {
     pub from: PublicKey,
@@ -41,7 +38,7 @@ pub struct Inbound<S> {
 }
 
 struct Hello {
-    lane: Lane,
+    lane: LaneId,
     class: Class,
     meta: Vec<u8>,
 }
@@ -52,8 +49,38 @@ struct Shared<T: Transport> {
     transport: Arc<T>,
     members: Arc<Members>,
     pacer: Pacer,
-    streams: Mutex<HashMap<Lane, Backlog<T::Stream>>>,
-    datagrams: Mutex<HashMap<Lane, Arc<Queues>>>,
+    lanes: RwLock<Vec<Lane>>,
+    streams: Mutex<HashMap<String, Backlog<T::Stream>>>,
+    datagrams: Mutex<HashMap<String, Arc<Queues>>>,
+}
+
+impl<T: Transport> Shared<T> {
+    fn served(&self, serves: impl Fn(&Lane) -> bool) -> Option<Lane> {
+        self.lanes
+            .read()
+            .expect("the table lock is never poisoned")
+            .iter()
+            .find(|lane| lane.enabled && serves(lane))
+            .cloned()
+    }
+
+    /// The lane `name` names, while the table lists it enabled.
+    fn named(&self, name: &str) -> Option<Lane> {
+        self.served(|lane| lane.name == name)
+    }
+
+    /// The lane wire id `id` names, while the table lists it enabled.
+    fn numbered(&self, id: LaneId) -> Option<Lane> {
+        self.served(|lane| lane.id == id)
+    }
+
+    fn listed(&self, name: &str) -> bool {
+        self.lanes
+            .read()
+            .expect("the table lock is never poisoned")
+            .iter()
+            .any(|lane| lane.name == name)
+    }
 }
 
 pub struct Plane<T: Transport> {
@@ -75,6 +102,7 @@ impl<T: Transport> Plane<T> {
             transport,
             members,
             pacer,
+            lanes: RwLock::default(),
             streams: Mutex::default(),
             datagrams: Mutex::default(),
         });
@@ -85,42 +113,64 @@ impl<T: Transport> Plane<T> {
         Plane { shared, tasks }
     }
 
-    pub fn streams(&self, lane: Lane, backlog: usize) -> Result<Streams<T>, Taken> {
-        let mut lanes = self
+    /// Serves `lanes` from now on, in place of the table before: what the halo role lists.
+    pub fn lanes(&self, lanes: Vec<Lane>) {
+        *self
+            .shared
+            .lanes
+            .write()
+            .expect("the table lock is never poisoned") = lanes;
+    }
+
+    /// Binds the streams of the lane `name`, at any time: it is served while the table lists it
+    /// enabled.
+    pub fn streams(&self, name: &str, backlog: usize) -> Result<Streams<T>, Taken> {
+        let mut bound = self
             .shared
             .streams
             .lock()
             .expect("the lanes lock is never poisoned");
-        let taken = lanes.contains_key(&lane);
+        let taken = bound.contains_key(name);
         if taken {
-            return Err(Taken(lane));
+            return Err(Taken(name.to_owned()));
         }
+        self.unlisted(name);
         let (queue, inbound) = mpsc::channel(backlog.max(1));
-        lanes.insert(lane, queue);
+        bound.insert(name.to_owned(), queue);
         Ok(Streams {
             shared: self.shared.clone(),
-            lane,
+            name: name.to_owned(),
             inbound: tokio::sync::Mutex::new(inbound),
         })
     }
 
-    pub fn datagrams(&self, lane: Lane, per_sender: usize) -> Result<Datagrams<T>, Taken> {
-        let mut lanes = self
+    /// Binds the datagrams of the lane `name`, at any time: it is served while the table lists it
+    /// enabled.
+    pub fn datagrams(&self, name: &str, per_sender: usize) -> Result<Datagrams<T>, Taken> {
+        let mut bound = self
             .shared
             .datagrams
             .lock()
             .expect("the lanes lock is never poisoned");
-        let taken = lanes.contains_key(&lane);
+        let taken = bound.contains_key(name);
         if taken {
-            return Err(Taken(lane));
+            return Err(Taken(name.to_owned()));
         }
+        self.unlisted(name);
         let queues = Arc::new(Queues::new(per_sender.max(1)));
-        lanes.insert(lane, queues.clone());
+        bound.insert(name.to_owned(), queues.clone());
         Ok(Datagrams {
             shared: self.shared.clone(),
-            lane,
+            name: name.to_owned(),
             queues,
         })
+    }
+
+    fn unlisted(&self, name: &str) {
+        let listed = self.shared.listed(name);
+        if !listed {
+            tracing::debug!(target: "ducktape::halo", lane = name, reason = "unlisted", "halo bound a lane the table does not list yet");
+        }
     }
 }
 
@@ -136,14 +186,18 @@ async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stre
         tracing::debug!(target: "ducktape::halo", %from, reason = "no_hello", "halo dropped a stream that named no lane");
         return;
     };
+    let Some(lane) = shared.numbered(hello.lane) else {
+        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane, reason = "no_lane", "halo dropped a stream for a lane it does not serve");
+        return;
+    };
     let backlog = shared
         .streams
         .lock()
         .expect("the lanes lock is never poisoned")
-        .get(&hello.lane)
+        .get(&lane.name)
         .cloned();
     let Some(backlog) = backlog else {
-        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane.0, reason = "no_lane", "halo dropped a stream for a lane it does not serve");
+        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane, reason = "unserved", "halo dropped a stream for a lane nothing on this node binds");
         return;
     };
     let admitted = shared.members.admits(&from);
@@ -151,7 +205,10 @@ async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stre
         tracing::debug!(target: "ducktape::halo", %from, reason = "not_a_member", "halo dropped a stream from a key that is not a member");
         return;
     }
-    let class = hello.class.capped(shared.members.validator(&from));
+    let class = capped(
+        claimed(hello.class, shared.members.validator(&from)),
+        lane.cap,
+    );
     let inbound = Inbound {
         from: from.clone(),
         class,
@@ -160,12 +217,12 @@ async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stre
     };
     let queued = backlog.try_send(inbound);
     if queued.is_err() {
-        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane.0, reason = "backlog_full", "halo refused a stream its lane had no room for");
+        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane, reason = "backlog_full", "halo refused a stream its lane had no room for");
     }
 }
 
 async fn read_hello<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Hello> {
-    let lane = Lane(stream.read_u8().await?);
+    let lane = stream.read_u8().await?;
     let class = Class::try_from(stream.read_u8().await?)
         .map_err(|byte| std::io::Error::other(format!("{byte} names no class")))?;
     let len = usize::from(stream.read_u16_le().await?);
@@ -180,7 +237,7 @@ async fn read_hello<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Hel
 
 async fn write_hello<S: AsyncWrite + Unpin>(
     stream: &mut S,
-    lane: Lane,
+    lane: LaneId,
     class: Class,
     meta: &[u8],
 ) -> Result<(), Error> {
@@ -191,7 +248,7 @@ async fn write_hello<S: AsyncWrite + Unpin>(
         )));
     }
     let mut hello = Vec::with_capacity(4 + meta.len());
-    hello.push(lane.0);
+    hello.push(lane);
     hello.push(u8::from(class));
     hello.extend_from_slice(&(meta.len() as u16).to_le_bytes());
     hello.extend_from_slice(meta);
@@ -201,7 +258,7 @@ async fn write_hello<S: AsyncWrite + Unpin>(
 
 pub struct Streams<T: Transport> {
     shared: Arc<Shared<T>>,
-    lane: Lane,
+    name: String,
     inbound: tokio::sync::Mutex<mpsc::Receiver<Inbound<T::Stream>>>,
 }
 
@@ -212,13 +269,16 @@ impl<T: Transport> Streams<T> {
         class: Class,
         meta: &[u8],
     ) -> Result<Paced<T::Stream>, Error> {
+        let Some(lane) = self.shared.named(&self.name) else {
+            return Err(Error::NoLane(self.name.clone()));
+        };
         let member = self.shared.members.admits(to);
         if !member {
             return Err(Error::Unreachable(to.clone()));
         }
         let mut stream = self.shared.transport.connect(to).await?;
-        write_hello(&mut stream, self.lane, class, meta).await?;
-        Ok(self.shared.pacer.pace(stream, class))
+        write_hello(&mut stream, lane.id, class, meta).await?;
+        Ok(self.shared.pacer.pace(stream, capped(class, lane.cap)))
     }
 
     pub async fn accept(&self) -> Option<Inbound<T::Stream>> {
@@ -228,26 +288,29 @@ impl<T: Transport> Streams<T> {
 
 impl<T: Transport> Drop for Streams<T> {
     fn drop(&mut self) {
-        if let Ok(mut lanes) = self.shared.streams.lock() {
-            lanes.remove(&self.lane);
+        if let Ok(mut bound) = self.shared.streams.lock() {
+            bound.remove(&self.name);
         }
     }
 }
 
 async fn demuxing<T: Transport>(shared: Arc<Shared<T>>) {
     while let Some((from, frame)) = shared.transport.recv_datagram().await {
-        let Some((&lane, payload)) = frame.split_first() else {
+        let Some((&id, payload)) = frame.split_first() else {
             continue;
         };
         let admitted = shared.members.admits(&from);
         if !admitted {
             continue;
         }
+        let Some(lane) = shared.numbered(id) else {
+            continue;
+        };
         let queues = shared
             .datagrams
             .lock()
             .expect("the lanes lock is never poisoned")
-            .get(&Lane(lane))
+            .get(&lane.name)
             .cloned();
         let Some(queues) = queues else {
             continue;
@@ -258,18 +321,21 @@ async fn demuxing<T: Transport>(shared: Arc<Shared<T>>) {
 
 pub struct Datagrams<T: Transport> {
     shared: Arc<Shared<T>>,
-    lane: Lane,
+    name: String,
     queues: Arc<Queues>,
 }
 
 impl<T: Transport> Datagrams<T> {
     pub async fn send(&self, to: &PublicKey, payload: &[u8]) -> Result<(), Error> {
+        let Some(lane) = self.shared.named(&self.name) else {
+            return Err(Error::NoLane(self.name.clone()));
+        };
         let member = self.shared.members.admits(to);
         if !member {
             return Err(Error::Unreachable(to.clone()));
         }
         let mut frame = Vec::with_capacity(1 + payload.len());
-        frame.push(self.lane.0);
+        frame.push(lane.id);
         frame.extend_from_slice(payload);
         self.shared
             .transport
@@ -288,8 +354,8 @@ impl<T: Transport> Datagrams<T> {
 
 impl<T: Transport> Drop for Datagrams<T> {
     fn drop(&mut self) {
-        if let Ok(mut lanes) = self.shared.datagrams.lock() {
-            lanes.remove(&self.lane);
+        if let Ok(mut bound) = self.shared.datagrams.lock() {
+            bound.remove(&self.name);
         }
     }
 }

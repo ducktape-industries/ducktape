@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use abi::role::halo;
 use abi::role::validators::{Motion, Op};
 use abi::{BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason};
 use blob::contract::Entry;
@@ -202,8 +203,12 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("blobs.wasm"), BLOBS).unwrap();
     std::fs::write(root.join("awaits.wasm"), AWAITS).unwrap();
     std::fs::write(root.join("halo.wasm"), HALO).unwrap();
-    let lanes = abi::role::halo::Genesis { lanes: Vec::new() };
-    std::fs::write(root.join("halo.params"), abi::encode(&lanes)).unwrap();
+    let lanes = vec![(blob::contract::LANE.to_owned(), halo::Class::Critical)];
+    std::fs::write(
+        root.join("halo.params"),
+        abi::encode(&halo::Genesis { lanes }),
+    )
+    .unwrap();
     let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
     let holders = vec![(putter.public_key().as_ref().to_vec(), PUTTER_ACCOUNT)];
     std::fs::write(root.join("holders.bin"), abi::encode(&holders)).unwrap();
@@ -1199,6 +1204,66 @@ fn shut_down(runtime: &::tokio::runtime::Runtime, seats: &[&Seat], live: Vec<Liv
     for node in live {
         node.thread.join().unwrap();
     }
+}
+
+async fn lanes(client: &Client, key: &ed25519::PrivateKey) -> Vec<halo::Lane> {
+    let asked = signed(client, key, "halo", abi::encode(&halo::Query::Lanes)).await;
+    let answer = client.query(Layer::Confirmed, asked).await.unwrap();
+    match abi::decode(&answer).unwrap() {
+        halo::Reply::Lanes(lanes) => lanes,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Founded with no lane: the block that votes blobs' lane open has both validators serve it, so a
+/// later put is gathered over it and held.
+#[test]
+fn a_lane_the_validators_vote_open_is_served_from_its_block() {
+    let root = tempfile::tempdir().unwrap();
+    let taker = Seat::new(root.path(), "n0");
+    let gatherer = Seat::new(root.path(), "n1");
+    let founding = founding(root.path(), &[&taker, &gatherer], EPOCH_LENGTH);
+    let unlaned = halo::Genesis { lanes: Vec::new() };
+    std::fs::write(root.path().join("halo.params"), abi::encode(&unlaned)).unwrap();
+    taker.init(&founding);
+    gatherer.init(&founding);
+    let live = vec![taker.start(), gatherer.start()];
+    let page = root.path().join("page");
+    std::fs::write(&page, b"gathered once the lane is open").unwrap();
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let client = &live[0].client;
+        assert_eq!(lanes(client, &taker.identity).await, []);
+        let open = halo::Op::Open {
+            name: blob::contract::LANE.into(),
+            cap: halo::Class::Critical,
+        };
+        let motion = Motion::Halo {
+            op: abi::encode(&open),
+        };
+        let height = membership(client, &taker.identity, Op::Vote(motion)).await;
+        let opened = halo::Lane {
+            name: blob::contract::LANE.into(),
+            id: 0,
+            cap: halo::Class::Critical,
+            enabled: true,
+            since: height,
+        };
+        assert_eq!(lanes(client, &taker.identity).await, [opened]);
+
+        let (id, bundle) = put_page(client, &page, 1).await;
+        let role = client.status().await.unwrap().roles.blobs;
+        ::tokio::time::timeout(Duration::from_secs(60), client.held(&role, bundle))
+            .await
+            .expect("the gatherer gathers and receipts the bundle over the lane the vote opened")
+            .unwrap();
+        let framed = blob::frame("page", b"gathered once the lane is open").unwrap();
+        assert_eq!(
+            live[1].client.blobs(&[id]).await.unwrap(),
+            vec![Some(framed)]
+        );
+    });
+    shut_down(&runtime, &[&taker, &gatherer], live);
 }
 
 #[test]

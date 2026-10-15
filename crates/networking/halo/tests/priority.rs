@@ -13,7 +13,7 @@ use tokio::time::Instant;
 const BUDGET: u64 = 1 << 20;
 const FETCHED: usize = 1 << 20;
 const ENDLESS: u64 = 1 << 40;
-const LANE: Lane = Lane(9);
+const LANE: &str = "bulk";
 
 async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Duration {
     let server = PrivateKey::from_seed(1).public_key();
@@ -35,6 +35,15 @@ async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Durati
         members,
         Pacer::new(100 * BUDGET, 64 << 10),
     );
+    let table = vec![Lane {
+        name: LANE.into(),
+        id: 0,
+        cap: Class::Critical,
+        enabled: true,
+        since: 0,
+    }];
+    serving.lanes(table.clone());
+    asking.lanes(table);
     let served = serving.streams(LANE, 4).unwrap();
     let wanting = asking.streams(LANE, 4).unwrap();
 

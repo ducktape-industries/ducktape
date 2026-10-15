@@ -223,6 +223,15 @@ whose halo address takes no inbound UDP still takes part by dialing out. A
 changed address is dialed from the next block on. `--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
 
+Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). The halo
+role's program holds the lane table: each lane's name, the id its streams and datagrams carry
+on the wire, the highest class it is served at, and whether it is served. A node reads the
+table at start and again after any block that writes it, so every node changes lanes at the
+same block. Only the validators' vote changes it (`ducktape vote halo <op>`, an
+`abi::role::halo::Op`): it opens a lane at the next id, sets a lane's class or pauses it, or
+closes one; an id is never handed out twice. A stream is served at the lower of the class it
+asks and its lane's cap. A stream already open when its lane is paused or closed runs on.
+
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844
 ```
@@ -287,7 +296,7 @@ verb's `--help` carries the rest.
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `program` (the small program SDK the fixtures compile against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
 | Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset`, `identity`, `blobs`, `awaits` and `halo`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Blobs | `crates/blob/` | `blob`: the framing a blob's id hashes and the blobs program's contract (wasm32, no features); the content-addressed store (feature `store`); and the service a node gathers, serves and receipts blobs with over halo (feature `node`) |
-| Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at each member's registered halo address, admission of current members by node key, lanes, the egress pacer and its priority classes |
+| Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at each member's registered halo address, admission of current members by node key, lanes bound by name over the halo role's table, the egress pacer and its priority classes |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 
 ## Develop
