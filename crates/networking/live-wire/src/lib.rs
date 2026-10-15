@@ -20,6 +20,10 @@ pub const NAMESPACE: &[u8] = b"ducktape:live";
 
 /// One object on a group stream.
 pub const MAX_STREAM_OBJECT: usize = 64 << 10;
+/// One control message's cap: a namespace, a track name and the fixed fields fit in it.
+pub const CONTROL_BYTES: u32 = 1 << 10;
+/// One websocket message's cap: a slice of one object, or a control message, with its framing.
+pub const WS_MESSAGE: usize = MAX_STREAM_OBJECT + CONTROL_BYTES as usize;
 /// The most a group may be, the sum of its objects. Two classes under one bound today: as the
 /// group a publisher encodes and every node must refuse alike, it is a wire invariant; as what
 /// the cache keeps per track, it is node memory. If the cache budget ever moves, it takes its

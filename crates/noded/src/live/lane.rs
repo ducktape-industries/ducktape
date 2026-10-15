@@ -13,14 +13,15 @@ use commonware_cryptography::ed25519::PublicKey;
 use commonware_runtime::telemetry::metrics::Counter;
 use halo::{Carried, Class, Halo, Inbound, Links, Paced};
 use live_wire::{
-    Alias, DatagramHeader, Forward, GROUP_COMPLETE, GroupHeader, LANE, LaneMeta, MAX_STREAM_OBJECT,
+    Alias, CONTROL_BYTES, DatagramHeader, Forward, GROUP_COMPLETE, GroupHeader, LANE, LaneMeta,
+    MAX_STREAM_OBJECT,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use super::Relay;
-use super::session::{CONTROL_BYTES, framed};
+use super::session::framed;
 use super::tracks::Relayed;
 
 /// Streams peers opened and this node has not taken yet, over every peer.

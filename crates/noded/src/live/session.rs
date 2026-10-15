@@ -11,16 +11,13 @@ use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Pacer};
 use live_wire::{
-    Alias, Control, DatagramHeader, GroupHeader, MAX_STREAM_OBJECT, Priority, WsFrame,
+    Alias, CONTROL_BYTES, Control, DatagramHeader, GroupHeader, MAX_STREAM_OBJECT, Priority,
+    WS_MESSAGE, WsFrame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
-/// One control message's cap: a namespace, a track name and the fixed fields fit in it.
-pub const CONTROL_BYTES: u32 = 1 << 10;
-/// One websocket message's cap: a slice of one object, or a control message, with its framing.
-pub const WS_MESSAGE: usize = MAX_STREAM_OBJECT + CONTROL_BYTES as usize;
 /// Inbound events waiting for the session's loop; a reader waits when it is full, so the
 /// transport's flow control holds the publisher back.
 const INBOUND: usize = 1024;

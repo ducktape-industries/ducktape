@@ -19,7 +19,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Halo, Lane, Seat};
 use live_wire::{
     ALPN, Account, Challenge, Code, Control, DatagramHeader, End, GroupHeader, Hello, KeyScheme,
-    LANE, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, Welcome, WsFrame,
+    LANE, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, WS_MESSAGE, Welcome, WsFrame,
     proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
@@ -27,7 +27,6 @@ use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::grants::{Answered, Chain};
-use super::session::WS_MESSAGE;
 use super::{GOAWAY_MS, Network, Relay, ws_upgrade};
 
 type Context = runtime::Context;

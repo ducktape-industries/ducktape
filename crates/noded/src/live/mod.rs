@@ -40,10 +40,6 @@ use tracks::{Ask, Effect, GoingAway, SessionId, State};
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
 /// What a client is told to wait before re-opening when the node goes away.
 const GOAWAY_MS: u32 = 1000;
-/// A QUIC client unheard this long is gone; the node pings an idle one every
-/// [`QUIC_KEEP_ALIVE`], so a session holding tracks stays open through a NAT.
-const QUIC_IDLE: Duration = Duration::from_secs(30);
-const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(10);
 
 /// The chain the relay serves: its id as namespaces spell it, its genesis digest as a hello
 /// names it, and the program bound to the identity role.
@@ -136,10 +132,6 @@ impl<E: crate::Context> Relay<E> {
             .lock()
             .expect("the tasks lock is never poisoned")
             .spawn(task);
-    }
-
-    pub fn network(&self) -> &Network {
-        &self.network
     }
 
     /// The UDP port of the QUIC door, `None` when the node opened none.
@@ -408,12 +400,9 @@ struct Decided {
 /// The QUIC door: the node key's certificate, which a client pins from `/v1/status`, on the live
 /// ALPN, asking no client for a certificate; a client proves its key in the session instead.
 fn door(identity: &PrivateKey, at: SocketAddr) -> Result<quinn::Endpoint, halo::quic::Error> {
-    let mut server = halo::quic::open_server(identity, ALPN)?;
-    let mut transport = quinn::TransportConfig::default();
-    let idle = quinn::IdleTimeout::try_from(QUIC_IDLE).expect("thirty seconds is a valid idle");
-    transport.max_idle_timeout(Some(idle));
-    transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
-    server.transport_config(Arc::new(transport));
+    // `open_server` already applies halo's idle timeout and keep-alive, so a live client that
+    // holds tracks stays open through a NAT on the same terms as a lane between members.
+    let server = halo::quic::open_server(identity, ALPN)?;
     Ok(quinn::Endpoint::server(server, at)?)
 }
 

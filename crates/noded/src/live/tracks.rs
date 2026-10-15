@@ -1227,16 +1227,19 @@ impl State {
             mode: held.mode,
             latest,
         };
-        if let (Origin::Remote(peer), true) = (&held.origin, first_local) {
-            // The forwarding request is our alias of the track: unique here, one per track.
-            held.request = RequestId::from(held.alias);
-            held.asked = from;
-            effects.push(Effect::Lane(Relayed::Subscribe {
-                to: peer.clone(),
-                request: held.request,
-                track: track.clone(),
-                from,
-            }));
+        // A remote track's first local subscriber makes us ask the publisher's node for it.
+        if first_local {
+            if let Origin::Remote(peer) = &held.origin {
+                // The forwarding request is our alias of the track: unique here, one per track.
+                held.request = RequestId::from(held.alias);
+                held.asked = from;
+                effects.push(Effect::Lane(Relayed::Subscribe {
+                    to: peer.clone(),
+                    request: held.request,
+                    track: track.clone(),
+                    from,
+                }));
+            }
         }
         self.count_moved(track, effects);
         Some(opened)
@@ -1369,12 +1372,15 @@ impl State {
             .subscribers
             .iter()
             .any(|other| matches!(other, Subscriber::Local { .. }));
-        if let (Origin::Remote(peer), true) = (&held.origin, none_local) {
-            effects.push(Effect::Lane(Relayed::Unsubscribe {
-                to: peer.clone(),
-                request: held.request,
-            }));
-            held.latest = None;
+        // A remote track whose last local subscriber left makes us drop our ask to its node.
+        if none_local {
+            if let Origin::Remote(peer) = &held.origin {
+                effects.push(Effect::Lane(Relayed::Unsubscribe {
+                    to: peer.clone(),
+                    request: held.request,
+                }));
+                held.latest = None;
+            }
         }
         self.count_moved(track, effects);
     }
@@ -1724,6 +1730,7 @@ impl State {
         let Some(held) = self.tracks.get(&track) else {
             return effects;
         };
+        let request = held.request;
         let this_group = held.incoming.get(&header.group);
         let abandoned = this_group.is_some_and(|incoming| incoming.abandoned);
         if abandoned {
@@ -1732,11 +1739,6 @@ impl State {
         let group_bytes = this_group.map_or(0, |incoming| incoming.bytes);
         let room_left = MAX_GROUP_BYTES.saturating_sub(group_bytes);
         let cap = MAX_STREAM_OBJECT.min(room_left);
-        let request = self
-            .tracks
-            .get(&track)
-            .map(|held| held.request)
-            .unwrap_or_default();
         match self.taken(&track, Mode::Stream, body.len(), cap, now) {
             Taken::Allowed => {}
             Taken::Dropped => {
