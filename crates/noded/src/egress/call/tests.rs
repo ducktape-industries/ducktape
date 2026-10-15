@@ -95,7 +95,22 @@ fn post(service: &str, target: &str, headers: Vec<(&str, &str)>) -> Request {
 }
 
 async fn ask(clients: &Clients, config: &Config, request: &Request, body: &[u8]) -> Answer {
-    answer(clients, config, &CALLER, request, body.to_vec()).await
+    let delivery = Delivery::Whole;
+    let unstreamed = |data| panic!("a whole request streamed {data:?}");
+    let called = answer(
+        clients,
+        config,
+        &CALLER,
+        request,
+        &delivery,
+        body.to_vec(),
+        unstreamed,
+    )
+    .await;
+    let Called::Whole(answer) = called else {
+        panic!("a whole request ended as a stream: {called:?}");
+    };
+    answer
 }
 
 fn output(answer: Answer) -> Response {

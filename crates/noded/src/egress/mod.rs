@@ -3,6 +3,7 @@
 mod call;
 mod config;
 mod desk;
+mod stream;
 
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ pub use call::Clients;
 pub use config::Config;
 
 use crate::egress::call::Caller;
-use crate::egress::desk::{Desk, Purpose, Reading, Sent, Step};
+use crate::egress::desk::{Called, Desk, Purpose, Reading, Sent, Step};
 use crate::{Context, Daemon, Error, Result};
 
 const TARGET: &str = "ducktape::egress";
@@ -28,7 +29,7 @@ struct Worker<E: Context> {
     role: ProgramId,
     config: Arc<Config>,
     clients: Arc<Clients>,
-    answers: mpsc::UnboundedSender<(u64, Answer)>,
+    answers: mpsc::UnboundedSender<(u64, Called)>,
 }
 
 pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clients) -> Handle<()> {
@@ -98,8 +99,8 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
                     worker.execute(&mut desk, step).await;
                 }
             }
-            Some((id, answer)) = answered.next() => {
-                if let Some(step) = desk.answered(id, answer) {
+            Some((id, called)) = answered.next() => {
+                if let Some(step) = desk.called(id, called) {
                     worker.execute(&mut desk, step).await;
                 }
             }
@@ -155,13 +156,16 @@ impl<E: Context> Worker<E> {
     }
 
     async fn execute(&self, desk: &mut Desk, step: Step) {
-        match step {
-            Step::Call(row) => self.call(row),
-            Step::Send(purpose) => self.send(desk, purpose).await,
+        let mut next = Some(step);
+        while let Some(step) = next {
+            next = match step {
+                Step::Call(row) => self.call(row),
+                Step::Send(purpose) => self.send(desk, purpose).await,
+            };
         }
     }
 
-    fn call(&self, row: RequestRow) {
+    fn call(&self, row: RequestRow) -> Option<Step> {
         let daemon = self.daemon.clone();
         let config = self.config.clone();
         let clients = self.clients.clone();
@@ -176,28 +180,40 @@ impl<E: Context> Worker<E> {
             .context
             .child("egress_call")
             .spawn(move |_| async move {
-                let answer = match body(&daemon, row.request.parts()).await {
+                let id = row.id;
+                let event = |data: Vec<u8>| {
+                    let _ = answers.unbounded_send((id, Called::Event(data)));
+                };
+                let called = match body(&daemon, row.request.parts()).await {
                     Ok(body) => {
                         let caller = Caller {
                             chain: &daemon.descriptor.network,
                             program: &row.requester,
-                            id: row.id,
+                            id,
                         };
-                        call::answer(&clients, &config, &caller, &row.request, body).await
+                        let request = &row.request;
+                        let delivery = &row.delivery;
+                        call::answer(&clients, &config, &caller, request, delivery, body, event)
+                            .await
                     }
-                    Err(reason) => Answer::Failed(reason),
+                    Err(reason) => Called::Whole(Answer::Failed(reason)),
                 };
-                let _ = answers.unbounded_send((row.id, answer));
+                tracing::debug!(
+                    target: TARGET,
+                    event = "egress_called",
+                    id,
+                    ending = called.ending(),
+                );
+                let _ = answers.unbounded_send((id, called));
             });
+        None
     }
 
-    async fn send(&self, desk: &mut Desk, purpose: Purpose) {
+    async fn send(&self, desk: &mut Desk, purpose: Purpose) -> Option<Step> {
         let frame = match desk.frame(&purpose) {
             Some(frame) => frame.to_vec(),
             None => {
-                let Some(op) = desk.op(&purpose) else {
-                    return;
-                };
+                let op = desk.op(&purpose)?;
                 match self.sign(&op).await {
                     Ok(frame) => frame,
                     Err(error) => {
@@ -209,12 +225,18 @@ impl<E: Context> Worker<E> {
                             %error,
                             "the egress worker could not anchor a frame; it tries again next block"
                         );
-                        return;
+                        return None;
                     }
                 }
             }
         };
         let sent = self.submit(frame).await;
+        tracing::trace!(
+            target: TARGET,
+            event = "egress_submitted",
+            ?purpose,
+            sent = sent.kind(),
+        );
         if let Sent::Refused(refusal) = &sent {
             tracing::warn!(
                 target: TARGET,
@@ -225,7 +247,7 @@ impl<E: Context> Worker<E> {
                 "the node refused an egress frame of its own"
             );
         }
-        desk.sent(&purpose, sent);
+        desk.sent(&purpose, sent)
     }
 
     async fn sign(&self, op: &Op) -> Result<Vec<u8>> {
