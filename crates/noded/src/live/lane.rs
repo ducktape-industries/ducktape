@@ -142,12 +142,11 @@ pub async fn serving<E: crate::Context>(
                 Some(relayed) => lanes.dispatch(relayed),
                 None => return,
             },
-            changed = membership.changed() => if changed.is_ok() {
-                lanes.reconcile();
-            },
-            changed = served.changed() => if changed.is_ok() {
-                lanes.reconcile();
-            },
+            // The `Ok(())` pattern disables a watch whose sender is gone, rather than firing it
+            // forever: a dropped sender means the halo or the plane is going, and the loop then
+            // waits only on its queue.
+            Ok(()) = membership.changed() => lanes.reconcile(),
+            Ok(()) = served.changed() => lanes.reconcile(),
         }
     }
 }
