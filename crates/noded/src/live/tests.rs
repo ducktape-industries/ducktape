@@ -168,6 +168,7 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         id: 1,
         cap: Class::Client,
         enabled: true,
+        pinned: false,
         since: 0,
     }]);
     let (shutdown, down) = watch::channel(false);

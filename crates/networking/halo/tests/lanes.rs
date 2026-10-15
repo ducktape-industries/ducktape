@@ -46,6 +46,7 @@ fn lane(name: &str, id: LaneId, cap: Class, enabled: bool) -> Lane {
         id,
         cap,
         enabled,
+        pinned: false,
         since: 0,
     }
 }

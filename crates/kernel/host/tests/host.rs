@@ -74,12 +74,17 @@ fn roles() -> Roles {
 
 const PING: u64 = fixture_identity::PROGRAMS_FROM + 4;
 
-/// The lanes the halo role is founded with.
+/// The lanes the halo role is founded with: `first` pinned, `second` not.
 fn lanes() -> Vec<u8> {
+    let founded = |name: &str, cap, pinned| halo::Founded {
+        name: name.into(),
+        cap,
+        pinned,
+    };
     abi::encode(&halo::Genesis {
         lanes: vec![
-            ("first".into(), halo::Class::Critical),
-            ("second".into(), halo::Class::Client),
+            founded("first", halo::Class::Critical, true),
+            founded("second", halo::Class::Client, false),
         ],
     })
 }
@@ -507,7 +512,15 @@ fn lane(name: &str, id: halo::LaneId, cap: halo::Class, since: u64) -> halo::Lan
         id,
         cap,
         enabled: true,
+        pinned: false,
         since,
+    }
+}
+
+fn pinned(lane: halo::Lane) -> halo::Lane {
+    halo::Lane {
+        pinned: true,
+        ..lane
     }
 }
 
@@ -517,7 +530,7 @@ fn the_halo_role_opens_a_lane_on_the_validators_vote_alone() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
         let founded = vec![
-            lane("first", 0, halo::Class::Critical, 0),
+            pinned(lane("first", 0, halo::Class::Critical, 0)),
             lane("second", 1, halo::Class::Client, 0),
         ];
         assert_eq!(lanes_of(&host).await, founded);
@@ -540,6 +553,55 @@ fn the_halo_role_opens_a_lane_on_the_validators_vote_alone() {
         output(&applied.submissions[1]);
         let opened = lane("third", 2, halo::Class::Member, 1);
         assert_eq!(lanes_of(&host).await, [founded, vec![opened]].concat());
+    });
+}
+
+/// The validators' vote on `op` at `height`, through the fixture valset: its receipt.
+async fn halo_vote(host: &mut Host<Ctx>, height: u64, op: &halo::Op) -> Receipt {
+    let motion = validators::Motion::Halo {
+        op: abi::encode(op),
+    };
+    let voted = submit("valset", abi::encode(&validators::Op::Vote(motion)));
+    let mut applied = host.apply(block(height, vec![voted])).await.unwrap();
+    applied.submissions.remove(0)
+}
+
+#[test]
+fn a_pinned_lane_is_never_paused_or_closed_and_an_unpinned_one_is() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let first = pinned(lane("first", 0, halo::Class::Critical, 0));
+        let second = lane("second", 1, halo::Class::Client, 0);
+        let set = |name: &str, cap, enabled| halo::Op::Set {
+            name: name.into(),
+            cap,
+            enabled,
+        };
+        let close = |name: &str| halo::Op::Close { name: name.into() };
+
+        let paused = halo_vote(&mut host, 1, &set("first", halo::Class::Critical, false)).await;
+        assert_eq!(rejected(&paused).reason, reason::INVALID_INPUT);
+        let closed = halo_vote(&mut host, 2, &close("first")).await;
+        assert_eq!(rejected(&closed).reason, reason::INVALID_INPUT);
+        assert_eq!(lanes_of(&host).await, [first.clone(), second.clone()]);
+
+        let capped = halo_vote(&mut host, 3, &set("first", halo::Class::Member, true)).await;
+        output(&capped);
+        let first = halo::Lane {
+            cap: halo::Class::Member,
+            ..first
+        };
+        assert_eq!(lanes_of(&host).await, [first.clone(), second.clone()]);
+
+        output(&halo_vote(&mut host, 4, &set("second", halo::Class::Client, false)).await);
+        let second = halo::Lane {
+            enabled: false,
+            ..second
+        };
+        assert_eq!(lanes_of(&host).await, [first.clone(), second]);
+        output(&halo_vote(&mut host, 5, &close("second")).await);
+        assert_eq!(lanes_of(&host).await, [first]);
     });
 }
 

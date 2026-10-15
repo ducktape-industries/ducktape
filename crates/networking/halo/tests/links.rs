@@ -26,6 +26,7 @@ fn table() -> Vec<Lane> {
             id,
             cap: Class::Critical,
             enabled: true,
+            pinned: false,
             since: 0,
         })
         .collect()

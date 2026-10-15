@@ -100,8 +100,8 @@ pub struct Roles {
     pub identity: ProgramId,
     pub blobs: ProgramId,
     pub awaits: ProgramId,
-    /// Holds the lane table halo serves: each lane's wire id, class cap and
-    /// whether it is served.
+    /// Holds the lane table halo serves: each lane's wire id, class cap,
+    /// whether it is served and whether it is pinned.
     pub halo: ProgramId,
 }
 
@@ -756,8 +756,9 @@ pub mod role {
     }
 
     /// The lanes halo carries between members: each named lane's wire id, the
-    /// class its streams are served at most, and whether it is served. Only
-    /// the validators' vote changes the table.
+    /// class its streams are served at most, whether it is served and whether
+    /// it is pinned. Only the validators' vote changes the table, and no vote
+    /// pauses or closes a pinned lane.
     pub mod halo {
         use crate::{BorshDeserialize, BorshSerialize};
 
@@ -815,6 +816,10 @@ pub mod role {
             pub id: LaneId,
             pub cap: Class,
             pub enabled: bool,
+            /// Set at founding and never changed: a pinned lane is served for
+            /// the network's life, so a lane a node needs to apply blocks
+            /// cannot be voted away from under it.
+            pub pinned: bool,
             /// The block that opened it.
             pub since: u64,
         }
@@ -823,15 +828,17 @@ pub mod role {
         /// is refused.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Op {
-            /// Lists `name` at the next free id, enabled.
+            /// Lists `name` at the next free id, enabled and not pinned.
             Open { name: String, cap: Class },
             /// Changes the cap and whether the lane is served; the id stays.
+            /// A pinned lane refuses `enabled: false` (`invalid_input`).
             Set {
                 name: String,
                 cap: Class,
                 enabled: bool,
             },
-            /// Unlists `name`; its id is never handed out again.
+            /// Unlists `name`; its id is never handed out again. A pinned lane
+            /// refuses it (`invalid_input`).
             Close { name: String },
         }
 
@@ -850,10 +857,18 @@ pub mod role {
             Lane(Option<Lane>),
         }
 
+        /// A lane the network is founded with.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Founded {
+            pub name: String,
+            pub cap: Class,
+            pub pinned: bool,
+        }
+
         /// The founding lanes, listed in order from id 0.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct Genesis {
-            pub lanes: Vec<(String, Class)>,
+            pub lanes: Vec<Founded>,
         }
     }
 }

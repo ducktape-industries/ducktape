@@ -207,8 +207,16 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("awaits.wasm"), AWAITS).unwrap();
     std::fs::write(root.join("halo.wasm"), HALO).unwrap();
     let lanes = vec![
-        (blob::contract::LANE.to_owned(), halo::Class::Critical),
-        (live_wire::LANE.to_owned(), halo::Class::Client),
+        halo::Founded {
+            name: blob::contract::LANE.to_owned(),
+            cap: halo::Class::Critical,
+            pinned: true,
+        },
+        halo::Founded {
+            name: live_wire::LANE.to_owned(),
+            cap: halo::Class::Client,
+            pinned: false,
+        },
     ];
     std::fs::write(
         root.join("halo.params"),
@@ -328,6 +336,19 @@ fn a_validator_serves_its_network_over_http() {
         );
         assert_eq!(status.roles.validators, "valset");
         assert_eq!(status.roles.halo, "halo");
+        let pins: Vec<(String, bool)> = lanes(&client, &seat.identity)
+            .await
+            .into_iter()
+            .map(|lane| (lane.name, lane.pinned))
+            .collect();
+        assert_eq!(
+            pins,
+            [
+                (blob::contract::LANE.to_owned(), true),
+                (live_wire::LANE.to_owned(), false),
+            ],
+            "the founding pins the lane blocks are applied over"
+        );
 
         let landing = frame(&client, &alice, vec![Step::Fail("landed".into())]).await;
         let (height, receipt) = client
@@ -1281,6 +1302,7 @@ fn a_lane_the_validators_vote_open_is_served_from_its_block() {
             id: 0,
             cap: halo::Class::Critical,
             enabled: true,
+            pinned: false,
             since: height,
         };
         assert_eq!(lanes(client, &taker.identity).await, [opened]);
