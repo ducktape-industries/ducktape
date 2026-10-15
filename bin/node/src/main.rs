@@ -100,6 +100,22 @@ enum Verb {
         #[arg(
             long,
             value_parser = permits,
+            default_value_t = HaloConfig::default().inbound_streams,
+            help = "the streams members open to this node that wait for it to take them; past it \
+                    the node takes no more until one is taken"
+        )]
+        halo_inbound_streams: NonZeroUsize,
+        #[arg(
+            long,
+            value_parser = permits,
+            default_value_t = HaloConfig::default().datagrams,
+            help = "the datagrams from members that wait for this node to read them; past it a \
+                    datagram is dropped"
+        )]
+        halo_datagrams: NonZeroUsize,
+        #[arg(
+            long,
+            value_parser = permits,
             default_value_t = LoadConfig::default().reads_in_flight,
             help = "the HTTP reads this node serves at once; the rest wait their turn"
         )]
@@ -316,6 +332,8 @@ fn execute(cli: Cli) -> Result<(), String> {
             tls,
             halo,
             halo_egress,
+            halo_inbound_streams,
+            halo_datagrams,
             reads_in_flight,
             uploads_in_flight,
             blob_serves_in_flight,
@@ -332,6 +350,8 @@ fn execute(cli: Cli) -> Result<(), String> {
             };
             let halo = HaloConfig {
                 egress_bytes_per_sec: halo_egress,
+                inbound_streams: halo_inbound_streams,
+                datagrams: halo_datagrams,
             };
             let load = LoadConfig {
                 reads_in_flight,
@@ -853,7 +873,7 @@ impl<T, E: std::fmt::Display> Sentence<T> for Result<T, E> {
 mod tests {
     use clap::Parser as _;
 
-    use noded::LoadConfig;
+    use noded::{HaloConfig, LoadConfig};
 
     use super::{Cli, Verb};
 
@@ -950,6 +970,35 @@ mod tests {
             "--blob-gatherers",
         ] {
             assert!(run(&[flag, "0"]).is_err(), "{flag}");
+        }
+    }
+
+    #[test]
+    fn run_takes_the_default_halo_queues_unless_named_and_refuses_zero_or_past_tokio() {
+        let halo = |flags: &[&str]| {
+            let Verb::Run {
+                halo_egress,
+                halo_inbound_streams,
+                halo_datagrams,
+                ..
+            } = run(flags).unwrap().verb
+            else {
+                panic!("run parses");
+            };
+            HaloConfig {
+                egress_bytes_per_sec: halo_egress,
+                inbound_streams: halo_inbound_streams,
+                datagrams: halo_datagrams,
+            }
+        };
+        assert_eq!(halo(&[]), HaloConfig::default());
+        let named = halo(&["--halo-inbound-streams", "3", "--halo-datagrams", "5"]);
+        assert_eq!(named.inbound_streams.get(), 3);
+        assert_eq!(named.datagrams.get(), 5);
+        let past_tokio = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
+        for flag in ["--halo-inbound-streams", "--halo-datagrams"] {
+            assert!(run(&[flag, "0"]).is_err(), "{flag}");
+            assert!(run(&[flag, &past_tokio]).is_err(), "{flag}");
         }
     }
 }

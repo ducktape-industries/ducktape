@@ -12,7 +12,7 @@ use blob::{Blobs, frame};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
-use halo::{Config, Halo, Seat};
+use halo::{Config, Halo, Queues, Seat};
 
 struct Node {
     service: Service,
@@ -26,6 +26,7 @@ fn node(context: &runtime::Context, seed: u64, validator: bool) -> (Node, Arc<Ha
     let config = Config {
         egress_bytes_per_sec: None,
         udp: "127.0.0.1:0".parse().unwrap(),
+        queues: Queues::default(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());
     let seat = Seat {

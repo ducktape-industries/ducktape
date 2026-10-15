@@ -263,8 +263,14 @@ loopback host (`0.0.0.0`, `::`, `127.0.0.1`, `localhost`) is refused. `run
 right. Each node dials every member once it is seated and keeps that
 connection open, and a connection carries streams both ways, so a member
 whose halo address takes no inbound UDP still takes part by dialing out. A
-changed address is dialed from the next block on. `--halo-egress` caps the bytes per second a node sends over halo;
+changed address is dialed from the next block on. A dial to a member that
+never answers ends when QUIC's idle timeout passes, and the node dials again.
+`--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
+`--halo-inbound-streams` is how many streams members open to the node wait
+for it to take them; past it the node takes no more until one is taken.
+`--halo-datagrams` is how many datagrams from members wait for the node to
+read them; past it a datagram is dropped.
 
 Five more `run` flags set how much work a node takes on at once.
 `--reads-in-flight` and `--uploads-in-flight` are the HTTP reads and the

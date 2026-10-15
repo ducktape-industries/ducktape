@@ -47,9 +47,31 @@ pub struct Listen {
     pub halo: SocketAddr,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HaloConfig {
     pub egress_bytes_per_sec: Option<u64>,
+    pub inbound_streams: NonZeroUsize,
+    pub datagrams: NonZeroUsize,
+}
+
+impl Default for HaloConfig {
+    fn default() -> HaloConfig {
+        let queues = halo::Queues::default();
+        HaloConfig {
+            egress_bytes_per_sec: None,
+            inbound_streams: queues.inbound,
+            datagrams: queues.datagrams,
+        }
+    }
+}
+
+impl HaloConfig {
+    fn queues(&self) -> halo::Queues {
+        halo::Queues {
+            inbound: self.inbound_streams,
+            datagrams: self.datagrams,
+        }
+    }
 }
 
 const READS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero");
@@ -263,6 +285,7 @@ async fn start<E: Context>(
             halo::Config {
                 egress_bytes_per_sec: halo.egress_bytes_per_sec,
                 udp: listen.halo,
+                queues: halo.queues(),
             },
         )
         .map_err(|error| Error::Tls(error.to_string()))?,

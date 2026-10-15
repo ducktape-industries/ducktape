@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -33,7 +33,13 @@ pub enum Error {
     #[error("certificate: {0}")]
     Certificate(#[from] rcgen::Error),
     #[error("quic: {0}")]
-    Quic(String),
+    CipherSuite(#[from] NoInitialCipherSuite),
+    #[error("quic: {0}")]
+    Connect(#[from] quinn::ConnectError),
+    #[error("quic: {0}")]
+    Connection(#[from] quinn::ConnectionError),
+    #[error("halo bound no udp of the peer's family")]
+    OtherFamily,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -227,8 +233,7 @@ impl Quic {
                 PrivateKeyDer::Pkcs8(certified.key.clone_key()),
             )?;
         crypto.alpn_protocols = vec![ALPN.to_vec()];
-        let crypto =
-            QuicServerConfig::try_from(crypto).map_err(|error| Error::Quic(error.to_string()))?;
+        let crypto = QuicServerConfig::try_from(crypto)?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         server.transport_config(transport());
         let endpoint = quinn::Endpoint::server(server, address)?;
@@ -254,7 +259,7 @@ impl Quic {
 
     pub async fn dial(&self, peer: &PublicKey, at: SocketAddr) -> Result<quinn::Connection, Error> {
         if !self.reaches(&at) {
-            return Err(Error::Quic("halo bound no udp of the peer's family".into()));
+            return Err(Error::OtherFamily);
         }
         let admit = Admit {
             members: self.members.clone(),
@@ -270,17 +275,11 @@ impl Quic {
                 PrivateKeyDer::Pkcs8(self.certified.key.clone_key()),
             )?;
         crypto.alpn_protocols = vec![ALPN.to_vec()];
-        let crypto =
-            QuicClientConfig::try_from(crypto).map_err(|error| Error::Quic(error.to_string()))?;
+        let crypto = QuicClientConfig::try_from(crypto)?;
         let mut client = quinn::ClientConfig::new(Arc::new(crypto));
         client.transport_config(transport());
-        let connecting = self
-            .endpoint
-            .connect_with(client, at, NAME)
-            .map_err(|error| Error::Quic(error.to_string()))?;
-        connecting
-            .await
-            .map_err(|error| Error::Quic(error.to_string()))
+        let connecting = self.endpoint.connect_with(client, at, NAME)?;
+        Ok(connecting.await?)
     }
 }
 
