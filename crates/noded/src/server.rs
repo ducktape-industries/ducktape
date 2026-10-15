@@ -182,10 +182,6 @@ async fn submit<E: Context>(
         Ok(submit) => submit,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let preconfirm = match preconfirm {
-        true => Preconfirm::On,
-        false => Preconfirm::Off,
-    };
     let mut node = daemon.node.lock().await;
     match node.submit(frame.clone(), Source::Client, preconfirm).await {
         Ok(Ok(Taken::New(prediction))) => {

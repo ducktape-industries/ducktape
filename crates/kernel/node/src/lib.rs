@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role::validators};
+use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
@@ -64,7 +65,7 @@ pub enum Source {
     Peer,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Preconfirm {
     Off,
     On,

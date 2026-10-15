@@ -1,6 +1,7 @@
 use abi::{ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Receipt, Tip};
+use node::Preconfirm;
 
 pub const NODE_CONTRACT: u32 = 6;
 pub const ADMIN: &str = "$admin";
@@ -58,7 +59,7 @@ impl Status {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Submit {
     pub frame: Vec<u8>,
-    pub preconfirm: bool,
+    pub preconfirm: Preconfirm,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

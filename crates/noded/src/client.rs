@@ -46,10 +46,6 @@ impl Client {
     }
 
     pub async fn submit(&self, frame: Vec<u8>, preconfirm: Preconfirm) -> Result<Submitted> {
-        let preconfirm = match preconfirm {
-            Preconfirm::On => true,
-            Preconfirm::Off => false,
-        };
         self.post(route::SUBMIT, &Submit { frame, preconfirm })
             .await
     }
