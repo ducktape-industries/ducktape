@@ -174,6 +174,13 @@ pub enum Control {
         request: RequestId,
         code: Code,
     },
+    /// The request waits: the node holds it, whole, for want of a grant (`code` is
+    /// `NotGranted`), and answers it as asked on the block whose grant covers it. Said once;
+    /// `Unpublish`, `Unsubscribe` or `Unwatch` withdraws it.
+    Waiting {
+        request: RequestId,
+        code: Code,
+    },
     /// The node is going away: re-open after `in_ms`.
     GoAway {
         in_ms: u32,
@@ -282,11 +289,13 @@ pub const GROUP_COMPLETE: u32 = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Forward {
-    /// Gossip to every member when a client publishes or unpublishes: who holds which track.
+    /// Gossip to every member when a client publishes or unpublishes: who holds which track,
+    /// and at what priority its groups are served.
     Announce {
         track: Track,
         by: Account,
         mode: Mode,
+        priority: Priority,
         up: bool,
     },
     /// A node with a local subscriber asks the publisher's node for the track, once per
@@ -331,8 +340,18 @@ pub fn well_named(name: &str) -> bool {
     fits && segments_hold
 }
 
-/// A grant pattern against a track name: `*` matches every name, `<prefix>/*` every name
-/// under the prefix, anything else exactly.
+/// What a grant pattern says for the account that asks: [`ACCOUNT`] in it is the account's
+/// number in decimal, so one row binds each name to its own account (`echo/{account}`).
+pub const ACCOUNT: &str = "{account}";
+
+/// `pattern` as it reads for `account`: each [`ACCOUNT`] written as its number.
+pub fn for_account(pattern: &str, account: Account) -> String {
+    pattern.replace(ACCOUNT, &account.to_string())
+}
+
+/// A grant pattern, as it reads for the account that asks ([`for_account`]), against a track
+/// name: `*` matches every name, `<prefix>/*` every name under the prefix, anything else
+/// exactly.
 pub fn pattern_covers(pattern: &str, name: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -371,6 +390,22 @@ mod tests {
         assert!(!pattern_covers("presence/*", "presencex/42"));
         assert!(pattern_covers("doc", "doc"));
         assert!(!pattern_covers("doc", "doc/1"));
+    }
+
+    #[test]
+    fn an_account_pattern_is_the_asking_accounts_own() {
+        let mine = for_account("echo/{account}", 42);
+        assert_eq!(mine, "echo/42");
+        assert!(pattern_covers(&mine, "echo/42"));
+        assert!(!pattern_covers(&mine, "echo/43"));
+        let under = for_account("ask/{account}/*", 42);
+        assert!(pattern_covers(&under, "ask/42/7/0b"));
+        assert!(!pattern_covers(&under, "ask/43/42/0b"));
+        assert!(!pattern_covers(
+            &for_account("ask/{account}/*", 4),
+            "ask/42/7"
+        ));
+        assert_eq!(for_account("doc", 42), "doc");
     }
 
     #[test]

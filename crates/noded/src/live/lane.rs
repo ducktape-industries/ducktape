@@ -135,12 +135,14 @@ impl<E: super::Context> Lanes<E> {
                 track,
                 by,
                 mode,
+                priority,
                 up,
             } => {
                 let announce = Forward::Announce {
                     track,
                     by,
                     mode,
+                    priority,
                     up,
                 };
                 for member in self.halo.members().candidates(&self.me, None) {
@@ -446,9 +448,10 @@ fn heard<E: super::Context>(
             track,
             by,
             mode,
+            priority,
             up,
         } => {
-            relay.step(|state| state.remote_announced(from.clone(), track, by, mode, up));
+            relay.step(|state| state.remote_announced(from.clone(), track, by, mode, priority, up));
             None
         }
         Forward::Subscribe {

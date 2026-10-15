@@ -857,7 +857,9 @@ pub mod live {
     }
 
     /// What one account, or every account, may do in one room. A pattern is
-    /// a track name exactly, a prefix ending in `/*` (`presence/*`), or `*`.
+    /// a track name exactly, a prefix ending in `/*` (`presence/*`), or `*`;
+    /// `{account}` in it is the asking account's number, so one `*` row binds
+    /// each name to its own account (`echo/{account}`).
     #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub struct Grant {
         /// Track names this account may publish; empty = may not publish.

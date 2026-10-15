@@ -23,18 +23,18 @@ use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::telemetry::metrics::raw::{Counter, Gauge};
 use halo::Halo;
 use live_wire::{
-    ALPN, Account, Challenge, Code, Control, IDLE_SESSION, Mode, NAMESPACE, Priority, Proof,
-    RequestId, Start, Track, Welcome, proof_preimage,
+    ALPN, Account, Challenge, Code, Control, IDLE_SESSION, NAMESPACE, Proof, RequestId, Welcome,
+    proof_preimage,
 };
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 pub use grants::Chain;
-use grants::{Act, Grants, covered, place};
+use grants::{Act, Grants, covered, place, watch_patterns};
 pub use session::ws_upgrade;
 use session::{Inbound, Link, Out, Outlet, Sent};
-use tracks::{Effect, GoingAway, SessionId, State};
+use tracks::{Ask, Effect, GoingAway, SessionId, State};
 
 /// What the relay needs of the node's runtime: the node's own context.
 pub trait Context: crate::Context {}
@@ -283,20 +283,28 @@ impl<E: Context> Relay<E> {
                 mode,
                 priority,
             } => {
-                self.publishing(id, account, request, track, mode, priority)
-                    .await
+                let ask = Ask::Publish {
+                    track,
+                    mode,
+                    priority,
+                };
+                self.asked(id, account, request, ask).await
             }
             Control::Unpublish { request } => self.stepped(|state| state.unpublish(id, request)),
             Control::Subscribe {
                 request,
                 track,
                 from,
-            } => self.subscribing(id, account, request, track, from).await,
+            } => {
+                let ask = Ask::Subscribe { track, from };
+                self.asked(id, account, request, ask).await
+            }
             Control::Unsubscribe { request } => {
                 self.stepped(|state| state.unsubscribe(id, request))
             }
             Control::Watch { request, namespace } => {
-                self.watching(id, account, request, namespace).await
+                let ask = Ask::Watch { namespace };
+                self.asked(id, account, request, ask).await
             }
             Control::Unwatch { request } => self.stepped(|state| state.unwatch(id, request)),
             Control::Hello(_)
@@ -309,76 +317,31 @@ impl<E: Context> Relay<E> {
             | Control::Announce { .. }
             | Control::Ended { .. }
             | Control::Refused { .. }
+            | Control::Waiting { .. }
             | Control::GoAway { .. } => Step::Close("malformed_request"),
         }
     }
 
-    /// The chain is read only for a track the node would take: a name it refuses as malformed
-    /// costs no read.
-    async fn publishing(
-        &self,
-        id: SessionId,
-        account: Account,
-        request: RequestId,
-        track: Track,
-        mode: Mode,
-        priority: Priority,
-    ) -> Step {
-        let admissible = self.state().admissible(&track);
+    /// A publish, subscribe or watch from the client. The chain is read only for an ask the
+    /// node would take: a name or namespace it refuses as malformed costs no read.
+    async fn asked(&self, id: SessionId, account: Account, request: RequestId, ask: Ask) -> Step {
+        let admissible = self.state().admissible_ask(&ask);
         if !admissible {
-            return self.stepped(|state| state.publish(id, request, track, mode, priority, false));
+            return self.stepped(|state| state.ask(id, request, ask, None));
         }
-        let decided = self.decided(account, &track.namespace).await;
-        let granted = decided
-            .grant
-            .as_ref()
-            .is_some_and(|grant| covered(grant, Act::Publish, &track.name));
-        let step = self.stepped(|state| state.publish(id, request, track, mode, priority, granted));
+        let decided = self.decided(account, ask.namespace()).await;
+        let step = self.stepped(|state| state.ask(id, request, ask, decided.grant.as_ref()));
         // Settled once the answer is out, so a re-check of the request comes after it.
         self.settled(decided);
         step
     }
 
-    async fn subscribing(
-        &self,
-        id: SessionId,
-        account: Account,
-        request: RequestId,
-        track: Track,
-        from: Start,
-    ) -> Step {
-        let admissible = self.state().admissible(&track);
-        if !admissible {
-            return self.stepped(|state| state.subscribe(id, request, track, from, false));
-        }
-        let decided = self.decided(account, &track.namespace).await;
-        let granted = decided
-            .grant
-            .as_ref()
-            .is_some_and(|grant| covered(grant, Act::Subscribe, &track.name));
-        let step = self.stepped(|state| state.subscribe(id, request, track, from, granted));
+    /// A waiting ask asked again, on the grants a block wrote: answered as the client's own
+    /// would be, unless the client withdrew it meanwhile.
+    async fn asked_again(&self, id: SessionId, account: Account, request: RequestId, ask: Ask) {
+        let decided = self.decided(account, ask.namespace()).await;
+        self.step(|state| state.admit(id, request, ask, decided.grant.as_ref()));
         self.settled(decided);
-        step
-    }
-
-    /// A watcher hears the announces its subscribe patterns cover; with none it is not
-    /// granted.
-    async fn watching(
-        &self,
-        id: SessionId,
-        account: Account,
-        request: RequestId,
-        namespace: String,
-    ) -> Step {
-        let admissible = self.state().admissible_namespace(&namespace);
-        if !admissible {
-            return self.stepped(|state| state.watch(id, request, namespace, None));
-        }
-        let decided = self.decided(account, &namespace).await;
-        let patterns = watch_patterns(decided.grant.as_ref());
-        let step = self.stepped(|state| state.watch(id, request, namespace, patterns));
-        self.settled(decided);
-        step
     }
 }
 
@@ -429,12 +392,6 @@ struct Decided {
     grant: Option<Grant>,
     program: Option<ProgramId>,
     generation: u64,
-}
-
-/// The subscribe patterns a watcher hears announces through, `None` when it may not watch.
-fn watch_patterns(grant: Option<&Grant>) -> Option<Vec<String>> {
-    let grant = grant?;
-    covered(grant, Act::Watch, "*").then(|| grant.subscribe.clone())
 }
 
 /// The QUIC door: the node key's certificate, which a client pins from `/v1/status`, on the live
@@ -659,7 +616,8 @@ async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
 
 /// A block moved grants or identities: every request the change could cover is re-read, and
 /// the ones no longer granted end with `GrantRevoked`; a watcher hears through its new
-/// patterns; a session whose key acts as no account any more is closed.
+/// patterns; every ask waiting in the program is asked again, and one a grant now covers is
+/// answered; a session whose key acts as no account any more is closed.
 async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
     loop {
         rechecks.notified().await;
@@ -680,7 +638,7 @@ async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
                 };
                 let decided = relay.decided(account, &track.namespace).await;
                 match act {
-                    Act::Watch => match watch_patterns(decided.grant.as_ref()) {
+                    Act::Watch => match watch_patterns(decided.grant.as_ref(), account) {
                         Some(patterns) => relay.step(|state| state.rewatch(id, request, patterns)),
                         None => relay.step(|state| state.revoke(id, request)),
                     },
@@ -688,12 +646,19 @@ async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
                         let granted = decided
                             .grant
                             .as_ref()
-                            .is_some_and(|grant| covered(grant, act, &track.name));
+                            .is_some_and(|grant| covered(grant, act, &track.name, account));
                         if !granted {
                             relay.step(|state| state.revoke(id, request));
                         }
                     }
                 }
+            }
+            let waiting = relay.state().waiting_in(program);
+            for (id, request, ask) in waiting {
+                let Some(account) = relay.state().session(id).map(|session| session.account) else {
+                    continue;
+                };
+                relay.asked_again(id, account, request, ask).await;
             }
         }
         if dirty.identity {

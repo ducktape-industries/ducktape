@@ -15,7 +15,9 @@ use live_wire::{
     pattern_covers, well_named,
 };
 
-use super::grants::Act;
+use abi::live::Grant;
+
+use super::grants::{Act, covered, watch_patterns};
 use super::session::{Out, Outlet};
 
 /// A refusal for an object is told once per track per this long; the rest are dropped quiet.
@@ -65,6 +67,7 @@ pub enum Relayed {
         track: Track,
         by: Account,
         mode: Mode,
+        priority: Priority,
         up: bool,
     },
     Object {
@@ -187,6 +190,40 @@ impl Watcher {
     }
 }
 
+/// An ask the node holds until a grant covers it, kept whole so it is answered as it was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ask {
+    Publish {
+        track: Track,
+        mode: Mode,
+        priority: Priority,
+    },
+    Subscribe {
+        track: Track,
+        from: Start,
+    },
+    Watch {
+        namespace: String,
+    },
+}
+
+impl Ask {
+    pub fn act(&self) -> Act {
+        match self {
+            Ask::Publish { .. } => Act::Publish,
+            Ask::Subscribe { .. } => Act::Subscribe,
+            Ask::Watch { .. } => Act::Watch,
+        }
+    }
+
+    pub fn namespace(&self) -> &str {
+        match self {
+            Ask::Publish { track, .. } | Ask::Subscribe { track, .. } => &track.namespace,
+            Ask::Watch { namespace } => namespace,
+        }
+    }
+}
+
 pub struct Session {
     pub account: Account,
     pub key: Vec<u8>,
@@ -194,11 +231,17 @@ pub struct Session {
     pub published: HashMap<RequestId, Track>,
     pub subscribed: HashMap<RequestId, Track>,
     pub watching: HashMap<RequestId, String>,
+    /// The asks refused for want of a grant alone, held until a block's grant covers them.
+    pub waiting: HashMap<RequestId, Ask>,
 }
 
 impl Session {
+    /// Nothing held and nothing waiting: a waiting ask keeps its session as a track does.
     pub fn idle(&self) -> bool {
-        self.published.is_empty() && self.subscribed.is_empty() && self.watching.is_empty()
+        self.published.is_empty()
+            && self.subscribed.is_empty()
+            && self.watching.is_empty()
+            && self.waiting.is_empty()
     }
 }
 
@@ -326,6 +369,7 @@ impl State {
                 published: HashMap::new(),
                 subscribed: HashMap::new(),
                 watching: HashMap::new(),
+                waiting: HashMap::new(),
             },
         );
         self.metrics.sessions.set(self.sessions.len() as i64);
@@ -393,6 +437,68 @@ impl State {
         self.admissible_namespace(&track.namespace) && well_named(&track.name)
     }
 
+    /// An ask the node could take: its namespace, and a track's name, as `admissible` holds
+    /// them.
+    pub fn admissible_ask(&self, ask: &Ask) -> bool {
+        match ask {
+            Ask::Publish { track, .. } | Ask::Subscribe { track, .. } => self.admissible(track),
+            Ask::Watch { namespace } => self.admissible_namespace(namespace),
+        }
+    }
+
+    /// A publish, subscribe or watch, decided on the grant read for it (`None`: no row, or
+    /// none read).
+    pub fn ask(
+        &mut self,
+        id: SessionId,
+        request: RequestId,
+        ask: Ask,
+        grant: Option<&Grant>,
+    ) -> Vec<Effect> {
+        let Some(account) = self.sessions.get(&id).map(|session| session.account) else {
+            return Vec::new();
+        };
+        match ask {
+            Ask::Publish {
+                track,
+                mode,
+                priority,
+            } => {
+                let granted =
+                    grant.is_some_and(|grant| covered(grant, Act::Publish, &track.name, account));
+                self.publish(id, request, track, mode, priority, granted)
+            }
+            Ask::Subscribe { track, from } => {
+                let granted =
+                    grant.is_some_and(|grant| covered(grant, Act::Subscribe, &track.name, account));
+                self.subscribe(id, request, track, from, granted)
+            }
+            Ask::Watch { namespace } => {
+                let patterns = watch_patterns(grant, account);
+                self.watch(id, request, namespace, patterns)
+            }
+        }
+    }
+
+    /// A waiting ask asked again on the grant a block wrote: answered as the client's own
+    /// would be, unless the client withdrew it meanwhile or asks something else under its id.
+    pub fn admit(
+        &mut self,
+        id: SessionId,
+        request: RequestId,
+        ask: Ask,
+        grant: Option<&Grant>,
+    ) -> Vec<Effect> {
+        let still_waiting = self
+            .sessions
+            .get(&id)
+            .is_some_and(|session| session.waiting.get(&request) == Some(&ask));
+        if !still_waiting {
+            return Vec::new();
+        }
+        self.ask(id, request, ask, grant)
+    }
+
     pub fn admissible_namespace(&self, namespace: &str) -> bool {
         let on_this_chain = namespace
             .strip_prefix(&self.chain)
@@ -400,13 +506,93 @@ impl State {
         on_this_chain && namespace.len() <= MAX_NAMESPACE
     }
 
-    /// A request id is free when no live request of the session wears it; 0 is the
-    /// handshake's and no request's.
-    fn request_taken(session: &Session, request: RequestId) -> bool {
+    /// A request id is free when no live request of the session wears it, nor a waiting one
+    /// that asks for something else: one that asks the same is this ask, asked again by a
+    /// re-check. 0 is the handshake's and no request's.
+    fn request_taken(session: &Session, request: RequestId, ask: &Ask) -> bool {
+        let waits_for_another = session
+            .waiting
+            .get(&request)
+            .is_some_and(|held| held != ask);
         request == 0
             || session.published.contains_key(&request)
             || session.subscribed.contains_key(&request)
             || session.watching.contains_key(&request)
+            || waits_for_another
+    }
+
+    /// An ask the node does not take now. Refused for want of a grant alone, it waits, held
+    /// whole until a block's grant covers it; any other refusal is final, and ends the ask if
+    /// it waited.
+    fn unanswered(
+        &mut self,
+        id: SessionId,
+        request: RequestId,
+        ask: Ask,
+        code: Code,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        match code {
+            Code::NotGranted => self.wait(id, request, ask, &mut effects),
+            Code::NoAccount
+            | Code::BadProof
+            | Code::Unknown
+            | Code::Duplicate
+            | Code::TooLarge
+            | Code::Malformed => {
+                self.unwait(id, request, &ask);
+                self.refuse(id, request, code, &mut effects);
+            }
+        }
+        effects
+    }
+
+    /// The ask is held: the client hears `Waiting` when it first waits, and nothing when a
+    /// re-check finds it waiting still.
+    fn wait(&mut self, id: SessionId, request: RequestId, ask: Ask, effects: &mut Vec<Effect>) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let told = session.waiting.get(&request) == Some(&ask);
+        if told {
+            return;
+        }
+        session.waiting.insert(request, ask);
+        self.tell(
+            id,
+            Control::Waiting {
+                request,
+                code: Code::NotGranted,
+            },
+            effects,
+        );
+    }
+
+    /// The ask, if it waited, waits no more: it is answered now, or refused for good.
+    fn unwait(&mut self, id: SessionId, request: RequestId, ask: &Ask) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let this_ask = session.waiting.get(&request) == Some(ask);
+        if this_ask {
+            session.waiting.remove(&request);
+        }
+    }
+
+    /// The client withdrew a waiting ask of `act`'s kind (`Unpublish`, `Unsubscribe`,
+    /// `Unwatch`): it is forgotten, and nothing is said. Whether one waited.
+    fn withdrawn(&mut self, id: SessionId, request: RequestId, act: Act) -> bool {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return false;
+        };
+        let waits = session
+            .waiting
+            .get(&request)
+            .is_some_and(|ask| ask.act() == act);
+        if waits {
+            session.waiting.remove(&request);
+        }
+        waits
     }
 
     /// `granted` is the grant check's answer, read before the lock was taken.
@@ -424,16 +610,21 @@ impl State {
             return effects;
         };
         let account = session.account;
-        let request_taken = Self::request_taken(session, request);
+        let ask = Ask::Publish {
+            track: track.clone(),
+            mode,
+            priority,
+        };
+        let request_taken = Self::request_taken(session, request, &ask);
         let refusal = first_refused(&[
             (!self.admissible(&track), Code::Malformed),
             (request_taken, Code::Malformed),
             (!granted, Code::NotGranted),
         ]);
         if let Some(code) = refusal {
-            self.refuse(id, request, code, &mut effects);
-            return effects;
+            return self.unanswered(id, request, ask, code);
         }
+        self.unwait(id, request, &ask);
         if let Some(held) = self.tracks.get(&track) {
             let same_account = held.by == account;
             if !same_account {
@@ -469,7 +660,8 @@ impl State {
         }
         self.metrics.tracks.set(self.tracks.len() as i64);
         self.tell(id, Control::Published { request, alias }, &mut effects);
-        self.announce(&track, account, mode, true, true, &mut effects);
+        let held = self.tracks.get(&track).expect("inserted above");
+        self.announce(&track, held, true, true, &mut effects);
         effects
     }
 
@@ -480,20 +672,24 @@ impl State {
             .get_mut(&id)
             .and_then(|session| session.published.remove(&request))
         else {
-            self.refuse(id, request, Code::Malformed, &mut effects);
+            let withdrawn = self.withdrawn(id, request, Act::Publish);
+            if !withdrawn {
+                self.refuse(id, request, Code::Malformed, &mut effects);
+            }
             return effects;
         };
         self.end_track(&track, End::TrackEnded, &mut effects);
         effects
     }
 
-    /// A track heard of over the live lane: another node's client publishes it.
+    /// A track heard of over the live lane: another node's client publishes it, at `priority`.
     pub fn remote_announced(
         &mut self,
         peer: PublicKey,
         track: Track,
         by: Account,
         mode: Mode,
+        priority: Priority,
         up: bool,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
@@ -510,8 +706,10 @@ impl State {
         if let Some(held) = self.tracks.get(&track) {
             let local = matches!(held.origin, Origin::Local(_));
             // A peer resyncing says again what we hold: nothing moved.
-            let same =
-                held.origin == Origin::Remote(peer.clone()) && held.by == by && held.mode == mode;
+            let same = held.origin == Origin::Remote(peer.clone())
+                && held.by == by
+                && held.mode == mode
+                && held.priority == priority;
             if local || same {
                 return effects;
             }
@@ -523,7 +721,7 @@ impl State {
             Published {
                 by,
                 mode,
-                priority: live_wire::DEFAULT_PRIORITY,
+                priority,
                 origin: Origin::Remote(peer),
                 request: 0,
                 alias,
@@ -538,7 +736,8 @@ impl State {
         );
         self.aliases.insert(alias, track.clone());
         self.metrics.tracks.set(self.tracks.len() as i64);
-        self.announce(&track, by, mode, true, false, &mut effects);
+        let held = self.tracks.get(&track).expect("inserted above");
+        self.announce(&track, held, true, false, &mut effects);
         effects
     }
 
@@ -609,7 +808,7 @@ impl State {
         }
         self.metrics.subscriptions.set(self.subscriptions() as i64);
         let local = matches!(held.origin, Origin::Local(_));
-        self.announce(track, held.by, held.mode, false, local, effects);
+        self.announce(track, &held, false, local, effects);
     }
 
     /// Every group in flight ends short for a subscriber that leaves it, so no stream of its
@@ -657,16 +856,16 @@ impl State {
     }
 
     /// Watchers of the namespace hear the track came or went; for a local track the members
-    /// hear it too.
+    /// hear it too, with the priority its groups are served at.
     fn announce(
         &self,
         track: &Track,
-        by: Account,
-        mode: Mode,
+        held: &Published,
         up: bool,
         local: bool,
         effects: &mut Vec<Effect>,
     ) {
+        let (by, mode, priority) = (held.by, held.mode, held.priority);
         if let Some(watchers) = self.watches.get(&track.namespace) {
             for watcher in watchers.iter().filter(|watcher| watcher.hears(&track.name)) {
                 self.tell(
@@ -687,6 +886,7 @@ impl State {
                 track: track.clone(),
                 by,
                 mode,
+                priority,
                 up,
             }));
         }
@@ -706,7 +906,11 @@ impl State {
         let Some(session) = self.sessions.get(&id) else {
             return effects;
         };
-        let request_taken = Self::request_taken(session, request);
+        let ask = Ask::Subscribe {
+            track: track.clone(),
+            from,
+        };
+        let request_taken = Self::request_taken(session, request, &ask);
         // One subscriber per session and track: two would share the alias and so the stream.
         let already = session.subscribed.values().any(|held| *held == track);
         let refusal = first_refused(&[
@@ -717,9 +921,9 @@ impl State {
             (already, Code::Duplicate),
         ]);
         if let Some(code) = refusal {
-            self.refuse(id, request, code, &mut effects);
-            return effects;
+            return self.unanswered(id, request, ask, code);
         }
+        self.unwait(id, request, &ask);
         let subscriber = Subscriber::Local {
             session: id,
             request,
@@ -878,7 +1082,10 @@ impl State {
             .get_mut(&id)
             .and_then(|session| session.subscribed.remove(&request))
         else {
-            self.refuse(id, request, Code::Malformed, &mut effects);
+            let withdrawn = self.withdrawn(id, request, Act::Subscribe);
+            if !withdrawn {
+                self.refuse(id, request, Code::Malformed, &mut effects);
+            }
             return effects;
         };
         self.drop_subscriber(
@@ -1018,7 +1225,10 @@ impl State {
         let Some(session) = self.sessions.get(&id) else {
             return effects;
         };
-        let request_taken = Self::request_taken(session, request);
+        let ask = Ask::Watch {
+            namespace: namespace.clone(),
+        };
+        let request_taken = Self::request_taken(session, request, &ask);
         // One watcher per session and namespace: a re-check finds it by the session.
         let already = session.watching.values().any(|held| *held == namespace);
         let refusal = first_refused(&[
@@ -1028,9 +1238,9 @@ impl State {
             (already, Code::Duplicate),
         ]);
         if let Some(code) = refusal {
-            self.refuse(id, request, code, &mut effects);
-            return effects;
+            return self.unanswered(id, request, ask, code);
         }
+        self.unwait(id, request, &ask);
         let watcher = Watcher {
             session: id,
             request,
@@ -1094,7 +1304,10 @@ impl State {
             .get_mut(&id)
             .and_then(|session| session.watching.remove(&request))
         else {
-            self.refuse(id, request, Code::Malformed, &mut effects);
+            let withdrawn = self.withdrawn(id, request, Act::Watch);
+            if !withdrawn {
+                self.refuse(id, request, Code::Malformed, &mut effects);
+            }
             return effects;
         };
         self.drop_watcher(&namespace, id);
@@ -1486,9 +1699,7 @@ impl State {
 
     /// Every request of a session that lives in `program`'s rooms, for a grant re-check.
     pub fn requests_in(&self, program: &str) -> Vec<(SessionId, RequestId, Track, Act)> {
-        let in_program = |namespace: &str| {
-            super::grants::place(namespace).is_some_and(|place| place.program == program)
-        };
+        let in_program = |namespace: &str| of_program(namespace, program);
         let mut found = Vec::new();
         for (id, session) in &self.sessions {
             for (request, track) in &session.published {
@@ -1514,6 +1725,27 @@ impl State {
         found
     }
 
+    /// Every ask waiting in `program`'s rooms, the publications first: a re-check asks them
+    /// again in this order, so a waiting subscription to a waiting publication finds it up.
+    pub fn waiting_in(&self, program: &str) -> Vec<(SessionId, RequestId, Ask)> {
+        let mut found: Vec<(SessionId, RequestId, Ask)> = self
+            .sessions
+            .iter()
+            .flat_map(|(id, session)| {
+                session
+                    .waiting
+                    .iter()
+                    .filter(|(_, ask)| of_program(ask.namespace(), program))
+                    .map(|(request, ask)| (*id, *request, ask.clone()))
+            })
+            .collect();
+        found.sort_by_key(|(_, _, ask)| {
+            let publishes = ask.act() == Act::Publish;
+            !publishes
+        });
+        found
+    }
+
     /// What a peer whose control stream just opened must hear to be in step: every local track
     /// up, and our asks for its tracks that local subscribers wait on.
     pub fn resync(&self, peer: &PublicKey) -> Vec<Forward> {
@@ -1526,6 +1758,7 @@ impl State {
                     track: track.clone(),
                     by: held.by,
                     mode: held.mode,
+                    priority: held.priority,
                     up: true,
                 }),
                 Origin::Remote(theirs) if theirs == peer => {
@@ -1558,6 +1791,11 @@ impl State {
         }
         effects
     }
+}
+
+/// Whether `namespace` is one of `program`'s rooms.
+fn of_program(namespace: &str, program: &str) -> bool {
+    super::grants::place(namespace).is_some_and(|place| place.program == program)
 }
 
 /// What one stream object is to the cached group.
@@ -1691,6 +1929,70 @@ mod tests {
                 Effect::Send(..) => None,
             })
             .collect()
+    }
+
+    /// What a step tells the sessions, without the data or the lane.
+    fn told(effects: Vec<Effect>) -> Vec<Control> {
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Send(_, Out::Control(control)) => Some(control),
+                Effect::Send(..) | Effect::Lane(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_re_check_of_an_ask_the_client_withdrew_answers_nothing_under_its_id() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let alice = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let doc = Track {
+                namespace: "net#00000000/chat/room".into(),
+                name: "doc".into(),
+            };
+            let publish = Ask::Publish {
+                track: doc.clone(),
+                mode: Mode::Stream,
+                priority: 128,
+            };
+            let waits = Control::Waiting {
+                request: 1,
+                code: Code::NotGranted,
+            };
+            assert_eq!(
+                told(state.ask(alice, 1, publish.clone(), None)),
+                std::slice::from_ref(&waits)
+            );
+            assert!(
+                !state.session(alice).expect("open").idle(),
+                "a waiting ask keeps its session"
+            );
+            // the id is taken while it waits, for anything else
+            let subscribe = Ask::Subscribe {
+                track: doc,
+                from: Start::Next,
+            };
+            let malformed = Control::Refused {
+                request: 1,
+                code: Code::Malformed,
+            };
+            assert_eq!(
+                told(state.ask(alice, 1, subscribe.clone(), None)),
+                [malformed]
+            );
+            assert_eq!(told(state.unpublish(alice, 1)), []);
+            // the id asks something else now, and waits too
+            assert_eq!(told(state.ask(alice, 1, subscribe.clone(), None)), [waits]);
+            // a re-check that read the withdrawn publish's grant comes too late for it
+            let open = Grant::all();
+            assert_eq!(told(state.admit(alice, 1, publish, Some(&open))), []);
+            let session = state.session(alice).expect("open");
+            assert_eq!(session.waiting.get(&1), Some(&subscribe));
+            assert!(session.published.is_empty());
+        });
     }
 
     #[test]

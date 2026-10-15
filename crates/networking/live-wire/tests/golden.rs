@@ -159,6 +159,10 @@ fn controls() -> Vec<Control> {
             request: 1,
             code: Code::Malformed,
         },
+        Control::Waiting {
+            request: 1,
+            code: Code::NotGranted,
+        },
         Control::GoAway { in_ms: 500 },
     ]
 }
@@ -170,6 +174,7 @@ fn forwards() -> Vec<Forward> {
             track: track.clone(),
             by: 42,
             mode: Mode::Datagram,
+            priority: 7,
             up: false,
         },
         Forward::Subscribe {

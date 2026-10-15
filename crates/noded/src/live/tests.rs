@@ -357,11 +357,15 @@ impl Client {
     }
 
     async fn publish(&mut self, request: u64, track: Track, mode: Mode) -> u32 {
+        self.publish_at(request, track, mode, 128).await
+    }
+
+    async fn publish_at(&mut self, request: u64, track: Track, mode: Mode, priority: u8) -> u32 {
         self.send(Control::Publish {
             request,
             track,
             mode,
-            priority: 128,
+            priority,
         })
         .await;
         match self.recv().await {
@@ -855,7 +859,7 @@ fn the_same_session_runs_over_the_websocket_door_without_datagrams() {
 // ---- (e) grants ----
 
 #[test]
-fn a_grant_a_block_removes_ends_the_request_and_a_room_without_one_refuses() {
+fn a_grant_a_block_removes_ends_the_request_and_a_room_without_one_waits() {
     runtime::Runner::default().start(|context| async move {
         let ledger = Arc::new(Ledger::default());
         let alice = seated(&ledger, 11, 42);
@@ -880,7 +884,7 @@ fn a_grant_a_block_removes_ends_the_request_and_a_room_without_one_refuses() {
         .await;
         assert_eq!(
             bob.recv().await,
-            Control::Refused {
+            Control::Waiting {
                 request: 2,
                 code: Code::NotGranted
             }
@@ -957,6 +961,228 @@ fn a_grant_a_block_moves_while_a_request_reads_it_is_read_again() {
     });
 }
 
+#[test]
+fn an_ask_a_room_does_not_grant_yet_waits_and_the_block_that_grants_it_answers_it() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        let carol = seated(&ledger, 13, 44);
+        let node = node(context, 1, ledger.clone());
+        let doc = track("room", "doc");
+
+        // bob asks for alice's track before she publishes it, and carol watches the room
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        bob.send(Control::Subscribe {
+            request: 1,
+            track: doc.clone(),
+            from: Start::Latest,
+        })
+        .await;
+        let waits = |request| Control::Waiting {
+            request,
+            code: Code::NotGranted,
+        };
+        assert_eq!(bob.recv().await, waits(1));
+        let (mut carol, _) = Client::open(&node, &carol).await;
+        carol
+            .send(Control::Watch {
+                request: 1,
+                namespace: namespace("room"),
+            })
+            .await;
+        assert_eq!(carol.recv().await, waits(1));
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        alice
+            .send(Control::Publish {
+                request: 1,
+                track: doc.clone(),
+                mode: Mode::Stream,
+                priority: 128,
+            })
+            .await;
+        assert_eq!(alice.recv().await, waits(1));
+
+        // the block that opens the room: each ask is answered as asked, no client asking again
+        ledger.grant("room", None, Grant::all());
+        node.relay.invalidate(&wrote_grants());
+        assert!(matches!(
+            alice.recv().await,
+            Control::Published { request: 1, .. }
+        ));
+        let Control::Subscribed {
+            request: 1, by: 42, ..
+        } = bob.recv().await
+        else {
+            panic!("bob's waiting subscription finds alice's track up");
+        };
+        assert_eq!(
+            carol.recv().await,
+            Control::Announce {
+                request: 1,
+                track: doc,
+                by: 42,
+                mode: Mode::Stream,
+                up: true
+            }
+        );
+        assert_eq!(
+            alice.recv().await,
+            Control::Subscribers {
+                request: 1,
+                count: 1
+            }
+        );
+    });
+}
+
+#[test]
+fn a_waiting_ask_withdrawn_is_forgotten_and_one_admitted_to_no_track_ends_unknown() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let node = node(context, 1, ledger.clone());
+        let waits = |request| Control::Waiting {
+            request,
+            code: Code::NotGranted,
+        };
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        alice
+            .send(Control::Publish {
+                request: 1,
+                track: track("room", "doc"),
+                mode: Mode::Stream,
+                priority: 128,
+            })
+            .await;
+        assert_eq!(alice.recv().await, waits(1));
+        // withdrawn: nothing is said, and the id is free again
+        alice.send(Control::Unpublish { request: 1 }).await;
+        alice
+            .send(Control::Subscribe {
+                request: 1,
+                track: track("room", "nobody"),
+                from: Start::Next,
+            })
+            .await;
+        assert_eq!(alice.recv().await, waits(1));
+        alice
+            .send(Control::Publish {
+                request: 2,
+                track: track("room", "notes"),
+                mode: Mode::Stream,
+                priority: 128,
+            })
+            .await;
+        assert_eq!(alice.recv().await, waits(2));
+
+        ledger.grant("room", None, Grant::all());
+        node.relay.invalidate(&wrote_grants());
+        assert!(
+            matches!(alice.recv().await, Control::Published { request: 2, .. }),
+            "the withdrawn publication is not answered"
+        );
+        assert_eq!(
+            alice.recv().await,
+            Control::Refused {
+                request: 1,
+                code: Code::Unknown
+            },
+            "admitted to a track no one publishes, the subscription ends"
+        );
+    });
+}
+
+#[test]
+fn a_waiting_ask_a_block_does_not_cover_is_told_nothing_more() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        let node = node(context, 1, ledger.clone());
+        let waits = |request| Control::Waiting {
+            request,
+            code: Code::NotGranted,
+        };
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        alice
+            .send(Control::Publish {
+                request: 1,
+                track: track("other", "doc"),
+                mode: Mode::Stream,
+                priority: 128,
+            })
+            .await;
+        assert_eq!(alice.recv().await, waits(1));
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        bob.send(Control::Subscribe {
+            request: 1,
+            track: track("room", "doc"),
+            from: Start::Next,
+        })
+        .await;
+        assert_eq!(bob.recv().await, waits(1));
+
+        // a block opens `room` alone; the re-check asks the publications again first, so
+        // alice's is asked again, and still not covered, before bob's subscription is answered
+        ledger.grant("room", None, Grant::all());
+        node.relay.invalidate(&wrote_grants());
+        assert_eq!(
+            bob.recv().await,
+            Control::Refused {
+                request: 1,
+                code: Code::Unknown
+            }
+        );
+        ledger.grant("other", None, Grant::all());
+        node.relay.invalidate(&wrote_grants());
+        assert!(
+            matches!(alice.recv().await, Control::Published { request: 1, .. }),
+            "the re-check that left the ask waiting said nothing"
+        );
+    });
+}
+
+#[test]
+fn an_account_pattern_lets_each_account_publish_its_own_name_alone() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        ledger.grant(
+            "room",
+            None,
+            Grant {
+                publish: vec!["echo/{account}".into()],
+                subscribe: vec!["*".into()],
+            },
+        );
+        let node = node(context, 1, ledger);
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        alice
+            .publish(1, track("room", "echo/42"), Mode::Stream)
+            .await;
+        alice
+            .send(Control::Publish {
+                request: 2,
+                track: track("room", "echo/43"),
+                mode: Mode::Stream,
+                priority: 128,
+            })
+            .await;
+        assert_eq!(
+            alice.recv().await,
+            Control::Waiting {
+                request: 2,
+                code: Code::NotGranted
+            },
+            "another account's name is not hers"
+        );
+    });
+}
+
 // ---- (f) two nodes over the live lane ----
 
 #[test]
@@ -981,7 +1207,7 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
         .await;
 
         let (mut alice, _) = Client::open(&first, &alice).await;
-        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
+        let alias = alice.publish_at(1, doc.clone(), Mode::Stream, 3).await;
         assert_eq!(
             bob.recv().await,
             Control::Announce {
@@ -1008,6 +1234,7 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
         let (header, objects, complete) = bob.received_group().await;
         assert!(complete, "a finished group crosses as complete");
         assert_eq!(header.group, 1);
+        assert_eq!(header.priority, 3, "the track's priority crossed with it");
         assert_eq!(objects, vec![b"across".to_vec(), b"nodes".to_vec()]);
 
         alice.send(Control::Unpublish { request: 1 }).await;

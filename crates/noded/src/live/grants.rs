@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use abi::live::{self, Grant};
 use abi::{Origin, role::identity};
 use host::Layer;
-use live_wire::{Account, pattern_covers};
+use live_wire::{Account, for_account, pattern_covers};
 
 use crate::Shared;
 
@@ -105,14 +105,31 @@ pub fn place(namespace: &str) -> Option<Place<'_>> {
     })
 }
 
-/// Whether the grant lets its holder `act` on the track `name`.
-pub fn covered(grant: &Grant, act: Act, name: &str) -> bool {
+/// Whether the grant lets `account` `act` on the track `name`, each pattern read as it reads
+/// for that account (`{account}` its number).
+pub fn covered(grant: &Grant, act: Act, name: &str, account: Account) -> bool {
     let patterns = match act {
         Act::Publish => &grant.publish,
         Act::Subscribe => &grant.subscribe,
         Act::Watch => return !grant.subscribe.is_empty(),
     };
-    patterns.iter().any(|pattern| pattern_covers(pattern, name))
+    patterns
+        .iter()
+        .any(|pattern| pattern_covers(&for_account(pattern, account), name))
+}
+
+/// The subscribe patterns `account` hears a room's announces through, as they read for it,
+/// `None` when it may not watch.
+pub fn watch_patterns(grant: Option<&Grant>, account: Account) -> Option<Vec<String>> {
+    let grant = grant?;
+    let may_watch = covered(grant, Act::Watch, "*", account);
+    may_watch.then(|| {
+        grant
+            .subscribe
+            .iter()
+            .map(|pattern| for_account(pattern, account))
+            .collect()
+    })
 }
 
 /// The chain's grants, read per request, and a count of the blocks that moved them so a
@@ -188,12 +205,34 @@ mod tests {
             publish: vec!["presence/*".into()],
             subscribe: vec!["*".into()],
         };
-        assert!(covered(&grant, Act::Publish, "presence/42"));
-        assert!(!covered(&grant, Act::Publish, "doc"));
-        assert!(covered(&grant, Act::Subscribe, "doc"));
-        assert!(covered(&grant, Act::Watch, "*"));
-        assert!(!covered(&Grant::default(), Act::Subscribe, "doc"));
-        assert!(!covered(&Grant::default(), Act::Watch, "*"));
+        assert!(covered(&grant, Act::Publish, "presence/42", 42));
+        assert!(!covered(&grant, Act::Publish, "doc", 42));
+        assert!(covered(&grant, Act::Subscribe, "doc", 42));
+        assert!(covered(&grant, Act::Watch, "*", 42));
+        assert!(!covered(&Grant::default(), Act::Subscribe, "doc", 42));
+        assert!(!covered(&Grant::default(), Act::Watch, "*", 42));
+    }
+
+    #[test]
+    fn an_account_pattern_covers_its_owner_and_no_one_else() {
+        let room = Grant {
+            publish: vec!["echo/{account}".into(), "board/{account}/*".into()],
+            subscribe: vec!["*".into()],
+        };
+        assert!(covered(&room, Act::Publish, "echo/42", 42));
+        assert!(covered(&room, Act::Publish, "board/42/0b", 42));
+        assert!(!covered(&room, Act::Publish, "echo/42", 13));
+        assert!(!covered(&room, Act::Publish, "board/42/0b", 13));
+        assert!(covered(&room, Act::Subscribe, "echo/42", 13));
+        let inbox = Grant {
+            publish: Vec::new(),
+            subscribe: vec!["inbox/{account}".into(), "lobby".into()],
+        };
+        assert_eq!(
+            watch_patterns(Some(&inbox), 42),
+            Some(vec!["inbox/42".to_owned(), "lobby".to_owned()]),
+            "a watcher hears its own names alone"
+        );
     }
 
     #[test]
