@@ -100,9 +100,33 @@ pub struct Roles {
     pub identity: ProgramId,
     pub blobs: ProgramId,
     pub awaits: ProgramId,
-    /// Holds the lane table halo serves: each lane's wire id, class cap and
-    /// whether it is served.
+    /// Holds the lane table halo serves: each lane's wire id, class cap,
+    /// whether it is served and whether it is pinned.
     pub halo: ProgramId,
+}
+
+impl Roles {
+    /// Every role by its name, with the program bound to it, in field order.
+    /// The pattern names every field, so a role added to `Roles` fails the
+    /// build here until it is named.
+    pub fn named(&self) -> [(&'static str, &ProgramId); 6] {
+        let Roles {
+            programs,
+            validators,
+            identity,
+            blobs,
+            awaits,
+            halo,
+        } = self;
+        [
+            ("programs", programs),
+            ("validators", validators),
+            ("identity", identity),
+            ("blobs", blobs),
+            ("awaits", awaits),
+            ("halo", halo),
+        ]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
@@ -732,8 +756,9 @@ pub mod role {
     }
 
     /// The lanes halo carries between members: each named lane's wire id, the
-    /// class its streams are served at most, and whether it is served. Only
-    /// the validators' vote changes the table.
+    /// class its streams are served at most, whether it is served and whether
+    /// it is pinned. Only the validators' vote changes the table, and no vote
+    /// pauses or closes a pinned lane.
     pub mod halo {
         use crate::{BorshDeserialize, BorshSerialize};
 
@@ -791,6 +816,10 @@ pub mod role {
             pub id: LaneId,
             pub cap: Class,
             pub enabled: bool,
+            /// Set at founding and never changed: a pinned lane is served for
+            /// the network's life, so a lane a node needs to apply blocks
+            /// cannot be voted away from under it.
+            pub pinned: bool,
             /// The block that opened it.
             pub since: u64,
         }
@@ -799,15 +828,17 @@ pub mod role {
         /// is refused.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Op {
-            /// Lists `name` at the next free id, enabled.
+            /// Lists `name` at the next free id, enabled and not pinned.
             Open { name: String, cap: Class },
             /// Changes the cap and whether the lane is served; the id stays.
+            /// A pinned lane refuses `enabled: false` (`invalid_input`).
             Set {
                 name: String,
                 cap: Class,
                 enabled: bool,
             },
-            /// Unlists `name`; its id is never handed out again.
+            /// Unlists `name`; its id is never handed out again. A pinned lane
+            /// refuses it (`invalid_input`).
             Close { name: String },
         }
 
@@ -826,10 +857,18 @@ pub mod role {
             Lane(Option<Lane>),
         }
 
+        /// A lane the network is founded with.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Founded {
+            pub name: String,
+            pub cap: Class,
+            pub pinned: bool,
+        }
+
         /// The founding lanes, listed in order from id 0.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct Genesis {
-            pub lanes: Vec<(String, Class)>,
+            pub lanes: Vec<Founded>,
         }
     }
 }
@@ -877,6 +916,47 @@ pub mod live {
                 subscribe: vec!["*".into()],
             }
         }
+
+        /// Whether `account` may publish the track `name`.
+        pub fn publishes(&self, name: &str, account: AccountNumber) -> bool {
+            covers(&self.publish, name, account)
+        }
+
+        /// Whether `account` may subscribe to the track `name`, and hears it when it watches
+        /// the room.
+        pub fn subscribes(&self, name: &str, account: AccountNumber) -> bool {
+            covers(&self.subscribe, name, account)
+        }
+    }
+
+    /// What a grant pattern says for the account that asks: [`ACCOUNT`] in it is the account's
+    /// number in decimal, so one row binds each name to its own account (`echo/{account}`).
+    pub const ACCOUNT: &str = "{account}";
+
+    /// `pattern` as it reads for `account`: each [`ACCOUNT`] written as its number.
+    pub fn for_account(pattern: &str, account: AccountNumber) -> String {
+        pattern.replace(ACCOUNT, &account.to_string())
+    }
+
+    /// A grant pattern, as it reads for the account that asks ([`for_account`]), against a
+    /// track name: `*` matches every name, `<prefix>/*` every name under the prefix, anything
+    /// else exactly.
+    pub fn pattern_covers(pattern: &str, name: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+        match pattern.strip_suffix("/*") {
+            Some(prefix) => name
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/')),
+            None => pattern == name,
+        }
+    }
+
+    fn covers(patterns: &[String], name: &str, account: AccountNumber) -> bool {
+        patterns
+            .iter()
+            .any(|pattern| pattern_covers(&for_account(pattern, account), name))
     }
 }
 
@@ -977,6 +1057,79 @@ mod tests {
                 publish: vec![],
                 subscribe: vec![]
             }
+        );
+    }
+
+    #[test]
+    fn a_pattern_is_everything_a_prefix_or_one_name() {
+        use live::pattern_covers;
+        assert!(pattern_covers("*", "anything/at/all"));
+        assert!(pattern_covers("presence/*", "presence/42"));
+        assert!(pattern_covers("presence/*", "presence/a/b"));
+        assert!(!pattern_covers("presence/*", "presence"));
+        assert!(!pattern_covers("presence/*", "presencex/42"));
+        assert!(pattern_covers("doc", "doc"));
+        assert!(!pattern_covers("doc", "doc/1"));
+    }
+
+    #[test]
+    fn an_account_pattern_is_the_asking_accounts_own() {
+        use live::{for_account, pattern_covers};
+        let mine = for_account("echo/{account}", 42);
+        assert_eq!(mine, "echo/42");
+        assert!(pattern_covers(&mine, "echo/42"));
+        assert!(!pattern_covers(&mine, "echo/43"));
+        let under = for_account("ask/{account}/*", 42);
+        assert!(pattern_covers(&under, "ask/42/7/0b"));
+        assert!(!pattern_covers(&under, "ask/43/42/0b"));
+        assert!(!pattern_covers(
+            &for_account("ask/{account}/*", 4),
+            "ask/42/7"
+        ));
+        assert_eq!(for_account("doc", 42), "doc");
+    }
+
+    #[test]
+    fn a_grant_decides_each_side_by_its_own_patterns_as_they_read_for_the_account() {
+        let room = live::Grant {
+            publish: vec!["echo/{account}".into(), "board/{account}/*".into()],
+            subscribe: vec!["lobby".into(), "inbox/{account}".into()],
+        };
+        assert!(room.publishes("echo/42", 42));
+        assert!(room.publishes("board/42/0b", 42));
+        assert!(!room.publishes("echo/42", 13));
+        assert!(!room.publishes("lobby", 42));
+        assert!(room.subscribes("lobby", 13));
+        assert!(room.subscribes("inbox/13", 13));
+        assert!(!room.subscribes("inbox/42", 13));
+        assert!(!room.subscribes("echo/13", 13));
+        assert!(!live::Grant::default().subscribes("lobby", 13));
+        assert!(live::Grant::all().publishes("any/name", 13));
+    }
+
+    #[test]
+    fn every_role_is_named_in_field_order() {
+        let roles = Roles {
+            programs: "r".into(),
+            validators: "v".into(),
+            identity: "i".into(),
+            blobs: "b".into(),
+            awaits: "a".into(),
+            halo: "h".into(),
+        };
+        let named = roles
+            .named()
+            .map(|(role, program)| (role, program.as_str()));
+        assert_eq!(
+            named,
+            [
+                ("programs", "r"),
+                ("validators", "v"),
+                ("identity", "i"),
+                ("blobs", "b"),
+                ("awaits", "a"),
+                ("halo", "h"),
+            ]
         );
     }
 

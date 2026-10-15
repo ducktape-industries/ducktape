@@ -194,7 +194,8 @@ impl ClientCertVerifier for Admit {
 }
 
 /// A server on this node key's certificate and one ALPN that asks no client for a certificate,
-/// for a service beside halo on a socket of its own; its clients pin the node key.
+/// for a service beside halo on a socket of its own; its clients pin the node key. It keeps
+/// halo's idle timeout and keep-alive.
 pub fn open_server(identity: &PrivateKey, alpn: &[u8]) -> Result<quinn::ServerConfig, Error> {
     let certified = certified(identity)?;
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider())
@@ -204,7 +205,9 @@ pub fn open_server(identity: &PrivateKey, alpn: &[u8]) -> Result<quinn::ServerCo
     crypto.alpn_protocols = vec![alpn.to_vec()];
     let crypto =
         QuicServerConfig::try_from(crypto).map_err(|error| Error::Quic(error.to_string()))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    server.transport_config(transport());
+    Ok(server)
 }
 
 fn transport() -> Arc<quinn::TransportConfig> {

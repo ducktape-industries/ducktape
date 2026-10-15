@@ -33,6 +33,7 @@ fn node(context: &runtime::Context, seed: u64, validator: bool) -> (Node, Arc<Ha
         id: 0,
         cap: Class::Critical,
         enabled: true,
+        pinned: false,
         since: 0,
     }]);
     let seat = Seat {

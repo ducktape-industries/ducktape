@@ -229,14 +229,38 @@ async fn start<E: Context>(
                 udp: listen.halo,
             },
         )
-        .map_err(|error| Error::Tls(error.to_string()))?,
+        .map_err(|error| Error::Address(format!("--halo {}: {error}", listen.halo)))?,
     );
     halo.seat(halo_seats(&node, &network).await?);
-    halo.plane().lanes(halo_lanes(&node).await?);
+    tabled(&halo, halo_lanes(&node).await?, tip.height);
     let blobs =
         blob::service::Service::start(halo.clone(), node.host().blobs().clone(), bundles(&node)?)?;
-
     let member_cap = node.member_cap()?;
+    let identity_role = node.host().roles().identity.clone();
+    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
+
+    // the live door binds its socket here, beside halo's, so a socket in use fails the start
+    // before consensus does any work
+    let (shutdown, _) = watch::channel(false);
+    let door = listen.live.map(|at| at.to_string()).unwrap_or_default();
+    let live = live::Relay::start(
+        context.child("live"),
+        live::Network {
+            id: live::Network::chain_id(
+                &descriptor.network,
+                &descriptor.genesis_block().digest().0,
+            ),
+            genesis: descriptor.genesis_block().digest().0,
+            identity: identity_role,
+        },
+        Arc::new(node.clone()),
+        halo.clone(),
+        &identity,
+        listen.live,
+        shutdown.subscribe(),
+    )
+    .map_err(|error| Error::Address(format!("--live {door}: {error}")))?;
+
     let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
         Mesh::start(
             context.child("mesh"),
@@ -254,7 +278,6 @@ async fn start<E: Context>(
         roster.seat(*epoch, validators);
     }
 
-    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
     let (inbox, deliveries) = mpsc::unbounded();
     let chain = Participant {
         node: node.clone(),
@@ -295,24 +318,6 @@ async fn start<E: Context>(
         "the node is up"
     );
 
-    let (shutdown, _) = watch::channel(false);
-    let live = live::Relay::start(
-        context.child("live"),
-        live::Network {
-            id: live::Network::chain_id(
-                &descriptor.network,
-                &descriptor.genesis_block().digest().0,
-            ),
-            genesis: descriptor.genesis_block().digest().0,
-            identity: node.lock().await.host().roles().identity.clone(),
-        },
-        Arc::new(node.clone()),
-        halo.clone(),
-        &identity,
-        listen.live,
-        shutdown.subscribe(),
-    )
-    .map_err(|error| Error::Tls(error.to_string()))?;
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         node,
@@ -460,9 +465,23 @@ async fn halo_lanes<E: Context>(node: &Node<E>) -> Result<Vec<Lane>> {
     Ok(lanes)
 }
 
+/// Whether a block's writes change what `program` answers: it wrote the program's state, or the
+/// host swapped its code (a write under `$programs` at the program's id).
+fn rewrites(writes: &state::Writes, program: &str) -> bool {
+    let state = writes
+        .programs
+        .get(program)
+        .is_some_and(|written| !written.is_empty());
+    let code = writes
+        .programs
+        .get(host::PROGRAMS)
+        .is_some_and(|written| written.contains_key(program.as_bytes()));
+    state || code
+}
+
 async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
     match halo_lanes(node).await {
-        Ok(lanes) => daemon.halo.plane().lanes(lanes),
+        Ok(lanes) => tabled(&daemon.halo, lanes, height),
         Err(error) => tracing::warn!(
             target: "ducktape::halo",
             event = "halo_untabled",
@@ -472,6 +491,35 @@ async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u6
             "halo keeps its lane table: the node could not read the halo program's lanes"
         ),
     }
+}
+
+/// Has halo serve `lanes`, the halo role's table at `height`, from now on, and says so.
+fn tabled(halo: &Halo, lanes: Vec<Lane>, height: u64) {
+    tracing::info!(
+        target: "ducktape::halo",
+        event = "halo_retabled",
+        height,
+        lanes = listing(&lanes),
+        "halo serves the halo role's lane table"
+    );
+    halo.plane().lanes(lanes);
+}
+
+/// The lane table as one log field, in id order: `name#id cap`, then `paused` or `served`, then
+/// `pinned` for a pinned lane.
+fn listing(lanes: &[Lane]) -> String {
+    let lane = |lane: &Lane| {
+        let served = match lane.enabled {
+            true => "served",
+            false => "paused",
+        };
+        let pinned = match lane.pinned {
+            true => " pinned",
+            false => "",
+        };
+        format!("{}#{} {:?} {served}{pinned}", lane.name, lane.id, lane.cap)
+    };
+    lanes.iter().map(lane).collect::<Vec<_>>().join(", ")
 }
 
 async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
@@ -672,16 +720,8 @@ async fn applied<E: Context>(
             daemon.record(&node, block, ran, Some(receipts)).await?;
             daemon.publish(&applied);
             let roles = node.host().roles();
-            let members_written = applied
-                .writes
-                .programs
-                .get(&roles.validators)
-                .is_some_and(|writes| !writes.is_empty());
-            let lanes_written = applied
-                .writes
-                .programs
-                .get(&roles.halo)
-                .is_some_and(|writes| !writes.is_empty());
+            let members_written = rewrites(&applied.writes, &roles.validators);
+            let lanes_written = rewrites(&applied.writes, &roles.halo);
             if lanes_written {
                 retable_halo(daemon, &node, block.height).await;
             }
@@ -732,4 +772,46 @@ async fn applied<E: Context>(
         .send(due.iter().chain(&receipted).map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{listing, rewrites};
+
+    #[test]
+    fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
+        let writes = |program: &str, key: &[u8]| state::Writes {
+            programs: BTreeMap::from([(
+                program.to_owned(),
+                BTreeMap::from([(key.to_vec(), Some(vec![1]))]),
+            )]),
+        };
+        assert!(rewrites(&writes("halo", b"l/x"), "halo"));
+        assert!(rewrites(&writes(host::PROGRAMS, b"halo"), "halo"));
+        assert!(!rewrites(&writes(host::PROGRAMS, b"blobs"), "halo"));
+        assert!(!rewrites(&writes("blobs", b"halo"), "halo"));
+        assert!(!rewrites(&state::Writes::default(), "halo"));
+    }
+
+    #[test]
+    fn the_table_reads_as_one_line() {
+        let lane = |name: &str, id, enabled, pinned| halo::Lane {
+            name: name.into(),
+            id,
+            cap: halo::Class::Critical,
+            enabled,
+            pinned,
+            since: 0,
+        };
+        let table = [
+            lane("a/blobs", 0, true, true),
+            lane("a/live", 1, false, false),
+        ];
+        assert_eq!(
+            listing(&table),
+            "a/blobs#0 Critical served pinned, a/live#1 Critical paused"
+        );
+    }
 }

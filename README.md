@@ -64,7 +64,7 @@ validators = "valset"         # seats each epoch's validators; runs membership a
 identity = "identity"         # resolves a key or a program to its account
 blobs = "blobs"               # records each bundle of blobs put and which validators hold it
 awaits = "awaits"             # keeps the tickets of frames that await a call, and hands each its answer
-halo = "halo"                 # holds the lane table halo serves: each lane's wire id, class cap and whether it is served
+halo = "halo"                 # holds the lane table halo serves: each lane's wire id, class cap, whether it is served and whether it is pinned
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
@@ -94,7 +94,7 @@ code = "awaits.wasm"
 [[programs]]
 id = "halo"
 code = "halo.wasm"
-params = "halo.params"        # the founding lanes, in order from id 0
+params = "halo.params"        # the founding lanes, in order from id 0, each pinned or not
 
 [[programs]]
 id = "ping"
@@ -225,12 +225,15 @@ without it the node sends as fast as the path allows.
 
 Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). The halo
 role's program holds the lane table: each lane's name, the id its streams and datagrams carry
-on the wire, the highest class it is served at, and whether it is served. A node reads the
-table at start and again after any block that writes it, so every node changes lanes at the
-same block. Only the validators' vote changes it (`ducktape vote halo <op>`, an
-`abi::role::halo::Op`): it opens a lane at the next id, sets a lane's class or pauses it, or
-closes one; an id is never handed out twice. A stream is served at the lower of the class it
-asks and its lane's cap. A stream already open when its lane is paused or closed runs on.
+on the wire, the highest class it is served at, whether it is served, and whether it is pinned.
+A node reads the table at start and again after any block that writes it or swaps the halo
+program's code, so every node changes lanes at the same block. Only the validators' vote
+changes it (`ducktape vote halo <op>`, an `abi::role::halo::Op`): it opens a lane at the next
+id, sets a lane's class or pauses it, or closes one; an id is never handed out twice. A lane is pinned only at founding, and no
+vote pauses or closes a pinned lane. Pin `ducktape/blobs`: a node fetches the blobs a block
+reads over it, so a vote that paused it would cut a node off from the very block that undoes
+the vote. A stream is served at the lower of the class it asks and its lane's cap. A stream
+already open when its lane is paused or closed runs on.
 
 Live tracks: the relay in every node (`crates/noded/src/live/`) lets a desktop
 client publish and subscribe to tracks of a room off consensus, in what the

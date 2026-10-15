@@ -24,3 +24,4 @@ x509-parser = { workspace = true }
 [dev-dependencies]
 halo = { workspace = true, features = ["sim"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = "0.3"

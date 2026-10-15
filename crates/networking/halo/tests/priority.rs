@@ -40,6 +40,7 @@ async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Durati
         id: 0,
         cap: Class::Critical,
         enabled: true,
+        pinned: false,
         since: 0,
     }];
     serving.lanes(table.clone());
