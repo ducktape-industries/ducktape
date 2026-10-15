@@ -2,7 +2,8 @@
 //! latest group each keeps for a late joiner, and every session's requests. Each step decides
 //! under one lock and returns what to send; the sessions' outlets carry it.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -19,10 +20,6 @@ use super::session::{Out, Outlet};
 
 /// A refusal for an object is told once per track per this long; the rest are dropped quiet.
 const REFUSAL_PAUSE: Duration = Duration::from_secs(1);
-/// Groups one publisher may have open on a track at once: enough for a skip-ahead and for two
-/// group streams whose readers race, few enough that no subscriber holds many streams. Past it
-/// the oldest ends short for the subscribers, and its late end is nothing.
-pub(super) const MAX_OPEN_INCOMING: usize = 4;
 
 pub type SessionId = u64;
 
@@ -122,7 +119,6 @@ pub struct Cached {
 
 /// A group the publisher is writing now.
 struct Incoming {
-    group: u64,
     bytes: usize,
     /// An object of it was refused or dropped: the subscribers heard it end short, and the
     /// rest of its objects are dropped quiet, so no one sees a hole as a complete group.
@@ -143,30 +139,22 @@ pub struct Published {
     pub node_counts: HashMap<PublicKey, u32>,
     /// The count the publisher was last told, so it hears every change once.
     told: u32,
-    /// The groups being written, oldest first, at most `MAX_OPEN_INCOMING`.
-    incoming: Vec<Incoming>,
+    /// The groups being written, by group: each leaves when its own end arrives, so a group
+    /// begun after it neither hides its end nor makes its objects stale.
+    incoming: BTreeMap<u64, Incoming>,
     refused_at: Option<Instant>,
     /// What the first local subscriber of a remote track asked for; a resync asks the same.
     asked: Start,
 }
 
 impl Published {
-    fn incoming(&self, group: u64) -> Option<&Incoming> {
-        self.incoming
-            .iter()
-            .find(|incoming| incoming.group == group)
-    }
-
-    fn newest_incoming(&self) -> Option<u64> {
-        self.incoming.iter().map(|incoming| incoming.group).max()
-    }
-
     /// The cached group a late joiner gets: one complete, or one still being written, which
     /// goes on live. One abandoned has a hole in it and is no one's to replay.
     fn replayable(&self) -> Option<&Cached> {
         let cached = self.latest.as_ref()?;
         let writing = self
-            .incoming(cached.group)
+            .incoming
+            .get(&cached.group)
             .is_some_and(|incoming| !incoming.abandoned);
         (cached.complete || writing).then_some(cached)
     }
@@ -449,7 +437,7 @@ impl State {
                 subscribers: Vec::new(),
                 node_counts: HashMap::new(),
                 told: 0,
-                incoming: Vec::new(),
+                incoming: BTreeMap::new(),
                 refused_at: None,
                 asked: Start::Next,
             },
@@ -522,7 +510,7 @@ impl State {
                 subscribers: Vec::new(),
                 node_counts: HashMap::new(),
                 told: 0,
-                incoming: Vec::new(),
+                incoming: BTreeMap::new(),
                 refused_at: None,
                 asked: Start::Next,
             },
@@ -606,8 +594,10 @@ impl State {
     /// Every group in flight ends short for a subscriber that leaves it, so no stream of its
     /// is left open with no end.
     fn group_cut(&self, held: &Published, subscriber: &Subscriber, effects: &mut Vec<Effect>) {
-        for incoming in held.incoming.iter().filter(|incoming| !incoming.abandoned) {
-            self.group_ended_for(held, subscriber, incoming.group, false, effects);
+        for (group, incoming) in &held.incoming {
+            if !incoming.abandoned {
+                self.group_ended_for(held, subscriber, *group, false, effects);
+            }
         }
     }
 
@@ -1198,17 +1188,7 @@ impl State {
         let Some(held) = self.tracks.get(&track) else {
             return effects;
         };
-        let this_group = held.incoming(header.group);
-        // A group older than the newest open one and not itself open is one the publisher
-        // left behind: dropped and counted.
-        let stale = this_group.is_none()
-            && held
-                .newest_incoming()
-                .is_some_and(|newest| header.group < newest);
-        if stale {
-            self.metrics.dropped_stale.inc();
-            return effects;
-        }
+        let this_group = held.incoming.get(&header.group);
         let abandoned = this_group.is_some_and(|incoming| incoming.abandoned);
         if abandoned {
             return effects;
@@ -1235,23 +1215,16 @@ impl State {
                 return effects;
             }
         }
-        let new_group = self
-            .tracks
-            .get(&track)
-            .is_some_and(|held| held.incoming(header.group).is_none());
-        if new_group {
-            self.open_incoming(&track, header.group, false, &mut effects);
-        }
         let Some(held) = self.tracks.get_mut(&track) else {
             return effects;
         };
-        if let Some(incoming) = held
-            .incoming
-            .iter_mut()
-            .find(|incoming| incoming.group == header.group)
-        {
-            incoming.bytes += body.len();
-        }
+        held.incoming
+            .entry(header.group)
+            .or_insert(Incoming {
+                bytes: 0,
+                abandoned: false,
+            })
+            .bytes += body.len();
         let header = GroupHeader {
             alias: held.alias,
             group: header.group,
@@ -1281,7 +1254,7 @@ impl State {
                 })),
             }
         }
-        self.cache_object(&track, header.group, object, body, false);
+        self.cache_object(&track, header.group, object, body);
         effects
     }
 
@@ -1299,16 +1272,10 @@ impl State {
         let Some(held) = self.tracks.get_mut(&track) else {
             return effects;
         };
-        // A group not open ended already, for its subscribers, when a newer one pushed it out
-        // or when it was abandoned: its late end is nothing.
-        let Some(at) = held
-            .incoming
-            .iter()
-            .position(|incoming| incoming.group == group)
-        else {
+        // A group abandoned ended short for its subscribers already: its end is nothing more.
+        let Some(incoming) = held.incoming.remove(&group) else {
             return effects;
         };
-        let incoming = held.incoming.remove(at);
         if incoming.abandoned {
             return effects;
         }
@@ -1317,40 +1284,6 @@ impl State {
         }
         self.group_ended(&track, group, complete, &mut effects);
         effects
-    }
-
-    /// A group begins; past `MAX_OPEN_INCOMING` open groups the oldest ends short for its
-    /// subscribers and is forgotten, so its late end and its late objects are nothing.
-    fn open_incoming(
-        &mut self,
-        track: &Track,
-        group: u64,
-        abandoned: bool,
-        effects: &mut Vec<Effect>,
-    ) {
-        let Some(held) = self.tracks.get_mut(track) else {
-            return;
-        };
-        held.incoming.push(Incoming {
-            group,
-            bytes: 0,
-            abandoned,
-        });
-        let over = held.incoming.len() > MAX_OPEN_INCOMING;
-        if !over {
-            return;
-        }
-        let oldest = held.incoming.remove(0);
-        if let Some(cached) = held
-            .latest
-            .as_mut()
-            .filter(|cached| cached.group == oldest.group)
-        {
-            cached.complete = false;
-        }
-        if !oldest.abandoned {
-            self.group_ended(track, oldest.group, false, effects);
-        }
     }
 
     /// The group ends for every subscriber of the track, complete or short.
@@ -1372,12 +1305,15 @@ impl State {
         if let Some(cached) = held.latest.as_mut().filter(|cached| cached.group == group) {
             cached.complete = false;
         }
-        let Some(incoming) = held
-            .incoming
-            .iter_mut()
-            .find(|incoming| incoming.group == group)
-        else {
-            self.open_incoming(track, group, true, effects);
+        let Some(incoming) = held.incoming.get_mut(&group) else {
+            // Its first object is the one refused: no subscriber heard of the group.
+            held.incoming.insert(
+                group,
+                Incoming {
+                    bytes: 0,
+                    abandoned: true,
+                },
+            );
             return;
         };
         let was_open = !incoming.abandoned;
@@ -1484,32 +1420,46 @@ impl State {
                 }
             }
         }
-        self.cache_object(&track, header.group, header.object, payload, true);
+        self.cache_datagram(&track, header, payload);
         effects
     }
 
     // ---- the cache ----
 
-    /// Stream mode keeps the newest group whole; datagram mode keeps the newest object alone.
-    fn cache_object(&mut self, track: &Track, group: u64, object: u32, body: Bytes, alone: bool) {
+    /// Stream mode keeps the newest group as it was written, from its first object on, while
+    /// other groups are written beside it.
+    fn cache_object(&mut self, track: &Track, group: u64, object: u32, body: Bytes) {
         let Some(held) = self.tracks.get_mut(track) else {
             return;
         };
-        let continues = !alone
-            && held
-                .latest
-                .as_ref()
-                .is_some_and(|cached| cached.group == group);
-        if continues {
-            let cached = held.latest.as_mut().expect("checked above");
-            cached.objects.push(body);
-            return;
+        match cached_step(held.latest.as_ref(), group, object) {
+            Cache::Continues => {
+                let cached = held.latest.as_mut().expect("the step read it");
+                cached.objects.push(body);
+            }
+            Cache::Begins => {
+                held.latest = Some(Cached {
+                    group,
+                    first: 0,
+                    objects: vec![body],
+                    complete: false,
+                });
+            }
+            Cache::Breaks => held.latest = None,
+            Cache::Passes => {}
         }
+    }
+
+    /// Datagram mode keeps the newest object alone.
+    fn cache_datagram(&mut self, track: &Track, header: DatagramHeader, payload: Bytes) {
+        let Some(held) = self.tracks.get_mut(track) else {
+            return;
+        };
         held.latest = Some(Cached {
-            group,
-            first: object,
-            objects: vec![body],
-            complete: alone,
+            group: header.group,
+            first: header.object,
+            objects: vec![payload],
+            complete: true,
         });
     }
 
@@ -1589,6 +1539,42 @@ impl State {
     }
 }
 
+/// What one stream object is to the cached group.
+enum Cache {
+    /// The next object of the cached group.
+    Continues,
+    /// The first object of a group newer than the cached one: it is cached from here.
+    Begins,
+    /// An object of the cached group out of its order: the group has a hole, so no one gets it.
+    Breaks,
+    /// An object of another group, older than the cached one or begun before the cache held it.
+    Passes,
+}
+
+fn cached_step(cached: Option<&Cached>, group: u64, object: u32) -> Cache {
+    let first = object == 0;
+    let Some(cached) = cached else {
+        return begins_at(first);
+    };
+    let in_order = cached.objects.len() == object as usize;
+    match group.cmp(&cached.group) {
+        Ordering::Equal => match in_order {
+            true => Cache::Continues,
+            false => Cache::Breaks,
+        },
+        Ordering::Greater => begins_at(first),
+        Ordering::Less => Cache::Passes,
+    }
+}
+
+/// A group the cache has not held begins it only at its first object.
+fn begins_at(first: bool) -> Cache {
+    match first {
+        true => Cache::Begins,
+        false => Cache::Passes,
+    }
+}
+
 fn replayed(held: &Published, cached: &Cached) -> Vec<Out> {
     match held.mode {
         Mode::Stream => {
@@ -1608,7 +1594,7 @@ fn replayed(held: &Published, cached: &Cached) -> Vec<Out> {
                 })
                 .collect();
             // A group still being written ends for the late joiner when it ends for everyone.
-            let closed = held.incoming(cached.group).is_none();
+            let closed = !held.incoming.contains_key(&cached.group);
             if closed {
                 out.push(Out::GroupEnd {
                     alias: held.alias,

@@ -27,7 +27,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::grants::{Answered, Chain};
 use super::session::WS_MESSAGE;
-use super::tracks::MAX_OPEN_INCOMING;
 use super::{Network, Relay, ws_upgrade};
 
 type Context = runtime::Context;
@@ -378,12 +377,7 @@ impl Client {
             .await
             .unwrap();
         for object in objects {
-            tokio::io::AsyncWriteExt::write_u32_le(&mut stream, object.len() as u32)
-                .await
-                .unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut stream, object)
-                .await
-                .unwrap();
+            write_object(&mut stream, object).await;
         }
         stream
     }
@@ -430,6 +424,40 @@ impl Client {
         let (header, payload) = bytes.split_at(16);
         (abi::decode(header).unwrap(), payload.to_vec())
     }
+}
+
+/// A group stream's header, read off its front.
+async fn read_header(stream: &mut quinn::RecvStream) -> GroupHeader {
+    let mut header = [0u8; 13];
+    stream.read_exact(&mut header).await.unwrap();
+    abi::decode(&header).unwrap()
+}
+
+/// The next object on a group stream.
+async fn read_object(stream: &mut quinn::RecvStream) -> Vec<u8> {
+    let len = stream.read_u32_le().await.unwrap();
+    let mut body = vec![0u8; len as usize];
+    stream.read_exact(&mut body).await.unwrap();
+    body
+}
+
+/// How a group stream ends once its objects are read: `true` for FIN (complete), `false` for
+/// a reset (cut short).
+async fn read_end(stream: &mut quinn::RecvStream) -> bool {
+    match stream.read_u32_le().await {
+        Ok(len) => panic!("an end, not another object of {len} bytes"),
+        Err(error) => error.kind() == std::io::ErrorKind::UnexpectedEof,
+    }
+}
+
+/// One object onto a group stream left open.
+async fn write_object(stream: &mut quinn::SendStream, object: &[u8]) {
+    tokio::io::AsyncWriteExt::write_u32_le(stream, object.len() as u32)
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(stream, object)
+        .await
+        .unwrap();
 }
 
 fn seated(ledger: &Ledger, seed: u64, account: Account) -> PrivateKey {
@@ -1295,64 +1323,6 @@ fn a_watcher_hears_the_announces_its_subscribe_patterns_cover() {
 // ---- (j) groups a publisher leaves open ----
 
 #[test]
-fn a_group_superseded_past_the_cap_ends_short_and_its_late_end_is_nothing() {
-    runtime::Runner::default().start(|context| async move {
-        let ledger = Arc::new(Ledger::default());
-        let alice = seated(&ledger, 11, 42);
-        let bob = seated(&ledger, 12, 43);
-        ledger.grant("room", None, Grant::all());
-        let node = node(context, 1, ledger);
-        let doc = track("room", "doc");
-
-        let (mut alice, _) = Client::open(&node, &alice).await;
-        let (mut bob, _) = Client::open(&node, &bob).await;
-        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
-        bob.subscribe(1, doc.clone(), Start::Next).await;
-        alice.recv().await;
-
-        // alice skips ahead: one group after another, none finished; bob reads each header as
-        // it comes, which orders them.
-        let mut open = Vec::new();
-        let mut streams = Vec::new();
-        for group in 1..=MAX_OPEN_INCOMING as u64 + 1 {
-            open.push(alice.group_open(alias, group, &[b"x"]).await);
-            let mut stream = bob.connection.accept_uni().await.unwrap();
-            let mut header = [0u8; 13];
-            stream.read_exact(&mut header).await.unwrap();
-            assert_eq!(abi::decode::<GroupHeader>(&header).unwrap().group, group);
-            let len = stream.read_u32_le().await.unwrap();
-            stream
-                .read_exact(&mut vec![0u8; len as usize])
-                .await
-                .unwrap();
-            streams.push(stream);
-        }
-        // The oldest open group ended short for bob when one past the cap began.
-        let ended = streams[0].read_u32_le().await;
-        let reset = ended
-            .as_ref()
-            .is_err_and(|error| error.kind() != std::io::ErrorKind::UnexpectedEof);
-        assert!(reset, "group 1 is cut short when group 5 begins: {ended:?}");
-
-        // Its late end is nothing; the newest group still ends as the publisher ends it.
-        open.remove(0).finish().unwrap();
-        open.pop().unwrap().finish().unwrap();
-        let last = streams.last_mut().unwrap();
-        let ended = last.read_u32_le().await;
-        assert!(
-            ended.is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof),
-            "the newest group ends clean"
-        );
-        alice.group(alias, 9, &[b"after"]).await;
-        let (header, objects, complete) = bob.received_group().await;
-        assert_eq!(
-            (header.group, objects, complete),
-            (9, vec![b"after".to_vec()], true)
-        );
-    });
-}
-
-#[test]
 fn a_late_joiner_is_offered_no_abandoned_group_and_holds_no_stream_for_it() {
     runtime::Runner::default().start(|context| async move {
         let ledger = Arc::new(Ledger::default());
@@ -1441,5 +1411,122 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_once_as_asked() {
         assert_eq!(header.group, 3);
         first.shutdown.send_replace(true);
         second.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn a_publisher_that_skips_ahead_cuts_the_old_group_short_and_the_new_one_goes_on() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context, 1, ledger);
+        let doc = track("room", "doc");
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
+        bob.subscribe(1, doc.clone(), Start::Next).await;
+        alice.recv().await;
+
+        // alice starts group 2 while group 1 is open, then resets group 1; bob reads each
+        // object as it comes, which orders them at the node.
+        let mut one = alice.group_open(alias, 1, &[b"old"]).await;
+        let mut ones = bob.connection.accept_uni().await.unwrap();
+        assert_eq!(read_header(&mut ones).await.group, 1);
+        assert_eq!(read_object(&mut ones).await, b"old");
+        let mut two = alice.group_open(alias, 2, &[b"new"]).await;
+        let mut twos = bob.connection.accept_uni().await.unwrap();
+        assert_eq!(read_header(&mut twos).await.group, 2);
+        assert_eq!(read_object(&mut twos).await, b"new");
+
+        one.reset(0u32.into()).unwrap();
+        assert!(
+            !read_end(&mut ones).await,
+            "group 1 is cut short as alice cut it"
+        );
+        two.finish().unwrap();
+        assert!(read_end(&mut twos).await, "group 2 ends complete");
+    });
+}
+
+#[test]
+fn a_group_whose_first_object_comes_after_a_newer_groups_still_reaches_the_subscriber_whole() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context, 1, ledger);
+        let doc = track("room", "doc");
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
+        bob.subscribe(1, doc.clone(), Start::Next).await;
+        alice.recv().await;
+
+        // Group 2's stream is read first, as when two group streams' readers race.
+        let mut newer = alice.group_open(alias, 2, &[b"newer"]).await;
+        let mut stream = bob.connection.accept_uni().await.unwrap();
+        assert_eq!(read_header(&mut stream).await.group, 2);
+        assert_eq!(read_object(&mut stream).await, b"newer");
+
+        alice.group(alias, 1, &[b"older", b"whole"]).await;
+        let (header, objects, complete) = bob.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (1, vec![b"older".to_vec(), b"whole".to_vec()], true),
+            "the older group was never seen before: it is no stale one"
+        );
+        newer.finish().unwrap();
+        assert!(read_end(&mut stream).await);
+    });
+}
+
+#[test]
+fn a_late_joiner_gets_the_newest_group_whole_while_two_are_written_at_once() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        let carol = seated(&ledger, 13, 44);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context, 1, ledger);
+        let doc = track("room", "doc");
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
+        bob.subscribe(1, doc.clone(), Start::Next).await;
+        alice.recv().await;
+
+        // Groups 1 and 2 are written at once; bob reads each object as it comes, which orders
+        // them at the node.
+        let mut one = alice.group_open(alias, 1, &[b"one-0"]).await;
+        let mut ones = bob.connection.accept_uni().await.unwrap();
+        assert_eq!(read_header(&mut ones).await.group, 1);
+        assert_eq!(read_object(&mut ones).await, b"one-0");
+        let mut two = alice.group_open(alias, 2, &[b"two-0"]).await;
+        let mut twos = bob.connection.accept_uni().await.unwrap();
+        assert_eq!(read_header(&mut twos).await.group, 2);
+        assert_eq!(read_object(&mut twos).await, b"two-0");
+        write_object(&mut one, b"one-1").await;
+        assert_eq!(read_object(&mut ones).await, b"one-1");
+        one.finish().unwrap();
+        assert!(read_end(&mut ones).await);
+        two.finish().unwrap();
+        assert!(read_end(&mut twos).await);
+
+        // The cache holds the newest group as it was written, not the tail of the older one.
+        let (mut carol, _) = Client::open(&node, &carol).await;
+        let (_, _, latest) = carol.subscribe(1, doc, Start::Latest).await;
+        assert_eq!(latest, Some(2));
+        let (header, objects, complete) = carol.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (2, vec![b"two-0".to_vec()], true)
+        );
     });
 }
