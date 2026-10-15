@@ -58,13 +58,14 @@ block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
-[roles]                       # one row per role: its name = the founding program that fills it; egress optional, the rest required
+[roles]                       # one row per role: its name = the founding program that fills it; egress and scheduler optional, the rest required
 programs = "programs"         # registers and swaps programs
 validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
 identity = "identity"         # resolves a key or a program to its account
 blobs = "blobs"               # records each bundle of blobs put and which validators hold it
 awaits = "awaits"             # keeps the tickets of frames that await a call, and hands each its answer
 egress = "egress"             # optional: answers programs' calls outside the chain; nodes read it, the kernel never calls it
+scheduler = "scheduler"       # optional: keeps the runs programs schedule for later heights; the kernel runs each at the end of its block
 
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
@@ -119,7 +120,7 @@ runs as no one (`None`). A program may send a message as another account
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so an agent account its manager hands to a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
-validators, identity, awaits, egress}`; the programs repository's `docs/roles.md` walks through them.
+validators, identity, awaits, egress, scheduler}`; the programs repository's `docs/roles.md` walks through them.
 
 A program can wait for another program's answer. Its `execute` is an async
 Rust function (the program SDK's `awaiting_program!`), and each
@@ -135,15 +136,31 @@ instance, and tells the awaits role which tickets the frame waits on. Later
 the called program sends `resolve`, a message to the awaits role. That role
 checks that the sender is the program the ticket called, and the host
 restores the memory and resumes the program inside the resolver's
-submission, on the resolver's fuel. A ticket nobody answers expires after
-`EXPIRY_BLOCKS`: anyone may then send the awaits role `Expire`, and the
-program resumes with a refusal. A frame that finishes answers whoever waited
+submission, on the resolver's fuel. A ticket stays open until the called
+program answers it; the kernel puts no deadline on a wait. A frame that finishes answers whoever waited
 on it: the emitter of a message that wanted a reply gets its `Completion`
 then, and a waiting caller gets its answer. When the programs role gives a
 program new code, the host ends every frame that program had parked and
 answers each waiter with a refusal. Each run between two waits is its own
 transaction, so a refusal undoes only the run it ends. Storing a frame and
 restoring it each cost `PAGE_FUEL` per stored page.
+
+A program can schedule a run for a later block through the program bound to
+the scheduler role (`abi::role::scheduler`), an optional row. It sends that
+program `Schedule { height, target, payload }` (the program SDK's
+`ctx.schedule`) and gets back an entry id; the scheduler records the sending
+program as the entry's owner, so a program schedules only as itself, and it
+refuses a height that is not later than the current one. Only the owner may
+`Cancel` an entry, and only before it runs. At the end of each block, after
+its submissions and hooks and before the epoch step, the host asks the
+scheduler `Due { height }` page by page and runs each entry still due: a
+frame from `Origin::Program(owner)`, acting as the owner's account, with
+`Cause::Scheduled { entry }`, executing `payload` on `target` under the
+network's per-frame limits. A refused run undoes only its own writes. The
+host then sends the scheduler `Ran { entry, receipt }` from the `System`
+origin, and the scheduler keeps the receipt on the entry; the block does not
+carry the receipts of scheduled runs. A scheduled run may schedule entries
+for later heights. On a network that binds no scheduler role nothing runs.
 
 A hook is a program the kernel tells of every frame a block carries, after
 the frame has run: at each block it asks the programs role `Hooks(height)` and,
@@ -204,10 +221,17 @@ Any other service is registered on chain by an account, which then assigns the
 node keys that may serve it; the chain elects among the assigned members that
 serve it.
 
-The node does this itself. After each block it applies, it asks the egress
-program which open requests the chain elected it for and which are past their
-deadline. It calls each new one and signs the answer with its own key, and it
-sends `Expire` for each overdue one. It also sends `Serve` while the chain's
+A request waits `wait` blocks for its answer, `DEFAULT_WAIT` (64) when the
+caller names none. The egress program schedules its own expiry through the
+scheduler role when it records the request, and cancels that entry when the
+answer comes. If the expiry runs first, egress drops the request and the
+caller's call ends with a refusal saying the request expired; a later answer
+is refused. A network that binds egress without a scheduler refuses every
+request. No node signs anything to expire a request.
+
+The node answers requests itself. After each block it applies, it asks the
+egress program which open requests the chain elected it for. It calls each new
+one and signs the answer with its own key. It also sends `Serve` while the chain's
 record of the services it serves differs from its `egress.toml`. It submits each
 of these frames again every block until a block carries it, and signs one again
 when its anchor grows old. An answer larger than a block carries goes out as a

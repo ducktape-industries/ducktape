@@ -7,12 +7,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+use abi::Receipt;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role::validators};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use host::{Applied, Genesis, Host, Layer, Receipt, Submission, SubmissionId, Tip};
+use host::{Applied, Genesis, Host, Layer, Submission, SubmissionId, Tip};
 use state::{Commitment, View};
 
 use crate::proposer::Pending;

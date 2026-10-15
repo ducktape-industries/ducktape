@@ -176,6 +176,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-scheduler"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
+]
+
+[[package]]
 name = "fixture-valset"
 version = "0.1.0"
 dependencies = [

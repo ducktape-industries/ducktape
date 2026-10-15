@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use abi::Receipt;
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
     HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, hook, reason,
@@ -19,7 +20,7 @@ use fixture_programs::Change;
 use fixture_relay::Script;
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
-    Limits, NETWORK, RECENT, Receipt, Roles, SPENT, Submission, Tip,
+    Limits, NETWORK, RECENT, Roles, SPENT, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;

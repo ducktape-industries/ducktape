@@ -1,5 +1,6 @@
 use abi::Outcome;
-use host::{ANCHOR_WINDOW, Receipt, Submission, Tip};
+use abi::Receipt;
+use host::{ANCHOR_WINDOW, Submission, Tip};
 use node::pool::Pool;
 
 fn submission(signer: &[u8], anchor: u64, payload: &[u8]) -> Submission {

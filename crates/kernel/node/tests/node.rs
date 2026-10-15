@@ -127,21 +127,21 @@ async fn seal(node: &mut TestNode) -> (Block, host::Applied) {
     (block, applied)
 }
 
-fn new(taken: Taken) -> host::Receipt {
+fn new(taken: Taken) -> abi::Receipt {
     match taken {
         Taken::New(Some(receipt)) => receipt,
         other => panic!("the pool did not take the frame as new and preconfirmed: {other:?}"),
     }
 }
 
-fn held(taken: Taken) -> host::Receipt {
+fn held(taken: Taken) -> abi::Receipt {
     match taken {
         Taken::Held(Some(receipt)) => receipt,
         other => panic!("the pool did not hold the frame preconfirmed: {other:?}"),
     }
 }
 
-fn rejected(receipt: &host::Receipt) -> &str {
+fn rejected(receipt: &abi::Receipt) -> &str {
     match &receipt.outcome {
         Outcome::Rejected(refusal) => &refusal.reason,
         Outcome::Applied { .. } => panic!("{} was applied", receipt.program),
@@ -265,7 +265,7 @@ fn unseen(node: &TestNode, frame: &[u8]) -> bool {
     !ran && !wrote
 }
 
-fn env_height(receipt: &host::Receipt) -> u64 {
+fn env_height(receipt: &abi::Receipt) -> u64 {
     let Outcome::Applied { output } = &receipt.outcome else {
         panic!("the probe runs: {receipt:?}");
     };

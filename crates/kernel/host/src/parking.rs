@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use abi::role::awaits::{self, Answer, Call, FrameId, Ticket};
-use abi::{Cause, Env, Origin, Outcome, Principal, ProgramCall, Refusal, reason, role};
+use abi::{Cause, Env, Origin, Outcome, Principal, ProgramCall, Receipt, Refusal, reason, role};
 use blob::Stage;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
@@ -12,7 +12,7 @@ use state::{Checkpoint, Overlay};
 
 use crate::parked::{self, Parked, Waiter};
 use crate::unit::{self, Called, Frame, Resumed, refusal_of};
-use crate::{Host, MAX_DEPTH, Receipt, Result, rejected};
+use crate::{Host, MAX_DEPTH, Result, rejected};
 
 pub const PAGE_FUEL: u64 = 4_096;
 

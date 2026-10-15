@@ -282,7 +282,7 @@ async fn membership(client: &Client, key: &ed25519::PrivateKey, op: Op) -> u64 {
     height
 }
 
-async fn preconfirmed(client: &Client, frame: Vec<u8>) -> host::Receipt {
+async fn preconfirmed(client: &Client, frame: Vec<u8>) -> abi::Receipt {
     match client.submit(frame, Preconfirm::On).await.unwrap() {
         Submitted::Preconfirmed(receipt) => receipt,
         Submitted::Pooled => panic!("a preconfirmed submit answers its prediction"),
