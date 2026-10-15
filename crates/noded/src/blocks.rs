@@ -197,7 +197,17 @@ impl<E: Context> Daemon<E> {
         let Some(validators) = validators.as_deref().and_then(validators_of) else {
             return Ok(None);
         };
-        let proposer = consensus::proposer(&certificate, &validators);
+        let previous = match epoch.checked_sub(1) {
+            Some(before) => {
+                let previous = node.epoch_validators(before)?;
+                let Some(previous) = previous.as_deref().and_then(validators_of) else {
+                    return Ok(None);
+                };
+                Some(previous)
+            }
+            None => None,
+        };
+        let proposer = consensus::proposer(&certificate, &validators, previous.as_ref());
         Ok(proposer.map(|key| key.as_ref().to_vec()))
     }
 }
