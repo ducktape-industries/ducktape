@@ -127,10 +127,6 @@ fn controls() -> Vec<Control> {
             request: 2,
             reason: End::GrantRevoked,
         },
-        Control::Ended {
-            request: 2,
-            reason: End::NodeClosing,
-        },
         Control::Refused {
             request: 0,
             code: Code::NoAccount,
@@ -207,7 +203,6 @@ fn every_message_keeps_its_bytes() {
     let header = GroupHeader {
         alias: 7,
         group: 9,
-        priority: 128,
     };
     let datagram = DatagramHeader {
         alias: 7,

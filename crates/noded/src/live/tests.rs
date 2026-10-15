@@ -424,7 +424,6 @@ impl Client {
         let header = GroupHeader {
             alias,
             group,
-            priority: 128,
         };
         tokio::io::AsyncWriteExt::write_all(&mut stream, &abi::encode(&header))
             .await
@@ -445,7 +444,7 @@ impl Client {
     /// complete (FIN) rather than cut short (RESET).
     async fn received_group(&mut self) -> (GroupHeader, Vec<Vec<u8>>, bool) {
         let mut stream = self.connection.accept_uni().await.unwrap();
-        let mut header = [0u8; 13];
+        let mut header = [0u8; 12];
         stream.read_exact(&mut header).await.unwrap();
         let header: GroupHeader = abi::decode(&header).unwrap();
         let mut objects = Vec::new();
@@ -481,7 +480,7 @@ impl Client {
 
 /// A group stream's header, read off its front.
 async fn read_header(stream: &mut quinn::RecvStream) -> GroupHeader {
-    let mut header = [0u8; 13];
+    let mut header = [0u8; 12];
     stream.read_exact(&mut header).await.unwrap();
     abi::decode(&header).unwrap()
 }
@@ -642,7 +641,6 @@ fn a_group_reaches_a_subscriber_whole_and_a_late_joiner_gets_it_from_the_cache()
             GroupHeader {
                 alias,
                 group: 5,
-                priority: 128
             }
         );
         assert_eq!(objects, vec![b"hello".to_vec(), b"world".to_vec()]);
@@ -843,7 +841,6 @@ fn the_same_session_runs_over_the_websocket_door_without_datagrams() {
         let header = GroupHeader {
             alias,
             group: 3,
-            priority: 128,
         };
         alice
             .send(WsFrame::Group {
@@ -1247,11 +1244,18 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
             "the publisher counts the subscriber behind the other node"
         );
 
+        // The track's priority crossed the lane with its announce and is held on the second
+        // node, where its egress streams are set to it; it is no longer a per-group header byte.
+        assert_eq!(
+            second.relay.state().track(&doc).expect("held remote").priority,
+            3,
+            "the track's priority crossed with its announce"
+        );
+
         alice.group(alias, 1, &[b"across", b"nodes"]).await;
         let (header, objects, complete) = bob.received_group().await;
         assert!(complete, "a finished group crosses as complete");
         assert_eq!(header.group, 1);
-        assert_eq!(header.priority, 3, "the track's priority crossed with it");
         assert_eq!(objects, vec![b"across".to_vec(), b"nodes".to_vec()]);
 
         alice.send(Control::Unpublish { request: 1 }).await;
@@ -1414,7 +1418,7 @@ fn a_group_in_flight_ends_short_when_its_track_ends() {
         let _open = alice.group_open(alias, 1, &[b"first"]).await;
         // bob is mid-group when the track ends.
         let mut stream = bob.connection.accept_uni().await.unwrap();
-        let mut header = [0u8; 13];
+        let mut header = [0u8; 12];
         stream.read_exact(&mut header).await.unwrap();
         let len = stream.read_u32_le().await.unwrap();
         let mut body = vec![0u8; len as usize];
@@ -1621,7 +1625,7 @@ fn a_group_the_publisher_resets_crosses_the_lane_as_cut_short() {
 
         let mut open = alice.group_open(alias, 1, &[b"partial"]).await;
         let mut stream = bob.connection.accept_uni().await.unwrap();
-        let mut header = [0u8; 13];
+        let mut header = [0u8; 12];
         stream.read_exact(&mut header).await.unwrap();
         let len = stream.read_u32_le().await.unwrap();
         let mut body = vec![0u8; len as usize];

@@ -473,7 +473,7 @@ fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward
 async fn group_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
     let from = inbound.from;
     let mut stream = inbound.stream;
-    let mut header = [0u8; 13];
+    let mut header = [0u8; 12];
     if stream.read_exact(&mut header).await.is_err() {
         return;
     }

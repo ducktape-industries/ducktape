@@ -204,7 +204,6 @@ pub enum End {
     TrackEnded,
     PublisherGone,
     GrantRevoked,
-    NodeClosing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -238,14 +237,14 @@ impl Code {
     }
 }
 
-/// The first bytes of a group stream: 4 + 8 + 1 = 13. Objects follow, each a `u32`
-/// little-endian length then its bytes, numbered 0, 1, 2… in stream order, until FIN (the
-/// group is complete) or RESET (the group was abandoned).
+/// The first bytes of a group stream: 4 + 8 = 12. Objects follow, each a `u32` little-endian
+/// length then its bytes, numbered 0, 1, 2… in stream order, until FIN (the group is complete)
+/// or RESET (the group was abandoned). The group's priority is the track's, which the node
+/// knows from `Publish`/`Announce`; it is not a per-group header field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct GroupHeader {
     pub alias: Alias,
     pub group: u64,
-    pub priority: Priority,
 }
 
 /// A datagram's first bytes: 4 + 8 + 4 = 16, then the payload to the datagram's end.
@@ -415,17 +414,13 @@ mod tests {
 
     #[test]
     fn the_headers_are_fixed_width() {
-        let group = GroupHeader {
-            alias: 1,
-            group: 2,
-            priority: 3,
-        };
+        let group = GroupHeader { alias: 1, group: 2 };
         let datagram = DatagramHeader {
             alias: 1,
             group: 2,
             object: 3,
         };
-        assert_eq!(abi::encode(&group).len(), 13);
+        assert_eq!(abi::encode(&group).len(), 12);
         assert_eq!(abi::encode(&datagram).len(), 16);
     }
 }

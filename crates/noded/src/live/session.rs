@@ -69,6 +69,9 @@ pub enum Out {
         header: GroupHeader,
         object: u32,
         body: Bytes,
+        /// The track's priority, which the egress sets its group stream to (the one source of
+        /// a track's priority, no longer a per-group header field).
+        priority: Priority,
     },
     GroupEnd {
         alias: Alias,
@@ -374,7 +377,7 @@ async fn quic_groups_reading(connection: quinn::Connection, inbound: mpsc::Sende
 }
 
 async fn quic_group_reading(mut stream: quinn::RecvStream, inbound: mpsc::Sender<Inbound>) {
-    let mut header = [0u8; 13];
+    let mut header = [0u8; 12];
     if stream.read_exact(&mut header).await.is_err() {
         return;
     }
@@ -512,8 +515,13 @@ async fn quic_writing(
                     return;
                 }
             }
-            Drained::Out(Out::Object { header, body, .. }) => {
-                quic_group_object(&connection, &pacer, &mut groups, header, body);
+            Drained::Out(Out::Object {
+                header,
+                body,
+                priority,
+                ..
+            }) => {
+                quic_group_object(&connection, &pacer, &mut groups, header, priority, body);
             }
             Drained::Out(Out::GroupEnd {
                 alias,
@@ -550,6 +558,7 @@ fn quic_group_object(
     pacer: &Pacer,
     groups: &mut Groups,
     header: GroupHeader,
+    priority: Priority,
     body: Bytes,
 ) {
     let key = (header.alias, header.group);
@@ -562,6 +571,7 @@ fn quic_group_object(
             connection.clone(),
             pacer.clone(),
             header,
+            priority,
             queue,
         ));
         sending
@@ -579,12 +589,13 @@ async fn quic_group_writing(
     connection: quinn::Connection,
     pacer: Pacer,
     header: GroupHeader,
+    priority: Priority,
     mut queue: mpsc::Receiver<GroupOut>,
 ) {
     let Ok(stream) = connection.open_uni().await else {
         return;
     };
-    let _ = stream.set_priority(stream_priority(header.priority));
+    let _ = stream.set_priority(stream_priority(priority));
     let mut paced = pacer.pace(stream, Class::Client);
     if paced.write_all(&abi::encode(&header)).await.is_err() {
         return;
@@ -740,11 +751,7 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
                 group,
                 complete: true,
             }) => vec![WsFrame::Group {
-                header: GroupHeader {
-                    alias,
-                    group,
-                    priority: 0,
-                },
+                header: GroupHeader { alias, group },
                 objects: Vec::new(),
                 end: true,
             }],
@@ -821,7 +828,6 @@ mod tests {
         let header = GroupHeader {
             alias: 3,
             group: 7,
-            priority: 128,
         };
         let mut counting = HashMap::new();
         let first = ws_arrived(
@@ -872,7 +878,6 @@ mod tests {
         let header = GroupHeader {
             alias: 3,
             group: 7,
-            priority: 128,
         };
         let group = WsFrame::Group {
             header,

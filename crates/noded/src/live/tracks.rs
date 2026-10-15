@@ -837,7 +837,7 @@ impl State {
         // own grant is intact, the track simply has no publisher any more.
         let to_subscribers = match reason {
             End::GrantRevoked => End::PublisherGone,
-            End::TrackEnded | End::PublisherGone | End::NodeClosing => reason,
+            End::TrackEnded | End::PublisherGone => reason,
         };
         for subscriber in &held.subscribers {
             self.group_cut(&held, subscriber, effects);
@@ -1734,10 +1734,10 @@ impl State {
             })
             .bytes += body.len();
         let group = header.group;
+        let priority = held.priority;
         let header = GroupHeader {
             alias: held.alias,
             group,
-            priority: held.priority,
         };
         // A subscriber that joined mid-group hears nothing of that group (C1-1).
         let hearing: Vec<Subscriber> = held
@@ -1756,6 +1756,7 @@ impl State {
                         header,
                         object,
                         body: body.clone(),
+                        priority,
                     },
                     &mut effects,
                 ),
@@ -2131,7 +2132,6 @@ fn replayed(held: &Published, cached: &Cached) -> Vec<Out> {
             let header = GroupHeader {
                 alias: held.alias,
                 group: cached.group,
-                priority: held.priority,
             };
             let mut out: Vec<Out> = cached
                 .objects
@@ -2141,6 +2141,7 @@ fn replayed(held: &Published, cached: &Cached) -> Vec<Out> {
                     header,
                     object: object as u32,
                     body: body.clone(),
+                    priority: held.priority,
                 })
                 .collect();
             // A group still being written ends for the late joiner when it ends for everyone.
@@ -2176,6 +2177,7 @@ fn relayed(to: PublicKey, alias: Alias, out: Out) -> Option<Relayed> {
             header,
             object,
             body,
+            ..
         } => Some(Relayed::Object {
             to,
             header: GroupHeader { alias, ..header },
@@ -2340,11 +2342,7 @@ mod tests {
             };
             state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
             let alias = state.track(&doc).expect("published").alias;
-            let header = |group| GroupHeader {
-                alias,
-                group,
-                priority: 128,
-            };
+            let header = |group| GroupHeader { alias, group };
             let now = Instant::now();
             // Group 1 is in flight: its object 0 is out before bob subscribes.
             state.object(Some(publisher), header(1), 0, Bytes::from_static(b"a"), now);
@@ -2394,7 +2392,6 @@ mod tests {
             let header = GroupHeader {
                 alias,
                 group: 1,
-                priority: 128,
             };
             let now = Instant::now();
             state.object(
