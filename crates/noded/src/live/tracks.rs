@@ -786,9 +786,18 @@ impl State {
                 self.refuse(id, request, Code::Duplicate, &mut effects);
                 return effects;
             }
-            // A reconnect inside the old connection's idle time: the new publication
-            // supersedes the old, whose subscribers hear the publisher is gone.
-            self.end_track(&track, End::PublisherGone, &mut effects);
+            match (&held.origin, held.mode == mode) {
+                (Origin::Local(old), true) => {
+                    let old = *old;
+                    self.hand_over(&track, old, id, request, priority, &mut effects);
+                    return effects;
+                }
+                // A track the account publishes from another node, or in another mode: the new
+                // publication supersedes the old, whose subscribers hear the publisher is gone.
+                (Origin::Local(_), false) | (Origin::Remote(_), _) => {
+                    self.end_track(&track, End::PublisherGone, &mut effects);
+                }
+            }
         }
         let alias = self.alias();
         self.tracks.insert(
@@ -821,6 +830,59 @@ impl State {
         let held = self.tracks.get(&track).expect("inserted above");
         self.announce(&track, held, true, &mut effects);
         effects
+    }
+
+    /// The account that publishes a track publishes it again from another session (a reconnect
+    /// inside the old connection's idle time): the subscribers, local and behind nodes, are
+    /// handed to the new publication and hear no end; the groups the old one left open are cut
+    /// short, and the next group comes from the new publication under the track's alias. The
+    /// old session is no publisher of it any more and hears nothing: its connection is what
+    /// went. The new publisher is told the subscriber count as a new publisher is.
+    fn hand_over(
+        &mut self,
+        track: &Track,
+        old: SessionId,
+        id: SessionId,
+        request: RequestId,
+        priority: Priority,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(held) = self.tracks.get(track) else {
+            return;
+        };
+        let old_request = held.request;
+        let open: Vec<u64> = held
+            .incoming
+            .iter()
+            .filter(|(_, incoming)| !incoming.abandoned)
+            .map(|(group, _)| *group)
+            .collect();
+        for group in open {
+            self.abandon(track, group, effects);
+        }
+        let Some(held) = self.tracks.get_mut(track) else {
+            return;
+        };
+        // The old publication's groups are over, cut or not: the new one's groups start fresh,
+        // and no subscriber skips one of them.
+        held.incoming.clear();
+        held.skip.clear();
+        held.origin = Origin::Local(id);
+        held.request = request;
+        held.priority = priority;
+        held.refused_at = None;
+        held.told = 0;
+        let alias = held.alias;
+        if let Some(session) = self.sessions.get_mut(&old) {
+            session.published.remove(&old_request);
+        }
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.published.insert(request, track.clone());
+        }
+        self.tell(id, Control::Published { request, alias }, effects);
+        self.count_moved(track, effects);
+        let held = self.tracks.get(track).expect("held above");
+        self.announce(track, held, true, effects);
     }
 
     pub fn unpublish(&mut self, id: SessionId, request: RequestId) -> Vec<Effect> {
@@ -871,17 +933,21 @@ impl State {
         if let Some(stale) = self.resyncing.get_mut(&peer) {
             stale.remove(&track);
         }
-        if let Some(held) = self.tracks.get(&track) {
-            let local = matches!(held.origin, Origin::Local(_));
-            // A peer resyncing says again what we hold: nothing moved.
-            let same = held.origin == Origin::Remote(peer.clone())
-                && held.by == by
-                && held.mode == mode
-                && held.priority == priority;
-            if local || same {
-                return effects;
+        if let Some(held) = self.tracks.get_mut(&track) {
+            // A peer resyncing says again what we hold, or its publisher's node re-announces
+            // the same publication at another priority (a hand-over there): nothing ends here.
+            let same_publication =
+                held.origin == Origin::Remote(peer.clone()) && held.by == by && held.mode == mode;
+            match (&held.origin, same_publication) {
+                (Origin::Local(_), _) => return effects,
+                (Origin::Remote(_), true) => {
+                    held.priority = priority;
+                    return effects;
+                }
+                (Origin::Remote(_), false) => {
+                    self.end_track(&track, End::PublisherGone, &mut effects);
+                }
             }
-            self.end_track(&track, End::PublisherGone, &mut effects);
         }
         let alias = self.alias();
         self.tracks.insert(
@@ -2929,6 +2995,176 @@ mod tests {
             .iter()
             .filter(|effect| matches!(effect, Effect::Send(_, Out::GroupEnd { .. })))
             .count()
+    }
+
+    #[test]
+    fn a_republish_by_the_same_account_hands_its_subscribers_over_and_cuts_the_open_group() {
+        let mut state = state();
+        let peer = PrivateKey::from_seed(9).public_key();
+        let doc = Track {
+            namespace: "net#00000000/chat/room".into(),
+            name: "doc".into(),
+        };
+        let now = Instant::now();
+        fn sends(effects: &[Effect]) -> Vec<&Out> {
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Send(_, out) => Some(out),
+                    Effect::Lane(_) | Effect::Close(..) => None,
+                })
+                .collect()
+        }
+        fn lanes(effects: &[Effect]) -> Vec<&Relayed> {
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Lane(relayed) => Some(relayed),
+                    Effect::Send(..) | Effect::Close(..) => None,
+                })
+                .collect()
+        }
+        let old = state
+            .opened(42, vec![1], super::super::session::unconnected())
+            .expect("the node is not going away");
+        let sub = state
+            .opened(43, vec![2], super::super::session::unconnected())
+            .expect("the node is not going away");
+        let published = state.publish(old, 1, doc.clone(), Mode::Stream, 128, true);
+        let alias = state.track(&doc).unwrap().alias;
+        assert!(
+            sends(&published)
+                .iter()
+                .any(|out| matches!(out, Out::Control(Control::Published { request: 1, .. })))
+        );
+        state.subscribe(sub, 1, doc.clone(), Start::Next, true);
+        state.node_subscribed(peer.clone(), 7, &doc, Start::Next);
+        // The old session leaves group 1 open.
+        state.object(
+            Some(old),
+            GroupHeader { alias, group: 1 },
+            0,
+            Bytes::from_static(b"a"),
+            now,
+        );
+
+        // The same account publishes the track again from a new session.
+        let new = state
+            .opened(42, vec![1], super::super::session::unconnected())
+            .expect("the node is not going away");
+        let handed = state.publish(new, 5, doc.clone(), Mode::Stream, 128, true);
+        let lane_items = lanes(&handed);
+        assert!(
+            !lane_items
+                .iter()
+                .any(|relayed| matches!(relayed, Relayed::Ended { .. })),
+            "the node behind the peer hears no end: {lane_items:?}"
+        );
+        assert!(
+            !sends(&handed)
+                .iter()
+                .any(|out| matches!(out, Out::Control(Control::Ended { .. }))),
+            "the local subscriber hears no end"
+        );
+        assert!(
+            lane_items.iter().any(|relayed| matches!(
+                relayed,
+                Relayed::GroupEnd {
+                    alias: 7,
+                    group: 1,
+                    complete: false,
+                    ..
+                }
+            )),
+            "the open group is cut for the peer"
+        );
+        assert!(
+            sends(&handed).iter().any(|out| matches!(
+                out,
+                Out::GroupEnd {
+                    group: 1,
+                    complete: false,
+                    ..
+                }
+            )),
+            "the open group is cut for the local subscriber"
+        );
+        assert!(
+            lane_items
+                .iter()
+                .any(|relayed| matches!(relayed, Relayed::Announce { up: true, .. })),
+            "the track is announced up, not down and up"
+        );
+        assert_eq!(state.track(&doc).unwrap().alias, alias, "the alias stays");
+        assert!(
+            state
+                .session(old)
+                .is_some_and(|session| session.published.is_empty()),
+            "the old session publishes it no more"
+        );
+
+        // The next group comes from the new publication, to both; the old session is ignored.
+        let next = state.object(
+            Some(new),
+            GroupHeader { alias, group: 2 },
+            0,
+            Bytes::from_static(b"b"),
+            now,
+        );
+        assert!(lanes(&next).iter().any(|relayed| matches!(
+            relayed,
+            Relayed::Object {
+                header: GroupHeader { alias: 7, group: 2 },
+                object: 0,
+                ..
+            }
+        )));
+        assert!(sends(&next).iter().any(|out| matches!(
+            out,
+            Out::Object {
+                header: GroupHeader { group: 2, .. },
+                object: 0,
+                ..
+            }
+        )));
+        let stale = state.object(
+            Some(old),
+            GroupHeader { alias, group: 3 },
+            0,
+            Bytes::from_static(b"c"),
+            now,
+        );
+        assert!(
+            stale.is_empty(),
+            "the old session is no publisher: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn a_peers_re_announce_of_the_same_publication_at_another_priority_ends_nothing() {
+        let mut state = state();
+        let peer = PrivateKey::from_seed(9).public_key();
+        let doc = Track {
+            namespace: "net#00000000/chat/room".into(),
+            name: "doc".into(),
+        };
+        state.remote_announced(peer.clone(), doc.clone(), 42, Mode::Stream, 128, true);
+        let sub = state
+            .opened(43, vec![1], super::super::session::unconnected())
+            .expect("the node is not going away");
+        state.subscribe(sub, 1, doc.clone(), Start::Next, true);
+        // The publisher's node hands the track over there and announces it again, higher.
+        let again = state.remote_announced(peer.clone(), doc.clone(), 42, Mode::Stream, 200, true);
+        assert!(
+            !again.iter().any(|effect| matches!(
+                effect,
+                Effect::Send(_, Out::Control(Control::Ended { .. }))
+            )),
+            "the local subscriber hears no end: {again:?}"
+        );
+        let held = state.track(&doc).unwrap();
+        assert_eq!(held.priority, 200, "the priority moves in place");
+        assert_eq!(held.subscribers.len(), 1, "the subscriber stays");
     }
 
     #[test]

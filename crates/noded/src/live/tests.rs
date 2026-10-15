@@ -515,6 +515,65 @@ fn seated(ledger: &Ledger, seed: u64, account: Account) -> PrivateKey {
     key
 }
 
+#[test]
+fn a_publisher_that_reconnects_keeps_its_subscribers_and_cuts_only_its_open_group() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        ledger.grant("room", None, Grant::all());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        let node = node(context, 1, ledger);
+        let doc = track("room", "doc");
+        let (mut old, _) = Client::open(&node, &alice).await;
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        let alias = old.publish(1, doc.clone(), Mode::Stream).await;
+        bob.subscribe(1, doc.clone(), Start::Next).await;
+        old.recv().await;
+        // Group 1 is left open on the old connection; bob has its first object in hand.
+        let _open = old.group_open(alias, 1, &[b"a"]).await;
+        let mut cut = bob.connection.accept_uni().await.unwrap();
+        let mut header = [0u8; GroupHeader::LEN];
+        cut.read_exact(&mut header).await.unwrap();
+        let header: GroupHeader = abi::decode(&header).unwrap();
+        assert_eq!(header.group, 1);
+        let len = cut.read_u32_le().await.unwrap();
+        let mut body = vec![0u8; len as usize];
+        cut.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, b"a");
+
+        // alice publishes the track again from a new connection: bob is handed over, hears no
+        // end, his open group is cut, and the next group comes from the new publication.
+        let (mut new, _) = Client::open(&node, &alice).await;
+        let again = new.publish(2, doc.clone(), Mode::Stream).await;
+        assert_eq!(again, alias, "the track keeps its alias");
+        assert!(
+            matches!(
+                new.recv().await,
+                Control::Subscribers {
+                    request: 2,
+                    count: 1
+                }
+            ),
+            "the new publisher is told who it inherits"
+        );
+        let reset = cut.read_u32_le().await.unwrap_err();
+        assert_ne!(
+            reset.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "the group the old connection left open is cut, not finished"
+        );
+        new.group(again, 2, &[b"b"]).await;
+        let (header, objects, complete) = bob.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (2, vec![b"b".to_vec()], true)
+        );
+        // bob's control stream carries no end: his next ask is answered in order.
+        new.publish(3, track("room", "other"), Mode::Stream).await;
+        bob.subscribe(2, track("room", "other"), Start::Next).await;
+    });
+}
+
 // ---- the handshake ----
 
 #[test]
