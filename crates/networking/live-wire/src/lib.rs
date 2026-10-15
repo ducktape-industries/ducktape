@@ -324,11 +324,11 @@ pub enum Forward {
         up: bool,
     },
     /// A node with a local subscriber asks the publisher's node for the track, once per
-    /// (node, track).
+    /// (node, track). The publisher's node replays its cached group, so the asking node's
+    /// cache holds what the publisher's does and serves its own `Latest` subscribers.
     Subscribe {
         request: RequestId,
         track: Track,
-        from: Start,
     },
     Unsubscribe {
         request: RequestId,

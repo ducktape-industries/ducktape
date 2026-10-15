@@ -2014,12 +2014,13 @@ fn a_late_joiner_is_offered_no_abandoned_group_and_holds_no_stream_for_it() {
 }
 
 #[test]
-fn a_node_asks_for_a_track_once_and_the_cache_crosses_once_as_asked() {
+fn a_node_asks_for_a_track_once_and_the_cache_crosses_to_it_but_not_to_a_next_subscriber() {
     runtime::Runner::default().start(|context| async move {
         let ledger = Arc::new(Ledger::default());
         let alice = seated(&ledger, 11, 42);
         let bob = seated(&ledger, 12, 43);
         let carol = seated(&ledger, 13, 44);
+        let dave = seated(&ledger, 14, 45);
         ledger.grant("room", None, Grant::all());
         let first = node(context.child("first"), 1, ledger.clone());
         let second = node(context.child("second"), 2, ledger);
@@ -2037,11 +2038,22 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_once_as_asked() {
         let (mut alice, _) = Client::open(&first, &alice).await;
         let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
         bob.recv().await;
-        // The first node caches group 1 while no one on the second has subscribed.
+        // The first node caches group 1 while no one on the second has subscribed. Its cache
+        // holds the group once dave, a `Latest` joiner there, is replayed it whole: alice's
+        // stream finishing says nothing about the node's table yet.
         alice.group(alias, 1, &[b"cached"]).await;
+        let (mut dave, _) = Client::open(&first, &dave).await;
+        dave.subscribe(1, doc.clone(), Start::Latest).await;
+        alice.recv().await;
+        let (header, objects, complete) = dave.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (1, vec![b"cached".to_vec()], true)
+        );
 
-        // bob asks for what comes next: the cached group does not cross to a `Next` asker, and
-        // bob hears the next group from its object 0, not the tail of a group already cached.
+        // bob asks for what comes next: the second node asks the first for the track and is
+        // replayed the cached group, which fills its own cache; bob, a `Next` subscriber,
+        // hears nothing of it, and gets the next group from its object 0.
         bob.subscribe(2, doc.clone(), Start::Next).await;
         alice.recv().await;
         alice.group(alias, 2, &[b"next"]).await;
@@ -2049,7 +2061,7 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_once_as_asked() {
         assert_eq!(
             (header.group, objects),
             (2, vec![b"next".to_vec()]),
-            "the cached group did not cross; the next one crossed whole"
+            "the cached group did not reach a Next subscriber; the next one crossed whole"
         );
 
         // carol asks for the latest: the second node's own cache answers, once.
@@ -2064,8 +2076,11 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_once_as_asked() {
         alice.group(alias, 3, &[b"after"]).await;
         let (header, objects, _) = carol.received_group().await;
         assert_eq!((header.group, objects), (3, vec![b"after".to_vec()]));
-        let (header, _, _) = bob.received_group().await;
-        assert_eq!(header.group, 3);
+        let (header, objects, complete) = bob.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (3, vec![b"after".to_vec()], true)
+        );
         first.shutdown.send_replace(true);
         second.shutdown.send_replace(true);
     });

@@ -545,7 +545,7 @@ impl<E: crate::Context> PeerLink<E> {
         let Some(relay) = self.relay.upgrade() else {
             return Ensured::Failed;
         };
-        let resync = relay.step_to(|state| state.resynced(&self.to));
+        let resync = relay.step_to(|state| (state.resync(&self.to), Vec::new()));
         drop(relay);
         for forward in &resync {
             if !self.write(forward).await {
@@ -697,11 +697,9 @@ fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward
         } => {
             relay.step(|state| state.remote_announced(from.clone(), track, by, mode, priority, up))
         }
-        Forward::Subscribe {
-            request,
-            track,
-            from: start,
-        } => relay.step(|state| state.node_subscribed(from.clone(), request, &track, start)),
+        Forward::Subscribe { request, track } => {
+            relay.step(|state| state.node_subscribed(from.clone(), request, &track))
+        }
         Forward::Unsubscribe { request } => {
             relay.step(|state| state.node_unsubscribed(from, request))
         }

@@ -170,11 +170,7 @@ fn forwards() -> Vec<Forward> {
             priority: 7,
             up: false,
         },
-        Forward::Subscribe {
-            request: 5,
-            track,
-            from: Start::Latest,
-        },
+        Forward::Subscribe { request: 5, track },
         Forward::Unsubscribe { request: 5 },
         Forward::Forwarded {
             request: 5,

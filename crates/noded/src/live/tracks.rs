@@ -97,8 +97,9 @@ pub struct Published {
     /// "the next group".
     skip: HashMap<Subscriber, HashSet<u64>>,
     /// Local subscribers of a remote track whose `Subscribed` waits on the publisher's node's
-    /// `Forwarded`, so its `latest` is the publisher's cache, not our still-empty one.
-    pending: Vec<(SessionId, RequestId)>,
+    /// answer, with what each asked for: they hear nothing until then, and are then joined as a
+    /// fresh subscriber of this node's own copy of the track.
+    pending: Vec<(SessionId, RequestId, Start)>,
     /// Subscribers behind each node that forwards this track, by that node's request.
     pub node_counts: HashMap<PublicKey, u32>,
     /// The count the publisher was last told, so it hears every change once.
@@ -106,15 +107,8 @@ pub struct Published {
     /// The groups being written, by group: each leaves when its own end arrives, so a group
     /// begun after it neither hides its end nor makes its objects stale.
     incoming: BTreeMap<u64, Incoming>,
-    /// What the first local subscriber of a remote track asked for; a resync asks the same.
-    asked: Start,
-    /// Forwarding asks of a remote track sent and not yet answered: while one is out, every
-    /// local subscriber waits for the publisher's node's answer, and only the last answer is
-    /// the one they hear (a `Latest` ask lifted over a standing `Next` one is answered twice).
-    unanswered: u32,
-    /// For a local track, what each node asked, so an ask lifted from `Next` to `Latest`
-    /// replays the one group the node missed, once, and a resync's repeated ask replays nothing.
-    node_asks: HashMap<PublicKey, Asked>,
+    /// The ask to the publisher's node for a remote track, out and not yet answered.
+    asked: Option<Asked>,
 }
 
 impl Published {
@@ -744,9 +738,7 @@ impl State {
                 node_counts: HashMap::new(),
                 told: 0,
                 incoming: BTreeMap::new(),
-                asked: Start::Next,
-                unanswered: 0,
-                node_asks: HashMap::new(),
+                asked: None,
             },
         );
         self.aliases.insert(alias, track.clone());
@@ -894,9 +886,7 @@ impl State {
                 node_counts: HashMap::new(),
                 told: 0,
                 incoming: BTreeMap::new(),
-                asked: Start::Next,
-                unanswered: 0,
-                node_asks: HashMap::new(),
+                asked: None,
             },
         );
         self.aliases.insert(alias, track.clone());
@@ -997,7 +987,7 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         // A subscriber that never heard this group's objects hears no end of it either.
-        if skipped(held, subscriber, group) {
+        if !hears(held, subscriber, group) {
             return;
         }
         match subscriber {
@@ -1101,26 +1091,15 @@ impl State {
             return self.unanswered(id, request, ask, code);
         }
         self.unwait(id, request, &ask);
-        // A remote track's first local subscriber is answered when the publisher's node answers
-        // our forwarding ask (`node_forwarded`): its `Subscribed.latest` is the publisher's
-        // cache, and its replay comes over the lane, not from our empty one.
+        // A remote track's local subscribers wait while our ask to the publisher's node is
+        // out: the first one's ask, or one asked already (`node_forwarded` answers them).
         let held = self.tracks.get(&track).expect("subscribe read the track");
         let remote = matches!(held.origin, Origin::Remote(_));
         let first_local = !held
             .subscribers
             .iter()
             .any(|other| matches!(other, Subscriber::Local { .. }));
-        let unanswered = held.unanswered > 0;
-        // A `Latest` subscriber behind a standing `Next` ask, while nothing of the track has
-        // reached this node, lifts the node's ask to `Latest` so the publisher's cached group
-        // comes; the lifted ask is answered like the first, and every local waits for that.
-        let untouched = held.latest.is_none() && held.incoming.is_empty();
-        let lifts = remote
-            && !first_local
-            && untouched
-            && from == Start::Latest
-            && held.asked == Start::Next;
-        let defer = remote && (first_local || unanswered || lifts);
+        let defer = remote && (first_local || held.asked.is_some());
         let subscriber = Subscriber::Local {
             session: id,
             request,
@@ -1128,25 +1107,10 @@ impl State {
         let Some(opened) = self.add_subscriber(&track, subscriber, from, &mut effects) else {
             return effects;
         };
-        if lifts
-            && let Some(held) = self.tracks.get_mut(&track)
-            && let Origin::Remote(peer) = &held.origin
-        {
-            held.asked = Start::Latest;
-            held.unanswered += 1;
-            effects.push(Effect::Lane(
-                peer.clone(),
-                ToPeer::Control(Forward::Subscribe {
-                    request: held.request,
-                    track: track.clone(),
-                    from: Start::Latest,
-                }),
-            ));
-        }
         self.subscription_held(id, request, track.clone());
         if defer {
             if let Some(held) = self.tracks.get_mut(&track) {
-                held.pending.push((id, request));
+                held.pending.push((id, request, from));
             }
             return effects;
         }
@@ -1167,8 +1131,13 @@ impl State {
         effects
     }
 
-    /// The publisher's node answered our forwarding ask: every local subscriber that waited on
-    /// it hears `Subscribed` now, its `latest` the publisher's cache.
+    /// The publisher's node answered our ask, replaying the group its cache held (`latest`):
+    /// every local subscriber that waited on it joins now, as a fresh subscriber of our copy of
+    /// the track would, since the replay fills our cache as a local publisher's groups would. A
+    /// `Latest` one is served our cache, or told the replayed group when that is still on its
+    /// way; a `Next` one skips the replayed group if it can still come, and every group in
+    /// flight here, as it joined after their object 0. An answer to no ask (a resync's second)
+    /// is nothing new.
     pub fn node_forwarded(
         &mut self,
         peer: &PublicKey,
@@ -1182,13 +1151,30 @@ impl State {
         let Some(held) = self.tracks.get_mut(&track) else {
             return effects;
         };
-        let (alias, by, mode) = (held.alias, held.by, held.mode);
-        held.unanswered = held.unanswered.saturating_sub(1);
-        if held.unanswered > 0 {
+        let Some(asked) = held.asked.take() else {
             return effects;
-        }
-        let pending = std::mem::take(&mut held.pending);
-        for (id, req) in pending {
+        };
+        let (alias, by, mode) = (held.alias, held.by, held.mode);
+        let coming = latest
+            .filter(|group| !asked.ended.contains(group) && !held.incoming.contains_key(group));
+        for (id, req, from) in std::mem::take(&mut held.pending) {
+            let held = self.tracks.get_mut(&track).expect("read above");
+            let subscriber = Subscriber::Local {
+                session: id,
+                request: req,
+            };
+            let (mut skip, replayed) = joining(held, from);
+            let told = match from {
+                Start::Latest => replayed.or(coming),
+                Start::Next => {
+                    skip.extend(coming);
+                    None
+                }
+            };
+            match skip.is_empty() {
+                true => held.skip.remove(&subscriber),
+                false => held.skip.insert(subscriber, skip),
+            };
             self.tell(
                 id,
                 Control::Subscribed {
@@ -1196,50 +1182,63 @@ impl State {
                     alias,
                     by,
                     mode,
-                    latest,
+                    latest: told,
                 },
                 &mut effects,
             );
+            if from == Start::Latest {
+                self.replay(id, &track, &mut effects);
+            }
         }
         effects
     }
 
-    /// A node asks for a local track over the live lane. The asking node's request is its own alias
-    /// of the track, and the data it gets names the track by it, so a group can never arrive
-    /// before the node knows the alias.
+    /// A node asks for a local track over the live lane: it is answered, and its first ask is
+    /// replayed the cached group after the answer, so its own cache holds what ours does. The
+    /// asking node's request is its own alias of the track, and the data it gets names the
+    /// track by it, so a group can never arrive before the node knows the alias.
     pub fn node_subscribed(
         &mut self,
         peer: PublicKey,
         request: RequestId,
         track: &Track,
-        from: Start,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         // The peer still wants this track, so its resync keeps its subscription.
         if let Some(stale) = self.resyncing.get_mut(&peer) {
             stale.remove(track);
         }
-        let answer = match self.node_subscribe(peer.clone(), request, track, from, &mut effects) {
-            Ok(opened) => Forward::Forwarded {
-                request,
-                latest: opened.latest,
-            },
-            Err(code) => Forward::Refused { request, code },
-        };
-        effects.push(Effect::Lane(peer, ToPeer::Control(answer)));
+        match self.node_subscribe(peer.clone(), request, track, &mut effects) {
+            Ok(NodeAsk { opened, first }) => {
+                effects.push(Effect::Lane(
+                    peer.clone(),
+                    ToPeer::Control(Forward::Forwarded {
+                        request,
+                        latest: opened.latest,
+                    }),
+                ));
+                if first {
+                    self.replay_to_node(&peer, opened.alias, track, &mut effects);
+                }
+            }
+            Err(code) => effects.push(Effect::Lane(
+                peer,
+                ToPeer::Control(Forward::Refused { request, code }),
+            )),
+        }
         effects
     }
 
     /// The decide step behind `node_subscribed`: the track opened for the peer, or the code to
-    /// refuse it with. Its replay effects are already in `effects`.
+    /// refuse it with. A peer asking again hears the answer again under its new request and
+    /// nothing else: the one subscription it holds carries the track already.
     fn node_subscribe(
         &mut self,
         peer: PublicKey,
         request: RequestId,
         track: &Track,
-        from: Start,
         effects: &mut Vec<Effect>,
-    ) -> Result<Opened, Code> {
+    ) -> Result<NodeAsk, Code> {
         let Some(held) = self.tracks.get(track) else {
             return Err(Code::Unknown);
         };
@@ -1251,7 +1250,6 @@ impl State {
             return Err(Code::Malformed);
         };
         let held = self.tracks.get_mut(track).expect("read above");
-        let cached = held.replayable().map(|cached| cached.group);
         let already = held
             .subscribers
             .iter_mut()
@@ -1262,70 +1260,30 @@ impl State {
                 } if *other == peer => Some(theirs),
                 Subscriber::Node { .. } | Subscriber::Local { .. } => None,
             });
-        // A peer asking again hears the answer again under its new request. A resync's repeated
-        // ask carries nothing else: the one subscription it holds already carries the track. An
-        // ask lifted from `Next` to `Latest` is replayed the cached group once, if it is the one
-        // the node has not heard; a group begun since the node asked is flowing to it live.
         if let Some(theirs) = already {
             *theirs = request;
-            let before = held.node_asks.get(&peer).copied();
-            let lifts =
-                before.is_some_and(|asked| asked.start == Start::Next) && from == Start::Latest;
-            let replays =
-                lifts && cached.is_some() && cached == before.and_then(|asked| asked.unheard);
-            let unheard = match replays {
-                true => None,
-                false => before.and_then(|asked| asked.unheard),
-            };
-            held.node_asks.insert(
-                peer.clone(),
-                Asked {
-                    start: from,
-                    unheard,
-                },
-            );
             let opened = Opened {
                 alias,
                 by: held.by,
                 mode: held.mode,
-                latest: cached,
+                latest: held.replayable().map(|cached| cached.group),
             };
-            if replays {
-                let subscriber = Subscriber::Node {
-                    peer: peer.clone(),
-                    request,
-                };
-                if let Some(cached) = cached
-                    && let Some(skipped) = held.skip.get_mut(&subscriber)
-                {
-                    skipped.remove(&cached);
-                }
-                self.replay_to_node(&peer, alias, track, effects);
-            }
-            return Ok(opened);
+            return Ok(NodeAsk {
+                opened,
+                first: false,
+            });
         }
-        let unheard = match from {
-            Start::Next => held.latest.as_ref().map(|cached| cached.group),
-            Start::Latest => None,
-        };
-        held.node_asks.insert(
-            peer.clone(),
-            Asked {
-                start: from,
-                unheard,
-            },
-        );
         let subscriber = Subscriber::Node {
             peer: peer.clone(),
             request,
         };
-        let Some(opened) = self.add_subscriber(track, subscriber, from, effects) else {
+        let Some(opened) = self.add_subscriber(track, subscriber, Start::Latest, effects) else {
             return Err(Code::Unknown);
         };
-        if from == Start::Latest {
-            self.replay_to_node(&peer, alias, track, effects);
-        }
-        Ok(Opened { alias, ..opened })
+        Ok(NodeAsk {
+            opened: Opened { alias, ..opened },
+            first: true,
+        })
     }
 
     /// A peer refused our forwarding ask: the track ends for our local subscribers. A grant
@@ -1366,47 +1324,27 @@ impl State {
                 .subscribers
                 .iter()
                 .any(|other| matches!(other, Subscriber::Local { .. }));
-        // A subscriber hears a group only from its object 0. It joined after that of every group
-        // in flight, so it hears none of them; the one group `Latest` replays whole it gets from
-        // its object 0 through the replay and then live, so that one it keeps.
-        let replayed = match from {
-            Start::Latest => held.replayable().map(|cached| cached.group),
-            Start::Next => None,
-        };
-        let in_flight: HashSet<u64> = held
-            .incoming
-            .iter()
-            .filter(|(_, incoming)| !incoming.abandoned)
-            .map(|(group, _)| *group)
-            .filter(|group| Some(*group) != replayed)
-            .collect();
-        if !in_flight.is_empty() {
-            held.skip.insert(subscriber.clone(), in_flight);
+        let (skip, replayed) = joining(held, from);
+        if !skip.is_empty() {
+            held.skip.insert(subscriber.clone(), skip);
         }
         held.subscribers.push(subscriber);
-        let latest = match from {
-            Start::Latest => held.replayable().map(|cached| cached.group),
-            // Nothing is sent first for `Next`, so it knows no caught-up group.
-            Start::Next => None,
-        };
         let opened = Opened {
             alias: held.alias,
             by: held.by,
             mode: held.mode,
-            latest,
+            latest: replayed,
         };
         // A remote track's first local subscriber makes us ask the publisher's node for it.
         if first_local && let Origin::Remote(peer) = &held.origin {
             // The forwarding request is our alias of the track: unique here, one per track.
             held.request = RequestId::from(held.alias);
-            held.asked = from;
-            held.unanswered += 1;
+            held.asked = Some(Asked::default());
             effects.push(Effect::Lane(
                 peer.clone(),
                 ToPeer::Control(Forward::Subscribe {
                     request: held.request,
                     track: track.clone(),
-                    from,
                 }),
             ));
         }
@@ -1527,15 +1465,14 @@ impl State {
         }
         // Everything the track holds about the leaver goes with it: a local one's wait on the
         // publisher's node's answer (its id may be re-used for something else before the answer
-        // lands), a node's count and standing ask.
+        // lands), a node's count.
         match subscriber {
             Subscriber::Local { session, request } => {
                 held.pending
-                    .retain(|(waiting, req)| !(waiting == session && req == request));
+                    .retain(|(waiting, req, _)| !(waiting == session && req == request));
             }
             Subscriber::Node { peer, .. } => {
                 held.node_counts.remove(peer);
-                held.node_asks.remove(peer);
             }
         }
         let held = self.tracks.get(track).expect("read above");
@@ -1941,11 +1878,10 @@ impl State {
             alias: held.alias,
             group,
         };
-        // A subscriber that joined mid-group hears nothing of that group.
         let hearing: Vec<Subscriber> = held
             .subscribers
             .iter()
-            .filter(|subscriber| !skipped(held, subscriber, group))
+            .filter(|subscriber| hears(held, subscriber, group))
             .cloned()
             .collect();
         for subscriber in hearing {
@@ -1993,6 +1929,9 @@ impl State {
         let Some(held) = self.tracks.get_mut(&track) else {
             return effects;
         };
+        if let Some(asked) = &mut held.asked {
+            asked.ended.insert(group);
+        }
         // A group abandoned ended short for its subscribers already: its end is nothing more.
         let Some(incoming) = held.incoming.remove(&group) else {
             return effects;
@@ -2107,7 +2046,13 @@ impl State {
             group: header.group,
             object: header.object,
         };
-        for subscriber in held.subscribers.clone() {
+        let hearing: Vec<Subscriber> = held
+            .subscribers
+            .iter()
+            .filter(|subscriber| !pending(held, subscriber))
+            .cloned()
+            .collect();
+        for subscriber in hearing {
             self.metrics.objects_out.inc();
             self.metrics.bytes_out.inc_by(payload.len() as u64);
             match subscriber {
@@ -2220,22 +2165,10 @@ impl State {
         found
     }
 
-    /// Our control stream to `peer` just opened and leads with a resync: the asks in flight to
-    /// it fold into the resync's one ask per track, whose one answer is the one the waiting
-    /// subscribers hear, and the resync is what the stream carries.
-    pub fn resynced(&mut self, peer: &PublicKey) -> (Vec<Forward>, Vec<Effect>) {
-        for held in self.tracks.values_mut() {
-            let theirs = held.origin == Origin::Remote(peer.clone());
-            if theirs && held.unanswered > 1 {
-                held.unanswered = 1;
-            }
-        }
-        (self.resync(peer), Vec::new())
-    }
-
     /// What a peer whose control stream just opened must hear to be in step: every local track
-    /// up, and our asks for its tracks that local subscribers wait on.
-    fn resync(&self, peer: &PublicKey) -> Vec<Forward> {
+    /// up, and our asks for its tracks that local subscribers wait on. An ask out when the
+    /// stream died is asked again here, and its answer is the one the waiting subscribers hear.
+    pub fn resync(&self, peer: &PublicKey) -> Vec<Forward> {
         let mut tracks: Vec<(&Track, &Published)> = self.tracks.iter().collect();
         tracks.sort_by(|a, b| a.0.cmp(b.0));
         let mut forwards = Vec::new();
@@ -2276,7 +2209,6 @@ impl State {
                         forwards.push(Forward::Subscribe {
                             request: held.request,
                             track: track.clone(),
-                            from: held.asked,
                         });
                     }
                 }
@@ -2391,14 +2323,58 @@ impl State {
     }
 }
 
-/// A node's standing ask on a local track.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Our ask to the publisher's node for a remote track, out and unanswered: the groups that
+/// ended here meanwhile are remembered, so the answer's replayed group is skipped by a `Next`
+/// subscriber only when it can still come (an entry for a group gone would outlive it, and
+/// skip a later group under the same number).
+#[derive(Default)]
 struct Asked {
-    start: Start,
-    /// The group cached when the node asked `Next`: in flight then, it skipped it; complete
-    /// then, it missed it. Either way the node has not heard it, and a lift to `Latest` replays
-    /// it, and nothing else: a group begun since reached the node live from its object 0.
-    unheard: Option<u64>,
+    ended: HashSet<u64>,
+}
+
+/// A node's ask taken: the track as opened for it, and whether the ask is its first (a
+/// repeated one, a resync's, carries nothing but the answer).
+struct NodeAsk {
+    opened: Opened,
+    first: bool,
+}
+
+/// What a subscriber joining the track `from` here skips, and the group it is replayed. It
+/// hears a group only from its object 0: it joined after that of every group in flight, so it
+/// hears none of them; the one group `Latest` replays whole it gets from its object 0 through
+/// the replay and then live, so that one it keeps.
+fn joining(held: &Published, from: Start) -> (HashSet<u64>, Option<u64>) {
+    let replayed = match from {
+        Start::Latest => held.replayable().map(|cached| cached.group),
+        // Nothing is sent first for `Next`, so it knows no caught-up group.
+        Start::Next => None,
+    };
+    let skip = held
+        .incoming
+        .iter()
+        .filter(|(_, incoming)| !incoming.abandoned)
+        .map(|(group, _)| *group)
+        .filter(|group| Some(*group) != replayed)
+        .collect();
+    (skip, replayed)
+}
+
+/// Whether a local subscriber still waits on the publisher's node's answer: it hears nothing
+/// until it is told `Subscribed`.
+fn pending(held: &Published, subscriber: &Subscriber) -> bool {
+    match subscriber {
+        Subscriber::Local { session, request } => held
+            .pending
+            .iter()
+            .any(|(waiting, req, _)| waiting == session && req == request),
+        Subscriber::Node { .. } => false,
+    }
+}
+
+/// Whether a subscriber hears `group`: one that joined after its object 0, or still waits to
+/// be told `Subscribed`, hears nothing of it.
+fn hears(held: &Published, subscriber: &Subscriber, group: u64) -> bool {
+    !skipped(held, subscriber, group) && !pending(held, subscriber)
 }
 
 /// The word a request hears when its grant is taken back.
@@ -2806,8 +2782,8 @@ mod tests {
             .expect("the node is not going away");
         state.publish(publisher, 2, ours_kept.clone(), Mode::Stream, 128, true);
         state.publish(publisher, 3, ours_gone.clone(), Mode::Stream, 128, true);
-        state.node_subscribed(peer.clone(), 7, &ours_kept, Start::Latest);
-        state.node_subscribed(peer.clone(), 8, &ours_gone, Start::Latest);
+        state.node_subscribed(peer.clone(), 7, &ours_kept);
+        state.node_subscribed(peer.clone(), 8, &ours_gone);
         let subscribed = |state: &State, track: &Track| {
             state.track(track).unwrap().subscribers.iter().any(|subscriber| {
                 matches!(subscriber, Subscriber::Node { peer: whose, .. } if *whose == peer)
@@ -2822,7 +2798,7 @@ mod tests {
         state.peer_fresh(peer.clone());
         // Its resync repeats only `kept` and its subscription to `ours_kept`.
         state.remote_announced(peer.clone(), kept.clone(), 42, Mode::Stream, 128, true);
-        state.node_subscribed(peer.clone(), 9, &ours_kept, Start::Latest);
+        state.node_subscribed(peer.clone(), 9, &ours_kept);
         let swept = state.peer_resynced(&peer);
 
         assert!(
@@ -2921,7 +2897,7 @@ mod tests {
                 .any(|out| matches!(out, Out::Control(Control::Published { request: 1, .. })))
         );
         state.subscribe(sub, 1, doc.clone(), Start::Next, true);
-        state.node_subscribed(peer.clone(), 7, &doc, Start::Next);
+        state.node_subscribed(peer.clone(), 7, &doc);
         // The old session leaves group 1 open.
         state.object(
             Some(old),
@@ -3171,8 +3147,8 @@ mod tests {
         state.remote_announced(gone.clone(), theirs.clone(), 42, Mode::Stream, 128, true);
         let publisher = open(&mut state, 42, 1);
         state.publish(publisher, 1, ours.clone(), Mode::Stream, 128, true);
-        state.node_subscribed(gone.clone(), 7, &ours, Start::Latest);
-        state.node_subscribed(kept.clone(), 8, &ours, Start::Latest);
+        state.node_subscribed(gone.clone(), 7, &ours);
+        state.node_subscribed(kept.clone(), 8, &ours);
 
         let swept = state.peers_gone(|peer| *peer == kept);
         assert!(
@@ -3207,7 +3183,7 @@ mod tests {
         let publisher = open(&mut state, 42, 1);
         let ours = room("ours");
         state.publish(publisher, 1, ours.clone(), Mode::Stream, 128, true);
-        state.node_subscribed(peer.clone(), 7, &ours, Start::Latest);
+        state.node_subscribed(peer.clone(), 7, &ours);
         let resync = state.resync(&peer);
         assert!(
             resync.contains(&Forward::Forwarded {
@@ -3219,62 +3195,73 @@ mod tests {
     }
 
     #[test]
-    fn every_local_subscriber_of_an_unanswered_remote_ask_waits_for_the_answer() {
+    fn every_local_subscriber_of_an_unanswered_remote_ask_waits_and_joins_on_the_answer() {
         let mut state = state();
         let peer = PrivateKey::from_seed(9).public_key();
         let doc = room("doc");
         state.remote_announced(peer.clone(), doc.clone(), 42, Mode::Stream, 128, true);
         let bob = open(&mut state, 43, 1);
         let carol = open(&mut state, 44, 2);
-        assert!(told(state.subscribe(bob, 1, doc.clone(), Start::Next, true)).is_empty());
-        // carol asks Latest while bob's Next ask is unanswered: she waits too, and the node's
-        // standing ask is lifted to Latest so the cached group reaches her.
+        let bobs = state.subscribe(bob, 1, doc.clone(), Start::Next, true);
+        assert!(
+            lane(bobs)
+                .iter()
+                .any(|item| matches!(item, ToPeer::Control(Forward::Subscribe { .. }))),
+            "the first local subscriber asks the publisher's node"
+        );
+        // carol asks Latest while bob's ask is unanswered: she waits too, and asks nothing.
         let carols = state.subscribe(carol, 1, doc.clone(), Start::Latest, true);
-        let answered_now = carols.iter().any(|effect| {
+        let told_or_asked = carols.iter().any(|effect| {
             matches!(
                 effect,
                 Effect::Send(_, Out::Control(Control::Subscribed { .. }))
+                    | Effect::Lane(_, ToPeer::Control(Forward::Subscribe { .. }))
             )
         });
         assert!(
-            !answered_now,
-            "the second subscriber is not answered from the empty cache"
+            !told_or_asked,
+            "the second subscriber waits and asks nothing: {carols:?}"
         );
+        let alias = state.track(&doc).unwrap().alias;
         let request = state.track(&doc).unwrap().request;
-        assert!(
-            lane(carols).iter().any(|item| matches!(
-                item,
-                ToPeer::Control(Forward::Subscribe {
-                    from: Start::Latest,
-                    ..
-                })
-            )),
-            "a Latest ask lifts the node's standing Next ask"
-        );
-        // The publisher's node answers each ask: the first says nothing to anyone, the
-        // lifted one's answer is the one both hear.
-        assert!(told(state.node_forwarded(&peer, request, None)).is_empty());
+        // The answer names the group it replays, still on its way: bob will skip it, carol is
+        // told it comes first.
         let answered = told(state.node_forwarded(&peer, request, Some(7)));
-        let subscribed = answered
-            .iter()
-            .filter(|control| {
-                matches!(
-                    control,
-                    Control::Subscribed {
-                        latest: Some(7),
-                        ..
-                    }
-                )
-            })
-            .count();
         assert_eq!(
-            subscribed, 2,
-            "both hear the publisher's cache: {answered:?}"
+            answered,
+            [
+                Control::Subscribed {
+                    request: 1,
+                    alias,
+                    by: 42,
+                    mode: Mode::Stream,
+                    latest: None
+                },
+                Control::Subscribed {
+                    request: 1,
+                    alias,
+                    by: 42,
+                    mode: Mode::Stream,
+                    latest: Some(7)
+                },
+            ]
         );
+        let header = |group| GroupHeader { alias, group };
+        let replay = state.object(None, header(7), 0, Bytes::from_static(b"old"));
+        assert_eq!(
+            objects_sent(&replay),
+            1,
+            "carol hears the replayed group, bob skips it"
+        );
+        assert_eq!(group_ends_sent(&state.group_end(None, alias, 7, true)), 1);
+        let next = state.object(None, header(8), 0, Bytes::from_static(b"new"));
+        assert_eq!(objects_sent(&next), 2, "the next group reaches both");
+        // The answer to a resync's repeated ask is nothing new.
+        assert!(told(state.node_forwarded(&peer, request, Some(8))).is_empty());
     }
 
     #[test]
-    fn a_resync_folds_the_asks_in_flight_into_its_one_ask() {
+    fn a_replay_that_lands_before_the_answer_reaches_no_waiting_subscriber_and_fills_the_cache() {
         let mut state = state();
         let peer = PrivateKey::from_seed(9).public_key();
         let doc = room("doc");
@@ -3283,91 +3270,42 @@ mod tests {
         let carol = open(&mut state, 44, 2);
         state.subscribe(bob, 1, doc.clone(), Start::Next, true);
         state.subscribe(carol, 1, doc.clone(), Start::Latest, true);
-        // Two asks are out when the stream to the peer dies; the resync asks once, and the one
-        // answer to it is the one both waiting subscribers hear.
-        let asks = state
-            .resynced(&peer)
-            .0
-            .into_iter()
-            .filter(|forward| matches!(forward, Forward::Subscribe { .. }))
-            .count();
-        assert_eq!(asks, 1);
+        let alias = state.track(&doc).unwrap().alias;
         let request = state.track(&doc).unwrap().request;
-        let answered = told(state.node_forwarded(&peer, request, Some(7)));
+        let header = |group| GroupHeader { alias, group };
+        // The replayed group's stream lands first, whole: no one is told yet, the cache holds it.
+        let early = state.object(None, header(7), 0, Bytes::from_static(b"old"));
         assert_eq!(
-            answered
-                .iter()
-                .filter(|control| matches!(control, Control::Subscribed { .. }))
-                .count(),
-            2,
-            "{answered:?}"
-        );
-    }
-
-    #[test]
-    fn a_lift_does_not_replay_a_group_the_node_already_receives_live() {
-        let mut state = state();
-        let peer = PrivateKey::from_seed(9).public_key();
-        let publisher = open(&mut state, 42, 1);
-        let ours = room("ours");
-        state.publish(publisher, 1, ours.clone(), Mode::Stream, 128, true);
-        let alias = state.track(&ours).unwrap().alias;
-        // The node asks Next with nothing cached; group 1 then begins and flows to it live.
-        state.node_subscribed(peer.clone(), 7, &ours, Start::Next);
-        let live = lane(state.object(
-            Some(publisher),
-            GroupHeader { alias, group: 1 },
+            objects_sent(&early),
             0,
-            Bytes::from_static(b"a"),
-        ));
+            "a waiting subscriber hears nothing"
+        );
+        assert_eq!(group_ends_sent(&state.group_end(None, alias, 7, true)), 0);
+        // The answer: carol is served the cache, bob skips nothing (the group is over).
+        let answered = state.node_forwarded(&peer, request, Some(7));
+        assert!(answered.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(
+                _,
+                Out::Control(Control::Subscribed {
+                    request: 1,
+                    latest: Some(7),
+                    ..
+                })
+            )
+        )));
         assert!(
-            live.iter()
-                .any(|item| matches!(item, ToPeer::Object { .. }))
+            answered.iter().any(|effect| {
+                matches!(effect, Effect::Send(_, Out::Group { header, end: Some(true), .. }) if header.group == 7)
+            }),
+            "carol is replayed the cached group: {answered:?}"
         );
-        let lifted = lane(state.node_subscribed(peer.clone(), 7, &ours, Start::Latest));
         assert!(
-            !lifted
-                .iter()
-                .any(|item| matches!(item, ToPeer::Group { .. })),
-            "the group the node receives live is not replayed onto its stream: {lifted:?}"
+            state.track(&doc).unwrap().skip.is_empty(),
+            "a group gone leaves no skip entry to catch a later group under its number"
         );
-    }
-
-    #[test]
-    fn a_lifted_ask_replays_once_and_a_repeated_latest_ask_does_not() {
-        let mut state = state();
-        let peer = PrivateKey::from_seed(9).public_key();
-        let publisher = open(&mut state, 42, 1);
-        let ours = room("ours");
-        state.publish(publisher, 1, ours.clone(), Mode::Stream, 128, true);
-        let alias = state.track(&ours).unwrap().alias;
-        state.object(
-            Some(publisher),
-            GroupHeader { alias, group: 1 },
-            0,
-            Bytes::from_static(b"a"),
-        );
-        state.group_end(Some(publisher), alias, 1, true);
-        let groups = |effects: Vec<Effect>| {
-            lane(effects)
-                .into_iter()
-                .filter(|item| matches!(item, ToPeer::Group { .. }))
-                .count()
-        };
-        assert_eq!(
-            groups(state.node_subscribed(peer.clone(), 7, &ours, Start::Next)),
-            0
-        );
-        assert_eq!(
-            groups(state.node_subscribed(peer.clone(), 7, &ours, Start::Latest)),
-            1,
-            "lifted: replayed"
-        );
-        assert_eq!(
-            groups(state.node_subscribed(peer.clone(), 7, &ours, Start::Latest)),
-            0,
-            "a resync re-ask: not again"
-        );
+        let again = state.object(None, header(7), 0, Bytes::from_static(b"again"));
+        assert_eq!(objects_sent(&again), 2, "a group begun again reaches both");
     }
 
     #[test]
@@ -3503,24 +3441,24 @@ mod tests {
         state.group_end(Some(publisher), alias, 1, true);
 
         let peer = PrivateKey::from_seed(2).public_key();
-        let replayed = lane(state.node_subscribed(peer.clone(), 7, &doc, Start::Latest));
+        let replayed = lane(state.node_subscribed(peer.clone(), 7, &doc));
         assert!(
             matches!(
                 replayed.as_slice(),
                 [
-                    ToPeer::Group {
-                        end: Some(true),
-                        ..
-                    },
                     ToPeer::Control(Forward::Forwarded {
                         latest: Some(1),
                         ..
-                    })
+                    }),
+                    ToPeer::Group {
+                        end: Some(true),
+                        ..
+                    }
                 ]
             ),
-            "the cached group crosses once as one unit, then the answer: {replayed:?}"
+            "the answer, then the cached group once as one unit: {replayed:?}"
         );
-        let again = lane(state.node_subscribed(peer, 8, &doc, Start::Latest));
+        let again = lane(state.node_subscribed(peer, 8, &doc));
         assert!(
             matches!(
                 again.as_slice(),
