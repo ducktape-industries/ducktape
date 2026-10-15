@@ -127,6 +127,9 @@ pub struct Outlet {
     ordered: mpsc::Sender<Out>,
     latest: Arc<Latest>,
     closing: watch::Sender<Option<&'static str>>,
+    /// Woken when the relay empties the session, so its loop re-arms the idle timer without
+    /// waiting on the client to send something (C1-7).
+    idle: Arc<Notify>,
 }
 
 impl std::fmt::Debug for Outlet {
@@ -173,6 +176,16 @@ impl Outlet {
 
     pub fn closed(&self) -> Option<&'static str> {
         *self.closing.borrow()
+    }
+
+    /// The relay emptied the session: wake its loop to re-arm its idle timer.
+    pub fn wake_idle(&self) {
+        self.idle.notify_one();
+    }
+
+    /// Resolves when the relay last emptied the session.
+    pub async fn emptied(&self) {
+        self.idle.notified().await;
     }
 }
 
@@ -235,6 +248,7 @@ fn outlet() -> (Outlet, Egress) {
         ordered,
         latest: latest.clone(),
         closing,
+        idle: Arc::new(Notify::new()),
     };
     let egress = Egress {
         ordered: receiving,

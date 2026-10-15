@@ -61,6 +61,8 @@ pub enum Effect {
     Send(Outlet, Out),
     Lane(Relayed),
     Close(Outlet, &'static str),
+    /// The relay emptied this session: wake its loop so it re-arms its idle timer (C1-7).
+    Idle(Outlet),
 }
 
 /// What the live lane carries for a step: announces to every member, and a group's objects or a
@@ -867,9 +869,10 @@ impl State {
             self.group_cut(&held, subscriber, effects);
             match subscriber {
                 Subscriber::Local { session, request } => {
-                    if let Some(subscribing) = self.sessions.get_mut(session) {
+                    let outlet = self.sessions.get_mut(session).map(|subscribing| {
                         subscribing.subscribed.remove(request);
-                    }
+                        subscribing.outlet.clone()
+                    });
                     self.tell(
                         *session,
                         Control::Ended {
@@ -878,6 +881,11 @@ impl State {
                         },
                         effects,
                     );
+                    // The relay ended this subscription, not the client: wake the session so it
+                    // re-arms its idle timer and is closed if this was its last request (C1-7).
+                    if let Some(outlet) = outlet {
+                        effects.push(Effect::Idle(outlet));
+                    }
                 }
                 Subscriber::Node { peer, request } => effects.push(Effect::Lane(Relayed::Ended {
                     to: peer.clone(),
@@ -1620,10 +1628,14 @@ impl State {
         if !names_it {
             return effects;
         }
+        // The relay, not the client, takes this request back, so the session is woken to re-arm
+        // its idle timer and is closed if this was its last one (C1-7).
+        let outlet = session.outlet.clone();
         match held {
             Held::Published(track) => {
                 session.published.remove(&request);
                 self.end_track(track, End::GrantRevoked, &mut effects);
+                effects.push(Effect::Idle(outlet));
                 return effects;
             }
             Held::Subscribed(track) => {
@@ -1652,6 +1664,7 @@ impl State {
             },
             &mut effects,
         );
+        effects.push(Effect::Idle(outlet));
         effects
     }
 
@@ -2317,7 +2330,7 @@ mod tests {
             .into_iter()
             .filter_map(|effect| match effect {
                 Effect::Lane(relayed) => Some(relayed),
-                Effect::Send(..) | Effect::Close(..) => None,
+                Effect::Send(..) | Effect::Close(..) | Effect::Idle(..) => None,
             })
             .collect()
     }
@@ -2328,7 +2341,7 @@ mod tests {
             .into_iter()
             .filter_map(|effect| match effect {
                 Effect::Send(_, Out::Control(control)) => Some(control),
-                Effect::Send(..) | Effect::Lane(_) | Effect::Close(..) => None,
+                Effect::Send(..) | Effect::Lane(_) | Effect::Close(..) | Effect::Idle(..) => None,
             })
             .collect()
     }
@@ -2425,6 +2438,32 @@ mod tests {
             .iter()
             .filter(|effect| matches!(effect, Effect::Send(_, Out::Object { .. })))
             .count()
+    }
+
+    #[test]
+    fn a_relay_ended_subscription_wakes_its_session_to_re_arm_idle() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let publisher = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let doc = Track {
+                namespace: "net#00000000/chat/room".into(),
+                name: "doc".into(),
+            };
+            state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
+            let bob = state
+                .opened(43, vec![2], super::super::session::unconnected())
+                .expect("the node is not going away");
+            state.subscribe(bob, 1, doc, Start::Latest, true);
+            // The publisher unpublishes: the relay, not bob, empties bob's session, so the step
+            // wakes bob's loop to re-arm its idle timer (C1-7).
+            let ended = state.unpublish(publisher, 1);
+            assert!(
+                ended.iter().any(|effect| matches!(effect, Effect::Idle(_))),
+                "the ended subscriber's session is woken: {ended:?}"
+            );
+        });
     }
 
     #[test]

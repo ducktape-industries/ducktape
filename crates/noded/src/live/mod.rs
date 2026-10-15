@@ -213,6 +213,7 @@ impl<E: crate::Context> Relay<E> {
                 Effect::Send(outlet, out) => self.deliver(&outlet, out),
                 Effect::Lane(relayed) => lane::relay(self, relayed),
                 Effect::Close(outlet, reason) => outlet.close(reason),
+                Effect::Idle(outlet) => outlet.wake_idle(),
             }
         }
     }
@@ -501,6 +502,8 @@ enum Awaited {
     Gone,
     /// The outlet was closed by fan-out, a re-check or the node going away.
     Closed(&'static str),
+    /// The relay emptied the session: re-arm the idle timer (C1-7).
+    Recheck,
     /// Nothing held for `IDLE_SESSION`.
     Idle,
 }
@@ -518,6 +521,7 @@ async fn awaited(link: &mut Link, idle_at: Option<Instant>) -> Awaited {
             None => Awaited::Gone,
         },
         reason = session::closed_elsewhere(&mut link.closing) => Awaited::Closed(reason),
+        () = link.outlet.emptied() => Awaited::Recheck,
         () = idle => Awaited::Idle,
     }
 }
@@ -576,6 +580,9 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
             Awaited::Inbound(inbound) => inbound,
             Awaited::Gone => break "closed",
             Awaited::Closed(reason) => break reason,
+            // The relay emptied the session; the loop's top re-arms `idle_at` from the now-empty
+            // session, so a session the relay emptied is closed after `IDLE_SESSION` like any other.
+            Awaited::Recheck => continue,
             Awaited::Idle => break "idle",
         };
         let Some(relay) = relay.upgrade() else {
