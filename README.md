@@ -225,7 +225,7 @@ ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100  
 ```sh
 ducktape status                         # height, tip, root, epoch, identity, role bindings
 ducktape wallet new alice               # a user key; DUCKTAPE_PASSWORD or a prompt
-ducktape submit ping request.bin        # sign a frame with the active wallet, print its preconfirmed receipt
+ducktape submit ping request.bin        # sign a frame with the active wallet and pool it; --preconfirm prints its predicted receipt
 ducktape get ping 6b6579                # a key in hex, from the preconfirmed layer
 ducktape get ping 6b6579 --confirmed    # the committed layer
 ducktape scan ping --lo 6b               # a key range
@@ -266,9 +266,13 @@ block reads it fetches it over halo before it applies the block. New program
 code is a bundle of kind `program`: the programs role schedules only code the
 blobs program reports held.
 
-The receipt `submit` prints is the node's prediction from its
-preconfirmed layer, not a verdict: a frame predicted to fail is still relayed
-and waits for a block, and the block decides. `ducktape logs`,
+`submit` pools the frame and prints its id; the block that carries it
+decides its outcome. The node runs a frame before its block only when the
+submit asks with `--preconfirm`: the frame's writes then show in the
+preconfirmed layer, the node runs it again after each block until a block
+carries it, and the receipt `submit` prints is that prediction, not a verdict.
+A frame predicted to fail is still relayed and waits for a block. `blob put`,
+votes and `ducktape halo` never preconfirm. `ducktape logs`,
 `ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
 node; the mutating ones are signed with the node's own identity key. Each
 verb's `--help` carries the rest.

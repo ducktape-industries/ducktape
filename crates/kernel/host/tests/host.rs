@@ -1365,7 +1365,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
                 body: b"body".to_vec(),
             })
         };
-        let id = blob::id_of(HashKind::Sha256, &blob::frame("page", b"body").unwrap());
+        let id = blob::id_of(HashKind::Sha256, &blob::frame("page", b"body").unwrap()).unwrap();
 
         let applied = host
             .apply(block(
@@ -1447,7 +1447,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
             ]
         );
 
-        let staged = blob::id_of(HashKind::Sha1, &blob::frame("note", b"x").unwrap());
+        let staged = blob::id_of(HashKind::Sha1, &blob::frame("note", b"x").unwrap()).unwrap();
         let applied = host
             .apply(block(
                 3,
@@ -2226,7 +2226,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             Err(Error::BlobUnavailable(_))
         ));
 
-        let page = blob::id_of(HashKind::Sha256, &blob::frame("page", b"body").unwrap());
+        let page = blob::id_of(HashKind::Sha256, &blob::frame("page", b"body").unwrap()).unwrap();
         assert!(matches!(
             joiner.install(page, b"page 4\0nope"),
             Err(Error::Corrupt(_))

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use abi::{Blob, BlobHeader, BlobId, HashKind, Refusal, reason};
 
 use crate::contract::Entry;
-use crate::{Hasher, frame, header, id_of, is_kind, name_of, parse, parse_header};
+use crate::{Collision, Hasher, frame, header, id_of, is_kind, name_of, parse, parse_header};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -14,6 +14,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("blob {0:?} is corrupt on disk: {1}")]
     Corrupt(BlobId, String),
+    #[error(transparent)]
+    Collision(#[from] Collision),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -31,7 +33,7 @@ impl Stage {
         body: &[u8],
     ) -> std::result::Result<BlobId, Refusal> {
         let framed = frame(kind, body)?;
-        let id = id_of(hash, &framed);
+        let id = id_of(hash, &framed)?;
         self.framed.entry(id).or_insert(framed);
         Ok(id)
     }
@@ -241,7 +243,7 @@ pub fn file_entry(kind: &str, path: &Path) -> std::result::Result<Entry, Refusal
         hasher.update(&chunk[..read]);
     }
     Ok(Entry {
-        id: hasher.finish(),
+        id: hasher.finish()?,
         len: header.len() as u64 + len,
         kind: kind.to_owned(),
     })
@@ -267,7 +269,7 @@ pub fn names(path: &Path, id: &BlobId) -> Result<Option<BlobHeader>> {
         body += read as u64;
     }
     let sized = body == header.len;
-    let hashed = hasher.finish() == *id;
+    let hashed = hasher.finish()? == *id;
     Ok((sized && hashed).then_some(header))
 }
 

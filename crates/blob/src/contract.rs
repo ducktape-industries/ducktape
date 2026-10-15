@@ -5,7 +5,7 @@ use abi::BlobId;
 use abi::role::identity::AccountNumber;
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::{id_of, parse};
+use crate::{Collision, id_of, parse};
 
 pub const BUNDLES: &[u8] = b"b/";
 pub const INDEX: &[u8] = b"i/";
@@ -22,20 +22,20 @@ impl Entry {
     pub fn of(framed: &[u8]) -> Option<Entry> {
         let (header, _) = parse(framed)?;
         Some(Entry {
-            id: id_of(abi::HashKind::Sha256, framed),
+            id: id_of(abi::HashKind::Sha256, framed).ok()?,
             len: framed.len() as u64,
             kind: header.kind,
         })
     }
 
-    pub fn names(&self, framed: &[u8]) -> bool {
+    pub fn names(&self, framed: &[u8]) -> Result<bool, Collision> {
         let Some((header, _)) = parse(framed) else {
-            return false;
+            return Ok(false);
         };
         let sized = framed.len() as u64 == self.len;
         let kinded = header.kind == self.kind;
-        let hashed = id_of(self.id.kind(), framed) == self.id;
-        sized && kinded && hashed
+        let hashed = id_of(self.id.kind(), framed)? == self.id;
+        Ok(sized && kinded && hashed)
     }
 }
 
@@ -129,14 +129,14 @@ mod tests {
         let entry = Entry::of(&framed).unwrap();
         assert_eq!(entry.kind, "pack");
         assert_eq!(entry.len, framed.len() as u64);
-        assert!(entry.names(&framed));
+        assert_eq!(entry.names(&framed), Ok(true));
         let other = frame("blob", b"PACK").unwrap();
-        assert!(!entry.names(&other));
+        assert_eq!(entry.names(&other), Ok(false));
         let mislabelled = Entry {
             kind: "blob".into(),
             ..entry.clone()
         };
-        assert!(!mislabelled.names(&framed));
+        assert_eq!(mislabelled.names(&framed), Ok(false));
         assert!(Entry::of(b"not framed").is_none());
     }
 

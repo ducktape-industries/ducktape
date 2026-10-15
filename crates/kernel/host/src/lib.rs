@@ -634,7 +634,9 @@ where
     }
 
     pub fn install(&mut self, id: BlobId, framed: &[u8]) -> Result<()> {
-        let hashes_to_id = blob::id_of(id.kind(), framed) == id;
+        let hashed = blob::id_of(id.kind(), framed)
+            .map_err(|collision| Error::Corrupt(collision.to_string()))?;
+        let hashes_to_id = hashed == id;
         if !hashes_to_id {
             return Err(Error::Corrupt(format!(
                 "the bytes offered for {id:?} do not hash to it"

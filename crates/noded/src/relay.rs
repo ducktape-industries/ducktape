@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::authenticated::lookup::{Receiver, Sender};
 use commonware_p2p::{Receiver as _, Recipients, Sender as _};
-use node::{Source, Taken};
+use node::{Preconfirm, Source, Taken};
 
 use crate::{Context, Daemon};
 
@@ -73,16 +73,14 @@ pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<Pu
         let (taken, role) = {
             let mut node = daemon.node.lock().await;
             let role = node.host().roles().blobs.clone();
-            (node.submit(frame.clone(), Source::Peer).await, role)
+            let taken = node
+                .submit(frame.clone(), Source::Peer, Preconfirm::Off)
+                .await;
+            (taken, role)
         };
         match taken {
-            Ok(Ok(Taken::New(receipt))) => {
-                tracing::debug!(
-                    target: "ducktape::relay",
-                    %peer,
-                    outcome = ?receipt.outcome,
-                    "took a relayed frame"
-                );
+            Ok(Ok(Taken::New(_))) => {
+                tracing::debug!(target: "ducktape::relay", %peer, "took a relayed frame");
                 sent(&daemon, &role, &frame, &peer);
             }
             Ok(Ok(Taken::Held(_))) => tracing::debug!(

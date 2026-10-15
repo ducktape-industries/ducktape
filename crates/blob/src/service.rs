@@ -18,7 +18,7 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::contract::{Bundle, Entry, bundle_of};
-use crate::{Blobs, names, size_of};
+use crate::{Blobs, Collision, Error, names, size_of};
 
 const BACKLOG: usize = 64;
 const SERVING: usize = 64;
@@ -457,10 +457,14 @@ impl Inner {
         }
         file.flush().await.map_err(|_| "unwritten")?;
         drop(file);
-        let named = checked(&partial, id, declared).await;
-        if !named {
+        let refused = match checked(&partial, id, declared).await {
+            Checked::Named => None,
+            Checked::Misnamed => Some("misnamed"),
+            Checked::Collision(_) => Some("collision"),
+        };
+        if let Some(reason) = refused {
             let _ = tokio::fs::remove_file(&partial).await;
-            return Err("misnamed");
+            return Err(reason);
         }
         self.store.adopt(id, &partial).map_err(|_| "unwritten")?;
         self.landed.send_modify(|landed| *landed += 1);
@@ -479,14 +483,24 @@ impl Inner {
         let flushed = file.flush().await;
         drop(file);
         let whole = copied.is_ok_and(|len| len == entry.len) && flushed.is_ok();
-        let named = whole && checked(&temp, &entry.id, Some(entry)).await;
-        if !named {
+        let checked = match whole {
+            true => checked(&temp, &entry.id, Some(entry)).await,
+            false => Checked::Misnamed,
+        };
+        let refusal = match checked {
+            Checked::Named => None,
+            Checked::Misnamed => Some(Refusal::new(
+                reason::INVALID_INPUT,
+                format!(
+                    "the upload does not carry {:?} as a {} blob of {} framed bytes",
+                    entry.id, entry.kind, entry.len
+                ),
+            )),
+            Checked::Collision(collision) => Some(collision.into()),
+        };
+        if let Some(refusal) = refusal {
             let _ = tokio::fs::remove_file(&temp).await;
-            let sentence = format!(
-                "the upload does not carry {:?} as a {} blob of {} framed bytes",
-                entry.id, entry.kind, entry.len
-            );
-            return Err(Refusal::new(reason::INVALID_INPUT, sentence));
+            return Err(refusal);
         }
         tokio::fs::rename(&temp, self.store.staged(&entry.id))
             .await
@@ -494,22 +508,34 @@ impl Inner {
     }
 }
 
-async fn checked(path: &Path, id: &BlobId, declared: Option<&Entry>) -> bool {
+enum Checked {
+    Named,
+    Misnamed,
+    Collision(Collision),
+}
+
+async fn checked(path: &Path, id: &BlobId, declared: Option<&Entry>) -> Checked {
     let path = path.to_path_buf();
     let id = *id;
     let declared = declared.cloned();
     let checked = tokio::task::spawn_blocking(move || {
-        let Ok(Some(header)) = names(&path, &id) else {
-            return false;
+        let header = match names(&path, &id) {
+            Ok(Some(header)) => header,
+            Err(Error::Collision(collision)) => return Checked::Collision(collision),
+            Ok(None) | Err(Error::Io(_) | Error::Corrupt(..)) => return Checked::Misnamed,
         };
         let Some(entry) = declared else {
-            return true;
+            return Checked::Named;
         };
         let size = size_of(&path).ok().flatten();
-        size == Some(entry.len) && header.kind == entry.kind
+        let matches_entry = size == Some(entry.len) && header.kind == entry.kind;
+        match matches_entry {
+            true => Checked::Named,
+            false => Checked::Misnamed,
+        }
     })
     .await;
-    checked.unwrap_or(false)
+    checked.unwrap_or(Checked::Misnamed)
 }
 
 async fn gathering(inner: Arc<Inner>) {

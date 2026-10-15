@@ -23,7 +23,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use halo::{Halo, Seat};
 use host::Layer;
-use node::{Block, Frame, Node, Sequenced, Source, Taken};
+use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source, Taken};
 use tokio::sync::watch;
 
 use crate::endpoint::Endpoint;
@@ -36,7 +36,7 @@ use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Delivery = (Arc<Block>, Exact);
 type Seating<E> =
-    Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant<E>>;
+    Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Listen {
@@ -249,12 +249,12 @@ async fn start<E: Context>(
         roster.seat(*epoch, validators);
     }
 
-    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
     let (inbox, deliveries) = mpsc::unbounded();
     let chain = Participant {
-        node: node.clone(),
+        proposer: node.proposer(),
         inbox,
     };
+    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
     let (marshal, summaries) = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
@@ -458,55 +458,25 @@ fn recorded_epochs<E: Context>(
     Ok(seated)
 }
 
-pub struct Participant<E: Context> {
-    node: Shared<E>,
+#[derive(Clone)]
+pub struct Participant {
+    proposer: Proposer,
     inbox: mpsc::UnboundedSender<Delivery>,
 }
 
-impl<E: Context> Clone for Participant<E> {
-    fn clone(&self) -> Self {
-        Participant {
-            node: self.node.clone(),
-            inbox: self.inbox.clone(),
-        }
-    }
-}
-
-impl<E: Context> Participant<E> {
-    async fn build(
-        &self,
-        parent: Arc<Block>,
-        ancestors: impl Ancestry<Block>,
-        time: u64,
-    ) -> node::Result<Block> {
-        let applied = self.node.lock().await.tip()?.height;
-        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
-        let node = self.node.lock().await;
-        node.build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time)
-    }
-}
-
-impl<E: Context> Chain for Participant<E> {
+impl Chain for Participant {
     async fn propose(
         &mut self,
         parent: Arc<Block>,
         ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> Option<Block> {
-        let height = parent.height + 1;
-        match self.build(parent, ancestors, time).await {
-            Ok(block) => Some(block),
-            Err(error) => {
-                tracing::error!(
-                    target: "ducktape::node",
-                    event = "build_failed",
-                    height,
-                    %error,
-                    "the node cannot build a block"
-                );
-                None
-            }
-        }
+        let applied = self.proposer.applied().height;
+        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
+        let block = self
+            .proposer
+            .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
+        Some(block)
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
@@ -579,7 +549,10 @@ async fn receipts_for<E: Context>(
             abi::encode(&blob::contract::Op::Receipt { bundle }),
         )
         .encode();
-        match node.submit(receipt.clone(), Source::Client).await? {
+        match node
+            .submit(receipt.clone(), Source::Client, Preconfirm::Off)
+            .await?
+        {
             Ok(Taken::New(_)) => taken.push(receipt),
             Ok(Taken::Held(_)) => {}
             Err(refusal) => tracing::debug!(
@@ -636,7 +609,7 @@ async fn applied<E: Context>(
         reseat_halo(daemon, &node, block.height).await;
     }
     if !closes {
-        let due = node.reoffer()?;
+        let due = node.reoffer();
         drop(node);
         daemon
             .relay
@@ -652,9 +625,9 @@ async fn applied<E: Context>(
     )))?;
     let reseated = daemon.relay.seat(seated.as_ref());
     let due = if reseated {
-        node.reoffer_all()?
+        node.reoffer_all()
     } else {
-        node.reoffer()?
+        node.reoffer()
     };
     drop(node);
     // The mesh admits every member, so a resident follows the chain; only

@@ -4,15 +4,15 @@ use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::{Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, Receipt, SubmissionId};
-use node::Frame;
+use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Status, TxAsk,
-    route,
+    BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Status, Submit,
+    Submitted, TxAsk, route,
 };
 use crate::{Error, Result};
 
@@ -45,13 +45,14 @@ impl Client {
         self.fetch(route::NETWORK).await
     }
 
-    pub async fn submit(&self, frame: Vec<u8>) -> Result<Receipt> {
-        self.post_raw(route::SUBMIT, frame).await
+    pub async fn submit(&self, frame: Vec<u8>, preconfirm: Preconfirm) -> Result<Submitted> {
+        self.post(route::SUBMIT, &Submit { frame, preconfirm })
+            .await
     }
 
     pub async fn land(&self, frame: &Frame) -> Result<(u64, Receipt)> {
         let blocks = self.changes(RECENT).await?;
-        self.submit(frame.encode()).await?;
+        self.submit(frame.encode(), Preconfirm::Off).await?;
         self.landed(frame, blocks).await
     }
 
@@ -119,7 +120,7 @@ impl Client {
         self.post(route::BLOB_GET, &id).await
     }
 
-    pub async fn put_blobs(&self, frame: &Frame, uploads: Vec<Upload>) -> Result<Receipt> {
+    pub async fn put_blobs(&self, frame: &Frame, uploads: Vec<Upload>) -> Result<Submitted> {
         let encoded = frame.encode();
         let mut opening = (encoded.len() as u32).to_le_bytes().to_vec();
         opening.extend_from_slice(&encoded);

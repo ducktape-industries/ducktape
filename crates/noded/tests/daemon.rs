@@ -12,8 +12,8 @@ use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
 use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
-use node::Frame;
-use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, TxAsk, TxRef};
+use node::{Frame, Preconfirm};
+use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, Submitted, TxAsk, TxRef};
 use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Upload, Workspace};
 
 const PROGRAMS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_programs.wasm");
@@ -263,6 +263,13 @@ async fn membership(client: &Client, key: &ed25519::PrivateKey, op: Op) -> u64 {
     height
 }
 
+async fn preconfirmed(client: &Client, frame: Vec<u8>) -> host::Receipt {
+    match client.submit(frame, Preconfirm::On).await.unwrap() {
+        Submitted::Preconfirmed(receipt) => receipt,
+        Submitted::Pooled => panic!("a preconfirmed submit answers its prediction"),
+    }
+}
+
 fn submission(frame: &[u8]) -> Submission {
     Frame::decode(frame).unwrap().body.submission()
 }
@@ -325,12 +332,12 @@ fn a_validator_serves_its_network_over_http() {
 
         let mut changes = client.changes("probe").await.unwrap();
         let failed = frame(&client, &alice, vec![Step::Fail("no".into())]).await;
-        let rejected = client.submit(failed.clone()).await.unwrap();
+        let rejected = preconfirmed(&client, failed.clone()).await;
         let Outcome::Rejected(refusal) = &rejected.outcome else {
             panic!("the failing run is rejected: {rejected:?}");
         };
         let submitted = frame(&client, &alice, vec![set(b"a", b"1")]).await;
-        let receipt = client.submit(submitted.clone()).await.unwrap();
+        let receipt = preconfirmed(&client, submitted.clone()).await;
         assert!(
             matches!(receipt.outcome, Outcome::Applied { .. }),
             "{receipt:?}"
@@ -531,7 +538,7 @@ fn a_validator_serves_its_network_over_http() {
         let programs = client.programs().await.unwrap();
         let code = programs["probe"];
         let framed = client.blob(code).await.unwrap().unwrap();
-        assert_eq!(blob::id_of(code.kind(), &framed), code);
+        assert_eq!(blob::id_of(code.kind(), &framed).unwrap(), code);
         assert!(client.missing_blobs().await.unwrap().is_empty());
         assert!(
             client
@@ -763,7 +770,7 @@ fn a_resident_follows_at_the_tip() {
             loop {
                 let write = set(b"a", &round.to_be_bytes());
                 client
-                    .submit(frame(&client, &alice, vec![write]).await)
+                    .submit(frame(&client, &alice, vec![write]).await, Preconfirm::Off)
                     .await
                     .unwrap();
                 changes.next().await.unwrap().unwrap();
@@ -863,7 +870,10 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
         let mut changes = live[0].client.changes("probe").await.unwrap();
         live[0]
             .client
-            .submit(frame(&live[0].client, &alice, vec![set(b"a", b"1")]).await)
+            .submit(
+                frame(&live[0].client, &alice, vec![set(b"a", b"1")]).await,
+                Preconfirm::Off,
+            )
             .await
             .unwrap();
         changes.next().await.unwrap().unwrap()
@@ -886,7 +896,10 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
         let mut changes = joined.client.changes("probe").await.unwrap();
         live[1]
             .client
-            .submit(frame(&live[1].client, &alice, vec![set(b"b", b"2")]).await)
+            .submit(
+                frame(&live[1].client, &alice, vec![set(b"b", b"2")]).await,
+                Preconfirm::Off,
+            )
             .await
             .unwrap();
         changes.next().await.unwrap().unwrap()
@@ -945,7 +958,7 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
         .block_on(founders[1].client.changes("probe"))
         .unwrap();
     let early = given(vec![set(b"early", b"at start")]);
-    let early = runtime.block_on(follower.client.submit(early)).unwrap();
+    let early = runtime.block_on(preconfirmed(&follower.client, early));
     assert!(
         matches!(early.outcome, Outcome::Applied { .. }),
         "{early:?}"
@@ -960,9 +973,7 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
     let mut spent = runtime
         .block_on(founders[1].client.changes(host::SPENT))
         .unwrap();
-    let predicted = runtime
-        .block_on(follower.client.submit(failing.clone()))
-        .unwrap();
+    let predicted = runtime.block_on(preconfirmed(&follower.client, failing.clone()));
     assert!(
         matches!(predicted.outcome, Outcome::Rejected(_)),
         "{predicted:?}"
@@ -980,7 +991,9 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
     for (n, value) in large.iter().enumerate() {
         let key = format!("large{n}");
         let large = given(vec![set(key.as_bytes(), value)]);
-        runtime.block_on(follower.client.submit(large)).unwrap();
+        runtime
+            .block_on(follower.client.submit(large, Preconfirm::Off))
+            .unwrap();
     }
     let [one, two] = runtime.block_on(async {
         ::tokio::time::timeout(
@@ -998,7 +1011,11 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
     );
     drop(changes);
 
-    let refused = runtime.block_on(follower.client.submit(vec![0; node::BLOCK_BYTES + 1]));
+    let refused = runtime.block_on(
+        follower
+            .client
+            .submit(vec![0; node::BLOCK_BYTES + 1], Preconfirm::Off),
+    );
     let Err(noded::Error::Refused(refusal)) = refused else {
         panic!("a frame no block carries is refused: {refused:?}");
     };
@@ -1125,7 +1142,7 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
             gathered.blobs(&ids).await.unwrap(),
             framed.clone().map(Some).to_vec()
         );
-        let named_by_none = blob::id_of(HashKind::Sha256, b"page 1\0x");
+        let named_by_none = blob::id_of(HashKind::Sha256, b"page 1\0x").unwrap();
         assert_eq!(gathered.blobs(&[named_by_none]).await.unwrap(), vec![None]);
 
         let reading = frame(gathered, &alice, vec![Step::Op(HostOp::BlobGet(ids[0]))]).await;
@@ -1280,7 +1297,10 @@ fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, diale
         let client = &live[0].client;
         let mut changes = client.changes("probe").await.unwrap();
         client
-            .submit(frame(client, &alice, vec![set(b"a", b"1")]).await)
+            .submit(
+                frame(client, &alice, vec![set(b"a", b"1")]).await,
+                Preconfirm::Off,
+            )
             .await
             .unwrap();
         let change = ::tokio::time::timeout(Duration::from_secs(60), changes.next())
