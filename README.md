@@ -228,7 +228,11 @@ what each program may do. A request may set none of those headers itself, nor
 gets no secrets and no `ducktape-*` headers, and reaches only public addresses,
 checked for an address in the URL and after the DNS lookup, unless `private =
 true`. No redirect is followed and no proxy is used: the whole response,
-redirects included, is the answer, and every node can read it.
+redirects included, is the answer, and every node can read it. The node acts as
+an HTTP proxy in both directions: it forwards no hop-by-hop header
+(`connection` and every header it names, `proxy-connection`, `keep-alive`, `te`,
+`transfer-encoding`, `upgrade`, `proxy-authenticate`, `proxy-authorization`),
+so none of them is sent upstream or written into an answer.
 
 ## Reach a node
 

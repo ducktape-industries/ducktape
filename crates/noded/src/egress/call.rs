@@ -42,6 +42,10 @@ fn builder() -> reqwest::ClientBuilder {
 
 struct PublicOnly;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0} has no public address")]
+struct NotPublic(String);
+
 impl Resolve for PublicOnly {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
@@ -49,7 +53,7 @@ impl Resolve for PublicOnly {
             let found = tokio::net::lookup_host((host.as_str(), 0)).await?;
             let public: Vec<SocketAddr> = found.filter(|address| public(address.ip())).collect();
             if public.is_empty() {
-                return Err(format!("{host} has no public address").into());
+                return Err(Box::new(NotPublic(host)) as Box<dyn std::error::Error + Send + Sync>);
             }
             let addresses: Addrs = Box::new(public.into_iter());
             Ok(addresses)
@@ -84,6 +88,47 @@ fn public_v6(ip: Ipv6Addr) -> bool {
     let local = ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local();
     let unrouted = ip.is_unspecified() || ip.is_multicast();
     !(local || unrouted)
+}
+
+const HOP_BY_HOP: [&str; 8] = [
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "te",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
+fn end_to_end(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    let named: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect();
+    headers
+        .into_iter()
+        .filter(|(name, _)| {
+            let name = name.to_ascii_lowercase();
+            let hop = HOP_BY_HOP.contains(&name.as_str()) || named.contains(&name);
+            !hop
+        })
+        .collect()
+}
+
+fn unreached(url: &Url, error: reqwest::Error) -> String {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut causes = Vec::new();
+    while let Some(cause) = source {
+        if cause.downcast_ref::<NotPublic>().is_some() {
+            return format!("{url} is not a public address");
+        }
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    format!("the target was not reached: {}", causes.join(": "))
 }
 
 pub struct Caller<'a> {
@@ -209,8 +254,8 @@ async fn send(
 ) -> Result<Response, String> {
     let method = reqwest::Method::from_bytes(head.method.as_str().as_bytes())
         .map_err(|error| error.to_string())?;
-    let mut request = client.request(method, url);
-    for (name, value) in headers {
+    let mut request = client.request(method, url.clone());
+    for (name, value) in end_to_end(headers) {
         request = request.header(name, value);
     }
     if !body.is_empty() {
@@ -219,15 +264,16 @@ async fn send(
     let response = request
         .send()
         .await
-        .map_err(|error| format!("the target was not reached: {error}"))?;
+        .map_err(|error| unreached(&url, error))?;
     let status = response.status().as_u16();
-    let headers = response
+    let received = response
         .headers()
         .iter()
         .filter_map(|(name, value)| {
             Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
         })
         .collect();
+    let headers = end_to_end(received);
     let body = response
         .bytes()
         .await
