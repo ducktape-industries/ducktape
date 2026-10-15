@@ -67,6 +67,11 @@ pub enum Effect {
 /// datagram to the node that subscribed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Relayed {
+    /// Open the control stream to this peer and resync, even with nothing else to send: the
+    /// peer was just seated, or its fresh control stream says it needs our state again (C1-5).
+    Resync {
+        to: PublicKey,
+    },
     Announce {
         track: Track,
         by: Account,
@@ -306,6 +311,10 @@ pub struct State {
     next_session: SessionId,
     /// When to re-open, once the node began to go away.
     going_away: Option<u32>,
+    /// Per peer whose control stream just reopened, the tracks it told us about before (its
+    /// remote tracks and its subscriptions) that its resync has not yet repeated: whatever is
+    /// left when its end marker arrives is stale and ended (C1-5).
+    resyncing: HashMap<PublicKey, HashSet<Track>>,
     metrics: Metrics,
 }
 
@@ -340,6 +349,7 @@ impl State {
             sessions: HashMap::new(),
             next_session: 1,
             going_away: None,
+            resyncing: HashMap::new(),
             metrics,
         }
     }
@@ -761,6 +771,10 @@ impl State {
             }
             return effects;
         }
+        // The peer still publishes this track, so its resync keeps it (C1-5).
+        if let Some(stale) = self.resyncing.get_mut(&peer) {
+            stale.remove(&track);
+        }
         if let Some(held) = self.tracks.get(&track) {
             let local = matches!(held.origin, Origin::Local(_));
             // A peer resyncing says again what we hold: nothing moved.
@@ -1076,6 +1090,10 @@ impl State {
         from: Start,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // The peer still wants this track, so its resync keeps its subscription (C1-5).
+        if let Some(stale) = self.resyncing.get_mut(&peer) {
+            stale.remove(track);
+        }
         match self.node_subscribe(peer.clone(), request, track, from, &mut effects) {
             Ok(opened) => effects.push(Effect::Lane(Relayed::Answer {
                 to: peer,
@@ -2086,6 +2104,74 @@ impl State {
         }
         effects
     }
+
+    /// Every remote track ends: the lane stopped serving on this node, so nothing the mesh
+    /// published can still reach us and its local subscribers hear it go (W4).
+    pub fn end_all_remote(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let remote: Vec<Track> = self
+            .tracks
+            .iter()
+            .filter(|(_, held)| matches!(held.origin, Origin::Remote(_)))
+            .map(|(track, _)| track.clone())
+            .collect();
+        for track in remote {
+            self.end_track(&track, End::PublisherGone, &mut effects);
+        }
+        effects
+    }
+
+    /// A peer's control stream reopened: it is new to us, or it restarted and forgot us. Mark
+    /// everything it told us before as provisional and resync to it, so it relearns our tracks
+    /// and asks; its end marker sweeps whatever it did not repeat (C1-5).
+    pub fn peer_fresh(&mut self, peer: PublicKey) -> Vec<Effect> {
+        let provisional: HashSet<Track> = self
+            .tracks
+            .iter()
+            .filter(|(_, held)| {
+                let publishes = held.origin == Origin::Remote(peer.clone());
+                let subscribes = held.subscribers.iter().any(|subscriber| {
+                    matches!(subscriber, Subscriber::Node { peer: whose, .. } if *whose == peer)
+                });
+                publishes || subscribes
+            })
+            .map(|(track, _)| track.clone())
+            .collect();
+        self.resyncing.insert(peer.clone(), provisional);
+        vec![Effect::Lane(Relayed::Resync { to: peer })]
+    }
+
+    /// The peer's resync ended: whatever it did not repeat is gone. A track it no longer
+    /// publishes ends for its local subscribers; a track it no longer subscribes to drops its
+    /// subscriber, so the publisher's count is true again (C1-5).
+    pub fn peer_resynced(&mut self, peer: &PublicKey) -> Vec<Effect> {
+        let Some(stale) = self.resyncing.remove(peer) else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        for track in stale {
+            let Some(held) = self.tracks.get(&track) else {
+                continue;
+            };
+            if held.origin == Origin::Remote(peer.clone()) {
+                self.end_track(&track, End::PublisherGone, &mut effects);
+                continue;
+            }
+            let subscriber = held.subscribers.iter().find_map(|subscriber| match subscriber {
+                Subscriber::Node { peer: whose, request } if whose == peer => {
+                    Some(Subscriber::Node {
+                        peer: peer.clone(),
+                        request: *request,
+                    })
+                }
+                _ => None,
+            });
+            if let Some(subscriber) = subscriber {
+                self.drop_subscriber(&track, &subscriber, &mut effects);
+            }
+        }
+        effects
+    }
 }
 
 /// Whether a subscriber joined `group` after its object 0, so it hears nothing of it.
@@ -2337,6 +2423,69 @@ mod tests {
             .iter()
             .filter(|effect| matches!(effect, Effect::Send(_, Out::Object { .. })))
             .count()
+    }
+
+    #[test]
+    fn a_peers_resync_ends_what_it_no_longer_publishes_or_subscribes_to() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let peer = PrivateKey::from_seed(9).public_key();
+            let room = "net#00000000/chat/room";
+            let track = |name: &str| Track {
+                namespace: room.into(),
+                name: name.into(),
+            };
+            let kept = track("kept");
+            let gone = track("gone");
+            let ours_kept = track("ours-kept");
+            let ours_gone = track("ours-gone");
+
+            // The peer publishes two tracks (a local client subscribes to one), and subscribes
+            // to two of ours.
+            state.remote_announced(peer.clone(), kept.clone(), 42, Mode::Stream, 128, true);
+            state.remote_announced(peer.clone(), gone.clone(), 42, Mode::Stream, 128, true);
+            let sub = state
+                .opened(43, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            state.subscribe(sub, 1, gone.clone(), Start::Latest, true);
+            let publisher = state
+                .opened(44, vec![2], super::super::session::unconnected())
+                .expect("the node is not going away");
+            state.publish(publisher, 2, ours_kept.clone(), Mode::Stream, 128, true);
+            state.publish(publisher, 3, ours_gone.clone(), Mode::Stream, 128, true);
+            state.node_subscribed(peer.clone(), 7, &ours_kept, Start::Latest);
+            state.node_subscribed(peer.clone(), 8, &ours_gone, Start::Latest);
+            let subscribed = |state: &State, track: &Track| {
+                state.track(track).unwrap().subscribers.iter().any(|subscriber| {
+                    matches!(subscriber, Subscriber::Node { peer: whose, .. } if *whose == peer)
+                })
+            };
+            assert!(subscribed(&state, &ours_gone), "the peer subscribes to ours");
+
+            // Its control stream reopens: everything it told us is provisional.
+            state.peer_fresh(peer.clone());
+            // Its resync repeats only `kept` and its subscription to `ours_kept`.
+            state.remote_announced(peer.clone(), kept.clone(), 42, Mode::Stream, 128, true);
+            state.node_subscribed(peer.clone(), 9, &ours_kept, Start::Latest);
+            let swept = state.peer_resynced(&peer);
+
+            assert!(state.track(&kept).is_some(), "a re-announced track survives");
+            assert!(state.track(&gone).is_none(), "a track not re-announced ends");
+            assert!(
+                subscribed(&state, &ours_kept),
+                "a re-asked subscription survives"
+            );
+            assert!(
+                !subscribed(&state, &ours_gone),
+                "a subscription not re-asked is dropped, so the publisher's count is true again"
+            );
+            // Only `gone` has a local subscriber, so the one `Ended` is to it.
+            let ended = told(swept)
+                .iter()
+                .any(|control| matches!(control, Control::Ended { reason: End::PublisherGone, .. }));
+            assert!(ended, "the gone track's local subscriber hears it end");
+            let _ = sub;
+        });
     }
 
     #[test]

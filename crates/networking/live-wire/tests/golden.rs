@@ -195,6 +195,7 @@ fn forwards() -> Vec<Forward> {
             request: 5,
             count: 2,
         },
+        Forward::Resynced,
     ]
 }
 

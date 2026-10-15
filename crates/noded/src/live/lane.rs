@@ -58,6 +58,9 @@ pub fn relay<E: crate::Context>(relay: &Relay<E>, relayed: Relayed) {
 /// What one peer's writer is handed.
 enum ToPeer {
     Control(Forward),
+    /// Open the control stream and resync, with nothing else to send: the peer was seated, or
+    /// its fresh control stream asked us to (C1-5).
+    Resync,
     Object {
         header: GroupHeader,
         body: Bytes,
@@ -119,6 +122,8 @@ pub async fn serving<E: crate::Context>(
     strong.spawn(accepting(relay.clone(), streams.clone()));
     strong.spawn(receiving(relay.clone(), datagrams.clone()));
     drop(strong);
+    let mut membership = halo.membership_changed();
+    let mut served = streams.served_changed();
     let mut lanes = Lanes {
         relay,
         halo,
@@ -128,14 +133,28 @@ pub async fn serving<E: crate::Context>(
         dropped,
         peers: HashMap::new(),
     };
-    while let Some(relayed) = queued.recv().await {
-        lanes.dispatch(relayed);
+    // A member seated, or the lane enabled, before this loop began to watch.
+    lanes.reconcile();
+    loop {
+        tokio::select! {
+            relayed = queued.recv() => match relayed {
+                Some(relayed) => lanes.dispatch(relayed),
+                None => return,
+            },
+            changed = membership.changed() => if changed.is_ok() {
+                lanes.reconcile();
+            },
+            changed = served.changed() => if changed.is_ok() {
+                lanes.reconcile();
+            },
+        }
     }
 }
 
 impl<E: crate::Context> Lanes<E> {
     fn dispatch(&mut self, relayed: Relayed) {
         match relayed {
+            Relayed::Resync { to } => self.hand(to, ToPeer::Resync),
             Relayed::Announce {
                 track,
                 by,
@@ -220,7 +239,29 @@ impl<E: crate::Context> Lanes<E> {
         }
     }
 
+    /// The lane's served state or the membership moved. Served: resync to every member, so one
+    /// seated after we last opened to it hears our tracks without a retable or a reconnect.
+    /// Unserved: drop every peer's control stream and end the tracks the mesh published to us,
+    /// so a paused or closed lane is silence, not a stall (W2, W4).
+    fn reconcile(&mut self) {
+        if !self.streams.served() {
+            self.peers.clear();
+            if let Some(relay) = self.relay.upgrade() {
+                relay.step(|state| state.end_all_remote());
+            }
+            return;
+        }
+        for member in self.halo.members().candidates(&self.me, None) {
+            self.hand(member, ToPeer::Resync);
+        }
+    }
+
     fn hand(&mut self, to: PublicKey, item: ToPeer) {
+        // A lane that is not served has no peers to carry anything to; its group fan-out would
+        // otherwise spawn writers that only fail to open.
+        if !self.streams.served() {
+            return;
+        }
         if !self.peers.contains_key(&to) {
             let Some(relay) = self.relay.upgrade() else {
                 return;
@@ -264,9 +305,29 @@ struct PeerLink<E: crate::Context> {
     writing: JoinSet<()>,
 }
 
+/// What `ensure_control` found: the stream is ready to write `forward` on, the resync it led
+/// with already carried `forward`, or the stream could not be opened.
+enum Ensured {
+    Ready,
+    Sent,
+    Failed,
+}
+
 async fn peer_writing<E: crate::Context>(mut link: PeerLink<E>, mut queue: mpsc::Receiver<ToPeer>) {
-    while let Some(item) = queue.recv().await {
-        link.send(item).await;
+    loop {
+        tokio::select! {
+            item = queue.recv() => match item {
+                Some(item) => link.send(item).await,
+                None => return,
+            },
+            // The peer never writes on our outbound control stream, so a read returns only when
+            // the stream is lost: reopen and resync at once, not when we next have something to
+            // send, so a peer that restarts relearns our state without waiting on our traffic.
+            () = link.control_lost() => {
+                link.control = None;
+                let _ = link.ensure_control(None).await;
+            }
+        }
     }
 }
 
@@ -274,6 +335,9 @@ impl<E: crate::Context> PeerLink<E> {
     async fn send(&mut self, item: ToPeer) {
         match item {
             ToPeer::Control(forward) => self.control(&forward).await,
+            ToPeer::Resync => {
+                let _ = self.ensure_control(None).await;
+            }
             ToPeer::Object { header, body } => self.group_object(header, body),
             ToPeer::Group {
                 header,
@@ -297,46 +361,80 @@ impl<E: crate::Context> PeerLink<E> {
         }
     }
 
-    /// One control message over the one control stream kept open to the peer. A stream that
-    /// opens, first or again, carries first what the peer must hear to be in step with us:
-    /// a member that restarted or that we could not reach misses nothing for good.
+    /// One control message to the peer, over the one control stream kept open to it. A stream
+    /// found dead is reopened and resynced once, so a message is never dropped for a stream that
+    /// died since we last wrote: the peer that restarted relearns our state and hears this too.
     async fn control(&mut self, forward: &Forward) {
-        if self.control.is_none() {
-            let opened = self
-                .streams
-                .open(&self.to, Class::Client, &abi::encode(&LaneMeta::Control))
-                .await;
-            match opened {
-                Ok(stream) => {
-                    self.control = Some(stream);
-                    self.attempts = 0;
-                }
-                Err(error) => {
-                    self.attempts += 1;
-                    let worth_a_line =
-                        self.attempts == 1 || self.attempts.is_multiple_of(ATTEMPTS_PER_LINE);
-                    if worth_a_line {
-                        tracing::debug!(target: "ducktape::live", to = %self.to, %error, attempts = self.attempts, reason = "lane_unopened", "the live lane could not reach a member");
+        for _ in 0..2 {
+            match self.ensure_control(Some(forward)).await {
+                Ensured::Sent | Ensured::Failed => return,
+                Ensured::Ready => {
+                    if self.write(forward).await {
+                        return;
                     }
-                    return;
+                    // The write dropped the dead stream; the next pass reopens and resyncs.
                 }
-            }
-            let Some(relay) = self.relay.upgrade() else {
-                return;
-            };
-            let resync = relay.state().resync(&self.to);
-            drop(relay);
-            for forward in &resync {
-                if !self.write(forward).await {
-                    return;
-                }
-            }
-            // The message that opened the stream is often in the resync: once is enough.
-            if resync.contains(forward) {
-                return;
             }
         }
-        self.write(forward).await;
+    }
+
+    /// Makes sure the control stream is open and the peer has our resync. A freshly opened stream
+    /// leads with our every announce and ask, then a `Resynced` marker so the peer ends whatever
+    /// we no longer hold (C1-5). Reports whether it is ready for `forward`, already sent it in
+    /// the resync, or could not be opened.
+    async fn ensure_control(&mut self, forward: Option<&Forward>) -> Ensured {
+        if self.control.is_some() {
+            return Ensured::Ready;
+        }
+        let opened = self
+            .streams
+            .open(&self.to, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await;
+        match opened {
+            Ok(stream) => {
+                self.control = Some(stream);
+                self.attempts = 0;
+            }
+            Err(error) => {
+                self.attempts += 1;
+                let worth_a_line =
+                    self.attempts == 1 || self.attempts.is_multiple_of(ATTEMPTS_PER_LINE);
+                if worth_a_line {
+                    tracing::debug!(target: "ducktape::live", to = %self.to, %error, attempts = self.attempts, reason = "lane_unopened", "the live lane could not reach a member");
+                }
+                return Ensured::Failed;
+            }
+        }
+        let Some(relay) = self.relay.upgrade() else {
+            return Ensured::Failed;
+        };
+        let resync = relay.state().resync(&self.to);
+        drop(relay);
+        for forward in &resync {
+            if !self.write(forward).await {
+                return Ensured::Failed;
+            }
+        }
+        if !self.write(&Forward::Resynced).await {
+            return Ensured::Failed;
+        }
+        // The message that opened the stream is often in the resync: once is enough.
+        match forward.is_some_and(|forward| resync.contains(forward)) {
+            true => Ensured::Sent,
+            false => Ensured::Ready,
+        }
+    }
+
+    /// Resolves only when the control stream is lost; pends forever while there is none, so a
+    /// `select!` falls through to the writer's queue.
+    async fn control_lost(&mut self) {
+        match self.control.as_mut() {
+            None => std::future::pending().await,
+            Some(stream) => {
+                let mut byte = [0u8; 1];
+                let _ = stream.read(&mut byte).await;
+            }
+        }
     }
 
     async fn write(&mut self, forward: &Forward) -> bool {
@@ -488,6 +586,14 @@ async fn read_forward(stream: &mut Stream) -> Option<Forward> {
 async fn control_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
     let from = inbound.from;
     let mut stream = inbound.stream;
+    // A control stream newly opened to us: the peer is new, or restarted and forgot us. Open our
+    // own stream back and resync, and hold what it told us before as provisional until this
+    // stream's own resync repeats it (C1-5).
+    let Some(strong) = relay.upgrade() else {
+        return;
+    };
+    strong.step(|state| state.peer_fresh(from.clone()));
+    drop(strong);
     while let Some(forward) = read_forward(&mut stream).await {
         let Some(relay) = relay.upgrade() else {
             return;
@@ -528,6 +634,7 @@ fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward
         Forward::Count { request, count } => {
             relay.step(|state| state.node_counted(from, request, count))
         }
+        Forward::Resynced => relay.step(|state| state.peer_resynced(from)),
     }
 }
 

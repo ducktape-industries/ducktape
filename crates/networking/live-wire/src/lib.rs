@@ -332,6 +332,10 @@ pub enum Forward {
         request: RequestId,
         count: u32,
     },
+    /// Ends the burst that a freshly opened control stream leads with: every announce and ask
+    /// the sender still holds came before it, so the reader ends whatever this sender told it
+    /// before the stream reopened and did not repeat (C1-5).
+    Resynced,
 }
 
 /// Whether a track name is one the node takes: within its cap, `/`-separated with no empty

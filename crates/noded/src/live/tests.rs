@@ -1657,9 +1657,8 @@ fn a_member_seated_after_a_track_was_published_hears_it_when_the_lane_opens() {
         let first = node(context.child("first"), 1, ledger.clone());
         let second = node(context.child("second"), 2, ledger);
         let early = track("room", "early");
-        let late = track("room", "late");
 
-        // No member is seated: the first track is announced to no one.
+        // No member is seated: the track is announced to no one.
         let (mut alice, _) = Client::open(&first, &alice).await;
         alice.publish(1, early.clone(), Mode::Stream).await;
         for node in [&first, &second] {
@@ -1672,19 +1671,14 @@ fn a_member_seated_after_a_track_was_published_hears_it_when_the_lane_opens() {
         })
         .await;
 
-        // The second track opens the control stream, which carries the first one too.
-        alice.publish(2, late.clone(), Mode::Stream).await;
-        let mut heard = Vec::new();
-        for _ in 0..2 {
-            match bob.recv().await {
-                Control::Announce {
-                    track, up: true, ..
-                } => heard.push(track),
-                other => panic!("an announce: {other:?}"),
-            }
+        // Seating opens the lane between the nodes, and its resync carries the track published
+        // before anyone was seated: no second publish and no reconnect make it cross (W2).
+        match bob.recv().await {
+            Control::Announce {
+                track, up: true, ..
+            } => assert_eq!(track, early),
+            other => panic!("an announce: {other:?}"),
         }
-        heard.sort();
-        assert_eq!(heard, vec![early, late]);
         first.shutdown.send_replace(true);
         second.shutdown.send_replace(true);
     });
