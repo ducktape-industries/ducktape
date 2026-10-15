@@ -3,7 +3,7 @@
 //! under one lock and returns what to send; the sessions' outlets carry it.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -40,7 +40,7 @@ pub struct Opened {
     pub latest: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Subscriber {
     Local {
         session: SessionId,
@@ -141,6 +141,10 @@ pub struct Published {
     pub alias: Alias,
     pub latest: Option<Cached>,
     pub subscribers: Vec<Subscriber>,
+    /// Groups that were in flight when a `Next` subscriber joined: it joined after their object
+    /// 0, so it hears nothing of them and gets the next group whole, from its object 0. MoQ's
+    /// "the next group".
+    skip: HashMap<Subscriber, HashSet<u64>>,
     /// Local subscribers of a remote track whose `Subscribed` waits on the publisher's node's
     /// `Forwarded`, so its `latest` is the publisher's cache, not our still-empty one.
     pending: Vec<(SessionId, RequestId)>,
@@ -683,6 +687,7 @@ impl State {
                 alias,
                 latest: None,
                 subscribers: Vec::new(),
+                skip: HashMap::new(),
                 pending: Vec::new(),
                 node_counts: HashMap::new(),
                 told: 0,
@@ -764,6 +769,7 @@ impl State {
                 alias,
                 latest: None,
                 subscribers: Vec::new(),
+                skip: HashMap::new(),
                 pending: Vec::new(),
                 node_counts: HashMap::new(),
                 told: 0,
@@ -873,6 +879,10 @@ impl State {
         complete: bool,
         effects: &mut Vec<Effect>,
     ) {
+        // A subscriber that never heard this group's objects hears no end of it either (C1-1).
+        if skipped(held, subscriber, group) {
+            return;
+        }
         match subscriber {
             Subscriber::Local { session, .. } => self.send(
                 *session,
@@ -1163,12 +1173,31 @@ impl State {
                 .subscribers
                 .iter()
                 .any(|other| matches!(other, Subscriber::Local { .. }));
+        // A `Next` subscriber joining mid-group hears nothing of the groups in flight: it joined
+        // after their object 0, so it gets the next group whole. A `Latest` subscriber replays
+        // the cached group from its object 0 and continues live, so it skips nothing.
+        if from == Start::Next {
+            let in_flight: HashSet<u64> = held
+                .incoming
+                .iter()
+                .filter(|(_, incoming)| !incoming.abandoned)
+                .map(|(group, _)| *group)
+                .collect();
+            if !in_flight.is_empty() {
+                held.skip.insert(subscriber.clone(), in_flight);
+            }
+        }
         held.subscribers.push(subscriber);
+        let latest = match from {
+            Start::Latest => held.replayable().map(|cached| cached.group),
+            // Nothing is sent first for `Next`, so it knows no caught-up group.
+            Start::Next => None,
+        };
         let opened = Opened {
             alias: held.alias,
             by: held.by,
             mode: held.mode,
-            latest: held.replayable().map(|cached| cached.group),
+            latest,
         };
         if let (Origin::Remote(peer), true) = (&held.origin, first_local) {
             // The forwarding request is our alias of the track: unique here, one per track.
@@ -1307,6 +1336,7 @@ impl State {
         let held = self.tracks.get(track).expect("read above");
         self.group_cut(held, subscriber, effects);
         let held = self.tracks.get_mut(track).expect("read above");
+        held.skip.remove(subscriber);
         let none_local = !held
             .subscribers
             .iter()
@@ -1703,12 +1733,20 @@ impl State {
                 abandoned: false,
             })
             .bytes += body.len();
+        let group = header.group;
         let header = GroupHeader {
             alias: held.alias,
-            group: header.group,
+            group,
             priority: held.priority,
         };
-        for subscriber in held.subscribers.clone() {
+        // A subscriber that joined mid-group hears nothing of that group (C1-1).
+        let hearing: Vec<Subscriber> = held
+            .subscribers
+            .iter()
+            .filter(|subscriber| !skipped(held, subscriber, group))
+            .cloned()
+            .collect();
+        for subscriber in hearing {
             self.metrics.objects_out.inc();
             self.metrics.bytes_out.inc_by(body.len() as u64);
             match subscriber {
@@ -1732,7 +1770,7 @@ impl State {
                 })),
             }
         }
-        self.cache_object(&track, header.group, object, body);
+        self.cache_object(&track, group, object, body);
         effects
     }
 
@@ -1760,6 +1798,11 @@ impl State {
         if let Some(cached) = held.latest.as_mut().filter(|cached| cached.group == group) {
             cached.complete = complete;
         }
+        // The group is over; no subscriber waits to skip it any more.
+        held.skip.retain(|_, groups| {
+            groups.remove(&group);
+            !groups.is_empty()
+        });
         self.group_ended(&track, group, complete, &mut effects);
         effects
     }
@@ -2034,6 +2077,13 @@ impl State {
     }
 }
 
+/// Whether a subscriber joined `group` after its object 0, so it hears nothing of it.
+fn skipped(held: &Published, subscriber: &Subscriber, group: u64) -> bool {
+    held.skip
+        .get(subscriber)
+        .is_some_and(|groups| groups.contains(&group))
+}
+
 /// Whether `namespace` is one of `program`'s rooms.
 fn of_program(namespace: &str, program: &str) -> bool {
     super::grants::place(namespace).is_some_and(|place| place.program == program)
@@ -2266,6 +2316,65 @@ mod tests {
                     "a malformed ask leaves the session idle, not waiting"
                 );
             }
+        });
+    }
+
+    /// How many of a step's effects send an object to a session.
+    fn objects_sent(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Send(_, Out::Object { .. })))
+            .count()
+    }
+
+    #[test]
+    fn a_next_subscriber_that_joins_mid_group_hears_the_next_group_from_its_start() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let publisher = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let doc = Track {
+                namespace: "net#00000000/chat/room".into(),
+                name: "doc".into(),
+            };
+            state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
+            let alias = state.track(&doc).expect("published").alias;
+            let header = |group| GroupHeader {
+                alias,
+                group,
+                priority: 128,
+            };
+            let now = Instant::now();
+            // Group 1 is in flight: its object 0 is out before bob subscribes.
+            state.object(Some(publisher), header(1), 0, Bytes::from_static(b"a"), now);
+
+            let bob = state
+                .opened(43, vec![2], super::super::session::unconnected())
+                .expect("the node is not going away");
+            let subscribed = state.subscribe(bob, 1, doc.clone(), Start::Next, true);
+            assert!(
+                told(subscribed).iter().any(|control| matches!(
+                    control,
+                    Control::Subscribed { latest: None, .. }
+                )),
+                "a Next subscriber knows no caught-up group"
+            );
+
+            // Object 1 of group 1: bob joined after its object 0, so he hears none of it.
+            let tail = state.object(Some(publisher), header(1), 1, Bytes::from_static(b"b"), now);
+            assert_eq!(
+                objects_sent(&tail),
+                0,
+                "bob hears no object of the group he joined mid-way"
+            );
+            // Group 2 from its object 0: bob hears it.
+            let next = state.object(Some(publisher), header(2), 0, Bytes::from_static(b"c"), now);
+            assert_eq!(
+                objects_sent(&next),
+                1,
+                "bob hears the next group from its start"
+            );
         });
     }
 

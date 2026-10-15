@@ -142,8 +142,9 @@ pub enum Control {
         request: RequestId,
         alias: Alias,
     },
-    /// `alias` names the track in data headers; `by` is the account that publishes it;
-    /// `latest` is the group the cache holds, which is sent first.
+    /// `alias` names the track in data headers; `by` is the account that publishes it; `latest`
+    /// is the cached group sent first for a `Latest` subscriber, and `None` for a `Next` one,
+    /// which hears only groups that begin after it subscribed.
     Subscribed {
         request: RequestId,
         alias: Alias,
