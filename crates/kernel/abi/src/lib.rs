@@ -100,6 +100,9 @@ pub struct Roles {
     pub identity: ProgramId,
     pub blobs: ProgramId,
     pub awaits: ProgramId,
+    /// Holds the lane table halo serves: each lane's wire id, class cap and
+    /// whether it is served.
+    pub halo: ProgramId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
@@ -491,6 +494,7 @@ pub mod role {
             Remove { key: Vec<u8> },
             Door { open: bool },
             Programs { op: Vec<u8> },
+            Halo { op: Vec<u8> },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -726,6 +730,108 @@ pub mod role {
             )
         }
     }
+
+    /// The lanes halo carries between members: each named lane's wire id, the
+    /// class its streams are served at most, and whether it is served. Only
+    /// the validators' vote changes the table.
+    pub mod halo {
+        use crate::{BorshDeserialize, BorshSerialize};
+
+        /// The lane byte on the wire: a stream hello's first byte, a
+        /// datagram's first byte.
+        pub type LaneId = u8;
+        pub const MAX_NAME: usize = 64;
+
+        /// The priority a halo stream is served at: Critical outranks
+        /// Member outranks Client.
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            BorshSerialize,
+            BorshDeserialize,
+        )]
+        pub enum Class {
+            Critical,
+            Member,
+            Client,
+        }
+
+        impl Class {
+            pub const COUNT: usize = 3;
+            pub const ALL: [Class; Class::COUNT] = [Class::Critical, Class::Member, Class::Client];
+
+            pub fn rank(self) -> usize {
+                self as usize
+            }
+        }
+
+        impl From<Class> for u8 {
+            fn from(class: Class) -> u8 {
+                class as u8
+            }
+        }
+
+        impl TryFrom<u8> for Class {
+            type Error = u8;
+
+            fn try_from(byte: u8) -> Result<Class, u8> {
+                Class::ALL.get(usize::from(byte)).copied().ok_or(byte)
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Lane {
+            pub name: String,
+            pub id: LaneId,
+            pub cap: Class,
+            pub enabled: bool,
+            /// The block that opened it.
+            pub since: u64,
+        }
+
+        /// Every op is the validators' vote (`Motion::Halo`); a signed frame
+        /// is refused.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Op {
+            /// Lists `name` at the next free id, enabled.
+            Open { name: String, cap: Class },
+            /// Changes the cap and whether the lane is served; the id stays.
+            Set {
+                name: String,
+                cap: Class,
+                enabled: bool,
+            },
+            /// Unlists `name`; its id is never handed out again.
+            Close { name: String },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Query {
+            /// Every listed lane, in id order.
+            Lanes,
+            Lane {
+                name: String,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Reply {
+            Lanes(Vec<Lane>),
+            Lane(Option<Lane>),
+        }
+
+        /// The founding lanes, listed in order from id 0.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Genesis {
+            pub lanes: Vec<(String, Class)>,
+        }
+    }
 }
 
 pub fn encode<T: BorshSerialize>(value: &T) -> Vec<u8> {
@@ -814,6 +920,15 @@ mod tests {
     }
 
     #[test]
+    fn a_class_survives_its_byte() {
+        use role::halo::Class;
+        for class in Class::ALL {
+            assert_eq!(Class::try_from(u8::from(class)), Ok(class));
+        }
+        assert_eq!(Class::try_from(3), Err(3));
+    }
+
+    #[test]
     fn every_envelope_round_trips() {
         let env = Env {
             network: b"n".to_vec(),
@@ -828,6 +943,7 @@ mod tests {
                 identity: "i".into(),
                 blobs: "b".into(),
                 awaits: "a".into(),
+                halo: "h".into(),
             },
             cause: Cause::Completion {
                 item: ItemRef {

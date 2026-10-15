@@ -23,6 +23,7 @@ const IDENTITY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_ident
 const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
 const BLOBS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_halo.wasm");
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
@@ -200,6 +201,9 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("identity.wasm"), IDENTITY).unwrap();
     std::fs::write(root.join("blobs.wasm"), BLOBS).unwrap();
     std::fs::write(root.join("awaits.wasm"), AWAITS).unwrap();
+    std::fs::write(root.join("halo.wasm"), HALO).unwrap();
+    let lanes = abi::role::halo::Genesis { lanes: Vec::new() };
+    std::fs::write(root.join("halo.params"), abi::encode(&lanes)).unwrap();
     let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
     let holders = vec![(putter.public_key().as_ref().to_vec(), PUTTER_ACCOUNT)];
     std::fs::write(root.join("holders.bin"), abi::encode(&holders)).unwrap();
@@ -209,7 +213,7 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
          block_time_ms = {BLOCK_TIME_MS}\nmember_cap = {MEMBER_CAP}\n\
          [roles]\nprograms = \"programs\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
-         blobs = \"blobs\"\nawaits = \"awaits\"\n\
+         blobs = \"blobs\"\nawaits = \"awaits\"\nhalo = \"halo\"\n\
          {validators}\
          [[programs]]\nid = \"programs\"\ncode = \"programs.wasm\"\n\
          [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\n\
@@ -217,7 +221,8 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
          [[programs]]\nid = \"blobs\"\ncode = \"blobs.wasm\"\n\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n\
-         [[programs]]\nid = \"awaits\"\ncode = \"awaits.wasm\"\n"
+         [[programs]]\nid = \"awaits\"\ncode = \"awaits.wasm\"\n\
+         [[programs]]\nid = \"halo\"\ncode = \"halo.wasm\"\nparams = \"halo.params\"\n"
     );
     let path = root.join("genesis.toml");
     std::fs::write(&path, text).unwrap();
@@ -306,6 +311,7 @@ fn a_validator_serves_its_network_over_http() {
             "the genesis digest a client salts the network name with"
         );
         assert_eq!(status.roles.validators, "valset");
+        assert_eq!(status.roles.halo, "halo");
 
         let landing = frame(&client, &alice, vec![Step::Fail("landed".into())]).await;
         let (height, receipt) = client

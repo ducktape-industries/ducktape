@@ -2,7 +2,7 @@ use abi::{ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Receipt, Tip};
 
-pub const NODE_CONTRACT: u32 = 5;
+pub const NODE_CONTRACT: u32 = 6;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {

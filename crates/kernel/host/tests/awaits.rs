@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use abi::role::awaits::{self, Answer, Ticket, TicketRow};
-use abi::role::{programs, validators};
+use abi::role::{halo, programs, validators};
 use abi::{BlobId, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, reason};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Finished, Plan};
@@ -23,6 +23,7 @@ const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
 const AWAITER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaiter.wasm");
 const ORACLE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_oracle.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
@@ -50,6 +51,7 @@ fn genesis() -> Genesis {
             identity: "identity".into(),
             blobs: "blobs".into(),
             awaits: "awaits".into(),
+            halo: "halo".into(),
         },
         validators: vec![validators::Member {
             key: b"v1".to_vec(),
@@ -74,6 +76,11 @@ fn genesis() -> Genesis {
             founding("oracle", ORACLE, Vec::new()),
             founding("echo", RELAY, Vec::new()),
             founding("ping", RELAY, Vec::new()),
+            founding(
+                "halo",
+                HALO,
+                abi::encode(&halo::Genesis { lanes: Vec::new() }),
+            ),
         ],
         views: Vec::new(),
         hooks: Vec::new(),
