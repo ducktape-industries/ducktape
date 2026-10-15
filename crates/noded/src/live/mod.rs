@@ -216,17 +216,6 @@ impl<E: crate::Context> Relay<E> {
         Step::Done
     }
 
-    /// A proven session joins the table and is welcomed in the one step, under the lock
-    /// `go_away` takes: a session hears its welcome before any GoAway.
-    fn welcomed(
-        &self,
-        account: Account,
-        key: Vec<u8>,
-        link: &Link,
-    ) -> Result<SessionId, GoingAway> {
-        self.step_to(|state| state.welcome(account, key, link.outlet.clone(), link.datagrams))
-    }
-
     fn deliver(&self, outlet: &Outlet, out: Out) {
         match outlet.send(out) {
             Sent::Queued => {}
@@ -600,7 +589,11 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
     let Some(strong) = relay.upgrade() else {
         return link.outlet.close("relay_gone");
     };
-    let id = match strong.welcomed(account, key, &link) {
+    // Joined and welcomed in the one step, under the lock `go_away` takes: a session hears its
+    // welcome before any GoAway.
+    let welcomed =
+        strong.step_to(|state| state.welcome(account, key, link.outlet.clone(), link.datagrams));
+    let id = match welcomed {
         Ok(id) => id,
         Err(GoingAway { in_ms }) => return going_away(&link, in_ms),
     };

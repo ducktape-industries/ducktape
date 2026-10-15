@@ -386,16 +386,17 @@ impl State {
 
     // ---- sessions ----
 
-    /// A proven session takes its place, unless the node is going away: then it hears what the
-    /// open sessions heard.
-    pub fn opened(
+    /// A proven session takes its place and hears its welcome, unless the node is going away:
+    /// then it hears what the open sessions heard.
+    pub fn welcome(
         &mut self,
         account: Account,
         key: Vec<u8>,
         outlet: Outlet,
-    ) -> Result<SessionId, GoingAway> {
+        datagrams: bool,
+    ) -> (Result<SessionId, GoingAway>, Vec<Effect>) {
         if let Some(in_ms) = self.going_away {
-            return Err(GoingAway { in_ms });
+            return (Err(GoingAway { in_ms }), Vec::new());
         }
         let id = self.next_session;
         self.next_session += 1;
@@ -404,33 +405,18 @@ impl State {
             Session {
                 account,
                 key,
-                outlet,
+                outlet: outlet.clone(),
                 published: HashMap::new(),
                 subscribed: HashMap::new(),
                 watching: HashMap::new(),
                 waiting: HashMap::new(),
             },
         );
-        Ok(id)
-    }
-
-    /// A proven session joins the table and hears its welcome, or hears why not.
-    pub fn welcome(
-        &mut self,
-        account: Account,
-        key: Vec<u8>,
-        outlet: Outlet,
-        datagrams: bool,
-    ) -> (Result<SessionId, GoingAway>, Vec<Effect>) {
-        let opened = self.opened(account, key, outlet.clone());
-        let effects = match &opened {
-            Ok(_) => vec![Effect::Send(
-                outlet,
-                Out::Control(Control::Welcome(Welcome { account, datagrams })),
-            )],
-            Err(_) => Vec::new(),
-        };
-        (opened, effects)
+        let welcome = Effect::Send(
+            outlet,
+            Out::Control(Control::Welcome(Welcome { account, datagrams })),
+        );
+        (Ok(id), vec![welcome])
     }
 
     /// The session sent what is not the wire: it hears a refusal and is closed for it.
@@ -2545,7 +2531,8 @@ mod tests {
     fn a_re_check_of_an_ask_the_client_withdrew_answers_nothing_under_its_id() {
         let mut state = state();
         let alice = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let doc = Track {
             namespace: "net#00000000/chat/room".into(),
@@ -2596,7 +2583,8 @@ mod tests {
     fn an_ask_in_a_room_less_namespace_is_refused_malformed_and_does_not_pin_the_session() {
         let mut state = state();
         let alice = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         // `<chain>/<program>` with no room, and `<chain>//room` with an empty program: each
         // is not a namespace, so it is refused for good, not held for a grant.
@@ -2635,7 +2623,8 @@ mod tests {
     fn a_publishers_revoked_grant_ends_it_and_tells_publisher_and_subscriber_apart() {
         let mut state = state();
         let publisher = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let doc = Track {
             namespace: "net#00000000/chat/room".into(),
@@ -2643,7 +2632,8 @@ mod tests {
         };
         state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
         let bob = state
-            .opened(43, vec![2], super::super::session::unconnected())
+            .welcome(43, vec![2], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         state.subscribe(bob, 1, doc.clone(), Start::Latest, true);
 
@@ -2712,7 +2702,8 @@ mod tests {
         let mut state = state();
         let namespace = "net#00000000/chat/room".to_string();
         let publisher = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let presence = Track {
             namespace: namespace.clone(),
@@ -2725,7 +2716,8 @@ mod tests {
         state.publish(publisher, 1, presence, Mode::Stream, 128, true);
         state.publish(publisher, 2, doc.clone(), Mode::Stream, 128, true);
         let watcher = state
-            .opened(43, vec![2], super::super::session::unconnected())
+            .welcome(43, vec![2], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         // Watching only `presence/*`: `doc` is up but unheard.
         state.watch(
@@ -2774,11 +2766,13 @@ mod tests {
         state.remote_announced(peer.clone(), kept.clone(), 42, Mode::Stream, 128, true);
         state.remote_announced(peer.clone(), gone.clone(), 42, Mode::Stream, 128, true);
         let sub = state
-            .opened(43, vec![1], super::super::session::unconnected())
+            .welcome(43, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         state.subscribe(sub, 1, gone.clone(), Start::Latest, true);
         let publisher = state
-            .opened(44, vec![2], super::super::session::unconnected())
+            .welcome(44, vec![2], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         state.publish(publisher, 2, ours_kept.clone(), Mode::Stream, 128, true);
         state.publish(publisher, 3, ours_gone.clone(), Mode::Stream, 128, true);
@@ -2840,7 +2834,13 @@ mod tests {
 
     fn open(state: &mut State, account: Account, key: u8) -> SessionId {
         state
-            .opened(account, vec![key], super::super::session::unconnected())
+            .welcome(
+                account,
+                vec![key],
+                super::super::session::unconnected(),
+                false,
+            )
+            .0
             .expect("the node is not going away")
     }
 
@@ -2884,10 +2884,12 @@ mod tests {
                 .collect()
         }
         let old = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let sub = state
-            .opened(43, vec![2], super::super::session::unconnected())
+            .welcome(43, vec![2], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let published = state.publish(old, 1, doc.clone(), Mode::Stream, 128, true);
         let alias = state.track(&doc).unwrap().alias;
@@ -2908,7 +2910,8 @@ mod tests {
 
         // The same account publishes the track again from a new session.
         let new = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let handed = state.publish(new, 5, doc.clone(), Mode::Stream, 128, true);
         let lane_items = lanes(&handed);
@@ -3036,7 +3039,8 @@ mod tests {
         };
         state.remote_announced(peer.clone(), doc.clone(), 42, Mode::Stream, 128, true);
         let sub = state
-            .opened(43, vec![1], super::super::session::unconnected())
+            .welcome(43, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         state.subscribe(sub, 1, doc.clone(), Start::Next, true);
         // The publisher's node hands the track over there and announces it again, higher.
@@ -3335,7 +3339,8 @@ mod tests {
     fn a_next_subscriber_that_joins_mid_group_hears_the_next_group_from_its_start() {
         let mut state = state();
         let publisher = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let doc = Track {
             namespace: "net#00000000/chat/room".into(),
@@ -3348,7 +3353,8 @@ mod tests {
         state.object(Some(publisher), header(1), 0, Bytes::from_static(b"a"));
 
         let bob = state
-            .opened(43, vec![2], super::super::session::unconnected())
+            .welcome(43, vec![2], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let subscribed = state.subscribe(bob, 1, doc.clone(), Start::Next, true);
         assert!(
@@ -3378,7 +3384,8 @@ mod tests {
     fn a_large_cached_group_replays_as_one_unit_not_one_send_per_object() {
         let mut state = state();
         let publisher = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let doc = Track {
             namespace: "net#00000000/chat/room".into(),
@@ -3399,7 +3406,8 @@ mod tests {
         state.group_end(Some(publisher), alias, 1, true);
 
         let bob = state
-            .opened(43, vec![2], super::super::session::unconnected())
+            .welcome(43, vec![2], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let effects = state.subscribe(bob, 1, doc, Start::Latest, true);
         let objects: usize = effects
@@ -3428,7 +3436,8 @@ mod tests {
     fn a_node_that_asks_again_hears_the_answer_and_no_second_replay() {
         let mut state = state();
         let publisher = state
-            .opened(42, vec![1], super::super::session::unconnected())
+            .welcome(42, vec![1], super::super::session::unconnected(), false)
+            .0
             .expect("the node is not going away");
         let doc = Track {
             namespace: "net#00000000/chat/room".into(),
