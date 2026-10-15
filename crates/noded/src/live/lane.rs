@@ -13,8 +13,7 @@ use commonware_cryptography::ed25519::PublicKey;
 use commonware_runtime::telemetry::metrics::Counter;
 use halo::{Carried, Class, Halo, Inbound, Links, Paced};
 use live_wire::{
-    Alias, Code, DatagramHeader, End, Forward, GROUP_COMPLETE, GroupHeader, LANE, LaneMeta,
-    MAX_STREAM_OBJECT, RequestId,
+    Alias, DatagramHeader, Forward, GROUP_COMPLETE, GroupHeader, LANE, LaneMeta, MAX_STREAM_OBJECT,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
@@ -50,7 +49,7 @@ pub fn queue() -> (Queue, mpsc::Receiver<Relayed>) {
 }
 
 /// A step's lane effect, queued for the lane task; dropped and counted when the lane is behind.
-pub fn relay<E: super::Context>(relay: &Relay<E>, relayed: Relayed) {
+pub fn relay<E: crate::Context>(relay: &Relay<E>, relayed: Relayed) {
     if relay.lane.try_send(relayed).is_err() {
         relay.metrics.dropped_behind.inc();
     }
@@ -80,7 +79,7 @@ enum GroupOut {
 }
 
 /// The dispatcher: one bounded queue per peer, fed without waiting.
-struct Lanes<E: super::Context> {
+struct Lanes<E: crate::Context> {
     relay: Weak<Relay<E>>,
     halo: Arc<Halo>,
     me: PublicKey,
@@ -90,7 +89,7 @@ struct Lanes<E: super::Context> {
     peers: HashMap<PublicKey, mpsc::Sender<ToPeer>>,
 }
 
-pub async fn serving<E: super::Context>(
+pub async fn serving<E: crate::Context>(
     relay: Weak<Relay<E>>,
     halo: Arc<Halo>,
     me: PublicKey,
@@ -128,7 +127,7 @@ pub async fn serving<E: super::Context>(
     }
 }
 
-impl<E: super::Context> Lanes<E> {
+impl<E: crate::Context> Lanes<E> {
     fn dispatch(&mut self, relayed: Relayed) {
         match relayed {
             Relayed::Announce {
@@ -230,7 +229,7 @@ impl<E: super::Context> Lanes<E> {
 }
 
 /// One peer's writer: the control stream to it, and its open group streams.
-struct PeerLink<E: super::Context> {
+struct PeerLink<E: crate::Context> {
     relay: Weak<Relay<E>>,
     streams: Arc<Streams>,
     datagrams: Arc<Datagrams>,
@@ -245,13 +244,13 @@ struct PeerLink<E: super::Context> {
     writing: JoinSet<()>,
 }
 
-async fn peer_writing<E: super::Context>(mut link: PeerLink<E>, mut queue: mpsc::Receiver<ToPeer>) {
+async fn peer_writing<E: crate::Context>(mut link: PeerLink<E>, mut queue: mpsc::Receiver<ToPeer>) {
     while let Some(item) = queue.recv().await {
         link.send(item).await;
     }
 }
 
-impl<E: super::Context> PeerLink<E> {
+impl<E: crate::Context> PeerLink<E> {
     async fn send(&mut self, item: ToPeer) {
         match item {
             ToPeer::Control(forward) => self.control(&forward).await,
@@ -393,7 +392,7 @@ fn cut_short(stream: Stream) {
     stream.into_inner().reset();
 }
 
-async fn accepting<E: super::Context>(relay: Weak<Relay<E>>, streams: Arc<Streams>) {
+async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, streams: Arc<Streams>) {
     while let Some(inbound) = streams.accept().await {
         let Ok(meta) = abi::decode::<LaneMeta>(&inbound.meta) else {
             continue;
@@ -417,32 +416,21 @@ async fn read_forward(stream: &mut Stream) -> Option<Forward> {
 }
 
 /// A peer's control stream: its announces, its asks for our tracks, and its answers to ours.
-/// What it wants back goes over our control stream to it.
-async fn control_reading<E: super::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
+/// What it wants back is a `Relayed::Answer` a step emits, carried over our control stream to it.
+async fn control_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
     let from = inbound.from;
     let mut stream = inbound.stream;
     while let Some(forward) = read_forward(&mut stream).await {
         let Some(relay) = relay.upgrade() else {
             return;
         };
-        if let Some(answer) = heard(&relay, &from, forward) {
-            self::relay(
-                &relay,
-                Relayed::Answer {
-                    to: from.clone(),
-                    forward: answer,
-                },
-            );
-        }
+        heard(&relay, &from, forward);
     }
 }
 
-/// One message from a peer, applied; the answer it wants back, if any.
-fn heard<E: super::Context>(
-    relay: &Relay<E>,
-    from: &PublicKey,
-    forward: Forward,
-) -> Option<Forward> {
+/// One message from a peer, applied: each kind is one step, which decides and delivers under the
+/// one lock, the answer a node's `Subscribe` wants among the effects it returns.
+fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward) {
     match forward {
         Forward::Announce {
             track,
@@ -450,74 +438,34 @@ fn heard<E: super::Context>(
             mode,
             priority,
             up,
-        } => {
-            relay.step(|state| state.remote_announced(from.clone(), track, by, mode, priority, up));
-            None
-        }
+        } => relay.step(|state| state.remote_announced(from.clone(), track, by, mode, priority, up)),
         Forward::Subscribe {
             request,
             track,
             from: start,
-        } => {
-            // The replay is delivered under the lock it was decided under, as a step's is.
-            let mut state = relay.state();
-            let answered = state.node_subscribed(from.clone(), request, &track, start);
-            match answered {
-                Ok((opened, effects)) => {
-                    relay.perform(effects);
-                    Some(Forward::Forwarded {
-                        request,
-                        alias: opened.alias,
-                        by: opened.by,
-                        mode: opened.mode,
-                        latest: opened.latest,
-                    })
-                }
-                Err(code) => Some(Forward::Refused { request, code }),
-            }
-        }
+        } => relay.step(|state| state.node_subscribed(from.clone(), request, &track, start)),
         Forward::Unsubscribe { request } => {
-            relay.step(|state| state.node_unsubscribed(from, request));
-            None
+            relay.step(|state| state.node_unsubscribed(from, request))
         }
         // The answer names the alias we asked with; the data already resolves by it.
-        Forward::Forwarded { .. } => None,
+        Forward::Forwarded { request, latest } => {
+            relay.step(|state| state.node_forwarded(from, request, latest))
+        }
         Forward::Ended { request, reason } => {
-            ended(relay, from, request, reason);
-            None
+            relay.step(|state| state.node_ended(from, request, reason))
         }
         Forward::Refused { request, code } => {
-            let reason = match code {
-                Code::NotGranted => End::GrantRevoked,
-                Code::NoAccount
-                | Code::BadProof
-                | Code::Unknown
-                | Code::Duplicate
-                | Code::TooLarge
-                | Code::Malformed => End::PublisherGone,
-            };
-            ended(relay, from, request, reason);
-            None
+            relay.step(|state| state.node_refused(from, request, code))
         }
         Forward::Count { request, count } => {
-            relay.step(|state| state.node_counted(from, request, count));
-            None
+            relay.step(|state| state.node_counted(from, request, count))
         }
     }
 }
 
-fn ended<E: super::Context>(relay: &Relay<E>, from: &PublicKey, request: RequestId, reason: End) {
-    let mut state = relay.state();
-    let Some(track) = state.remote_request(from, request) else {
-        return;
-    };
-    let effects = state.end_remote(&track, reason);
-    relay.perform(effects);
-}
-
 /// One group a peer forwards to us: its objects fan out here as a local publisher's would. The
 /// group is complete when `GROUP_COMPLETE` ends it; an end without it is a group cut short.
-async fn group_reading<E: super::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
+async fn group_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
     let from = inbound.from;
     let mut stream = inbound.stream;
     let mut header = [0u8; 13];
@@ -562,7 +510,7 @@ async fn group_reading<E: super::Context>(relay: Weak<Relay<E>>, inbound: Inboun
     relay.step(|state| state.group_end(None, alias, header.group, complete));
 }
 
-async fn receiving<E: super::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Datagrams>) {
+async fn receiving<E: crate::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Datagrams>) {
     loop {
         let (from, bytes) = datagrams.recv().await;
         let mut bytes = Bytes::from(bytes);

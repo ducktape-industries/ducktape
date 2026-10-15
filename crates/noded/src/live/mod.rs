@@ -31,15 +31,10 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 pub use grants::Chain;
-use grants::{Act, Grants, covered, place, watch_patterns};
+use grants::{Grants, place};
 pub use session::ws_upgrade;
 use session::{Inbound, Link, Out, Outlet, Sent};
 use tracks::{Ask, Effect, GoingAway, SessionId, State};
-
-/// What the relay needs of the node's runtime: the node's own context.
-pub trait Context: crate::Context {}
-
-impl<E> Context for E where E: crate::Context {}
 
 /// The control stream and the proof must arrive this soon after the connection.
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
@@ -74,7 +69,7 @@ struct Dirty {
     identity: bool,
 }
 
-pub struct Relay<E: Context> {
+pub struct Relay<E: crate::Context> {
     context: E,
     network: Network,
     grants: Grants,
@@ -94,7 +89,7 @@ pub struct Relay<E: Context> {
     tasks: Mutex<JoinSet<()>>,
 }
 
-impl<E: Context> Relay<E> {
+impl<E: crate::Context> Relay<E> {
     /// The relay, with its QUIC door bound at `live` when one is given.
     pub fn start(
         context: E,
@@ -218,12 +213,14 @@ impl<E: Context> Relay<E> {
     }
 
     /// Everything a step decided, delivered: a session's outlet takes it or is closed as behind.
-    /// It takes no lock of the relay's, so a step delivers under the state lock.
+    /// It takes no lock of the relay's, so a step delivers under the state lock. Only `step`
+    /// calls it, so nothing decides and delivers but the one place.
     fn perform(&self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
                 Effect::Send(outlet, out) => self.deliver(&outlet, out),
                 Effect::Lane(relayed) => lane::relay(self, relayed),
+                Effect::Close(outlet, reason) => outlet.close(reason),
             }
         }
     }
@@ -346,7 +343,7 @@ impl<E: Context> Relay<E> {
 }
 
 /// The relay's metrics, registered on the node's context.
-fn metrics<E: Context>(context: &E) -> tracks::Metrics {
+fn metrics<E: crate::Context>(context: &E) -> tracks::Metrics {
     tracks::Metrics {
         sessions: context.register("live_sessions", "live sessions open", Gauge::default()),
         tracks: context.register(
@@ -406,7 +403,7 @@ fn door(identity: &PrivateKey, at: SocketAddr) -> Result<quinn::Endpoint, halo::
     Ok(quinn::Endpoint::server(server, at)?)
 }
 
-async fn accepting<E: Context>(relay: Weak<Relay<E>>, door: quinn::Endpoint) {
+async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, door: quinn::Endpoint) {
     while let Some(incoming) = door.accept().await {
         let Some(strong) = relay.upgrade() else {
             return;
@@ -419,7 +416,7 @@ async fn accepting<E: Context>(relay: Weak<Relay<E>>, door: quinn::Endpoint) {
     }
 }
 
-async fn serve_quic<E: Context>(
+async fn serve_quic<E: crate::Context>(
     relay: Weak<Relay<E>>,
     incoming: quinn::Incoming,
     pacer: halo::Pacer,
@@ -453,7 +450,7 @@ async fn next_control(link: &mut Link) -> Option<Control> {
 
 /// Hello, challenge, proof: the key named in the hello signs the chain, this node, the nonce
 /// and itself, and the identity role names the account it acts as.
-async fn handshake<E: Context>(relay: &Relay<E>, link: &mut Link) -> Handshake {
+async fn handshake<E: crate::Context>(relay: &Relay<E>, link: &mut Link) -> Handshake {
     let Some(Control::Hello(hello)) = next_control(link).await else {
         return Handshake::Gone;
     };
@@ -532,7 +529,7 @@ fn going_away(link: &Link, in_ms: u32) {
 
 /// One session, from its handshake to its close. The relay is held only while a step runs, so
 /// an open client never keeps a dropped relay alive.
-async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
+async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
     let Some(strong) = relay.upgrade() else {
         return;
     };
@@ -618,7 +615,7 @@ async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
 /// the ones no longer granted end with `GrantRevoked`; a watcher hears through its new
 /// patterns; every ask waiting in the program is asked again, and one a grant now covers is
 /// answered; a session whose key acts as no account any more is closed.
-async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
+async fn rechecking<E: crate::Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
     loop {
         rechecks.notified().await;
         let Some(relay) = relay.upgrade() else {
@@ -632,26 +629,14 @@ async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
         );
         for program in &dirty.programs {
             let requests = relay.state().requests_in(program);
-            for (id, request, track, act) in requests {
+            for (id, request, held) in requests {
                 let Some(account) = relay.state().session(id).map(|session| session.account) else {
                     continue;
                 };
-                let decided = relay.decided(account, &track.namespace).await;
-                match act {
-                    Act::Watch => match watch_patterns(decided.grant.as_ref(), account) {
-                        Some(patterns) => relay.step(|state| state.rewatch(id, request, patterns)),
-                        None => relay.step(|state| state.revoke(id, request)),
-                    },
-                    Act::Publish | Act::Subscribe => {
-                        let granted = decided
-                            .grant
-                            .as_ref()
-                            .is_some_and(|grant| covered(grant, act, &track.name, account));
-                        if !granted {
-                            relay.step(|state| state.revoke(id, request));
-                        }
-                    }
-                }
+                let decided = relay.decided(account, held.namespace()).await;
+                // The held thing may have changed under the id while the grant was read; the
+                // step re-reads it and acts only if it still names what the re-check saw.
+                relay.step(|state| state.rechecked(id, request, &held, decided.grant.as_ref()));
             }
             let waiting = relay.state().waiting_in(program);
             for (id, request, ask) in waiting {
@@ -662,37 +647,27 @@ async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
             }
         }
         if dirty.identity {
-            let sessions: Vec<(SessionId, Vec<u8>, Account, Outlet)> = relay
+            let sessions: Vec<(SessionId, Vec<u8>, Account)> = relay
                 .state()
                 .sessions()
-                .map(|(id, session)| {
-                    (
-                        id,
-                        session.key.clone(),
-                        session.account,
-                        session.outlet.clone(),
-                    )
-                })
+                .map(|(id, session)| (id, session.key.clone(), session.account))
                 .collect();
-            for (_, key, account, outlet) in sessions {
+            for (id, key, account) in sessions {
                 let still = relay.grants.account(&key).await == Some(account);
                 if !still {
-                    outlet.close("no_account");
+                    relay.step(|state| state.close_session(id, "no_account"));
                 }
             }
         }
     }
 }
 
-/// The node is going away: every session hears `GoAway`, then is closed, in that order, so the
-/// word is queued before the close the writer honors.
-async fn closing<E: Context>(relay: Weak<Relay<E>>, mut shutdown: watch::Receiver<bool>) {
+/// The node is going away: in one step every session hears `GoAway`, then is closed, in that
+/// order, so the word is queued before the close the writer honors.
+async fn closing<E: crate::Context>(relay: Weak<Relay<E>>, mut shutdown: watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|down| *down).await;
     let Some(relay) = relay.upgrade() else {
         return;
     };
     relay.step(|state| state.go_away(GOAWAY_MS));
-    for outlet in relay.state().outlets() {
-        outlet.close("node_closing");
-    }
 }

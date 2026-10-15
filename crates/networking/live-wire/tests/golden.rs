@@ -185,9 +185,6 @@ fn forwards() -> Vec<Forward> {
         Forward::Unsubscribe { request: 5 },
         Forward::Forwarded {
             request: 5,
-            alias: 8,
-            by: 42,
-            mode: Mode::Stream,
             latest: Some(11),
         },
         Forward::Ended {

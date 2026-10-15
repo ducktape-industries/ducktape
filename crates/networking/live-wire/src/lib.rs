@@ -308,11 +308,12 @@ pub enum Forward {
     Unsubscribe {
         request: RequestId,
     },
+    /// The publisher's node took our forwarding ask: `latest` is the group its cache holds now,
+    /// which the asking node answers its first local subscriber's `Subscribed` with. The alias
+    /// is the one we asked with and the publisher and mode came with the `Announce`, so the ack
+    /// carries only what the asking node did not already know.
     Forwarded {
         request: RequestId,
-        alias: Alias,
-        by: Account,
-        mode: Mode,
         latest: Option<u64>,
     },
     Ended {

@@ -52,11 +52,14 @@ pub enum Subscriber {
     },
 }
 
-/// What is sent as a step's outcome: to a session here, or over the live lane to a node.
+/// What is sent as a step's outcome: to a session here, over the live lane to a node, or an
+/// outlet closed. Closing is an effect like any other, so its order against the sends before it
+/// is owned by the one executor (a `GoAway` is queued before the close that follows it).
 #[derive(Debug)]
 pub enum Effect {
     Send(Outlet, Out),
     Lane(Relayed),
+    Close(Outlet, &'static str),
 }
 
 /// What the live lane carries for a step: announces to every member, and a group's objects or a
@@ -138,6 +141,9 @@ pub struct Published {
     pub alias: Alias,
     pub latest: Option<Cached>,
     pub subscribers: Vec<Subscriber>,
+    /// Local subscribers of a remote track whose `Subscribed` waits on the publisher's node's
+    /// `Forwarded`, so its `latest` is the publisher's cache, not our still-empty one.
+    pending: Vec<(SessionId, RequestId)>,
     /// Subscribers behind each node that forwards this track, by that node's request.
     pub node_counts: HashMap<PublicKey, u32>,
     /// The count the publisher was last told, so it hears every change once.
@@ -187,6 +193,24 @@ impl Watcher {
         self.patterns
             .iter()
             .any(|pattern| pattern_covers(pattern, name))
+    }
+}
+
+/// What one of a session's requests holds: a published track, a subscription, or a watched
+/// namespace. The thing a grant re-check reads and a revoke ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Held {
+    Published(Track),
+    Subscribed(Track),
+    Watching(String),
+}
+
+impl Held {
+    pub fn namespace(&self) -> &str {
+        match self {
+            Held::Published(track) | Held::Subscribed(track) => &track.namespace,
+            Held::Watching(namespace) => namespace,
+        }
     }
 }
 
@@ -376,13 +400,6 @@ impl State {
         Ok(id)
     }
 
-    pub fn outlets(&self) -> Vec<Outlet> {
-        self.sessions
-            .values()
-            .map(|session| session.outlet.clone())
-            .collect()
-    }
-
     /// The session is gone: its tracks end, its subscriptions and watches drop.
     pub fn closed(&mut self, id: SessionId) -> Vec<Effect> {
         let mut effects = Vec::new();
@@ -409,19 +426,30 @@ impl State {
         effects
     }
 
-    /// Every session hears the node is going away, and every one proven from now on; the caller
-    /// closes them once it is sent.
+    /// Every session hears the node is going away, and every one proven from now on, then is
+    /// closed. The `GoAway` is queued before the close, so the writer puts it out first.
     pub fn go_away(&mut self, in_ms: u32) -> Vec<Effect> {
         self.going_away = Some(in_ms);
         self.sessions
             .values()
-            .map(|session| {
-                Effect::Send(
-                    session.outlet.clone(),
-                    Out::Control(Control::GoAway { in_ms }),
-                )
+            .flat_map(|session| {
+                [
+                    Effect::Send(
+                        session.outlet.clone(),
+                        Out::Control(Control::GoAway { in_ms }),
+                    ),
+                    Effect::Close(session.outlet.clone(), "node_closing"),
+                ]
             })
             .collect()
+    }
+
+    /// The outlet of one session, to close it from a step (a re-check whose key acts as no
+    /// account any more).
+    pub fn close_session(&self, id: SessionId, reason: &'static str) -> Vec<Effect> {
+        self.outlet(id)
+            .map(|outlet| vec![Effect::Close(outlet, reason)])
+            .unwrap_or_default()
     }
 
     // ---- publish ----
@@ -647,6 +675,7 @@ impl State {
                 alias,
                 latest: None,
                 subscribers: Vec::new(),
+                pending: Vec::new(),
                 node_counts: HashMap::new(),
                 told: 0,
                 incoming: BTreeMap::new(),
@@ -727,6 +756,7 @@ impl State {
                 alias,
                 latest: None,
                 subscribers: Vec::new(),
+                pending: Vec::new(),
                 node_counts: HashMap::new(),
                 told: 0,
                 incoming: BTreeMap::new(),
@@ -783,6 +813,12 @@ impl State {
                 );
             }
         }
+        // The publisher's grant being taken back is the publisher's news; to a subscriber, whose
+        // own grant is intact, the track simply has no publisher any more.
+        let to_subscribers = match reason {
+            End::GrantRevoked => End::PublisherGone,
+            End::TrackEnded | End::PublisherGone | End::NodeClosing => reason,
+        };
         for subscriber in &held.subscribers {
             self.group_cut(&held, subscriber, effects);
             match subscriber {
@@ -794,7 +830,7 @@ impl State {
                         *session,
                         Control::Ended {
                             request: *request,
-                            reason,
+                            reason: to_subscribers,
                         },
                         effects,
                     );
@@ -802,7 +838,7 @@ impl State {
                 Subscriber::Node { peer, request } => effects.push(Effect::Lane(Relayed::Ended {
                     to: peer.clone(),
                     request: *request,
-                    reason,
+                    reason: to_subscribers,
                 })),
             }
         }
@@ -924,6 +960,16 @@ impl State {
             return self.unanswered(id, request, ask, code);
         }
         self.unwait(id, request, &ask);
+        // A remote track's first local subscriber is answered when the publisher's node answers
+        // our forwarding ask (`node_forwarded`): its `Subscribed.latest` is the publisher's
+        // cache, and its replay comes over the lane, not from our empty one.
+        let held = self.tracks.get(&track).expect("subscribe read the track");
+        let remote = matches!(held.origin, Origin::Remote(_));
+        let first_local = !held
+            .subscribers
+            .iter()
+            .any(|other| matches!(other, Subscriber::Local { .. }));
+        let defer = remote && first_local;
         let subscriber = Subscriber::Local {
             session: id,
             request,
@@ -935,6 +981,12 @@ impl State {
             session.subscribed.insert(request, track.clone());
         }
         self.metrics.subscriptions.set(self.subscriptions() as i64);
+        if defer {
+            if let Some(held) = self.tracks.get_mut(&track) {
+                held.pending.push((id, request));
+            }
+            return effects;
+        }
         self.tell(
             id,
             Control::Subscribed {
@@ -952,6 +1004,39 @@ impl State {
         effects
     }
 
+    /// The publisher's node answered our forwarding ask: every local subscriber that waited on
+    /// it hears `Subscribed` now, its `latest` the publisher's cache.
+    pub fn node_forwarded(
+        &mut self,
+        peer: &PublicKey,
+        request: RequestId,
+        latest: Option<u64>,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let Some(track) = self.remote_request(peer, request) else {
+            return effects;
+        };
+        let Some(held) = self.tracks.get_mut(&track) else {
+            return effects;
+        };
+        let (alias, by, mode) = (held.alias, held.by, held.mode);
+        let pending = std::mem::take(&mut held.pending);
+        for (id, req) in pending {
+            self.tell(
+                id,
+                Control::Subscribed {
+                    request: req,
+                    alias,
+                    by,
+                    mode,
+                    latest,
+                },
+                &mut effects,
+            );
+        }
+        effects
+    }
+
     /// A node asks for a local track over the live lane. The asking node's request is its own alias
     /// of the track, and the data it gets names the track by it, so a group can never arrive
     /// before the node knows the alias.
@@ -961,8 +1046,34 @@ impl State {
         request: RequestId,
         track: &Track,
         from: Start,
-    ) -> Result<(Opened, Vec<Effect>), Code> {
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        match self.node_subscribe(peer.clone(), request, track, from, &mut effects) {
+            Ok(opened) => effects.push(Effect::Lane(Relayed::Answer {
+                to: peer,
+                forward: Forward::Forwarded {
+                    request,
+                    latest: opened.latest,
+                },
+            })),
+            Err(code) => effects.push(Effect::Lane(Relayed::Answer {
+                to: peer,
+                forward: Forward::Refused { request, code },
+            })),
+        }
+        effects
+    }
+
+    /// The decide step behind `node_subscribed`: the track opened for the peer, or the code to
+    /// refuse it with. Its replay effects are already in `effects`.
+    fn node_subscribe(
+        &mut self,
+        peer: PublicKey,
+        request: RequestId,
+        track: &Track,
+        from: Start,
+        effects: &mut Vec<Effect>,
+    ) -> Result<Opened, Code> {
         let Some(held) = self.tracks.get(track) else {
             return Err(Code::Unknown);
         };
@@ -988,25 +1099,47 @@ impl State {
         // nothing else: the one subscription it holds already carries the track.
         if let Some(theirs) = already {
             *theirs = request;
-            let opened = Opened {
+            return Ok(Opened {
                 alias,
                 by: held.by,
                 mode: held.mode,
                 latest: held.replayable().map(|cached| cached.group),
-            };
-            return Ok((opened, effects));
+            });
         }
         let subscriber = Subscriber::Node {
             peer: peer.clone(),
             request,
         };
-        let Some(opened) = self.add_subscriber(track, subscriber, from, &mut effects) else {
+        let Some(opened) = self.add_subscriber(track, subscriber, from, effects) else {
             return Err(Code::Unknown);
         };
         if from == Start::Latest {
-            self.replay_to_node(&peer, alias, track, &mut effects);
+            self.replay_to_node(&peer, alias, track, effects);
         }
-        Ok((Opened { alias, ..opened }, effects))
+        Ok(Opened { alias, ..opened })
+    }
+
+    /// A peer refused our forwarding ask: the track ends for our local subscribers. A grant
+    /// taken back on the publisher's node reads to them as the publisher being gone.
+    pub fn node_refused(&mut self, peer: &PublicKey, request: RequestId, code: Code) -> Vec<Effect> {
+        let reason = match code {
+            Code::NotGranted => End::GrantRevoked,
+            Code::NoAccount
+            | Code::BadProof
+            | Code::Unknown
+            | Code::Duplicate
+            | Code::TooLarge
+            | Code::Malformed => End::PublisherGone,
+        };
+        self.node_ended(peer, request, reason)
+    }
+
+    /// A peer ended a track it forwarded to us: our remote holder of it ends for its subscribers.
+    pub fn node_ended(&mut self, peer: &PublicKey, request: RequestId, reason: End) -> Vec<Effect> {
+        let Some(track) = self.remote_request(peer, request) else {
+            return Vec::new();
+        };
+        self.end_remote(&track, reason)
     }
 
     fn add_subscriber(
@@ -1273,20 +1406,64 @@ impl State {
         effects
     }
 
-    /// The watcher's grant moved: it hears through the new patterns from here on.
+    /// The watcher's grant moved: it hears `Announce { up }` for every track its new patterns
+    /// cover that the old did not, and `{ up: false }` for every one the old covered that the
+    /// new does not, so a watcher after a grant move holds what a fresh watcher would. Only
+    /// while the session still watches the namespace the re-check read.
     pub fn rewatch(
         &mut self,
         id: SessionId,
         request: RequestId,
+        held: &Held,
         patterns: Vec<String>,
     ) -> Vec<Effect> {
-        let Some(namespace) = self
+        let Held::Watching(namespace) = held else {
+            return Vec::new();
+        };
+        let still = self
             .sessions
             .get(&id)
             .and_then(|session| session.watching.get(&request))
+            .is_some_and(|ns| ns == namespace);
+        if !still {
+            return Vec::new();
+        }
+        let Some(watcher) = self
+            .watches
+            .get(namespace)
+            .and_then(|watchers| watchers.iter().find(|watcher| watcher.session == id))
         else {
             return Vec::new();
         };
+        let hears = |patterns: &[String], name: &str| {
+            patterns.iter().any(|pattern| pattern_covers(pattern, name))
+        };
+        let was = watcher.patterns.clone();
+        let mut effects = Vec::new();
+        let mut moved: Vec<(Track, Account, Mode, bool)> = self
+            .tracks
+            .iter()
+            .filter(|(track, _)| track.namespace == *namespace)
+            .filter_map(|(track, held)| {
+                let before = hears(&was, &track.name);
+                let now = hears(&patterns, &track.name);
+                (before != now).then(|| (track.clone(), held.by, held.mode, now))
+            })
+            .collect();
+        moved.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        for (track, by, mode, up) in moved {
+            self.tell(
+                id,
+                Control::Announce {
+                    request,
+                    track,
+                    by,
+                    mode,
+                    up,
+                },
+                &mut effects,
+            );
+        }
         if let Some(watcher) = self
             .watches
             .get_mut(namespace)
@@ -1294,7 +1471,7 @@ impl State {
         {
             watcher.patterns = patterns;
         }
-        Vec::new()
+        effects
     }
 
     pub fn unwatch(&mut self, id: SessionId, request: RequestId) -> Vec<Effect> {
@@ -1326,30 +1503,74 @@ impl State {
 
     // ---- grants revoked ----
 
-    /// A request no longer covered by a grant ends with `GrantRevoked`.
-    pub fn revoke(&mut self, id: SessionId, request: RequestId) -> Vec<Effect> {
+    /// A grant re-check's ruling on one held request: a publish or subscribe a grant no longer
+    /// covers is revoked; a watch is re-aimed at its new patterns, or revoked if it may not
+    /// watch at all. The decision is the table's, the twin of `admit` for a fresh ask.
+    pub fn rechecked(
+        &mut self,
+        id: SessionId,
+        request: RequestId,
+        held: &Held,
+        grant: Option<&Grant>,
+    ) -> Vec<Effect> {
+        let Some(account) = self.sessions.get(&id).map(|session| session.account) else {
+            return Vec::new();
+        };
+        match held {
+            Held::Watching(_) => match watch_patterns(grant, account) {
+                Some(patterns) => self.rewatch(id, request, held, patterns),
+                None => self.revoke(id, request, held),
+            },
+            Held::Published(track) | Held::Subscribed(track) => {
+                let act = match held {
+                    Held::Published(_) => Act::Publish,
+                    Held::Subscribed(_) | Held::Watching(_) => Act::Subscribe,
+                };
+                let granted =
+                    grant.is_some_and(|grant| covered(grant, act, &track.name, account));
+                match granted {
+                    true => Vec::new(),
+                    false => self.revoke(id, request, held),
+                }
+            }
+        }
+    }
+
+    /// A request a grant no longer covers ends with `GrantRevoked`, but only while the session's
+    /// request still names what the re-check read (the client may have withdrawn and re-used the
+    /// id meanwhile).
+    pub fn revoke(&mut self, id: SessionId, request: RequestId, held: &Held) -> Vec<Effect> {
         let mut effects = Vec::new();
         let Some(session) = self.sessions.get_mut(&id) else {
             return effects;
         };
-        if let Some(track) = session.published.remove(&request) {
-            self.end_track(&track, End::GrantRevoked, &mut effects);
+        let names_it = Self::held(session, request).as_ref() == Some(held);
+        if !names_it {
             return effects;
         }
-        if let Some(track) = session.subscribed.remove(&request) {
-            self.drop_subscriber(
-                &track,
-                &Subscriber::Local {
-                    session: id,
-                    request,
-                },
-                &mut effects,
-            );
-            self.metrics.subscriptions.set(self.subscriptions() as i64);
-        } else if let Some(namespace) = session.watching.remove(&request) {
-            self.drop_watcher(&namespace, id);
-        } else {
-            return effects;
+        match held {
+            Held::Published(track) => {
+                session.published.remove(&request);
+                self.end_track(track, End::GrantRevoked, &mut effects);
+                return effects;
+            }
+            Held::Subscribed(track) => {
+                session.subscribed.remove(&request);
+                self.drop_subscriber(
+                    track,
+                    &Subscriber::Local {
+                        session: id,
+                        request,
+                    },
+                    &mut effects,
+                );
+                self.metrics.subscriptions.set(self.subscriptions() as i64);
+            }
+            Held::Watching(namespace) => {
+                let namespace = namespace.clone();
+                session.watching.remove(&request);
+                self.drop_watcher(&namespace, id);
+            }
         }
         self.tell(
             id,
@@ -1361,6 +1582,21 @@ impl State {
         );
         effects
     }
+
+    /// What a session's request holds: the one table it lives in, named.
+    fn held(session: &Session, request: RequestId) -> Option<Held> {
+        if let Some(track) = session.published.get(&request) {
+            return Some(Held::Published(track.clone()));
+        }
+        if let Some(track) = session.subscribed.get(&request) {
+            return Some(Held::Subscribed(track.clone()));
+        }
+        session
+            .watching
+            .get(&request)
+            .map(|namespace| Held::Watching(namespace.clone()))
+    }
+
 
     // ---- objects in ----
 
@@ -1697,28 +1933,25 @@ impl State {
         });
     }
 
-    /// Every request of a session that lives in `program`'s rooms, for a grant re-check.
-    pub fn requests_in(&self, program: &str) -> Vec<(SessionId, RequestId, Track, Act)> {
+    /// Every request of a session that lives in `program`'s rooms, as the thing it holds, for a
+    /// grant re-check.
+    pub fn requests_in(&self, program: &str) -> Vec<(SessionId, RequestId, Held)> {
         let in_program = |namespace: &str| of_program(namespace, program);
         let mut found = Vec::new();
         for (id, session) in &self.sessions {
             for (request, track) in &session.published {
                 if in_program(&track.namespace) {
-                    found.push((*id, *request, track.clone(), Act::Publish));
+                    found.push((*id, *request, Held::Published(track.clone())));
                 }
             }
             for (request, track) in &session.subscribed {
                 if in_program(&track.namespace) {
-                    found.push((*id, *request, track.clone(), Act::Subscribe));
+                    found.push((*id, *request, Held::Subscribed(track.clone())));
                 }
             }
             for (request, namespace) in &session.watching {
                 if in_program(namespace) {
-                    let track = Track {
-                        namespace: namespace.clone(),
-                        name: "*".into(),
-                    };
-                    found.push((*id, *request, track, Act::Watch));
+                    found.push((*id, *request, Held::Watching(namespace.clone())));
                 }
             }
         }
@@ -1926,7 +2159,7 @@ mod tests {
             .into_iter()
             .filter_map(|effect| match effect {
                 Effect::Lane(relayed) => Some(relayed),
-                Effect::Send(..) => None,
+                Effect::Send(..) | Effect::Close(..) => None,
             })
             .collect()
     }
@@ -1937,7 +2170,7 @@ mod tests {
             .into_iter()
             .filter_map(|effect| match effect {
                 Effect::Send(_, Out::Control(control)) => Some(control),
-                Effect::Send(..) | Effect::Lane(_) => None,
+                Effect::Send(..) | Effect::Lane(_) | Effect::Close(..) => None,
             })
             .collect()
     }
@@ -2024,28 +2257,35 @@ mod tests {
             state.group_end(Some(publisher), alias, 1, true);
 
             let peer = PrivateKey::from_seed(2).public_key();
-            let (_, asked) = state
-                .node_subscribed(peer.clone(), 7, &doc, Start::Latest)
-                .expect("the track is local");
-            let replayed = lane(asked);
+            let replayed = lane(state.node_subscribed(peer.clone(), 7, &doc, Start::Latest));
             assert!(
                 matches!(
                     replayed.as_slice(),
                     [
                         Relayed::Object { .. },
-                        Relayed::GroupEnd { complete: true, .. }
+                        Relayed::GroupEnd { complete: true, .. },
+                        Relayed::Answer {
+                            forward: Forward::Forwarded { latest: Some(1), .. },
+                            ..
+                        }
                     ]
                 ),
-                "the cached group crosses once: {replayed:?}"
+                "the cached group crosses once, then the answer: {replayed:?}"
             );
-            let (opened, again) = state
-                .node_subscribed(peer, 8, &doc, Start::Latest)
-                .expect("the track is local");
-            assert_eq!((opened.alias, opened.latest), (8, Some(1)));
-            assert_eq!(
-                lane(again),
-                Vec::new(),
-                "the subscription carries the track already"
+            let again = lane(state.node_subscribed(peer, 8, &doc, Start::Latest));
+            assert!(
+                matches!(
+                    again.as_slice(),
+                    [Relayed::Answer {
+                        forward: Forward::Forwarded {
+                            request: 8,
+                            latest: Some(1),
+                            ..
+                        },
+                        ..
+                    }]
+                ),
+                "the subscription carries the track already, only the answer crosses: {again:?}"
             );
         });
     }
