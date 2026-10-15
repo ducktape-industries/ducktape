@@ -73,7 +73,8 @@ impl Groups {
 
     /// A whole cached group as one queue item on its stream, from its object 0; a still-open
     /// group (`end: None`) keeps its stream for the live objects that follow, a closed one ends
-    /// here.
+    /// here. A group already on a stream is not replayed onto it: that would double it, so it is
+    /// cut short instead.
     pub fn batch(
         &mut self,
         header: GroupHeader,
@@ -82,6 +83,9 @@ impl Groups {
         spawn: impl FnOnce(GroupHeader, mpsc::Receiver<GroupOut>),
     ) -> Handed {
         let key = (header.alias, header.group);
+        if self.open.contains_key(&key) {
+            return self.cut(key);
+        }
         let count = objects.len() as u32;
         let handed = self.hand(header, GroupOut::Batch(objects), spawn);
         match (&handed, end) {
@@ -198,8 +202,19 @@ mod tests {
             Handed::Dropped
         ));
         assert!(matches!(
-            groups.object(header, 3, body, &spawn),
+            groups.object(header, 3, body.clone(), &spawn),
             Handed::Abandoned
+        ));
+        // A replay of a group already on a stream would double it: cut, not appended.
+        let open = GroupHeader { alias: 1, group: 6 };
+        assert!(matches!(
+            groups.object(open, 0, body.clone(), &spawn),
+            Handed::Queued
+        ));
+        let replay = Arc::new(vec![body]);
+        assert!(matches!(
+            groups.batch(open, replay, None, &spawn),
+            Handed::Dropped
         ));
     }
 }

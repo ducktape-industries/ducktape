@@ -145,8 +145,8 @@ struct Lanes<E: crate::Context> {
     datagrams: Arc<Datagrams>,
     dropped: Counter,
     peers: HashMap<PublicKey, Writer>,
-    /// How often a peer's writer was dropped for a full control queue, for the log's pace.
-    resets: u32,
+    /// How often each peer's writer was dropped for a full control queue, for the log's pace.
+    resets: HashMap<PublicKey, u32>,
     /// How often the relay's control queue overflowed, for the log's pace.
     restarts: u32,
 }
@@ -185,28 +185,29 @@ pub async fn serving<E: crate::Context>(
         datagrams,
         dropped,
         peers: HashMap::new(),
-        resets: 0,
+        resets: HashMap::new(),
         restarts: 0,
     };
     // A member seated, or the lane enabled, before this loop began to watch.
     lanes.reconcile();
     loop {
         tokio::select! {
-            // Control first: an announce or an answer is never behind the objects.
+            // Control, then the table and the membership, then data: an announce, an answer or
+            // a reconcile is never behind the objects, however many there are.
             biased;
             relayed = queued.control.recv() => match relayed {
                 Some(relayed) => lanes.dispatch(relayed),
                 None => return,
             },
+            // The `Ok(())` pattern disables a watch whose sender is gone, rather than firing it
+            // forever: a dropped sender means the halo or the plane is going, and the loop then
+            // waits only on its queues.
+            Ok(()) = membership.changed() => lanes.reconcile(),
+            Ok(()) = served.changed() => lanes.reconcile(),
             relayed = queued.data.recv() => match relayed {
                 Some(relayed) => lanes.dispatch(relayed),
                 None => return,
             },
-            // The `Ok(())` pattern disables a watch whose sender is gone, rather than firing it
-            // forever: a dropped sender means the halo or the plane is going, and the loop then
-            // waits only on its queue.
-            Ok(()) = membership.changed() => lanes.reconcile(),
-            Ok(()) = served.changed() => lanes.reconcile(),
         }
         if lanes.behind() {
             lanes.restart(&mut queued);
@@ -424,9 +425,10 @@ impl<E: crate::Context> Lanes<E> {
         // of keeping a hole in it. The fresh queue is empty, so the resync is taken.
         self.dropped.inc();
         if control {
-            self.resets += 1;
-            if worth_a_line(self.resets) {
-                tracing::warn!(target: "ducktape::live", event = "live_peer_reset", reason = "control_behind", %to, attempts = self.resets, "a member fell behind the relay's control and is resynced");
+            let resets = self.resets.entry(to.clone()).or_insert(0);
+            *resets += 1;
+            if worth_a_line(*resets) {
+                tracing::warn!(target: "ducktape::live", event = "live_peer_reset", reason = "control_behind", %to, attempts = *resets, "a member fell behind the relay's control and is resynced");
             }
             self.drop_peer(&to);
             self.hand(to, ToPeer::Resync);
@@ -480,13 +482,10 @@ async fn peer_writing<E: crate::Context>(
     loop {
         let (halo, to) = (link.halo.clone(), link.to.clone());
         tokio::select! {
-            // Control first: an announce or an answer is never behind the objects.
+            // Control and the stream's own fate first, data last: an announce, an answer or a
+            // reopen is never behind the objects, however many there are.
             biased;
             item = control.recv() => match item {
-                Some(item) => link.send(item).await,
-                None => return,
-            },
-            item = data.recv() => match item {
                 Some(item) => link.send(item).await,
                 None => return,
             },
@@ -502,6 +501,10 @@ async fn peer_writing<E: crate::Context>(
                 link.unlinked = false;
                 let _ = link.ensure_control(None).await;
             }
+            item = data.recv() => match item {
+                Some(item) => link.send(item).await,
+                None => return,
+            },
         }
     }
 }
