@@ -27,7 +27,7 @@ use live_wire::{
     RequestId, Start, Track, Welcome, proof_preimage,
 };
 use tokio::sync::{Notify, watch};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 pub use grants::Chain;
@@ -89,20 +89,9 @@ pub struct Relay<E: Context> {
     dirty: Mutex<Dirty>,
     rechecks: Arc<Notify>,
     lane: lane::Queue,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
-}
-
-impl<E: Context> Drop for Relay<E> {
-    fn drop(&mut self) {
-        for task in self
-            .tasks
-            .lock()
-            .expect("the tasks lock is never poisoned")
-            .iter()
-        {
-            task.abort();
-        }
-    }
+    /// Every task the relay runs, lane 7's included: dropped with the relay, they are aborted,
+    /// and what they hold of halo goes with them.
+    tasks: Mutex<JoinSet<()>>,
 }
 
 impl<E: Context> Relay<E> {
@@ -137,19 +126,21 @@ impl<E: Context> Relay<E> {
         });
         // The tasks hold the relay weakly: it drops with its last owner, and they end with it.
         let weak = Arc::downgrade(&relay);
-        let mut tasks = vec![
-            tokio::spawn(rechecking(weak.clone(), rechecks)),
-            tokio::spawn(closing(weak.clone(), shutdown)),
-            tokio::spawn(lane::serving(weak.clone(), halo, me, queued)),
-        ];
+        relay.spawn(rechecking(weak.clone(), rechecks));
+        relay.spawn(closing(weak.clone(), shutdown));
+        relay.spawn(lane::serving(weak.clone(), halo, me, queued));
         if let Some(door) = door {
-            tasks.push(tokio::spawn(accepting(weak, door)));
+            relay.spawn(accepting(weak, door));
         }
-        *relay
-            .tasks
-            .lock()
-            .expect("the tasks lock is never poisoned") = tasks;
         Ok(relay)
+    }
+
+    /// A task that lives no longer than the relay.
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks
+            .lock()
+            .expect("the tasks lock is never poisoned")
+            .spawn(task);
     }
 
     pub fn network(&self) -> &Network {

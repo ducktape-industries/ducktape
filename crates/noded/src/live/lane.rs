@@ -18,6 +18,7 @@ use live_wire::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use super::Relay;
 use super::session::{CONTROL_BYTES, framed};
@@ -106,21 +107,13 @@ pub async fn serving<E: super::Context>(
             .datagrams(Lane(LANE), PER_SENDER)
             .expect("lane 7 is the relay's alone"),
     );
-    let Some(dropped) = relay
-        .upgrade()
-        .map(|relay| relay.metrics.dropped_behind.clone())
-    else {
+    let Some(strong) = relay.upgrade() else {
         return;
     };
-    let accepting = tokio::spawn(accepting(relay.clone(), streams.clone()));
-    let receiving = tokio::spawn(receiving(relay.clone(), datagrams.clone()));
-    if let Some(strong) = relay.upgrade() {
-        strong
-            .tasks
-            .lock()
-            .expect("the tasks lock is never poisoned")
-            .extend([accepting, receiving]);
-    }
+    let dropped = strong.metrics.dropped_behind.clone();
+    strong.spawn(accepting(relay.clone(), streams.clone()));
+    strong.spawn(receiving(relay.clone(), datagrams.clone()));
+    drop(strong);
     let mut lanes = Lanes {
         relay,
         halo,
@@ -206,21 +199,11 @@ impl<E: super::Context> Lanes<E> {
         }
     }
 
-    /// A lane task ends with the relay: it is aborted when the relay drops.
-    fn track(&self, task: tokio::task::JoinHandle<()>) {
-        let Some(relay) = self.relay.upgrade() else {
-            task.abort();
-            return;
-        };
-        relay
-            .tasks
-            .lock()
-            .expect("the tasks lock is never poisoned")
-            .push(task);
-    }
-
     fn hand(&mut self, to: PublicKey, item: ToPeer) {
         if !self.peers.contains_key(&to) {
+            let Some(relay) = self.relay.upgrade() else {
+                return;
+            };
             let (sending, queue) = mpsc::channel(PEER_QUEUE);
             let link = PeerLink {
                 relay: self.relay.clone(),
@@ -232,8 +215,9 @@ impl<E: super::Context> Lanes<E> {
                 attempts: 0,
                 groups: HashMap::new(),
                 abandoned: HashSet::new(),
+                writing: JoinSet::new(),
             };
-            self.track(tokio::spawn(peer_writing(link, queue)));
+            relay.spawn(peer_writing(link, queue));
             self.peers.insert(to.clone(), sending);
         }
         let writer = self.peers.get(&to).expect("inserted above");
@@ -255,6 +239,8 @@ struct PeerLink<E: super::Context> {
     groups: HashMap<(Alias, u64), mpsc::Sender<GroupOut>>,
     /// Groups dropped short for falling behind: the rest of their objects are dropped quiet.
     abandoned: HashSet<(Alias, u64)>,
+    /// The group writers, aborted with the link and so with the relay.
+    writing: JoinSet<()>,
 }
 
 async fn peer_writing<E: super::Context>(mut link: PeerLink<E>, mut queue: mpsc::Receiver<ToPeer>) {
@@ -345,9 +331,10 @@ impl<E: super::Context> PeerLink<E> {
         if self.abandoned.contains(&key) {
             return;
         }
+        while self.writing.try_join_next().is_some() {}
         let sending = self.groups.entry(key).or_insert_with(|| {
             let (sending, queue) = mpsc::channel(GROUP_QUEUE);
-            tokio::spawn(group_writing(
+            self.writing.spawn(group_writing(
                 self.streams.clone(),
                 self.to.clone(),
                 header,
