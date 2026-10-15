@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use abi::role::egress::RELAY;
 use abi::role::egress::http::Method;
 use axum::Router;
-use axum::http::{HeaderMap, Method as Verb, Uri};
+use axum::http::{HeaderMap, HeaderName, Method as Verb, Uri};
 use axum::response::Redirect;
 use axum::routing::any;
 use tokio::net::TcpListener;
@@ -31,6 +31,21 @@ async fn echo(verb: Verb, uri: Uri, headers: HeaderMap, body: String) -> (Header
     (answered, format!("{verb} {uri} {seen} {body}"))
 }
 
+async fn names(headers: HeaderMap) -> (HeaderMap, String) {
+    let mut answered = HeaderMap::new();
+    for (name, value) in [
+        ("connection", "x-hop"),
+        ("keep-alive", "timeout=5"),
+        ("x-hop", "1"),
+        ("x-kept", "yes"),
+    ] {
+        answered.insert(HeaderName::from_static(name), value.parse().unwrap());
+    }
+    let mut seen: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
+    seen.sort_unstable();
+    (answered, seen.join(" "))
+}
+
 async fn target() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -39,6 +54,7 @@ async fn target() -> String {
             "/moved",
             any(|| async { Redirect::temporary("/elsewhere") }),
         )
+        .route("/names", any(names))
         .fallback(any(echo));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{address}")
@@ -164,6 +180,37 @@ async fn an_internet_request_gets_no_secret_and_its_redirect_comes_back_unfollow
 }
 
 #[tokio::test]
+async fn the_node_forwards_end_to_end_headers_only_as_a_proxy_does() {
+    let base = target().await;
+    let config = config(&base, Reach::Private);
+    let clients = Clients::new(config.reach).unwrap();
+    let hops = vec![
+        ("keep-alive", "1"),
+        ("te", "trailers"),
+        ("upgrade", "h2c"),
+        ("proxy-authorization", "x"),
+        ("x-end", "1"),
+    ];
+    let request = post(HTTP, &format!("{base}/names"), hops);
+    let response = output(ask(&clients, &config, &request, b"").await);
+    let names: Vec<&str> = response
+        .headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(names.contains(&"x-kept"), "{names:?}");
+    for hop in ["connection", "keep-alive", "x-hop", "transfer-encoding"] {
+        assert!(!names.contains(&hop), "{hop} came back: {names:?}");
+    }
+    let forwarded = text(response);
+    assert!(forwarded.contains("x-end"), "{forwarded}");
+    for hop in ["keep-alive", "te", "upgrade", "proxy-authorization"] {
+        let sent = forwarded.split(' ').any(|name| name == hop);
+        assert!(!sent, "{hop} was forwarded: {forwarded}");
+    }
+}
+
+#[tokio::test]
 async fn a_public_node_refuses_a_private_address_by_literal_or_by_name() {
     let base = target().await;
     let port = base.rsplit(':').next().unwrap();
@@ -176,7 +223,13 @@ async fn a_public_node_refuses_a_private_address_by_literal_or_by_name() {
         "http://169.254.169.254/latest/meta-data/".to_owned(),
     ] {
         let refused = ask(&clients, &config, &post(HTTP, &url, Vec::new()), b"").await;
-        assert!(matches!(refused, Answer::Failed(_)), "{url}: {refused:?}");
+        let Answer::Failed(sentence) = refused else {
+            panic!("{url}: {refused:?}");
+        };
+        assert!(
+            sentence.ends_with("is not a public address"),
+            "{url}: {sentence}"
+        );
     }
 }
 
