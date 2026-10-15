@@ -816,7 +816,7 @@ mod tests {
         ];
         assert_eq!(
             listing(&table),
-            "a/blobs#0 Critical served pinned, a/live#1 Critical paused"
+            "a/blobs#0 critical served pinned, a/live#1 critical paused"
         );
     }
 }
