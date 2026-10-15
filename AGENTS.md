@@ -71,7 +71,7 @@ under `ops/`.
 ## Branching and Delivery
 
 - All task work targets `dev`: worktrees fork from `origin/dev`, PRs are based
-  on `dev`, and high-confidence reviewed PRs merge into `dev`. `main` advances
+  on `dev`, and the user merges reviewed PRs into `dev`. `main` advances
   only by an explicit, user-requested release of `dev`.
 - Default feature/fix/doc work happens in an isolated git worktree rather than
   directly in the primary checkout. Use the current checkout only when the user
@@ -85,33 +85,29 @@ under `ops/`.
 - After the worktree change is implemented and verified, submit it as a PR
   against `dev`. Do not treat local completion as done when the requested flow
   is delivery.
-- Merge to `dev` only when confidence is high: the change is understood and the
-  relevant gates are green or any skips are justified. If confidence is medium
-  or low, leave the PR open with the risks, failed checks, or follow-up review
-  needed instead of merging by default.
+- An assistant never merges a PR. It opens the PR against `dev` and stops;
+  the user merges (`/done`). The PR body names any risk, failed check, or
+  review the change still needs.
 
 ## Delivery Speed (high confidence is the gate, not the calendar)
 
-- **Local gates decide the merge; CI is not waited on.** When the touched
-  crates' gates are green locally and the change is understood, merge at once
-  (`gh pr merge --squash`). Do not arm a watch on the CI run, do not wait for
-  a review round, do not open a follow-up "verify" pass. CI stays light and
-  catches what the box missed after the fact; a red there is a new issue, not
-  a reason to have waited.
+- **Local gates decide when a PR is ready; CI is not waited on.** When the
+  touched crates' gates are green locally and the change is understood, open
+  the PR at once and stop. Do not arm a watch on the CI run and do not open a
+  follow-up "verify" pass. The user reviews and merges.
 - **Gate what you touched, not the tree.** Run the per-crate clippy gate and
   the tests of the crates the diff changes. A whole-workspace run is for a
   change that spans the workspace. Never run the e2e node suites for a change
   that cannot reach them.
 - **One session, one task, end to end.** The session that implements a unit
-  also gates it, opens the PR, merges it, and closes the issue by hand (a
-  merge into `dev` closes nothing; `main` is the default branch). No
-  implement → review → verify chains; a second pair of eyes is for a change
-  the author says they do not understand.
+  also gates it and opens the PR. After the user merges it, `/done` closes the
+  issue by hand (a merge into `dev` closes nothing; `main` is the default
+  branch). No implement → review → verify chains between assistants.
 - **Reproduce before fixing, at current `dev`.** A report names a symptom; an
   attached cause may be stale. If it does not reproduce, close the issue with
   the evidence and move on — that is delivery, not a skipped task.
-- **Merged means gone.** Remove the worktree and delete the branch as soon as
-  the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
+- **Merged means gone.** Once the user merges the PR, remove the worktree
+  and delete the branch. Then `git grep` your symbol on `origin/dev`: a sibling's
   merge commit can revert it.
 - **A fixture's bytes move with everything it compiles in.** The kernel
   suites run committed programs (`crates/kernel/fixtures/wasm/fixture_*.wasm`)
@@ -126,9 +122,6 @@ under `ops/`.
   the kernel fixtures build against; that repository's `crates/sdk/program`
   is the full SDK its programs build against. They are two crates, not
   copies.
-- **Hold only what is really uncertain.** A PR stays open only when the
-  author can name the risk in one sentence. "Waiting for CI", "waiting for
-  review", or "someone else should look" are not risks.
 
 ## Worktree Cleanup (a merged worktree is garbage — remove it)
 
