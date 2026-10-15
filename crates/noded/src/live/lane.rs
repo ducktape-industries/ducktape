@@ -448,10 +448,7 @@ fn heard<E: super::Context>(
             mode,
             up,
         } => {
-            let effects = relay
-                .state()
-                .remote_announced(from.clone(), track, by, mode, up);
-            relay.perform(effects);
+            relay.step(|state| state.remote_announced(from.clone(), track, by, mode, up));
             None
         }
         Forward::Subscribe {
@@ -459,9 +456,9 @@ fn heard<E: super::Context>(
             track,
             from: start,
         } => {
-            let answered = relay
-                .state()
-                .node_subscribed(from.clone(), request, &track, start);
+            // The replay is delivered under the lock it was decided under, as a step's is.
+            let mut state = relay.state();
+            let answered = state.node_subscribed(from.clone(), request, &track, start);
             match answered {
                 Ok((opened, effects)) => {
                     relay.perform(effects);
@@ -477,8 +474,7 @@ fn heard<E: super::Context>(
             }
         }
         Forward::Unsubscribe { request } => {
-            let effects = relay.state().node_unsubscribed(from, request);
-            relay.perform(effects);
+            relay.step(|state| state.node_unsubscribed(from, request));
             None
         }
         // The answer names the alias we asked with; the data already resolves by it.
@@ -501,8 +497,7 @@ fn heard<E: super::Context>(
             None
         }
         Forward::Count { request, count } => {
-            let effects = relay.state().node_counted(from, request, count);
-            relay.perform(effects);
+            relay.step(|state| state.node_counted(from, request, count));
             None
         }
     }
@@ -514,7 +509,6 @@ fn ended<E: super::Context>(relay: &Relay<E>, from: &PublicKey, request: Request
         return;
     };
     let effects = state.end_remote(&track, reason);
-    drop(state);
     relay.perform(effects);
 }
 
@@ -556,17 +550,13 @@ async fn group_reading<E: super::Context>(relay: Weak<Relay<E>>, inbound: Inboun
         let Some(relay) = relay.upgrade() else {
             return;
         };
-        let effects = relay
-            .state()
-            .object(None, header, object, body.into(), Instant::now());
-        relay.perform(effects);
+        relay.step(|state| state.object(None, header, object, body.into(), Instant::now()));
         object += 1;
     }
     let Some(relay) = relay.upgrade() else {
         return;
     };
-    let effects = relay.state().group_end(None, alias, header.group, complete);
-    relay.perform(effects);
+    relay.step(|state| state.group_end(None, alias, header.group, complete));
 }
 
 async fn receiving<E: super::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Datagrams>) {
@@ -588,7 +578,6 @@ async fn receiving<E: super::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Data
             continue;
         };
         let header = DatagramHeader { alias, ..theirs };
-        let effects = relay.state().datagram(None, header, bytes, Instant::now());
-        relay.perform(effects);
+        relay.step(|state| state.datagram(None, header, bytes, Instant::now()));
     }
 }

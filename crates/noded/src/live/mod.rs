@@ -185,7 +185,40 @@ impl<E: Context> Relay<E> {
         }
     }
 
+    /// One step on the table, decided and delivered under the one lock: what steps send leaves
+    /// in the order they were decided, so no step's word to a session overtakes another's, as a
+    /// re-check's end would overtake the answer to the request it re-checks.
+    fn step(&self, decide: impl FnOnce(&mut State) -> Vec<Effect>) {
+        let mut state = self.state();
+        let effects = decide(&mut state);
+        self.perform(effects);
+    }
+
+    /// A step a session's loop took, for the loop to go on.
+    fn stepped(&self, decide: impl FnOnce(&mut State) -> Vec<Effect>) -> Step {
+        self.step(decide);
+        Step::Done
+    }
+
+    /// A proven session joins the table, welcomed under the lock `go_away` takes: a session
+    /// hears its welcome before any GoAway.
+    fn welcomed(
+        &self,
+        account: Account,
+        key: Vec<u8>,
+        link: &Link,
+    ) -> Result<SessionId, GoingAway> {
+        let mut state = self.state();
+        let id = state.opened(account, key, link.outlet.clone())?;
+        link.outlet.send(Out::Control(Control::Welcome(Welcome {
+            account,
+            datagrams: link.datagrams,
+        })));
+        Ok(id)
+    }
+
     /// Everything a step decided, delivered: a session's outlet takes it or is closed as behind.
+    /// It takes no lock of the relay's, so a step delivers under the state lock.
     fn perform(&self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
@@ -242,13 +275,8 @@ impl<E: Context> Relay<E> {
     }
 
     /// One control message from a client, after the handshake.
-    async fn control(
-        &self,
-        id: SessionId,
-        account: Account,
-        control: Control,
-    ) -> Option<Vec<Effect>> {
-        let effects = match control {
+    async fn control(&self, id: SessionId, account: Account, control: Control) -> Step {
+        match control {
             Control::Publish {
                 request,
                 track,
@@ -258,17 +286,19 @@ impl<E: Context> Relay<E> {
                 self.publishing(id, account, request, track, mode, priority)
                     .await
             }
-            Control::Unpublish { request } => self.state().unpublish(id, request),
+            Control::Unpublish { request } => self.stepped(|state| state.unpublish(id, request)),
             Control::Subscribe {
                 request,
                 track,
                 from,
             } => self.subscribing(id, account, request, track, from).await,
-            Control::Unsubscribe { request } => self.state().unsubscribe(id, request),
+            Control::Unsubscribe { request } => {
+                self.stepped(|state| state.unsubscribe(id, request))
+            }
             Control::Watch { request, namespace } => {
                 self.watching(id, account, request, namespace).await
             }
-            Control::Unwatch { request } => self.state().unwatch(id, request),
+            Control::Unwatch { request } => self.stepped(|state| state.unwatch(id, request)),
             Control::Hello(_)
             | Control::Challenge(_)
             | Control::Proof(_)
@@ -279,9 +309,8 @@ impl<E: Context> Relay<E> {
             | Control::Announce { .. }
             | Control::Ended { .. }
             | Control::Refused { .. }
-            | Control::GoAway { .. } => return None,
-        };
-        Some(effects)
+            | Control::GoAway { .. } => Step::Close("malformed_request"),
+        }
     }
 
     /// The chain is read only for a track the node would take: a name it refuses as malformed
@@ -294,23 +323,20 @@ impl<E: Context> Relay<E> {
         track: Track,
         mode: Mode,
         priority: Priority,
-    ) -> Vec<Effect> {
+    ) -> Step {
         let admissible = self.state().admissible(&track);
         if !admissible {
-            return self
-                .state()
-                .publish(id, request, track, mode, priority, false);
+            return self.stepped(|state| state.publish(id, request, track, mode, priority, false));
         }
         let decided = self.decided(account, &track.namespace).await;
         let granted = decided
             .grant
             .as_ref()
             .is_some_and(|grant| covered(grant, Act::Publish, &track.name));
-        let effects = self
-            .state()
-            .publish(id, request, track, mode, priority, granted);
+        let step = self.stepped(|state| state.publish(id, request, track, mode, priority, granted));
+        // Settled once the answer is out, so a re-check of the request comes after it.
         self.settled(decided);
-        effects
+        step
     }
 
     async fn subscribing(
@@ -320,19 +346,19 @@ impl<E: Context> Relay<E> {
         request: RequestId,
         track: Track,
         from: Start,
-    ) -> Vec<Effect> {
+    ) -> Step {
         let admissible = self.state().admissible(&track);
         if !admissible {
-            return self.state().subscribe(id, request, track, from, false);
+            return self.stepped(|state| state.subscribe(id, request, track, from, false));
         }
         let decided = self.decided(account, &track.namespace).await;
         let granted = decided
             .grant
             .as_ref()
             .is_some_and(|grant| covered(grant, Act::Subscribe, &track.name));
-        let effects = self.state().subscribe(id, request, track, from, granted);
+        let step = self.stepped(|state| state.subscribe(id, request, track, from, granted));
         self.settled(decided);
-        effects
+        step
     }
 
     /// A watcher hears the announces its subscribe patterns cover; with none it is not
@@ -343,16 +369,16 @@ impl<E: Context> Relay<E> {
         account: Account,
         request: RequestId,
         namespace: String,
-    ) -> Vec<Effect> {
+    ) -> Step {
         let admissible = self.state().admissible_namespace(&namespace);
         if !admissible {
-            return self.state().watch(id, request, namespace, None);
+            return self.stepped(|state| state.watch(id, request, namespace, None));
         }
         let decided = self.decided(account, &namespace).await;
         let patterns = watch_patterns(decided.grant.as_ref());
-        let effects = self.state().watch(id, request, namespace, patterns);
+        let step = self.stepped(|state| state.watch(id, request, namespace, patterns));
         self.settled(decided);
-        effects
+        step
     }
 }
 
@@ -499,9 +525,9 @@ async fn handshake<E: Context>(relay: &Relay<E>, link: &mut Link) -> Handshake {
     Handshake::Welcomed(account, hello.key)
 }
 
-/// What a session's loop does with what arrived.
+/// What a session's loop does once a step is taken.
 enum Step {
-    Effects(Vec<Effect>),
+    Done,
     Close(&'static str),
 }
 
@@ -559,15 +585,10 @@ async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
         Handshake::Refused(code) => return refused(&link, code),
         Handshake::Gone => return link.outlet.close("no_handshake"),
     };
-    let opened = strong.state().opened(account, key, link.outlet.clone());
-    let id = match opened {
+    let id = match strong.welcomed(account, key, &link) {
         Ok(id) => id,
         Err(GoingAway { in_ms }) => return going_away(&link, in_ms),
     };
-    link.outlet.send(Out::Control(Control::Welcome(Welcome {
-        account,
-        datagrams: link.datagrams,
-    })));
     tracing::info!(target: "ducktape::live", event = "live_session", account, path = link.path, "a live session opened");
     drop(strong);
     let mut idle_since: Option<Instant> = None;
@@ -596,31 +617,28 @@ async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
         };
         let now = std::time::Instant::now();
         let step = match inbound {
-            Inbound::Control(control) => match relay.control(id, account, control).await {
-                Some(effects) => Step::Effects(effects),
-                None => Step::Close("malformed_request"),
-            },
+            Inbound::Control(control) => relay.control(id, account, control).await,
             Inbound::Object {
                 header,
                 object,
                 body,
-            } => Step::Effects(relay.state().object(Some(id), header, object, body, now)),
+            } => relay.stepped(|state| state.object(Some(id), header, object, body, now)),
             Inbound::GroupEnd {
                 alias,
                 group,
                 complete,
-            } => Step::Effects(relay.state().group_end(Some(id), alias, group, complete)),
+            } => relay.stepped(|state| state.group_end(Some(id), alias, group, complete)),
             Inbound::Oversize { alias, group } => {
-                Step::Effects(relay.state().oversize(id, alias, group, now))
+                relay.stepped(|state| state.oversize(id, alias, group, now))
             }
             Inbound::Datagram { header, payload } => {
-                Step::Effects(relay.state().datagram(Some(id), header, payload, now))
+                relay.stepped(|state| state.datagram(Some(id), header, payload, now))
             }
             Inbound::Garbled => Step::Close("malformed_request"),
             Inbound::Closed => break "closed",
         };
         match step {
-            Step::Effects(effects) => relay.perform(effects),
+            Step::Done => {}
             Step::Close(reason) => {
                 tracing::debug!(target: "ducktape::live", event = "live_refused", reason, path = link.path, "a live session sent what is not the wire");
                 link.outlet.send(Out::Control(Control::Refused {
@@ -634,8 +652,7 @@ async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
     };
     link.outlet.close(reason);
     if let Some(relay) = relay.upgrade() {
-        let effects = relay.state().closed(id);
-        relay.perform(effects);
+        relay.step(|state| state.closed(id));
     }
     tracing::info!(target: "ducktape::live", event = "live_session", account, path = link.path, reason, "a live session closed");
 }
@@ -662,23 +679,21 @@ async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
                     continue;
                 };
                 let decided = relay.decided(account, &track.namespace).await;
-                let effects = match act {
+                match act {
                     Act::Watch => match watch_patterns(decided.grant.as_ref()) {
-                        Some(patterns) => relay.state().rewatch(id, request, patterns),
-                        None => relay.state().revoke(id, request),
+                        Some(patterns) => relay.step(|state| state.rewatch(id, request, patterns)),
+                        None => relay.step(|state| state.revoke(id, request)),
                     },
                     Act::Publish | Act::Subscribe => {
                         let granted = decided
                             .grant
                             .as_ref()
                             .is_some_and(|grant| covered(grant, act, &track.name));
-                        match granted {
-                            true => Vec::new(),
-                            false => relay.state().revoke(id, request),
+                        if !granted {
+                            relay.step(|state| state.revoke(id, request));
                         }
                     }
-                };
-                relay.perform(effects);
+                }
             }
         }
         if dirty.identity {
@@ -711,8 +726,7 @@ async fn closing<E: Context>(relay: Weak<Relay<E>>, mut shutdown: watch::Receive
     let Some(relay) = relay.upgrade() else {
         return;
     };
-    let effects = relay.state().go_away(GOAWAY_MS);
-    relay.perform(effects);
+    relay.step(|state| state.go_away(GOAWAY_MS));
     for outlet in relay.state().outlets() {
         outlet.close("node_closing");
     }
