@@ -118,16 +118,21 @@ pub fn covered(grant: &Grant, act: Act, name: &str, account: Account) -> bool {
     match act {
         Act::Publish => grant.publishes(name, account),
         Act::Subscribe => grant.subscribes(name, account),
-        Act::Watch => !grant.subscribe.is_empty(),
+        Act::Watch => may_watch(grant),
     }
+}
+
+/// Whether `grant` lets its holder watch a room: any subscribe pattern is enough, so a watch
+/// turns on no track name and no account, unlike a publish or a subscribe.
+pub fn may_watch(grant: &Grant) -> bool {
+    !grant.subscribe.is_empty()
 }
 
 /// The subscribe patterns `account` hears a room's announces through, as they read for it,
 /// `None` when it may not watch.
 pub fn watch_patterns(grant: Option<&Grant>, account: Account) -> Option<Vec<String>> {
     let grant = grant?;
-    let may_watch = covered(grant, Act::Watch, "*", account);
-    may_watch.then(|| {
+    may_watch(grant).then(|| {
         grant
             .subscribe
             .iter()
@@ -224,9 +229,9 @@ mod tests {
         assert!(covered(&grant, Act::Publish, "presence/42", 42));
         assert!(!covered(&grant, Act::Publish, "doc", 42));
         assert!(covered(&grant, Act::Subscribe, "doc", 42));
-        assert!(covered(&grant, Act::Watch, "*", 42));
+        assert!(may_watch(&grant));
         assert!(!covered(&Grant::default(), Act::Subscribe, "doc", 42));
-        assert!(!covered(&Grant::default(), Act::Watch, "*", 42));
+        assert!(!may_watch(&Grant::default()));
     }
 
     #[test]

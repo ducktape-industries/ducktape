@@ -518,7 +518,7 @@ fn seated(ledger: &Ledger, seed: u64, account: Account) -> PrivateKey {
     key
 }
 
-// ---- (a) the handshake ----
+// ---- the handshake ----
 
 #[test]
 fn a_seated_key_is_welcomed_as_its_account_and_a_bad_proof_or_an_unseated_key_is_refused() {
@@ -603,7 +603,7 @@ fn a_session_proven_after_the_node_began_to_go_away_hears_it_too() {
     });
 }
 
-// ---- (b) stream mode and the cache ----
+// ---- stream mode and the cache ----
 
 #[test]
 fn a_group_reaches_a_subscriber_whole_and_a_late_joiner_gets_it_from_the_cache() {
@@ -670,7 +670,7 @@ fn a_group_reaches_a_subscriber_whole_and_a_late_joiner_gets_it_from_the_cache()
     });
 }
 
-// ---- (c) datagram mode ----
+// ---- datagram mode ----
 
 #[test]
 fn a_datagram_older_than_the_newest_held_is_dropped_and_counted() {
@@ -719,7 +719,7 @@ fn a_datagram_older_than_the_newest_held_is_dropped_and_counted() {
     });
 }
 
-// ---- (d) the websocket door ----
+// ---- the websocket door ----
 
 struct WsClient {
     socket: tokio_tungstenite::WebSocketStream<
@@ -870,7 +870,7 @@ fn the_same_session_runs_over_the_websocket_door_without_datagrams() {
     });
 }
 
-// ---- (e) grants ----
+// ---- grants ----
 
 #[test]
 fn a_grant_a_block_removes_ends_the_request_and_a_room_without_one_waits() {
@@ -1197,7 +1197,7 @@ fn an_account_pattern_lets_each_account_publish_its_own_name_alone() {
     });
 }
 
-// ---- (f) two nodes over the live lane ----
+// ---- two nodes over the live lane ----
 
 #[test]
 fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
@@ -1281,7 +1281,7 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
     });
 }
 
-// ---- (g) one hostile or slow client ----
+// ---- one hostile or slow client ----
 
 #[test]
 fn a_websocket_message_over_the_cap_closes_the_socket_and_a_control_over_its_cap_is_malformed() {
@@ -1595,7 +1595,7 @@ fn data_in_the_wrong_mode_for_its_track_is_refused_malformed() {
     });
 }
 
-// ---- (h) the live lane under failure ----
+// ---- the live lane under failure ----
 
 #[test]
 fn a_group_the_publisher_resets_crosses_the_lane_as_cut_short() {
@@ -1740,7 +1740,7 @@ fn a_member_that_cannot_be_reached_slows_no_other() {
     });
 }
 
-// ---- (i) a watcher hears what its grant covers ----
+// ---- a watcher hears what its grant covers ----
 
 #[test]
 fn a_watcher_hears_the_announces_its_subscribe_patterns_cover() {
@@ -1798,7 +1798,7 @@ fn a_watcher_hears_the_announces_its_subscribe_patterns_cover() {
     });
 }
 
-// ---- (j) groups a publisher leaves open ----
+// ---- groups a publisher leaves open ----
 
 #[test]
 fn a_late_joiner_is_offered_no_abandoned_group_and_holds_no_stream_for_it() {
