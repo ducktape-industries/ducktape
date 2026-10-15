@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -49,6 +50,41 @@ pub struct Listen {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HaloConfig {
     pub egress_bytes_per_sec: Option<u64>,
+}
+
+const READS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero");
+const UPLOADS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadConfig {
+    pub reads_in_flight: NonZeroUsize,
+    pub uploads_in_flight: NonZeroUsize,
+    pub blob_backlog: NonZeroUsize,
+    pub blob_serves_in_flight: NonZeroUsize,
+    pub blob_gatherers: NonZeroUsize,
+}
+
+impl Default for LoadConfig {
+    fn default() -> LoadConfig {
+        let blobs = blob::service::Config::default();
+        LoadConfig {
+            reads_in_flight: READS_IN_FLIGHT,
+            uploads_in_flight: UPLOADS_IN_FLIGHT,
+            blob_backlog: blobs.backlog,
+            blob_serves_in_flight: blobs.serving,
+            blob_gatherers: blobs.gatherers,
+        }
+    }
+}
+
+impl LoadConfig {
+    fn blobs(&self) -> blob::service::Config {
+        blob::service::Config {
+            backlog: self.blob_backlog,
+            serving: self.blob_serves_in_flight,
+            gatherers: self.blob_gatherers,
+        }
+    }
 }
 
 pub struct Running<E: Context> {
@@ -102,8 +138,9 @@ pub fn run<'a, E: Context>(
     logs: Logs,
     listen: Listen,
     halo: HaloConfig,
+    load: LoadConfig,
 ) -> Boxed<'a, Result<Running<E>>> {
-    Box::pin(start(context, workspace, logs, listen, halo))
+    Box::pin(start(context, workspace, logs, listen, halo, load))
 }
 
 async fn found<E: Context>(
@@ -193,6 +230,7 @@ async fn start<E: Context>(
     logs: Logs,
     listen: Listen,
     halo: HaloConfig,
+    load: LoadConfig,
 ) -> Result<Running<E>> {
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
@@ -230,8 +268,12 @@ async fn start<E: Context>(
         .map_err(|error| Error::Tls(error.to_string()))?,
     );
     halo.seat(halo_seats(&node, &network).await?);
-    let blobs =
-        blob::service::Service::start(halo.clone(), node.host().blobs().clone(), bundles(&node)?)?;
+    let blobs = blob::service::Service::start(
+        halo.clone(),
+        node.host().blobs().clone(),
+        bundles(&node)?,
+        load.blobs(),
+    )?;
 
     let member_cap = node.member_cap()?;
     let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
@@ -312,7 +354,6 @@ async fn start<E: Context>(
         key: identity.clone(),
         mesh: transport::loopback(listen.p2p),
         subscribers: Mutex::new(Vec::new()),
-        recent: Mutex::default(),
     });
     let founding = tip.height == 0;
     if let Anchor::Genesis(genesis) = marshal.anchor()
@@ -340,7 +381,7 @@ async fn start<E: Context>(
         None => None,
     };
     let server = context.child("http").spawn({
-        let router = crate::server::router(daemon.clone());
+        let router = crate::server::router(daemon.clone(), load);
         let mut down = daemon.shutdown.subscribe();
         move |_| async move {
             let served = axum::serve(listener, router)
@@ -530,37 +571,89 @@ async fn holding<'a, E: Context>(
     }
 }
 
-async fn receipts_for<E: Context>(
+enum Posted {
+    Pending,
+    Retaken(Vec<u8>),
+    Refused,
+    Unheld,
+}
+
+async fn reposted<E: Context>(node: &mut Node<E>, posted: Option<Vec<u8>>) -> Result<Posted> {
+    let Some(receipt) = posted else {
+        return Ok(Posted::Unheld);
+    };
+    match node
+        .submit(receipt.clone(), Source::Client, Preconfirm::Off)
+        .await?
+    {
+        Ok(Taken::Held(_)) => Ok(Posted::Pending),
+        Ok(Taken::New(_)) => Ok(Posted::Retaken(receipt)),
+        Err(refusal) => {
+            let carried = refusal.reason == abi::reason::DUPLICATE;
+            if carried {
+                return Ok(Posted::Refused);
+            }
+            Ok(Posted::Unheld)
+        }
+    }
+}
+
+async fn receipt_for<E: Context>(
     daemon: &Daemon<E>,
     node: &mut Node<E>,
     height: u64,
-    bundles: Vec<u64>,
-) -> Result<Vec<Vec<u8>>> {
+    bundle: u64,
+) -> Result<Option<Vec<u8>>> {
     let tip = node.tip()?;
     let role = node.host().roles().blobs.clone();
-    let mut taken = Vec::new();
-    for bundle in bundles {
-        let receipt = Frame::sign(
-            &daemon.key,
-            &daemon.descriptor.id(),
-            tip,
-            Some(height),
-            &role,
-            abi::encode(&blob::contract::Op::Receipt { bundle }),
-        )
-        .encode();
-        match node
-            .submit(receipt.clone(), Source::Client, Preconfirm::Off)
-            .await?
-        {
-            Ok(Taken::New(_)) => taken.push(receipt),
-            Ok(Taken::Held(_)) => {}
-            Err(refusal) => tracing::debug!(
+    let receipt = Frame::sign(
+        &daemon.key,
+        &daemon.descriptor.id(),
+        tip,
+        Some(height),
+        &role,
+        abi::encode(&blob::contract::Op::Receipt { bundle }),
+    )
+    .encode();
+    match node
+        .submit(receipt.clone(), Source::Client, Preconfirm::Off)
+        .await?
+    {
+        Ok(Taken::New(_)) => {
+            daemon.blobs.posted(bundle, receipt.clone());
+            Ok(Some(receipt))
+        }
+        Ok(Taken::Held(_)) => Ok(None),
+        Err(refusal) => {
+            tracing::debug!(
                 target: "ducktape::blob",
                 bundle,
                 reason = refusal.reason,
                 "the node did not take its own receipt"
-            ),
+            );
+            Ok(None)
+        }
+    }
+}
+
+async fn receipts_for<E: Context>(
+    daemon: &Daemon<E>,
+    node: &mut Node<E>,
+    height: u64,
+    due: Vec<blob::service::Due>,
+    reseated: bool,
+) -> Result<Vec<Vec<u8>>> {
+    let mut taken = Vec::new();
+    for due in due {
+        match reposted(node, due.posted).await? {
+            Posted::Pending => {}
+            Posted::Retaken(receipt) => taken.push(receipt),
+            Posted::Refused => {
+                if reseated {
+                    taken.extend(receipt_for(daemon, node, height, due.bundle).await?);
+                }
+            }
+            Posted::Unheld => taken.extend(receipt_for(daemon, node, height, due.bundle).await?),
         }
     }
     Ok(taken)
@@ -577,6 +670,7 @@ async fn applied<E: Context>(
     // and the book, so no height it serves passes its tip
     daemon.votes.applied(block.digest(), block.height);
     daemon.tips.send_replace(block.height);
+    let closes = daemon.network.closes_an_epoch(block.height);
     let (receipted, members_written) = match sequenced {
         Sequenced::Applied {
             mut applied,
@@ -593,10 +687,11 @@ async fn applied<E: Context>(
                 .get(&roles.validators)
                 .is_some_and(|writes| !writes.is_empty());
             let writes = applied.writes.programs.get(&roles.blobs).cloned();
-            let bundles = daemon
+            let due = daemon
                 .blobs
                 .applied(block.height, &writes.unwrap_or_default());
-            let receipted = receipts_for(daemon, &mut node, block.height, bundles).await?;
+            let reseated = members_written || closes;
+            let receipted = receipts_for(daemon, &mut node, block.height, due, reseated).await?;
             (receipted, members_written)
         }
         Sequenced::Replayed => {
@@ -604,7 +699,6 @@ async fn applied<E: Context>(
             (Vec::new(), false)
         }
     };
-    let closes = daemon.network.closes_an_epoch(block.height);
     let reseats = members_written || closes;
     if reseats {
         reseat_halo(daemon, &node, block.height).await;

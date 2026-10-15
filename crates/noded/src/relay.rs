@@ -116,7 +116,8 @@ fn sent<E: Context>(daemon: &Daemon<E>, role: &str, frame: &[u8], peer: &PublicK
     let Ok(blob::contract::Op::Put { blobs }) = abi::decode(&submission.payload) else {
         return;
     };
+    let carried_until = submission.anchor.height.saturating_add(host::ANCHOR_WINDOW);
     daemon
         .blobs
-        .sent(blobs.into_iter().map(|entry| entry.id), peer);
+        .sent(blobs.into_iter().map(|entry| entry.id), peer, carried_until);
 }

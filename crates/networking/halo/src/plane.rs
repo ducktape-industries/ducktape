@@ -6,7 +6,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use bytes::Bytes;
 use commonware_cryptography::ed25519::PublicKey;
@@ -18,9 +17,6 @@ use crate::class::Class;
 use crate::members::Members;
 use crate::pacer::{Paced, Pacer};
 use crate::transport::{Error, Transport};
-
-const HELLO_WAIT: Duration = Duration::from_secs(5);
-pub const META_BYTES: usize = 1 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Lane(pub u8);
@@ -131,8 +127,12 @@ async fn accepting<T: Transport>(shared: Arc<Shared<T>>) {
 }
 
 async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stream: T::Stream) {
-    let read = tokio::time::timeout(HELLO_WAIT, read_hello(&mut stream)).await;
-    let Ok(Ok(hello)) = read else {
+    let admitted = shared.members.admits(&from);
+    if !admitted {
+        tracing::debug!(target: "ducktape::halo", %from, reason = "not_a_member", "halo dropped a stream from a key that is not a member");
+        return;
+    }
+    let Ok(hello) = read_hello(&mut stream).await else {
         tracing::debug!(target: "ducktape::halo", %from, reason = "no_hello", "halo dropped a stream that named no lane");
         return;
     };
@@ -146,11 +146,6 @@ async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stre
         tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane.0, reason = "no_lane", "halo dropped a stream for a lane it does not serve");
         return;
     };
-    let admitted = shared.members.admits(&from);
-    if !admitted {
-        tracing::debug!(target: "ducktape::halo", %from, reason = "not_a_member", "halo dropped a stream from a key that is not a member");
-        return;
-    }
     let class = hello.class.capped(shared.members.validator(&from));
     let inbound = Inbound {
         from: from.clone(),
@@ -169,10 +164,6 @@ async fn read_hello<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Hel
     let class = Class::try_from(stream.read_u8().await?)
         .map_err(|byte| std::io::Error::other(format!("{byte} names no class")))?;
     let len = usize::from(stream.read_u16_le().await?);
-    let fits = len <= META_BYTES;
-    if !fits {
-        return Err(std::io::Error::other("the hello's meta is past its cap"));
-    }
     let mut meta = vec![0; len];
     stream.read_exact(&mut meta).await?;
     Ok(Hello { lane, class, meta })
@@ -184,16 +175,15 @@ async fn write_hello<S: AsyncWrite + Unpin>(
     class: Class,
     meta: &[u8],
 ) -> Result<(), Error> {
-    let fits = meta.len() <= META_BYTES;
-    if !fits {
+    let Ok(len) = u16::try_from(meta.len()) else {
         return Err(Error::Io(std::io::Error::other(
-            "the hello's meta is past its cap",
+            "the hello's meta is longer than its u16 length field",
         )));
-    }
+    };
     let mut hello = Vec::with_capacity(4 + meta.len());
     hello.push(lane.0);
     hello.push(u8::from(class));
-    hello.extend_from_slice(&(meta.len() as u16).to_le_bytes());
+    hello.extend_from_slice(&len.to_le_bytes());
     hello.extend_from_slice(meta);
     stream.write_all(&hello).await?;
     Ok(())

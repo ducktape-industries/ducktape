@@ -11,8 +11,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Status, Submit,
-    Submitted, TxAsk, route,
+    BlockAsk, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
+    Status, Submit, Submitted, TxAsk, route,
 };
 use crate::{Error, Result};
 
@@ -87,7 +87,11 @@ impl Client {
     }
 
     async fn carried(&self, height: u64, id: &SubmissionId) -> Result<Option<Receipt>> {
-        let Some(block) = self.block(BlockRef::Height(height)).await? else {
+        let ask = BlockAsk {
+            by: BlockRef::Height(height),
+            most: 0,
+        };
+        let Some(block) = self.block(ask).await? else {
             return Ok(None);
         };
         let tx = block.txs.into_iter().find(|tx| &tx.hash == id);
@@ -172,12 +176,12 @@ impl Client {
         self.fetch(route::PROGRAMS).await
     }
 
-    pub async fn blocks(&self, before: Option<u64>, limit: u32) -> Result<Page> {
-        self.post(route::BLOCKS, &Blocks { before, limit }).await
+    pub async fn blocks(&self, page: Blocks) -> Result<Page> {
+        self.post(route::BLOCKS, &page).await
     }
 
-    pub async fn block(&self, by: BlockRef) -> Result<Option<Finalized>> {
-        self.post(route::BLOCK, &by).await
+    pub async fn block(&self, ask: BlockAsk) -> Result<Option<Finalized>> {
+        self.post(route::BLOCK, &ask).await
     }
 
     pub async fn tx(&self, ask: TxAsk) -> Result<Option<Located>> {
