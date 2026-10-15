@@ -25,7 +25,7 @@ use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::telemetry::metrics::raw::{Counter, Gauge};
 use halo::Halo;
 use live_wire::{
-    ALPN, Account, Challenge, Code, Control, IDLE_SESSION, NAMESPACE, Proof, RequestId,
+    ALPN, Account, Challenge, Code, Control, Hello, IDLE_SESSION, NAMESPACE, Proof, RequestId,
     proof_preimage,
 };
 use tokio::sync::{Notify, watch};
@@ -199,6 +199,7 @@ impl<E: crate::Context> Relay<E> {
             match effect {
                 Effect::Send(outlet, out) => self.deliver(&outlet, out),
                 Effect::Lane(relayed) => lane::relay(self, relayed),
+                Effect::Nudge(outlet) => outlet.nudge(),
                 Effect::Close(outlet, reason) => outlet.close(reason),
             }
         }
@@ -448,6 +449,8 @@ enum Handshake {
     /// at, so a block that moved the identity table while the session registered is re-checked.
     Welcomed(Account, Vec<u8>, u64),
     Refused(Code),
+    /// Held for an account while the node went away: it hears when to re-open.
+    GoingAway(u32),
     Gone,
 }
 
@@ -460,43 +463,65 @@ async fn next_control(link: &mut Link) -> Option<Control> {
 }
 
 /// Hello, challenge, proof: the key named in the hello signs the chain, this node, the nonce
-/// and itself, and the identity role names the account it acts as.
-async fn handshake<E: crate::Context>(relay: &Relay<E>, link: &mut Link) -> Handshake {
+/// and itself.
+async fn proven<E: crate::Context>(relay: &Relay<E>, link: &mut Link) -> Result<Hello, Handshake> {
     let Some(Control::Hello(hello)) = next_control(link).await else {
-        return Handshake::Gone;
+        return Err(Handshake::Gone);
     };
     let this_chain = hello.chain == relay.network.genesis;
     let key_shaped = hello.scheme.pubkey_wellformed(&hello.key);
     if !(this_chain && key_shaped) {
-        return Handshake::Refused(Code::Malformed);
+        return Err(Handshake::Refused(Code::Malformed));
     }
     let mut nonce = [0u8; 32];
     rand_core::Rng::fill_bytes(&mut relay.context.child("nonce"), &mut nonce);
     link.outlet
         .send(Out::Control(Control::Challenge(Challenge { nonce })));
     let Some(Control::Proof(Proof { signature })) = next_control(link).await else {
-        return Handshake::Gone;
+        return Err(Handshake::Gone);
     };
     let preimage = proof_preimage(&hello.chain, relay.me.as_ref(), &nonce, &hello.key);
     let proven = hello
         .scheme
         .verify(&hello.key, NAMESPACE, &preimage, &signature);
     if !proven {
-        return Handshake::Refused(Code::BadProof);
+        return Err(Handshake::Refused(Code::BadProof));
     }
-    // A key that holds no account yet is not yet: the handshake is held, and the block that
-    // gives the key an account welcomes it. The wait is armed before the read, so a move between
-    // the read and the wait is seen; the generation is read before the account, so a block that
-    // moves the identity table during or after the read is seen once the session is registered.
-    // A client that speaks, or goes, while held is let go.
+    Ok(hello)
+}
+
+/// The proof, then the account the identity role names for the key. A key that holds no
+/// account yet is not yet: the handshake is held, and the block that gives the key an account
+/// welcomes it. The relay is held only while the account is read, so a handshake held for a
+/// key keeps no relay alive, and the node going away wakes it to hear so. The wait is armed
+/// before the read, so a move between the read and the wait is seen; the generation is read
+/// before the account, so a block that moves the identity table during or after the read is
+/// seen once the session is registered. A client that speaks, or goes, while held is let go.
+async fn handshake<E: crate::Context>(relay: &Weak<Relay<E>>, link: &mut Link) -> Handshake {
+    let Some(strong) = relay.upgrade() else {
+        return Handshake::Gone;
+    };
+    let hello = match proven(&strong, link).await {
+        Ok(hello) => hello,
+        Err(handshake) => return handshake,
+    };
+    let held = strong.grants.held();
+    drop(strong);
     loop {
-        let moved = relay.grants.identity_moves();
+        let moved = held.notified();
         tokio::pin!(moved);
         moved.as_mut().enable();
-        let generation = relay.grants.identity_generation();
-        if let Some(account) = relay.grants.account(&hello.key).await {
+        let Some(strong) = relay.upgrade() else {
+            return Handshake::Gone;
+        };
+        let generation = strong.grants.identity_generation();
+        if let Some(account) = strong.grants.account(&hello.key).await {
             return Handshake::Welcomed(account, hello.key, generation);
         }
+        if let Some(GoingAway { in_ms }) = strong.state().going_away() {
+            return Handshake::GoingAway(in_ms);
+        }
+        drop(strong);
         tokio::select! {
             () = &mut moved => {}
             _ = link.inbound.recv() => return Handshake::Gone,
@@ -558,14 +583,14 @@ fn going_away(link: &Link, in_ms: u32) {
 /// One session, from its handshake to its close. The relay is held only while a step runs, so
 /// an open client never keeps a dropped relay alive.
 async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
-    let Some(strong) = relay.upgrade() else {
-        return;
-    };
-    let handshake = handshake(&strong, &mut link).await;
-    let (account, key, generation) = match handshake {
+    let (account, key, generation) = match handshake(&relay, &mut link).await {
         Handshake::Welcomed(account, key, generation) => (account, key, generation),
         Handshake::Refused(code) => return refused(&link, code),
+        Handshake::GoingAway(in_ms) => return going_away(&link, in_ms),
         Handshake::Gone => return link.outlet.close("no_handshake"),
+    };
+    let Some(strong) = relay.upgrade() else {
+        return link.outlet.close("relay_gone");
     };
     let id = match strong.welcomed(account, key, &link) {
         Ok(id) => id,
@@ -596,8 +621,9 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
             Awaited::Gone => break "closed",
             Awaited::Closed(reason) => break reason,
             // Every change the relay makes to a session's requests is told to it as a control
-            // message, so the loop's top re-arms `idle_at` from what the session holds now: one
-            // the relay emptied is closed after `IDLE_SESSION` like one the client stopped using.
+            // message, or nudges it when there is nothing to say, so the loop's top re-arms
+            // `idle_at` from what the session holds now: one the relay emptied is closed after
+            // `IDLE_SESSION` like one the client stopped using.
             Awaited::Recheck => continue,
             Awaited::Idle => break "idle",
         };
@@ -694,11 +720,13 @@ async fn rechecking<E: crate::Context>(relay: Weak<Relay<E>>, rechecks: Arc<Noti
 }
 
 /// The node is going away: in one step every session hears `GoAway`, then is closed, in that
-/// order, so the word is queued before the close the writer honors.
+/// order, so the word is queued before the close the writer honors; then every handshake held
+/// for an account wakes to hear it too.
 async fn closing<E: crate::Context>(relay: Weak<Relay<E>>, mut shutdown: watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|down| *down).await;
     let Some(relay) = relay.upgrade() else {
         return;
     };
     relay.step(|state| state.go_away(GOAWAY_MS));
+    relay.grants.going_away();
 }

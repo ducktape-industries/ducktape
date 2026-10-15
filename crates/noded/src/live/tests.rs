@@ -1469,6 +1469,35 @@ fn a_key_with_no_account_yet_is_held_at_the_handshake_until_a_block_gives_it_one
 }
 
 #[test]
+fn a_handshake_held_for_an_account_hears_the_node_go_away() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let stranger = PrivateKey::from_seed(12);
+        let node = node(context, 1, ledger.clone());
+
+        // The account read parks on `None`; the node goes away while the handshake is held.
+        let (read, answer) = ledger.park_account();
+        let mut client = Client::dial(&node).await;
+        let handshake = async {
+            client
+                .handshake(&stranger, GENESIS, &node.key, &stranger)
+                .await
+        };
+        let going = async {
+            read.await.unwrap();
+            answer.send(()).unwrap();
+            node.shutdown.send_replace(true);
+        };
+        let (heard, ()) = tokio::join!(handshake, going);
+        assert_eq!(
+            heard,
+            Control::GoAway { in_ms: GOAWAY_MS },
+            "a held handshake hears the node go away, not nothing"
+        );
+    });
+}
+
+#[test]
 fn a_key_that_moves_account_while_its_session_proves_is_closed_once_registered() {
     runtime::Runner::default().start(|context| async move {
         let ledger = Arc::new(Ledger::default());

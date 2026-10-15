@@ -152,7 +152,7 @@ pub enum Sent {
 impl Outlet {
     pub fn send(&self, out: Out) -> Sent {
         if let Out::Control(_) = &out {
-            self.told.notify_one();
+            self.nudge();
         }
         if let Out::Datagram { header, payload } = out {
             return match self.latest.put(header, payload) {
@@ -183,8 +183,14 @@ impl Outlet {
         *self.closing.borrow()
     }
 
-    /// Resolves once a control message was delivered since it was last awaited (a permit is
-    /// kept, so one delivered while the loop was in a step is not lost).
+    /// The session's requests changed with nothing to say about it: its loop re-reads what it
+    /// holds, as it does on a control message.
+    pub fn nudge(&self) {
+        self.told.notify_one();
+    }
+
+    /// Resolves once a control message was delivered, or the session nudged, since it was last
+    /// awaited (a permit is kept, so one delivered while the loop was in a step is not lost).
     pub async fn told(&self) {
         self.told.notified().await;
     }

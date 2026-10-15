@@ -53,13 +53,15 @@ pub enum Subscriber {
     },
 }
 
-/// What is sent as a step's outcome: to a session here, over the live lane to a node, or an
-/// outlet closed. Closing is an effect like any other, so its order against the sends before it
-/// is owned by the one executor (a `GoAway` is queued before the close that follows it).
+/// What is sent as a step's outcome: to a session here, over the live lane to a node, a
+/// session nudged to re-read what it holds (a hand-over took its publication with no word), or
+/// an outlet closed. Closing is an effect like any other, so its order against the sends before
+/// it is owned by the one executor (a `GoAway` is queued before the close that follows it).
 #[derive(Debug)]
 pub enum Effect {
     Send(Outlet, Out),
     Lane(Relayed),
+    Nudge(Outlet),
     Close(Outlet, &'static str),
 }
 
@@ -424,6 +426,11 @@ impl State {
         self.sessions.get(&id)
     }
 
+    /// When to re-open, once the node began to go away.
+    pub fn going_away(&self) -> Option<GoingAway> {
+        self.going_away.map(|in_ms| GoingAway { in_ms })
+    }
+
     pub fn sessions(&self) -> impl Iterator<Item = (SessionId, &Session)> {
         self.sessions.iter().map(|(id, session)| (*id, session))
     }
@@ -781,8 +788,11 @@ impl State {
         }
         self.unwait(id, request, &ask);
         if let Some(held) = self.tracks.get(&track) {
+            // One publication per session and track: this session publishes it already, under
+            // another request. A priority change is an unpublish and a publish.
+            let same_session = held.origin == Origin::Local(id);
             let same_account = held.by == account;
-            if !same_account {
+            if same_session || !same_account {
                 self.refuse(id, request, Code::Duplicate, &mut effects);
                 return effects;
             }
@@ -836,8 +846,9 @@ impl State {
     /// inside the old connection's idle time): the subscribers, local and behind nodes, are
     /// handed to the new publication and hear no end; the groups the old one left open are cut
     /// short, and the next group comes from the new publication under the track's alias. The
-    /// old session is no publisher of it any more and hears nothing: its connection is what
-    /// went. The new publisher is told the subscriber count as a new publisher is.
+    /// old session is no publisher of it any more and hears nothing (its connection is what
+    /// went), but is nudged, so one still open re-arms its idle timer. The new publisher is told
+    /// the subscriber count as a new publisher is.
     fn hand_over(
         &mut self,
         track: &Track,
@@ -875,6 +886,7 @@ impl State {
         let alias = held.alias;
         if let Some(session) = self.sessions.get_mut(&old) {
             session.published.remove(&old_request);
+            effects.push(Effect::Nudge(session.outlet.clone()));
         }
         if let Some(session) = self.sessions.get_mut(&id) {
             session.published.insert(request, track.clone());
@@ -2671,7 +2683,7 @@ mod tests {
             .into_iter()
             .filter_map(|effect| match effect {
                 Effect::Lane(relayed) => Some(relayed),
-                Effect::Send(..) | Effect::Close(..) => None,
+                Effect::Send(..) | Effect::Nudge(_) | Effect::Close(..) => None,
             })
             .collect()
     }
@@ -2682,7 +2694,7 @@ mod tests {
             .into_iter()
             .filter_map(|effect| match effect {
                 Effect::Send(_, Out::Control(control)) => Some(control),
-                Effect::Send(..) | Effect::Lane(_) | Effect::Close(..) => None,
+                Effect::Send(..) | Effect::Lane(_) | Effect::Nudge(_) | Effect::Close(..) => None,
             })
             .collect()
     }
@@ -3011,7 +3023,7 @@ mod tests {
                 .iter()
                 .filter_map(|effect| match effect {
                     Effect::Send(_, out) => Some(out),
-                    Effect::Lane(_) | Effect::Close(..) => None,
+                    Effect::Lane(_) | Effect::Nudge(_) | Effect::Close(..) => None,
                 })
                 .collect()
         }
@@ -3020,7 +3032,7 @@ mod tests {
                 .iter()
                 .filter_map(|effect| match effect {
                     Effect::Lane(relayed) => Some(relayed),
-                    Effect::Send(..) | Effect::Close(..) => None,
+                    Effect::Send(..) | Effect::Nudge(_) | Effect::Close(..) => None,
                 })
                 .collect()
         }
@@ -3102,6 +3114,12 @@ mod tests {
                 .is_some_and(|session| session.published.is_empty()),
             "the old session publishes it no more"
         );
+        assert!(
+            handed
+                .iter()
+                .any(|effect| matches!(effect, Effect::Nudge(_))),
+            "the old session is nudged to re-arm its idle timer: {handed:?}"
+        );
 
         // The next group comes from the new publication, to both; the old session is ignored.
         let next = state.object(
@@ -3138,6 +3156,30 @@ mod tests {
             stale.is_empty(),
             "the old session is no publisher: {stale:?}"
         );
+    }
+
+    #[test]
+    fn a_session_that_publishes_a_track_it_publishes_already_is_refused_duplicate() {
+        let mut state = state();
+        let alice = open(&mut state, 42, 1);
+        let doc = room("doc");
+        state.publish(alice, 1, doc.clone(), Mode::Stream, 128, true);
+        let again = told(state.publish(alice, 2, doc.clone(), Mode::Stream, 200, true));
+        assert_eq!(
+            again,
+            [Control::Refused {
+                request: 2,
+                code: Code::Duplicate
+            }],
+            "the same session hands nothing over to itself"
+        );
+        let held = state.track(&doc).expect("published");
+        assert_eq!(
+            (held.request, held.priority),
+            (1, 128),
+            "the publication stands as it was"
+        );
+        assert_eq!(state.session(alice).expect("open").published.len(), 1);
     }
 
     #[test]

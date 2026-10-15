@@ -9,7 +9,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, Semaphore};
 
 use abi::live::{self, Grant};
@@ -125,9 +124,10 @@ pub struct Grants {
     chain: Arc<dyn Chain>,
     generation: AtomicU64,
     identity: AtomicU64,
-    /// Woken on every move of the identity table: a handshake held for a key with no account
-    /// yet reads it again.
-    identities: Notify,
+    /// Woken on every move of the identity table, and when the node goes away: a handshake
+    /// held for a key with no account yet reads it again, or hears the node is going. Its own
+    /// handle, so a held handshake waits on it holding nothing of the relay.
+    held: Arc<Notify>,
     reads: Semaphore,
 }
 
@@ -137,7 +137,7 @@ impl Grants {
             chain,
             generation: AtomicU64::new(0),
             identity: AtomicU64::new(0),
-            identities: Notify::new(),
+            held: Arc::new(Notify::new()),
             reads: Semaphore::new(READS_IN_FLIGHT),
         }
     }
@@ -180,13 +180,18 @@ impl Grants {
 
     pub fn identity_moved(&self) {
         self.identity.fetch_add(1, Ordering::AcqRel);
-        self.identities.notify_waiters();
+        self.held.notify_waiters();
     }
 
-    /// The next move of the identity table; armed (`enable`) before a read, it sees a move
+    /// What a held handshake waits on: a `notified` armed (`enable`) before a read sees a move
     /// between the read and the wait.
-    pub fn identity_moves(&self) -> Notified<'_> {
-        self.identities.notified()
+    pub fn held(&self) -> Arc<Notify> {
+        self.held.clone()
+    }
+
+    /// The node goes away: every held handshake wakes to hear it.
+    pub fn going_away(&self) {
+        self.held.notify_waiters();
     }
 }
 
