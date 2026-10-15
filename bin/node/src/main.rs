@@ -362,11 +362,16 @@ enum VoteVerb {
     #[command(about = "make enrolling take an invite")]
     Close,
     #[command(
-        about = "send the programs role an op, a file or stdin: schedule or cancel a program change"
+        about = "send the program bound to a role an op, a file or stdin: `programs` schedules or cancels a program change, `halo` opens, sets or closes a lane"
     )]
-    Programs { op: Option<PathBuf> },
-    #[command(about = "send the halo role an op, a file or stdin: open, set or close a lane")]
-    Halo { op: Option<PathBuf> },
+    Role { role: String, op: Option<PathBuf> },
+    #[command(
+        about = "bind a program to a role, or unbind the role without a program; a role the network binds for its life is refused"
+    )]
+    Bind {
+        role: String,
+        program: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -803,8 +808,11 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
         VoteVerb::Remove { key: member } => Motion::Remove { key: key(member)? },
         VoteVerb::Open => Motion::Door { open: true },
         VoteVerb::Close => Motion::Door { open: false },
-        VoteVerb::Programs { op } => Motion::Programs { op: bytes(op)? },
-        VoteVerb::Halo { op } => Motion::Halo { op: bytes(op)? },
+        VoteVerb::Role { role, op } => Motion::Role {
+            role,
+            op: bytes(op)?,
+        },
+        VoteVerb::Bind { role, program } => Motion::Bind { role, program },
     })
 }
 

@@ -1482,7 +1482,8 @@ fn a_lane_the_validators_vote_open_is_served_from_its_block() {
             name: blob::contract::LANE.into(),
             cap: halo::Class::Critical,
         };
-        let motion = Motion::Halo {
+        let motion = Motion::Role {
+            role: role::HALO.into(),
             op: abi::encode(&open),
         };
         let height = membership(client, &taker.identity, Op::Vote(motion)).await;

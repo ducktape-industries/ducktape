@@ -1729,6 +1729,14 @@ where
         let writes = overlay.into_writes();
         self.blobs.promote(stage)?;
         self.store.commit(tip.height, writes.clone()).await?;
+        // a vote may have bound or unbound a role: the table the next block's
+        // frames carry is the one just committed
+        let roles = self
+            .store
+            .view(Vec::new())
+            .get(NETWORK, namespace::ROLES)?
+            .ok_or_else(|| Error::Corrupt("the network records no roles".into()))?;
+        self.roles = abi::decode(&roles).map_err(corrupt)?;
         // a commitment outlives neither its program's drop nor an undone
         // admission: the root is over the programs a reopened node opens
         let running: BTreeSet<ProgramId> = programs_in(self.store.storage())?.into_iter().collect();
@@ -1883,7 +1891,7 @@ fn member_cap_of(view: &View<'_>) -> Result<u32> {
     Ok(cap)
 }
 
-fn bound<'r>(roles: &'r Roles, role: &str) -> Result<&'r ProgramId> {
+pub(crate) fn bound<'r>(roles: &'r Roles, role: &str) -> Result<&'r ProgramId> {
     roles
         .get(role)
         .ok_or_else(|| Error::Unfilled { role: role.into() })

@@ -62,9 +62,9 @@ mod program {
                 .find(|member| member.key == key)
         }
 
-        /// Enacts a roster motion; a halo motion changes no roster and is
-        /// returned as the op the halo role runs.
-        fn enact(&mut self, motion: Motion) -> Result<Option<Vec<u8>>, Refusal> {
+        /// Enacts a roster motion; a role motion changes no roster and is
+        /// returned as the op the role's program runs, a bind as the row.
+        fn enact(&mut self, motion: Motion) -> Result<Option<Forwarded>, Refusal> {
             match motion {
                 Motion::Promote { key } => {
                     let member = self.take(&key).ok_or_else(not_a_member)?;
@@ -77,16 +77,31 @@ mod program {
                 Motion::Remove { key } => {
                     self.take(&key).ok_or_else(not_a_member)?;
                 }
-                Motion::Halo { op } => return Ok(Some(op)),
-                Motion::Door { .. } | Motion::Programs { .. } => {
+                Motion::Role { role, op } => return Ok(Some(Forwarded::Op { role, op })),
+                Motion::Bind { role, program } => {
+                    return Ok(Some(Forwarded::Bind { role, program }));
+                }
+                Motion::Door { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
-                        "the fixture valset has no door and no programs motion",
+                        "the fixture valset has no door",
                     ));
                 }
             }
             Ok(None)
         }
+    }
+
+    /// What a vote enacts outside the roster.
+    enum Forwarded {
+        Op {
+            role: String,
+            op: Vec<u8>,
+        },
+        Bind {
+            role: String,
+            program: Option<abi::ProgramId>,
+        },
     }
 
     fn not_a_member() -> Refusal {
@@ -123,9 +138,12 @@ mod program {
                     roster.take(signer).ok_or_else(not_a_member)?;
                 }
                 Op::Vote(motion) => {
-                    let forwarded = roster.enact(motion)?;
-                    if let Some(op) = forwarded {
-                        ctx.emit(env.roles.bound(abi::role::HALO)?.clone(), op, false);
+                    match roster.enact(motion)? {
+                        Some(Forwarded::Op { role, op }) => {
+                            ctx.emit(env.roles.bound(&role)?.clone(), op, false);
+                        }
+                        Some(Forwarded::Bind { role, program }) => ctx.bind(role, program)?,
+                        None => {}
                     }
                     ctx.output(abi::encode(&Voted::Enacted));
                 }

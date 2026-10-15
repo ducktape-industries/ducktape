@@ -115,6 +115,10 @@ impl Roles {
         self.0.insert(role.into(), program.into());
     }
 
+    pub fn unbind(&mut self, role: &str) {
+        self.0.remove(role);
+    }
+
     pub fn unfilled(&self) -> Option<&'static str> {
         role::REQUIRED
             .iter()
@@ -384,6 +388,13 @@ pub enum HostOp {
         ticket: role::awaits::Ticket,
         answer: role::awaits::Answer,
     },
+    /// Bind `program` to `role` in the network's roles table, or unbind the
+    /// role when `program` is `None`: the validators role's alone, and never
+    /// a role in `role::REQUIRED`.
+    Bind {
+        role: String,
+        program: Option<ProgramId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -546,12 +557,31 @@ pub mod role {
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Motion {
-            Promote { key: Vec<u8> },
-            Demote { key: Vec<u8> },
-            Remove { key: Vec<u8> },
-            Door { open: bool },
-            Programs { op: Vec<u8> },
-            Halo { op: Vec<u8> },
+            Promote {
+                key: Vec<u8>,
+            },
+            Demote {
+                key: Vec<u8>,
+            },
+            Remove {
+                key: Vec<u8>,
+            },
+            Door {
+                open: bool,
+            },
+            /// The validators' vote on an op of the program bound to `role`:
+            /// on enactment the op runs on that program as the vote.
+            Role {
+                role: String,
+                op: Vec<u8>,
+            },
+            /// The validators' vote on the roles table: bind `program` to
+            /// `role`, or unbind the role when `program` is `None`. A role in
+            /// `REQUIRED` is refused: its program is fixed.
+            Bind {
+                role: String,
+                program: Option<crate::ProgramId>,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -839,7 +869,7 @@ pub mod role {
             pub since: u64,
         }
 
-        /// Every op is the validators' vote (`Motion::Halo`); a signed frame
+        /// Every op is the validators' vote (`Motion::Role`); a signed frame
         /// is refused.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Op {

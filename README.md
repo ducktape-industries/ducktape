@@ -203,11 +203,13 @@ Membership changes only by the validators' vote. The door starts closed, so
 a stranger needs an invite a validator signed: `ducktape invite` prints one,
 good for one enrollment for 72 hours (`--hours`). Validators vote with
 `ducktape vote promote|demote|remove <key>`, `ducktape vote open|close` (the
-door), `ducktape vote programs <op>`, which sends the programs role a
-program change once it passes, and `ducktape vote halo <op>`, which sends the
-halo role a lane to open, set or close; neither role takes a change from
-anything else. A motion passes when more than two thirds of the current validators
-vote for it. `ducktape leave` takes the node out; the last validator cannot
+door), `ducktape vote role <role> <op>`, which runs `op` on the program bound
+to the role once it passes (`programs` takes a program change, `halo` a lane
+to open, set or close; neither takes a change from anything else), and
+`ducktape vote bind <role> [program]`, which binds a program to a role, or
+unbinds the role, on the running network (a role in `abi::role::REQUIRED` is
+bound for the network's life). A motion passes when more than two thirds of
+the current validators vote for it. `ducktape leave` takes the node out; the last validator cannot
 leave. Each prints the block that carried it.
 
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
@@ -379,7 +381,7 @@ role's program holds the lane table: each lane's name, the id its streams and da
 on the wire, the highest class it is served at, whether it is served, and whether it is pinned.
 A node reads the table at start and again after any block that writes it or swaps the halo
 program's code, so every node changes lanes at the same block. Only the validators' vote
-changes it (`ducktape vote halo <op>`, an `abi::role::halo::Op`): it opens a lane at the next
+changes it (`ducktape vote role halo <op>`, an `abi::role::halo::Op`): it opens a lane at the next
 id, sets a lane's class or pauses it, or closes one; an id is never handed out twice. A lane is pinned only at founding, and no
 vote pauses or closes a pinned lane. Pin `ducktape/blobs`: a node fetches the blobs a block
 reads over it, so a vote that paused it would cut a node off from the very block that undoes
