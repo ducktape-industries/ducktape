@@ -12,7 +12,7 @@ use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::Layer;
-use node::{Frame, Node, Source, Taken};
+use node::{Frame, Node, Preconfirm, Source, Taken};
 
 pub use call::Clients;
 pub use config::Config;
@@ -238,7 +238,9 @@ impl<E: Context> Worker<E> {
 
     async fn submit(&self, frame: Vec<u8>) -> Sent {
         let mut node = self.daemon.node.lock().await;
-        let taken = node.submit(frame.clone(), Source::Client).await;
+        let taken = node
+            .submit(frame.clone(), Source::Client, Preconfirm::Off)
+            .await;
         drop(node);
         match taken {
             Ok(Ok(Taken::New(_))) => {
