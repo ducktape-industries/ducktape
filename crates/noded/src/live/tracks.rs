@@ -50,14 +50,14 @@ pub enum Subscriber {
     },
 }
 
-/// What is sent as a step's outcome: to a session here, or over lane 7 to a node.
+/// What is sent as a step's outcome: to a session here, or over the live lane to a node.
 #[derive(Debug)]
 pub enum Effect {
     Send(Outlet, Out),
     Lane(Relayed),
 }
 
-/// What lane 7 carries for a step: announces to every member, and a group's objects or a
+/// What the live lane carries for a step: announces to every member, and a group's objects or a
 /// datagram to the node that subscribed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Relayed {
@@ -487,7 +487,7 @@ impl State {
         effects
     }
 
-    /// A track heard of over lane 7: another node's client publishes it.
+    /// A track heard of over the live lane: another node's client publishes it.
     pub fn remote_announced(
         &mut self,
         peer: PublicKey,
@@ -552,7 +552,7 @@ impl State {
         theirs.then_some(alias)
     }
 
-    /// The lane-7 forwarding request of a remote track, if one was answered.
+    /// The live lane's forwarding request of a remote track, if one was answered.
     pub fn remote_request(&self, peer: &PublicKey, request: RequestId) -> Option<Track> {
         self.tracks
             .iter()
@@ -748,7 +748,7 @@ impl State {
         effects
     }
 
-    /// A node asks for a local track over lane 7. The asking node's request is its own alias
+    /// A node asks for a local track over the live lane. The asking node's request is its own alias
     /// of the track, and the data it gets names the track by it, so a group can never arrive
     /// before the node knows the alias.
     pub fn node_subscribed(
@@ -1682,7 +1682,7 @@ mod tests {
         State::new("net#00000000".into(), super::super::metrics(context))
     }
 
-    /// What a step sends a node over lane 7, without the sessions' sends.
+    /// What a step sends a node over the live lane, without the sessions' sends.
     fn lane(effects: Vec<Effect>) -> Vec<Relayed> {
         effects
             .into_iter()

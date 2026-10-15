@@ -1,0 +1,11 @@
+[package]
+name = "fixture-halo"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+abi = { workspace = true }
+program = { workspace = true }

@@ -1,41 +1,21 @@
-//! The priority a halo stream is served at, and the cap on what an asker may claim.
+//! The priority a halo stream is served at: what it asked, no higher than its lane's cap, and
+//! `Critical` only for a validator.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Class {
-    Critical,
-    Member,
-    Client,
+pub use abi::role::halo::Class;
+
+/// `Critical` is a validator's alone: anyone else claiming it is served at `Member`.
+pub(crate) fn claimed(asked: Class, validator: bool) -> Class {
+    let claims_critical = asked == Class::Critical;
+    if claims_critical && !validator {
+        return Class::Member;
+    }
+    asked
 }
 
-impl Class {
-    pub const COUNT: usize = 3;
-    pub const ALL: [Class; Class::COUNT] = [Class::Critical, Class::Member, Class::Client];
-
-    pub fn rank(self) -> usize {
-        self as usize
-    }
-
-    pub fn capped(self, validator: bool) -> Class {
-        let claims_critical = self == Class::Critical;
-        if claims_critical && !validator {
-            return Class::Member;
-        }
-        self
-    }
-}
-
-impl From<Class> for u8 {
-    fn from(class: Class) -> u8 {
-        class as u8
-    }
-}
-
-impl TryFrom<u8> for Class {
-    type Error = u8;
-
-    fn try_from(byte: u8) -> Result<Class, u8> {
-        Class::ALL.get(usize::from(byte)).copied().ok_or(byte)
-    }
+/// `asked`, no higher than `cap`. `Ord` puts the higher priority first, so the lower
+/// priority of the two is the greater.
+pub(crate) fn capped(asked: Class, cap: Class) -> Class {
+    asked.max(cap)
 }
 
 #[cfg(test)]
@@ -44,19 +24,21 @@ mod tests {
 
     #[test]
     fn only_a_validator_is_served_at_critical() {
-        assert_eq!(Class::Critical.capped(true), Class::Critical);
-        assert_eq!(Class::Critical.capped(false), Class::Member);
+        assert_eq!(claimed(Class::Critical, true), Class::Critical);
+        assert_eq!(claimed(Class::Critical, false), Class::Member);
         for class in [Class::Member, Class::Client] {
-            assert_eq!(class.capped(false), class);
-            assert_eq!(class.capped(true), class);
+            assert_eq!(claimed(class, false), class);
+            assert_eq!(claimed(class, true), class);
         }
     }
 
     #[test]
-    fn a_class_survives_its_byte() {
+    fn a_stream_is_served_at_the_lower_of_what_it_asked_and_its_cap() {
+        assert_eq!(capped(Class::Critical, Class::Member), Class::Member);
+        assert_eq!(capped(Class::Client, Class::Member), Class::Client);
         for class in Class::ALL {
-            assert_eq!(Class::try_from(u8::from(class)), Ok(class));
+            assert_eq!(capped(class, Class::Critical), class);
+            assert_eq!(capped(class, Class::Client), Class::Client);
         }
-        assert_eq!(Class::try_from(3), Err(3));
     }
 }

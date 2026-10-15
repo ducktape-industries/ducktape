@@ -5,7 +5,7 @@ use std::sync::Arc;
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
     HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, hook, reason,
-    role::{identity, programs, validators},
+    role::{halo, identity, programs, validators},
 };
 use blob::contract as blobs;
 use commonware_codec::Encode as _;
@@ -32,6 +32,7 @@ const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.was
 const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
 
 const SIGNER: &[u8] = b"signer";
 /// Fuel that runs one relay handler and a message of it, not a chain of eight.
@@ -67,10 +68,21 @@ fn roles() -> Roles {
         identity: "identity".into(),
         blobs: "blobs".into(),
         awaits: "awaits".into(),
+        halo: "halo".into(),
     }
 }
 
 const PING: u64 = fixture_identity::PROGRAMS_FROM + 4;
+
+/// The lanes the halo role is founded with.
+fn lanes() -> Vec<u8> {
+    abi::encode(&halo::Genesis {
+        lanes: vec![
+            ("first".into(), halo::Class::Critical),
+            ("second".into(), halo::Class::Client),
+        ],
+    })
+}
 
 /// The programs role, the validators and identity (where [`SIGNER`] holds
 /// [`ACCOUNT`]), then `programs`.
@@ -92,7 +104,10 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
         programs: bound
             .into_iter()
             .chain(programs)
-            .chain([founding("awaits", AWAITS, Vec::new())])
+            .chain([
+                founding("awaits", AWAITS, Vec::new()),
+                founding("halo", HALO, lanes()),
+            ])
             .collect(),
         views: Vec::new(),
         hooks: Vec::new(),
@@ -382,7 +397,8 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(
             ids,
             [
-                "awaits", "blobs", "identity", "ping", "pong", "probe", "programs", "valset"
+                "awaits", "blobs", "halo", "identity", "ping", "pong", "probe", "programs",
+                "valset"
             ]
         );
         assert_eq!(programs["ping"], programs["pong"]);
@@ -439,20 +455,91 @@ fn founding_admits_every_program_and_the_host_reopens() {
 
 #[test]
 fn founding_refuses_an_unbound_role() {
+    type Binding = fn(&mut Roles) -> &mut String;
+    let identity: Binding = |roles| &mut roles.identity;
+    let halo: Binding = |roles| &mut roles.halo;
     deterministic::Runner::default().start(|context| async move {
-        for (name, identity) in [("empty", ""), ("unfounded", "nobody")] {
+        for (name, bound, binding, program) in [
+            ("identity_empty", "identity", identity, ""),
+            ("identity_unfounded", "identity", identity, "nobody"),
+            ("halo_empty", "halo", halo, ""),
+            ("halo_unfounded", "halo", halo, "nobody"),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let mut unbound = standard();
-            unbound.roles.identity = identity.into();
-            let Err(Error::Unbound { role, program }) =
-                Host::found(context.child(name), name, dir.path(), block_id(0), unbound).await
+            *binding(&mut unbound.roles) = program.into();
+            let Err(Error::Unbound {
+                role,
+                program: named,
+            }) = Host::found(context.child(name), name, dir.path(), block_id(0), unbound).await
             else {
-                panic!("a genesis with identity bound to {identity:?} was founded");
+                panic!("a genesis with {bound} bound to {program:?} was founded");
             };
-            assert_eq!((role, program.as_str()), ("identity", identity));
+            assert_eq!((role, named.as_str()), (bound, program));
             assert!(!dir.path().join("state").exists(), "{name} wrote state");
             assert!(!dir.path().join("blobs").exists(), "{name} wrote blobs");
         }
+    });
+}
+
+/// The halo role's lanes, as the kernel reads them.
+async fn lanes_of(host: &Host<Ctx>) -> Vec<halo::Lane> {
+    let reply = host
+        .query(
+            Layer::Confirmed,
+            TIME,
+            Origin::System,
+            "halo",
+            abi::encode(&halo::Query::Lanes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    match abi::decode(&reply).unwrap() {
+        halo::Reply::Lanes(lanes) => lanes,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn lane(name: &str, id: halo::LaneId, cap: halo::Class, since: u64) -> halo::Lane {
+    halo::Lane {
+        name: name.into(),
+        id,
+        cap,
+        enabled: true,
+        since,
+    }
+}
+
+#[test]
+fn the_halo_role_opens_a_lane_on_the_validators_vote_alone() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let founded = vec![
+            lane("first", 0, halo::Class::Critical, 0),
+            lane("second", 1, halo::Class::Client, 0),
+        ];
+        assert_eq!(lanes_of(&host).await, founded);
+
+        let open = abi::encode(&halo::Op::Open {
+            name: "third".into(),
+            cap: halo::Class::Member,
+        });
+        let motion = validators::Motion::Halo { op: open.clone() };
+        let voted = submit("valset", abi::encode(&validators::Op::Vote(motion)));
+        let applied = host
+            .apply(block(1, vec![submit("halo", open), voted]))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected(&applied.submissions[0]).reason,
+            reason::UNAUTHORIZED,
+            "a signed frame changes no lane"
+        );
+        output(&applied.submissions[1]);
+        let opened = lane("third", 2, halo::Class::Member, 1);
+        assert_eq!(lanes_of(&host).await, [founded, vec![opened]].concat());
     });
 }
 
@@ -1628,8 +1715,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 receipt("echo", ok(b""), vec![]),
             ]
         );
-        let ninth = fixture_identity::PROGRAMS_FROM + 8;
-        assert_eq!(account_of(&host, "echo").await, Some(ninth));
+        let tenth = fixture_identity::PROGRAMS_FROM + 9;
+        assert_eq!(account_of(&host, "echo").await, Some(tenth));
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
             .apply(block(
@@ -1737,7 +1824,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
         assert_eq!(
             ids,
             [
-                "awaits", "blobs", "identity", "ping", "pong", "probe", "programs", "valset"
+                "awaits", "blobs", "halo", "identity", "ping", "pong", "probe", "programs",
+                "valset"
             ]
         );
         // retried: registered and refused again
@@ -2163,7 +2251,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             let id: BlobId = abi::decode(&entry.key).unwrap();
             framed.insert(id, upstream.blob(&id, TIME).await.unwrap().unwrap());
         }
-        assert_eq!(framed.len(), 8);
+        assert_eq!(framed.len(), 9);
         let targets: BTreeMap<String, SyncTarget> = upstream
             .store()
             .programs()

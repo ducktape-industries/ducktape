@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use abi::{HostOp, Root, role::validators};
+use abi::{
+    HostOp, Root,
+    role::{halo, validators},
+};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_p2p::simulated::{self, Link, Oracle};
 use commonware_runtime::{Quota, Runner as _, Spawner as _, Supervisor as _, deterministic};
@@ -28,6 +31,7 @@ const RELAY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_relay.wasm")
 const IDENTITY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_identity.wasm");
 const BLOBS: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_halo.wasm");
 const PROBE: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"cluster";
@@ -90,6 +94,7 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
             identity: "identity".into(),
             blobs: "blobs".into(),
             awaits: "awaits".into(),
+            halo: "halo".into(),
         },
         validators: members.to_vec(),
         programs: vec![
@@ -127,6 +132,11 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
                 program: "awaits".into(),
                 code: AWAITS.to_vec(),
                 params: Vec::new(),
+            },
+            Founding {
+                program: "halo".into(),
+                code: HALO.to_vec(),
+                params: abi::encode(&halo::Genesis { lanes: Vec::new() }),
             },
         ],
         views: Vec::new(),

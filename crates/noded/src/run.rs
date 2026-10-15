@@ -21,7 +21,7 @@ use consensus::{
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use halo::{Halo, Seat};
+use halo::{Halo, Lane, Seat};
 use host::Layer;
 use node::{Block, Frame, Node, Sequenced, Source, Taken};
 use tokio::sync::watch;
@@ -232,6 +232,7 @@ async fn start<E: Context>(
         .map_err(|error| Error::Tls(error.to_string()))?,
     );
     halo.seat(halo_seats(&node, &network).await?);
+    halo.plane().lanes(halo_lanes(&node).await?);
     let blobs =
         blob::service::Service::start(halo.clone(), node.host().blobs().clone(), bundles(&node)?)?;
 
@@ -437,6 +438,42 @@ async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec
     Ok(seats(&members, &validators))
 }
 
+/// The lanes the halo role lists, at the confirmed tip.
+async fn halo_lanes<E: Context>(node: &Node<E>) -> Result<Vec<Lane>> {
+    let role = node.host().roles().halo.clone();
+    let asked = abi::encode(&abi::role::halo::Query::Lanes);
+    let answer = node
+        .query(Layer::Confirmed, abi::Origin::System, &role, asked)
+        .await?
+        .map_err(|refusal| Error::Corrupt(format!("the halo program refused Lanes: {refusal}")))?;
+    let abi::role::halo::Reply::Lanes(lanes) = abi::decode(&answer).map_err(|refusal| {
+        Error::Corrupt(format!(
+            "the Lanes answer does not decode: {}",
+            refusal.sentence
+        ))
+    })?
+    else {
+        return Err(Error::Corrupt(
+            "the halo program answered Lanes with another reply".into(),
+        ));
+    };
+    Ok(lanes)
+}
+
+async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
+    match halo_lanes(node).await {
+        Ok(lanes) => daemon.halo.plane().lanes(lanes),
+        Err(error) => tracing::warn!(
+            target: "ducktape::halo",
+            event = "halo_untabled",
+            height,
+            %error,
+            reason = "lanes_unread",
+            "halo keeps its lane table: the node could not read the halo program's lanes"
+        ),
+    }
+}
+
 async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
     match halo_seats(node, &daemon.network).await {
         Ok(seats) => daemon.halo.seat(seats),
@@ -640,6 +677,14 @@ async fn applied<E: Context>(
                 .programs
                 .get(&roles.validators)
                 .is_some_and(|writes| !writes.is_empty());
+            let lanes_written = applied
+                .writes
+                .programs
+                .get(&roles.halo)
+                .is_some_and(|writes| !writes.is_empty());
+            if lanes_written {
+                retable_halo(daemon, &node, block.height).await;
+            }
             let writes = applied.writes.programs.get(&roles.blobs).cloned();
             let bundles = daemon
                 .blobs

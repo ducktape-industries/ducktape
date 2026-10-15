@@ -1,5 +1,5 @@
 //! The live wire: what a desktop client and a node say to each other over QUIC or a websocket
-//! to publish and subscribe to tracks off consensus, and what two nodes say over halo's lane 7
+//! to publish and subscribe to tracks off consensus, and what two nodes say over halo's live lane
 //! to carry a track between them. Every message is borsh; a client depends on this crate alone.
 
 use std::time::Duration;
@@ -263,10 +263,11 @@ pub enum WsFrame {
     },
 }
 
-/// halo's lane between nodes, for both streams and datagrams.
-pub const LANE: u8 = 7;
+/// The name of halo's lane between nodes, for both streams and datagrams, as the halo role's
+/// table lists it.
+pub const LANE: &str = "ducktape/live";
 
-/// What a lane-7 stream carries, in its halo hello's meta: control messages (length-prefixed
+/// What a live-lane stream carries, in its halo hello's meta: control messages (length-prefixed
 /// [`Forward`]) or one group ([`GroupHeader`] then objects, the alias as the node that asked
 /// `Subscribe` picked it, then [`GROUP_COMPLETE`] when the group completes; an end without it
 /// is a group abandoned, which a path that cannot reset says this way).

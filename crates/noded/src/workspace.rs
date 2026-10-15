@@ -166,6 +166,7 @@ pub struct RoleIds {
     pub identity: String,
     pub blobs: String,
     pub awaits: String,
+    pub halo: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -285,6 +286,7 @@ impl Founding {
                 identity: self.roles.identity.clone(),
                 blobs: self.roles.blobs.clone(),
                 awaits: self.roles.awaits.clone(),
+                halo: self.roles.halo.clone(),
             },
             validators,
             programs,
@@ -332,7 +334,7 @@ mod tests {
 
     const FILE: &str = "network = \"n\"\ntime = 0\nepoch_length = 4\nblock_time_ms = 1000\n\
          HOOKS\
-         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\nblobs = \"b\"\nawaits = \"a\"\n\
+         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\nblobs = \"b\"\nawaits = \"a\"\nhalo = \"h\"\n\
          [[validators]]\nkey = \"00\"\nhalo = \"n0.example.org:1\"\n\
          [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
 

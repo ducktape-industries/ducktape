@@ -2,7 +2,7 @@
 //! consensus, over QUIC on the relay's own UDP socket (`run --live`) or a websocket on the http
 //! port. A session proves its seated key, acts as the account the identity role answers for it,
 //! and does in a room what the room's program granted it. Objects fan out to every local
-//! subscriber and, over halo's lane 7, to every node with a subscriber of its own.
+//! subscriber and, over halo's live lane, to every node with a subscriber of its own.
 
 mod grants;
 mod lane;
@@ -89,8 +89,8 @@ pub struct Relay<E: Context> {
     dirty: Mutex<Dirty>,
     rechecks: Arc<Notify>,
     lane: lane::Queue,
-    /// Every task the relay runs, lane 7's included: dropped with the relay, they are aborted,
-    /// and what they hold of halo goes with them.
+    /// Every task the relay runs, the live lane's included: dropped with the relay, they are
+    /// aborted, and what they hold of halo goes with them.
     tasks: Mutex<JoinSet<()>>,
 }
 

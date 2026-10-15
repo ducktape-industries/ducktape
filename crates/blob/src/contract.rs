@@ -7,6 +7,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{id_of, parse};
 
+/// The halo lane a node gathers and serves blobs on, as the halo role's table names it.
+pub const LANE: &str = "ducktape/blobs";
 pub const BUNDLES: &[u8] = b"b/";
 pub const INDEX: &[u8] = b"i/";
 pub const NEXT: &[u8] = b"next";
