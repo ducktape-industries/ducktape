@@ -630,24 +630,23 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
         let Some(relay) = relay.upgrade() else {
             break "relay_gone";
         };
-        let now = std::time::Instant::now();
         let step = match inbound {
             Inbound::Control(control) => relay.control(id, account, control).await,
             Inbound::Object {
                 header,
                 object,
                 body,
-            } => relay.stepped(|state| state.object(Some(id), header, object, body, now)),
+            } => relay.stepped(|state| state.object(Some(id), header, object, body)),
             Inbound::GroupEnd {
                 alias,
                 group,
                 complete,
             } => relay.stepped(|state| state.group_end(Some(id), alias, group, complete)),
             Inbound::Oversize { alias, group } => {
-                relay.stepped(|state| state.oversize(id, alias, group, now))
+                relay.stepped(|state| state.oversize(id, alias, group))
             }
             Inbound::Datagram { header, payload } => {
-                relay.stepped(|state| state.datagram(Some(id), header, payload, now))
+                relay.stepped(|state| state.datagram(Some(id), header, payload))
             }
             Inbound::Garbled => Step::Close("malformed_request"),
             Inbound::Closed => break "closed",

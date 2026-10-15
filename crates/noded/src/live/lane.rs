@@ -7,7 +7,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
 
 use bytes::Bytes;
 use commonware_cryptography::ed25519::PublicKey;
@@ -1104,7 +1103,7 @@ async fn group_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inboun
         let Some(relay) = relay.upgrade() else {
             return;
         };
-        relay.step(|state| state.object(None, header, object, body.into(), Instant::now()));
+        relay.step(|state| state.object(None, header, object, body.into()));
         object += 1;
     };
     let Some(relay) = relay.upgrade() else {
@@ -1132,7 +1131,7 @@ async fn receiving<E: crate::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Data
             continue;
         };
         let header = DatagramHeader { alias, ..theirs };
-        relay.step(|state| state.datagram(None, header, bytes, Instant::now()));
+        relay.step(|state| state.datagram(None, header, bytes));
     }
 }
 

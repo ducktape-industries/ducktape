@@ -5,7 +5,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use commonware_cryptography::ed25519::PublicKey;
@@ -20,9 +19,6 @@ use abi::live::{Grant, pattern_covers};
 
 use super::grants::{Act, watch_patterns};
 use super::session::{Out, Outlet};
-
-/// A refusal for an object is told once per track per this long; the rest are dropped quiet.
-const REFUSAL_PAUSE: Duration = Duration::from_secs(1);
 
 pub type SessionId = u64;
 
@@ -187,7 +183,6 @@ pub struct Published {
     /// The groups being written, by group: each leaves when its own end arrives, so a group
     /// begun after it neither hides its end nor makes its objects stale.
     incoming: BTreeMap<u64, Incoming>,
-    refused_at: Option<Instant>,
     /// What the first local subscriber of a remote track asked for; a resync asks the same.
     asked: Start,
     /// Forwarding asks of a remote track sent and not yet answered: while one is out, every
@@ -826,7 +821,6 @@ impl State {
                 node_counts: HashMap::new(),
                 told: 0,
                 incoming: BTreeMap::new(),
-                refused_at: None,
                 asked: Start::Next,
                 unanswered: 0,
                 node_asks: HashMap::new(),
@@ -881,7 +875,6 @@ impl State {
         held.origin = Origin::Local(id);
         held.request = request;
         held.priority = priority;
-        held.refused_at = None;
         held.told = 0;
         let alias = held.alias;
         if let Some(session) = self.sessions.get_mut(&old) {
@@ -978,7 +971,6 @@ impl State {
                 node_counts: HashMap::new(),
                 told: 0,
                 incoming: BTreeMap::new(),
-                refused_at: None,
                 asked: Start::Next,
                 unanswered: 0,
                 node_asks: HashMap::new(),
@@ -1955,15 +1947,8 @@ impl State {
         owned.then(|| track.clone())
     }
 
-    fn taken(
-        &mut self,
-        track: &Track,
-        mode: Mode,
-        bytes: usize,
-        cap: usize,
-        now: Instant,
-    ) -> Taken {
-        let Some(held) = self.tracks.get_mut(track) else {
+    fn taken(&mut self, track: &Track, mode: Mode, bytes: usize, cap: usize) -> Taken {
+        let Some(held) = self.tracks.get(track) else {
             return Taken::Dropped;
         };
         let in_mode = held.mode == mode;
@@ -1973,22 +1958,6 @@ impl State {
             self.metrics.objects_in.inc();
             return Taken::Allowed;
         };
-        self.refusal_due(track, code, now)
-    }
-
-    /// A refusal the track's publisher hears once per `REFUSAL_PAUSE`; inside the pause the
-    /// offending object is dropped quiet, so a publisher that keeps erring is not told each time.
-    fn refusal_due(&mut self, track: &Track, code: Code, now: Instant) -> Taken {
-        let Some(held) = self.tracks.get_mut(track) else {
-            return Taken::Dropped;
-        };
-        let told_lately = held
-            .refused_at
-            .is_some_and(|at| now.duration_since(at) < REFUSAL_PAUSE);
-        if told_lately {
-            return Taken::Dropped;
-        }
-        held.refused_at = Some(now);
         Taken::Refused(code)
     }
 
@@ -2000,7 +1969,6 @@ impl State {
         header: GroupHeader,
         object: u32,
         body: Bytes,
-        now: Instant,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let Some(track) = self.publisher_of(id, header.alias) else {
@@ -2018,7 +1986,7 @@ impl State {
         let group_bytes = this_group.map_or(0, |incoming| incoming.bytes);
         let room_left = MAX_GROUP_BYTES.saturating_sub(group_bytes);
         let cap = MAX_STREAM_OBJECT.min(room_left);
-        match self.taken(&track, Mode::Stream, body.len(), cap, now) {
+        match self.taken(&track, Mode::Stream, body.len(), cap) {
             Taken::Allowed => {}
             Taken::Dropped => {
                 self.abandon(&track, header.group, &mut effects);
@@ -2167,13 +2135,7 @@ impl State {
 
     /// The publisher's stream carried an object over its cap: refused `TooLarge`, the group
     /// abandoned, the session kept.
-    pub fn oversize(
-        &mut self,
-        id: SessionId,
-        alias: Alias,
-        group: u64,
-        now: Instant,
-    ) -> Vec<Effect> {
+    pub fn oversize(&mut self, id: SessionId, alias: Alias, group: u64) -> Vec<Effect> {
         let mut effects = Vec::new();
         let Some(track) = self.publisher_of(Some(id), alias) else {
             return effects;
@@ -2181,10 +2143,7 @@ impl State {
         let Some(held) = self.tracks.get(&track) else {
             return effects;
         };
-        let request = held.request;
-        if let Taken::Refused(code) = self.refusal_due(&track, Code::TooLarge, now) {
-            self.refuse(id, request, code, &mut effects);
-        }
+        self.refuse(id, held.request, Code::TooLarge, &mut effects);
         self.abandon(&track, group, &mut effects);
         effects
     }
@@ -2195,7 +2154,6 @@ impl State {
         id: Option<SessionId>,
         header: DatagramHeader,
         payload: Bytes,
-        now: Instant,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let Some(track) = self.publisher_of(id, header.alias) else {
@@ -2213,13 +2171,7 @@ impl State {
             return effects;
         }
         let request = held.request;
-        match self.taken(
-            &track,
-            Mode::Datagram,
-            payload.len(),
-            MAX_DATAGRAM_OBJECT,
-            now,
-        ) {
+        match self.taken(&track, Mode::Datagram, payload.len(), MAX_DATAGRAM_OBJECT) {
             Taken::Allowed => {}
             Taken::Dropped => return effects,
             Taken::Refused(code) => {
@@ -3017,7 +2969,6 @@ mod tests {
             namespace: "net#00000000/chat/room".into(),
             name: "doc".into(),
         };
-        let now = Instant::now();
         fn sends(effects: &[Effect]) -> Vec<&Out> {
             effects
                 .iter()
@@ -3057,7 +3008,6 @@ mod tests {
             GroupHeader { alias, group: 1 },
             0,
             Bytes::from_static(b"a"),
-            now,
         );
 
         // The same account publishes the track again from a new session.
@@ -3127,7 +3077,6 @@ mod tests {
             GroupHeader { alias, group: 2 },
             0,
             Bytes::from_static(b"b"),
-            now,
         );
         assert!(lanes(&next).iter().any(|relayed| matches!(
             relayed,
@@ -3150,7 +3099,6 @@ mod tests {
             GroupHeader { alias, group: 3 },
             0,
             Bytes::from_static(b"c"),
-            now,
         );
         assert!(
             stale.is_empty(),
@@ -3265,9 +3213,8 @@ mod tests {
         state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
         let alias = state.track(&doc).unwrap().alias;
         let header = |group| GroupHeader { alias, group };
-        let now = Instant::now();
-        state.object(Some(publisher), header(1), 0, Bytes::from_static(b"a"), now);
-        state.object(Some(publisher), header(2), 0, Bytes::from_static(b"b"), now);
+        state.object(Some(publisher), header(1), 0, Bytes::from_static(b"a"));
+        state.object(Some(publisher), header(2), 0, Bytes::from_static(b"b"));
 
         let bob = open(&mut state, 43, 2);
         let joined = state.subscribe(bob, 1, doc, Start::Latest, true);
@@ -3277,7 +3224,7 @@ mod tests {
         assert!(replayed_g2, "the cached group 2 replays whole");
 
         // Group 1's tail: bob joined after its object 0, so none of it, not even its end.
-        let tail = state.object(Some(publisher), header(1), 1, Bytes::from_static(b"c"), now);
+        let tail = state.object(Some(publisher), header(1), 1, Bytes::from_static(b"c"));
         assert_eq!(
             objects_sent(&tail),
             0,
@@ -3290,7 +3237,7 @@ mod tests {
             "no end of a group bob never began"
         );
         // Group 2 goes on for him on the stream the replay opened.
-        let live = state.object(Some(publisher), header(2), 1, Bytes::from_static(b"d"), now);
+        let live = state.object(Some(publisher), header(2), 1, Bytes::from_static(b"d"));
         assert_eq!(objects_sent(&live), 1, "group 2 continues live for bob");
     }
 
@@ -3453,7 +3400,6 @@ mod tests {
             GroupHeader { alias, group: 1 },
             0,
             Bytes::from_static(b"a"),
-            Instant::now(),
         ));
         assert!(
             live.iter()
@@ -3476,13 +3422,11 @@ mod tests {
         let ours = room("ours");
         state.publish(publisher, 1, ours.clone(), Mode::Stream, 128, true);
         let alias = state.track(&ours).unwrap().alias;
-        let now = Instant::now();
         state.object(
             Some(publisher),
             GroupHeader { alias, group: 1 },
             0,
             Bytes::from_static(b"a"),
-            now,
         );
         state.group_end(Some(publisher), alias, 1, true);
         let groups = |effects: Vec<Effect>| {
@@ -3514,17 +3458,15 @@ mod tests {
         let doc = room("doc");
         state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
         let alias = state.track(&doc).unwrap().alias;
-        let now = Instant::now();
         state.object(
             Some(publisher),
             GroupHeader { alias, group: 1 },
             0,
             Bytes::from_static(b"a"),
-            now,
         );
         let bob = open(&mut state, 43, 2);
         state.subscribe(bob, 1, doc.clone(), Start::Next, true);
-        state.oversize(publisher, alias, 1, now);
+        state.oversize(publisher, alias, 1);
         state.group_end(Some(publisher), alias, 1, false);
         assert!(
             state.track(&doc).unwrap().skip.is_empty(),
@@ -3545,9 +3487,8 @@ mod tests {
         state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
         let alias = state.track(&doc).expect("published").alias;
         let header = |group| GroupHeader { alias, group };
-        let now = Instant::now();
         // Group 1 is in flight: its object 0 is out before bob subscribes.
-        state.object(Some(publisher), header(1), 0, Bytes::from_static(b"a"), now);
+        state.object(Some(publisher), header(1), 0, Bytes::from_static(b"a"));
 
         let bob = state
             .opened(43, vec![2], super::super::session::unconnected())
@@ -3561,14 +3502,14 @@ mod tests {
         );
 
         // Object 1 of group 1: bob joined after its object 0, so he hears none of it.
-        let tail = state.object(Some(publisher), header(1), 1, Bytes::from_static(b"b"), now);
+        let tail = state.object(Some(publisher), header(1), 1, Bytes::from_static(b"b"));
         assert_eq!(
             objects_sent(&tail),
             0,
             "bob hears no object of the group he joined mid-way"
         );
         // Group 2 from its object 0: bob hears it.
-        let next = state.object(Some(publisher), header(2), 0, Bytes::from_static(b"c"), now);
+        let next = state.object(Some(publisher), header(2), 0, Bytes::from_static(b"c"));
         assert_eq!(
             objects_sent(&next),
             1,
@@ -3588,7 +3529,6 @@ mod tests {
         };
         state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
         let alias = state.track(&doc).expect("published").alias;
-        let now = Instant::now();
         // A group far larger than any egress queue is cached complete.
         let count = 300u32;
         for object in 0..count {
@@ -3597,7 +3537,6 @@ mod tests {
                 GroupHeader { alias, group: 1 },
                 object,
                 Bytes::from(vec![0u8; 8]),
-                now,
             );
         }
         state.group_end(Some(publisher), alias, 1, true);
@@ -3641,14 +3580,7 @@ mod tests {
         state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
         let alias = state.track(&doc).expect("published").alias;
         let header = GroupHeader { alias, group: 1 };
-        let now = Instant::now();
-        state.object(
-            Some(publisher),
-            header,
-            0,
-            Bytes::from_static(b"cached"),
-            now,
-        );
+        state.object(Some(publisher), header, 0, Bytes::from_static(b"cached"));
         state.group_end(Some(publisher), alias, 1, true);
 
         let peer = PrivateKey::from_seed(2).public_key();
