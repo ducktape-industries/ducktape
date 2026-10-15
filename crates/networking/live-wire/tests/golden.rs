@@ -2,6 +2,7 @@
 // data headers, a websocket frame of each kind and the proof preimage, as bytes. A sampled
 // byte that moves fails; when the change is meant, regenerate with LIVE_GOLDEN_WRITE=1.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use live_wire::{
@@ -238,42 +239,65 @@ fn every_message_keeps_its_bytes() {
 
 #[test]
 fn every_wire_variant_has_a_golden_sample() {
-    // These matches are exhaustive (no `_`): a new `Control` or `Forward` variant fails to
-    // compile here, next to the sample lists, until it is routed and given a golden sample (C3-8).
-    for control in controls() {
+    // Each variant has a number, and the matches are exhaustive (no `_`): a new `Control` or
+    // `Forward` variant fails to compile here until it is numbered, and the count fails until
+    // its number is seen among the samples, so no variant goes without a golden sample.
+    const CONTROLS: usize = 18;
+    const FORWARDS: usize = 8;
+    let control_index = |control: &Control| -> usize {
         match control {
-            Control::Hello(_)
-            | Control::Challenge(_)
-            | Control::Proof(_)
-            | Control::Welcome(_)
-            | Control::Publish { .. }
-            | Control::Unpublish { .. }
-            | Control::Subscribe { .. }
-            | Control::Unsubscribe { .. }
-            | Control::Watch { .. }
-            | Control::Unwatch { .. }
-            | Control::Published { .. }
-            | Control::Subscribed { .. }
-            | Control::Subscribers { .. }
-            | Control::Announce { .. }
-            | Control::Ended { .. }
-            | Control::Refused { .. }
-            | Control::Waiting { .. }
-            | Control::GoAway { .. } => {}
+            Control::Hello(_) => 0,
+            Control::Challenge(_) => 1,
+            Control::Proof(_) => 2,
+            Control::Welcome(_) => 3,
+            Control::Publish { .. } => 4,
+            Control::Unpublish { .. } => 5,
+            Control::Subscribe { .. } => 6,
+            Control::Unsubscribe { .. } => 7,
+            Control::Watch { .. } => 8,
+            Control::Unwatch { .. } => 9,
+            Control::Published { .. } => 10,
+            Control::Subscribed { .. } => 11,
+            Control::Subscribers { .. } => 12,
+            Control::Announce { .. } => 13,
+            Control::Ended { .. } => 14,
+            Control::Refused { .. } => 15,
+            Control::Waiting { .. } => 16,
+            Control::GoAway { .. } => 17,
         }
-    }
-    for forward in forwards() {
+    };
+    let forward_index = |forward: &Forward| -> usize {
         match forward {
-            Forward::Announce { .. }
-            | Forward::Subscribe { .. }
-            | Forward::Unsubscribe { .. }
-            | Forward::Forwarded { .. }
-            | Forward::Ended { .. }
-            | Forward::Refused { .. }
-            | Forward::Count { .. }
-            | Forward::Resynced => {}
+            Forward::Announce { .. } => 0,
+            Forward::Subscribe { .. } => 1,
+            Forward::Unsubscribe { .. } => 2,
+            Forward::Forwarded { .. } => 3,
+            Forward::Ended { .. } => 4,
+            Forward::Refused { .. } => 5,
+            Forward::Count { .. } => 6,
+            Forward::Resynced => 7,
         }
-    }
+    };
+    let seen: BTreeSet<usize> = controls()
+        .iter()
+        .map(control_index)
+        .inspect(|index| assert!(*index < CONTROLS))
+        .collect();
+    assert_eq!(
+        seen,
+        (0..CONTROLS).collect(),
+        "every control variant has a sample"
+    );
+    let seen: BTreeSet<usize> = forwards()
+        .iter()
+        .map(forward_index)
+        .inspect(|index| assert!(*index < FORWARDS))
+        .collect();
+    assert_eq!(
+        seen,
+        (0..FORWARDS).collect(),
+        "every forward variant has a sample"
+    );
 }
 
 #[test]

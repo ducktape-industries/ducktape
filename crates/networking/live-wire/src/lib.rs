@@ -24,10 +24,10 @@ pub const MAX_STREAM_OBJECT: usize = 64 << 10;
 pub const CONTROL_BYTES: u32 = 1 << 10;
 /// One websocket message's cap: a slice of one object, or a control message, with its framing.
 pub const WS_MESSAGE: usize = MAX_STREAM_OBJECT + CONTROL_BYTES as usize;
-/// The most a group may be, the sum of its objects. Two classes under one bound today: as the
-/// group a publisher encodes and every node must refuse alike, it is a wire invariant; as what
-/// the cache keeps per track, it is node memory. If the cache budget ever moves, it takes its
-/// own symbol and this wire bound stays.
+/// The most a group may be, the sum of its objects: a wire invariant, the group a publisher
+/// encodes and every node refuses alike. The cache keeps one group per track, so it is also the
+/// most the cache holds per track, as node memory; a cache budget of its own would be a second
+/// symbol, and this wire bound would stay.
 pub const MAX_GROUP_BYTES: usize = 4 << 20;
 /// A datagram's payload: with its header it fits the path's datagram size (~1200 bytes).
 pub const MAX_DATAGRAM_OBJECT: usize = 1100;
@@ -251,12 +251,22 @@ pub struct GroupHeader {
     pub group: u64,
 }
 
+impl GroupHeader {
+    /// The header's encoded width.
+    pub const LEN: usize = 12;
+}
+
 /// A datagram's first bytes: 4 + 8 + 4 = 16, then the payload to the datagram's end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct DatagramHeader {
     pub alias: Alias,
     pub group: u64,
     pub object: u32,
+}
+
+impl DatagramHeader {
+    /// The header's encoded width.
+    pub const LEN: usize = 16;
 }
 
 /// One binary websocket message.
@@ -338,7 +348,7 @@ pub enum Forward {
     },
     /// Ends the burst that a freshly opened control stream leads with: every announce and ask
     /// the sender still holds came before it, so the reader ends whatever this sender told it
-    /// before the stream reopened and did not repeat (C1-5).
+    /// before the stream reopened and did not repeat.
     Resynced,
 }
 
@@ -377,7 +387,7 @@ mod tests {
             group: 2,
             object: 3,
         };
-        assert_eq!(abi::encode(&group).len(), 12);
-        assert_eq!(abi::encode(&datagram).len(), 16);
+        assert_eq!(abi::encode(&group).len(), GroupHeader::LEN);
+        assert_eq!(abi::encode(&datagram).len(), DatagramHeader::LEN);
     }
 }
