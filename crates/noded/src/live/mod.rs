@@ -160,22 +160,21 @@ impl<E: crate::Context> Relay<E> {
     /// and lock-free on the node, because the caller holds the node lock.
     pub fn invalidate(&self, writes: &state::Writes) {
         let mut dirty = self.dirty.lock().expect("the dirty lock is never poisoned");
-        let mut changed = false;
+        let was = (dirty.identity, dirty.programs.len());
         for (program, keys) in &writes.programs {
             let wrote_identity = *program == self.network.identity;
             if wrote_identity {
                 dirty.identity = true;
-                changed = true;
             }
-            let wrote_grants = keys.keys().any(|key| key.starts_with(b"live/"));
+            let wrote_grants = keys.keys().any(|key| grants::is_grant_row(key));
             if wrote_grants {
                 dirty.programs.insert(program.clone());
                 self.grants.moved();
-                changed = true;
             }
         }
+        let moved = (dirty.identity, dirty.programs.len()) != was;
         drop(dirty);
-        if changed {
+        if moved {
             self.rechecks.notify_one();
         }
     }

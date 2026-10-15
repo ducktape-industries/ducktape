@@ -483,27 +483,30 @@ async fn group_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inboun
     };
     let header = GroupHeader { alias, ..theirs };
     let mut object = 0u32;
-    let mut complete = false;
-    while let Ok(len) = stream.read_u32_le().await {
+    // The group completes only on `GROUP_COMPLETE`; a short read, a reset or an oversize object
+    // ends it short, as the sibling QUIC reader reads its own end.
+    let complete = loop {
+        let Ok(len) = stream.read_u32_le().await else {
+            break false;
+        };
         if len == GROUP_COMPLETE {
-            complete = true;
-            break;
+            break true;
         }
         let len = len as usize;
         let fits = len <= MAX_STREAM_OBJECT;
         if !fits {
-            break;
+            break false;
         }
         let mut body = vec![0u8; len];
         if stream.read_exact(&mut body).await.is_err() {
-            break;
+            break false;
         }
         let Some(relay) = relay.upgrade() else {
             return;
         };
         relay.step(|state| state.object(None, header, object, body.into(), Instant::now()));
         object += 1;
-    }
+    };
     let Some(relay) = relay.upgrade() else {
         return;
     };

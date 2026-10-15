@@ -214,7 +214,7 @@ pub enum Code {
     Unknown,
     /// The track is published already, by another account.
     Duplicate,
-    /// An object, group or name over its cap.
+    /// An object or a group over its cap. A name or namespace over its cap is `Malformed`.
     TooLarge,
     Malformed,
 }

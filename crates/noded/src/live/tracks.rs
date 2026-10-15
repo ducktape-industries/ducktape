@@ -527,10 +527,12 @@ impl State {
         self.ask(id, request, ask, grant)
     }
 
+    /// One definition of a namespace the node serves: `<chain>/<program>/<room>` on this chain,
+    /// within its cap. A room-less `<chain>/<program>` or an empty part is not a namespace, so
+    /// an ask in it is refused `Malformed`, not held forever for a grant no block can write.
     pub fn admissible_namespace(&self, namespace: &str) -> bool {
-        let on_this_chain = namespace
-            .strip_prefix(&self.chain)
-            .is_some_and(|rest| rest.starts_with('/'));
+        let on_this_chain =
+            super::grants::place(namespace).is_some_and(|place| place.chain == self.chain);
         on_this_chain && namespace.len() <= MAX_NAMESPACE
     }
 
@@ -2225,6 +2227,39 @@ mod tests {
             let session = state.session(alice).expect("open");
             assert_eq!(session.waiting.get(&1), Some(&subscribe));
             assert!(session.published.is_empty());
+        });
+    }
+
+    #[test]
+    fn an_ask_in_a_room_less_namespace_is_refused_malformed_and_does_not_pin_the_session() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let alice = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
+            // `<chain>/<program>` with no room, and `<chain>//room` with an empty program: each
+            // is not a namespace, so it is refused for good, not held for a grant.
+            for namespace in ["net#00000000/chat", "net#00000000//room"] {
+                assert!(
+                    !state.admissible_namespace(namespace),
+                    "{namespace} is not a namespace"
+                );
+                let ask = Ask::Watch {
+                    namespace: namespace.to_owned(),
+                };
+                assert_eq!(
+                    told(state.ask(alice, 1, ask, Some(&Grant::all()))),
+                    [Control::Refused {
+                        request: 1,
+                        code: Code::Malformed,
+                    }],
+                    "{namespace}"
+                );
+                assert!(
+                    state.session(alice).expect("open").idle(),
+                    "a malformed ask leaves the session idle, not waiting"
+                );
+            }
         });
     }
 

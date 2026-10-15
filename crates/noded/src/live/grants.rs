@@ -94,6 +94,13 @@ pub struct Place<'a> {
     pub room: &'a str,
 }
 
+/// Whether a key a block wrote is a grant row, so the relay re-reads the program's grants:
+/// `live/<room>/<who>`, under `abi::live::TABLE`.
+pub fn is_grant_row(key: &[u8]) -> bool {
+    let table = live::TABLE.as_bytes();
+    key.starts_with(table) && key.get(table.len()) == Some(&b'/')
+}
+
 pub fn place(namespace: &str) -> Option<Place<'_>> {
     let (chain, rest) = namespace.split_once('/')?;
     let (program, room) = rest.split_once('/')?;
