@@ -499,10 +499,10 @@ impl<E: crate::Context> PeerLink<E> {
             self.dropped.inc();
             return;
         }
-        if let Some(complete) = end {
-            if let Some(sending) = self.groups.remove(&key) {
-                let _ = sending.try_send(GroupOut::End { complete });
-            }
+        if let Some(complete) = end
+            && let Some(sending) = self.groups.remove(&key)
+        {
+            let _ = sending.try_send(GroupOut::End { complete });
         }
     }
 }
@@ -613,7 +613,9 @@ fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward
             mode,
             priority,
             up,
-        } => relay.step(|state| state.remote_announced(from.clone(), track, by, mode, priority, up)),
+        } => {
+            relay.step(|state| state.remote_announced(from.clone(), track, by, mode, priority, up))
+        }
         Forward::Subscribe {
             request,
             track,

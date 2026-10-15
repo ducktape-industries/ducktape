@@ -201,10 +201,7 @@ fn forwards() -> Vec<Forward> {
 
 #[test]
 fn every_message_keeps_its_bytes() {
-    let header = GroupHeader {
-        alias: 7,
-        group: 9,
-    };
+    let header = GroupHeader { alias: 7, group: 9 };
     let datagram = DatagramHeader {
         alias: 7,
         group: 9,

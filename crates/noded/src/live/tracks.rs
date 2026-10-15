@@ -71,9 +71,7 @@ pub enum Effect {
 pub enum Relayed {
     /// Open the control stream to this peer and resync, even with nothing else to send: the
     /// peer was just seated, or its fresh control stream says it needs our state again (C1-5).
-    Resync {
-        to: PublicKey,
-    },
+    Resync { to: PublicKey },
     Announce {
         track: Track,
         by: Account,
@@ -1175,7 +1173,12 @@ impl State {
 
     /// A peer refused our forwarding ask: the track ends for our local subscribers. A grant
     /// taken back on the publisher's node reads to them as the publisher being gone.
-    pub fn node_refused(&mut self, peer: &PublicKey, request: RequestId, code: Code) -> Vec<Effect> {
+    pub fn node_refused(
+        &mut self,
+        peer: &PublicKey,
+        request: RequestId,
+        code: Code,
+    ) -> Vec<Effect> {
         let reason = match code {
             Code::NotGranted => End::GrantRevoked,
             Code::NoAccount
@@ -1236,18 +1239,16 @@ impl State {
             latest,
         };
         // A remote track's first local subscriber makes us ask the publisher's node for it.
-        if first_local {
-            if let Origin::Remote(peer) = &held.origin {
-                // The forwarding request is our alias of the track: unique here, one per track.
-                held.request = RequestId::from(held.alias);
-                held.asked = from;
-                effects.push(Effect::Lane(Relayed::Subscribe {
-                    to: peer.clone(),
-                    request: held.request,
-                    track: track.clone(),
-                    from,
-                }));
-            }
+        if first_local && let Origin::Remote(peer) = &held.origin {
+            // The forwarding request is our alias of the track: unique here, one per track.
+            held.request = RequestId::from(held.alias);
+            held.asked = from;
+            effects.push(Effect::Lane(Relayed::Subscribe {
+                to: peer.clone(),
+                request: held.request,
+                track: track.clone(),
+                from,
+            }));
         }
         self.count_moved(track, effects);
         Some(opened)
@@ -1381,14 +1382,12 @@ impl State {
             .iter()
             .any(|other| matches!(other, Subscriber::Local { .. }));
         // A remote track whose last local subscriber left makes us drop our ask to its node.
-        if none_local {
-            if let Origin::Remote(peer) = &held.origin {
-                effects.push(Effect::Lane(Relayed::Unsubscribe {
-                    to: peer.clone(),
-                    request: held.request,
-                }));
-                held.latest = None;
-            }
+        if none_local && let Origin::Remote(peer) = &held.origin {
+            effects.push(Effect::Lane(Relayed::Unsubscribe {
+                to: peer.clone(),
+                request: held.request,
+            }));
+            held.latest = None;
         }
         self.count_moved(track, effects);
     }
@@ -1606,8 +1605,7 @@ impl State {
                     Held::Published(_) => Act::Publish,
                     Held::Subscribed(_) | Held::Watching(_) => Act::Subscribe,
                 };
-                let granted =
-                    grant.is_some_and(|grant| covered(grant, act, &track.name, account));
+                let granted = grant.is_some_and(|grant| covered(grant, act, &track.name, account));
                 match granted {
                     true => Vec::new(),
                     false => self.revoke(id, request, held),
@@ -1681,7 +1679,6 @@ impl State {
             .get(&request)
             .map(|namespace| Held::Watching(namespace.clone()))
     }
-
 
     // ---- objects in ----
 
@@ -2172,15 +2169,19 @@ impl State {
                 self.end_track(&track, End::PublisherGone, &mut effects);
                 continue;
             }
-            let subscriber = held.subscribers.iter().find_map(|subscriber| match subscriber {
-                Subscriber::Node { peer: whose, request } if whose == peer => {
-                    Some(Subscriber::Node {
+            let subscriber = held
+                .subscribers
+                .iter()
+                .find_map(|subscriber| match subscriber {
+                    Subscriber::Node {
+                        peer: whose,
+                        request,
+                    } if whose == peer => Some(Subscriber::Node {
                         peer: peer.clone(),
                         request: *request,
-                    })
-                }
-                _ => None,
-            });
+                    }),
+                    _ => None,
+                });
             if let Some(subscriber) = subscriber {
                 self.drop_subscriber(&track, &subscriber, &mut effects);
             }
@@ -2461,14 +2462,20 @@ mod tests {
             assert!(
                 controls.iter().any(|control| matches!(
                     control,
-                    Control::Ended { reason: End::GrantRevoked, .. }
+                    Control::Ended {
+                        reason: End::GrantRevoked,
+                        ..
+                    }
                 )),
                 "the publisher hears its grant was revoked"
             );
             assert!(
                 controls.iter().any(|control| matches!(
                     control,
-                    Control::Ended { reason: End::PublisherGone, .. }
+                    Control::Ended {
+                        reason: End::PublisherGone,
+                        ..
+                    }
                 )),
                 "the subscriber, whose own grant is intact, hears only that the publisher is gone"
             );
@@ -2498,7 +2505,12 @@ mod tests {
                 .opened(43, vec![2], super::super::session::unconnected())
                 .expect("the node is not going away");
             // Watching only `presence/*`: `doc` is up but unheard.
-            state.watch(watcher, 1, namespace.clone(), Some(vec!["presence/*".into()]));
+            state.watch(
+                watcher,
+                1,
+                namespace.clone(),
+                Some(vec!["presence/*".into()]),
+            );
             let held = Held::Watching(namespace);
 
             // Widened to everything: `doc` is now heard, up.
@@ -2584,7 +2596,10 @@ mod tests {
                     matches!(subscriber, Subscriber::Node { peer: whose, .. } if *whose == peer)
                 })
             };
-            assert!(subscribed(&state, &ours_gone), "the peer subscribes to ours");
+            assert!(
+                subscribed(&state, &ours_gone),
+                "the peer subscribes to ours"
+            );
 
             // Its control stream reopens: everything it told us is provisional.
             state.peer_fresh(peer.clone());
@@ -2593,8 +2608,14 @@ mod tests {
             state.node_subscribed(peer.clone(), 9, &ours_kept, Start::Latest);
             let swept = state.peer_resynced(&peer);
 
-            assert!(state.track(&kept).is_some(), "a re-announced track survives");
-            assert!(state.track(&gone).is_none(), "a track not re-announced ends");
+            assert!(
+                state.track(&kept).is_some(),
+                "a re-announced track survives"
+            );
+            assert!(
+                state.track(&gone).is_none(),
+                "a track not re-announced ends"
+            );
             assert!(
                 subscribed(&state, &ours_kept),
                 "a re-asked subscription survives"
@@ -2604,9 +2625,15 @@ mod tests {
                 "a subscription not re-asked is dropped, so the publisher's count is true again"
             );
             // Only `gone` has a local subscriber, so the one `Ended` is to it.
-            let ended = told(swept)
-                .iter()
-                .any(|control| matches!(control, Control::Ended { reason: End::PublisherGone, .. }));
+            let ended = told(swept).iter().any(|control| {
+                matches!(
+                    control,
+                    Control::Ended {
+                        reason: End::PublisherGone,
+                        ..
+                    }
+                )
+            });
             assert!(ended, "the gone track's local subscriber hears it end");
             let _ = sub;
         });
@@ -2635,10 +2662,9 @@ mod tests {
                 .expect("the node is not going away");
             let subscribed = state.subscribe(bob, 1, doc.clone(), Start::Next, true);
             assert!(
-                told(subscribed).iter().any(|control| matches!(
-                    control,
-                    Control::Subscribed { latest: None, .. }
-                )),
+                told(subscribed)
+                    .iter()
+                    .any(|control| matches!(control, Control::Subscribed { latest: None, .. })),
                 "a Next subscriber knows no caught-up group"
             );
 
@@ -2726,10 +2752,7 @@ mod tests {
             };
             state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
             let alias = state.track(&doc).expect("published").alias;
-            let header = GroupHeader {
-                alias,
-                group: 1,
-            };
+            let header = GroupHeader { alias, group: 1 };
             let now = Instant::now();
             state.object(
                 Some(publisher),
@@ -2746,9 +2769,15 @@ mod tests {
                 matches!(
                     replayed.as_slice(),
                     [
-                        Relayed::Group { end: Some(true), .. },
+                        Relayed::Group {
+                            end: Some(true),
+                            ..
+                        },
                         Relayed::Answer {
-                            forward: Forward::Forwarded { latest: Some(1), .. },
+                            forward: Forward::Forwarded {
+                                latest: Some(1),
+                                ..
+                            },
                             ..
                         }
                     ]

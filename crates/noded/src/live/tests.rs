@@ -19,8 +19,8 @@ use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Halo, Lane, Seat};
 use live_wire::{
     ALPN, Account, Challenge, Code, Control, DatagramHeader, End, GroupHeader, Hello, KeyScheme,
-    LANE, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, WS_MESSAGE, Welcome, WsFrame,
-    proof_preimage,
+    LANE, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, WS_MESSAGE, Welcome,
+    WsFrame, proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{oneshot, watch};
@@ -421,10 +421,7 @@ impl Client {
     /// A group stream left open after `objects`: the caller finishes or resets it.
     async fn group_open(&mut self, alias: u32, group: u64, objects: &[&[u8]]) -> quinn::SendStream {
         let mut stream = self.connection.open_uni().await.unwrap();
-        let header = GroupHeader {
-            alias,
-            group,
-        };
+        let header = GroupHeader { alias, group };
         tokio::io::AsyncWriteExt::write_all(&mut stream, &abi::encode(&header))
             .await
             .unwrap();
@@ -636,13 +633,7 @@ fn a_group_reaches_a_subscriber_whole_and_a_late_joiner_gets_it_from_the_cache()
         alice.group(alias, 5, &[b"hello", b"world"]).await;
         let (header, objects, complete) = bob.received_group().await;
         assert!(complete);
-        assert_eq!(
-            header,
-            GroupHeader {
-                alias,
-                group: 5,
-            }
-        );
+        assert_eq!(header, GroupHeader { alias, group: 5 });
         assert_eq!(objects, vec![b"hello".to_vec(), b"world".to_vec()]);
 
         let (mut carol, _) = Client::open(&node, &carol).await;
@@ -838,10 +829,7 @@ fn the_same_session_runs_over_the_websocket_door_without_datagrams() {
         }))
         .await;
         assert!(matches!(bob.control().await, Control::Subscribed { .. }));
-        let header = GroupHeader {
-            alias,
-            group: 3,
-        };
+        let header = GroupHeader { alias, group: 3 };
         alice
             .send(WsFrame::Group {
                 header,
@@ -1247,7 +1235,12 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
         // The track's priority crossed the lane with its announce and is held on the second
         // node, where its egress streams are set to it; it is no longer a per-group header byte.
         assert_eq!(
-            second.relay.state().track(&doc).expect("held remote").priority,
+            second
+                .relay
+                .state()
+                .track(&doc)
+                .expect("held remote")
+                .priority,
             3,
             "the track's priority crossed with its announce"
         );

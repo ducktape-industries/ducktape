@@ -512,7 +512,9 @@ enum GroupOut {
     /// A whole cached group's objects, written in one go: a replay is one queue item, not one
     /// per object.
     Batch(Arc<Vec<Bytes>>),
-    End { complete: bool },
+    End {
+        complete: bool,
+    },
 }
 
 struct Groups {
@@ -553,7 +555,15 @@ async fn quic_writing(
                 objects,
                 end,
             }) => {
-                quic_group_batch(&connection, &pacer, &mut groups, header, priority, objects, end);
+                quic_group_batch(
+                    &connection,
+                    &pacer,
+                    &mut groups,
+                    header,
+                    priority,
+                    objects,
+                    end,
+                );
             }
             Drained::Out(Out::GroupEnd {
                 alias,
@@ -647,10 +657,10 @@ fn quic_group_batch(
         return;
     }
     // A closed group ends here; an open one keeps its stream for the live objects that follow.
-    if let Some(complete) = end {
-        if let Some(sending) = groups.open.remove(&key) {
-            let _ = sending.try_send(GroupOut::End { complete });
-        }
+    if let Some(complete) = end
+        && let Some(sending) = groups.open.remove(&key)
+    {
+        let _ = sending.try_send(GroupOut::End { complete });
     }
 }
 
@@ -915,10 +925,7 @@ mod tests {
 
     #[test]
     fn a_websocket_group_numbers_its_objects_across_slices() {
-        let header = GroupHeader {
-            alias: 3,
-            group: 7,
-        };
+        let header = GroupHeader { alias: 3, group: 7 };
         let mut counting = HashMap::new();
         let first = ws_arrived(
             abi::encode(&WsFrame::Group {
@@ -965,10 +972,7 @@ mod tests {
             ws_arrived(abi::encode(&control).into(), &mut counting).as_slice(),
             [Inbound::Garbled]
         ));
-        let header = GroupHeader {
-            alias: 3,
-            group: 7,
-        };
+        let header = GroupHeader { alias: 3, group: 7 };
         let group = WsFrame::Group {
             header,
             objects: vec![vec![0; MAX_STREAM_OBJECT + 1]],
