@@ -123,6 +123,7 @@ impl<S> Paced<S> {
         self.class
     }
 
+    /// The stream under the pacing, for what only the stream can do (a lane abandoning it).
     pub fn into_inner(self) -> S {
         self.inner
     }

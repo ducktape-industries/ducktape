@@ -1,7 +1,6 @@
 //! halo: the network between members, off consensus. It carries lanes of streams and
 //! datagrams between current members over QUIC, at the halo address each member registers,
-//! at a priority class capped by who asks. Its UDP socket also takes desktop clients on the
-//! live ALPN and hands them to the node's relay.
+//! at a priority class capped by who asks.
 
 pub mod class;
 pub mod links;
@@ -19,7 +18,6 @@ use std::sync::Arc;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::Metrics;
-use tokio::sync::mpsc;
 
 pub use class::Class;
 pub use links::{Carried, Links};
@@ -83,15 +81,6 @@ impl Halo {
 
     pub fn plane(&self) -> &Plane<Arc<Links>> {
         &self.plane
-    }
-
-    pub fn pacer(&self) -> &Pacer {
-        self.plane.pacer()
-    }
-
-    /// Connections desktop clients opened on the live ALPN of this node's UDP socket.
-    pub fn clients(&self) -> &tokio::sync::Mutex<mpsc::Receiver<quinn::Connection>> {
-        self.links.clients()
     }
 
     pub fn udp(&self) -> std::io::Result<SocketAddr> {

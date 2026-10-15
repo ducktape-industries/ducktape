@@ -555,9 +555,9 @@ async fn p2p<E: Context>(
     upgrade.on_upgrade(move |socket| crate::transport::inbound_websocket(socket, mesh))
 }
 
-/// The UDP port a client dials for live tracks, `None` when halo bound none.
+/// The UDP port a client dials for live tracks, `None` when the node runs no QUIC door.
 async fn live_port<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Option<u16>> {
-    Reply::Answered(daemon.halo.udp().ok().map(|at| at.port()))
+    Reply::Answered(daemon.live.port())
 }
 
 async fn live_socket<E: Context>(

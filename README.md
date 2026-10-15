@@ -216,12 +216,13 @@ whose halo address takes no inbound UDP still takes part by dialing out. A
 changed address is dialed from the next block on. `--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
 
-The halo UDP socket also takes desktop clients for live tracks: the relay in every
-node (`crates/noded/src/live/`) lets a client publish and subscribe to tracks
-of a room off consensus, over QUIC on the ALPN `ducktape-live` or the
-WebSocket `/v1/live`, in what the room's program granted its account under
-the `live` table; nodes carry a track between their clients over halo's lane
-7. `GET /v1/live/port` names the UDP port.
+Live tracks: the relay in every node (`crates/noded/src/live/`) lets a desktop
+client publish and subscribe to tracks of a room off consensus, in what the
+room's program granted its account under the `live` table, over QUIC on a UDP
+socket of its own (`run --live 0.0.0.0:9200`, ALPN `ducktape-live`, the node
+key's certificate) or the WebSocket `/v1/live`; nodes carry a track between
+their clients over halo's lane 7. `GET /v1/live/port` names the QUIC port, or
+none without `--live`, and then clients take the WebSocket.
 
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844

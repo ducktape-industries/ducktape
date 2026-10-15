@@ -8,12 +8,13 @@ pub use abi::role::identity::AccountNumber as Account;
 use borsh::{BorshDeserialize, BorshSerialize};
 pub use keyscheme::KeyScheme;
 
-/// The QUIC ALPN a client dials the node's UDP socket with, beside halo's between members.
+/// The QUIC ALPN a client dials the node's live socket (`run --live`) with.
 pub const ALPN: &[u8] = b"ducktape-live";
 /// The websocket route a client falls back to on the node's http port.
 pub const ROUTE: &str = "/v1/live";
 /// GET: borsh `Option<u16>`, the UDP port a client dials for live tracks at the host of its
-/// `/v1` url, `None` when the node bound none; a node with no relay answers 404.
+/// `/v1` url, `None` when the node opened no QUIC door (the websocket alone); a node with no
+/// relay answers 404.
 pub const PORT_ROUTE: &str = "/v1/live/port";
 /// The signing domain of a session's proof.
 pub const NAMESPACE: &[u8] = b"ducktape:live";

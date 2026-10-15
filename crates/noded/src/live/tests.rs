@@ -116,14 +116,16 @@ struct Node {
 }
 
 impl Node {
-    fn udp(&self) -> std::net::SocketAddr {
-        self.halo.udp().unwrap()
+    /// Where a client dials the relay's QUIC door.
+    fn door(&self) -> std::net::SocketAddr {
+        let port = self.relay.port().expect("the test node opens a QUIC door");
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
     }
 
     fn seat(&self) -> Seat {
         Seat {
             key: self.key.clone(),
-            halo: format!("localhost:{}", self.udp().port()),
+            halo: format!("localhost:{}", self.halo.udp().unwrap().port()),
             validator: true,
         }
     }
@@ -136,7 +138,7 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         egress_bytes_per_sec: Some(1 << 30),
         udp: "127.0.0.1:0".parse().unwrap(),
     };
-    let halo = Arc::new(Halo::start(&context.child("halo"), identity, config).unwrap());
+    let halo = Arc::new(Halo::start(&context.child("halo"), identity.clone(), config).unwrap());
     let (shutdown, down) = watch::channel(false);
     let relay = Relay::start(
         context.child("live"),
@@ -147,9 +149,11 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         },
         ledger,
         halo.clone(),
-        key.clone(),
+        &identity,
+        Some("127.0.0.1:0".parse().unwrap()),
         down,
-    );
+    )
+    .unwrap();
     Node {
         key,
         halo,
@@ -185,6 +189,68 @@ fn metric(context: &Context, name: &str) -> u64 {
 
 // ---- a QUIC client ----
 
+/// A client as the app is one: no certificate, the node key it means to reach pinned.
+fn pinned(node: &PublicKey) -> quinn::ClientConfig {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Pinned {
+            node: node.clone(),
+            algorithms: provider.signature_verification_algorithms,
+        }))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap();
+    quinn::ClientConfig::new(Arc::new(crypto))
+}
+
+#[derive(Debug)]
+struct Pinned {
+    node: PublicKey,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let meant = halo::quic::key_of(cert).is_some_and(|key| key == self.node);
+        if !meant {
+            return Err(rustls::Error::General("not the node dialed".into()));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("tls 1.3 only".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signed: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, signed, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
 struct Client {
     connection: quinn::Connection,
     send: quinn::SendStream,
@@ -195,9 +261,8 @@ struct Client {
 impl Client {
     async fn dial(node: &Node) -> Client {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        let config = halo::quic::pinned_client(&node.key, ALPN).unwrap();
         let connection = endpoint
-            .connect_with(config, node.udp(), halo::quic::NAME)
+            .connect_with(pinned(&node.key), node.door(), "ducktape-live")
             .unwrap()
             .await
             .unwrap();

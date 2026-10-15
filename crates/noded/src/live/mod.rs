@@ -1,8 +1,8 @@
 //! The live relay: desktop clients publish and subscribe to tracks through the node, off
-//! consensus, over QUIC on halo's UDP socket or a websocket on the http port. A session proves
-//! its seated key, acts as the account the identity role answers for it, and does in a room
-//! what the room's program granted it. Objects fan out to every local subscriber and, over halo's
-//! lane 7, to every node with a subscriber of its own.
+//! consensus, over QUIC on the relay's own UDP socket (`run --live`) or a websocket on the http
+//! port. A session proves its seated key, acts as the account the identity role answers for it,
+//! and does in a room what the room's program granted it. Objects fan out to every local
+//! subscriber and, over halo's lane 7, to every node with a subscriber of its own.
 
 mod grants;
 mod lane;
@@ -12,18 +12,20 @@ mod tests;
 mod tracks;
 
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use abi::ProgramId;
 use abi::live::Grant;
-use commonware_cryptography::ed25519::PublicKey;
+use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::telemetry::metrics::raw::{Counter, Gauge};
 use futures::SinkExt as _;
 use halo::Halo;
 use live_wire::{
-    Account, Challenge, Code, Control, IDLE_SESSION, Mode, NAMESPACE, Priority, Proof, RequestId,
-    Start, Track, Welcome, proof_preimage,
+    ALPN, Account, Challenge, Code, Control, IDLE_SESSION, Mode, NAMESPACE, Priority, Proof,
+    RequestId, Start, Track, Welcome, proof_preimage,
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -35,7 +37,7 @@ pub use session::ws_upgrade;
 use session::{Inbound, Link, Out, Outlet, Sent};
 use tracks::{Effect, SessionId, State};
 
-/// What the relay needs of the node's runtime: halo's context and a metrics registry.
+/// What the relay needs of the node's runtime: the node's own context.
 pub trait Context: crate::Context {}
 
 impl<E> Context for E where E: crate::Context {}
@@ -44,9 +46,13 @@ impl<E> Context for E where E: crate::Context {}
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
 /// What a client is told to wait before re-opening when the node goes away.
 const GOAWAY_MS: u32 = 1000;
-/// Handshakes in flight at once, as halo bounds its own: past it a connection is told busy, so
+/// Handshakes in flight at once, TLS and proof together: past it a connection is refused, so
 /// unproven connections cost the node a bounded amount.
 const HANDSHAKES: usize = 64;
+/// A QUIC client unheard this long is gone; the node pings an idle one every
+/// [`QUIC_KEEP_ALIVE`], so a session holding tracks stays open through a NAT.
+const QUIC_IDLE: Duration = Duration::from_secs(30);
+const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// Sessions open at once, both doors counted; past it a connection is told busy.
 const MAX_SESSIONS: usize = 1024;
 
@@ -79,6 +85,9 @@ pub struct Relay<E: Context> {
     network: Network,
     grants: Grants,
     halo: Arc<Halo>,
+    /// The QUIC door, on its own UDP socket; `None` without `run --live`, and then clients take
+    /// the websocket alone.
+    door: Option<quinn::Endpoint>,
     /// This node's key, which a proof names.
     me: PublicKey,
     metrics: tracks::Metrics,
@@ -105,14 +114,18 @@ impl<E: Context> Drop for Relay<E> {
 }
 
 impl<E: Context> Relay<E> {
+    /// The relay, with its QUIC door bound at `live` when one is given.
     pub fn start(
         context: E,
         network: Network,
         chain: Arc<dyn Chain>,
         halo: Arc<Halo>,
-        me: PublicKey,
+        identity: &PrivateKey,
+        live: Option<SocketAddr>,
         shutdown: watch::Receiver<bool>,
-    ) -> Arc<Relay<E>> {
+    ) -> Result<Arc<Relay<E>>, halo::quic::Error> {
+        let door = live.map(|at| door(identity, at)).transpose()?;
+        let me = identity.public_key();
         let metrics = tracks::Metrics {
             sessions: context.register("live_sessions", "live sessions open", Gauge::default()),
             tracks: context.register(
@@ -169,6 +182,7 @@ impl<E: Context> Relay<E> {
             network,
             grants: Grants::new(chain),
             halo: halo.clone(),
+            door: door.clone(),
             me: me.clone(),
             metrics,
             dirty: Mutex::default(),
@@ -180,21 +194,29 @@ impl<E: Context> Relay<E> {
         });
         // The tasks hold the relay weakly: it drops with its last owner, and they end with it.
         let weak = Arc::downgrade(&relay);
-        let tasks = vec![
-            tokio::spawn(accepting(weak.clone(), halo.clone())),
+        let mut tasks = vec![
             tokio::spawn(rechecking(weak.clone(), rechecks)),
             tokio::spawn(closing(weak.clone(), shutdown)),
-            tokio::spawn(lane::serving(weak, halo, me, queued)),
+            tokio::spawn(lane::serving(weak.clone(), halo, me, queued)),
         ];
+        if let Some(door) = door {
+            tasks.push(tokio::spawn(accepting(weak, door)));
+        }
         *relay
             .tasks
             .lock()
             .expect("the tasks lock is never poisoned") = tasks;
-        relay
+        Ok(relay)
     }
 
     pub fn network(&self) -> &Network {
         &self.network
+    }
+
+    /// The UDP port of the QUIC door, `None` when the node opened none.
+    pub fn port(&self) -> Option<u16> {
+        let door = self.door.as_ref()?;
+        door.local_addr().ok().map(|at| at.port())
     }
 
     /// A websocket on `/v1/live`: the same session over the http port.
@@ -418,24 +440,32 @@ fn watch_patterns(grant: Option<&Grant>) -> Option<Vec<String>> {
     covered(grant, Act::Watch, "*").then(|| grant.subscribe.clone())
 }
 
-async fn accepting<E: Context>(relay: Weak<Relay<E>>, halo: Arc<Halo>) {
-    loop {
-        let connection = halo.clients().lock().await.recv().await;
-        let Some(connection) = connection else {
-            return;
-        };
+/// The QUIC door: the node key's certificate, which a client pins from `/v1/status`, on the live
+/// ALPN, asking no client for a certificate; a client proves its key in the session instead.
+fn door(identity: &PrivateKey, at: SocketAddr) -> Result<quinn::Endpoint, halo::quic::Error> {
+    let mut server = halo::quic::open_server(identity, ALPN)?;
+    let mut transport = quinn::TransportConfig::default();
+    let idle = quinn::IdleTimeout::try_from(QUIC_IDLE).expect("thirty seconds is a valid idle");
+    transport.max_idle_timeout(Some(idle));
+    transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
+    server.transport_config(Arc::new(transport));
+    Ok(quinn::Endpoint::server(server, at)?)
+}
+
+async fn accepting<E: Context>(relay: Weak<Relay<E>>, door: quinn::Endpoint) {
+    while let Some(incoming) = door.accept().await {
         let Some(strong) = relay.upgrade() else {
             return;
         };
         let Ok(handshaking) = strong.handshakes.clone().try_acquire_owned() else {
             tracing::debug!(target: "ducktape::live", reason = "handshakes_full", path = "quic", "the relay refused a connection it had no handshake slot for");
-            connection.close(0u32.into(), b"busy");
+            incoming.refuse();
             continue;
         };
         tokio::spawn(serve_quic(
             relay.clone(),
-            connection,
-            strong.halo.pacer().clone(),
+            incoming,
+            strong.halo.plane().pacer().clone(),
             handshaking,
         ));
     }
@@ -443,10 +473,14 @@ async fn accepting<E: Context>(relay: Weak<Relay<E>>, halo: Arc<Halo>) {
 
 async fn serve_quic<E: Context>(
     relay: Weak<Relay<E>>,
-    connection: quinn::Connection,
+    incoming: quinn::Incoming,
     pacer: halo::Pacer,
     handshaking: OwnedSemaphorePermit,
 ) {
+    let connected = tokio::time::timeout(HANDSHAKE_WAIT, incoming).await;
+    let Ok(Ok(connection)) = connected else {
+        return;
+    };
     let control = tokio::time::timeout(HANDSHAKE_WAIT, connection.accept_bi()).await;
     let Ok(Ok(control)) = control else {
         connection.close(0u32.into(), b"no control stream");

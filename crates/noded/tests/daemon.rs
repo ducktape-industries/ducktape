@@ -67,6 +67,7 @@ struct Seat {
     http: SocketAddr,
     tls: SocketAddr,
     halo: SocketAddr,
+    live: Option<SocketAddr>,
     registered: String,
     address: Option<String>,
 }
@@ -87,6 +88,7 @@ impl Seat {
             http: free_port(),
             tls: free_port(),
             halo,
+            live: Some(free_udp_port()),
             registered: halo.to_string(),
             address: Some(format!("tcp://localhost:{}", p2p.port())),
         }
@@ -151,6 +153,7 @@ impl Seat {
             http: self.http,
             tls: Some(self.tls),
             halo: self.halo,
+            live: self.live,
         };
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
@@ -302,8 +305,8 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(status.contract, noded::NODE_CONTRACT);
         assert_eq!(
             client.live_port().await.unwrap(),
-            Some(seat.halo.port()),
-            "live tracks are dialed at halo's udp"
+            seat.live.map(|live| live.port()),
+            "live tracks are dialed at the relay's own udp, `run --live`"
         );
         assert_eq!(
             status.genesis,
@@ -698,6 +701,29 @@ fn a_changes_subscriber_that_closes_is_answered() {
         assert!(
             matches!(answered.as_slice(), [Message::Close(_)]),
             "{answered:?}"
+        );
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_node_run_without_live_names_no_live_port() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat {
+        live: None,
+        ..Seat::new(root.path(), "n0")
+    };
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        assert_eq!(
+            client.live_port().await.unwrap(),
+            None,
+            "no QUIC door: a client takes the websocket alone"
         );
         seat.admin(&client, Admin::Shutdown).await;
     });

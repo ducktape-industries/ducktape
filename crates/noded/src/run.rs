@@ -45,6 +45,9 @@ pub struct Listen {
     pub http: SocketAddr,
     pub tls: Option<SocketAddr>,
     pub halo: SocketAddr,
+    /// The UDP socket desktop clients reach the live relay on over QUIC; without it they take
+    /// the websocket alone.
+    pub live: Option<SocketAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -304,9 +307,11 @@ async fn start<E: Context>(
         },
         Arc::new(node.clone()),
         halo.clone(),
-        identity.public_key(),
+        &identity,
+        listen.live,
         shutdown.subscribe(),
-    );
+    )
+    .map_err(|error| Error::Tls(error.to_string()))?;
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         node,

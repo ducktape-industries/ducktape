@@ -96,6 +96,12 @@ enum Verb {
                     when absent"
         )]
         halo_egress: Option<u64>,
+        #[arg(
+            long,
+            help = "the UDP socket desktop clients reach live tracks on over QUIC; without it \
+                    they take the websocket on the http port"
+        )]
+        live: Option<SocketAddr>,
         #[arg(long, default_value = "info")]
         log: String,
     },
@@ -276,6 +282,7 @@ fn execute(cli: Cli) -> Result<(), String> {
             tls,
             halo,
             halo_egress,
+            live,
             log,
         } => node_runtime(&workspace).start(|context| async move {
             let logs = Logs::install(&log)?;
@@ -284,6 +291,7 @@ fn execute(cli: Cli) -> Result<(), String> {
                 http,
                 tls,
                 halo,
+                live,
             };
             let halo = HaloConfig {
                 egress_bytes_per_sec: halo_egress,

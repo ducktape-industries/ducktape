@@ -1,7 +1,6 @@
 //! The real medium: QUIC on UDP at the halo address each member registers. A node dials every
 //! seated member and keeps one connection to each, which carries streams both ways, so a member
-//! no one can reach still takes part by dialing out. A connection on the live ALPN is a desktop
-//! client's, not a member's: it is handed on whole.
+//! no one can reach still takes part by dialing out.
 
 use std::collections::HashMap;
 use std::io;
@@ -32,8 +31,6 @@ const REDIAL: Duration = Duration::from_secs(1);
 const REDIAL_MOST: Duration = Duration::from_secs(60);
 const INBOUND: usize = 256;
 const DATAGRAMS: usize = 1024;
-/// Client connections accepted and not yet taken by the relay; past it a client is told busy.
-const CLIENTS: usize = 256;
 
 pub struct Carried {
     send: quinn::SendStream,
@@ -71,7 +68,7 @@ impl AsyncWrite for Carried {
 }
 
 impl Carried {
-    /// Abandons the stream: the peer reads a reset, never a clean end.
+    /// Abandons the stream, so the peer reads a reset rather than a clean end.
     pub fn reset(mut self) {
         let _ = self.send.reset(0u32.into());
     }
@@ -196,8 +193,6 @@ pub struct Links {
     accepted: tokio::sync::Mutex<mpsc::Receiver<(PublicKey, Carried)>>,
     received: mpsc::Sender<(PublicKey, Bytes)>,
     datagrams: tokio::sync::Mutex<mpsc::Receiver<(PublicKey, Bytes)>>,
-    clients: mpsc::Sender<quinn::Connection>,
-    accepted_clients: tokio::sync::Mutex<mpsc::Receiver<quinn::Connection>>,
     opened: Registered<Counter>,
 }
 
@@ -211,7 +206,6 @@ impl Links {
         let quic = Quic::bind(udp, &identity, members.clone())?;
         let (inbound, accepted) = mpsc::channel(INBOUND);
         let (received, datagrams) = mpsc::channel(DATAGRAMS);
-        let (clients, accepted_clients) = mpsc::channel(CLIENTS);
         let opened = context.register(
             "halo_streams_opened",
             "streams this node opened to a member over QUIC",
@@ -226,8 +220,6 @@ impl Links {
             accepted: tokio::sync::Mutex::new(accepted),
             received,
             datagrams: tokio::sync::Mutex::new(datagrams),
-            clients,
-            accepted_clients: tokio::sync::Mutex::new(accepted_clients),
             opened,
         });
         tokio::spawn(accepting(
@@ -239,11 +231,6 @@ impl Links {
 
     pub fn udp(&self) -> io::Result<SocketAddr> {
         self.quic.local()
-    }
-
-    /// Connections desktop clients opened on the live ALPN, for the relay that serves them.
-    pub fn clients(&self) -> &tokio::sync::Mutex<mpsc::Receiver<quinn::Connection>> {
-        &self.accepted_clients
     }
 
     pub fn seated(self: &Arc<Self>, changed: Vec<PublicKey>) {
@@ -405,42 +392,12 @@ async fn accepting(links: Weak<Links>, endpoint: quinn::Endpoint) {
             let Some(links) = links.upgrade() else {
                 return;
             };
-            match arrival(&connection) {
-                Arrival::Member => member_arrived(&links, connection),
-                Arrival::Client => client_arrived(&links, connection),
-                Arrival::Unknown => connection.close(0u32.into(), b"unknown protocol"),
-            }
+            let Some(peer) = quic::peer_of(&connection) else {
+                connection.close(0u32.into(), b"no node key");
+                return;
+            };
+            links.carry(&peer, connection, Side::Accepted);
         });
-    }
-}
-
-enum Arrival {
-    Member,
-    Client,
-    Unknown,
-}
-
-fn arrival(connection: &quinn::Connection) -> Arrival {
-    match quic::alpn_of(connection).as_deref() {
-        Some(quic::ALPN) => Arrival::Member,
-        Some(live_wire::ALPN) => Arrival::Client,
-        Some(_) | None => Arrival::Unknown,
-    }
-}
-
-fn member_arrived(links: &Arc<Links>, connection: quinn::Connection) {
-    let Some(peer) = quic::peer_of(&connection) else {
-        connection.close(0u32.into(), b"no node key");
-        return;
-    };
-    links.carry(&peer, connection, Side::Accepted);
-}
-
-fn client_arrived(links: &Links, connection: quinn::Connection) {
-    let queued = links.clients.try_send(connection);
-    if let Err(full) = queued {
-        full.into_inner().close(0u32.into(), b"busy");
-        tracing::debug!(target: "ducktape::halo", reason = "clients_full", "halo refused a client connection the relay had no room for");
     }
 }
 
