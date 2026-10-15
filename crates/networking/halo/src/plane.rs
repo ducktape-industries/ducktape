@@ -61,7 +61,7 @@ impl<T: Transport> Shared<T> {
     fn served(&self, serves: impl Fn(&Lane) -> bool) -> Option<Lane> {
         self.lanes
             .read()
-            .expect("the table lock is never poisoned")
+            .expect("the lanes lock is never poisoned")
             .iter()
             .flatten()
             .find(|lane| lane.enabled && serves(lane))
@@ -81,7 +81,7 @@ impl<T: Transport> Shared<T> {
     fn listed(&self, name: &str) -> bool {
         self.lanes
             .read()
-            .expect("the table lock is never poisoned")
+            .expect("the lanes lock is never poisoned")
             .iter()
             .flatten()
             .any(|lane| lane.name == name)
@@ -137,7 +137,7 @@ impl<T: Transport> Plane<T> {
             .shared
             .lanes
             .write()
-            .expect("the table lock is never poisoned")
+            .expect("the lanes lock is never poisoned")
             .replace(lanes);
         // A binding watching its lane's served state learns the table moved.
         let _ = self.shared.served.send(());
@@ -159,13 +159,13 @@ impl<T: Transport> Plane<T> {
             .shared
             .streams
             .lock()
-            .expect("the lanes lock is never poisoned")
+            .expect("the streams lock is never poisoned")
             .contains_key(name);
         let datagrams = self
             .shared
             .datagrams
             .lock()
-            .expect("the lanes lock is never poisoned")
+            .expect("the datagrams lock is never poisoned")
             .contains_key(name);
         streams || datagrams
     }
@@ -177,7 +177,7 @@ impl<T: Transport> Plane<T> {
             .shared
             .streams
             .lock()
-            .expect("the lanes lock is never poisoned");
+            .expect("the streams lock is never poisoned");
         let taken = bound.contains_key(name);
         if taken {
             return Err(Taken(name.to_owned()));
@@ -199,7 +199,7 @@ impl<T: Transport> Plane<T> {
             .shared
             .datagrams
             .lock()
-            .expect("the lanes lock is never poisoned");
+            .expect("the datagrams lock is never poisoned");
         let taken = bound.contains_key(name);
         if taken {
             return Err(Taken(name.to_owned()));
@@ -241,11 +241,11 @@ async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stre
     let backlog = shared
         .streams
         .lock()
-        .expect("the lanes lock is never poisoned")
+        .expect("the streams lock is never poisoned")
         .get(&lane.name)
         .cloned();
     let Some(backlog) = backlog else {
-        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane, reason = "unserved", "halo dropped a stream for a lane nothing on this node binds");
+        tracing::debug!(target: "ducktape::halo", event = "halo_unbound", %from, lane = hello.lane, reason = "unbound", "halo dropped a stream for a lane nothing on this node binds");
         return;
     };
     let admitted = shared.members.admits(&from);
@@ -367,7 +367,7 @@ async fn demuxing<T: Transport>(shared: Arc<Shared<T>>) {
         let queues = shared
             .datagrams
             .lock()
-            .expect("the lanes lock is never poisoned")
+            .expect("the datagrams lock is never poisoned")
             .get(&lane.name)
             .cloned();
         let Some(queues) = queues else {

@@ -68,9 +68,12 @@ impl Halo {
 
     pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) {
         let changed = self.members.seat(seats);
+        let moved = !changed.is_empty();
         self.links.seated(changed);
-        // A binding that reconciles per-peer state (the live relay) learns the membership moved.
-        let _ = self.membership.send(());
+        // A binding that reconciles per-peer state learns the membership moved.
+        if moved {
+            let _ = self.membership.send(());
+        }
     }
 
     /// Fires whenever the seated members change, so a binding reconciles its per-peer state.
