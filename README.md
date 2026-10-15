@@ -118,7 +118,7 @@ as `Env.sender`; a refusal rejects the frame, and a key that holds no account
 runs as no one (`None`). A program may send a message as another account
 (`Message.acting`, the program SDK's `emit_as`): the host asks the identity role
 `Runs { program, account }` and runs the message as that account only when
-the role answers with it, so an agent account its manager hands to a program
+the role answers with it, so a program account whose script calls a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
 validators, identity, awaits, egress, scheduler}`; the programs repository's `docs/roles.md` walks through them.
 
