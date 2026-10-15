@@ -229,13 +229,35 @@ caller's call ends with a refusal saying the request expired; a later answer
 is refused. A network that binds egress without a scheduler refuses every
 request. No node signs anything to expire a request.
 
+A request also says how its reply comes back. `Delivery::Whole` asks for one
+answer: the whole response, or a failure. `Delivery::Events { deliver }` asks
+for the response's events as they arrive; only the requester can ask its
+service for a stream (an Anthropic request sets `"stream": true` in the body it
+builds). When such a request's response is `text/event-stream`, the node reads
+the body as it arrives and sends each complete event as its own `Op::Event`
+frame: `seq` counts from 0 and `data` is the event's lines as received, without
+the blank line that ends it. Egress hands each one to the requester as
+`deliver` followed by the encoded `Event`, and pushes the request's expiry
+`wait` blocks past it. When the body ends, the node sends `Op::EndStream` with
+the number of events it sent and `StreamEnd::Complete`, the response's status
+and headers. When the body breaks off, it sends `StreamEnd::Cut` with the
+reason `stream_broken`. An event unended when the body ends is dropped. Any
+other response to an events request, and every response to a whole request,
+comes back whole.
+
 The node answers requests itself. After each block it applies, it asks the
 egress program which open requests the chain elected it for. It calls each new
 one and signs the answer with its own key. It also sends `Serve` while the chain's
 record of the services it serves differs from its `egress.toml`. It submits each
 of these frames again every block until a block carries it, and signs one again
-when its anchor grows old. An answer larger than a block carries goes out as a
-failure. On a network that binds no egress role the node does none of this.
+when its anchor grows old. A request's frames go out one at a time: the node
+sends a stream's next event, or its end, only after a block has carried the one
+before. A frame carries no sequence number, and the relay to the validators
+may drop a frame and offer it again blocks later, so without this wait a later
+event could reach a block first. An answer larger than a block carries goes out as a failure; an event or
+end larger than a block carries ends the stream `Cut` (`event_too_large`,
+`end_too_large`) and the node drops the rest. On a network that binds no egress
+role the node does none of this.
 
 ```toml
 # $DUCKTAPE_HOME/egress.toml: read when the node starts; absent means it serves nothing

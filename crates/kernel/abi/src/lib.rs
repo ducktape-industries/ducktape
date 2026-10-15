@@ -798,11 +798,18 @@ pub mod role {
             },
             Request {
                 request: Request,
+                delivery: Delivery,
                 wait: Option<u64>,
             },
             Answer {
                 id: u64,
                 answer: Answer,
+            },
+            Event(Event),
+            EndStream {
+                id: u64,
+                events: u64,
+                end: StreamEnd,
             },
             Expire {
                 id: u64,
@@ -844,6 +851,38 @@ pub mod role {
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Delivery {
+            Whole,
+            Events { deliver: Vec<u8> },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Event {
+            pub id: u64,
+            pub seq: u64,
+            pub data: Vec<u8>,
+        }
+
+        impl Event {
+            pub fn payload(&self, deliver: &[u8]) -> Vec<u8> {
+                let mut payload = deliver.to_vec();
+                payload.extend(crate::encode(self));
+                payload
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum StreamEnd {
+            Complete {
+                status: u16,
+                headers: Vec<(String, String)>,
+            },
+            Cut {
+                reason: String,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct ServiceRow {
             pub name: String,
             pub owner: AccountNumber,
@@ -856,6 +895,7 @@ pub mod role {
             pub id: u64,
             pub requester: ProgramId,
             pub request: Request,
+            pub delivery: Delivery,
             pub node: Vec<u8>,
             pub made: u64,
             pub expiry: EntryId,
@@ -1155,6 +1195,27 @@ mod tests {
         assert_eq!(encode(&Reply::Requests(Vec::new())), [0, 0, 0, 0, 0]);
         assert_eq!(encode(&Reply::Node(None)), [1, 0]);
         assert_eq!(encode(&Reply::Serving(Vec::new())), [2, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_streamed_event_reaches_its_requester_as_the_requesters_own_op() {
+        use role::egress::Event;
+        #[derive(Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        enum Requester {
+            Other,
+            Streamed(Event),
+        }
+        let event = Event {
+            id: 7,
+            seq: 3,
+            data: b"event: delta\ndata: {}\n".to_vec(),
+        };
+        let streamed_tag = encode(&Requester::Other)[0] + 1;
+        let delivered = event.payload(&[streamed_tag]);
+        assert_eq!(
+            decode::<Requester>(&delivered).unwrap(),
+            Requester::Streamed(event)
+        );
     }
 
     #[test]
