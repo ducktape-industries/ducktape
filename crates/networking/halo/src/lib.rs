@@ -40,6 +40,7 @@ pub struct Halo {
     members: Arc<Members>,
     plane: Plane<Arc<Links>>,
     me: PublicKey,
+    membership: tokio::sync::watch::Sender<()>,
 }
 
 impl Halo {
@@ -61,12 +62,20 @@ impl Halo {
             members,
             plane,
             me,
+            membership: tokio::sync::watch::channel(()).0,
         })
     }
 
     pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) {
         let changed = self.members.seat(seats);
         self.links.seated(changed);
+        // A binding that reconciles per-peer state (the live relay) learns the membership moved.
+        let _ = self.membership.send(());
+    }
+
+    /// Fires whenever the seated members change, so a binding reconciles its per-peer state.
+    pub fn membership_changed(&self) -> tokio::sync::watch::Receiver<()> {
+        self.membership.subscribe()
     }
 
     pub async fn linked(&self, member: &PublicKey) {

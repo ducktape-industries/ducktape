@@ -14,7 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use commonware_cryptography::ed25519::PublicKey;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::class::{Class, capped, claimed};
@@ -52,6 +52,8 @@ struct Shared<T: Transport> {
     lanes: RwLock<Vec<Lane>>,
     streams: Mutex<HashMap<String, Backlog<T::Stream>>>,
     datagrams: Mutex<HashMap<String, Arc<Queues>>>,
+    /// Fires whenever the table is replaced, so a binding can see its lane's served state change.
+    served: watch::Sender<()>,
 }
 
 impl<T: Transport> Shared<T> {
@@ -105,6 +107,7 @@ impl<T: Transport> Plane<T> {
             lanes: RwLock::default(),
             streams: Mutex::default(),
             datagrams: Mutex::default(),
+            served: watch::channel(()).0,
         });
         let tasks = vec![
             tokio::spawn(accepting(shared.clone())),
@@ -125,6 +128,8 @@ impl<T: Transport> Plane<T> {
             .lanes
             .write()
             .expect("the table lock is never poisoned") = lanes;
+        // A binding watching its lane's served state learns the table moved.
+        let _ = self.shared.served.send(());
     }
 
     /// Binds the streams of the lane `name`, at any time: it is served while the table lists it
@@ -288,6 +293,16 @@ impl<T: Transport> Streams<T> {
 
     pub async fn accept(&self) -> Option<Inbound<T::Stream>> {
         self.inbound.lock().await.recv().await
+    }
+
+    /// Whether the table lists this lane enabled right now.
+    pub fn served(&self) -> bool {
+        self.shared.named(&self.name).is_some()
+    }
+
+    /// Fires whenever the table is replaced, so a binding reconciles its lane's served state.
+    pub fn served_changed(&self) -> watch::Receiver<()> {
+        self.shared.served.subscribe()
     }
 }
 
