@@ -50,6 +50,7 @@ clap = { version = "4.6", features = ["derive"] }
 # `/v1/logs` AND on stderr — both gated by ONE reloadable filter, see
 # crates/noded/src/logs.rs.
 tracing = "0.1"
+sha1-checked = { version = "0.10", default-features = false }
 sha2 = "0.10"
 sha3 = "0.10"
 # the wallet schemes keyscheme verifies: secp256r1 (WebAuthn) and secp256k1

@@ -2,7 +2,7 @@
 // `Node` admits and settles through it; consensus builds through a `Proposer` while a block applies.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use host::{SubmissionId, Tip};
 
@@ -32,7 +32,7 @@ impl Proposer {
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Pending> {
-        self.pending.lock().expect("the pool's holder never panics")
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn applied(&self) -> Tip {

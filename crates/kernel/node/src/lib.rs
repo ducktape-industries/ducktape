@@ -26,6 +26,8 @@ pub enum Error {
     Host(#[from] host::Error),
     #[error("block {height} does not build on the tip at {tip}")]
     Link { height: u64, tip: u64 },
+    #[error("the host returned no receipt for a submission it preconfirmed")]
+    Unpredicted,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -316,7 +318,7 @@ where
     async fn preconfirm(&mut self, submission: Submission) -> Result<Receipt> {
         let time = self.now();
         let mut predicted = self.host.preconfirm(time, vec![submission]).await?;
-        Ok(predicted.pop().expect("one submission yields one receipt"))
+        predicted.pop().ok_or(Error::Unpredicted)
     }
 
     fn settle(&mut self, carried: &[SubmissionId], applied: Tip) {
