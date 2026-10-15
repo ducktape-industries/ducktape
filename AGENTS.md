@@ -200,6 +200,12 @@ under `ops/`.
 Complement the lint/build gates above. The `rust` skill (let-else guards,
 macros) still applies.
 
+- **A set that grows is a table.** A collection whose members are added over
+  time (the roles a network binds, the services a node offers) is a keyed
+  table, a map from name to value, never one struct field per member. A borsh
+  reader built before a new field cannot read the struct at all; a reader of a
+  table skips the rows it does not know. A field is for what every reader must
+  have.
 - **Explicit control flow.** No boolean-flag steering — don't set `did_x = true`
   up top for a branch below to read; restructure (early-return, extract the two
   paths, or branch once on a discriminant). Early return over nesting: handle the
