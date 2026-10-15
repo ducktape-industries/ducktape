@@ -232,7 +232,7 @@ async fn start<E: Context>(
         .map_err(|error| Error::Tls(error.to_string()))?,
     );
     halo.seat(halo_seats(&node, &network).await?);
-    halo.plane().lanes(halo_lanes(&node).await?);
+    tabled(&halo, halo_lanes(&node).await?, tip.height);
     let blobs =
         blob::service::Service::start(halo.clone(), node.host().blobs().clone(), bundles(&node)?)?;
 
@@ -476,7 +476,7 @@ fn rewrites(writes: &state::Writes, program: &str) -> bool {
 
 async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
     match halo_lanes(node).await {
-        Ok(lanes) => daemon.halo.plane().lanes(lanes),
+        Ok(lanes) => tabled(&daemon.halo, lanes, height),
         Err(error) => tracing::warn!(
             target: "ducktape::halo",
             event = "halo_untabled",
@@ -486,6 +486,35 @@ async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u6
             "halo keeps its lane table: the node could not read the halo program's lanes"
         ),
     }
+}
+
+/// Has halo serve `lanes`, the halo role's table at `height`, from now on, and says so.
+fn tabled(halo: &Halo, lanes: Vec<Lane>, height: u64) {
+    tracing::info!(
+        target: "ducktape::halo",
+        event = "halo_retabled",
+        height,
+        lanes = listing(&lanes),
+        "halo serves the halo role's lane table"
+    );
+    halo.plane().lanes(lanes);
+}
+
+/// The lane table as one log field, in id order: `name#id cap`, then `paused` or `served`, then
+/// `pinned` for a pinned lane.
+fn listing(lanes: &[Lane]) -> String {
+    let lane = |lane: &Lane| {
+        let served = match lane.enabled {
+            true => "served",
+            false => "paused",
+        };
+        let pinned = match lane.pinned {
+            true => " pinned",
+            false => "",
+        };
+        format!("{}#{} {:?} {served}{pinned}", lane.name, lane.id, lane.cap)
+    };
+    lanes.iter().map(lane).collect::<Vec<_>>().join(", ")
 }
 
 async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
@@ -744,7 +773,7 @@ async fn applied<E: Context>(
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::rewrites;
+    use super::{listing, rewrites};
 
     #[test]
     fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
@@ -759,5 +788,25 @@ mod tests {
         assert!(!rewrites(&writes(host::PROGRAMS, b"blobs"), "halo"));
         assert!(!rewrites(&writes("blobs", b"halo"), "halo"));
         assert!(!rewrites(&state::Writes::default(), "halo"));
+    }
+
+    #[test]
+    fn the_table_reads_as_one_line() {
+        let lane = |name: &str, id, enabled, pinned| halo::Lane {
+            name: name.into(),
+            id,
+            cap: halo::Class::Critical,
+            enabled,
+            pinned,
+            since: 0,
+        };
+        let table = [
+            lane("a/blobs", 0, true, true),
+            lane("a/live", 1, false, false),
+        ];
+        assert_eq!(
+            listing(&table),
+            "a/blobs#0 Critical served pinned, a/live#1 Critical paused"
+        );
     }
 }

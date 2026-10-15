@@ -30,6 +30,9 @@ const PAUSE: Duration = Duration::from_secs(1);
 const PAUSE_MOST: Duration = Duration::from_secs(60);
 const CHUNK: usize = 64 << 10;
 const RECEIPT_AGAIN: u64 = 16;
+/// This node's own lane table does not serve the blobs lane, so it asks no member.
+const NO_LANE: &str = "no_lane";
+const NO_MEMBER_GAVE_IT: &str = "no_member_gave_it";
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 struct Ask {
@@ -199,6 +202,16 @@ fn unstored(error: impl std::fmt::Display) -> Refusal {
     )
 }
 
+/// The reason a round that gave nothing names: this node's own lane table when every ask failed
+/// on it, else the members.
+fn missed(reasons: &[&'static str]) -> &'static str {
+    let unlaned = !reasons.is_empty() && reasons.iter().all(|reason| *reason == NO_LANE);
+    if unlaned {
+        return NO_LANE;
+    }
+    NO_MEMBER_GAVE_IT
+}
+
 fn pause(rounds: u32) -> Duration {
     PAUSE.saturating_mul(rounds).min(PAUSE_MOST)
 }
@@ -314,13 +327,13 @@ impl Inner {
         }
     }
 
-    fn gathered(&self, id: &BlobId, pulled: bool) {
+    fn gathered(&self, id: &BlobId, round: Result<(), &'static str>) {
         let mut state = self.state();
-        if pulled {
+        let Err(missed) = round else {
             state.wanted.remove(id);
             state.senders.remove(id);
             return;
-        }
+        };
         let Some(want) = state.wanted.get_mut(id) else {
             return;
         };
@@ -330,7 +343,7 @@ impl Inner {
         let rounds = want.rounds;
         let worth_a_line = rounds == 1 || rounds.is_multiple_of(10);
         if worth_a_line {
-            tracing::warn!(target: "ducktape::blob", event = "blob_ungathered", ?id, attempts = rounds, reason = "no_member_gave_it", "no member gave a blob a bundle names; the node asks again");
+            tracing::warn!(target: "ducktape::blob", event = "blob_ungathered", ?id, attempts = rounds, reason = missed, "no member gave a blob a bundle names; the node asks again");
         }
     }
 
@@ -349,19 +362,28 @@ impl Inner {
         })
     }
 
-    async fn round(&self, id: &BlobId, declared: Option<&Entry>, class: Class) -> bool {
+    /// Asks each candidate member in turn until one gives the blob; failing that, the reason
+    /// the round names.
+    async fn round(
+        &self,
+        id: &BlobId,
+        declared: Option<&Entry>,
+        class: Class,
+    ) -> Result<(), &'static str> {
         let me = self.halo.me();
         let sender = self.sender(id);
+        let mut reasons = Vec::new();
         for peer in self.halo.members().candidates(me, sender.as_ref()) {
             let pulled = self.pull(&peer, id, declared, class).await;
             match pulled {
-                Ok(()) => return true,
+                Ok(()) => return Ok(()),
                 Err(reason) => {
                     tracing::debug!(target: "ducktape::blob", ?id, %peer, reason, "a member did not give a blob");
+                    reasons.push(reason);
                 }
             }
         }
-        false
+        Err(missed(&reasons))
     }
 
     async fn fetch(&self, id: BlobId, class: Class) {
@@ -371,13 +393,13 @@ impl Inner {
             if self.store.has(&id) {
                 return;
             }
-            if self.round(&id, declared.as_ref(), class).await {
+            let Err(missed) = self.round(&id, declared.as_ref(), class).await else {
                 return;
-            }
+            };
             rounds += 1;
             let worth_a_line = rounds == 1 || rounds.is_multiple_of(10);
             if worth_a_line {
-                tracing::warn!(target: "ducktape::blob", event = "blob_unfetched", ?id, attempts = rounds, reason = "no_member_gave_it", "no member gave a blob this node needs; it asks again");
+                tracing::warn!(target: "ducktape::blob", event = "blob_unfetched", ?id, attempts = rounds, reason = missed, "no member gave a blob this node needs; it asks again");
             }
             tokio::time::sleep(pause(rounds)).await;
         }
@@ -395,9 +417,10 @@ impl Inner {
         class: Class,
         ask: &Ask,
     ) -> Result<(Answer, Paced<halo::Carried>), &'static str> {
-        let opened = self.lane.open(peer, class, &abi::encode(ask)).await;
-        let Ok(mut stream) = opened else {
-            return Err("unopened");
+        let mut stream = match self.lane.open(peer, class, &abi::encode(ask)).await {
+            Ok(stream) => stream,
+            Err(halo::Error::NoLane(_)) => return Err(NO_LANE),
+            Err(_) => return Err("unopened"),
         };
         let answer = within(read_answer(&mut stream)).await?;
         Ok((answer, stream))
@@ -519,8 +542,8 @@ async fn gathering(inner: Arc<Inner>) {
         notified.as_mut().enable();
         match inner.next() {
             Next::Pull(entry) => {
-                let pulled = inner.round(&entry.id, Some(&entry), Class::Member).await;
-                inner.gathered(&entry.id, pulled);
+                let round = inner.round(&entry.id, Some(&entry), Class::Member).await;
+                inner.gathered(&entry.id, round);
             }
             Next::Until(at) => {
                 tokio::select! {
@@ -611,4 +634,17 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|_| "broken")?;
     stream.shutdown().await.map_err(|_| "broken")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NO_LANE, NO_MEMBER_GAVE_IT, missed};
+
+    #[test]
+    fn a_round_names_the_lane_only_when_every_ask_failed_on_it() {
+        assert_eq!(missed(&[NO_LANE, NO_LANE]), NO_LANE);
+        assert_eq!(missed(&[NO_LANE, "lacks"]), NO_MEMBER_GAVE_IT);
+        assert_eq!(missed(&["unopened"]), NO_MEMBER_GAVE_IT);
+        assert_eq!(missed(&[]), NO_MEMBER_GAVE_IT);
+    }
 }
