@@ -18,6 +18,7 @@ use live_wire::{
 use abi::live::{Grant, pattern_covers};
 
 use super::grants::{Act, watch_patterns};
+use super::lane::ToPeer;
 use super::session::{Out, Outlet};
 
 pub type SessionId = u64;
@@ -49,94 +50,18 @@ pub enum Subscriber {
     },
 }
 
-/// What is sent as a step's outcome: to a session here, over the live lane to a node, a
-/// session nudged to re-read what it holds (a hand-over took its publication with no word), or
-/// an outlet closed. Closing is an effect like any other, so its order against the sends before
-/// it is owned by the one executor (a `GoAway` is queued before the close that follows it).
+/// What is sent as a step's outcome: to a session here; over the live lane to one node, or an
+/// announce to every member; a session nudged to re-read what it holds (a hand-over took its
+/// publication with no word); or an outlet closed. Closing is an effect like any other, so its
+/// order against the sends before it is owned by the one executor (a `GoAway` is queued before
+/// the close that follows it).
 #[derive(Debug)]
 pub enum Effect {
     Send(Outlet, Out),
-    Lane(Relayed),
+    Lane(PublicKey, ToPeer),
+    Announce(Forward),
     Nudge(Outlet),
     Close(Outlet, &'static str),
-}
-
-/// What a dropped data item is told as: its group, and the index of the item missing from it
-/// (an object's index, 0 for a replay, the object count for an end).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Cut {
-    pub alias: Alias,
-    pub group: u64,
-    pub at: u32,
-}
-
-/// What the live lane carries for a step: announces to every member, and a group's objects or a
-/// datagram to the node that subscribed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Relayed {
-    /// The peer opened a fresh control stream to us: it is new, or restarted and forgot us.
-    /// Open ours back and resync, even with nothing else to send. (A member seated is resynced
-    /// by the lane itself, not through a step.)
-    Fresh { to: PublicKey },
-    /// A data item to this peer was dropped on its way to the lane: the lane cuts the group
-    /// short at that peer, so the peer never reads a group with a hole as whole.
-    Cut { to: PublicKey, cut: Cut },
-    Announce {
-        track: Track,
-        by: Account,
-        mode: Mode,
-        priority: Priority,
-        up: bool,
-    },
-    Object {
-        to: PublicKey,
-        header: GroupHeader,
-        object: u32,
-        body: Bytes,
-    },
-    /// A whole cached group forwarded to a node that asked `Latest`, as one unit, so a large
-    /// replay across the lane is not N bounded sends that drop the group short.
-    Group {
-        to: PublicKey,
-        alias: Alias,
-        group: u64,
-        objects: Arc<Vec<Bytes>>,
-        end: Option<bool>,
-    },
-    GroupEnd {
-        to: PublicKey,
-        alias: Alias,
-        group: u64,
-        complete: bool,
-        /// The objects the group carried: its stream holds them all, or is reset.
-        objects: u32,
-    },
-    Datagram {
-        to: PublicKey,
-        header: DatagramHeader,
-        payload: Bytes,
-    },
-    /// The answer to a node's ask, on the control stream to it.
-    Answer { to: PublicKey, forward: Forward },
-    Count {
-        to: PublicKey,
-        request: RequestId,
-        count: u32,
-    },
-    Ended {
-        to: PublicKey,
-        request: RequestId,
-        reason: End,
-    },
-    /// The first local subscriber of a remote track: the publisher's node is asked for it.
-    Subscribe {
-        to: PublicKey,
-        request: RequestId,
-        track: Track,
-        from: Start,
-    },
-    /// The last local subscriber left a remote track.
-    Unsubscribe { to: PublicKey, request: RequestId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,8 +77,6 @@ pub struct Cached {
 /// A group the publisher is writing now.
 struct Incoming {
     bytes: usize,
-    /// The objects of it heard so far: what its end says the group holds.
-    objects: u32,
     /// An object of it was refused or dropped: the subscribers heard it end short, and the
     /// rest of its objects are dropped quiet, so no one sees a hole as a complete group.
     abandoned: bool,
@@ -1043,11 +966,13 @@ impl State {
                         effects,
                     );
                 }
-                Subscriber::Node { peer, request } => effects.push(Effect::Lane(Relayed::Ended {
-                    to: peer.clone(),
-                    request: *request,
-                    reason: to_subscribers,
-                })),
+                Subscriber::Node { peer, request } => effects.push(Effect::Lane(
+                    peer.clone(),
+                    ToPeer::Control(Forward::Ended {
+                        request: *request,
+                        reason: to_subscribers,
+                    }),
+                )),
             }
         }
         self.announce(track, &held, false, effects);
@@ -1058,7 +983,7 @@ impl State {
     fn group_cut(&self, held: &Published, subscriber: &Subscriber, effects: &mut Vec<Effect>) {
         for (group, incoming) in &held.incoming {
             if !incoming.abandoned {
-                self.group_ended_for(held, subscriber, *group, false, incoming.objects, effects);
+                self.group_ended_for(held, subscriber, *group, false, effects);
             }
         }
     }
@@ -1069,7 +994,6 @@ impl State {
         subscriber: &Subscriber,
         group: u64,
         complete: bool,
-        objects: u32,
         effects: &mut Vec<Effect>,
     ) {
         // A subscriber that never heard this group's objects hears no end of it either.
@@ -1083,17 +1007,17 @@ impl State {
                     alias: held.alias,
                     group,
                     complete,
-                    objects,
                 },
                 effects,
             ),
-            Subscriber::Node { peer, request } => effects.push(Effect::Lane(Relayed::GroupEnd {
-                to: peer.clone(),
-                alias: *request as Alias,
-                group,
-                complete,
-                objects,
-            })),
+            Subscriber::Node { peer, request } => effects.push(Effect::Lane(
+                peer.clone(),
+                ToPeer::GroupEnd {
+                    alias: *request as Alias,
+                    group,
+                    complete,
+                },
+            )),
         }
     }
 
@@ -1134,7 +1058,7 @@ impl State {
         }
         // A local track is gossiped to the members; a remote one we only re-announce locally.
         match held.origin {
-            Origin::Local(_) => effects.push(Effect::Lane(Relayed::Announce {
+            Origin::Local(_) => effects.push(Effect::Announce(Forward::Announce {
                 track: track.clone(),
                 by,
                 mode,
@@ -1210,12 +1134,14 @@ impl State {
         {
             held.asked = Start::Latest;
             held.unanswered += 1;
-            effects.push(Effect::Lane(Relayed::Subscribe {
-                to: peer.clone(),
-                request: held.request,
-                track: track.clone(),
-                from: Start::Latest,
-            }));
+            effects.push(Effect::Lane(
+                peer.clone(),
+                ToPeer::Control(Forward::Subscribe {
+                    request: held.request,
+                    track: track.clone(),
+                    from: Start::Latest,
+                }),
+            ));
         }
         self.subscription_held(id, request, track.clone());
         if defer {
@@ -1293,19 +1219,14 @@ impl State {
         if let Some(stale) = self.resyncing.get_mut(&peer) {
             stale.remove(track);
         }
-        match self.node_subscribe(peer.clone(), request, track, from, &mut effects) {
-            Ok(opened) => effects.push(Effect::Lane(Relayed::Answer {
-                to: peer,
-                forward: Forward::Forwarded {
-                    request,
-                    latest: opened.latest,
-                },
-            })),
-            Err(code) => effects.push(Effect::Lane(Relayed::Answer {
-                to: peer,
-                forward: Forward::Refused { request, code },
-            })),
-        }
+        let answer = match self.node_subscribe(peer.clone(), request, track, from, &mut effects) {
+            Ok(opened) => Forward::Forwarded {
+                request,
+                latest: opened.latest,
+            },
+            Err(code) => Forward::Refused { request, code },
+        };
+        effects.push(Effect::Lane(peer, ToPeer::Control(answer)));
         effects
     }
 
@@ -1480,12 +1401,14 @@ impl State {
             held.request = RequestId::from(held.alias);
             held.asked = from;
             held.unanswered += 1;
-            effects.push(Effect::Lane(Relayed::Subscribe {
-                to: peer.clone(),
-                request: held.request,
-                track: track.clone(),
-                from,
-            }));
+            effects.push(Effect::Lane(
+                peer.clone(),
+                ToPeer::Control(Forward::Subscribe {
+                    request: held.request,
+                    track: track.clone(),
+                    from,
+                }),
+            ));
         }
         self.count_moved(track, effects);
         Some(opened)
@@ -1518,7 +1441,7 @@ impl State {
             return;
         };
         for out in replayed(held, cached) {
-            effects.extend(relayed(peer.clone(), alias, out).map(Effect::Lane));
+            effects.extend(relayed(alias, out).map(|item| Effect::Lane(peer.clone(), item)));
         }
     }
 
@@ -1625,10 +1548,12 @@ impl State {
             .any(|other| matches!(other, Subscriber::Local { .. }));
         // A remote track whose last local subscriber left makes us drop our ask to its node.
         if none_local && let Origin::Remote(peer) = &held.origin {
-            effects.push(Effect::Lane(Relayed::Unsubscribe {
-                to: peer.clone(),
-                request: held.request,
-            }));
+            effects.push(Effect::Lane(
+                peer.clone(),
+                ToPeer::Control(Forward::Unsubscribe {
+                    request: held.request,
+                }),
+            ));
             held.latest = None;
         }
         self.count_moved(track, effects);
@@ -1656,11 +1581,13 @@ impl State {
                 },
                 effects,
             ),
-            Origin::Remote(peer) => effects.push(Effect::Lane(Relayed::Count {
-                to: peer.clone(),
-                request: held.request,
-                count,
-            })),
+            Origin::Remote(peer) => effects.push(Effect::Lane(
+                peer.clone(),
+                ToPeer::Control(Forward::Count {
+                    request: held.request,
+                    count,
+                }),
+            )),
         }
     }
 
@@ -2005,11 +1932,9 @@ impl State {
         };
         let incoming = held.incoming.entry(header.group).or_insert(Incoming {
             bytes: 0,
-            objects: 0,
             abandoned: false,
         });
         incoming.bytes += body.len();
-        incoming.objects += 1;
         let group = header.group;
         let priority = held.priority;
         let header = GroupHeader {
@@ -2037,15 +1962,17 @@ impl State {
                     },
                     &mut effects,
                 ),
-                Subscriber::Node { peer, request } => effects.push(Effect::Lane(Relayed::Object {
-                    to: peer,
-                    header: GroupHeader {
-                        alias: request as Alias,
-                        ..header
+                Subscriber::Node { peer, request } => effects.push(Effect::Lane(
+                    peer,
+                    ToPeer::Object {
+                        header: GroupHeader {
+                            alias: request as Alias,
+                            ..header
+                        },
+                        object,
+                        body: body.clone(),
                     },
-                    object,
-                    body: body.clone(),
-                })),
+                )),
             }
         }
         self.cache_object(&track, group, object, body);
@@ -2074,7 +2001,7 @@ impl State {
             if let Some(cached) = held.latest.as_mut().filter(|cached| cached.group == group) {
                 cached.complete = complete;
             }
-            self.group_ended(&track, group, complete, incoming.objects, &mut effects);
+            self.group_ended(&track, group, complete, &mut effects);
         }
         // The group is over either way, and its end went only to those who heard it: no
         // subscriber waits to skip it any more.
@@ -2088,19 +2015,12 @@ impl State {
     }
 
     /// The group ends for every subscriber of the track, complete or short.
-    fn group_ended(
-        &self,
-        track: &Track,
-        group: u64,
-        complete: bool,
-        objects: u32,
-        effects: &mut Vec<Effect>,
-    ) {
+    fn group_ended(&self, track: &Track, group: u64, complete: bool, effects: &mut Vec<Effect>) {
         let Some(held) = self.tracks.get(track) else {
             return;
         };
         for subscriber in &held.subscribers {
-            self.group_ended_for(held, subscriber, group, complete, objects, effects);
+            self.group_ended_for(held, subscriber, group, complete, effects);
         }
     }
 
@@ -2119,7 +2039,6 @@ impl State {
                 group,
                 Incoming {
                     bytes: 0,
-                    objects: 0,
                     abandoned: true,
                 },
             );
@@ -2127,9 +2046,8 @@ impl State {
         };
         let was_open = !incoming.abandoned;
         incoming.abandoned = true;
-        let objects = incoming.objects;
         if was_open {
-            self.group_ended(track, group, false, objects, effects);
+            self.group_ended(track, group, false, effects);
         }
     }
 
@@ -2201,16 +2119,16 @@ impl State {
                     },
                     &mut effects,
                 ),
-                Subscriber::Node { peer, request } => {
-                    effects.push(Effect::Lane(Relayed::Datagram {
-                        to: peer,
+                Subscriber::Node { peer, request } => effects.push(Effect::Lane(
+                    peer,
+                    ToPeer::Datagram {
                         header: DatagramHeader {
                             alias: request as Alias,
                             ..header
                         },
                         payload: payload.clone(),
-                    }))
-                }
+                    },
+                )),
             }
         }
         self.cache_datagram(&track, header, payload);
@@ -2419,7 +2337,7 @@ impl State {
     pub fn peer_fresh(&mut self, peer: PublicKey) -> Vec<Effect> {
         let provisional = self.told_by(&peer);
         self.resyncing.insert(peer.clone(), provisional);
-        vec![Effect::Lane(Relayed::Fresh { to: peer })]
+        vec![Effect::Lane(peer, ToPeer::Fresh)]
     }
 
     /// The peer's resync ended: whatever it did not repeat is gone.
@@ -2572,15 +2490,14 @@ fn replayed(held: &Published, cached: &Cached) -> Vec<Out> {
 }
 
 /// A replayed object for a node, named by the alias the node asked with.
-fn relayed(to: PublicKey, alias: Alias, out: Out) -> Option<Relayed> {
+fn relayed(alias: Alias, out: Out) -> Option<ToPeer> {
     match out {
         Out::Object {
             header,
             object,
             body,
             ..
-        } => Some(Relayed::Object {
-            to,
+        } => Some(ToPeer::Object {
             header: GroupHeader { alias, ..header },
             object,
             body,
@@ -2590,27 +2507,19 @@ fn relayed(to: PublicKey, alias: Alias, out: Out) -> Option<Relayed> {
             objects,
             end,
             ..
-        } => Some(Relayed::Group {
-            to,
-            alias,
-            group: header.group,
+        } => Some(ToPeer::Group {
+            header: GroupHeader { alias, ..header },
             objects,
             end,
         }),
         Out::GroupEnd {
-            group,
-            complete,
-            objects,
-            ..
-        } => Some(Relayed::GroupEnd {
-            to,
+            group, complete, ..
+        } => Some(ToPeer::GroupEnd {
             alias,
             group,
             complete,
-            objects,
         }),
-        Out::Datagram { header, payload } => Some(Relayed::Datagram {
-            to,
+        Out::Datagram { header, payload } => Some(ToPeer::Datagram {
             header: DatagramHeader { alias, ..header },
             payload,
         }),
@@ -2629,12 +2538,13 @@ mod tests {
         State::new("net#00000000".into(), Metrics::unregistered())
     }
 
-    /// What a step sends a node over the live lane, without the sessions' sends.
-    fn lane(effects: Vec<Effect>) -> Vec<Relayed> {
+    /// What a step sends the nodes over the live lane, without the sessions' sends.
+    fn lane(effects: Vec<Effect>) -> Vec<ToPeer> {
         effects
             .into_iter()
             .filter_map(|effect| match effect {
-                Effect::Lane(relayed) => Some(relayed),
+                Effect::Lane(_, item) => Some(item),
+                Effect::Announce(forward) => Some(ToPeer::Control(forward)),
                 Effect::Send(..) | Effect::Nudge(_) | Effect::Close(..) => None,
             })
             .collect()
@@ -2646,7 +2556,11 @@ mod tests {
             .into_iter()
             .filter_map(|effect| match effect {
                 Effect::Send(_, Out::Control(control)) => Some(control),
-                Effect::Send(..) | Effect::Lane(_) | Effect::Nudge(_) | Effect::Close(..) => None,
+                Effect::Send(..)
+                | Effect::Lane(..)
+                | Effect::Announce(_)
+                | Effect::Nudge(_)
+                | Effect::Close(..) => None,
             })
             .collect()
     }
@@ -2974,16 +2888,22 @@ mod tests {
                 .iter()
                 .filter_map(|effect| match effect {
                     Effect::Send(_, out) => Some(out),
-                    Effect::Lane(_) | Effect::Nudge(_) | Effect::Close(..) => None,
+                    Effect::Lane(..)
+                    | Effect::Announce(_)
+                    | Effect::Nudge(_)
+                    | Effect::Close(..) => None,
                 })
                 .collect()
         }
-        fn lanes(effects: &[Effect]) -> Vec<&Relayed> {
+        fn lanes(effects: &[Effect]) -> Vec<&ToPeer> {
             effects
                 .iter()
                 .filter_map(|effect| match effect {
-                    Effect::Lane(relayed) => Some(relayed),
-                    Effect::Send(..) | Effect::Nudge(_) | Effect::Close(..) => None,
+                    Effect::Lane(_, item) => Some(item),
+                    Effect::Send(..)
+                    | Effect::Announce(_)
+                    | Effect::Nudge(_)
+                    | Effect::Close(..) => None,
                 })
                 .collect()
         }
@@ -3019,7 +2939,7 @@ mod tests {
         assert!(
             !lane_items
                 .iter()
-                .any(|relayed| matches!(relayed, Relayed::Ended { .. })),
+                .any(|item| matches!(item, ToPeer::Control(Forward::Ended { .. }))),
             "the node behind the peer hears no end: {lane_items:?}"
         );
         assert!(
@@ -3029,13 +2949,12 @@ mod tests {
             "the local subscriber hears no end"
         );
         assert!(
-            lane_items.iter().any(|relayed| matches!(
-                relayed,
-                Relayed::GroupEnd {
+            lane_items.iter().any(|item| matches!(
+                item,
+                ToPeer::GroupEnd {
                     alias: 7,
                     group: 1,
                     complete: false,
-                    ..
                 }
             )),
             "the open group is cut for the peer"
@@ -3052,9 +2971,10 @@ mod tests {
             "the open group is cut for the local subscriber"
         );
         assert!(
-            lane_items
-                .iter()
-                .any(|relayed| matches!(relayed, Relayed::Announce { up: true, .. })),
+            handed.iter().any(|effect| matches!(
+                effect,
+                Effect::Announce(Forward::Announce { up: true, .. })
+            )),
             "the track is announced up, not down and up"
         );
         assert_eq!(state.track(&doc).unwrap().alias, alias, "the alias stays");
@@ -3078,9 +2998,9 @@ mod tests {
             0,
             Bytes::from_static(b"b"),
         );
-        assert!(lanes(&next).iter().any(|relayed| matches!(
-            relayed,
-            Relayed::Object {
+        assert!(lanes(&next).iter().any(|item| matches!(
+            item,
+            ToPeer::Object {
                 header: GroupHeader { alias: 7, group: 2 },
                 object: 0,
                 ..
@@ -3256,10 +3176,9 @@ mod tests {
 
         let swept = state.peers_gone(|peer| *peer == kept);
         assert!(
-            !lane(swept).iter().any(|relayed| matches!(
-                relayed,
-                Relayed::Ended { to, .. } | Relayed::Fresh { to } if *to == gone
-            )),
+            !swept
+                .iter()
+                .any(|effect| matches!(effect, Effect::Lane(to, _) if *to == gone)),
             "nothing is sent to a member that is gone: its writer is dropped, not re-made"
         );
         assert!(
@@ -3323,12 +3242,12 @@ mod tests {
         );
         let request = state.track(&doc).unwrap().request;
         assert!(
-            lane(carols).iter().any(|relayed| matches!(
-                relayed,
-                Relayed::Subscribe {
+            lane(carols).iter().any(|item| matches!(
+                item,
+                ToPeer::Control(Forward::Subscribe {
                     from: Start::Latest,
                     ..
-                }
+                })
             )),
             "a Latest ask lifts the node's standing Next ask"
         );
@@ -3403,13 +3322,13 @@ mod tests {
         ));
         assert!(
             live.iter()
-                .any(|relayed| matches!(relayed, Relayed::Object { .. }))
+                .any(|item| matches!(item, ToPeer::Object { .. }))
         );
         let lifted = lane(state.node_subscribed(peer.clone(), 7, &ours, Start::Latest));
         assert!(
             !lifted
                 .iter()
-                .any(|relayed| matches!(relayed, Relayed::Group { .. })),
+                .any(|item| matches!(item, ToPeer::Group { .. })),
             "the group the node receives live is not replayed onto its stream: {lifted:?}"
         );
     }
@@ -3432,7 +3351,7 @@ mod tests {
         let groups = |effects: Vec<Effect>| {
             lane(effects)
                 .into_iter()
-                .filter(|relayed| matches!(relayed, Relayed::Group { .. }))
+                .filter(|item| matches!(item, ToPeer::Group { .. }))
                 .count()
         };
         assert_eq!(
@@ -3589,17 +3508,14 @@ mod tests {
             matches!(
                 replayed.as_slice(),
                 [
-                    Relayed::Group {
+                    ToPeer::Group {
                         end: Some(true),
                         ..
                     },
-                    Relayed::Answer {
-                        forward: Forward::Forwarded {
-                            latest: Some(1),
-                            ..
-                        },
+                    ToPeer::Control(Forward::Forwarded {
+                        latest: Some(1),
                         ..
-                    }
+                    })
                 ]
             ),
             "the cached group crosses once as one unit, then the answer: {replayed:?}"
@@ -3608,14 +3524,10 @@ mod tests {
         assert!(
             matches!(
                 again.as_slice(),
-                [Relayed::Answer {
-                    forward: Forward::Forwarded {
-                        request: 8,
-                        latest: Some(1),
-                        ..
-                    },
-                    ..
-                }]
+                [ToPeer::Control(Forward::Forwarded {
+                    request: 8,
+                    latest: Some(1),
+                })]
             ),
             "the subscription carries the track already, only the answer crosses: {again:?}"
         );

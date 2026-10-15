@@ -15,6 +15,7 @@ use live_wire::{
     Priority, WS_MESSAGE, WsFrame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -84,8 +85,6 @@ pub enum Out {
         alias: Alias,
         group: u64,
         complete: bool,
-        /// The objects the group carried: a stream short of them is reset, not finished.
-        objects: u32,
     },
     Datagram {
         header: DatagramHeader,
@@ -93,16 +92,17 @@ pub enum Out {
     },
 }
 
-/// Datagram-mode objects waiting for a connection: the newest per track, older ones dropped,
-/// which is a datagram's semantics done in software.
+/// Datagram-mode objects waiting for a connection or a peer: the newest per track, older ones
+/// dropped, which is a datagram's semantics done in software.
 #[derive(Default)]
-struct Latest {
+pub struct Latest {
     slots: Mutex<HashMap<Alias, (DatagramHeader, Bytes)>>,
     ready: Notify,
 }
 
 impl Latest {
-    fn put(&self, header: DatagramHeader, payload: Bytes) -> bool {
+    /// Whether an older datagram for the track was dropped for this one.
+    pub fn put(&self, header: DatagramHeader, payload: Bytes) -> bool {
         let replaced = self
             .slots
             .lock()
@@ -113,13 +113,19 @@ impl Latest {
         replaced
     }
 
-    fn take(&self) -> Vec<(DatagramHeader, Bytes)> {
+    pub fn take(&self) -> Vec<(DatagramHeader, Bytes)> {
         self.slots
             .lock()
             .expect("the slots lock is never poisoned")
             .drain()
             .map(|(_, datagram)| datagram)
             .collect()
+    }
+
+    /// Resolves once a datagram was put since it was last awaited (a permit is kept, so one
+    /// put before the wait is not lost).
+    pub fn ready(&self) -> Notified<'_> {
+        self.ready.notified()
     }
 }
 
@@ -216,7 +222,7 @@ impl Egress {
             if let Ok(out) = self.ordered.try_recv() {
                 return Drained::Out(out);
             }
-            let ready = self.latest.ready.notified();
+            let ready = self.latest.ready();
             let pending = self.latest.take();
             if !pending.is_empty() {
                 return Drained::Datagrams(pending);
@@ -559,8 +565,7 @@ async fn quic_writing(
                 alias,
                 group,
                 complete,
-                objects,
-            }) => groups.end(alias, group, complete, objects),
+            }) => groups.end(alias, group, complete),
             Drained::Out(Out::Datagram { .. }) => {}
             Drained::Datagrams(datagrams) => {
                 for (header, payload) in datagrams {
@@ -804,7 +809,6 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
                 alias,
                 group,
                 complete,
-                ..
             }) => vec![WsFrame::Group {
                 header: GroupHeader { alias, group },
                 objects: Vec::new(),

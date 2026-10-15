@@ -14,7 +14,6 @@ mod tracks;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -81,12 +80,12 @@ pub struct Relay<E: crate::Context> {
     state: Mutex<State>,
     dirty: Mutex<Dirty>,
     rechecks: Arc<Notify>,
-    lane: lane::Queue,
-    /// Set when the lane's control queue was full: the lane task then drops every peer's writer
-    /// and resyncs.
-    lane_behind: AtomicBool,
-    /// Every task the relay runs, the live lane's included: dropped with the relay, they are
-    /// aborted, and what they hold of halo goes with them.
+    /// The live lane's writers, one per peer, fed by the steps' effects: locked after the
+    /// state lock, never before it.
+    lanes: Mutex<lane::Lanes<E>>,
+    /// Every task the relay runs, the live lane's included (each peer writer's group writers
+    /// go with that writer): dropped with the relay, they are aborted, and what they hold of
+    /// halo goes with them.
     tasks: Mutex<JoinSet<()>>,
 }
 
@@ -104,9 +103,10 @@ impl<E: crate::Context> Relay<E> {
         let door = live.map(|at| door(identity, at)).transpose()?;
         let me = identity.public_key();
         let metrics = metrics(&context);
-        let (lane, queued) = lane::queue();
         let rechecks = Arc::new(Notify::new());
-        let relay = Arc::new(Relay {
+        // The tasks and the lanes hold the relay weakly: it drops with its last owner, and
+        // they end with it.
+        let relay = Arc::new_cyclic(|weak: &Weak<Relay<E>>| Relay {
             state: Mutex::new(State::new(network.id.clone(), metrics.clone())),
             context,
             network,
@@ -114,25 +114,27 @@ impl<E: crate::Context> Relay<E> {
             halo: halo.clone(),
             door: door.clone(),
             me: me.clone(),
-            metrics,
             dirty: Mutex::default(),
             rechecks: rechecks.clone(),
-            lane,
-            lane_behind: AtomicBool::new(false),
+            lanes: Mutex::new(lane::Lanes::new(
+                weak.clone(),
+                halo,
+                me,
+                metrics.dropped_behind.clone(),
+            )),
+            metrics,
             tasks: Mutex::default(),
         });
-        // The tasks hold the relay weakly: it drops with its last owner, and they end with it.
         let weak = Arc::downgrade(&relay);
         relay.spawn(rechecking(weak.clone(), rechecks));
         relay.spawn(closing(weak.clone(), shutdown));
-        relay.spawn(lane::serving(weak.clone(), halo, me, queued));
+        relay.spawn(lane::serving(weak.clone()));
         if let Some(door) = door {
             relay.spawn(accepting(weak, door));
         }
         Ok(relay)
     }
 
-    /// A task that lives no longer than the relay.
     /// A task aborted with the relay; the handle aborts it sooner. The tasks already over are
     /// let go first, so the set holds only what runs.
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> tokio::task::AbortHandle {
@@ -183,9 +185,10 @@ impl<E: crate::Context> Relay<E> {
     /// in the order they were decided, so no step's word to a session overtakes another's, as a
     /// re-check's end would overtake the answer to the request it re-checks. Everything a step
     /// decides is delivered here and nowhere else: a session's outlet takes what it is sent or
-    /// is closed as behind, and nothing here takes a lock of the relay's. Outside the table are
-    /// only the handshake's refusal and go-away, to a session that was never in it, and a
-    /// session's own loop closing its outlet when it ends.
+    /// is closed as behind, and a peer's writer takes what it is handed or is dropped and
+    /// resynced; the lanes lock is the only lock taken here, after the state's. Outside the
+    /// table are only the handshake's refusal and go-away, to a session that was never in it,
+    /// and a session's own loop closing its outlet when it ends.
     fn step(&self, decide: impl FnOnce(&mut State) -> Vec<Effect>) {
         self.step_to(|state| ((), decide(state)));
     }
@@ -198,7 +201,8 @@ impl<E: crate::Context> Relay<E> {
         for effect in effects {
             match effect {
                 Effect::Send(outlet, out) => self.deliver(&outlet, out),
-                Effect::Lane(relayed) => lane::relay(self, relayed),
+                Effect::Lane(to, item) => self.lanes().hand(to, item),
+                Effect::Announce(forward) => self.lanes().announce(forward),
                 Effect::Nudge(outlet) => outlet.nudge(),
                 Effect::Close(outlet, reason) => outlet.close(reason),
             }
@@ -234,6 +238,10 @@ impl<E: crate::Context> Relay<E> {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("the state lock is never poisoned")
+    }
+
+    fn lanes(&self) -> std::sync::MutexGuard<'_, lane::Lanes<E>> {
+        self.lanes.lock().expect("the lanes lock is never poisoned")
     }
 
     /// The grant read for one request, with the generation it was read at, so a block that
