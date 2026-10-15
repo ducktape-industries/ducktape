@@ -538,7 +538,7 @@ fn a_validator_serves_its_network_over_http() {
         let programs = client.programs().await.unwrap();
         let code = programs["probe"];
         let framed = client.blob(code).await.unwrap().unwrap();
-        assert_eq!(blob::id_of(code.kind(), &framed), code);
+        assert_eq!(blob::id_of(code.kind(), &framed).unwrap(), code);
         assert!(client.missing_blobs().await.unwrap().is_empty());
         assert!(
             client
@@ -1142,7 +1142,7 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
             gathered.blobs(&ids).await.unwrap(),
             framed.clone().map(Some).to_vec()
         );
-        let named_by_none = blob::id_of(HashKind::Sha256, b"page 1\0x");
+        let named_by_none = blob::id_of(HashKind::Sha256, b"page 1\0x").unwrap();
         assert_eq!(gathered.blobs(&[named_by_none]).await.unwrap(), vec![None]);
 
         let reading = frame(gathered, &alice, vec![Step::Op(HostOp::BlobGet(ids[0]))]).await;

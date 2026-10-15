@@ -9,7 +9,8 @@ pub mod service;
 mod store;
 
 use abi::{BlobHeader, BlobId, HashKind, Refusal, hex, reason};
-use sha1::Digest as _;
+use sha1_checked::CollisionResult;
+use sha2::Digest as _;
 
 #[cfg(feature = "store")]
 pub use store::{Blobs, Error, Layered, Result, Stage, file_entry, names, size_of, window};
@@ -56,22 +57,45 @@ pub(crate) fn parse_header(head: &[u8]) -> Option<BlobHeader> {
     })
 }
 
-pub fn id_of(hash: HashKind, framed: &[u8]) -> BlobId {
+pub fn id_of(hash: HashKind, framed: &[u8]) -> std::result::Result<BlobId, Collision> {
     let mut hasher = Hasher::new(hash);
     hasher.update(framed);
     hasher.finish()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Collision(pub BlobId);
+
+impl std::fmt::Display for Collision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the bytes named {:?} carry a SHA-1 collision attack",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Collision {}
+
+impl From<Collision> for Refusal {
+    fn from(collision: Collision) -> Refusal {
+        Refusal::new(reason::INVALID_INPUT, collision.to_string())
+    }
+}
+
 pub enum Hasher {
     Sha256(sha2::Sha256),
-    Sha1(sha1::Sha1),
+    Sha1(Box<sha1_checked::Sha1>),
 }
 
 impl Hasher {
     pub fn new(hash: HashKind) -> Hasher {
         match hash {
             HashKind::Sha256 => Hasher::Sha256(sha2::Sha256::new()),
-            HashKind::Sha1 => Hasher::Sha1(sha1::Sha1::new()),
+            HashKind::Sha1 => Hasher::Sha1(Box::new(
+                sha1_checked::Sha1::builder().safe_hash(false).build(),
+            )),
         }
     }
 
@@ -82,10 +106,19 @@ impl Hasher {
         }
     }
 
-    pub fn finish(self) -> BlobId {
+    pub fn finish(self) -> std::result::Result<BlobId, Collision> {
         match self {
-            Hasher::Sha256(hasher) => BlobId::Sha256(hasher.finalize().into()),
-            Hasher::Sha1(hasher) => BlobId::Sha1(hasher.finalize().into()),
+            Hasher::Sha256(hasher) => Ok(BlobId::Sha256(hasher.finalize().into())),
+            Hasher::Sha1(hasher) => sha1_id(hasher.try_finalize()),
+        }
+    }
+}
+
+fn sha1_id(result: CollisionResult) -> std::result::Result<BlobId, Collision> {
+    match result {
+        CollisionResult::Ok(digest) => Ok(BlobId::Sha1(digest.into())),
+        CollisionResult::Collision(digest) | CollisionResult::Mitigated(digest) => {
+            Err(Collision(BlobId::Sha1(digest.into())))
         }
     }
 }
@@ -102,12 +135,61 @@ mod tests {
     fn a_git_blob_gets_its_git_oid() {
         let framed = frame("blob", b"hello\n").unwrap();
         assert_eq!(framed, b"blob 6\0hello\n");
-        let id = id_of(HashKind::Sha1, &framed);
+        let id = id_of(HashKind::Sha1, &framed).unwrap();
         assert_eq!(hex(id.digest()), "ce013625030ba8dba906f756967f9e9ca394464a");
         let (header, body) = parse(&framed).unwrap();
         assert_eq!(header.kind, "blob");
         assert_eq!(header.len, 6);
         assert_eq!(body, b"hello\n");
+    }
+
+    #[test]
+    fn a_git_object_gets_the_id_git_gives_it_in_either_hash() {
+        let sha1 = |framed: &[u8]| hex(id_of(HashKind::Sha1, framed).unwrap().digest());
+        let sha256 = |framed: &[u8]| hex(id_of(HashKind::Sha256, framed).unwrap().digest());
+        assert_eq!(
+            sha1(b"blob 0\0"),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        assert_eq!(
+            sha1(b"tree 0\0"),
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        );
+        assert_eq!(
+            sha256(b"blob 0\0"),
+            "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"
+        );
+        assert_eq!(
+            sha256(b"blob 6\0hello\n"),
+            "2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4"
+        );
+        assert_eq!(
+            sha256(b"tree 0\0"),
+            "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+        );
+    }
+
+    #[test]
+    fn both_halves_of_the_shattered_collision_are_refused_naming_the_id_they_share() {
+        let first: &[u8] = include_bytes!("../fixtures/shattered-1.bin");
+        let second: &[u8] = include_bytes!("../fixtures/shattered-2.bin");
+        assert_ne!(first, second);
+        let shared = "f92d74e3874587aaf443d1db961d4e26dde13e9c";
+        for half in [first, second] {
+            let Err(Collision(id)) = id_of(HashKind::Sha1, half) else {
+                panic!("a SHAttered half hashed without a collision");
+            };
+            assert_eq!(hex(id.digest()), shared);
+            let mut streamed = Hasher::new(HashKind::Sha1);
+            for chunk in half.chunks(7) {
+                streamed.update(chunk);
+            }
+            assert_eq!(streamed.finish(), Err(Collision(id)));
+            let refusal = Refusal::from(Collision(id));
+            assert_eq!(refusal.reason, reason::INVALID_INPUT);
+            assert!(refusal.sentence.contains(shared), "{}", refusal.sentence);
+        }
+        assert!(id_of(HashKind::Sha256, first).is_ok());
     }
 
     #[test]
