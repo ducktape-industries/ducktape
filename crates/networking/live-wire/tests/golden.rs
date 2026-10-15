@@ -240,6 +240,46 @@ fn every_message_keeps_its_bytes() {
 }
 
 #[test]
+fn every_wire_variant_has_a_golden_sample() {
+    // These matches are exhaustive (no `_`): a new `Control` or `Forward` variant fails to
+    // compile here, next to the sample lists, until it is routed and given a golden sample (C3-8).
+    for control in controls() {
+        match control {
+            Control::Hello(_)
+            | Control::Challenge(_)
+            | Control::Proof(_)
+            | Control::Welcome(_)
+            | Control::Publish { .. }
+            | Control::Unpublish { .. }
+            | Control::Subscribe { .. }
+            | Control::Unsubscribe { .. }
+            | Control::Watch { .. }
+            | Control::Unwatch { .. }
+            | Control::Published { .. }
+            | Control::Subscribed { .. }
+            | Control::Subscribers { .. }
+            | Control::Announce { .. }
+            | Control::Ended { .. }
+            | Control::Refused { .. }
+            | Control::Waiting { .. }
+            | Control::GoAway { .. } => {}
+        }
+    }
+    for forward in forwards() {
+        match forward {
+            Forward::Announce { .. }
+            | Forward::Subscribe { .. }
+            | Forward::Unsubscribe { .. }
+            | Forward::Forwarded { .. }
+            | Forward::Ended { .. }
+            | Forward::Refused { .. }
+            | Forward::Count { .. }
+            | Forward::Resynced => {}
+        }
+    }
+}
+
+#[test]
 fn every_message_round_trips() {
     for control in controls() {
         assert_eq!(
