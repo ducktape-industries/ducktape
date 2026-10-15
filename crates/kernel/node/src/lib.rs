@@ -62,22 +62,28 @@ pub enum Source {
     Peer,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preconfirm {
+    Off,
+    On,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Taken {
-    New(Receipt),
-    Held(Receipt),
+    New(Option<Receipt>),
+    Held(Option<Receipt>),
 }
 
 impl Taken {
-    pub fn receipt(&self) -> &Receipt {
+    pub fn prediction(&self) -> Option<&Receipt> {
         match self {
-            Taken::New(receipt) | Taken::Held(receipt) => receipt,
+            Taken::New(prediction) | Taken::Held(prediction) => prediction.as_ref(),
         }
     }
 
-    pub fn into_receipt(self) -> Receipt {
+    pub fn into_prediction(self) -> Option<Receipt> {
         match self {
-            Taken::New(receipt) | Taken::Held(receipt) => receipt,
+            Taken::New(prediction) | Taken::Held(prediction) => prediction,
         }
     }
 }
@@ -223,6 +229,7 @@ where
         &mut self,
         frame: Vec<u8>,
         source: Source,
+        preconfirm: Preconfirm,
     ) -> Result<std::result::Result<Taken, Refusal>> {
         if !Block::carries(&frame) {
             let sentence = format!(
@@ -246,9 +253,10 @@ where
         if let Err(refusal) = self.host.fresh(&submission)? {
             return Ok(Err(refusal));
         }
-        let time = self.now();
-        let mut predicted = self.host.preconfirm(time, vec![submission.clone()]).await?;
-        let prediction = predicted.pop().expect("one submission yields one receipt");
+        let prediction = match preconfirm {
+            Preconfirm::Off => None,
+            Preconfirm::On => Some(self.preconfirm(submission.clone()).await?),
+        };
         let offered = match source {
             Source::Client => Some(self.host.tip()?.height),
             Source::Peer => None,
@@ -305,6 +313,12 @@ where
         Ok(Sequenced::Applied { applied, carried })
     }
 
+    async fn preconfirm(&mut self, submission: Submission) -> Result<Receipt> {
+        let time = self.now();
+        let mut predicted = self.host.preconfirm(time, vec![submission]).await?;
+        Ok(predicted.pop().expect("one submission yields one receipt"))
+    }
+
     fn settle(&mut self, carried: &[SubmissionId], applied: Tip) {
         let mut pending = self.locked();
         pending.pool.settle(carried, applied.height + 1);
@@ -312,13 +326,17 @@ where
     }
 
     async fn replay(&mut self) -> Result<()> {
-        let time = self.now();
         let (ids, submissions): (Vec<SubmissionId>, Vec<Submission>) = self
             .locked()
             .pool
             .order()
+            .filter(|held| held.preconfirmed())
             .map(|held| (held.id, held.submission.clone()))
             .unzip();
+        if submissions.is_empty() {
+            return Ok(());
+        }
+        let time = self.now();
         let predicted = self.host.preconfirm(time, submissions).await?;
         let mut pending = self.locked();
         for (id, receipt) in ids.iter().zip(predicted) {

@@ -18,7 +18,7 @@ use fixture_probe::Step;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
-use node::{Block, Frame, Node, Proposer, Sequenced, Source};
+use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source};
 
 mod epochs;
 
@@ -438,11 +438,13 @@ impl Peer {
             .node
             .lock()
             .await
-            .submit(frame, Source::Client)
+            .submit(frame, Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap();
-        let receipt = taken.receipt();
+        let receipt = taken
+            .prediction()
+            .expect("a preconfirmed frame is predicted");
         assert!(
             matches!(receipt.outcome, abi::Outcome::Applied { .. }),
             "{receipt:?}"
@@ -484,7 +486,10 @@ impl Pump {
                 applied: outcome, ..
             } = node.apply(&block).await.unwrap()
             {
-                self.roots.lock().unwrap().insert(block.height, outcome.root);
+                self.roots
+                    .lock()
+                    .unwrap()
+                    .insert(block.height, outcome.root);
                 self.carried
                     .lock()
                     .unwrap()

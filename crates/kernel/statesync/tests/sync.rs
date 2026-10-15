@@ -335,14 +335,14 @@ impl Network {
         let mut node = self.source.node.lock().await;
         for frame in frames {
             let taken = node
-                .submit(frame, node::Source::Client)
+                .submit(frame, node::Source::Client, node::Preconfirm::On)
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(
-                taken.receipt().outcome,
-                abi::Outcome::Applied { .. }
-            ));
+            let prediction = taken
+                .prediction()
+                .expect("a preconfirmed frame is predicted");
+            assert!(matches!(prediction.outcome, abi::Outcome::Applied { .. }));
         }
         let tip = seal(&mut node).await.tip();
         drop(node);
@@ -458,7 +458,11 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
 
         let mut source = network.source.node.lock().await;
         source
-            .submit(frame(&alice, vec![set(b"c", b"3")]), node::Source::Client)
+            .submit(
+                frame(&alice, vec![set(b"c", b"3")]),
+                node::Source::Client,
+                node::Preconfirm::Off,
+            )
             .await
             .unwrap()
             .unwrap();

@@ -23,7 +23,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use halo::{Halo, Seat};
 use host::Layer;
-use node::{Block, Frame, Node, Proposer, Sequenced, Source, Taken};
+use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source, Taken};
 use tokio::sync::watch;
 
 use crate::endpoint::Endpoint;
@@ -549,7 +549,10 @@ async fn receipts_for<E: Context>(
             abi::encode(&blob::contract::Op::Receipt { bundle }),
         )
         .encode();
-        match node.submit(receipt.clone(), Source::Client).await? {
+        match node
+            .submit(receipt.clone(), Source::Client, Preconfirm::Off)
+            .await?
+        {
             Ok(Taken::New(_)) => taken.push(receipt),
             Ok(Taken::Held(_)) => {}
             Err(refusal) => tracing::debug!(
