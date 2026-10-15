@@ -9,7 +9,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::Semaphore;
+use tokio::sync::futures::Notified;
+use tokio::sync::{Notify, Semaphore};
 
 use abi::live::{self, Grant};
 use abi::{Origin, role::identity};
@@ -124,6 +125,9 @@ pub struct Grants {
     chain: Arc<dyn Chain>,
     generation: AtomicU64,
     identity: AtomicU64,
+    /// Woken on every move of the identity table: a handshake held for a key with no account
+    /// yet reads it again.
+    identities: Notify,
     reads: Semaphore,
 }
 
@@ -133,6 +137,7 @@ impl Grants {
             chain,
             generation: AtomicU64::new(0),
             identity: AtomicU64::new(0),
+            identities: Notify::new(),
             reads: Semaphore::new(READS_IN_FLIGHT),
         }
     }
@@ -175,6 +180,13 @@ impl Grants {
 
     pub fn identity_moved(&self) {
         self.identity.fetch_add(1, Ordering::AcqRel);
+        self.identities.notify_waiters();
+    }
+
+    /// The next move of the identity table; armed (`enable`) before a read, it sees a move
+    /// between the read and the wait.
+    pub fn identity_moves(&self) -> Notified<'_> {
+        self.identities.notified()
     }
 }
 

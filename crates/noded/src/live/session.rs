@@ -11,8 +11,8 @@ use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Pacer};
 use live_wire::{
-    Alias, CONTROL_BYTES, Control, DatagramHeader, GroupHeader, MAX_STREAM_OBJECT, Priority,
-    WS_MESSAGE, WsFrame,
+    Alias, CONTROL_BYTES, Control, DatagramHeader, Ending, GroupHeader, MAX_STREAM_OBJECT,
+    Priority, WS_MESSAGE, WsFrame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, mpsc, watch};
@@ -715,12 +715,17 @@ fn ws_arrived(bytes: Bytes, counting: &mut HashMap<(Alias, u64), u32>) -> Vec<In
                     body: body.into(),
                 });
             }
-            if end {
+            let complete = match end {
+                Ending::More => None,
+                Ending::Complete => Some(true),
+                Ending::Cut => Some(false),
+            };
+            if let Some(complete) = complete {
                 counting.remove(&key);
                 events.push(Inbound::GroupEnd {
                     alias: header.alias,
                     group: header.group,
-                    complete: true,
+                    complete,
                 });
             }
             events
@@ -738,8 +743,8 @@ const WS_GROUP_FRAME: usize = 1 + GroupHeader::LEN + 4 + 1;
 
 /// A replayed group as websocket frames, each within `WS_MESSAGE` encoded (an object costs its
 /// bytes and a 4-byte length), so one big group does not hold the socket from control; the last
-/// frame ends the group when the cache holds it closed and complete, and a still-open group's
-/// live objects follow in later frames. A complete group with no objects is one ending frame.
+/// frame ends the group as the cache holds it, complete or cut, and a still-open group's live
+/// objects follow in later frames. A closed group with no objects is one ending frame.
 fn ws_group_frames(header: GroupHeader, objects: &[Bytes], end: Option<bool>) -> Vec<WsFrame> {
     let mut frames: Vec<WsFrame> = Vec::new();
     let mut slice: Vec<Vec<u8>> = Vec::new();
@@ -750,19 +755,23 @@ fn ws_group_frames(header: GroupHeader, objects: &[Bytes], end: Option<bool>) ->
             frames.push(WsFrame::Group {
                 header,
                 objects: std::mem::take(&mut slice),
-                end: false,
+                end: Ending::More,
             });
             bytes = WS_GROUP_FRAME;
         }
         bytes += costs;
         slice.push(body.to_vec());
     }
-    let complete = end == Some(true);
-    if !slice.is_empty() || complete {
+    let ending = match end {
+        None => Ending::More,
+        Some(true) => Ending::Complete,
+        Some(false) => Ending::Cut,
+    };
+    if !slice.is_empty() || end.is_some() {
         frames.push(WsFrame::Group {
             header,
             objects: slice,
-            end: complete,
+            end: ending,
         });
     }
     frames
@@ -775,7 +784,7 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
             Drained::Out(Out::Object { header, body, .. }) => vec![WsFrame::Group {
                 header,
                 objects: vec![body.to_vec()],
-                end: false,
+                end: Ending::More,
             }],
             Drained::Out(Out::Group {
                 header,
@@ -783,21 +792,21 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
                 end,
                 ..
             }) => ws_group_frames(header, &objects, end),
-            // The frame has no word for an abandoned group: a subscriber sees the next group
-            // start instead.
+            // The session's queue is ordered and closes the session when it overflows, so no
+            // group reaches here with a hole: a group ends complete or cut as the relay said.
             Drained::Out(Out::GroupEnd {
                 alias,
                 group,
-                complete: true,
+                complete,
                 ..
             }) => vec![WsFrame::Group {
                 header: GroupHeader { alias, group },
                 objects: Vec::new(),
-                end: true,
+                end: match complete {
+                    true => Ending::Complete,
+                    false => Ending::Cut,
+                },
             }],
-            Drained::Out(Out::GroupEnd {
-                complete: false, ..
-            }) => Vec::new(),
             Drained::Out(Out::Datagram { .. }) => Vec::new(),
             Drained::Datagrams(datagrams) => datagrams
                 .into_iter()
@@ -871,7 +880,7 @@ mod tests {
             abi::encode(&WsFrame::Group {
                 header,
                 objects: vec![vec![1], vec![2]],
-                end: false,
+                end: Ending::More,
             })
             .into(),
             &mut counting,
@@ -880,7 +889,7 @@ mod tests {
             abi::encode(&WsFrame::Group {
                 header,
                 objects: vec![vec![3]],
-                end: true,
+                end: Ending::Complete,
             })
             .into(),
             &mut counting,
@@ -916,7 +925,7 @@ mod tests {
         let group = WsFrame::Group {
             header,
             objects: vec![vec![0; MAX_STREAM_OBJECT + 1]],
-            end: true,
+            end: Ending::Complete,
         };
         assert!(matches!(
             ws_arrived(abi::encode(&group).into(), &mut counting).as_slice(),
@@ -941,7 +950,7 @@ mod tests {
             vec![WsFrame::Group {
                 header,
                 objects: vec![b"a".to_vec(), b"bc".to_vec()],
-                end: true
+                end: Ending::Complete
             }]
         );
         assert_eq!(
@@ -949,7 +958,7 @@ mod tests {
             vec![WsFrame::Group {
                 header,
                 objects: Vec::new(),
-                end: true
+                end: Ending::Complete
             }]
         );
         assert!(ws_group_frames(header, &[], None).is_empty());
@@ -961,16 +970,23 @@ mod tests {
         let big = Bytes::from(vec![0; MAX_STREAM_OBJECT]);
         let objects = [big.clone(), Bytes::from_static(b"x"), big.clone()];
         let frames = ws_group_frames(header, &objects, Some(true));
-        let ends: Vec<bool> = frames
-            .iter()
-            .map(|frame| match frame {
-                WsFrame::Group { end, .. } => *end,
-                WsFrame::Control(_) | WsFrame::Datagram { .. } => unreachable!(),
-            })
-            .collect();
+        let ends = |frames: &[WsFrame]| -> Vec<Ending> {
+            frames
+                .iter()
+                .map(|frame| match frame {
+                    WsFrame::Group { end, .. } => *end,
+                    WsFrame::Control(_) | WsFrame::Datagram { .. } => unreachable!(),
+                })
+                .collect()
+        };
         // The one-byte object rides with the first big one (both fit the message); the second
         // big one does not, so it is the frame that ends the group.
-        assert_eq!(ends, vec![false, true]);
+        assert_eq!(ends(&frames), vec![Ending::More, Ending::Complete]);
+        // A cached group abandoned replays cut, in the frame: nothing is left to infer.
+        assert_eq!(
+            ends(&ws_group_frames(header, &objects, Some(false))),
+            vec![Ending::More, Ending::Cut]
+        );
         for frame in &frames {
             assert!(
                 abi::encode(frame).len() <= WS_MESSAGE,
@@ -981,8 +997,34 @@ mod tests {
         assert_eq!(open.len(), 2);
         assert!(matches!(
             open.last(),
-            Some(WsFrame::Group { end: false, .. })
+            Some(WsFrame::Group {
+                end: Ending::More,
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn a_cut_frame_from_a_publisher_ends_its_group_short() {
+        let mut counting = HashMap::new();
+        let header = GroupHeader { alias: 1, group: 2 };
+        let cut = WsFrame::Group {
+            header,
+            objects: vec![b"a".to_vec()],
+            end: Ending::Cut,
+        };
+        let events = ws_arrived(abi::encode(&cut).into(), &mut counting);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Inbound::Object { object: 0, .. },
+                Inbound::GroupEnd {
+                    complete: false,
+                    ..
+                }
+            ]
+        ));
+        assert!(counting.is_empty(), "the group is over: its count is gone");
     }
 
     #[test]

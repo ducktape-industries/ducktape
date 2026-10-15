@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use live_wire::{
-    Challenge, Code, Control, DatagramHeader, End, Forward, GroupHeader, Hello, KeyScheme,
+    Challenge, Code, Control, DatagramHeader, End, Ending, Forward, GroupHeader, Hello, KeyScheme,
     LaneMeta, Mode, Proof, Start, Track, Welcome, WsFrame, proof_preimage,
 };
 
@@ -130,10 +130,6 @@ fn controls() -> Vec<Control> {
         },
         Control::Refused {
             request: 0,
-            code: Code::NoAccount,
-        },
-        Control::Refused {
-            request: 0,
             code: Code::BadProof,
         },
         Control::Refused {
@@ -223,7 +219,17 @@ fn every_message_keeps_its_bytes() {
             WsFrame::Group {
                 header,
                 objects: vec![vec![1, 2, 3], vec![]],
-                end: true,
+                end: Ending::More,
+            },
+            WsFrame::Group {
+                header,
+                objects: vec![vec![6]],
+                end: Ending::Complete,
+            },
+            WsFrame::Group {
+                header,
+                objects: vec![],
+                end: Ending::Cut,
             },
             WsFrame::Datagram {
                 header: datagram,
@@ -319,7 +325,6 @@ fn every_message_round_trips() {
 #[test]
 fn every_code_has_a_word_of_its_own() {
     let codes = [
-        Code::NoAccount,
         Code::BadProof,
         Code::NotGranted,
         Code::Unknown,

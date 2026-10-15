@@ -18,9 +18,9 @@ use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _, tokio as ru
 use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Halo, Lane, Seat};
 use live_wire::{
-    ALPN, Account, Challenge, Code, Control, DatagramHeader, End, GroupHeader, Hello, KeyScheme,
-    LANE, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, WS_MESSAGE, Welcome,
-    WsFrame, proof_preimage,
+    ALPN, Account, Challenge, Code, Control, DatagramHeader, End, Ending, GroupHeader, Hello,
+    KeyScheme, LANE, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, WS_MESSAGE,
+    Welcome, WsFrame, proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{oneshot, watch};
@@ -545,17 +545,6 @@ fn a_seated_key_is_welcomed_as_its_account_and_a_bad_proof_or_an_unseated_key_is
             }
         );
 
-        let mut unseated = Client::dial(&node).await;
-        assert_eq!(
-            unseated
-                .handshake(&stranger, GENESIS, &node.key, &stranger)
-                .await,
-            Control::Refused {
-                request: 0,
-                code: Code::NoAccount
-            }
-        );
-
         let mut elsewhere = Client::dial(&node).await;
         assert_eq!(
             elsewhere
@@ -834,7 +823,7 @@ fn the_same_session_runs_over_the_websocket_door_without_datagrams() {
             .send(WsFrame::Group {
                 header,
                 objects: vec![b"a".to_vec(), b"b".to_vec()],
-                end: true,
+                end: Ending::Complete,
             })
             .await;
         let mut objects = Vec::new();
@@ -847,7 +836,7 @@ fn the_same_session_runs_over_the_websocket_door_without_datagrams() {
                 } => {
                     assert_eq!(seen.group, header.group);
                     objects.extend(more);
-                    if end {
+                    if end == Ending::Complete {
                         break;
                     }
                 }
@@ -855,6 +844,34 @@ fn the_same_session_runs_over_the_websocket_door_without_datagrams() {
             }
         }
         assert_eq!(objects, vec![b"a".to_vec(), b"b".to_vec()]);
+        // A group alice cuts reaches bob cut, in the frame: nothing for him to infer.
+        let cut = GroupHeader { alias, group: 4 };
+        alice
+            .send(WsFrame::Group {
+                header: cut,
+                objects: vec![b"c".to_vec()],
+                end: Ending::Cut,
+            })
+            .await;
+        let mut objects = Vec::new();
+        let ending = loop {
+            match bob.recv().await {
+                WsFrame::Group {
+                    header: seen,
+                    objects: more,
+                    end,
+                } => {
+                    assert_eq!(seen.group, cut.group);
+                    objects.extend(more);
+                    match end {
+                        Ending::More => {}
+                        Ending::Complete | Ending::Cut => break end,
+                    }
+                }
+                other => panic!("a group slice: {other:?}"),
+            }
+        };
+        assert_eq!((objects, ending), (vec![b"c".to_vec()], Ending::Cut));
     });
 }
 
@@ -1353,6 +1370,40 @@ fn a_session_closed_by_a_recheck_leaves_the_table_without_the_client_saying_anyt
                 reason: "no_account".into(),
             }),
             "alice's connection is closed under her, saying why"
+        );
+    });
+}
+
+#[test]
+fn a_key_with_no_account_yet_is_held_at_the_handshake_until_a_block_gives_it_one() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let stranger = PrivateKey::from_seed(12);
+        let node = node(context, 1, ledger.clone());
+
+        // The account read parks on `None`; while it parks the key is given an account, so the
+        // handshake's first read is `None` for sure, and the block that follows welcomes it.
+        let (read, answer) = ledger.park_account();
+        let mut client = Client::dial(&node).await;
+        let handshake = async {
+            client
+                .handshake(&stranger, GENESIS, &node.key, &stranger)
+                .await
+        };
+        let block = async {
+            read.await.unwrap();
+            answer.send(()).unwrap();
+            ledger.holds(&stranger, 77);
+            node.relay.invalidate(&wrote_identity());
+        };
+        let (welcomed, ()) = tokio::join!(handshake, block);
+        assert_eq!(
+            welcomed,
+            Control::Welcome(Welcome {
+                account: 77,
+                datagrams: true
+            }),
+            "held, not refused: the block that seats the key welcomes it"
         );
     });
 }

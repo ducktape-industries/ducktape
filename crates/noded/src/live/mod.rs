@@ -484,13 +484,24 @@ async fn handshake<E: crate::Context>(relay: &Relay<E>, link: &mut Link) -> Hand
     if !proven {
         return Handshake::Refused(Code::BadProof);
     }
-    // Read the generation before the account, so a block that moves the identity table during
-    // or after the read is seen as a move once the session is registered.
-    let generation = relay.grants.identity_generation();
-    let Some(account) = relay.grants.account(&hello.key).await else {
-        return Handshake::Refused(Code::NoAccount);
-    };
-    Handshake::Welcomed(account, hello.key, generation)
+    // A key that holds no account yet is not yet: the handshake is held, and the block that
+    // gives the key an account welcomes it. The wait is armed before the read, so a move between
+    // the read and the wait is seen; the generation is read before the account, so a block that
+    // moves the identity table during or after the read is seen once the session is registered.
+    // A client that speaks, or goes, while held is let go.
+    loop {
+        let moved = relay.grants.identity_moves();
+        tokio::pin!(moved);
+        moved.as_mut().enable();
+        let generation = relay.grants.identity_generation();
+        if let Some(account) = relay.grants.account(&hello.key).await {
+            return Handshake::Welcomed(account, hello.key, generation);
+        }
+        tokio::select! {
+            () = &mut moved => {}
+            _ = link.inbound.recv() => return Handshake::Gone,
+        }
+    }
 }
 
 /// What a session's loop does once a step is taken.

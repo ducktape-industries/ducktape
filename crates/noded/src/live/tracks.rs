@@ -694,12 +694,7 @@ impl State {
         let mut effects = Vec::new();
         match code {
             Code::NotGranted => self.wait(id, request, ask, &mut effects),
-            Code::NoAccount
-            | Code::BadProof
-            | Code::Unknown
-            | Code::Duplicate
-            | Code::TooLarge
-            | Code::Malformed => {
+            Code::BadProof | Code::Unknown | Code::Duplicate | Code::TooLarge | Code::Malformed => {
                 self.unwait(id, request, &ask);
                 self.refuse(id, request, code, &mut effects);
             }
@@ -1352,12 +1347,9 @@ impl State {
     ) -> Vec<Effect> {
         let reason = match code {
             Code::NotGranted => End::GrantRevoked,
-            Code::NoAccount
-            | Code::BadProof
-            | Code::Unknown
-            | Code::Duplicate
-            | Code::TooLarge
-            | Code::Malformed => End::PublisherGone,
+            Code::BadProof | Code::Unknown | Code::Duplicate | Code::TooLarge | Code::Malformed => {
+                End::PublisherGone
+            }
         };
         self.node_ended(peer, request, reason)
     }

@@ -212,8 +212,6 @@ pub enum End {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Code {
-    /// The key acts as no account on this chain.
-    NoAccount,
     BadProof,
     /// The program wrote no grant that covers this account, room and track.
     NotGranted,
@@ -230,7 +228,6 @@ impl Code {
     /// The refusal word a view reads.
     pub fn as_str(self) -> &'static str {
         match self {
-            Code::NoAccount => "no_account",
             Code::BadProof => "bad_proof",
             Code::NotGranted => "not_granted",
             Code::Unknown => "unknown_track",
@@ -273,18 +270,29 @@ impl DatagramHeader {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum WsFrame {
     Control(Control),
-    /// A whole stream-mode group or a slice of it; `end` marks the group complete. A group is
-    /// delivered in slices of at most [`MAX_STREAM_OBJECT`] so one big group does not starve
-    /// control.
+    /// A whole stream-mode group or a slice of it; `end` says how the group stands after this
+    /// slice. A group is delivered in slices of at most [`MAX_STREAM_OBJECT`] so one big group
+    /// does not starve control.
     Group {
         header: GroupHeader,
         objects: Vec<Vec<u8>>,
-        end: bool,
+        end: Ending,
     },
     Datagram {
         header: DatagramHeader,
         payload: Vec<u8>,
     },
+}
+
+/// How a group stands after a websocket slice of it: more follows; it is complete; or it is
+/// cut, by its publisher or on the way, and nothing more of it comes. What a QUIC group stream
+/// says with its FIN, [`GROUP_COMPLETE`] or reset, said in the frame, so a subscriber never
+/// infers a cut from the next group starting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Ending {
+    More,
+    Complete,
+    Cut,
 }
 
 /// The name of halo's lane between nodes, for both streams and datagrams, as the halo role's
