@@ -886,8 +886,11 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         let alice = key(11);
-        // 256 keys: probe's log takes four fetches at the least
-        let frames = (0..4)
+        let tuning = state::Tuning::default();
+        let section = tuning.items_per_section.get() as usize;
+        let fetch = tuning.sync_fetch_batch.get() as usize;
+        let serves = 1 + 2 * section / fetch + 1;
+        let frames = (0..4 * section / 64)
             .map(|n| {
                 let steps = (0..64)
                     .map(|i| set(format!("{n}-{i}").as_bytes(), b"1"))
@@ -908,11 +911,8 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
         .await
         .unwrap();
         let whole = whole.load(Ordering::SeqCst);
-        assert!(whole >= 4, "a whole sync of probe asks {whole} times");
+        assert!(whole > serves, "a whole sync of probe asks {whole} times");
 
-        // the boundary, then three fetches of 64: a sync keeps its log a
-        // 64-op section at a time, sealed once the next one starts, so two
-        // whole sections are kept when the fifth request is refused
         let dir = tempfile::tempdir().unwrap();
         let refused = Arc::new(AtomicUsize::new(0));
         let error = join(
@@ -920,11 +920,11 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
-            network.counting(&refused, 4),
+            network.counting(&refused, serves),
         )
         .await
         .err()
-        .expect("probe's fifth request is refused");
+        .expect("a request past the second whole section is refused");
         assert!(
             matches!(error, Error::State(state::Error::Sync(_))),
             "{error}"
