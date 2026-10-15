@@ -774,27 +774,12 @@ impl<T, E: std::fmt::Display> Sentence<T> for Result<T, E> {
     }
 }
 
-/// Every role and the program bound to it, `role program`, in `Roles` order. The pattern names
-/// every field, so a role added to `Roles` fails the build here until it is printed.
+/// Every role and the program bound to it, `role program`, in `Roles` order.
 fn roles(roles: &abi::Roles) -> String {
-    let abi::Roles {
-        programs,
-        validators,
-        identity,
-        blobs,
-        awaits,
-        halo,
-    } = roles;
-    [
-        ("programs", programs),
-        ("validators", validators),
-        ("identity", identity),
-        ("blobs", blobs),
-        ("awaits", awaits),
-        ("halo", halo),
-    ]
-    .map(|(role, program)| format!("{role} {program}"))
-    .join(", ")
+    roles
+        .named()
+        .map(|(role, program)| format!("{role} {program}"))
+        .join(", ")
 }
 
 #[cfg(test)]

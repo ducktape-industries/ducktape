@@ -12,10 +12,10 @@ use commonware_runtime::telemetry::metrics::{Counter, Gauge};
 use live_wire::{
     Account, Alias, Code, Control, DatagramHeader, End, Forward, GroupHeader, MAX_DATAGRAM_OBJECT,
     MAX_GROUP_BYTES, MAX_NAMESPACE, MAX_STREAM_OBJECT, Mode, Priority, RequestId, Start, Track,
-    pattern_covers, well_named,
+    well_named,
 };
 
-use abi::live::Grant;
+use abi::live::{Grant, pattern_covers};
 
 use super::grants::{Act, covered, watch_patterns};
 use super::session::{Out, Outlet};

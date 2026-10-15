@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use abi::live::{self, Grant};
 use abi::{Origin, role::identity};
 use host::Layer;
-use live_wire::{Account, for_account, pattern_covers};
+use live_wire::Account;
 
 use crate::Shared;
 
@@ -108,14 +108,11 @@ pub fn place(namespace: &str) -> Option<Place<'_>> {
 /// Whether the grant lets `account` `act` on the track `name`, each pattern read as it reads
 /// for that account (`{account}` its number).
 pub fn covered(grant: &Grant, act: Act, name: &str, account: Account) -> bool {
-    let patterns = match act {
-        Act::Publish => &grant.publish,
-        Act::Subscribe => &grant.subscribe,
-        Act::Watch => return !grant.subscribe.is_empty(),
-    };
-    patterns
-        .iter()
-        .any(|pattern| pattern_covers(&for_account(pattern, account), name))
+    match act {
+        Act::Publish => grant.publishes(name, account),
+        Act::Subscribe => grant.subscribes(name, account),
+        Act::Watch => !grant.subscribe.is_empty(),
+    }
 }
 
 /// The subscribe patterns `account` hears a room's announces through, as they read for it,
@@ -127,7 +124,7 @@ pub fn watch_patterns(grant: Option<&Grant>, account: Account) -> Option<Vec<Str
         grant
             .subscribe
             .iter()
-            .map(|pattern| for_account(pattern, account))
+            .map(|pattern| live::for_account(pattern, account))
             .collect()
     })
 }

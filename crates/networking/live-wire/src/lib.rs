@@ -340,30 +340,6 @@ pub fn well_named(name: &str) -> bool {
     fits && segments_hold
 }
 
-/// What a grant pattern says for the account that asks: [`ACCOUNT`] in it is the account's
-/// number in decimal, so one row binds each name to its own account (`echo/{account}`).
-pub const ACCOUNT: &str = "{account}";
-
-/// `pattern` as it reads for `account`: each [`ACCOUNT`] written as its number.
-pub fn for_account(pattern: &str, account: Account) -> String {
-    pattern.replace(ACCOUNT, &account.to_string())
-}
-
-/// A grant pattern, as it reads for the account that asks ([`for_account`]), against a track
-/// name: `*` matches every name, `<prefix>/*` every name under the prefix, anything else
-/// exactly.
-pub fn pattern_covers(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    match pattern.strip_suffix("/*") {
-        Some(prefix) => name
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/')),
-        None => pattern == name,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,33 +355,6 @@ mod tests {
         assert!(!well_named("a/../b"));
         assert!(!well_named(&"x".repeat(MAX_TRACK_NAME + 1)));
         assert!(well_named(&"x".repeat(MAX_TRACK_NAME)));
-    }
-
-    #[test]
-    fn a_pattern_is_everything_a_prefix_or_one_name() {
-        assert!(pattern_covers("*", "anything/at/all"));
-        assert!(pattern_covers("presence/*", "presence/42"));
-        assert!(pattern_covers("presence/*", "presence/a/b"));
-        assert!(!pattern_covers("presence/*", "presence"));
-        assert!(!pattern_covers("presence/*", "presencex/42"));
-        assert!(pattern_covers("doc", "doc"));
-        assert!(!pattern_covers("doc", "doc/1"));
-    }
-
-    #[test]
-    fn an_account_pattern_is_the_asking_accounts_own() {
-        let mine = for_account("echo/{account}", 42);
-        assert_eq!(mine, "echo/42");
-        assert!(pattern_covers(&mine, "echo/42"));
-        assert!(!pattern_covers(&mine, "echo/43"));
-        let under = for_account("ask/{account}/*", 42);
-        assert!(pattern_covers(&under, "ask/42/7/0b"));
-        assert!(!pattern_covers(&under, "ask/43/42/0b"));
-        assert!(!pattern_covers(
-            &for_account("ask/{account}/*", 4),
-            "ask/42/7"
-        ));
-        assert_eq!(for_account("doc", 42), "doc");
     }
 
     #[test]

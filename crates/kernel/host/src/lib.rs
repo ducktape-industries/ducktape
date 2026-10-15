@@ -305,14 +305,7 @@ where
             })
             .collect();
         let roles = &genesis.roles;
-        for (role, program) in [
-            ("programs", &roles.programs),
-            ("validators", &roles.validators),
-            ("identity", &roles.identity),
-            ("blobs", &roles.blobs),
-            ("awaits", &roles.awaits),
-            ("halo", &roles.halo),
-        ] {
+        for (role, program) in roles.named() {
             let founded = entries.iter().any(|entry| entry.program == *program);
             if !founded {
                 return Err(Error::Unbound {
