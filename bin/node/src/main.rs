@@ -1,5 +1,6 @@
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use abi::role::validators::{Grant, Invite, Motion, Op, Voted};
@@ -12,7 +13,7 @@ use futures::StreamExt as _;
 use host::Layer;
 use node::{Frame, Preconfirm};
 use noded::wire::{Admin, Submitted};
-use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Upload, Workspace};
+use noded::{Client, Endpoint, HaloConfig, Listen, LoadConfig, Logs, Upload, Workspace};
 
 #[derive(Parser)]
 #[command(name = "ducktape", about = "a ducktape node and its client", version)]
@@ -96,6 +97,56 @@ enum Verb {
                     when absent"
         )]
         halo_egress: Option<u64>,
+        #[arg(
+            long,
+            value_parser = permits,
+            default_value_t = HaloConfig::default().inbound_streams,
+            help = "the streams members open to this node that wait for it to take them; past it \
+                    the node takes no more until one is taken"
+        )]
+        halo_inbound_streams: NonZeroUsize,
+        #[arg(
+            long,
+            value_parser = permits,
+            default_value_t = HaloConfig::default().datagrams,
+            help = "the datagrams from members that wait for this node to read them; past it a \
+                    datagram is dropped"
+        )]
+        halo_datagrams: NonZeroUsize,
+        #[arg(
+            long,
+            value_parser = permits,
+            default_value_t = LoadConfig::default().reads_in_flight,
+            help = "the HTTP reads this node serves at once; the rest wait their turn"
+        )]
+        reads_in_flight: NonZeroUsize,
+        #[arg(
+            long,
+            value_parser = permits,
+            default_value_t = LoadConfig::default().uploads_in_flight,
+            help = "the uploads (submit, blob put) this node takes at once; the rest wait their turn"
+        )]
+        uploads_in_flight: NonZeroUsize,
+        #[arg(
+            long,
+            value_parser = permits,
+            default_value_t = LoadConfig::default().blob_serves_in_flight,
+            help = "the blobs this node sends to members at once"
+        )]
+        blob_serves_in_flight: NonZeroUsize,
+        #[arg(
+            long,
+            value_parser = permits,
+            default_value_t = LoadConfig::default().blob_backlog,
+            help = "the members' blob requests that wait for a send; past it a request is refused"
+        )]
+        blob_backlog: NonZeroUsize,
+        #[arg(
+            long,
+            default_value_t = LoadConfig::default().blob_gatherers,
+            help = "the blobs this node gathers from members at once"
+        )]
+        blob_gatherers: NonZeroUsize,
         #[arg(long, default_value = "info")]
         log: String,
     },
@@ -281,6 +332,13 @@ fn execute(cli: Cli) -> Result<(), String> {
             tls,
             halo,
             halo_egress,
+            halo_inbound_streams,
+            halo_datagrams,
+            reads_in_flight,
+            uploads_in_flight,
+            blob_serves_in_flight,
+            blob_backlog,
+            blob_gatherers,
             log,
         } => node_runtime(&workspace).start(|context| async move {
             let logs = Logs::install(&log)?;
@@ -292,8 +350,17 @@ fn execute(cli: Cli) -> Result<(), String> {
             };
             let halo = HaloConfig {
                 egress_bytes_per_sec: halo_egress,
+                inbound_streams: halo_inbound_streams,
+                datagrams: halo_datagrams,
             };
-            let running = noded::run(context, &workspace, logs, listen, halo)
+            let load = LoadConfig {
+                reads_in_flight,
+                uploads_in_flight,
+                blob_backlog,
+                blob_serves_in_flight,
+                blob_gatherers,
+            };
+            let running = noded::run(context, &workspace, logs, listen, halo, load)
                 .await
                 .sentence()?;
             println!("http {}", running.http);
@@ -650,6 +717,18 @@ fn registered_halo(text: &str) -> Result<String, String> {
     Ok(text.to_owned())
 }
 
+fn permits(text: &str) -> Result<NonZeroUsize, String> {
+    let count: NonZeroUsize = text.parse().sentence()?;
+    let most = tokio::sync::Semaphore::MAX_PERMITS;
+    let held = count.get() <= most;
+    if !held {
+        return Err(format!(
+            "{count} is past the {most} a tokio semaphore holds"
+        ));
+    }
+    Ok(count)
+}
+
 fn decode_invite(text: &str) -> Result<Invite, String> {
     let bytes = hex::decode(text).sentence()?;
     abi::decode(&bytes).map_err(|refusal| refusal.sentence)
@@ -794,6 +873,8 @@ impl<T, E: std::fmt::Display> Sentence<T> for Result<T, E> {
 mod tests {
     use clap::Parser as _;
 
+    use noded::{HaloConfig, LoadConfig};
+
     use super::{Cli, Verb};
 
     #[test]
@@ -839,5 +920,85 @@ mod tests {
             panic!("run parses");
         };
         assert_eq!(halo, "0.0.0.0:9100".parse().unwrap());
+    }
+
+    fn run(load: &[&str]) -> Result<Cli, clap::Error> {
+        let args = [
+            "ducktape",
+            "run",
+            "--listen",
+            "127.0.0.1:9000",
+            "--halo",
+            "0.0.0.0:9100",
+        ];
+        Cli::try_parse_from(args.into_iter().chain(load.iter().copied()))
+    }
+
+    #[test]
+    fn run_takes_the_default_load_unless_the_operator_names_one_and_refuses_zero() {
+        let Verb::Run {
+            reads_in_flight,
+            uploads_in_flight,
+            blob_serves_in_flight,
+            blob_backlog,
+            blob_gatherers,
+            ..
+        } = run(&[]).unwrap().verb
+        else {
+            panic!("run parses");
+        };
+        let named = LoadConfig {
+            reads_in_flight,
+            uploads_in_flight,
+            blob_backlog,
+            blob_serves_in_flight,
+            blob_gatherers,
+        };
+        assert_eq!(named, LoadConfig::default());
+        let Verb::Run {
+            uploads_in_flight, ..
+        } = run(&["--uploads-in-flight", "1"]).unwrap().verb
+        else {
+            panic!("run parses");
+        };
+        assert_eq!(uploads_in_flight.get(), 1);
+        for flag in [
+            "--reads-in-flight",
+            "--uploads-in-flight",
+            "--blob-serves-in-flight",
+            "--blob-backlog",
+            "--blob-gatherers",
+        ] {
+            assert!(run(&[flag, "0"]).is_err(), "{flag}");
+        }
+    }
+
+    #[test]
+    fn run_takes_the_default_halo_queues_unless_named_and_refuses_zero_or_past_tokio() {
+        let halo = |flags: &[&str]| {
+            let Verb::Run {
+                halo_egress,
+                halo_inbound_streams,
+                halo_datagrams,
+                ..
+            } = run(flags).unwrap().verb
+            else {
+                panic!("run parses");
+            };
+            HaloConfig {
+                egress_bytes_per_sec: halo_egress,
+                inbound_streams: halo_inbound_streams,
+                datagrams: halo_datagrams,
+            }
+        };
+        assert_eq!(halo(&[]), HaloConfig::default());
+        let named = halo(&["--halo-inbound-streams", "3", "--halo-datagrams", "5"]);
+        assert_eq!(named.inbound_streams.get(), 3);
+        assert_eq!(named.datagrams.get(), 5);
+        let past_tokio = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
+        for flag in ["--halo-inbound-streams", "--halo-datagrams"] {
+            assert!(run(&[flag, "0"]).is_err(), "{flag}");
+            assert!(run(&[flag, &past_tokio]).is_err(), "{flag}");
+        }
     }
 }

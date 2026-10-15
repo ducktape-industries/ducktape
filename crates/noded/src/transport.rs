@@ -193,15 +193,30 @@ enum Remote {
     WebSocket(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
 }
 
-async fn carry(mesh: TcpStream, endpoint: &Endpoint, client: Arc<ClientConfig>) -> io::Result<()> {
+async fn carry(
+    mut mesh: TcpStream,
+    endpoint: &Endpoint,
+    client: Arc<ClientConfig>,
+) -> io::Result<()> {
     mesh.set_nodelay(true)?;
-    let remote = tokio::time::timeout(OPEN, open(endpoint, client))
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    let (remote, early) = opened(&mut mesh, endpoint, client).await?;
     match remote {
-        Remote::Tcp(stream) => pipe(mesh, stream).await,
-        Remote::Tls(stream) => pipe(mesh, stream).await,
-        Remote::WebSocket(socket) => {
+        Remote::Tcp(mut stream) => {
+            stream.write_all(&early).await?;
+            pipe(mesh, stream).await
+        }
+        Remote::Tls(mut stream) => {
+            stream.write_all(&early).await?;
+            pipe(mesh, stream).await
+        }
+        Remote::WebSocket(mut socket) => {
+            let any_early = !early.is_empty();
+            if any_early {
+                socket
+                    .send(tungstenite::Message::Binary(early))
+                    .await
+                    .map_err(io::Error::other)?;
+            }
             splice(
                 socket,
                 mesh,
@@ -209,6 +224,27 @@ async fn carry(mesh: TcpStream, endpoint: &Endpoint, client: Arc<ClientConfig>) 
                 tungstenite_frame,
             )
             .await
+        }
+    }
+}
+
+async fn opened(
+    mesh: &mut TcpStream,
+    endpoint: &Endpoint,
+    client: Arc<ClientConfig>,
+) -> io::Result<(Remote, Vec<u8>)> {
+    let mut early = Vec::new();
+    let open = open(endpoint, client);
+    futures::pin_mut!(open);
+    loop {
+        tokio::select! {
+            remote = &mut open => return Ok((remote?, early)),
+            read = mesh.read_buf(&mut early) => {
+                let gone = read? == 0;
+                if gone {
+                    return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
+                }
+            }
         }
     }
 }
@@ -370,3 +406,6 @@ where
         .factor_first()
         .0
 }
+
+#[cfg(test)]
+mod tests;

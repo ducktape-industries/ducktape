@@ -1,4 +1,6 @@
-use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
+use std::io::{Read as _, Write as _};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -13,8 +15,8 @@ use fixture_probe::{Reply, Step};
 use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
-use noded::wire::{Admin, BlockRef, PREVIEW_BYTES, Submitted, TxAsk, TxRef};
-use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Upload, Workspace};
+use noded::wire::{Admin, BlockAsk, BlockRef, Blocks, Submitted, TxAsk, TxRef};
+use noded::{Client, Endpoint, HaloConfig, Listen, LoadConfig, Logs, Upload, Workspace};
 
 const PROGRAMS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
@@ -144,6 +146,10 @@ impl Seat {
     }
 
     fn start(&self) -> Live {
+        self.start_with(LoadConfig::default())
+    }
+
+    fn start_with(&self, load: LoadConfig) -> Live {
         let (ready, started) = mpsc::channel();
         let workspace = self.workspace.clone();
         let listen = Listen {
@@ -155,9 +161,16 @@ impl Seat {
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
                 let logs = Logs::install("info").unwrap();
-                let running = noded::run(context, &workspace, logs, listen, HaloConfig::default())
-                    .await
-                    .unwrap();
+                let running = noded::run(
+                    context,
+                    &workspace,
+                    logs,
+                    listen,
+                    HaloConfig::default(),
+                    load,
+                )
+                .await
+                .unwrap();
                 ready.send(running.http).unwrap();
                 running.stopped().await;
             });
@@ -281,6 +294,23 @@ async fn reach(client: &Client, height: u64) {
     }
 }
 
+const WHOLE: u32 = u32::MAX;
+
+fn block_at(height: u64, most: u32) -> BlockAsk {
+    BlockAsk {
+        by: BlockRef::Height(height),
+        most,
+    }
+}
+
+fn page(before: Option<u64>, limit: u32, most: u32) -> Blocks {
+    Blocks {
+        before,
+        limit,
+        most,
+    }
+}
+
 fn client_runtime() -> ::tokio::runtime::Runtime {
     ::tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -319,11 +349,7 @@ fn a_validator_serves_its_network_over_http() {
             .land(&Frame::decode(&landing).unwrap())
             .await
             .unwrap();
-        let carried = client
-            .block(BlockRef::Height(height))
-            .await
-            .unwrap()
-            .unwrap();
+        let carried = client.block(block_at(height, 0)).await.unwrap().unwrap();
         assert_eq!(carried.txs[0].hash, submission(&landing).id());
         assert!(
             matches!(&receipt.outcome, Outcome::Rejected(refusal) if refusal.sentence == "landed"),
@@ -384,7 +410,7 @@ fn a_validator_serves_its_network_over_http() {
 
         // the block that wrote it, read back from the archive
         let block = client
-            .block(BlockRef::Height(change.height))
+            .block(block_at(change.height, WHOLE))
             .await
             .unwrap()
             .unwrap();
@@ -403,7 +429,7 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(
             tx.payload.as_ref(),
             Some(&payload),
-            "a short payload rides along"
+            "a payload within the asked most rides along"
         );
         assert_eq!(tx.receipt.as_ref(), Some(&receipt), "the kept receipt");
         let position = (block.txs.len() - 1) as u32;
@@ -441,11 +467,13 @@ fn a_validator_serves_its_network_over_http() {
         let none = client.tx(TxAsk { tx: past, most: 0 }).await.unwrap();
         assert_eq!(none, None);
 
-        let large = vec![set(b"large", &[7; 2 * PREVIEW_BYTES as usize])];
+        let large = vec![set(b"large", &[7; 8 << 10])];
         let large = frame(&client, &alice, large).await;
         let (landed, _) = client.land(&Frame::decode(&large).unwrap()).await.unwrap();
+        let large_payload = submission(&large).payload;
+        let below_it = large_payload.len() as u32 - 1;
         let carrier = client
-            .block(BlockRef::Height(landed))
+            .block(block_at(landed, below_it))
             .await
             .unwrap()
             .unwrap();
@@ -456,9 +484,15 @@ fn a_validator_serves_its_network_over_http() {
             .position(|tx| tx.hash == large_id)
             .expect("the block carries the large frame") as u32;
         let listed = &carrier.txs[position as usize];
-        let large_payload = submission(&large).payload;
         assert_eq!(listed.size as usize, large_payload.len());
-        assert_eq!(listed.payload, None, "a block read carries no long payload");
+        assert_eq!(listed.payload, None, "a payload past the asked most");
+        let whole = client
+            .block(block_at(landed, WHOLE))
+            .await
+            .unwrap()
+            .unwrap();
+        let whole = &whole.txs[position as usize];
+        assert_eq!(whole.payload.as_ref(), Some(&large_payload));
         let opened = client
             .tx(TxAsk {
                 tx: TxRef::At {
@@ -474,7 +508,10 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(opened.tx.receipt, listed.receipt);
 
         let fails = |tx: &&noded::wire::Tx| tx.hash == submission(&failed).id();
-        let holding = client.blocks(Some(block.height + 1), 3).await.unwrap();
+        let holding = client
+            .blocks(page(Some(block.height + 1), 3, WHOLE))
+            .await
+            .unwrap();
         assert_eq!(
             holding.listed_from,
             Some(0),
@@ -506,22 +543,42 @@ fn a_validator_serves_its_network_over_http() {
             block.proposer.as_deref(),
             Some(seat.identity.public_key().as_ref())
         );
-        let by_id = client.block(BlockRef::Id(block.id)).await.unwrap();
-        assert_eq!(by_id.as_ref(), Some(&block));
-        assert_eq!(client.block(BlockRef::Id([7; 32])).await.unwrap(), None);
-        let newest = client.blocks(None, 1_000).await.unwrap().blocks;
-        assert!(newest.len() as u32 <= noded::wire::MAX_BLOCKS);
+        let by_id = BlockAsk {
+            by: BlockRef::Id(block.id),
+            most: WHOLE,
+        };
+        assert_eq!(client.block(by_id).await.unwrap().as_ref(), Some(&block));
+        let unknown = BlockAsk {
+            by: BlockRef::Id([7; 32]),
+            most: 0,
+        };
+        assert_eq!(client.block(unknown).await.unwrap(), None);
+        let newest = client
+            .blocks(page(None, u32::MAX, WHOLE))
+            .await
+            .unwrap()
+            .blocks;
+        assert_eq!(
+            newest.last().map(|oldest| oldest.height),
+            Some(0),
+            "a page with room for the whole chain lists down to genesis"
+        );
         assert!(
             newest
                 .windows(2)
                 .all(|pair| pair[1].height + 1 == pair[0].height && pair[1].id == pair[0].parent)
         );
         assert!(newest.iter().any(|seen| seen == &block));
-        let below = client.blocks(Some(block.height), 2).await.unwrap().blocks;
+        let below = client
+            .blocks(page(Some(block.height), 2, 0))
+            .await
+            .unwrap()
+            .blocks;
         assert_eq!(below[0].height, block.height - 1);
         assert_eq!(below[0].id, block.parent);
-        assert!(client.blocks(Some(0), 5).await.unwrap().blocks.is_empty());
-        let genesis = client.blocks(Some(1), 5).await.unwrap().blocks;
+        let none = client.blocks(page(Some(0), 5, 0)).await.unwrap();
+        assert!(none.blocks.is_empty());
+        let genesis = client.blocks(page(Some(1), 5, 0)).await.unwrap().blocks;
         assert_eq!(genesis.len(), 1);
         assert_eq!(
             genesis[0].id,
@@ -578,7 +635,7 @@ fn a_validator_serves_its_network_over_http() {
     let client = live.client.clone();
     client_runtime().block_on(async {
         for seen in [&block, &holder] {
-            let again = client.block(BlockRef::Height(seen.height)).await.unwrap();
+            let again = client.block(block_at(seen.height, WHOLE)).await.unwrap();
             assert_eq!(again.as_ref(), Some(seen));
         }
         let at = TxRef::At {
@@ -610,14 +667,10 @@ fn a_node_reads_a_transaction_of_a_block_it_lists_no_summary_for() {
     let alice = ed25519::PrivateKey::from_seed(11);
 
     let large = client_runtime().block_on(async {
-        let steps = vec![set(b"large", &[7; 2 * PREVIEW_BYTES as usize])];
+        let steps = vec![set(b"large", &[7; 8 << 10])];
         let large = frame(&client, &alice, steps).await;
         let (landed, _) = client.land(&Frame::decode(&large).unwrap()).await.unwrap();
-        let block = client
-            .block(BlockRef::Height(landed))
-            .await
-            .unwrap()
-            .unwrap();
+        let block = client.block(block_at(landed, 0)).await.unwrap().unwrap();
         let id = submission(&large).id();
         let position = block.txs.iter().position(|tx| tx.hash == id).unwrap() as u32;
         let mut blocks = client.changes(host::RECENT).await.unwrap();
@@ -642,14 +695,19 @@ fn a_node_reads_a_transaction_of_a_block_it_lists_no_summary_for() {
     client_runtime().block_on(async {
         let mut blocks = client.changes(host::RECENT).await.unwrap();
         blocks.next().await.unwrap().unwrap();
-        let page = client.blocks(None, 10).await.unwrap();
-        let listed_from = page.listed_from.expect("the blocks applied since");
+        let newest = client.blocks(page(None, 10, 0)).await.unwrap();
+        let listed_from = newest.listed_from.expect("the blocks applied since");
         assert!(listed_from > landed, "{listed_from} lists {landed}");
-        assert!(page.blocks.iter().all(|block| block.height >= listed_from));
-        let below = client.blocks(Some(listed_from), 10).await.unwrap();
+        assert!(
+            newest
+                .blocks
+                .iter()
+                .all(|block| block.height >= listed_from)
+        );
+        let below = client.blocks(page(Some(listed_from), 10, 0)).await.unwrap();
         assert!(below.blocks.is_empty());
         assert_eq!(below.listed_from, Some(listed_from));
-        assert_eq!(client.block(BlockRef::Height(landed)).await.unwrap(), None);
+        assert_eq!(client.block(block_at(landed, 0)).await.unwrap(), None);
 
         let at = TxRef::At {
             height: landed,
@@ -703,6 +761,59 @@ fn a_changes_subscriber_that_closes_is_answered() {
         );
         seat.admin(&client, Admin::Shutdown).await;
     });
+    live.thread.join().unwrap();
+}
+
+const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+fn upload_expecting_continue(http: SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect(http).unwrap();
+    let head = format!(
+        "POST {} HTTP/1.1\r\nhost: node\r\ncontent-length: 1\r\nexpect: 100-continue\r\n\r\n",
+        noded::wire::route::SUBMIT
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream
+}
+
+fn continued(stream: &mut TcpStream) {
+    let mut line = vec![0u8; CONTINUE.len()];
+    stream.read_exact(&mut line).unwrap();
+    assert_eq!(line, CONTINUE);
+}
+
+fn answered_yet(stream: &mut TcpStream) -> bool {
+    stream.set_nonblocking(true).unwrap();
+    let read = stream.read(&mut [0u8; 1]);
+    stream.set_nonblocking(false).unwrap();
+    !matches!(read, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+#[test]
+fn a_node_run_with_one_upload_in_flight_reads_the_next_upload_only_when_the_first_ends() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let load = LoadConfig {
+        uploads_in_flight: NonZeroUsize::MIN,
+        ..LoadConfig::default()
+    };
+    let live = seat.start_with(load);
+    let client = live.client.clone();
+
+    let mut first = upload_expecting_continue(seat.http);
+    continued(&mut first);
+    let mut second = upload_expecting_continue(seat.http);
+    client_runtime().block_on(async { client.status().await.unwrap() });
+    assert!(
+        !answered_yet(&mut second),
+        "the node reads a second upload while the first is in flight"
+    );
+    first.write_all(b"x").unwrap();
+    continued(&mut second);
+
+    client_runtime().block_on(seat.admin(&client, Admin::Shutdown));
     live.thread.join().unwrap();
 }
 

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use abi::{BlobId, Origin, ProgramId, Refusal, reason};
 use axum::Router;
@@ -20,24 +19,16 @@ use statesync::Request as SyncRequest;
 use tokio::sync::Semaphore;
 
 use crate::wire::{
-    Admin, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Submit,
+    Admin, BlockAsk, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Submit,
     Submitted, TxAsk, route,
 };
-use crate::{Context, Daemon};
-
-const READS_IN_FLIGHT: usize = 64;
-const READ_DEADLINE: Duration = Duration::from_secs(30);
-const QUERY_DEADLINE: Duration = Duration::from_secs(60);
-const UPLOADS_IN_FLIGHT: usize = 8;
-const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
+use crate::{Context, Daemon, LoadConfig};
 
 const SUBMIT_BYTES: usize = BLOCK_BYTES;
 const SUBMIT_BODY_BYTES: usize = SUBMIT_BYTES + size_of::<u32>() + size_of::<bool>();
-const QUERY_BODY_BYTES: usize = 4 << 20;
-const ASK_BYTES: usize = 1 << 20;
 
-pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
-    let read_permits = Arc::new(Semaphore::new(READS_IN_FLIGHT));
+pub fn router<E: Context>(daemon: Arc<Daemon<E>>, load: LoadConfig) -> Router {
+    let read_permits = Arc::new(Semaphore::new(load.reads_in_flight.get()));
     let reads = Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
@@ -54,22 +45,13 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
-        .layer(middleware::from_fn_with_state(
-            Lane::new(read_permits.clone(), READ_DEADLINE),
-            bounded,
-        ));
-    let queries =
-        Router::new()
-            .route(route::QUERY, post(query::<E>))
-            .layer(middleware::from_fn_with_state(
-                Lane::new(read_permits, QUERY_DEADLINE),
-                bounded,
-            ));
+        .route(route::QUERY, post(query::<E>))
+        .layer(middleware::from_fn_with_state(read_permits, bounded));
     let uploads = Router::new()
         .route(route::SUBMIT, post(submit::<E>))
         .route(route::BLOB_PUT, post(blob_put::<E>))
         .layer(middleware::from_fn_with_state(
-            Lane::new(Arc::new(Semaphore::new(UPLOADS_IN_FLIGHT)), UPLOAD_DEADLINE),
+            Arc::new(Semaphore::new(load.uploads_in_flight.get())),
             bounded,
         ));
     let streams = Router::new()
@@ -78,39 +60,30 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             get(changes::<E>),
         )
         .route(route::P2P, get(p2p::<E>));
-    reads
-        .merge(queries)
-        .merge(uploads)
-        .merge(streams)
-        .with_state(daemon)
+    reads.merge(uploads).merge(streams).with_state(daemon)
 }
 
-#[derive(Clone)]
-struct Lane {
-    permits: Arc<Semaphore>,
-    deadline: Duration,
-}
-
-impl Lane {
-    fn new(permits: Arc<Semaphore>, deadline: Duration) -> Lane {
-        Lane { permits, deadline }
-    }
-}
-
-async fn bounded(State(lane): State<Lane>, request: Request, next: middleware::Next) -> Response {
-    let deadline = tokio::time::Instant::now() + lane.deadline;
-    let seconds = lane.deadline.as_secs();
-    let permit = tokio::time::timeout_at(deadline, lane.permits.acquire_owned()).await;
-    let Ok(Ok(_permit)) = permit else {
-        let sentence =
-            format!("the node is busy and did not start this request within {seconds} s");
+async fn bounded(
+    State(permits): State<Arc<Semaphore>>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let Ok(_permit) = permits.acquire_owned().await else {
+        let sentence = "the node stopped taking requests";
         return (StatusCode::SERVICE_UNAVAILABLE, sentence).into_response();
     };
-    match tokio::time::timeout_at(deadline, next.run(request)).await {
-        Ok(response) => response,
-        Err(_) => {
-            let sentence = format!("the node did not answer within {seconds} s");
-            (StatusCode::SERVICE_UNAVAILABLE, sentence).into_response()
+    next.run(request).await
+}
+
+struct Whole(Bytes);
+
+impl<S: Send + Sync> FromRequest<S> for Whole {
+    type Rejection = Reply<()>;
+
+    async fn from_request(request: Request, _: &S) -> Result<Self, Reply<()>> {
+        match request.into_body().collect().await {
+            Ok(body) => Ok(Whole(body.to_bytes())),
+            Err(error) => Err(cut(error)),
         }
     }
 }
@@ -128,12 +101,16 @@ impl<S: Send + Sync, const MAX: usize> FromRequest<S> for Capped<MAX> {
                 reason::CAPACITY,
                 format!("the request is over the {MAX} bytes this route reads"),
             ))),
-            Err(error) => Err(Reply::Refused(Refusal::new(
-                reason::INVALID_INPUT,
-                format!("the request body did not arrive whole: {error}"),
-            ))),
+            Err(error) => Err(cut(error)),
         }
     }
+}
+
+fn cut(error: impl std::fmt::Display) -> Reply<()> {
+    Reply::Refused(Refusal::new(
+        reason::INVALID_INPUT,
+        format!("the request body did not arrive whole: {error}"),
+    ))
 }
 
 pub enum Reply<T> {
@@ -204,7 +181,7 @@ fn submitted(prediction: Option<Receipt>) -> Submitted {
 
 async fn query<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<QUERY_BODY_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Vec<u8>> {
     let query: Query = match abi::decode(&body) {
         Ok(query) => query,
@@ -232,7 +209,7 @@ async fn query<E: Context>(
 
 async fn get_value<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Option<Vec<u8>>> {
     let get: Get = match abi::decode(&body) {
         Ok(get) => get,
@@ -247,7 +224,7 @@ async fn get_value<E: Context>(
 
 async fn scan<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Vec<abi::Entry>> {
     let range: Range = match abi::decode(&body) {
         Ok(range) => range,
@@ -262,7 +239,7 @@ async fn scan<E: Context>(
 
 async fn blob_get<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Option<Vec<u8>>> {
     let id: BlobId = match abi::decode(&body) {
         Ok(id) => id,
@@ -276,7 +253,7 @@ async fn blob_get<E: Context>(
 
 async fn blobs<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Vec<Option<Vec<u8>>>> {
     let ids: Vec<BlobId> = match abi::decode(&body) {
         Ok(ids) => ids,
@@ -461,7 +438,7 @@ async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Change>)
 
 async fn blocks<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Page> {
     let page: Blocks = match abi::decode(&body) {
         Ok(page) => page,
@@ -475,13 +452,13 @@ async fn blocks<E: Context>(
 
 async fn block<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Option<Finalized>> {
-    let by: BlockRef = match abi::decode(&body) {
-        Ok(by) => by,
+    let ask: BlockAsk = match abi::decode(&body) {
+        Ok(ask) => ask,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match daemon.block(by).await {
+    match daemon.block(ask).await {
         Ok(block) => Reply::Answered(block),
         Err(error) => failed(error),
     }
@@ -489,7 +466,7 @@ async fn block<E: Context>(
 
 async fn tx<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<Option<Located>> {
     let ask: TxAsk = match abi::decode(&body) {
         Ok(ask) => ask,
@@ -505,10 +482,7 @@ async fn logs<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Vec<Str
     Reply::Answered(daemon.logs.lines())
 }
 
-async fn admin<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
-) -> Reply<()> {
+async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, Whole(body): Whole) -> Reply<()> {
     let submission = match node::verify(&body, &daemon.descriptor.id()) {
         Ok(submission) => submission,
         Err(refusal) => return Reply::Refused(refusal),
@@ -546,7 +520,7 @@ async fn admin<E: Context>(
 
 async fn sync<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<ASK_BYTES>,
+    Whole(body): Whole,
 ) -> Reply<statesync::Response> {
     let request: SyncRequest = match abi::decode(&body) {
         Ok(request) => request,
@@ -597,35 +571,25 @@ mod tests {
         assert_eq!(refusal.reason, reason::CAPACITY);
     }
 
-    async fn served(lane: Lane) -> String {
-        let router = Router::new()
-            .route("/held", get(std::future::pending::<()>))
-            .layer(middleware::from_fn_with_state(lane, bounded));
+    const PAST_AXUM_DEFAULT_LIMIT: usize = (2 << 20) + 1;
+
+    #[tokio::test]
+    async fn a_body_past_the_frameworks_default_limit_is_read_whole() {
+        let router = Router::new().route(
+            "/whole",
+            post(|Whole(body): Whole| async move { body.len().to_string() }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
-        format!("http://{address}/held")
-    }
-
-    async fn status(url: &str) -> (u16, String) {
-        let response = reqwest::get(url).await.unwrap();
-        let status = response.status().as_u16();
-        (status, response.text().await.unwrap())
-    }
-
-    #[tokio::test]
-    async fn a_request_with_no_permit_by_its_deadline_is_answered_unavailable() {
-        let lane = Lane::new(Arc::new(Semaphore::new(0)), Duration::from_millis(1));
-        let (status, sentence) = status(&served(lane).await).await;
-        assert_eq!(status, 503);
-        assert!(sentence.contains("busy"), "{sentence}");
-    }
-
-    #[tokio::test]
-    async fn a_request_unanswered_by_its_deadline_is_answered_unavailable() {
-        let lane = Lane::new(Arc::new(Semaphore::new(1)), Duration::from_millis(1));
-        let (status, sentence) = status(&served(lane).await).await;
-        assert_eq!(status, 503);
-        assert!(sentence.contains("did not answer"), "{sentence}");
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/whole"))
+            .body(vec![0u8; PAST_AXUM_DEFAULT_LIMIT])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let read = response.text().await.unwrap();
+        assert_eq!(read, PAST_AXUM_DEFAULT_LIMIT.to_string());
     }
 }

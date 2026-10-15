@@ -263,8 +263,22 @@ loopback host (`0.0.0.0`, `::`, `127.0.0.1`, `localhost`) is refused. `run
 right. Each node dials every member once it is seated and keeps that
 connection open, and a connection carries streams both ways, so a member
 whose halo address takes no inbound UDP still takes part by dialing out. A
-changed address is dialed from the next block on. `--halo-egress` caps the bytes per second a node sends over halo;
+changed address is dialed from the next block on. A dial to a member that
+never answers ends when QUIC's idle timeout passes, and the node dials again.
+`--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
+`--halo-inbound-streams` is how many streams members open to the node wait
+for it to take them; past it the node takes no more until one is taken.
+`--halo-datagrams` is how many datagrams from members wait for the node to
+read them; past it a datagram is dropped.
+
+Five more `run` flags set how much work a node takes on at once.
+`--reads-in-flight` and `--uploads-in-flight` are the HTTP reads and the
+uploads (submit, blob put) it serves together; the rest wait their turn.
+`--blob-serves-in-flight` and `--blob-gatherers` are the blobs it sends to
+members and gathers from members together. `--blob-backlog` is how many
+members' blob requests wait for a send; past it a request is refused.
+`ducktape run --help` shows each default.
 
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844
@@ -324,8 +338,8 @@ carries it, and the receipt `submit` prints is that prediction, not a verdict.
 A frame predicted to fail is still relayed and waits for a block. `blob put`,
 votes and `ducktape halo` never preconfirm. `ducktape logs`,
 `ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
-node; the mutating ones are signed with the node's own identity key. Each
-verb's `--help` carries the rest.
+node; the mutating ones are signed with the node's own identity key. Each verb's
+`--help` carries the rest.
 
 ## How it is built
 

@@ -3,6 +3,7 @@
 // for a blob it lacks.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,16 +21,35 @@ use tokio::time::Instant;
 use crate::contract::{Bundle, Entry, bundle_of};
 use crate::{Blobs, Collision, Error, names, size_of};
 
-const BACKLOG: usize = 64;
-const SERVING: usize = 64;
-const GATHERERS: usize = 4;
-const SENDERS: usize = 4096;
-const ANSWER_BYTES: u32 = 1 << 10;
-const STALLED: Duration = Duration::from_secs(30);
+const BACKLOG: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero");
+const SERVING: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero");
+const GATHERERS: NonZeroUsize = NonZeroUsize::new(4).expect("nonzero");
 const PAUSE: Duration = Duration::from_secs(1);
 const PAUSE_MOST: Duration = Duration::from_secs(60);
 const CHUNK: usize = 64 << 10;
-const RECEIPT_AGAIN: u64 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub backlog: NonZeroUsize,
+    pub serving: NonZeroUsize,
+    pub gatherers: NonZeroUsize,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            backlog: BACKLOG,
+            serving: SERVING,
+            gatherers: GATHERERS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Due {
+    pub bundle: u64,
+    pub posted: Option<Vec<u8>>,
+}
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 struct Ask {
@@ -52,7 +72,12 @@ enum Local {
 
 struct Open {
     bundle: Bundle,
-    posted: Option<u64>,
+    posted: Option<Vec<u8>>,
+}
+
+struct SentBy {
+    key: PublicKey,
+    carried_until: u64,
 }
 
 struct Wanted {
@@ -72,7 +97,7 @@ enum Next {
 struct State {
     open: BTreeMap<u64, Open>,
     wanted: BTreeMap<BlobId, Wanted>,
-    senders: HashMap<BlobId, PublicKey>,
+    senders: HashMap<BlobId, SentBy>,
 }
 
 struct Inner {
@@ -104,11 +129,12 @@ impl Service {
         halo: Arc<Halo>,
         store: Blobs,
         bundles: impl IntoIterator<Item = (u64, Bundle)>,
+        config: Config,
     ) -> crate::Result<Service> {
         store.clear_staging()?;
         let lane = halo
             .plane()
-            .streams(Lane::BLOBS, BACKLOG)
+            .streams(Lane::BLOBS, config.backlog.get())
             .map_err(|taken| std::io::Error::new(std::io::ErrorKind::AddrInUse, taken))?;
         let inner = Arc::new(Inner {
             halo,
@@ -123,14 +149,14 @@ impl Service {
         for (n, bundle) in bundles {
             inner.record(n, bundle);
         }
-        let mut tasks = vec![tokio::spawn(serving(inner.clone())).abort_handle()];
-        for _ in 0..GATHERERS {
+        let mut tasks = vec![tokio::spawn(serving(inner.clone(), config.serving)).abort_handle()];
+        for _ in 0..config.gatherers.get() {
             tasks.push(tokio::spawn(gathering(inner.clone())).abort_handle());
         }
         Ok(Service { inner, tasks })
     }
 
-    pub fn applied(&self, height: u64, writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<u64> {
+    pub fn applied(&self, height: u64, writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<Due> {
         for (key, value) in writes {
             let Some(n) = bundle_of(key) else {
                 continue;
@@ -140,16 +166,29 @@ impl Service {
             };
             self.inner.record(n, bundle);
         }
-        self.inner.due(height)
+        self.inner.unsent(height);
+        self.inner.due()
     }
 
-    pub fn sent(&self, ids: impl IntoIterator<Item = BlobId>, from: &PublicKey) {
+    pub fn sent(
+        &self,
+        ids: impl IntoIterator<Item = BlobId>,
+        from: &PublicKey,
+        carried_until: u64,
+    ) {
         let mut state = self.inner.state();
         for id in ids {
-            let room = state.senders.len() < SENDERS;
-            if room {
-                state.senders.insert(id, from.clone());
-            }
+            let sender = SentBy {
+                key: from.clone(),
+                carried_until,
+            };
+            state.senders.insert(id, sender);
+        }
+    }
+
+    pub fn posted(&self, bundle: u64, receipt: Vec<u8>) {
+        if let Some(open) = self.inner.state().open.get_mut(&bundle) {
+            open.posted = Some(receipt);
         }
     }
 
@@ -245,13 +284,21 @@ impl Inner {
                 pulling: false,
             });
         }
-        let posted = state.open.get(&n).and_then(|open| open.posted);
+        let posted = state.open.remove(&n).and_then(|open| open.posted);
         state.open.insert(n, Open { bundle, posted });
         drop(state);
         self.work.notify_waiters();
     }
 
-    fn due(&self, height: u64) -> Vec<u64> {
+    fn unsent(&self, height: u64) {
+        let mut state = self.state();
+        let State {
+            wanted, senders, ..
+        } = &mut *state;
+        senders.retain(|id, sender| wanted.contains_key(id) || height < sender.carried_until);
+    }
+
+    fn due(&self) -> Vec<Due> {
         let me = self.halo.me().clone();
         let validator = self.halo.members().validator(&me);
         let open: Vec<(u64, Vec<Entry>)> = self
@@ -282,13 +329,12 @@ impl Inner {
                 state.open.remove(&n);
                 continue;
             }
-            let again = open
-                .posted
-                .is_none_or(|posted| height >= posted + RECEIPT_AGAIN);
-            let receipts = validator && all && !held && !receipted && again;
+            let receipts = validator && all && !held && !receipted;
             if receipts {
-                open.posted = Some(height);
-                due.push(n);
+                due.push(Due {
+                    bundle: n,
+                    posted: open.posted.clone(),
+                });
             }
         }
         due
@@ -335,7 +381,7 @@ impl Inner {
     }
 
     fn sender(&self, id: &BlobId) -> Option<PublicKey> {
-        self.state().senders.get(id).cloned()
+        Some(self.state().senders.get(id)?.key.clone())
     }
 
     fn declared(&self, id: &BlobId) -> Option<Entry> {
@@ -399,7 +445,7 @@ impl Inner {
         let Ok(mut stream) = opened else {
             return Err("unopened");
         };
-        let answer = within(read_answer(&mut stream)).await?;
+        let answer = read_answer(&mut stream).await?;
         Ok((answer, stream))
     }
 
@@ -444,9 +490,10 @@ impl Inner {
         let mut chunk = vec![0u8; CHUNK];
         while left > 0 {
             let want = left.min(CHUNK as u64) as usize;
-            let read =
-                within(async { stream.read(&mut chunk[..want]).await.map_err(|_| "broken") })
-                    .await?;
+            let read = stream
+                .read(&mut chunk[..want])
+                .await
+                .map_err(|_| "broken")?;
             if read == 0 {
                 return Err("cut");
             }
@@ -559,8 +606,8 @@ async fn gathering(inner: Arc<Inner>) {
     }
 }
 
-async fn serving(inner: Arc<Inner>) {
-    let serving = Arc::new(Semaphore::new(SERVING));
+async fn serving(inner: Arc<Inner>, serving: NonZeroUsize) {
+    let serving = Arc::new(Semaphore::new(serving.get()));
     loop {
         let Ok(permit) = serving.clone().acquire_owned().await else {
             return;
@@ -580,20 +627,18 @@ async fn serving(inner: Arc<Inner>) {
     }
 }
 
-async fn within<T>(step: impl Future<Output = Result<T, &'static str>>) -> Result<T, &'static str> {
-    tokio::time::timeout(STALLED, step)
-        .await
-        .unwrap_or(Err("stalled"))
-}
-
 async fn read_answer<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Answer, &'static str> {
     let len = stream.read_u32_le().await.map_err(|_| "cut")?;
-    let fits = len <= ANSWER_BYTES;
-    if !fits {
-        return Err("malformed");
+    let mut bytes = Vec::new();
+    let read = stream
+        .take(u64::from(len))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| "cut")?;
+    let whole = read == len as usize;
+    if !whole {
+        return Err("cut");
     }
-    let mut bytes = vec![0u8; len as usize];
-    stream.read_exact(&mut bytes).await.map_err(|_| "cut")?;
     abi::decode(&bytes).map_err(|_| "malformed")
 }
 

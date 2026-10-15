@@ -1,18 +1,18 @@
 // Two nodes' blob services over QUIC on loopback: an upload is staged only when it carries the
 // blobs its put names, a resident gathers a bundle from the node that took the upload, and a
-// validator receipts a bundle once it holds every blob of it and never again once receipted.
+// validator receipts a bundle it holds whole, keeps its posted receipt, and stops once receipted.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use abi::BlobId;
 use blob::contract::{Bundle, Custody, Entry, bundle_key};
-use blob::service::Service;
+use blob::service::{self, Due, Service};
 use blob::{Blobs, frame};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
-use halo::{Config, Halo, Seat};
+use halo::{Config, Halo, Queues, Seat};
 
 struct Node {
     service: Service,
@@ -26,6 +26,7 @@ fn node(context: &runtime::Context, seed: u64, validator: bool) -> (Node, Arc<Ha
     let config = Config {
         egress_bytes_per_sec: None,
         udp: "127.0.0.1:0".parse().unwrap(),
+        queues: Queues::default(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());
     let seat = Seat {
@@ -35,7 +36,8 @@ fn node(context: &runtime::Context, seed: u64, validator: bool) -> (Node, Arc<Ha
     };
     let dir = tempfile::tempdir().unwrap();
     let store = Blobs::open(dir.path()).unwrap();
-    let service = Service::start(halo.clone(), store, Vec::new()).unwrap();
+    let service =
+        Service::start(halo.clone(), store, Vec::new(), service::Config::default()).unwrap();
     (
         Node {
             service,
@@ -121,7 +123,17 @@ fn a_resident_gathers_a_bundle_from_the_node_that_took_the_upload() {
 }
 
 #[test]
-fn a_validator_receipts_a_bundle_once_it_holds_every_blob_and_not_again_once_receipted() {
+fn a_validator_receipts_a_bundle_it_holds_whole_keeps_its_posted_receipt_and_stops_once_receipted()
+{
+    let unposted = Due {
+        bundle: 0,
+        posted: None,
+    };
+    let receipt = b"the posted receipt".to_vec();
+    let posted = Due {
+        bundle: 0,
+        posted: Some(receipt.clone()),
+    };
     runtime::Runner::default().start(|context| async move {
         let (taker, taker_halo) = node(&context.child("taker"), 1, false);
         let (validator, validator_halo) = node(&context.child("validator"), 2, true);
@@ -134,8 +146,12 @@ fn a_validator_receipts_a_bundle_once_it_holds_every_blob_and_not_again_once_rec
         let mut landed = validator.service.landed();
         assert!(validator.service.applied(1, &writes(0, &put)).is_empty());
         landed.wait_for(|landed| *landed == 1).await.unwrap();
-        assert_eq!(validator.service.applied(2, &BTreeMap::new()), vec![0]);
-        assert!(validator.service.applied(3, &BTreeMap::new()).is_empty());
+        assert_eq!(
+            validator.service.applied(2, &BTreeMap::new()),
+            vec![unposted]
+        );
+        validator.service.posted(0, receipt);
+        assert_eq!(validator.service.applied(3, &BTreeMap::new()), vec![posted]);
         let key = validator.seat.key.as_ref().to_vec();
         let receipted = bundle(vec![entry], Custody::Receipted(vec![key]));
         assert!(validator.service.applied(4, &writes(0, &receipted)).is_empty());

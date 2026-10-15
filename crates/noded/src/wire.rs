@@ -3,7 +3,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Receipt, Tip};
 use node::Preconfirm;
 
-pub const NODE_CONTRACT: u32 = 7;
+pub const NODE_CONTRACT: u32 = 8;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {
@@ -101,17 +101,11 @@ pub struct Change {
     pub writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
-/// The most blocks one `/v1/blocks` page answers.
-pub const MAX_BLOCKS: u32 = 100;
-
-pub const PAGE_BYTES: usize = 4 << 20;
-
-pub const PREVIEW_BYTES: u32 = 4 << 10;
-
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Blocks {
     pub before: Option<u64>,
     pub limit: u32,
+    pub most: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -125,6 +119,12 @@ pub struct Page {
 pub enum BlockRef {
     Height(u64),
     Id([u8; 32]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct BlockAsk {
+    pub by: BlockRef,
+    pub most: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
