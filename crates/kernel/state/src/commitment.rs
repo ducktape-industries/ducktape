@@ -49,7 +49,7 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Tuning {
         Tuning {
-            items_per_blob: NonZeroU64::new(64).unwrap(),
+            items_per_blob: NonZeroU64::new(4096).unwrap(),
             items_per_section: NonZeroU64::new(64).unwrap(),
             write_buffer: NonZeroUsize::new(1024).unwrap(),
             replay_buffer: NonZeroUsize::new(1 << 20).unwrap(),

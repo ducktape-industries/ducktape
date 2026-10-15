@@ -126,8 +126,8 @@ fn frame(key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
 async fn seal(node: &mut Node<Ctx>) -> Block {
     let tip = node.tip().unwrap();
     let block = node
-        .build(tip, std::iter::empty(), TIME + tip.height + 1)
-        .unwrap();
+        .proposer()
+        .build(tip, std::iter::empty(), TIME + tip.height + 1);
     let Sequenced::Applied { .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };

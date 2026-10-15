@@ -16,9 +16,9 @@ use consensus::{
 };
 use fixture_probe::Step;
 use futures::StreamExt as _;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
-use node::{Block, Frame, Node, Sequenced, Source};
+use node::{Block, Frame, Node, Proposer, Sequenced, Source};
 
 mod epochs;
 
@@ -40,6 +40,7 @@ type Ctx = deterministic::Context;
 type Shared = Arc<futures::lock::Mutex<Node<Ctx>>>;
 type Roots = Arc<Mutex<BTreeMap<u64, Root>>>;
 type Carried = Arc<Mutex<BTreeMap<u64, Vec<Vec<u8>>>>>;
+type Stalls = Arc<Mutex<Option<Stall>>>;
 type Delivery = (Arc<Block>, Exact);
 type Seating = Membership<
     Ctx,
@@ -238,8 +239,9 @@ async fn heal(
 
 #[derive(Clone)]
 struct Participant {
-    node: Shared,
+    proposer: Proposer,
     inbox: mpsc::UnboundedSender<Delivery>,
+    proposed: mpsc::UnboundedSender<u64>,
 }
 
 impl Chain for Participant {
@@ -249,15 +251,30 @@ impl Chain for Participant {
         ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> Option<Block> {
-        let applied = self.node.lock().await.tip().unwrap().height;
+        let applied = self.proposer.applied().height;
         let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
-        let node = self.node.lock().await;
-        let block = node.build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
-        Some(block.unwrap())
+        let block = self
+            .proposer
+            .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
+        let _ = self.proposed.unbounded_send(block.height);
+        Some(block)
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
         let _ = self.inbox.unbounded_send((block, ack));
+    }
+}
+
+struct Stall {
+    height: u64,
+    holding: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+impl Stall {
+    async fn hold(self) {
+        let _ = self.holding.send(());
+        let _ = self.release.await;
     }
 }
 
@@ -267,6 +284,8 @@ struct Peer {
     roster: Roster,
     marshal: Marshal,
     heights: mpsc::UnboundedReceiver<u64>,
+    proposed: mpsc::UnboundedReceiver<u64>,
+    stalls: Stalls,
     roots: Roots,
     carried: Carried,
     _dir: tempfile::TempDir,
@@ -291,6 +310,7 @@ impl Peer {
         .await
         .unwrap();
         let seated = node.epoch_validators(0).unwrap().unwrap();
+        let proposer = node.proposer();
         let node: Shared = Arc::new(futures::lock::Mutex::new(node));
         let roster = Roster::new(NETWORK.to_vec(), Some(key.clone()));
         let mesh = SimMesh::new(
@@ -300,11 +320,14 @@ impl Peer {
         );
         let (inbox, deliveries) = mpsc::unbounded();
         let (applied, heights) = mpsc::unbounded();
+        let (proposals, proposed) = mpsc::unbounded();
+        let stalls: Stalls = Arc::default();
         let roots: Roots = Arc::default();
         let carried: Carried = Arc::default();
         let chain = Participant {
-            node: node.clone(),
+            proposer,
             inbox,
+            proposed: proposals,
         };
         let (marshal, _receipts) = Marshal::start(
             context.child("marshal"),
@@ -338,15 +361,15 @@ impl Peer {
         let standing = membership.seat(genesis_block.tip(), &seated).await.unwrap();
         assert_eq!(standing == Standing::Validator, roster.participates(0));
         context.child("pump").spawn({
-            let node = node.clone();
-            let roots = roots.clone();
-            let carried = carried.clone();
-            let network = network.clone();
-            move |_| {
-                pump(
-                    node, membership, deliveries, applied, roots, carried, network,
-                )
-            }
+            let pump = Pump {
+                node: node.clone(),
+                applied,
+                stalls: stalls.clone(),
+                roots: roots.clone(),
+                carried: carried.clone(),
+                network: network.clone(),
+            };
+            move |_| pump.run(membership, deliveries)
         });
         Peer {
             key,
@@ -354,9 +377,32 @@ impl Peer {
             roster,
             marshal,
             heights,
+            proposed,
+            stalls,
             roots,
             carried,
             _dir: dir,
+        }
+    }
+
+    fn stall_at(&self, height: u64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (holding, held) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let stall = Stall {
+            height,
+            holding,
+            release: released,
+        };
+        *self.stalls.lock().unwrap() = Some(stall);
+        (held, release)
+    }
+
+    async fn proposes_at_least(&mut self, target: u64) {
+        loop {
+            let height = self.proposed.next().await.expect("consensus lives");
+            if height >= target {
+                return;
+            }
         }
     }
 
@@ -413,43 +459,54 @@ impl Peer {
     }
 }
 
-async fn pump(
+struct Pump {
     node: Shared,
-    mut membership: Seating,
-    mut deliveries: mpsc::UnboundedReceiver<Delivery>,
     applied: mpsc::UnboundedSender<u64>,
+    stalls: Stalls,
     roots: Roots,
     carried: Carried,
     network: Network,
-) {
-    while let Some((block, ack)) = deliveries.next().await {
-        let mut node = node.lock().await;
-        if let Sequenced::Applied {
-            applied: outcome, ..
-        } = node.apply(&block).await.unwrap()
-        {
-            roots.lock().unwrap().insert(block.height, outcome.root);
-            carried
+}
+
+impl Pump {
+    async fn run(self, mut membership: Seating, mut deliveries: mpsc::UnboundedReceiver<Delivery>) {
+        while let Some((block, ack)) = deliveries.next().await {
+            let mut node = self.node.lock().await;
+            let stall = self
+                .stalls
                 .lock()
                 .unwrap()
-                .insert(block.height, block.frames.clone());
+                .take_if(|stall| stall.height == block.height);
+            if let Some(stall) = stall {
+                stall.hold().await;
+            }
+            if let Sequenced::Applied {
+                applied: outcome, ..
+            } = node.apply(&block).await.unwrap()
+            {
+                self.roots.lock().unwrap().insert(block.height, outcome.root);
+                self.carried
+                    .lock()
+                    .unwrap()
+                    .insert(block.height, block.frames.clone());
+            }
+            let seating = if self.network.closes_an_epoch(block.height) {
+                let epoch = self.network.epoch_after(block.height);
+                let validators = node
+                    .epoch_validators(epoch)
+                    .unwrap()
+                    .expect("the boundary records the epoch");
+                Some((epoch, validators))
+            } else {
+                None
+            };
+            drop(node);
+            if let Some((_, validators)) = seating {
+                membership.seat(block.tip(), &validators).await.unwrap();
+            }
+            ack.acknowledge();
+            let _ = self.applied.unbounded_send(block.height);
         }
-        let seating = if network.closes_an_epoch(block.height) {
-            let epoch = network.epoch_after(block.height);
-            let validators = node
-                .epoch_validators(epoch)
-                .unwrap()
-                .expect("the boundary records the epoch");
-            Some((epoch, validators))
-        } else {
-            None
-        };
-        drop(node);
-        if let Some((_, validators)) = seating {
-            membership.seat(block.tip(), &validators).await.unwrap();
-        }
-        ack.acknowledge();
-        let _ = applied.unbounded_send(block.height);
     }
 }
 
@@ -558,6 +615,40 @@ fn a_frame_every_validator_holds_lands_once_when_leaders_build_ahead_of_finality
                 "each frame rides one block"
             );
             assert_eq!(peer.node.lock().await.pending(), 0);
+        }
+    });
+}
+
+#[test]
+fn validators_keep_proposing_while_every_apply_is_stalled() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=3).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh(&context, &keys).await;
+        let network = network(1_000);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+
+        let stalled = 3;
+        let (holding, releases): (Vec<_>, Vec<_>) =
+            peers.iter().map(|peer| peer.stall_at(stalled)).unzip();
+        for held in holding {
+            held.await.unwrap();
+        }
+        for peer in &mut peers {
+            peer.proposes_at_least(stalled + 3).await;
+        }
+
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        let mut tips = Vec::new();
+        for peer in &mut peers {
+            tips.push(peer.reached(stalled + 3).await);
+        }
+        let common = *tips.iter().min().unwrap();
+        let root = peers[0].root_at(common);
+        for peer in &peers {
+            assert_eq!(peer.root_at(common), root);
         }
     });
 }

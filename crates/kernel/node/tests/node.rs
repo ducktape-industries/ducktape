@@ -117,8 +117,8 @@ fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
 async fn seal(node: &mut TestNode) -> (Block, host::Applied) {
     let tip = node.tip().unwrap();
     let block = node
-        .build(tip, std::iter::empty(), TIME + tip.height + 1)
-        .unwrap();
+        .proposer()
+        .build(tip, std::iter::empty(), TIME + tip.height + 1);
     let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
@@ -159,7 +159,7 @@ fn founding_seals_the_genesis_block_as_the_tip() {
             node.epoch_members(0).unwrap(),
             Some(vec![member(&key(1), "v1:1")])
         );
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
 
         let decoded = Block::decode(block.encode()).unwrap();
         assert_eq!(decoded, block);
@@ -189,7 +189,7 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             }
         );
         assert_eq!(node.pending(), 1);
-        assert!(node.due().unwrap());
+        assert!(node.due());
         assert_eq!(
             node.view(Layer::Preconfirmed).get("probe", b"k").unwrap(),
             Some(b"v".to_vec())
@@ -245,7 +245,7 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             Sequenced::Replayed
         ));
         assert_eq!(node.tip().unwrap(), block.tip());
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
     });
 }
 
@@ -270,7 +270,7 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
             Sequenced::Applied { .. }
         ));
         assert_eq!(node.pending(), 1);
-        assert!(node.due().unwrap());
+        assert!(node.due());
         assert_eq!(
             node.view(Layer::Preconfirmed).get("probe", b"k").unwrap(),
             Some(b"v".to_vec())
@@ -347,7 +347,7 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
         }
 
         let tip = node.tip().unwrap();
-        let parent = node.build(tip, std::iter::empty(), TIME + 1).unwrap();
+        let parent = node.proposer().build(tip, std::iter::empty(), TIME + 1);
         assert_eq!(parent.frames, vec![alice_first.clone(), bob_first.clone()]);
         new(node
             .submit(alice_second.clone(), Source::Client)
@@ -355,11 +355,11 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
             .unwrap()
             .unwrap());
 
-        let child = node.build(parent.tip(), [&parent], TIME + 2).unwrap();
+        let child = node.proposer().build(parent.tip(), [&parent], TIME + 2);
         assert_eq!(child.frames, vec![alice_second.clone()]);
         let again = node
-            .build(parent.tip(), std::iter::empty(), TIME + 2)
-            .unwrap();
+            .proposer()
+            .build(parent.tip(), std::iter::empty(), TIME + 2);
         assert_eq!(again.frames, vec![alice_first, bob_first, alice_second]);
 
         for block in [&parent, &child] {
@@ -409,17 +409,17 @@ fn a_frame_a_client_gave_is_offered_again_until_it_lands_and_a_relayed_one_never
             let tip = node.tip().unwrap();
             let empty = Block::next(tip, TIME + tip.height + 1, Vec::new());
             node.apply(&empty).await.unwrap();
-            for frame in node.reoffer().unwrap() {
+            for frame in node.reoffer() {
                 offered.push((empty.height, frame));
             }
         }
         assert_eq!(offered, vec![(4, given.clone()), (12, given.clone())]);
-        assert_eq!(node.reoffer_all().unwrap(), vec![given]);
+        assert_eq!(node.reoffer_all(), vec![given]);
 
         let (block, _) = seal(&mut node).await;
         assert_eq!(block.frames.len(), 2);
         assert_eq!(node.pending(), 0);
-        assert!(node.reoffer_all().unwrap().is_empty());
+        assert!(node.reoffer_all().is_empty());
     });
 }
 
@@ -476,7 +476,7 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
         ));
         assert_eq!(rejected(&applied.submissions[1]), reason::DUPLICATE);
         assert_eq!(node.pending(), 0);
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
         let refusal = node.submit(one, Source::Client).await.unwrap().unwrap_err();
         assert_eq!(refusal.reason, reason::DUPLICATE);
     });
@@ -566,18 +566,18 @@ fn a_held_frame_leaves_the_pool_when_its_anchor_ages_out() {
         assert_eq!(node.pending(), 1);
         let tip = node.tip().unwrap();
         let last = node
-            .build(tip, std::iter::empty(), TIME + ANCHOR_WINDOW)
-            .unwrap();
+            .proposer()
+            .build(tip, std::iter::empty(), TIME + ANCHOR_WINDOW);
         assert_eq!(last.frames, vec![aging.clone()]);
         let empty = Block::next(tip, TIME + ANCHOR_WINDOW, Vec::new());
         let past = node
-            .build(empty.tip(), [&empty], TIME + ANCHOR_WINDOW + 1)
-            .unwrap();
+            .proposer()
+            .build(empty.tip(), [&empty], TIME + ANCHOR_WINDOW + 1);
         assert_eq!(past.frames, Vec::<Vec<u8>>::new());
 
         node.apply(&empty).await.unwrap();
         assert_eq!(node.pending(), 0);
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
         let refusal = node
             .submit(aging, Source::Client)
             .await
@@ -641,7 +641,7 @@ fn a_frame_is_refused_when_it_names_another_network_lies_about_its_signer_or_out
             .unwrap_err();
         assert_eq!(refusal.reason, reason::CAPACITY);
         assert_eq!(node.pending(), 0);
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
     });
 }
 
@@ -722,7 +722,7 @@ fn a_message_lands_in_the_block_that_carries_its_frame() {
         .await
         .unwrap()
         .unwrap();
-        assert!(node.due().unwrap());
+        assert!(node.due());
 
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
@@ -732,7 +732,7 @@ fn a_message_lands_in_the_block_that_carries_its_frame() {
             .map(|receipt| receipt.program.as_str())
             .collect();
         assert_eq!(ran, ["pong", "ping"]);
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
     });
 }
 
