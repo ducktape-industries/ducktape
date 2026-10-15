@@ -3,7 +3,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use host::{Receipt, Submission, SubmissionId};
+use abi::Receipt;
+use host::{Submission, SubmissionId};
 
 const FIRST_WAIT: u64 = 4;
 const LONGEST_WAIT: u64 = 64;

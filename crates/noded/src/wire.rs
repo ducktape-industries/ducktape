@@ -1,6 +1,7 @@
+use abi::Receipt;
 use abi::{ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
-use host::{Layer, Receipt, Tip};
+use host::{Layer, Tip};
 use node::Preconfirm;
 
 pub const NODE_CONTRACT: u32 = 9;

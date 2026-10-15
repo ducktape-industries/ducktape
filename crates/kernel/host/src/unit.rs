@@ -4,7 +4,7 @@ use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::role::identity::AccountNumber;
 use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
-    ProgramCall, ProgramId, Refusal, Roles, reason, role,
+    ProgramCall, ProgramId, Receipt, Refusal, Roles, reason, role,
 };
 use blob::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
@@ -12,7 +12,7 @@ use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Ran, Runtime, Suspended};
 use state::{Overlay, Storage, Store, View};
 
-use crate::{Error, Receipt, Result, crypto, namespace, parked};
+use crate::{Error, Result, crypto, namespace, parked};
 
 pub struct Loaded {
     runtime: Runtime,

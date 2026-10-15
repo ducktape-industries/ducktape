@@ -1,11 +1,12 @@
 //! Block summaries this node records as it applies blocks, served by the
 //! block read routes; a route reads a block out of the marshal archive only
 //! for a payload its caller asks for.
+use abi::Receipt;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_consensus::types::Height;
 use commonware_cryptography::{Digestible as _, sha256};
 use consensus::validators_of;
-use host::{Receipt, Submission, SubmissionId};
+use host::{Submission, SubmissionId};
 use node::{Block, Body, Carried, Frame, Node};
 
 use crate::wire::{BlockAsk, BlockRef, Blocks, Finalized, Located, Page, Tx, TxAsk, TxRef};

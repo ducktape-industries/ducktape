@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use abi::Receipt;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::Bytes;
@@ -12,7 +13,6 @@ use axum::routing::{get, post};
 use borsh::BorshSerialize;
 use futures::channel::mpsc;
 use futures::{SinkExt as _, StreamExt as _};
-use host::Receipt;
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use node::{BLOCK_BYTES, Preconfirm, Source, Taken};
 use statesync::Request as SyncRequest;

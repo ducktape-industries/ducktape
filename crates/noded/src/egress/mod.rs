@@ -1,5 +1,5 @@
 //! The node's egress worker: after each applied block it reads the program bound to the egress
-//! role and answers, expires and serves through it with the node's key. Spawned by `run.rs`.
+//! role and answers and serves through it with the node's key. Spawned by `run.rs`.
 mod call;
 mod config;
 mod desk;
@@ -136,7 +136,6 @@ impl<E: Context> Worker<E> {
         let assigned = self
             .requests(&node, &Query::Assigned { key: key.clone() })
             .await?;
-        let overdue = self.requests(&node, &Query::Overdue).await?;
         let Reply::Node(row) = self.ask(&node, &Query::Node { key: key.clone() }).await? else {
             return Err(Error::Corrupt(
                 "the egress program answered a node with something else".into(),
@@ -150,7 +149,6 @@ impl<E: Context> Worker<E> {
         serving.sort();
         Ok(Reading {
             assigned,
-            overdue,
             serving,
             member,
         })

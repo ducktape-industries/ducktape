@@ -2,6 +2,7 @@ mod crypto;
 mod namespace;
 mod parked;
 mod parking;
+mod scheduling;
 mod unit;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,7 +13,7 @@ use std::path::Path;
 pub use abi::Roles;
 use abi::{
     BlobId, Cause, Env, HashKind, Invocation, ItemRef, Message, Origin, Outcome, Principal,
-    ProgramCall, ProgramId, Refusal, Root, Scan, hook, reason,
+    ProgramCall, ProgramId, Receipt, Refusal, Root, Scan, hook, reason,
     role::{self, identity, programs, validators},
 };
 use blob::{Blobs, Layered, Stage};
@@ -39,7 +40,7 @@ const CODE_KIND: &str = "program";
 pub const MAX_DEPTH: u32 = 8;
 pub const ANCHOR_WINDOW: u64 = 256;
 pub const HOOK_FUEL: u64 = 2_000_000;
-const HOOK_LOG_EVERY: u64 = 64;
+const STREAK_LOG_EVERY: u64 = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -151,18 +152,6 @@ impl Submission {
     }
 }
 
-/// One frame's run. A rejected receipt's run wrote nothing: the outcome
-/// is the refusal of the run itself or, propagated, of a run nested in it.
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct Receipt {
-    pub program: ProgramId,
-    pub outcome: Outcome,
-    pub events: Vec<Vec<u8>>,
-    /// A nested receipt's `Applied` and events stand only when every
-    /// receipt above it was applied too: an ancestor's rejection undid it.
-    pub nested: Vec<Receipt>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     pub height: u64,
@@ -189,6 +178,7 @@ where
     loaded: Loaded,
     preconfirmed: Overlay,
     hook_streaks: BTreeMap<ProgramId, u64>,
+    scheduler_streak: u64,
 }
 
 enum Submitted {
@@ -398,6 +388,7 @@ where
             loaded: Loaded::new(genesis.limits),
             preconfirmed: Overlay::default(),
             hook_streaks: BTreeMap::new(),
+            scheduler_streak: 0,
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -496,6 +487,7 @@ where
             loaded: Loaded::new(limits),
             preconfirmed: Overlay::default(),
             hook_streaks: BTreeMap::new(),
+            scheduler_streak: 0,
         };
         host.sync_code()?;
         Ok(host)
@@ -876,6 +868,10 @@ where
             submissions.push(receipt);
         }
         self.log_hooks(block.height, hooks);
+        let refusals = self
+            .run_scheduled(block.height, block.time, &mut overlay, &mut stage)
+            .await?;
+        self.log_scheduler(block.height, refusals);
         let epoch_length = self.epoch_length()?;
         let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
         if ends_an_epoch {
@@ -1080,7 +1076,7 @@ where
             };
             let blocks = self.hook_streaks.entry(program.clone()).or_default();
             *blocks += 1;
-            let due = *blocks == 1 || blocks.is_multiple_of(HOOK_LOG_EVERY);
+            let due = *blocks == 1 || blocks.is_multiple_of(STREAK_LOG_EVERY);
             if due {
                 tracing::warn!(
                     target: "ducktape::hook",

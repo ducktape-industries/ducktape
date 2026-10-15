@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
+use abi::Receipt;
 use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::{Stream, StreamExt as _};
-use host::{ANCHOR_WINDOW, Layer, RECENT, Receipt, SubmissionId};
+use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
 use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
