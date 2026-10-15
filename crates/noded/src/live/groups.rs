@@ -25,8 +25,9 @@ pub enum GroupOut {
 }
 
 /// How a group's objects reach a writer: queued; dropped now, for a queue that overflowed or
-/// a hole in the group's objects (the egress is counted behind); or dropped quiet, as the rest
-/// of a group dropped before.
+/// a hole in the group's objects (the lane counts it; the client egress has no counter of its
+/// own); or dropped quiet, as the rest of a group dropped before.
+#[must_use]
 pub enum Handed {
     Queued,
     Dropped,
@@ -62,7 +63,7 @@ impl Groups {
         let key = (header.alias, header.group);
         let expected = self.open.get(&key).map_or(0, |open| open.next);
         if object != expected {
-            return self.cut(key);
+            return self.dropped(key);
         }
         let handed = self.hand(header, GroupOut::Object(body), spawn);
         if let (Handed::Queued, Some(open)) = (&handed, self.open.get_mut(&key)) {
@@ -84,7 +85,7 @@ impl Groups {
     ) -> Handed {
         let key = (header.alias, header.group);
         if self.open.contains_key(&key) {
-            return self.cut(key);
+            return self.dropped(key);
         }
         let count = objects.len() as u32;
         let handed = self.hand(header, GroupOut::Batch(objects), spawn);
@@ -119,6 +120,10 @@ impl Groups {
             return Handed::Abandoned;
         }
         let open = self.open.entry(key).or_insert_with(|| {
+            // A newer group of the track begins: a cut held for an older one whose end never
+            // came (it was the item dropped) is over.
+            self.abandoned
+                .retain(|(alias, group)| *alias != header.alias || *group >= header.group);
             let (sending, queue) = mpsc::channel(GROUP_QUEUE);
             spawn(header, queue);
             Open { sending, next: 0 }
@@ -126,12 +131,20 @@ impl Groups {
         if open.sending.try_send(out).is_ok() {
             return Handed::Queued;
         }
-        self.cut(key)
+        self.dropped(key)
+    }
+
+    /// An item of the group (an object, or its end) was dropped before it reached here: the
+    /// group is dropped short, its stream reset if one is open, and what of it still arrives is
+    /// dropped quiet. The cut may overtake the group's own items, so it holds until a newer
+    /// group of the track begins.
+    pub fn cut(&mut self, alias: Alias, group: u64) {
+        let _ = self.dropped((alias, group));
     }
 
     /// The group is dropped short: its writer, if any, resets the stream, and the rest of the
     /// group is dropped quiet until it ends.
-    fn cut(&mut self, key: (Alias, u64)) -> Handed {
+    fn dropped(&mut self, key: (Alias, u64)) -> Handed {
         if self.abandoned.contains(&key) {
             return Handed::Abandoned;
         }
@@ -184,6 +197,54 @@ mod tests {
             Handed::Queued
         ));
         assert_eq!(spawned.borrow().len(), 1, "one stream, opened at object 0");
+    }
+
+    #[test]
+    fn a_cut_resets_an_open_group_and_holds_a_group_quiet_until_a_newer_one() {
+        let mut groups = Groups::default();
+        let (spawned, spawn) = counting();
+        let body = Bytes::from_static(b"x");
+        let header = GroupHeader { alias: 1, group: 5 };
+        assert!(matches!(
+            groups.object(header, 0, body.clone(), &spawn),
+            Handed::Queued
+        ));
+        groups.cut(1, 5);
+        {
+            let mut queues = spawned.borrow_mut();
+            let _ = queues[0].try_recv();
+            assert!(
+                matches!(
+                    queues[0].try_recv(),
+                    Err(mpsc::error::TryRecvError::Disconnected)
+                ),
+                "the writer's queue is closed after the object: the stream is reset"
+            );
+        }
+        assert!(matches!(
+            groups.object(header, 1, body.clone(), &spawn),
+            Handed::Abandoned
+        ));
+        // A cut that overtook its group's items holds them quiet, until a newer group begins.
+        let later = GroupHeader { alias: 1, group: 6 };
+        groups.cut(1, 6);
+        assert!(matches!(
+            groups.object(later, 0, body.clone(), &spawn),
+            Handed::Abandoned
+        ));
+        let newer = GroupHeader { alias: 1, group: 7 };
+        assert!(matches!(
+            groups.object(newer, 0, body.clone(), &spawn),
+            Handed::Queued
+        ));
+        assert!(
+            groups.abandoned.is_empty(),
+            "the held cuts of older groups are gone"
+        );
+        assert!(
+            matches!(groups.object(later, 1, body, &spawn), Handed::Dropped),
+            "an older straggler is a hole"
+        );
     }
 
     #[test]

@@ -536,7 +536,8 @@ async fn quic_writing(
                 body,
                 priority,
             }) => {
-                groups.object(header, object, body, spawn(priority));
+                // The client egress has no counter of its own; the lane counts its drops.
+                let _ = groups.object(header, object, body, spawn(priority));
             }
             Drained::Out(Out::Group {
                 header,
@@ -544,7 +545,7 @@ async fn quic_writing(
                 objects,
                 end,
             }) => {
-                groups.batch(header, objects, end, spawn(priority));
+                let _ = groups.batch(header, objects, end, spawn(priority));
             }
             Drained::Out(Out::GroupEnd {
                 alias,

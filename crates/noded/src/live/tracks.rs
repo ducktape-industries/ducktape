@@ -67,9 +67,17 @@ pub enum Effect {
 /// datagram to the node that subscribed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Relayed {
-    /// Open the control stream to this peer and resync, even with nothing else to send: the
-    /// peer was just seated, or its fresh control stream says it needs our state again.
-    Resync { to: PublicKey },
+    /// The peer opened a fresh control stream to us: it is new, or restarted and forgot us.
+    /// Open ours back and resync, even with nothing else to send. (A member seated is resynced
+    /// by the lane itself, not through a step.)
+    Fresh { to: PublicKey },
+    /// A data item to this peer was dropped on its way to the lane: the lane cuts the group
+    /// short at that peer, so the peer never reads a group with a hole as whole.
+    Cut {
+        to: PublicKey,
+        alias: Alias,
+        group: u64,
+    },
     Announce {
         track: Track,
         by: Account,
@@ -478,7 +486,6 @@ impl State {
         Ok(id)
     }
 
-    /// The session is gone: its tracks end, its subscriptions and watches drop.
     /// A proven session joins the table and hears its welcome, or hears why not.
     pub fn welcome(
         &mut self,
@@ -516,6 +523,7 @@ impl State {
         effects
     }
 
+    /// The session is gone: its tracks end, its subscriptions and watches drop.
     pub fn closed(&mut self, id: SessionId) -> Vec<Effect> {
         let mut effects = Vec::new();
         let Some(session) = self.sessions.remove(&id) else {
@@ -2251,22 +2259,22 @@ impl State {
         found
     }
 
-    /// Our control stream to `peer` is being reopened and will carry a resync: the asks in flight
-    /// to it fold into the resync's one ask per track, whose one answer is the one the waiting
-    /// subscribers hear.
-    pub fn asks_folded(&mut self, peer: &PublicKey) -> Vec<Effect> {
+    /// Our control stream to `peer` just opened and leads with a resync: the asks in flight to
+    /// it fold into the resync's one ask per track, whose one answer is the one the waiting
+    /// subscribers hear, and the resync is what the stream carries.
+    pub fn resynced(&mut self, peer: &PublicKey) -> (Vec<Forward>, Vec<Effect>) {
         for held in self.tracks.values_mut() {
             let theirs = held.origin == Origin::Remote(peer.clone());
             if theirs && held.unanswered > 1 {
                 held.unanswered = 1;
             }
         }
-        Vec::new()
+        (self.resync(peer), Vec::new())
     }
 
     /// What a peer whose control stream just opened must hear to be in step: every local track
     /// up, and our asks for its tracks that local subscribers wait on.
-    pub fn resync(&self, peer: &PublicKey) -> Vec<Forward> {
+    fn resync(&self, peer: &PublicKey) -> Vec<Forward> {
         let mut tracks: Vec<(&Track, &Published)> = self.tracks.iter().collect();
         tracks.sort_by(|a, b| a.0.cmp(b.0));
         let mut forwards = Vec::new();
@@ -2368,7 +2376,7 @@ impl State {
     pub fn peer_fresh(&mut self, peer: PublicKey) -> Vec<Effect> {
         let provisional = self.told_by(&peer);
         self.resyncing.insert(peer.clone(), provisional);
-        vec![Effect::Lane(Relayed::Resync { to: peer })]
+        vec![Effect::Lane(Relayed::Fresh { to: peer })]
     }
 
     /// The peer's resync ended: whatever it did not repeat is gone.
@@ -3008,7 +3016,7 @@ mod tests {
         assert!(
             !lane(swept).iter().any(|relayed| matches!(
                 relayed,
-                Relayed::Ended { to, .. } | Relayed::Resync { to } if *to == gone
+                Relayed::Ended { to, .. } | Relayed::Fresh { to } if *to == gone
             )),
             "nothing is sent to a member that is gone: its writer is dropped, not re-made"
         );
@@ -3116,9 +3124,9 @@ mod tests {
         state.subscribe(carol, 1, doc.clone(), Start::Latest, true);
         // Two asks are out when the stream to the peer dies; the resync asks once, and the one
         // answer to it is the one both waiting subscribers hear.
-        state.asks_folded(&peer);
         let asks = state
-            .resync(&peer)
+            .resynced(&peer)
+            .0
             .into_iter()
             .filter(|forward| matches!(forward, Forward::Subscribe { .. }))
             .count();

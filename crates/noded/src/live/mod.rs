@@ -82,7 +82,8 @@ pub struct Relay<E: crate::Context> {
     dirty: Mutex<Dirty>,
     rechecks: Arc<Notify>,
     lane: lane::Queue,
-    /// Set when `lane` was full: the lane task then drops every peer's writer and resyncs.
+    /// Set when the lane's control queue was full: the lane task then drops every peer's writer
+    /// and resyncs.
     lane_behind: AtomicBool,
     /// Every task the relay runs, the live lane's included: dropped with the relay, they are
     /// aborted, and what they hold of halo goes with them.
