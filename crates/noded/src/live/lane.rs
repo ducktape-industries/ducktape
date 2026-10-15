@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use super::Relay;
-use super::session::{CONTROL_BYTES, MAX_OPEN_GROUPS, framed};
+use super::session::{CONTROL_BYTES, framed};
 use super::tracks::Relayed;
 
 /// Streams peers opened and this node has not taken yet, over every peer.
@@ -34,6 +34,12 @@ const QUEUE: usize = 4096;
 const PEER_QUEUE: usize = 1024;
 /// Objects waiting on one group stream to a peer; past it the group is dropped short.
 const GROUP_QUEUE: usize = 256;
+/// Group stream writers alive to one peer at once. A group is a bidirectional stream on the one
+/// connection halo keeps to that member, and every lane on it, blobs included, shares quinn's
+/// default of 100 concurrent bidirectional streams a peer may open
+/// (quinn-proto 0.11.15 `src/config/transport.rs:362`), so the lane takes a sixth of them and
+/// leaves the rest to the others.
+const PEER_GROUPS: usize = 16;
 /// A control stream that would not open logs its first attempt, then every tenth.
 const ATTEMPTS_PER_LINE: u32 = 10;
 
@@ -232,7 +238,7 @@ impl<E: super::Context> Lanes<E> {
                 attempts: 0,
                 groups: HashMap::new(),
                 abandoned: HashSet::new(),
-                writers: Arc::new(Semaphore::new(MAX_OPEN_GROUPS)),
+                writers: Arc::new(Semaphore::new(PEER_GROUPS)),
             };
             self.track(tokio::spawn(peer_writing(link, queue)));
             self.peers.insert(to.clone(), sending);
@@ -341,7 +347,7 @@ impl<E: super::Context> PeerLink<E> {
         written
     }
 
-    /// With `MAX_OPEN_GROUPS` group writers alive to one peer a new group is dropped short and
+    /// With `PEER_GROUPS` group writers alive to one peer a new group is dropped short and
     /// counted: the peer's stream credit is shared with every lane, and a peer this far behind
     /// gets the next group.
     fn group_object(&mut self, header: GroupHeader, body: Bytes) {
