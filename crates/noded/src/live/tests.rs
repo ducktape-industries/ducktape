@@ -27,7 +27,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::grants::{Answered, Chain};
 use super::session::WS_MESSAGE;
-use super::{Network, Relay, ws_upgrade};
+use super::{GOAWAY_MS, Network, Relay, ws_upgrade};
 
 type Context = runtime::Context;
 
@@ -551,6 +551,26 @@ fn a_seated_key_is_welcomed_as_its_account_and_a_bad_proof_or_an_unseated_key_is
                 request: 0,
                 code: Code::BadProof
             }
+        );
+    });
+}
+
+#[test]
+fn a_session_proven_after_the_node_began_to_go_away_hears_it_too() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        let node = node(context, 1, ledger);
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        node.shutdown.send_replace(true);
+        assert_eq!(alice.recv().await, Control::GoAway { in_ms: GOAWAY_MS });
+        let mut late = Client::dial(&node).await;
+        assert_eq!(
+            late.handshake(&bob, GENESIS, &node.key, &bob).await,
+            Control::GoAway { in_ms: GOAWAY_MS },
+            "no session is welcomed once the node is going away"
         );
     });
 }
@@ -1169,6 +1189,35 @@ fn an_object_over_its_cap_is_refused_too_large_and_the_session_goes_on() {
             (header.group, objects, complete),
             (2, vec![b"fits".to_vec()], true)
         );
+    });
+}
+
+#[test]
+fn a_group_whose_stream_ends_inside_a_length_prefix_is_cut_short() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context, 1, ledger);
+        let doc = track("room", "doc");
+
+        let (mut alice, _) = Client::open(&node, &alice).await;
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
+        bob.subscribe(1, doc.clone(), Start::Next).await;
+        alice.recv().await;
+
+        let mut open = alice.group_open(alias, 1, &[b"whole"]).await;
+        let mut stream = bob.connection.accept_uni().await.unwrap();
+        assert_eq!(read_header(&mut stream).await.group, 1);
+        assert_eq!(read_object(&mut stream).await, b"whole");
+        // Two of a prefix's four bytes, then FIN: the next object was cut, not the group done.
+        tokio::io::AsyncWriteExt::write_all(&mut open, &[9, 0])
+            .await
+            .unwrap();
+        open.finish().unwrap();
+        assert!(!read_end(&mut stream).await, "the group is cut short");
     });
 }
 

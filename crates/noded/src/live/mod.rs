@@ -34,7 +34,7 @@ pub use grants::Chain;
 use grants::{Act, Grants, covered, place};
 pub use session::ws_upgrade;
 use session::{Inbound, Link, Out, Outlet, Sent};
-use tracks::{Effect, SessionId, State};
+use tracks::{Effect, GoingAway, SessionId, State};
 
 /// What the relay needs of the node's runtime: the node's own context.
 pub trait Context: crate::Context {}
@@ -540,6 +540,13 @@ fn refused(link: &Link, code: Code) {
     link.outlet.close(code.as_str());
 }
 
+/// A session proven while the node goes away hears when to re-open, and is closed.
+fn going_away(link: &Link, in_ms: u32) {
+    tracing::debug!(target: "ducktape::live", event = "live_refused", reason = "node_closing", path = link.path, "a live session was refused");
+    link.outlet.send(Out::Control(Control::GoAway { in_ms }));
+    link.outlet.close("node_closing");
+}
+
 /// One session, from its handshake to its close. The relay is held only while a step runs, so
 /// an open client never keeps a dropped relay alive.
 async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
@@ -552,7 +559,11 @@ async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
         Handshake::Refused(code) => return refused(&link, code),
         Handshake::Gone => return link.outlet.close("no_handshake"),
     };
-    let id = strong.state().opened(account, key, link.outlet.clone());
+    let opened = strong.state().opened(account, key, link.outlet.clone());
+    let id = match opened {
+        Ok(id) => id,
+        Err(GoingAway { in_ms }) => return going_away(&link, in_ms),
+    };
     link.outlet.send(Out::Control(Control::Welcome(Welcome {
         account,
         datagrams: link.datagrams,

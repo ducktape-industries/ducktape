@@ -223,7 +223,15 @@ pub struct State {
     watches: HashMap<String, Vec<Watcher>>,
     sessions: HashMap<SessionId, Session>,
     next_session: SessionId,
+    /// When to re-open, once the node began to go away.
+    going_away: Option<u32>,
     metrics: Metrics,
+}
+
+/// A session proven after the node began to go away: it hears when to re-open.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GoingAway {
+    pub in_ms: u32,
 }
 
 /// The first check that fails, in the order the checks are listed, is the refusal.
@@ -250,6 +258,7 @@ impl State {
             watches: HashMap::new(),
             sessions: HashMap::new(),
             next_session: 1,
+            going_away: None,
             metrics,
         }
     }
@@ -295,7 +304,17 @@ impl State {
 
     // ---- sessions ----
 
-    pub fn opened(&mut self, account: Account, key: Vec<u8>, outlet: Outlet) -> SessionId {
+    /// A proven session takes its place, unless the node is going away: then it hears what the
+    /// open sessions heard.
+    pub fn opened(
+        &mut self,
+        account: Account,
+        key: Vec<u8>,
+        outlet: Outlet,
+    ) -> Result<SessionId, GoingAway> {
+        if let Some(in_ms) = self.going_away {
+            return Err(GoingAway { in_ms });
+        }
         let id = self.next_session;
         self.next_session += 1;
         self.sessions.insert(
@@ -310,7 +329,7 @@ impl State {
             },
         );
         self.metrics.sessions.set(self.sessions.len() as i64);
-        id
+        Ok(id)
     }
 
     pub fn outlets(&self) -> Vec<Outlet> {
@@ -346,8 +365,10 @@ impl State {
         effects
     }
 
-    /// Every session hears the node is going away; the caller closes them once it is sent.
-    pub fn go_away(&self, in_ms: u32) -> Vec<Effect> {
+    /// Every session hears the node is going away, and every one proven from now on; the caller
+    /// closes them once it is sent.
+    pub fn go_away(&mut self, in_ms: u32) -> Vec<Effect> {
+        self.going_away = Some(in_ms);
         self.sessions
             .values()
             .map(|session| {
@@ -1676,7 +1697,9 @@ mod tests {
     fn a_node_that_asks_again_hears_the_answer_and_no_second_replay() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let mut state = state(&context);
-            let publisher = state.opened(42, vec![1], super::super::session::unconnected());
+            let publisher = state
+                .opened(42, vec![1], super::super::session::unconnected())
+                .expect("the node is not going away");
             let doc = Track {
                 namespace: "net#00000000/chat/room".into(),
                 name: "doc".into(),
