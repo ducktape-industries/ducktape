@@ -104,7 +104,6 @@ pub struct Daemon<E: Context> {
     pub summaries: Summaries<E>,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
-    /// The height of each block the node applies, as it applies it.
     pub tips: watch::Sender<u64>,
     pub relay: relay::Relay<E>,
     pub blobs: blob::service::Service,

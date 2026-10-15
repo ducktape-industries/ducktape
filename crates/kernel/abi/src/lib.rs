@@ -100,8 +100,6 @@ pub struct Roles {
     pub identity: ProgramId,
     pub blobs: ProgramId,
     pub awaits: ProgramId,
-    /// Answers programs' calls outside the chain; `None` on a network that
-    /// makes none. Nodes read it, the kernel never calls it.
     pub egress: Option<ProgramId>,
 }
 
@@ -730,10 +728,6 @@ pub mod role {
         }
     }
 
-    /// A program's call to something outside the chain: a registered service
-    /// or the public internet, answered by the member node the chain elects,
-    /// in a later block. Every node reads this contract to answer what it is
-    /// elected for and to expire what nobody answered.
     pub mod egress {
         use crate::role::identity::AccountNumber;
         use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
@@ -744,12 +738,24 @@ pub mod role {
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Op {
-            Register { service: String },
-            Assign { service: String, nodes: Vec<Vec<u8>> },
-            Serve { services: Vec<String> },
+            Register {
+                service: String,
+            },
+            Assign {
+                service: String,
+                nodes: Vec<Vec<u8>>,
+            },
+            Serve {
+                services: Vec<String>,
+            },
             Request(Request),
-            Answer { id: u64, answer: Answer },
-            Expire { id: u64 },
+            Answer {
+                id: u64,
+                answer: Answer,
+            },
+            Expire {
+                id: u64,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -811,8 +817,6 @@ pub mod role {
             pub since: u64,
         }
 
-        /// What a node asks: every open request elected to `key`, every
-        /// request past its deadline, and the services `key` serves.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         #[borsh(use_discriminant = true)]
         #[repr(u8)]
@@ -820,6 +824,7 @@ pub mod role {
             Assigned { key: Vec<u8> } = 0,
             Overdue = 1,
             Node { key: Vec<u8> } = 2,
+            Serving { service: String } = 3,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -828,12 +833,9 @@ pub mod role {
         pub enum Reply {
             Requests(Vec<RequestRow>) = 0,
             Node(Option<NodeRow>) = 1,
+            Serving(Vec<Vec<u8>>) = 2,
         }
 
-        /// The HTTP shape every egress call speaks: a [`Head`] (a method, a
-        /// target, headers) and the body as blob parts in, the [`Response`]
-        /// the node got back out. The target is a full URL for [`HTTP`] and a
-        /// path for a registered service.
         pub mod http {
             use crate::{BorshDeserialize, BorshSerialize, Refusal, reason};
 
@@ -1044,8 +1046,13 @@ mod tests {
         assert_eq!(encode(&Query::Assigned { key: vec![7] })[0], 0);
         assert_eq!(encode(&Query::Overdue), [1]);
         assert_eq!(encode(&Query::Node { key: vec![7] })[0], 2);
+        let serving = Query::Serving {
+            service: "s".into(),
+        };
+        assert_eq!(encode(&serving)[0], 3);
         assert_eq!(encode(&Reply::Requests(Vec::new())), [0, 0, 0, 0, 0]);
         assert_eq!(encode(&Reply::Node(None)), [1, 0]);
+        assert_eq!(encode(&Reply::Serving(Vec::new())), [2, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -1063,7 +1070,12 @@ mod tests {
         for fits in [url, "http://127.0.0.1:8080/x?y=1"] {
             assert_eq!(head(&[], fits).check_url(), Ok(()), "{fits}");
         }
-        for unfit in ["/v1/messages", "ftp://host/", "https:///path", "https://host/a b"] {
+        for unfit in [
+            "/v1/messages",
+            "ftp://host/",
+            "https:///path",
+            "https://host/a b",
+        ] {
             let refusal = head(&[], unfit).check_url().unwrap_err();
             assert_eq!(refusal.reason, reason::INVALID_INPUT, "{unfit}");
         }
@@ -1085,7 +1097,13 @@ mod tests {
         for name in ["authorization", "x-api-key", "cookie"] {
             assert_eq!(head(&[(name, "x")], "/").check_path(), Ok(()), "{name}");
         }
-        for name in ["host", "content-length", "connection", "ducktape-program", "X-Up"] {
+        for name in [
+            "host",
+            "content-length",
+            "connection",
+            "ducktape-program",
+            "X-Up",
+        ] {
             assert!(head(&[(name, "x")], "/").check_path().is_err(), "{name}");
         }
     }

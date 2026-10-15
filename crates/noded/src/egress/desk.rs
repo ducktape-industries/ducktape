@@ -1,7 +1,5 @@
-//! What the egress worker does after a block, decided from what it read and what it holds: call
-//! each request newly elected to this node, send each computed answer, expire each request past
-//! its deadline, and send `Serve` while the chain's record of this node differs from its config.
-//! Every send repeats each block until a block carries it; the desk never performs one.
+//! The egress worker's decisions after each block: which requests to call, and which answers,
+//! expiries and `Serve` frames to send. Pure; `mod.rs` performs what it decides.
 use std::collections::{BTreeMap, BTreeSet};
 
 use abi::role::egress::{Answer, Op, RequestRow};
@@ -158,7 +156,8 @@ impl Desk {
     }
 
     pub fn sent(&mut self, purpose: &Purpose, sent: Sent) {
-        let too_large = matches!(&sent, Sent::Refused(refusal) if refusal.reason == reason::CAPACITY);
+        let too_large =
+            matches!(&sent, Sent::Refused(refusal) if refusal.reason == reason::CAPACITY);
         let next = match sent {
             Sent::Pending(frame) => Sending::Pending(frame),
             Sent::Stale => Sending::Unsigned,
@@ -170,9 +169,8 @@ impl Desk {
                     return;
                 };
                 if too_large {
-                    *answer = Answer::Failed(
-                        "the answer is larger than a block carries".to_owned(),
-                    );
+                    *answer =
+                        Answer::Failed("the answer is larger than a block carries".to_owned());
                     *sending = Sending::Unsigned;
                     return;
                 }

@@ -66,7 +66,10 @@ fn a_stale_frame_is_signed_again_and_an_answer_too_large_for_a_block_becomes_a_f
         ..
     }) = desk.op(&purpose)
     else {
-        panic!("the answer did not become a failure: {:?}", desk.op(&purpose));
+        panic!(
+            "the answer did not become a failure: {:?}",
+            desk.op(&purpose)
+        );
     };
     let resent = desk.read(reading(&[1], &[], &["relay"], true));
     assert_eq!(resent, [Step::Send(purpose)]);

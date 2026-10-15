@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
+use abi::role::egress::RELAY;
+use abi::role::egress::http::Method;
 use axum::Router;
 use axum::http::{HeaderMap, Method as Verb, Uri};
 use axum::response::Redirect;
 use axum::routing::any;
-use abi::role::egress::RELAY;
-use abi::role::egress::http::Method;
 use tokio::net::TcpListener;
 
 use super::*;

@@ -1,6 +1,5 @@
-//! The node's egress worker: after every applied block it reads the program bound to the egress
-//! role, calls what the chain elected this node for, and signs and submits the answers, the
-//! expiries and its own `Serve` with the node's key, each until a block carries it.
+//! The node's egress worker: after each applied block it reads the program bound to the egress
+//! role and answers, expires and serves through it with the node's key. Spawned by `run.rs`.
 mod call;
 mod config;
 mod desk;
@@ -118,8 +117,8 @@ impl<E: Context> Worker<E> {
     async fn requests(&self, node: &Node<E>, query: &Query) -> Result<Vec<RequestRow>> {
         match self.ask(node, query).await? {
             Reply::Requests(rows) => Ok(rows),
-            Reply::Node(_) => Err(Error::Corrupt(
-                "the egress program answered a request listing with a node".into(),
+            Reply::Node(_) | Reply::Serving(_) => Err(Error::Corrupt(
+                "the egress program answered a request listing with something else".into(),
             )),
         }
     }
@@ -133,7 +132,7 @@ impl<E: Context> Worker<E> {
         let overdue = self.requests(&node, &Query::Overdue).await?;
         let Reply::Node(row) = self.ask(&node, &Query::Node { key: key.clone() }).await? else {
             return Err(Error::Corrupt(
-                "the egress program answered a node with a request listing".into(),
+                "the egress program answered a node with something else".into(),
             ));
         };
         let epoch = self.daemon.network.epoch_after(node.tip()?.height);
@@ -168,20 +167,23 @@ impl<E: Context> Worker<E> {
             id = row.id,
             service = row.request.service(),
         );
-        self.daemon.context.child("egress_call").spawn(move |_| async move {
-            let answer = match body(&daemon, row.request.parts()).await {
-                Ok(body) => {
-                    let caller = Caller {
-                        chain: &daemon.descriptor.network,
-                        program: &row.requester,
-                        id: row.id,
-                    };
-                    call::answer(&clients, &config, &caller, &row.request, body).await
-                }
-                Err(reason) => Answer::Failed(reason),
-            };
-            let _ = answers.unbounded_send((row.id, answer));
-        });
+        self.daemon
+            .context
+            .child("egress_call")
+            .spawn(move |_| async move {
+                let answer = match body(&daemon, row.request.parts()).await {
+                    Ok(body) => {
+                        let caller = Caller {
+                            chain: &daemon.descriptor.network,
+                            program: &row.requester,
+                            id: row.id,
+                        };
+                        call::answer(&clients, &config, &caller, &row.request, body).await
+                    }
+                    Err(reason) => Answer::Failed(reason),
+                };
+                let _ = answers.unbounded_send((row.id, answer));
+            });
     }
 
     async fn send(&self, desk: &mut Desk, purpose: Purpose) {
@@ -263,7 +265,10 @@ impl<E: Context> Worker<E> {
     }
 }
 
-async fn body<E: Context>(daemon: &Daemon<E>, parts: &[BlobId]) -> std::result::Result<Vec<u8>, String> {
+async fn body<E: Context>(
+    daemon: &Daemon<E>,
+    parts: &[BlobId],
+) -> std::result::Result<Vec<u8>, String> {
     let mut body = Vec::new();
     for part in parts {
         if !daemon.blobs.store().has(part) {

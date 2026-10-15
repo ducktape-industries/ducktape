@@ -1,6 +1,5 @@
-//! What this node serves through the egress role, read from `egress.toml` in its workspace: the
-//! relay, the public internet and whether it may reach private addresses, and each registered
-//! service it fronts with the base URL its requests go to and the headers carrying its secrets.
+//! What this node serves through the egress role, read from `egress.toml` in its workspace.
+//! Read by `run.rs` at start and handed to the egress worker.
 use std::collections::BTreeMap;
 
 use abi::role::egress::{HTTP, RELAY, RESERVED};

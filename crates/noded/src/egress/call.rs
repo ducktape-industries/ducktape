@@ -1,7 +1,5 @@
-//! One request answered: a relay at once with nothing; a public `http` request at its own URL,
-//! public addresses only unless the node allows private ones; a registered service's request at
-//! the service's base joined with its path, with the service's secrets and the chain's word on
-//! who asked. The whole response is the answer, a redirect included, never followed.
+//! One egress request answered by this node: a relay, a public `http` request, or a registered
+//! service's request at its configured base. Used by the egress worker in `mod.rs`.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
