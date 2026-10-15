@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub enum Error {
     #[error("{0} is not a member halo can reach")]
     Unreachable(PublicKey),
+    #[error("the lane table serves no lane {0}")]
+    NoLane(String),
     #[error("the path to {0} carries no datagrams")]
     NoDatagrams(PublicKey),
     #[error("the datagram is {0} bytes, past what the path carries")]

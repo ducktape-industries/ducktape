@@ -1,4 +1,4 @@
-//! Lane 7: live tracks between nodes over halo. Every member hears which tracks this node's
+//! Live tracks between nodes over halo's live lane. Every member hears which tracks this node's
 //! clients publish; a node with a subscriber of its own asks the publisher's node for the track
 //! once, and the track's groups and datagrams come back on the lane and fan out there as a local
 //! track would. One writer task per peer owns the one control stream to it, so a member that
@@ -11,7 +11,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_runtime::telemetry::metrics::Counter;
-use halo::{Carried, Class, Halo, Inbound, Lane, Links, Paced};
+use halo::{Carried, Class, Halo, Inbound, Links, Paced};
 use live_wire::{
     Alias, Code, DatagramHeader, End, Forward, GROUP_COMPLETE, GroupHeader, LANE, LaneMeta,
     MAX_STREAM_OBJECT, RequestId,
@@ -104,13 +104,13 @@ pub async fn serving<E: super::Context>(
     let plane = halo.plane();
     let streams = Arc::new(
         plane
-            .streams(Lane(LANE), BACKLOG)
-            .expect("lane 7 is the relay's alone"),
+            .streams(LANE, BACKLOG)
+            .expect("the live lane is the relay's alone"),
     );
     let datagrams = Arc::new(
         plane
-            .datagrams(Lane(LANE), PER_SENDER)
-            .expect("lane 7 is the relay's alone"),
+            .datagrams(LANE, PER_SENDER)
+            .expect("the live lane is the relay's alone"),
     );
     let Some(dropped) = relay
         .upgrade()

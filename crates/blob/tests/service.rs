@@ -6,13 +6,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use abi::BlobId;
-use blob::contract::{Bundle, Custody, Entry, bundle_key};
+use blob::contract::{Bundle, Custody, Entry, LANE, bundle_key};
 use blob::service::Service;
 use blob::{Blobs, frame};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
-use halo::{Config, Halo, Seat};
+use halo::{Class, Config, Halo, Lane, Seat};
 
 struct Node {
     service: Service,
@@ -28,6 +28,13 @@ fn node(context: &runtime::Context, seed: u64, validator: bool) -> (Node, Arc<Ha
         udp: "127.0.0.1:0".parse().unwrap(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());
+    halo.plane().lanes(vec![Lane {
+        name: LANE.into(),
+        id: 0,
+        cap: Class::Critical,
+        enabled: true,
+        since: 0,
+    }]);
     let seat = Seat {
         key,
         halo: format!("localhost:{}", halo.udp().unwrap().port()),
@@ -152,7 +159,7 @@ fn a_fetch_takes_a_blob_no_bundle_names_from_a_member_that_holds_it() {
         let framed = frame("code", b"rostered").unwrap();
         let id: BlobId = blob::id_of(abi::HashKind::Sha256, &framed);
         holder.service.store().write(&id, &framed).unwrap();
-        asker.service.fetch(id, halo::Class::Critical).await;
+        asker.service.fetch(id, Class::Critical).await;
         assert_eq!(asker.service.store().framed(&id).unwrap(), Some(framed));
     });
 }

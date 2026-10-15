@@ -11,7 +11,7 @@ use std::time::Duration;
 use abi::{BlobId, Refusal, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::ed25519::PublicKey;
-use halo::{Class, Halo, Inbound, Lane, Links, Paced, Streams};
+use halo::{Class, Halo, Inbound, Links, Paced, Streams};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::AbortHandle;
@@ -108,7 +108,7 @@ impl Service {
         store.clear_staging()?;
         let lane = halo
             .plane()
-            .streams(Lane::BLOBS, BACKLOG)
+            .streams(crate::contract::LANE, BACKLOG)
             .map_err(|taken| std::io::Error::new(std::io::ErrorKind::AddrInUse, taken))?;
         let inner = Arc::new(Inner {
             halo,

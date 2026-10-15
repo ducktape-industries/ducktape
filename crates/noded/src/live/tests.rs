@@ -1,7 +1,7 @@
 // The relay on loopback: sessions prove a key and act as its account; a group published by one
 // client reaches another whole, and a late joiner gets the cached group; a stale datagram is
 // dropped and counted; the same over a websocket; a grant a block removes ends the request; the
-// caps refuse; and two nodes carry a track between their clients over halo's lane 7.
+// caps refuse; and two nodes carry a track between their clients over halo's live lane.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,11 +15,11 @@ use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _, tokio as runtime};
 use futures::{SinkExt as _, StreamExt as _};
-use halo::{Halo, Seat};
+use halo::{Class, Halo, Lane, Seat};
 use live_wire::{
     ALPN, Account, Challenge, Code, Control, DatagramHeader, End, GroupHeader, Hello, KeyScheme,
-    MAX_SESSIONS_PER_ACCOUNT, MAX_STREAM_OBJECT, MAX_TRACKS_PER_SESSION, Mode, NAMESPACE, Proof,
-    ROUTE, Start, Track, Welcome, WsFrame, proof_preimage,
+    LANE, MAX_SESSIONS_PER_ACCOUNT, MAX_STREAM_OBJECT, MAX_TRACKS_PER_SESSION, Mode, NAMESPACE,
+    Proof, ROUTE, Start, Track, Welcome, WsFrame, proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::watch;
@@ -139,6 +139,13 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         udp: "127.0.0.1:0".parse().unwrap(),
     };
     let halo = Arc::new(Halo::start(&context.child("halo"), identity.clone(), config).unwrap());
+    halo.plane().lanes(vec![Lane {
+        name: LANE.into(),
+        id: 1,
+        cap: Class::Client,
+        enabled: true,
+        since: 0,
+    }]);
     let (shutdown, down) = watch::channel(false);
     let relay = Relay::start(
         context.child("live"),
@@ -866,7 +873,7 @@ fn a_session_publishes_at_most_its_cap_of_tracks() {
     });
 }
 
-// ---- (g) two nodes over lane 7 ----
+// ---- (g) two nodes over the live lane ----
 
 #[test]
 fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
@@ -1269,7 +1276,7 @@ fn data_in_the_wrong_mode_for_its_track_is_refused_malformed() {
     });
 }
 
-// ---- (i) lane 7 under failure ----
+// ---- (i) the live lane under failure ----
 
 #[test]
 fn a_group_the_publisher_resets_crosses_the_lane_as_cut_short() {

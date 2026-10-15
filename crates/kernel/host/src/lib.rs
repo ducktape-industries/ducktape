@@ -311,6 +311,7 @@ where
             ("identity", &roles.identity),
             ("blobs", &roles.blobs),
             ("awaits", &roles.awaits),
+            ("halo", &roles.halo),
         ] {
             let founded = entries.iter().any(|entry| entry.program == *program);
             if !founded {

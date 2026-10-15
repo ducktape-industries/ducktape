@@ -208,6 +208,8 @@ enum VoteVerb {
         about = "send the programs role an op, a file or stdin: schedule or cancel a program change"
     )]
     Programs { op: Option<PathBuf> },
+    #[command(about = "send the halo role an op, a file or stdin: open, set or close a lane")]
+    Halo { op: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -629,6 +631,7 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
         VoteVerb::Open => Motion::Door { open: true },
         VoteVerb::Close => Motion::Door { open: false },
         VoteVerb::Programs { op } => Motion::Programs { op: bytes(op)? },
+        VoteVerb::Halo { op } => Motion::Halo { op: bytes(op)? },
     })
 }
 

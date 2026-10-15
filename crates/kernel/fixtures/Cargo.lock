@@ -132,6 +132,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-halo"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "program",
+]
+
+[[package]]
 name = "fixture-identity"
 version = "0.1.0"
 dependencies = [
