@@ -751,14 +751,16 @@ fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
     seat.init(&founding);
-    let taken = seat.live.unwrap();
+    // The one test that names a live port up front: the socket it holds is the one the node
+    // is told to bind.
+    let taken = free_udp_port();
     let _holder = UdpSocket::bind(taken).unwrap();
     let listen = Listen {
         p2p: seat.p2p,
         http: seat.http,
         tls: Some(seat.tls),
         halo: seat.halo,
-        live: seat.live,
+        live: Some(taken),
     };
     let workspace = seat.workspace.clone();
     let refused = runner(&workspace.runtime_dir()).start(|context| async move {
