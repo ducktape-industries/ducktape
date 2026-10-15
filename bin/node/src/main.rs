@@ -342,13 +342,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             );
             println!("identity  {}", hex::encode(&status.identity));
             println!("contract  {}", status.contract);
-            println!(
-                "roles     programs {}, validators {}, identity {}, blobs {}",
-                status.roles.programs,
-                status.roles.validators,
-                status.roles.identity,
-                status.roles.blobs
-            );
+            println!("roles     {}", roles(&status.roles));
             Ok(())
         }
         Verb::Submit { program, payload } => {
@@ -772,11 +766,50 @@ impl<T, E: std::fmt::Display> Sentence<T> for Result<T, E> {
     }
 }
 
+/// Every role and the program bound to it, `role program`, in `Roles` order. The pattern names
+/// every field, so a role added to `Roles` fails the build here until it is printed.
+fn roles(roles: &abi::Roles) -> String {
+    let abi::Roles {
+        programs,
+        validators,
+        identity,
+        blobs,
+        awaits,
+        halo,
+    } = roles;
+    [
+        ("programs", programs),
+        ("validators", validators),
+        ("identity", identity),
+        ("blobs", blobs),
+        ("awaits", awaits),
+        ("halo", halo),
+    ]
+    .map(|(role, program)| format!("{role} {program}"))
+    .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
 
-    use super::{Cli, Verb};
+    use super::{Cli, Verb, roles};
+
+    #[test]
+    fn status_prints_every_role() {
+        let bound = abi::Roles {
+            programs: "p".into(),
+            validators: "v".into(),
+            identity: "i".into(),
+            blobs: "b".into(),
+            awaits: "a".into(),
+            halo: "h".into(),
+        };
+        assert_eq!(
+            roles(&bound),
+            "programs p, validators v, identity i, blobs b, awaits a, halo h"
+        );
+    }
 
     #[test]
     fn a_registered_halo_address_refuses_a_bind_only_host_and_run_binds_one() {
