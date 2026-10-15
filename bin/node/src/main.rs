@@ -345,12 +345,15 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             );
             println!("identity  {}", hex::encode(&status.identity));
             println!("contract  {}", status.contract);
+            let egress = status.roles.egress.as_deref().unwrap_or("none");
             println!(
-                "roles     programs {}, validators {}, identity {}, blobs {}",
+                "roles     programs {}, validators {}, identity {}, blobs {}, awaits {}, egress {}",
                 status.roles.programs,
                 status.roles.validators,
                 status.roles.identity,
-                status.roles.blobs
+                status.roles.blobs,
+                status.roles.awaits,
+                egress
             );
             Ok(())
         }
