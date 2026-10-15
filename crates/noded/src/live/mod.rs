@@ -118,44 +118,7 @@ impl<E: Context> Relay<E> {
     ) -> Result<Arc<Relay<E>>, halo::quic::Error> {
         let door = live.map(|at| door(identity, at)).transpose()?;
         let me = identity.public_key();
-        let metrics = tracks::Metrics {
-            sessions: context.register("live_sessions", "live sessions open", Gauge::default()),
-            tracks: context.register(
-                "live_tracks",
-                "tracks published through this node",
-                Gauge::default(),
-            ),
-            subscriptions: context.register(
-                "live_subscriptions",
-                "subscriptions held by live sessions",
-                Gauge::default(),
-            ),
-            objects_in: context.register(
-                "live_objects_in",
-                "objects published to this node",
-                Counter::default(),
-            ),
-            objects_out: context.register(
-                "live_objects_out",
-                "objects sent to subscribers",
-                Counter::default(),
-            ),
-            bytes_out: context.register(
-                "live_bytes_out",
-                "object bytes sent to subscribers",
-                Counter::default(),
-            ),
-            dropped_stale: context.register(
-                "live_dropped_stale",
-                "objects older than the newest held",
-                Counter::default(),
-            ),
-            dropped_behind: context.register(
-                "live_dropped_behind",
-                "objects a slow session or peer did not get",
-                Counter::default(),
-            ),
-        };
+        let metrics = metrics(&context);
         let (lane, queued) = lane::queue();
         let rechecks = Arc::new(Notify::new());
         let relay = Arc::new(Relay {
@@ -399,6 +362,48 @@ impl<E: Context> Relay<E> {
         let effects = self.state().watch(id, request, namespace, patterns);
         self.settled(decided);
         effects
+    }
+}
+
+/// The relay's metrics, registered on the node's context.
+fn metrics<E: Context>(context: &E) -> tracks::Metrics {
+    tracks::Metrics {
+        sessions: context.register("live_sessions", "live sessions open", Gauge::default()),
+        tracks: context.register(
+            "live_tracks",
+            "tracks published through this node",
+            Gauge::default(),
+        ),
+        subscriptions: context.register(
+            "live_subscriptions",
+            "subscriptions held by live sessions",
+            Gauge::default(),
+        ),
+        objects_in: context.register(
+            "live_objects_in",
+            "objects published to this node",
+            Counter::default(),
+        ),
+        objects_out: context.register(
+            "live_objects_out",
+            "objects sent to subscribers",
+            Counter::default(),
+        ),
+        bytes_out: context.register(
+            "live_bytes_out",
+            "object bytes sent to subscribers",
+            Counter::default(),
+        ),
+        dropped_stale: context.register(
+            "live_dropped_stale",
+            "objects older than the newest held",
+            Counter::default(),
+        ),
+        dropped_behind: context.register(
+            "live_dropped_behind",
+            "objects a slow session or peer did not get",
+            Counter::default(),
+        ),
     }
 }
 

@@ -212,6 +212,12 @@ impl Egress {
     }
 }
 
+/// An outlet no connection drains, for a step that is tested without one.
+#[cfg(test)]
+pub fn unconnected() -> Outlet {
+    outlet().0
+}
+
 fn outlet() -> (Outlet, Egress) {
     let (ordered, receiving) = mpsc::channel(OUTBOUND);
     let latest = Arc::new(Latest::default());

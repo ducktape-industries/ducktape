@@ -1648,3 +1648,80 @@ fn relayed(to: PublicKey, alias: Alias, out: Out) -> Option<Relayed> {
         Out::Control(_) => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use commonware_cryptography::Signer as _;
+    use commonware_cryptography::ed25519::PrivateKey;
+    use commonware_runtime::Runner as _;
+
+    use super::*;
+
+    fn state(context: &commonware_runtime::tokio::Context) -> State {
+        State::new("net#00000000".into(), super::super::metrics(context))
+    }
+
+    /// What a step sends a node over lane 7, without the sessions' sends.
+    fn lane(effects: Vec<Effect>) -> Vec<Relayed> {
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Lane(relayed) => Some(relayed),
+                Effect::Send(..) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_node_that_asks_again_hears_the_answer_and_no_second_replay() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mut state = state(&context);
+            let publisher = state.opened(42, vec![1], super::super::session::unconnected());
+            let doc = Track {
+                namespace: "net#00000000/chat/room".into(),
+                name: "doc".into(),
+            };
+            state.publish(publisher, 1, doc.clone(), Mode::Stream, 128, true);
+            let alias = state.track(&doc).expect("published").alias;
+            let header = GroupHeader {
+                alias,
+                group: 1,
+                priority: 128,
+            };
+            let now = Instant::now();
+            state.object(
+                Some(publisher),
+                header,
+                0,
+                Bytes::from_static(b"cached"),
+                now,
+            );
+            state.group_end(Some(publisher), alias, 1, true);
+
+            let peer = PrivateKey::from_seed(2).public_key();
+            let (_, asked) = state
+                .node_subscribed(peer.clone(), 7, &doc, Start::Latest)
+                .expect("the track is local");
+            let replayed = lane(asked);
+            assert!(
+                matches!(
+                    replayed.as_slice(),
+                    [
+                        Relayed::Object { .. },
+                        Relayed::GroupEnd { complete: true, .. }
+                    ]
+                ),
+                "the cached group crosses once: {replayed:?}"
+            );
+            let (opened, again) = state
+                .node_subscribed(peer, 8, &doc, Start::Latest)
+                .expect("the track is local");
+            assert_eq!((opened.alias, opened.latest), (8, Some(1)));
+            assert_eq!(
+                lane(again),
+                Vec::new(),
+                "the subscription carries the track already"
+            );
+        });
+    }
+}

@@ -1530,3 +1530,49 @@ fn a_late_joiner_gets_the_newest_group_whole_while_two_are_written_at_once() {
         );
     });
 }
+
+#[test]
+fn a_node_that_asks_for_the_latest_gets_the_cached_group_once() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        ledger.grant("room", None, Grant::all());
+        let first = node(context.child("first"), 1, ledger.clone());
+        let second = node(context.child("second"), 2, ledger);
+        for node in [&first, &second] {
+            node.halo.seat([first.seat(), second.seat()]);
+        }
+        let doc = track("room", "doc");
+
+        let (mut bob, _) = Client::open(&second, &bob).await;
+        bob.send(Control::Watch {
+            request: 1,
+            namespace: namespace("room"),
+        })
+        .await;
+        let (mut alice, _) = Client::open(&first, &alice).await;
+        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
+        bob.recv().await;
+        alice.group(alias, 1, &[b"cached"]).await;
+
+        // bob's subscribe is the second node's first lane message: it opens the control
+        // stream, whose resync asks for the same track. The cached group crosses once.
+        bob.subscribe(2, doc.clone(), Start::Latest).await;
+        alice.recv().await;
+        let (header, objects, complete) = bob.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (1, vec![b"cached".to_vec()], true)
+        );
+        alice.group(alias, 2, &[b"next"]).await;
+        let (header, objects, _) = bob.received_group().await;
+        assert_eq!(
+            (header.group, objects),
+            (2, vec![b"next".to_vec()]),
+            "the group after the cached one, not the cached one again"
+        );
+        first.shutdown.send_replace(true);
+        second.shutdown.send_replace(true);
+    });
+}
