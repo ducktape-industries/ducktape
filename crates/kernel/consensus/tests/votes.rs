@@ -12,7 +12,7 @@ use commonware_utils::acknowledgement::Exact;
 use commonware_utils::{NZU32, NZUsize};
 use consensus::{
     Ancestry, Anchor, Cadence, Chain, EngineMux, Marshal, Membership, Network, Roster, SimMesh,
-    Transport, Votes,
+    Timeouts, Transport, Votes,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -66,7 +66,7 @@ impl Peer {
     ) -> Peer {
         let network = Network {
             epoch_length: 1_000,
-            cadence: Cadence::from_millis(1_000),
+            cadence: Cadence::new(Duration::from_millis(1_000), Timeouts::default()).unwrap(),
         };
         let genesis = Block::genesis(NETWORK, 0);
         let roster = Roster::new(NETWORK.to_vec(), Some(key.clone()));

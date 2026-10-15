@@ -12,7 +12,7 @@ mod votes;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 
 pub use anchor::Anchor;
-pub use cadence::Cadence;
+pub use cadence::{Cadence, CadenceError, Timeouts};
 pub use chain::{App, Chain, unapplied};
 pub use commonware_consensus::marshal::ancestry::Ancestry;
 pub use engine::proposer;

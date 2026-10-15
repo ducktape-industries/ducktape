@@ -189,7 +189,7 @@ leave. Each prints the block that carried it.
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
 from, the address its HTTP surface bound, the runtime's storage and, when the
-operator writes one, `egress.toml`.
+operator writes them, `node.toml` and `egress.toml`.
 
 ## Answer calls outside the chain
 
@@ -239,6 +239,63 @@ an HTTP proxy in both directions: it forwards no hop-by-hop header
 `transfer-encoding`, `upgrade`, `proxy-authenticate`, `proxy-authorization`),
 so none of them is sent upstream or written into an answer.
 
+## Configure a node
+
+`ducktape run` reads `node.toml` from the workspace. The file is optional,
+and every key in it is too. Every `ducktape run` flag has a key, named like
+the flag with `_` for `-`. A flag overrides the file, and the file overrides
+the built-in default. `listen` and `halo` have no default, so the node
+refuses to start unless the flag or the file names each. A key the file does
+not know is an error, so a misspelled key stops the node instead of being
+ignored. `egress.toml` stays its own file.
+
+```toml
+listen = "127.0.0.1:9000"     # --listen; no default
+http = "127.0.0.1:8844"       # --http; default 127.0.0.1:0
+tls = "127.0.0.1:9443"        # --tls; default none
+halo = "0.0.0.0:9100"         # --halo; no default
+log = "info"                  # --log; default info
+
+[load]
+halo_egress = 10000000        # --halo-egress; default unlimited
+halo_inbound_streams = 512    # --halo-inbound-streams
+halo_datagrams = 2048         # --halo-datagrams
+reads_in_flight = 128         # --reads-in-flight
+uploads_in_flight = 16        # --uploads-in-flight
+blob_serves_in_flight = 32    # --blob-serves-in-flight
+blob_backlog = 128            # --blob-backlog
+blob_gatherers = 8            # --blob-gatherers
+
+[consensus]
+leader_timeout_ms = 5000          # --leader-timeout-ms; default 20 block times
+certification_timeout_ms = 7500   # --certification-timeout-ms; default 30 block times
+timeout_retry_ms = 2500           # --timeout-retry-ms; default 10 block times
+```
+
+The top level says where the node is reached and what it logs. `[load]`
+says how much work the node takes on at once and how fast it sends over
+halo; "Reach a node" describes each of its keys, and `ducktape run --help`
+shows each default. A count in `[load]` is above zero, and every count but
+`blob_gatherers` is at most what a tokio semaphore holds. `[consensus]`
+holds the consensus timeouts.
+
+The block time is the network's, from the founding file, so the defaults
+follow it. A view gives up on its leader after the leader timeout and on
+certifying a proposal after the certification timeout. Once a view has timed
+out, the node resends its timeout vote every retry interval. The node skips a
+view after the certification timeout plus one block time, and gives up on a
+fetch after one block time. `ducktape run` refuses to start unless the leader
+timeout is above zero, the certification timeout exceeds the leader timeout,
+and the retry interval is above zero and below the skip timeout.
+
+The leader timeout also bounds how long a silent peer link lives. A link
+that carries nothing for one leader timeout is dropped and dialed again, and
+the node pings each peer every quarter of its leader timeout so a healthy
+link is never silent that long. A peer reads one ping per eighth of its own
+leader timeout and waits out faster ones, so keep every node's leader timeout
+within a factor of two of the others'. The node's `node_started` log event
+carries the effective timeouts, the link timeout and the ping interval.
+
 ## Reach a node
 
 A node's address names a transport and a host, and the host may be a name.
@@ -283,7 +340,7 @@ uploads (submit, blob put) it serves together; the rest wait their turn.
 `--blob-serves-in-flight` and `--blob-gatherers` are the blobs it sends to
 members and gathers from members together. `--blob-backlog` is how many
 members' blob requests wait for a send; past it a request is refused.
-`ducktape run --help` shows each default.
+`ducktape run --help` shows each default and its `node.toml` key.
 
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844

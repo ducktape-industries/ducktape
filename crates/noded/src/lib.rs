@@ -1,5 +1,6 @@
 mod blocks;
 mod client;
+mod config;
 mod egress;
 mod endpoint;
 mod logs;
@@ -23,6 +24,9 @@ use node::Node;
 use tokio::sync::watch;
 
 pub use client::{Client, Upload};
+pub use config::{
+    ConsensusSettings, DEFAULT_HTTP, DEFAULT_LOG, LoadSettings, NodeConfig, Settings, permits,
+};
 pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
@@ -50,6 +54,22 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("the founding file does not parse: {0}")]
     Founding(#[from] toml::de::Error),
+    #[error("{} is refused: {reason}", .path.display())]
+    Settings {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    #[error("the node has no p2p socket: pass --listen or set listen in node.toml")]
+    NoListen,
+    #[error("the node has no halo socket: pass --halo or set halo in node.toml")]
+    NoHalo,
+    #[error("the consensus timeouts are refused: {0}")]
+    Cadence(#[from] consensus::CadenceError),
+    #[error("{count} is past the {most} a tokio semaphore holds")]
+    PastPermits {
+        count: std::num::NonZeroUsize,
+        most: usize,
+    },
     #[error("not hex: {0}")]
     Hex(#[from] hex::FromHexError),
     #[error("{0}")]
