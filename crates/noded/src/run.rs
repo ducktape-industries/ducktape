@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use abi::Outcome;
 use abi::Scan;
 use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
-use blob::contract::{BUNDLES, Bundle, bundle_of};
+use blob::contract::{BUNDLES, Bundle};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
@@ -23,7 +23,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use halo::{Class, Halo, Lane, Seat};
 use host::Layer;
-use node::{Block, Frame, Node, Sequenced, Source, Taken};
+use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source, Taken};
 use tokio::sync::watch;
 
 use crate::endpoint::Endpoint;
@@ -37,7 +37,7 @@ use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Delivery = (Arc<Block>, Exact);
 type Seating<E> =
-    Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant<E>>;
+    Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Listen {
@@ -201,6 +201,8 @@ async fn start<E: Context>(
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
     let anchor = workspace.anchor()?;
+    let egress = workspace.egress()?;
+    let clients = crate::egress::Clients::new(egress.reach).map_err(Error::Egress)?;
     let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     let network = Network {
         epoch_length: node.epoch_length()?,
@@ -237,6 +239,7 @@ async fn start<E: Context>(
         blob::service::Service::start(halo.clone(), node.host().blobs().clone(), bundles(&node)?)?;
     let member_cap = node.member_cap()?;
     let identity_role = node.host().roles().identity.clone();
+    let proposer = node.proposer();
     let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
 
     // the live door binds its socket here, beside halo's, so a socket in use fails the start
@@ -279,10 +282,7 @@ async fn start<E: Context>(
     }
 
     let (inbox, deliveries) = mpsc::unbounded();
-    let chain = Participant {
-        node: node.clone(),
-        inbox,
-    };
+    let chain = Participant { proposer, inbox };
     let (marshal, summaries) = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
@@ -318,6 +318,7 @@ async fn start<E: Context>(
         "the node is up"
     );
 
+    let (tips, _) = watch::channel(tip.height);
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         node,
@@ -328,6 +329,7 @@ async fn start<E: Context>(
         summaries,
         logs,
         shutdown,
+        tips,
         votes: membership.votes().clone(),
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
         blobs,
@@ -377,7 +379,8 @@ async fn start<E: Context>(
             }
         }
     });
-    let mut tasks = vec![pump, server, relayed];
+    let egressing = crate::egress::spawn(daemon.clone(), egress, clients);
+    let mut tasks = vec![pump, server, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(listen.p2p);
         tasks.push(
@@ -403,17 +406,12 @@ fn bundles<E: Context>(node: &Node<E>) -> Result<Vec<(u64, Bundle)>> {
         .view(Layer::Confirmed)
         .scan(role, &Scan::prefix(BUNDLES))
         .map_err(host::Error::from)?;
-    let mut bundles = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let Some(n) = bundle_of(&entry.key) else {
-            continue;
-        };
-        let bundle = abi::decode(&entry.value).map_err(|refusal| {
-            Error::Corrupt(format!("bundle {n} does not decode: {}", refusal.sentence))
-        })?;
-        bundles.push((n, bundle));
-    }
-    Ok(bundles)
+    blob::contract::recorded(&entries).map_err(|unreadable| {
+        Error::Corrupt(format!(
+            "bundle {} does not decode: {}",
+            unreadable.bundle, unreadable.refusal.sentence
+        ))
+    })
 }
 
 async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec<Seat>> {
@@ -570,55 +568,25 @@ fn recorded_epochs<E: Context>(
     Ok(seated)
 }
 
-pub struct Participant<E: Context> {
-    node: Shared<E>,
+#[derive(Clone)]
+pub struct Participant {
+    proposer: Proposer,
     inbox: mpsc::UnboundedSender<Delivery>,
 }
 
-impl<E: Context> Clone for Participant<E> {
-    fn clone(&self) -> Self {
-        Participant {
-            node: self.node.clone(),
-            inbox: self.inbox.clone(),
-        }
-    }
-}
-
-impl<E: Context> Participant<E> {
-    async fn build(
-        &self,
-        parent: Arc<Block>,
-        ancestors: impl Ancestry<Block>,
-        time: u64,
-    ) -> node::Result<Block> {
-        let applied = self.node.lock().await.tip()?.height;
-        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
-        let node = self.node.lock().await;
-        node.build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time)
-    }
-}
-
-impl<E: Context> Chain for Participant<E> {
+impl Chain for Participant {
     async fn propose(
         &mut self,
         parent: Arc<Block>,
         ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> Option<Block> {
-        let height = parent.height + 1;
-        match self.build(parent, ancestors, time).await {
-            Ok(block) => Some(block),
-            Err(error) => {
-                tracing::error!(
-                    target: "ducktape::node",
-                    event = "build_failed",
-                    height,
-                    %error,
-                    "the node cannot build a block"
-                );
-                None
-            }
-        }
+        let applied = self.proposer.applied().height;
+        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
+        let block = self
+            .proposer
+            .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
+        Some(block)
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
@@ -691,7 +659,10 @@ async fn receipts_for<E: Context>(
             abi::encode(&blob::contract::Op::Receipt { bundle }),
         )
         .encode();
-        match node.submit(receipt.clone(), Source::Client).await? {
+        match node
+            .submit(receipt.clone(), Source::Client, Preconfirm::Off)
+            .await?
+        {
             Ok(Taken::New(_)) => taken.push(receipt),
             Ok(Taken::Held(_)) => {}
             Err(refusal) => tracing::debug!(
@@ -715,6 +686,7 @@ async fn applied<E: Context>(
     // under the node lock, which a /v1/network read holds across the tip
     // and the book, so no height it serves passes its tip
     daemon.votes.applied(block.digest(), block.height);
+    daemon.tips.send_replace(block.height);
     let (receipted, members_written) = match sequenced {
         Sequenced::Applied {
             mut applied,
@@ -748,7 +720,7 @@ async fn applied<E: Context>(
         reseat_halo(daemon, &node, block.height).await;
     }
     if !closes {
-        let due = node.reoffer()?;
+        let due = node.reoffer();
         drop(node);
         daemon
             .relay
@@ -764,9 +736,9 @@ async fn applied<E: Context>(
     )))?;
     let reseated = daemon.relay.seat(seated.as_ref());
     let due = if reseated {
-        node.reoffer_all()?
+        node.reoffer_all()
     } else {
-        node.reoffer()?
+        node.reoffer()
     };
     drop(node);
     // The mesh admits every member, so a resident follows the chain; only

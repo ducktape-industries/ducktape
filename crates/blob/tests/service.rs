@@ -158,7 +158,7 @@ fn a_fetch_takes_a_blob_no_bundle_names_from_a_member_that_holds_it() {
         let (asker, asker_halo) = node(&context.child("asker"), 2, true);
         seat_all(&[&holder_halo, &asker_halo], &[&holder, &asker]);
         let framed = frame("code", b"rostered").unwrap();
-        let id: BlobId = blob::id_of(abi::HashKind::Sha256, &framed);
+        let id: BlobId = blob::id_of(abi::HashKind::Sha256, &framed).unwrap();
         holder.service.store().write(&id, &framed).unwrap();
         asker.service.fetch(id, Class::Critical).await;
         assert_eq!(asker.service.store().framed(&id).unwrap(), Some(framed));

@@ -60,6 +60,7 @@ fn genesis(members: &[validators::Member]) -> Genesis {
             identity: "identity".into(),
             blobs: "blobs".into(),
             awaits: "awaits".into(),
+            egress: None,
             halo: "halo".into(),
         },
         validators: members.to_vec(),
@@ -136,8 +137,8 @@ fn frame(key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
 async fn seal(node: &mut Node<Ctx>) -> Block {
     let tip = node.tip().unwrap();
     let block = node
-        .build(tip, std::iter::empty(), TIME + tip.height + 1)
-        .unwrap();
+        .proposer()
+        .build(tip, std::iter::empty(), TIME + tip.height + 1);
     let Sequenced::Applied { .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
@@ -345,14 +346,14 @@ impl Network {
         let mut node = self.source.node.lock().await;
         for frame in frames {
             let taken = node
-                .submit(frame, node::Source::Client)
+                .submit(frame, node::Source::Client, node::Preconfirm::On)
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(
-                taken.receipt().outcome,
-                abi::Outcome::Applied { .. }
-            ));
+            let prediction = taken
+                .prediction()
+                .expect("a preconfirmed frame is predicted");
+            assert!(matches!(prediction.outcome, abi::Outcome::Applied { .. }));
         }
         let tip = seal(&mut node).await.tip();
         drop(node);
@@ -468,7 +469,11 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
 
         let mut source = network.source.node.lock().await;
         source
-            .submit(frame(&alice, vec![set(b"c", b"3")]), node::Source::Client)
+            .submit(
+                frame(&alice, vec![set(b"c", b"3")]),
+                node::Source::Client,
+                node::Preconfirm::Off,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -892,8 +897,11 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         let alice = key(11);
-        // 256 keys: probe's log takes four fetches at the least
-        let frames = (0..4)
+        let tuning = state::Tuning::default();
+        let section = tuning.items_per_section.get() as usize;
+        let fetch = tuning.sync_fetch_batch.get() as usize;
+        let serves = 1 + 2 * section / fetch + 1;
+        let frames = (0..4 * section / 64)
             .map(|n| {
                 let steps = (0..64)
                     .map(|i| set(format!("{n}-{i}").as_bytes(), b"1"))
@@ -914,11 +922,8 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
         .await
         .unwrap();
         let whole = whole.load(Ordering::SeqCst);
-        assert!(whole >= 4, "a whole sync of probe asks {whole} times");
+        assert!(whole > serves, "a whole sync of probe asks {whole} times");
 
-        // the boundary, then three fetches of 64: a sync keeps its log a
-        // 64-op section at a time, sealed once the next one starts, so two
-        // whole sections are kept when the fifth request is refused
         let dir = tempfile::tempdir().unwrap();
         let refused = Arc::new(AtomicUsize::new(0));
         let error = join(
@@ -926,11 +931,11 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
-            network.counting(&refused, 4),
+            network.counting(&refused, serves),
         )
         .await
         .err()
-        .expect("probe's fifth request is refused");
+        .expect("a request past the second whole section is refused");
         assert!(
             matches!(error, Error::State(state::Error::Sync(_))),
             "{error}"

@@ -4,15 +4,15 @@ use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::{Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, Receipt, SubmissionId};
-use node::Frame;
+use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
 use statesync::{Exchange, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Status, TxAsk,
-    route,
+    BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Status, Submit,
+    Submitted, TxAsk, route,
 };
 use crate::{Error, Result};
 
@@ -50,13 +50,14 @@ impl Client {
         self.fetch(live_wire::PORT_ROUTE).await
     }
 
-    pub async fn submit(&self, frame: Vec<u8>) -> Result<Receipt> {
-        self.post_raw(route::SUBMIT, frame).await
+    pub async fn submit(&self, frame: Vec<u8>, preconfirm: Preconfirm) -> Result<Submitted> {
+        self.post(route::SUBMIT, &Submit { frame, preconfirm })
+            .await
     }
 
     pub async fn land(&self, frame: &Frame) -> Result<(u64, Receipt)> {
         let blocks = self.changes(RECENT).await?;
-        self.submit(frame.encode()).await?;
+        self.submit(frame.encode(), Preconfirm::Off).await?;
         self.landed(frame, blocks).await
     }
 
@@ -124,7 +125,7 @@ impl Client {
         self.post(route::BLOB_GET, &id).await
     }
 
-    pub async fn put_blobs(&self, frame: &Frame, uploads: Vec<Upload>) -> Result<Receipt> {
+    pub async fn put_blobs(&self, frame: &Frame, uploads: Vec<Upload>) -> Result<Submitted> {
         let encoded = frame.encode();
         let mut opening = (encoded.len() as u32).to_le_bytes().to_vec();
         opening.extend_from_slice(&encoded);
@@ -149,7 +150,7 @@ impl Client {
         let key = blob::contract::bundle_key(bundle);
         let mut changes = self.changes(role).await?;
         let recorded = self.get(Layer::Confirmed, role, &key).await?;
-        if let Some(since) = held_since(recorded.as_deref()) {
+        if let Some(since) = blob::contract::held_since(recorded.as_deref()) {
             return Ok(since);
         }
         while let Some(change) = changes.next().await {
@@ -157,7 +158,7 @@ impl Client {
                 .writes
                 .into_iter()
                 .find_map(|(written, value)| (written == key).then_some(value));
-            if let Some(since) = held_since(written.flatten().as_deref()) {
+            if let Some(since) = blob::contract::held_since(written.flatten().as_deref()) {
                 return Ok(since);
             }
         }
@@ -261,14 +262,6 @@ fn once(bytes: Vec<u8>) -> Part {
     Box::pin(futures::stream::once(futures::future::ready(Ok(
         bytes::Bytes::from(bytes),
     ))))
-}
-
-fn held_since(bundle: Option<&[u8]>) -> Option<u64> {
-    let bundle: blob::contract::Bundle = abi::decode(bundle?).ok()?;
-    match bundle.custody {
-        blob::contract::Custody::Held { since } => Some(since),
-        blob::contract::Custody::Receipted(_) => None,
-    }
 }
 
 async fn answered<T: BorshDeserialize>(response: reqwest::Response) -> Result<T> {

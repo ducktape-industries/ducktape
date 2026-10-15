@@ -15,13 +15,13 @@ use futures::channel::mpsc;
 use futures::{SinkExt as _, StreamExt as _};
 use host::Receipt;
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
-use node::{BLOCK_BYTES, Source, Taken};
+use node::{BLOCK_BYTES, Preconfirm, Source, Taken};
 use statesync::Request as SyncRequest;
 use tokio::sync::Semaphore;
 
 use crate::wire::{
-    Admin, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, TxAsk,
-    route,
+    Admin, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Submit,
+    Submitted, TxAsk, route,
 };
 use crate::{Context, Daemon};
 
@@ -32,6 +32,7 @@ const UPLOADS_IN_FLIGHT: usize = 8;
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 
 const SUBMIT_BYTES: usize = BLOCK_BYTES;
+const SUBMIT_BODY_BYTES: usize = SUBMIT_BYTES + size_of::<u32>() + size_of::<bool>();
 const QUERY_BODY_BYTES: usize = 4 << 20;
 const ASK_BYTES: usize = 1 << 20;
 
@@ -177,18 +178,29 @@ async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Netw
 
 async fn submit<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    Capped(body): Capped<SUBMIT_BYTES>,
-) -> Reply<Receipt> {
+    Capped(body): Capped<SUBMIT_BODY_BYTES>,
+) -> Reply<Submitted> {
+    let Submit { frame, preconfirm } = match abi::decode(&body) {
+        Ok(submit) => submit,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
     let mut node = daemon.node.lock().await;
-    match node.submit(body.to_vec(), Source::Client).await {
-        Ok(Ok(Taken::New(receipt))) => {
+    match node.submit(frame.clone(), Source::Client, preconfirm).await {
+        Ok(Ok(Taken::New(prediction))) => {
             drop(node);
-            daemon.relay.send([body.as_ref()]);
-            Reply::Answered(receipt)
+            daemon.relay.send([frame.as_slice()]);
+            Reply::Answered(submitted(prediction))
         }
-        Ok(Ok(Taken::Held(receipt))) => Reply::Answered(receipt),
+        Ok(Ok(Taken::Held(prediction))) => Reply::Answered(submitted(prediction)),
         Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
+    }
+}
+
+fn submitted(prediction: Option<Receipt>) -> Submitted {
+    match prediction {
+        Some(receipt) => Submitted::Preconfirmed(receipt),
+        None => Submitted::Pooled,
     }
 }
 
@@ -309,7 +321,7 @@ async fn served<E: Context>(
 async fn blob_put<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
     request: Request,
-) -> Reply<Receipt> {
+) -> Reply<Submitted> {
     let stream = request
         .into_body()
         .into_data_stream()
@@ -332,13 +344,16 @@ async fn blob_put<E: Context>(
         return Reply::Refused(refusal);
     }
     let mut node = daemon.node.lock().await;
-    match node.submit(frame.clone(), Source::Client).await {
-        Ok(Ok(Taken::New(receipt))) => {
+    match node
+        .submit(frame.clone(), Source::Client, Preconfirm::Off)
+        .await
+    {
+        Ok(Ok(Taken::New(prediction))) => {
             drop(node);
             daemon.relay.send([frame.as_slice()]);
-            Reply::Answered(receipt)
+            Reply::Answered(submitted(prediction))
         }
-        Ok(Ok(Taken::Held(receipt))) => Reply::Answered(receipt),
+        Ok(Ok(Taken::Held(prediction))) => Reply::Answered(submitted(prediction)),
         Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }

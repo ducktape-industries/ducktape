@@ -11,6 +11,7 @@ use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
 
+use crate::egress::Config as EgressConfig;
 use crate::endpoint::Endpoint;
 use crate::{Error, Result};
 
@@ -19,6 +20,7 @@ const DESCRIPTOR: &str = "network";
 const ANCHOR: &str = "anchor";
 const HTTP: &str = "http";
 const RUNTIME: &str = "runtime";
+const EGRESS: &str = "egress.toml";
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Descriptor {
@@ -105,6 +107,19 @@ impl Workspace {
         Ok(std::fs::write(self.dir.join(HTTP), address.to_string())?)
     }
 
+    pub(crate) fn egress(&self) -> Result<EgressConfig> {
+        let path = self.dir.join(EGRESS);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(EgressConfig::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        EgressConfig::parse(&text, |variable| std::env::var(variable).ok())
+            .map_err(|problem| Error::Egress(format!("{} is refused: {problem}", path.display())))
+    }
+
     fn read_record<T: BorshDeserialize>(&self, name: &str) -> Result<T> {
         let bytes = std::fs::read(self.dir.join(name))?;
         abi::decode(&bytes).map_err(|refusal| Error::Corrupt(refusal.sentence))
@@ -166,6 +181,8 @@ pub struct RoleIds {
     pub identity: String,
     pub blobs: String,
     pub awaits: String,
+    #[serde(default)]
+    pub egress: Option<String>,
     pub halo: String,
 }
 
@@ -286,6 +303,7 @@ impl Founding {
                 identity: self.roles.identity.clone(),
                 blobs: self.roles.blobs.clone(),
                 awaits: self.roles.awaits.clone(),
+                egress: self.roles.egress.clone(),
                 halo: self.roles.halo.clone(),
             },
             validators,

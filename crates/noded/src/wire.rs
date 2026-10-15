@@ -1,8 +1,9 @@
 use abi::{ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Receipt, Tip};
+use node::Preconfirm;
 
-pub const NODE_CONTRACT: u32 = 6;
+pub const NODE_CONTRACT: u32 = 8;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {
@@ -53,6 +54,18 @@ impl Status {
             id: self.tip,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Submit {
+    pub frame: Vec<u8>,
+    pub preconfirm: Preconfirm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Submitted {
+    Pooled,
+    Preconfirmed(Receipt),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

@@ -30,6 +30,7 @@ fn env() -> Env {
             identity: "identity".into(),
             blobs: "blobs".into(),
             awaits: "awaits".into(),
+            egress: None,
             halo: "halo".into(),
         },
         cause: Cause::Direct,

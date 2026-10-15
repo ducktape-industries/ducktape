@@ -10,7 +10,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 
-pub use commitment::{Commitment, Db, Family, Op, SyncTarget, codec_config, digest};
+pub use commitment::{Commitment, Db, Family, Op, SyncTarget, Tuning, codec_config, digest};
 pub use overlay::{Checkpoint, Overlay, Slot};
 pub use storage::{RESERVED_PREFIX, Storage, reserved, valid_program_id};
 pub use view::View;

@@ -63,6 +63,7 @@ fn at(height: u64, call: ProgramCall) -> Invocation {
                 identity: "identity".into(),
                 blobs: "blobs".into(),
                 awaits: "awaits".into(),
+                egress: None,
                 halo: "halo".into(),
             },
             cause: Cause::Direct,

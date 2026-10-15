@@ -10,8 +10,8 @@ use commonware_runtime::Runner as _;
 use commonware_runtime::tokio::{Config, Runner};
 use futures::StreamExt as _;
 use host::Layer;
-use node::Frame;
-use noded::wire::Admin;
+use node::{Frame, Preconfirm};
+use noded::wire::{Admin, Submitted};
 use noded::{Client, Endpoint, HaloConfig, Listen, Logs, Upload, Workspace};
 
 #[derive(Parser)]
@@ -107,10 +107,15 @@ enum Verb {
     },
     #[command(about = "print the node's height, tip, root, epoch and identity")]
     Status,
-    #[command(about = "submit a signed frame; the payload is a file or stdin")]
+    #[command(
+        about = "submit a signed frame to the pool; the payload is a file or stdin. With \
+                 --preconfirm the node also runs it now and prints its predicted receipt"
+    )]
     Submit {
         program: String,
         payload: Option<PathBuf>,
+        #[arg(long)]
+        preconfirm: bool,
     },
     #[command(about = "query a program; the request is a file or stdin, the answer is stdout")]
     Query {
@@ -353,7 +358,11 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             println!("roles     {}", roles(&status.roles));
             Ok(())
         }
-        Verb::Submit { program, payload } => {
+        Verb::Submit {
+            program,
+            payload,
+            preconfirm,
+        } => {
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
             let frame = Frame::sign(
@@ -364,7 +373,19 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
                 &program,
                 bytes(payload)?,
             );
-            let receipt = client.submit(frame.encode()).await.sentence()?;
+            let preconfirm = match preconfirm {
+                true => Preconfirm::On,
+                false => Preconfirm::Off,
+            };
+            let id = frame.body.submission().id();
+            let submitted = client.submit(frame.encode(), preconfirm).await.sentence()?;
+            let receipt = match submitted {
+                Submitted::Pooled => {
+                    println!("pooled {}", hex::encode(id));
+                    return Ok(());
+                }
+                Submitted::Preconfirmed(receipt) => receipt,
+            };
             match receipt.outcome {
                 Outcome::Applied { output } => {
                     println!("preconfirmed applied {}", hex::encode(output))
@@ -569,10 +590,7 @@ async fn put_blobs(
         }
     };
     if !wait {
-        let receipt = client.put_blobs(&frame, uploads).await.sentence()?;
-        if let Outcome::Rejected(refusal) = receipt.outcome {
-            return Err(format!("{}: {}", refusal.reason, refusal.sentence));
-        }
+        client.put_blobs(&frame, uploads).await.sentence()?;
         ids();
         return Ok(());
     }
@@ -778,7 +796,9 @@ impl<T, E: std::fmt::Display> Sentence<T> for Result<T, E> {
 fn roles(roles: &abi::Roles) -> String {
     roles
         .named()
+        .into_iter()
         .map(|(role, program)| format!("{role} {program}"))
+        .collect::<Vec<_>>()
         .join(", ")
 }
 
@@ -796,11 +816,21 @@ mod tests {
             identity: "i".into(),
             blobs: "b".into(),
             awaits: "a".into(),
+            egress: None,
             halo: "h".into(),
         };
         assert_eq!(
             roles(&bound),
-            "programs p, validators v, identity i, blobs b, awaits a, halo h"
+            "programs p, validators v, identity i, blobs b, awaits a, halo h",
+            "a network that binds no egress lists none"
+        );
+        let with_egress = abi::Roles {
+            egress: Some("e".into()),
+            ..bound
+        };
+        assert_eq!(
+            roles(&with_egress),
+            "programs p, validators v, identity i, blobs b, awaits a, egress e, halo h"
         );
     }
 
