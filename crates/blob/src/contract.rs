@@ -70,6 +70,13 @@ impl Bundle {
         matches!(self.custody, Custody::Held { .. })
     }
 
+    pub fn held_since(&self) -> Option<u64> {
+        match self.custody {
+            Custody::Held { since } => Some(since),
+            Custody::Receipted(_) => None,
+        }
+    }
+
     pub fn receipted_by(&self, key: &[u8]) -> bool {
         match &self.custody {
             Custody::Receipted(keys) => keys.iter().any(|held| held == key),
@@ -90,6 +97,30 @@ pub struct Holding {
 pub enum Reply {
     Held(Option<Holding>),
     Bundle(Option<Bundle>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unreadable {
+    pub bundle: u64,
+    pub refusal: abi::Refusal,
+}
+
+pub fn held_since(stored: Option<&[u8]>) -> Option<u64> {
+    let bundle: Bundle = abi::decode(stored?).ok()?;
+    bundle.held_since()
+}
+
+pub fn recorded(entries: &[abi::Entry]) -> Result<Vec<(u64, Bundle)>, Unreadable> {
+    let mut bundles = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(n) = bundle_of(&entry.key) else {
+            continue;
+        };
+        let bundle =
+            abi::decode(&entry.value).map_err(|refusal| Unreadable { bundle: n, refusal })?;
+        bundles.push((n, bundle));
+    }
+    Ok(bundles)
 }
 
 pub fn bundle_key(n: u64) -> Vec<u8> {
@@ -149,6 +180,49 @@ mod tests {
         let other = BlobId::Sha256([4; 32]);
         assert_eq!(indexed_bundle(&index_key(&id, 9), &id), Some(9));
         assert_eq!(indexed_bundle(&index_key(&other, 9), &id), None);
+    }
+
+    fn bundle(custody: Custody) -> Bundle {
+        Bundle {
+            putter: 1,
+            height: 4,
+            blobs: Vec::new(),
+            custody,
+        }
+    }
+
+    #[test]
+    fn a_stored_bundle_is_held_since_its_height_only_once_held() {
+        let held = abi::encode(&bundle(Custody::Held { since: 11 }));
+        let receipted = abi::encode(&bundle(Custody::Receipted(vec![vec![1]])));
+        assert_eq!(held_since(Some(&held)), Some(11));
+        assert_eq!(held_since(Some(&receipted)), None);
+        assert_eq!(held_since(None), None);
+        assert_eq!(held_since(Some(b"not a bundle")), None);
+    }
+
+    #[test]
+    fn recorded_reads_every_bundle_and_names_the_one_that_does_not_decode() {
+        let held = bundle(Custody::Held { since: 11 });
+        let receipted = bundle(Custody::Receipted(Vec::new()));
+        let entry = |key: Vec<u8>, value: Vec<u8>| abi::Entry { key, value };
+        let entries = [
+            entry(bundle_key(2), abi::encode(&held)),
+            entry(bundle_key(5), abi::encode(&receipted)),
+            entry(NEXT.to_vec(), abi::encode(&6u64)),
+        ];
+        assert_eq!(
+            recorded(&entries),
+            Ok(vec![(2, held.clone()), (5, receipted)])
+        );
+        let broken = [
+            entry(bundle_key(2), abi::encode(&held)),
+            entry(bundle_key(3), b"not a bundle".to_vec()),
+        ];
+        assert_eq!(
+            recorded(&broken).map_err(|unreadable| unreadable.bundle),
+            Err(3)
+        );
     }
 
     #[test]

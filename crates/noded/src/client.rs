@@ -145,7 +145,7 @@ impl Client {
         let key = blob::contract::bundle_key(bundle);
         let mut changes = self.changes(role).await?;
         let recorded = self.get(Layer::Confirmed, role, &key).await?;
-        if let Some(since) = held_since(recorded.as_deref()) {
+        if let Some(since) = blob::contract::held_since(recorded.as_deref()) {
             return Ok(since);
         }
         while let Some(change) = changes.next().await {
@@ -153,7 +153,7 @@ impl Client {
                 .writes
                 .into_iter()
                 .find_map(|(written, value)| (written == key).then_some(value));
-            if let Some(since) = held_since(written.flatten().as_deref()) {
+            if let Some(since) = blob::contract::held_since(written.flatten().as_deref()) {
                 return Ok(since);
             }
         }
@@ -257,14 +257,6 @@ fn once(bytes: Vec<u8>) -> Part {
     Box::pin(futures::stream::once(futures::future::ready(Ok(
         bytes::Bytes::from(bytes),
     ))))
-}
-
-fn held_since(bundle: Option<&[u8]>) -> Option<u64> {
-    let bundle: blob::contract::Bundle = abi::decode(bundle?).ok()?;
-    match bundle.custody {
-        blob::contract::Custody::Held { since } => Some(since),
-        blob::contract::Custody::Receipted(_) => None,
-    }
 }
 
 async fn answered<T: BorshDeserialize>(response: reqwest::Response) -> Result<T> {

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use abi::Outcome;
 use abi::Scan;
 use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
-use blob::contract::{BUNDLES, Bundle, bundle_of};
+use blob::contract::{BUNDLES, Bundle};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
@@ -375,17 +375,12 @@ fn bundles<E: Context>(node: &Node<E>) -> Result<Vec<(u64, Bundle)>> {
         .view(Layer::Confirmed)
         .scan(role, &Scan::prefix(BUNDLES))
         .map_err(host::Error::from)?;
-    let mut bundles = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let Some(n) = bundle_of(&entry.key) else {
-            continue;
-        };
-        let bundle = abi::decode(&entry.value).map_err(|refusal| {
-            Error::Corrupt(format!("bundle {n} does not decode: {}", refusal.sentence))
-        })?;
-        bundles.push((n, bundle));
-    }
-    Ok(bundles)
+    blob::contract::recorded(&entries).map_err(|unreadable| {
+        Error::Corrupt(format!(
+            "bundle {} does not decode: {}",
+            unreadable.bundle, unreadable.refusal.sentence
+        ))
+    })
 }
 
 async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec<Seat>> {
