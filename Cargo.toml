@@ -1,18 +1,20 @@
 # ducktape — a BFT-replicated sandbox for wasm programs. layout:
 #   crates/kernel/     — the platform: abi (the bytes ABI programs and hosts
-#                        share), guest (what a program compiles against),
+#                        share), program (what a program compiles against),
 #                        runtime (the wasmtime embedding), state (the
-#                        authenticated store and its commitments), blobs (one
-#                        content-addressed store), host (the sandbox: submit,
+#                        authenticated store and its commitments), host (the sandbox: submit,
 #                        query, deliver), node (frames, blocks, the mempool),
 #                        consensus (simplex BFT over marshal, per-epoch
 #                        engines, catch-up), statesync (a joiner adopts a
 #                        network's state); fixtures/ is its own workspace of
 #                        wasm32 test programs
+#   crates/blob/       — blobs: the content-addressed store, the blobs program's
+#                        contract, and (feature `node`) how a node gathers,
+#                        serves and receipts them over halo
 #   crates/networking/ — halo: the network between members, off consensus
-#                        (QUIC and tcp/tls/ws/wss links, the egress pacer and
-#                        its classes, the blob lane); live-wire: the types a
-#                        client and a node speak live tracks in
+#                        (QUIC links, the egress pacer and its classes);
+#                        live-wire: the types a client and a node speak
+#                        live tracks in
 #   crates/noded/      — the daemon library: the /v1 http+ws surface, the
 #                        lookup mesh, the workspace on disk, the client
 #   bin/node           — the `ducktape` binary: the node and its CLI
@@ -21,15 +23,15 @@
 resolver = "2"
 members = [
     "crates/kernel/abi",
-    "crates/kernel/guest",
+    "crates/kernel/program",
     "crates/kernel/runtime",
     "crates/kernel/state",
-    "crates/kernel/blobs",
     "crates/kernel/host",
     "crates/kernel/node",
     "crates/kernel/consensus",
     "crates/kernel/statesync",
     "crates/kernel/keyscheme",
+    "crates/blob",
     "crates/networking/halo",
     "crates/networking/live-wire",
     "crates/noded",
@@ -81,7 +83,7 @@ commonware-parallel = "2026.9.0"
 commonware-utils = "2026.9.0"
 commonware-actor = "2026.9.0"
 base64 = "0.22"
-# tests only: isolated on-disk module data dirs.
+# tests only: isolated on-disk data dirs.
 tempfile = "3"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 x509-parser = "0.18"
@@ -112,10 +114,9 @@ wasmtime = "=46.0.3"
 # share.
 keyscheme = { path = "crates/kernel/keyscheme" }
 abi = { path = "crates/kernel/abi" }
-guest = { path = "crates/kernel/guest" }
+program = { path = "crates/kernel/program" }
 runtime = { path = "crates/kernel/runtime" }
 state = { path = "crates/kernel/state" }
-blobs = { path = "crates/kernel/blobs" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
@@ -131,12 +132,13 @@ halo = { path = "crates/networking/halo" }
 # the live wire: what a client and a node say over QUIC or a websocket to
 # publish and subscribe to tracks; a client links this and nothing of the node.
 live-wire = { path = "crates/networking/live-wire" }
+blob = { path = "crates/blob", default-features = false }
 
 # the rng bounds commonware-runtime 2026.9.0 depends on (a different
 # semver-major would be a different trait).
 rand_core = "0.10.1"
 
-# dev/test builds compile wasm guests through cranelift (the fixture programs
+# dev/test builds compile wasm programs through cranelift (the fixture programs
 # in the kernel tests). unoptimized
 # cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
 # concurrently blows readiness deadlines — so the code generator itself is

@@ -20,10 +20,12 @@ use node::{Block, Frame, Node, Sequenced};
 use state::{Storage, Store};
 use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, join, serve};
 
-const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
+const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
+const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"sync";
@@ -41,6 +43,7 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
     validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: Some(format!("{}:1", key.public_key())),
+        halo: format!("{}:2", key.public_key()),
     }
 }
 
@@ -48,15 +51,17 @@ fn genesis(members: &[validators::Member]) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
         roles: Roles {
-            registry: "module-registry".into(),
+            programs: "programs".into(),
             validators: "valset".into(),
             identity: "identity".into(),
+            blobs: "blobs".into(),
+            awaits: "awaits".into(),
         },
         validators: members.to_vec(),
         programs: vec![
             Founding {
-                program: "module-registry".into(),
-                code: MODULE_REGISTRY.to_vec(),
+                program: "programs".into(),
+                code: PROGRAMS.to_vec(),
                 params: Vec::new(),
             },
             Founding {
@@ -70,6 +75,11 @@ fn genesis(members: &[validators::Member]) -> Genesis {
                 params: abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
             },
             Founding {
+                program: "blobs".into(),
+                code: BLOBS.to_vec(),
+                params: Vec::new(),
+            },
+            Founding {
                 program: "ping".into(),
                 code: RELAY.to_vec(),
                 params: Vec::new(),
@@ -78,6 +88,11 @@ fn genesis(members: &[validators::Member]) -> Genesis {
                 program: "probe".into(),
                 code: PROBE.to_vec(),
                 params: abi::encode(&Vec::<Step>::new()),
+            },
+            Founding {
+                program: "awaits".into(),
+                code: AWAITS.to_vec(),
+                params: Vec::new(),
             },
         ],
         views: Vec::new(),
@@ -251,8 +266,8 @@ fn blobs(request: &Request) -> bool {
     matches!(request, Request::Blob(_))
 }
 
-/// `program`'s sync; the head lists the reserved programs, then identity,
-/// module-registry and ping, before probe.
+/// `program`'s sync; the head lists the reserved programs, then identity
+/// and ping, before probe.
 fn syncing(request: &Request, program: &str) -> bool {
     matches!(request, Request::Sync { program: asked, .. } if asked == program)
 }
@@ -534,6 +549,7 @@ fn a_tip_certificate_verifies_against_the_validators_not_the_members() {
             let resident = key(seed);
             let enroll = validators::Op::Enroll {
                 address: member(&resident).address,
+                halo: member(&resident).halo,
                 invite: None,
             };
             Frame::sign(

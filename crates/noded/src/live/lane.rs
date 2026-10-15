@@ -38,8 +38,8 @@ const GROUP_QUEUE: usize = 256;
 const ATTEMPTS_PER_LINE: u32 = 10;
 
 type Stream = Paced<Carried>;
-type Streams<E> = halo::Streams<Arc<Links<E>>>;
-type Datagrams<E> = halo::Datagrams<Arc<Links<E>>>;
+type Streams = halo::Streams<Arc<Links>>;
+type Datagrams = halo::Datagrams<Arc<Links>>;
 
 /// What the relay's steps hand the lane task.
 pub type Queue = mpsc::Sender<Relayed>;
@@ -81,17 +81,17 @@ enum GroupOut {
 /// The dispatcher: one bounded queue per peer, fed without waiting.
 struct Lanes<E: super::Context> {
     relay: Weak<Relay<E>>,
-    halo: Arc<Halo<E>>,
+    halo: Arc<Halo>,
     me: PublicKey,
-    streams: Arc<Streams<E>>,
-    datagrams: Arc<Datagrams<E>>,
+    streams: Arc<Streams>,
+    datagrams: Arc<Datagrams>,
     dropped: Counter,
     peers: HashMap<PublicKey, mpsc::Sender<ToPeer>>,
 }
 
 pub async fn serving<E: super::Context>(
     relay: Weak<Relay<E>>,
-    halo: Arc<Halo<E>>,
+    halo: Arc<Halo>,
     me: PublicKey,
     mut queued: mpsc::Receiver<Relayed>,
 ) {
@@ -247,8 +247,8 @@ impl<E: super::Context> Lanes<E> {
 /// One peer's writer: the control stream to it, and its open group streams.
 struct PeerLink<E: super::Context> {
     relay: Weak<Relay<E>>,
-    streams: Arc<Streams<E>>,
-    datagrams: Arc<Datagrams<E>>,
+    streams: Arc<Streams>,
+    datagrams: Arc<Datagrams>,
     dropped: Counter,
     to: PublicKey,
     control: Option<Stream>,
@@ -376,10 +376,9 @@ impl<E: super::Context> PeerLink<E> {
 }
 
 /// One group to a peer, as one lane stream: the header, the objects, then `GROUP_COMPLETE` and
-/// FIN when the group completes. A group abandoned or dropped short is reset where the path
-/// can (QUIC) and ends without the word where it cannot (tcp), which reads the same.
-async fn group_writing<E: super::Context>(
-    streams: Arc<Streams<E>>,
+/// FIN when the group completes. A group abandoned or dropped short is reset.
+async fn group_writing(
+    streams: Arc<Streams>,
     to: PublicKey,
     header: GroupHeader,
     mut queue: mpsc::Receiver<GroupOut>,
@@ -414,15 +413,10 @@ async fn group_writing<E: super::Context>(
 }
 
 fn cut_short(stream: Stream) {
-    match stream.into_inner() {
-        Carried::Quic(mut send, _) => {
-            let _ = send.reset(0u32.into());
-        }
-        Carried::Tcp(_) => {}
-    }
+    stream.into_inner().reset();
 }
 
-async fn accepting<E: super::Context>(relay: Weak<Relay<E>>, streams: Arc<Streams<E>>) {
+async fn accepting<E: super::Context>(relay: Weak<Relay<E>>, streams: Arc<Streams>) {
     while let Some(inbound) = streams.accept().await {
         let Ok(meta) = abi::decode::<LaneMeta>(&inbound.meta) else {
             continue;
@@ -602,7 +596,7 @@ async fn group_reading<E: super::Context>(relay: Weak<Relay<E>>, inbound: Inboun
     relay.perform(effects);
 }
 
-async fn receiving<E: super::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Datagrams<E>>) {
+async fn receiving<E: super::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Datagrams>) {
     loop {
         let (from, bytes) = datagrams.recv().await;
         let mut bytes = Bytes::from(bytes);

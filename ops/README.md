@@ -26,15 +26,17 @@ scripts back a `make` target; see the repository `Makefile`.
   ```sh
   kubectl -n NETWORK exec found -- ducktape identity
   kubectl cp founding NETWORK/found:/data/founding
-  kubectl -n NETWORK exec found -- ducktape init /data/founding/founding.toml
+  kubectl -n NETWORK exec found -- ducktape init /data/founding/founding.toml --halo node.example.org:9100
   kubectl -n NETWORK delete pod found
   ```
 
 - Without it, it applies `k8s/node.yaml`: one pod running the node on
   `home` and cloudflared, which carries the node's HTTP port, and the
   WebSocket on it that peers dial, through a Cloudflare tunnel. The founding
-  file's `address` is `wss://` and the tunnel's hostname. The tunnel's token
-  is the Secret `tunnel`:
+  file's `address` is `wss://` and the tunnel's hostname. The node binds halo
+  at `0.0.0.0:9100` and registers the host:port given to `init --halo`.
+  A node whose registered halo address takes no inbound UDP still takes part by dialing out.
+  The tunnel's token is the Secret `tunnel`:
 
   ```sh
   cloudflared tunnel create NETWORK

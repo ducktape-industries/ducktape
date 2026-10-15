@@ -110,21 +110,20 @@ fn wrote_identity() -> state::Writes {
 
 struct Node {
     key: PublicKey,
-    halo: Arc<Halo<Context>>,
+    halo: Arc<Halo>,
     relay: Arc<Relay<Context>>,
     shutdown: watch::Sender<bool>,
-    _dir: tempfile::TempDir,
 }
 
 impl Node {
     fn udp(&self) -> std::net::SocketAddr {
-        self.halo.udp()[0]
+        self.halo.udp().unwrap()
     }
 
     fn seat(&self) -> Seat {
         Seat {
             key: self.key.clone(),
-            endpoint: Some(format!("tcp://{}", self.udp()).parse().unwrap()),
+            halo: format!("localhost:{}", self.udp().port()),
             validator: true,
         }
     }
@@ -133,15 +132,11 @@ impl Node {
 fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
     let identity = PrivateKey::from_seed(seed);
     let key = identity.public_key();
-    let dir = tempfile::tempdir().unwrap();
-    let store = blobs::Blobs::open(dir.path()).unwrap();
     let config = halo::Config {
-        egress_bytes_per_sec: 1 << 30,
-        udp: vec!["127.0.0.1:0".parse().unwrap()],
+        egress_bytes_per_sec: Some(1 << 30),
+        udp: "127.0.0.1:0".parse().unwrap(),
     };
-    let halo = Arc::new(
-        Halo::start(context.child("halo"), identity, b"live-test", config, store).unwrap(),
-    );
+    let halo = Arc::new(Halo::start(&context.child("halo"), identity, config).unwrap());
     let (shutdown, down) = watch::channel(false);
     let relay = Relay::start(
         context.child("live"),
@@ -160,7 +155,6 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         halo,
         relay,
         shutdown,
-        _dir: dir,
     }
 }
 

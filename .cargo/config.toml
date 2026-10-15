@@ -1,5 +1,4 @@
-# fetch git dependencies (fluent31, and this repository itself — guest-builder
-# reads every module out of it at a revision) with the git CLI instead of
+# fetch git dependencies (fluent31) with the git CLI instead of
 # libgit2: a `url.insteadOf` rewrite to ssh breaks cargo's built-in fetcher,
 # while the real git binary picks up the usual ssh agent/keys.
 [net]
@@ -9,8 +8,7 @@ git-fetch-with-cli = true
 # bin/node/src/task_dump.rs) needs this cfg. Linux only, matching the target
 # table in bin/node/Cargo.toml that turns the `taskdump` feature on: tokio
 # refuses that feature on any other OS, and a macOS build must stay a plain
-# stable-tokio build. wasm32 guests are outside `target_os = "linux"` too, so
-# a guest module's committed bytes never see this flag — `make
-# wasm-modules-check` and `ops/wasm-repro-check.sh` are the proof.
+# stable-tokio build. wasm32 programs are outside `target_os = "linux"` too, so
+# a program's committed bytes never see this flag.
 [target.'cfg(target_os = "linux")']
 rustflags = ["--cfg", "tokio_unstable"]

@@ -1,5 +1,5 @@
 //! A node's halo egress budget: one token bucket every stream it writes draws from, where a
-//! class that asked recently holds back every lower class.
+//! class that asked recently holds back every lower class; an unlimited pacer writes through.
 
 use std::future::Future;
 use std::io;
@@ -77,10 +77,14 @@ impl Bucket {
 
 #[derive(Clone)]
 pub struct Pacer {
-    bucket: Arc<Bucket>,
+    bucket: Option<Arc<Bucket>>,
 }
 
 impl Pacer {
+    pub fn unlimited() -> Pacer {
+        Pacer { bucket: None }
+    }
+
     pub fn new(bytes_per_sec: u64, burst_bytes: u64) -> Pacer {
         let level = Level {
             tokens: burst_bytes as f64,
@@ -93,7 +97,7 @@ impl Pacer {
             state: Mutex::new(level),
         };
         Pacer {
-            bucket: Arc::new(bucket),
+            bucket: Some(Arc::new(bucket)),
         }
     }
 
@@ -109,7 +113,7 @@ impl Pacer {
 
 pub struct Paced<S> {
     inner: S,
-    bucket: Arc<Bucket>,
+    bucket: Option<Arc<Bucket>>,
     class: Class,
     throttle: Option<Pin<Box<Sleep>>>,
 }
@@ -141,6 +145,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Paced<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        let Some(bucket) = this.bucket.clone() else {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
+        };
         if buf.is_empty() {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
@@ -149,7 +156,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Paced<S> {
                 std::task::ready!(throttle.as_mut().poll(cx));
                 this.throttle = None;
             }
-            let granted = match this.bucket.grant(buf.len(), this.class) {
+            let granted = match bucket.grant(buf.len(), this.class) {
                 Grant::Wait(at) => {
                     this.throttle = Some(Box::pin(sleep_until(at)));
                     continue;
@@ -162,7 +169,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Paced<S> {
                 Poll::Ready(Err(_)) | Poll::Pending => granted,
             };
             if unused > 0 {
-                this.bucket.refund(unused);
+                bucket.refund(unused);
             }
             return written;
         }
@@ -184,7 +191,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_grant_short_by_a_sliver_of_a_byte_waits_until_a_later_instant() {
         let pacer = Pacer::new(1 << 20, 1 << 10);
-        let bucket = &pacer.bucket;
+        let bucket = pacer.bucket.as_deref().unwrap();
         bucket.state.lock().unwrap().tokens = 1_023.999_999;
         let Grant::Wait(at) = bucket.grant(1 << 10, Class::Member) else {
             panic!("a short bucket waits");
@@ -195,7 +202,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_class_that_asked_lately_holds_back_every_lower_class() {
         let pacer = Pacer::new(1 << 20, 1 << 20);
-        let bucket = &pacer.bucket;
+        let bucket = pacer.bucket.as_deref().unwrap();
         assert!(matches!(bucket.grant(1, Class::Critical), Grant::Take(1)));
         assert!(matches!(bucket.grant(1, Class::Member), Grant::Wait(_)));
         assert!(matches!(bucket.grant(1, Class::Critical), Grant::Take(1)));

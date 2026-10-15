@@ -94,10 +94,12 @@ pub enum Principal {
 /// its binding, never by a name it assumes.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Roles {
-    pub registry: ProgramId,
+    pub programs: ProgramId,
     pub validators: ProgramId,
     /// Asked, once per frame, which account the frame acts as.
     pub identity: ProgramId,
+    pub blobs: ProgramId,
+    pub awaits: ProgramId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
@@ -174,13 +176,11 @@ pub enum Outcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-/// Why a frame runs: a submission, a message another program emitted in
-/// this frame, or the outcome of a message this program emitted with a
-/// reply wanted.
 pub enum Cause {
     Direct,
     Message(ItemRef),
     Completion { item: ItemRef, outcome: Outcome },
+    Call { ticket: role::awaits::Ticket },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -327,6 +327,17 @@ pub enum HostOp {
     Output(Vec<u8>),
     Respond(Vec<u8>),
     Crypto(CryptoOp),
+    Await {
+        target: ProgramId,
+        payload: Vec<u8>,
+        acting: Option<role::identity::AccountNumber>,
+    },
+    Defer,
+    Resume {
+        frame: role::awaits::FrameId,
+        ticket: role::awaits::Ticket,
+        answer: role::awaits::Answer,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -342,20 +353,25 @@ pub enum HostReply {
     Query(Result<Vec<u8>, Refusal>),
     Crypto(CryptoReply),
     Refused(Refusal),
+    Ticket(role::awaits::Ticket),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Invocation {
     pub env: Env,
-    pub call: GuestCall,
+    pub call: ProgramCall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum GuestCall {
+pub enum ProgramCall {
     Init(Vec<u8>),
     Execute(Vec<u8>),
     Query(Vec<u8>),
     Hook(hook::Record),
+    Resume {
+        ticket: role::awaits::Ticket,
+        answer: role::awaits::Answer,
+    },
 }
 
 pub mod hook {
@@ -372,14 +388,11 @@ pub mod hook {
     }
 }
 
-pub type GuestReply = Result<(), Refusal>;
+pub type ProgramReply = Result<(), Refusal>;
 
-/// The kernel calls programs by role, never by id: genesis binds each role
-/// (registry, validators, identity) to a founding program. Each module here is
-/// the interface the kernel speaks to the program in that role.
 pub mod role {
     /// Which code runs at a height.
-    pub mod registry {
+    pub mod programs {
         use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -432,6 +445,7 @@ pub mod role {
         pub struct Member {
             pub key: Vec<u8>,
             pub address: Option<String>,
+            pub halo: String,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -460,10 +474,14 @@ pub mod role {
         pub enum Op {
             Enroll {
                 address: Option<String>,
+                halo: String,
                 invite: Option<Invite>,
             },
             Leave,
             Vote(Motion),
+            SetHalo {
+                halo: String,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -472,7 +490,7 @@ pub mod role {
             Demote { key: Vec<u8> },
             Remove { key: Vec<u8> },
             Door { open: bool },
-            Registry { op: Vec<u8> },
+            Programs { op: Vec<u8> },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -500,6 +518,38 @@ pub mod role {
             pub grant: Grant,
             pub signature: Vec<u8>,
         }
+
+        pub fn registered_halo(halo: &str) -> Result<(), crate::Refusal> {
+            let refused = |why: &str| {
+                crate::Refusal::new(
+                    crate::reason::INVALID_INPUT,
+                    format!("halo: `{halo}` {why}"),
+                )
+            };
+            let Some((host, port)) = halo.rsplit_once(':') else {
+                return Err(refused("is not host:port"));
+            };
+            let ported = port.parse::<u16>().is_ok_and(|port| port != 0);
+            if host.is_empty() || !ported {
+                return Err(refused("is not host:port"));
+            }
+            let bare = host
+                .strip_prefix('[')
+                .and_then(|inner| inner.strip_suffix(']'))
+                .unwrap_or(host);
+            let name = bare.trim_end_matches('.').to_ascii_lowercase();
+            let named_localhost = name == "localhost" || name.ends_with(".localhost");
+            let bind_only = bare
+                .parse::<core::net::IpAddr>()
+                .map(|ip| ip.to_canonical())
+                .is_ok_and(|ip| ip.is_unspecified() || ip.is_loopback());
+            if named_localhost || bind_only {
+                return Err(refused(
+                    "is an unspecified or loopback host: register the host:port other members dial",
+                ));
+            }
+            Ok(())
+        }
     }
 
     /// Who holds a key or runs as a program (the account a frame acts as),
@@ -512,7 +562,7 @@ pub mod role {
         /// What an account is, in one field, so no account is two things
         /// at once: a person holds their own keys; a managed account holds
         /// the keys its `manager`, a person, gives it and acts only while
-        /// its `standing` is `Active`; a module's account is its program's
+        /// its `standing` is `Active`; a program's account is the program's own
         /// and holds no keys.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Kind {
@@ -523,7 +573,7 @@ pub mod role {
                 standing: Standing,
                 runner: Option<ProgramId>,
             },
-            Module(ProgramId),
+            Program(ProgramId),
         }
 
         /// What a manager declares a managed account to be. The enum only
@@ -555,7 +605,7 @@ pub mod role {
         /// program that has one changes nothing.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Op {
-            RegisterModule { module: ProgramId },
+            RegisterProgram { program: ProgramId },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -568,7 +618,7 @@ pub mod role {
             Account(Vec<u8>),
             /// The kernel's: the account of a program, answered as
             /// `Account`.
-            OfModule(ProgramId),
+            OfProgram(ProgramId),
             /// One account's profile, `None` for a number no account has.
             Profile(AccountNumber),
             /// Every account's profile, ascending by number from past
@@ -592,6 +642,88 @@ pub mod role {
                 profiles: Vec<Profile>,
                 next: Option<AccountNumber>,
             },
+        }
+    }
+
+    pub mod awaits {
+        use crate::{BorshDeserialize, BorshSerialize, ProgramId, Refusal, reason};
+
+        pub type Ticket = u64;
+        pub type FrameId = u64;
+        pub type Answer = Result<Vec<u8>, Refusal>;
+
+        pub const EXPIRY_BLOCKS: u64 = 64;
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Call {
+            pub ticket: Ticket,
+            pub target: ProgramId,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Op {
+            Park {
+                frame: FrameId,
+                program: ProgramId,
+                calls: Vec<Call>,
+            },
+            Resolve {
+                ticket: Ticket,
+                answer: Answer,
+            },
+            Expire {
+                ticket: Ticket,
+            },
+            Close {
+                frame: FrameId,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct TicketRow {
+            pub ticket: Ticket,
+            pub frame: FrameId,
+            pub caller: ProgramId,
+            pub target: ProgramId,
+            pub opened: u64,
+            pub deadline: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Query {
+            Ticket {
+                ticket: Ticket,
+            },
+            Owed {
+                target: ProgramId,
+                after: Option<Ticket>,
+                limit: u32,
+            },
+            Overdue {
+                height: u64,
+                after: Option<Ticket>,
+                limit: u32,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Reply {
+            Ticket(Option<TicketRow>),
+            Tickets(Vec<TicketRow>),
+        }
+
+        pub fn expired(ticket: Ticket, height: u64) -> Refusal {
+            Refusal::new(
+                reason::WRONG_STATE,
+                format!("call {ticket} expired at height {height}"),
+            )
+        }
+
+        pub fn cancelled(program: &str) -> Refusal {
+            Refusal::new(
+                reason::WRONG_STATE,
+                format!("{program} changed code while its frame awaited"),
+            )
         }
     }
 }
@@ -653,6 +785,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_registered_halo_address_names_a_host_other_members_dial() {
+        use role::validators::registered_halo;
+        for dialed in [
+            "a.example.org:9100",
+            "203.0.113.7:9100",
+            "[2001:db8::1]:9100",
+            "localhost-like.example:1",
+        ] {
+            assert_eq!(registered_halo(dialed), Ok(()), "{dialed}");
+        }
+        for unregistrable in [
+            "0.0.0.0:9100",
+            "[::]:9100",
+            ":::9100",
+            "127.0.0.1:9100",
+            "127.1.2.3:9100",
+            "[::1]:9100",
+            "[::ffff:127.0.0.1]:9100",
+            "localhost:9100",
+            "LOCALHOST.:9100",
+            "node.localhost:9100",
+            "a.example.org",
+            "a.example.org:0",
+            ":9100",
+        ] {
+            let refusal = registered_halo(unregistrable).unwrap_err();
+            assert_eq!(refusal.reason, reason::INVALID_INPUT, "{unregistrable}");
+            assert!(refusal.sentence.starts_with("halo: "), "{refusal:?}");
+        }
+    }
+
+    #[test]
     fn prefix_end_is_the_first_key_past_every_extension() {
         assert_eq!(prefix_end(b"ab"), Some(b"ac".to_vec()));
         assert_eq!(prefix_end(&[0x61, 0xff]), Some(vec![0x62]));
@@ -674,8 +838,8 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_role_keeps_at_on_tag_zero_and_asks_hooks_on_tag_five() {
-        use role::registry::{Query, Reply};
+    fn the_programs_role_keeps_at_on_tag_zero_and_asks_hooks_on_tag_five() {
+        use role::programs::{Query, Reply};
         let at = Query::At(7);
         let hooks = Query::Hooks(7);
         assert_eq!(encode(&at), [&[0u8][..], &7u64.to_le_bytes()].concat());
@@ -718,9 +882,11 @@ mod tests {
             origin: Origin::Program("b".into()),
             sender: Some(Principal::Account(4)),
             roles: Roles {
-                registry: "r".into(),
+                programs: "r".into(),
                 validators: "v".into(),
                 identity: "i".into(),
+                blobs: "b".into(),
+                awaits: "a".into(),
             },
             cause: Cause::Completion {
                 item: ItemRef {
@@ -737,7 +903,7 @@ mod tests {
         let reply = HostReply::Query(Err(Refusal::new("r", "s")));
         let invocation = Invocation {
             env: env.clone(),
-            call: GuestCall::Hook(hook::Record {
+            call: ProgramCall::Hook(hook::Record {
                 height: 7,
                 position: 2,
                 signer: vec![1],
@@ -746,7 +912,7 @@ mod tests {
                 applied: false,
             }),
         };
-        let guest_reply: GuestReply = Ok(());
+        let program_reply: ProgramReply = Ok(());
         assert_eq!(decode::<Env>(&encode(&env)).unwrap(), env);
         assert_eq!(decode::<HostOp>(&encode(&op)).unwrap(), op);
         assert_eq!(decode::<HostReply>(&encode(&reply)).unwrap(), reply);
@@ -755,8 +921,8 @@ mod tests {
             invocation
         );
         assert_eq!(
-            decode::<GuestReply>(&encode(&guest_reply)).unwrap(),
-            guest_reply
+            decode::<ProgramReply>(&encode(&program_reply)).unwrap(),
+            program_reply
         );
         assert_eq!(decode::<Env>(&[9, 9]).unwrap_err().reason, reason::PROTOCOL);
     }

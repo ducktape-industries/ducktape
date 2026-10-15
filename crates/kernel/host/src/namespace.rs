@@ -7,13 +7,15 @@ pub const PROGRAMS: &str = "$programs";
 pub const NETWORK: &str = "$network";
 pub const RECENT: &str = "$recent";
 pub const SPENT: &str = "$spent";
-pub const RESERVED: [&str; 5] = [BLOBS, PROGRAMS, NETWORK, RECENT, SPENT];
+pub const PARKED: &str = "$parked";
+pub const RESERVED: [&str; 6] = [BLOBS, PROGRAMS, NETWORK, RECENT, SPENT, PARKED];
 
 pub const ID: &[u8] = b"id";
 pub const LIMITS: &[u8] = b"limits";
 pub const EPOCH_LENGTH: &[u8] = b"epoch_length";
 pub const MEMBER_CAP: &[u8] = b"member_cap";
 pub const ROLES: &[u8] = b"roles";
+pub const NEXT_ITEM: &[u8] = b"next_item";
 
 pub fn blob(id: &BlobId) -> Vec<u8> {
     abi::encode(id)

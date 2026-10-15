@@ -1,6 +1,5 @@
 //! What halo needs from the medium under it: authenticated byte streams to and from members,
-//! and datagrams where the path to a member carries them. Links (QUIC, then tcp/tls/ws/wss)
-//! is the real medium; the sim medium serves tests.
+//! and datagrams. Links (QUIC) is the real medium; the sim medium serves tests.
 
 use std::future::Future;
 

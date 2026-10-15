@@ -1,6 +1,7 @@
-pub mod attach;
 mod crypto;
 mod namespace;
+mod parked;
+mod parking;
 mod unit;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,22 +11,24 @@ use std::path::Path;
 /// that leaves a role empty, or names a program it does not found, is refused.
 pub use abi::Roles;
 use abi::{
-    BlobId, Cause, Env, GuestCall, HashKind, Invocation, Origin, Outcome, Principal, ProgramId,
-    Refusal, Root, Scan, hook, reason,
-    role::{identity, registry, validators},
+    BlobId, Cause, Env, HashKind, Invocation, ItemRef, Message, Origin, Outcome, Principal,
+    ProgramCall, ProgramId, Refusal, Root, Scan, hook, reason,
+    role::{identity, programs, validators},
 };
-use blobs::{Blobs, Layered, Stage};
+use blob::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use runtime::Fault;
+use runtime::{Fault, Suspended};
 use sha2::{Digest as _, Sha256};
 use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
 
-use crate::attach::{Attachment, Budget};
+use crate::parked::Waiter;
+use crate::parking::{Run, Segment, Start, Status};
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
-pub use namespace::{BLOBS, NETWORK, PROGRAMS, RECENT, RESERVED, SPENT, spent};
+pub use namespace::{BLOBS, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT, spent};
+pub use parking::PAGE_FUEL;
 pub use runtime::Limits;
 
 const STATE_DIR: &str = "state";
@@ -43,7 +46,7 @@ pub enum Error {
     #[error(transparent)]
     State(#[from] state::Error),
     #[error(transparent)]
-    Blobs(#[from] blobs::Error),
+    Blobs(#[from] blob::Error),
     #[error("blob {0:?} is recorded on chain but not on this node")]
     BlobUnavailable(BlobId),
     #[error("{program} runs {code:?}, which this node cannot load: {fault}")]
@@ -82,16 +85,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type BlockId = [u8; 32];
 pub type SubmissionId = [u8; 32];
 
+type Sender = std::result::Result<Option<Principal>, Refusal>;
+
 pub struct Genesis {
     pub network: Vec<u8>,
     pub roles: Roles,
     /// The validators program's founding params: the kernel writes them.
     pub validators: Vec<validators::Member>,
-    /// The registry's founding params are the kernel's too: every founding
+    /// The programs role's founding params are the kernel's too: every founding
     /// program and view.
     pub programs: Vec<Founding>,
     /// Views with no program behind them: each blob is stored and listed by
-    /// the registry under its name; nothing is admitted.
+    /// the programs role under its name; nothing is admitted.
     pub views: Vec<FoundingView>,
     pub hooks: Vec<ProgramId>,
     pub limits: Limits,
@@ -154,8 +159,6 @@ pub struct Receipt {
     pub program: ProgramId,
     pub outcome: Outcome,
     pub events: Vec<Vec<u8>>,
-    /// The runs this one's messages caused, in order: each message's
-    /// target, then, when a reply was wanted, this program's reply run.
     /// A nested receipt's `Applied` and events stand only when every
     /// receipt above it was applied too: an ancestor's rejection undid it.
     pub nested: Vec<Receipt>,
@@ -195,31 +198,14 @@ enum Submitted {
         receipt: Receipt,
         account: Option<identity::AccountNumber>,
     },
-    Unheld {
-        target: ProgramId,
-        id: BlobId,
-    },
 }
 
 impl Submitted {
-    fn prediction(self) -> Receipt {
+    fn receipt(self) -> Receipt {
         match self {
             Submitted::Stale(receipt) | Submitted::Carried { receipt, .. } => receipt,
-            Submitted::Unheld { target, id } => rejected(
-                &target,
-                Refusal::new(
-                    reason::NOT_FOUND,
-                    format!("attachment {id:?} is not held here"),
-                ),
-            ),
         }
     }
-}
-
-enum Holding {
-    Held,
-    Absent(BlobId),
-    Misnamed(Refusal),
 }
 
 struct Hooks {
@@ -309,10 +295,10 @@ where
             namespace::ROLES.to_vec(),
             abi::encode(&genesis.roles),
         );
-        let mut entries: Vec<registry::Entry> = genesis
+        let mut entries: Vec<programs::Entry> = genesis
             .programs
             .into_iter()
-            .map(|founding| registry::Entry {
+            .map(|founding| programs::Entry {
                 program: founding.program,
                 code: put_code(&mut overlay, &mut stage, &founding.code),
                 params: founding.params,
@@ -320,9 +306,11 @@ where
             .collect();
         let roles = &genesis.roles;
         for (role, program) in [
-            ("registry", &roles.registry),
+            ("programs", &roles.programs),
             ("validators", &roles.validators),
             ("identity", &roles.identity),
+            ("blobs", &roles.blobs),
+            ("awaits", &roles.awaits),
         ] {
             let founded = entries.iter().any(|entry| entry.program == *program);
             if !founded {
@@ -338,9 +326,12 @@ where
                 return Err(Error::Unhooked(hook.clone()));
             }
         }
-        // the registry, the validators, then identity are admitted before
-        // the rest
-        let founding_roles = [&roles.registry, &roles.validators, &roles.identity];
+        let founding_roles = [
+            &roles.programs,
+            &roles.validators,
+            &roles.identity,
+            &roles.blobs,
+        ];
         entries.sort_by_key(|entry| {
             founding_roles
                 .iter()
@@ -356,10 +347,10 @@ where
                 entry.params = params.clone();
             }
         }
-        let views: Vec<registry::View> = genesis
+        let views: Vec<programs::View> = genesis
             .views
             .into_iter()
-            .map(|founding| registry::View {
+            .map(|founding| programs::View {
                 name: founding.name,
                 view: put_code(&mut overlay, &mut stage, &founding.view),
             })
@@ -378,7 +369,7 @@ where
                 });
             }
         }
-        entries[0].params = abi::encode(&registry::Genesis {
+        entries[0].params = abi::encode(&programs::Genesis {
             programs: entries.clone(),
             views,
             hooks: genesis.hooks,
@@ -386,7 +377,7 @@ where
         // the roles init before identity can give an account; every other
         // program has its account before its init runs, so what it emits
         // carries it
-        let is_role = |entry: &registry::Entry| founding_roles.contains(&&entry.program);
+        let is_role = |entry: &programs::Entry| founding_roles.contains(&&entry.program);
         let (role_entries, rest) = entries.split_at(entries.partition_point(is_role));
         // nothing above touches `dir`: a genesis refused there leaves no state
         let storage = Storage::open(&dir.join(STATE_DIR))?;
@@ -633,22 +624,17 @@ where
     }
 
     pub fn missing_blobs(&self) -> Result<Vec<BlobId>> {
-        let rostered = self
-            .store
-            .view(Vec::new())
-            .scan(BLOBS, &Scan::prefix(b""))?;
-        let mut missing = Vec::new();
-        for entry in rostered {
-            let id: BlobId = abi::decode(&entry.key).map_err(corrupt)?;
-            if !self.blobs.has(&id) {
-                missing.push(id);
-            }
+        let view = self.store.view(Vec::new());
+        let mut named = BTreeSet::new();
+        for entry in view.scan(BLOBS, &Scan::prefix(b""))? {
+            named.insert(abi::decode::<BlobId>(&entry.key).map_err(corrupt)?);
         }
-        Ok(missing)
+        named.extend(programs_of(&view)?.into_values());
+        Ok(named.into_iter().filter(|id| !self.blobs.has(id)).collect())
     }
 
     pub fn install(&mut self, id: BlobId, framed: &[u8]) -> Result<()> {
-        let hashes_to_id = blobs::id_of(id.kind(), framed) == id;
+        let hashes_to_id = blob::id_of(id.kind(), framed) == id;
         if !hashes_to_id {
             return Err(Error::Corrupt(format!(
                 "the bytes offered for {id:?} do not hash to it"
@@ -662,16 +648,39 @@ where
         &self.blobs
     }
 
-    pub fn rostered(&self, id: &BlobId) -> Result<bool> {
-        let entry = self
-            .store
-            .view(Vec::new())
-            .get(BLOBS, &namespace::blob(id))?;
-        Ok(entry.is_some())
+    pub async fn readable(&self, id: &BlobId, time: u64) -> Result<bool> {
+        let height = self.height()?;
+        self.readable_in(id, height, time, &Overlay::default(), &Stage::default())
+            .await
     }
 
-    pub fn blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
-        if !self.rostered(id)? {
+    async fn readable_in(
+        &self,
+        id: &BlobId,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<bool> {
+        let rostered = View::new(self.store.storage(), vec![overlay])
+            .get(BLOBS, &namespace::blob(id))?
+            .is_some();
+        if rostered {
+            return Ok(true);
+        }
+        unit::held(
+            self.world(height, time),
+            vec![overlay],
+            stage,
+            &[],
+            id,
+            &mut self.loaded.limits().fuel,
+        )
+        .await
+    }
+
+    pub async fn blob(&self, id: &BlobId, time: u64) -> Result<Option<Vec<u8>>> {
+        if !self.readable(id, time).await? {
             return Ok(None);
         }
         self.blobs
@@ -687,38 +696,9 @@ where
             loaded: &self.loaded,
             network: &self.network,
             roles: &self.roles,
-            attached: &[],
             height,
             time,
         }
-    }
-
-    pub fn held_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
-        Ok(self.blobs.framed(id)?)
-    }
-
-    pub fn holds(&self, attachment: &Attachment) -> Result<bool> {
-        let size = self.blobs.size(&attachment.id)?;
-        Ok(size == Some(attachment.len))
-    }
-
-    fn holding(&self, attached: &[Attachment]) -> Result<Holding> {
-        for attachment in attached {
-            let Some(size) = self.blobs.size(&attachment.id)? else {
-                return Ok(Holding::Absent(attachment.id));
-            };
-            let as_named = size == attachment.len;
-            if !as_named {
-                return Ok(Holding::Misnamed(Refusal::new(
-                    reason::INVALID_INPUT,
-                    format!(
-                        "attachment {:?} is {size} bytes, and the frame names {}",
-                        attachment.id, attachment.len
-                    ),
-                )));
-            }
-        }
-        Ok(Holding::Held)
     }
 
     pub async fn query(
@@ -829,20 +809,12 @@ where
         let height = self.next_height()?;
         let mut overlay = std::mem::take(&mut self.preconfirmed);
         let mut stage = Stage::default();
-        let mut budget = Budget::default();
         let mut receipts = Vec::new();
         for submission in submissions {
             let submitted = self
-                .submit(
-                    submission,
-                    height,
-                    time,
-                    &mut budget,
-                    &mut overlay,
-                    &mut stage,
-                )
+                .submit(submission, height, time, &mut overlay, &mut stage)
                 .await?;
-            receipts.push(submitted.prediction());
+            receipts.push(submitted.receipt());
         }
         self.preconfirmed = overlay;
         Ok(receipts)
@@ -866,30 +838,28 @@ where
         let mut hooks = self
             .hooks(block.height, block.time, &overlay, &stage)
             .await?;
-        let mut budget = Budget::default();
         let mut submissions = Vec::new();
         for (position, submission) in block.submissions.into_iter().enumerate() {
             let signer = submission.signer.clone();
+            let target = submission.target.clone();
             let submitted = self
                 .submit(
                     submission,
                     block.height,
                     block.time,
-                    &mut budget,
                     &mut overlay,
                     &mut stage,
                 )
                 .await?;
             let receipt = match submitted {
                 Submitted::Stale(receipt) => receipt,
-                Submitted::Unheld { id, .. } => return Err(Error::BlobUnavailable(id)),
                 Submitted::Carried { receipt, account } => {
                     let record = hook::Record {
                         height: block.height,
                         position: position as u32,
                         signer,
                         account,
-                        target: receipt.program.clone(),
+                        target,
                         applied: matches!(receipt.outcome, Outcome::Applied { .. }),
                     };
                     self.tell(&mut hooks, &record, block.time, &mut overlay, &mut stage)
@@ -925,12 +895,9 @@ where
         submission: Submission,
         height: u64,
         time: u64,
-        budget: &mut Budget,
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Submitted> {
-        let envelope = attach::attached(&submission)
-            .map(|envelope| envelope.and_then(|attached| budget.take(attached)));
         let view = self.store.view(vec![&*overlay]);
         if let Err(refusal) = fresh(&view, &submission, height)? {
             return Ok(Submitted::Stale(rejected(&submission.target, refusal)));
@@ -950,32 +917,12 @@ where
                 });
             }
         };
-        let (target, payload, attached) = match envelope {
-            None => (submission.target, submission.payload, Vec::new()),
-            Some(Ok(attached)) => (attached.target, attached.payload, attached.blobs),
-            Some(Err(refusal)) => {
-                return Ok(Submitted::Carried {
-                    receipt: rejected(&submission.target, refusal),
-                    account,
-                });
-            }
-        };
-        match self.holding(&attached)? {
-            Holding::Held => {}
-            Holding::Absent(id) => return Ok(Submitted::Unheld { target, id }),
-            Holding::Misnamed(refusal) => {
-                return Ok(Submitted::Carried {
-                    receipt: rejected(&target, refusal),
-                    account,
-                });
-            }
-        }
         let checkpoint = overlay.checkpoint();
         let env = Env {
             network: self.network.clone(),
             height,
             time,
-            me: target.clone(),
+            me: submission.target.clone(),
             origin: Origin::External(submission.signer),
             // a key that holds no account still runs (identity's own
             // create is such a frame); it acts as no one
@@ -985,10 +932,9 @@ where
         };
         let receipt = self
             .run(
-                &target,
-                GuestCall::Execute(payload),
+                &submission.target,
+                ProgramCall::Execute(submission.payload),
                 env,
-                attached,
                 overlay,
                 stage,
             )
@@ -1016,15 +962,15 @@ where
             stage,
             &[],
             Origin::System,
-            self.roles.registry.clone(),
-            abi::encode(&registry::Query::Hooks(height)),
+            self.roles.programs.clone(),
+            abi::encode(&programs::Query::Hooks(height)),
             &mut self.loaded.limits().fuel,
         )
         .await?;
         let Ok(bytes) = reply else {
             return Ok(none());
         };
-        let Ok(registry::Reply::Hooks(listed)) = abi::decode::<registry::Reply>(&bytes) else {
+        let Ok(programs::Reply::Hooks(listed)) = abi::decode::<programs::Reply>(&bytes) else {
             return Ok(none());
         };
         let mut hooks = none();
@@ -1089,23 +1035,25 @@ where
         };
         let mut frame = Frame {
             fuel: self.loaded.limits().fuel.map(|_| HOOK_FUEL),
+            first_item: 0,
             next_item: 0,
-            attached: Vec::new(),
         };
         let invocation = Invocation {
             env,
-            call: GuestCall::Hook(record.clone()),
+            call: ProgramCall::Hook(record.clone()),
         };
-        let (receipt, emitted) = unit::execute(
+        let (receipt, effects) = unit::execute(
             self.world(record.height, time),
             overlay,
             stage,
             &mut frame,
             program,
+            None,
             invocation,
         )
         .await?;
-        let sent_messages = !emitted.is_empty();
+        let sent_messages =
+            !(effects.emitted.is_empty() && effects.calls.is_empty() && effects.resumes.is_empty());
         let refusal = match (receipt.outcome, sent_messages) {
             (Outcome::Rejected(refusal), _) => refusal,
             (Outcome::Applied { .. }, false) => return Ok(None),
@@ -1151,12 +1099,53 @@ where
         overlay: &Overlay,
         stage: &Stage,
         frame: &mut Frame,
-    ) -> Result<std::result::Result<Option<Principal>, Refusal>> {
-        let asked = identity::Query::OfModule(program.to_owned());
+    ) -> Result<Sender> {
+        let asked = identity::Query::OfProgram(program.to_owned());
         let account = self
             .account(asked, height, time, overlay, stage, &mut frame.fuel)
             .await?;
         Ok(account.map(|account| account.map(Principal::Account)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn own_sender(
+        &self,
+        program: &str,
+        asked: bool,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+        frame: &mut Frame,
+    ) -> Result<Sender> {
+        match asked {
+            true => {
+                self.account_of(program, height, time, overlay, stage, frame)
+                    .await
+            }
+            false => Ok(Ok(None)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sender(
+        &self,
+        program: &str,
+        acting: Option<identity::AccountNumber>,
+        own: &Sender,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+        frame: &mut Frame,
+    ) -> Result<Sender> {
+        match acting {
+            None => Ok(own.clone()),
+            Some(account) => {
+                self.run_by(program, account, height, time, overlay, stage, frame)
+                    .await
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1169,7 +1158,7 @@ where
         overlay: &Overlay,
         stage: &Stage,
         frame: &mut Frame,
-    ) -> Result<std::result::Result<Option<Principal>, Refusal>> {
+    ) -> Result<Sender> {
         let asked = identity::Query::Runs {
             program: program.to_owned(),
             account,
@@ -1187,7 +1176,7 @@ where
     }
 
     /// The account the identity role says a frame acts as: the one a key
-    /// holds (`Account`), or a program's own (`OfModule`). The role's
+    /// holds (`Account`), or a program's own (`OfProgram`). The role's
     /// refusal, or a reply that is not its interface's, rejects the frame.
     async fn account(
         &self,
@@ -1230,98 +1219,193 @@ where
     async fn run(
         &self,
         program: &str,
-        call: GuestCall,
+        call: ProgramCall,
         env: Env,
-        attached: Vec<Attachment>,
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Receipt> {
-        let mut frame = Frame {
-            fuel: self.loaded.limits().fuel,
-            next_item: 0,
-            attached,
-        };
-        self.run_frame(program, call, env, overlay, stage, &mut frame, 0)
-            .await
+        let mut frame = self.open_frame(self.loaded.limits().fuel, overlay)?;
+        let ran = self
+            .run_frame(
+                program,
+                call,
+                env,
+                Waiter::Nobody,
+                overlay,
+                stage,
+                &mut frame,
+                0,
+            )
+            .await?;
+        self.close_frame(overlay, &frame);
+        Ok(ran.receipt)
     }
 
-    /// Runs `call`, then the messages it emitted in order, each at
-    /// `depth + 1` and depth first, and undoes the whole run on a rejection
-    /// it does not absorb: a rejected message without a reply, or a
-    /// rejected reply run. A message with a reply wanted comes back as a
-    /// `Completion` frame of the emitter, the target's writes undone when
-    /// it was rejected.
+    fn open_frame(&self, fuel: Option<u64>, overlay: &Overlay) -> Result<Frame> {
+        let view = self.store.view(vec![overlay]);
+        let next_item = parked::counter(&view, NETWORK, namespace::NEXT_ITEM)?;
+        Ok(Frame {
+            fuel,
+            first_item: next_item,
+            next_item,
+        })
+    }
+
+    fn close_frame(&self, overlay: &mut Overlay, frame: &Frame) {
+        let emitted = frame.next_item != frame.first_item;
+        if emitted {
+            let next = frame.next_item.to_be_bytes().to_vec();
+            overlay.set(NETWORK, namespace::NEXT_ITEM.to_vec(), next);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_frame(
         &self,
         program: &str,
-        call: GuestCall,
+        call: ProgramCall,
         env: Env,
+        waiter: Waiter,
         overlay: &mut Overlay,
         stage: &mut Stage,
         frame: &mut Frame,
         depth: u32,
-    ) -> Result<Receipt> {
+    ) -> Result<Run> {
         if depth > MAX_DEPTH {
-            return Ok(rejected(
-                program,
-                Refusal::new(
-                    reason::CAPACITY,
-                    format!("messages nest deeper than {MAX_DEPTH}"),
-                ),
-            ));
+            let too_deep = Refusal::new(
+                reason::CAPACITY,
+                format!("messages nest deeper than {MAX_DEPTH}"),
+            );
+            return Ok(Run::finished(rejected(program, too_deep)));
         }
-        let (height, time) = (env.height, env.time);
         let checkpoint = overlay.checkpoint();
-        let (mut receipt, emitted) = unit::execute(
-            self.world(height, time),
-            overlay,
-            stage,
-            frame,
-            program,
-            Invocation { env, call },
-        )
-        .await?;
+        let segment = self
+            .segment(program, &env, None, call, overlay, stage, frame, depth)
+            .await?;
+        let start = Start {
+            frame: None,
+            waiter,
+            checkpoint,
+        };
+        self.follow(program, env, start, segment, overlay, stage, frame, depth)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn segment(
+        &self,
+        program: &str,
+        env: &Env,
+        suspended: Option<Suspended>,
+        call: ProgramCall,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+        frame: &mut Frame,
+        depth: u32,
+    ) -> Result<Segment> {
+        let checkpoint = overlay.checkpoint();
+        let invocation = Invocation {
+            env: env.clone(),
+            call,
+        };
+        let world = self.world(env.height, env.time);
+        let (mut receipt, effects) =
+            unit::execute(world, overlay, stage, frame, program, suspended, invocation).await?;
+        let unit::Effects {
+            emitted,
+            calls,
+            resumes,
+            deferred,
+            parked,
+        } = effects;
+        let refused = self
+            .deliver(
+                program,
+                env,
+                emitted,
+                &mut receipt,
+                overlay,
+                stage,
+                frame,
+                depth,
+            )
+            .await?;
+        if let Some(outcome) = refused {
+            overlay.restore(checkpoint);
+            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+            receipt.outcome = outcome;
+            return Ok(Segment::finished(receipt));
+        }
+        for resumed in resumes {
+            let ran = Box::pin(self.resume_parked(
+                resumed,
+                env.height,
+                env.time,
+                overlay,
+                stage,
+                frame,
+                depth + 1,
+            ))
+            .await?;
+            receipt.nested.push(ran);
+        }
+        Ok(Segment {
+            receipt,
+            calls,
+            deferred,
+            parked,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver(
+        &self,
+        program: &str,
+        env: &Env,
+        emitted: Vec<(ItemRef, Message)>,
+        receipt: &mut Receipt,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+        frame: &mut Frame,
+        depth: u32,
+    ) -> Result<Option<Outcome>> {
+        let (height, time) = (env.height, env.time);
         // the emitter's account, asked once for all its messages
         let as_itself = emitted.iter().any(|(_, message)| message.acting.is_none());
-        let emitter = if as_itself {
-            self.account_of(program, height, time, overlay, stage, frame)
-                .await?
-        } else {
-            Ok(None)
-        };
+        let emitter = self
+            .own_sender(program, as_itself, height, time, overlay, stage, frame)
+            .await?;
         for (item, message) in emitted {
-            let sender = match message.acting {
-                None => emitter.clone(),
-                Some(account) => {
-                    self.run_by(program, account, height, time, overlay, stage, frame)
-                        .await?
-                }
-            };
-            let env = |me: &str, origin: &str, sender, cause| Env {
-                network: self.network.clone(),
-                height,
-                time,
-                me: me.to_owned(),
-                origin: Origin::Program(origin.to_owned()),
-                sender,
-                roles: self.roles.clone(),
-                cause,
-            };
+            let sender = self
+                .sender(
+                    program,
+                    message.acting,
+                    &emitter,
+                    height,
+                    time,
+                    overlay,
+                    stage,
+                    frame,
+                )
+                .await?;
             let ran = match sender {
-                Err(refusal) => rejected(&message.target, refusal),
+                Err(refusal) => Run::finished(rejected(&message.target, refusal)),
                 Ok(sender) => {
-                    let env = env(
-                        &message.target,
-                        program,
-                        sender,
-                        Cause::Message(item.clone()),
-                    );
-                    let call = GuestCall::Execute(message.payload);
+                    let cause = Cause::Message(item.clone());
+                    let env = self.env(&message.target, program, sender, cause, height, time);
+                    let call = ProgramCall::Execute(message.payload);
+                    let waiter = match message.reply {
+                        true => Waiter::Reply {
+                            emitter: program.to_owned(),
+                            item: item.clone(),
+                        },
+                        false => Waiter::Nobody,
+                    };
                     Box::pin(self.run_frame(
                         &message.target,
                         call,
                         env,
+                        waiter,
                         overlay,
                         stage,
                         frame,
@@ -1330,35 +1414,31 @@ where
                     .await?
                 }
             };
-            let outcome = ran.outcome.clone();
-            receipt.nested.push(ran);
+            let outcome = ran.receipt.outcome.clone();
+            receipt.nested.push(ran.receipt);
+            let waits = matches!(ran.status, Status::Parked);
+            if waits {
+                continue;
+            }
             let refused = matches!(outcome, Outcome::Rejected(_));
             let outcome = match (refused, message.reply) {
                 (false, false) => continue,
                 (true, false) => outcome,
                 (_, true) => {
-                    let by = &message.target;
-                    let replied = match self
-                        .account_of(by, height, time, overlay, stage, frame)
-                        .await?
-                    {
-                        Err(refusal) => rejected(program, refusal),
-                        Ok(sender) => {
-                            let cause = Cause::Completion { item, outcome };
-                            let env = env(program, by, sender, cause);
-                            let call = GuestCall::Execute(Vec::new());
-                            Box::pin(self.run_frame(
-                                program,
-                                call,
-                                env,
-                                overlay,
-                                stage,
-                                frame,
-                                depth + 1,
-                            ))
-                            .await?
-                        }
-                    };
+                    let replied = self
+                        .complete(
+                            program,
+                            &message.target,
+                            item,
+                            outcome,
+                            height,
+                            time,
+                            overlay,
+                            stage,
+                            frame,
+                            depth + 1,
+                        )
+                        .await?;
                     let outcome = replied.outcome.clone();
                     receipt.nested.push(replied);
                     match outcome {
@@ -1367,12 +1447,61 @@ where
                     }
                 }
             };
-            overlay.restore(checkpoint);
-            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
-            receipt.outcome = outcome;
-            break;
+            return Ok(Some(outcome));
         }
-        Ok(receipt)
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete(
+        &self,
+        emitter: &str,
+        by: &str,
+        item: ItemRef,
+        outcome: Outcome,
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+        frame: &mut Frame,
+        depth: u32,
+    ) -> Result<Receipt> {
+        let sender = match self
+            .account_of(by, height, time, overlay, stage, frame)
+            .await?
+        {
+            Err(refusal) => return Ok(rejected(emitter, refusal)),
+            Ok(sender) => sender,
+        };
+        let cause = Cause::Completion { item, outcome };
+        let env = self.env(emitter, by, sender, cause, height, time);
+        let call = ProgramCall::Execute(Vec::new());
+        let waiter = Waiter::Nobody;
+        let ran =
+            Box::pin(self.run_frame(emitter, call, env, waiter, overlay, stage, frame, depth))
+                .await?;
+        Ok(ran.receipt)
+    }
+
+    pub(crate) fn env(
+        &self,
+        me: &str,
+        origin: &str,
+        sender: Option<Principal>,
+        cause: Cause,
+        height: u64,
+        time: u64,
+    ) -> Env {
+        Env {
+            network: self.network.clone(),
+            height,
+            time,
+            me: me.to_owned(),
+            origin: Origin::Program(origin.to_owned()),
+            sender,
+            roles: self.roles.clone(),
+            cause,
+        }
     }
 
     async fn refresh_programs(
@@ -1388,35 +1517,39 @@ where
             &*stage,
             &[],
             Origin::System,
-            self.roles.registry.clone(),
-            abi::encode(&registry::Query::At(height)),
+            self.roles.programs.clone(),
+            abi::encode(&programs::Query::At(height)),
             &mut self.loaded.limits().fuel,
         )
         .await?;
         let Ok(bytes) = reply else {
             return Ok(Vec::new());
         };
-        let Ok(registry::Reply::Programs(entries)) = abi::decode::<registry::Reply>(&bytes) else {
+        let Ok(programs::Reply::Programs(entries)) = abi::decode::<programs::Reply>(&bytes) else {
             return Ok(Vec::new());
         };
         let running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
         let mut receipts = Vec::new();
         let mut wanted = BTreeSet::new();
+        let mut changed = Vec::new();
         for entry in entries {
             let admissible = valid_program_id(&entry.program) && !wanted.contains(&entry.program);
             if !admissible {
                 continue;
             }
-            let rostered = View::new(self.store.storage(), vec![&*overlay])
-                .get(BLOBS, &namespace::blob(&entry.code))?
-                .is_some();
-            if !rostered {
+            let readable = self
+                .readable_in(&entry.code, height, time, overlay, stage)
+                .await?;
+            if !readable {
                 continue;
             }
             wanted.insert(entry.program.clone());
             match running.get(&entry.program) {
                 Some(code) if *code == entry.code => {}
-                Some(_) => receipts.push(self.swap(&entry, overlay, stage)?),
+                Some(_) => {
+                    receipts.push(self.swap(&entry, overlay, stage)?);
+                    changed.push(entry.program.clone());
+                }
                 None => {
                     // a program runs only as its account, its init too:
                     // identity's refusal leaves it unadmitted, and the next
@@ -1447,14 +1580,21 @@ where
             if dropped {
                 overlay.delete(PROGRAMS, program.clone().into_bytes());
                 self.loaded.unload(program);
+                changed.push(program.clone());
             }
+        }
+        for program in changed {
+            let cancelled = self
+                .cancel_parked(&program, height, time, overlay, stage)
+                .await?;
+            receipts.extend(cancelled);
         }
         Ok(receipts)
     }
 
     async fn admit(
         &mut self,
-        entry: &registry::Entry,
+        entry: &programs::Entry,
         height: u64,
         time: u64,
         overlay: &mut Overlay,
@@ -1478,9 +1618,8 @@ where
         let receipt = self
             .run(
                 &entry.program,
-                GuestCall::Init(entry.params.clone()),
+                ProgramCall::Init(entry.params.clone()),
                 env,
-                Vec::new(),
                 overlay,
                 stage,
             )
@@ -1500,7 +1639,7 @@ where
     }
 
     /// Gives an admitted program its account: the identity role's
-    /// `RegisterModule`, run as the system. A refusal is the receipt's.
+    /// `RegisterProgram`, run as the system. A refusal is the receipt's.
     async fn register(
         &self,
         program: &str,
@@ -1519,14 +1658,13 @@ where
             roles: self.roles.clone(),
             cause: Cause::Direct,
         };
-        let op = identity::Op::RegisterModule {
-            module: program.to_owned(),
+        let op = identity::Op::RegisterProgram {
+            program: program.to_owned(),
         };
         self.run(
             &self.roles.identity,
-            GuestCall::Execute(abi::encode(&op)),
+            ProgramCall::Execute(abi::encode(&op)),
             env,
-            Vec::new(),
             overlay,
             stage,
         )
@@ -1535,7 +1673,7 @@ where
 
     fn swap(
         &mut self,
-        entry: &registry::Entry,
+        entry: &programs::Entry,
         overlay: &mut Overlay,
         stage: &Stage,
     ) -> Result<Receipt> {
@@ -1559,7 +1697,7 @@ where
 
     fn load(
         &self,
-        entry: &registry::Entry,
+        entry: &programs::Entry,
         stage: &Stage,
     ) -> Result<std::result::Result<runtime::Code, Refusal>> {
         let layered = Layered {
@@ -1625,7 +1763,7 @@ where
 }
 
 /// A founding run's receipt, or the refusal that stops the founding.
-fn founded(entry: &registry::Entry, receipt: Receipt) -> Result<Receipt> {
+fn founded(entry: &programs::Entry, receipt: Receipt) -> Result<Receipt> {
     match &receipt.outcome {
         Outcome::Applied { .. } => Ok(receipt),
         Outcome::Rejected(refusal) => Err(Error::Genesis {

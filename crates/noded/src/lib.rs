@@ -1,6 +1,6 @@
 mod blocks;
 mod client;
-mod fetch;
+mod endpoint;
 pub mod live;
 mod logs;
 mod mesh;
@@ -22,8 +22,8 @@ use host::Applied;
 use node::Node;
 use tokio::sync::watch;
 
-pub use client::Client;
-pub use halo::{Endpoint, Scheme};
+pub use client::{Client, Upload};
+pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
 pub use run::{HaloConfig, Listen, Running, init, invite, join, run};
@@ -63,7 +63,7 @@ pub enum Error {
     #[error(transparent)]
     Host(#[from] host::Error),
     #[error(transparent)]
-    Blobs(#[from] blobs::Error),
+    Blob(#[from] blob::Error),
     #[error(transparent)]
     Sync(#[from] statesync::Error),
     #[error(transparent)]
@@ -103,8 +103,10 @@ pub struct Daemon<E: Context> {
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub relay: relay::Relay<E>,
-    pub halo: Arc<halo::Halo<E>>,
+    pub blobs: blob::service::Service,
+    halo: Arc<halo::Halo>,
     pub live: Arc<live::Relay<E>>,
+    key: commonware_cryptography::ed25519::PrivateKey,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,

@@ -14,7 +14,6 @@ pub struct Held {
     pub frame: Vec<u8>,
     pub submission: Submission,
     pub prediction: Receipt,
-    pub attached: u64,
     arrival: u64,
     offer: Option<Offer>,
 }
@@ -57,7 +56,6 @@ impl Pool {
         frame: Vec<u8>,
         submission: Submission,
         prediction: Receipt,
-        attached: u64,
         offered: Option<u64>,
     ) {
         let id = submission.id();
@@ -72,7 +70,6 @@ impl Pool {
             frame,
             submission,
             prediction,
-            attached,
             arrival,
             offer: offered.map(|at| Offer { at, sends: 1 }),
         };

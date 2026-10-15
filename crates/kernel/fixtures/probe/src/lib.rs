@@ -30,7 +30,7 @@ pub fn seen(height: u64, position: u32) -> Vec<u8> {
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::{Env, Refusal, hook};
-    use guest::{Execute, Program, Query, Reads};
+    use program::{Execute, Program, Query, Reads};
 
     use crate::{HOOK, Reply, Step, seen};
 
@@ -82,5 +82,5 @@ mod program {
         Ok(replies)
     }
 
-    guest::program!(Probe);
+    program::program!(Probe);
 }

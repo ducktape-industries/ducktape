@@ -1,17 +1,15 @@
-//! The current member set halo admits and dials: each member's key, the endpoint the chain
-//! records for it, and whether it votes.
+//! The current member set halo admits and dials: each member's key, the halo address it
+//! registered on the chain, and whether it votes.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 
 use commonware_cryptography::ed25519::PublicKey;
 
-use crate::endpoint::Endpoint;
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seat {
     pub key: PublicKey,
-    pub endpoint: Option<Endpoint>,
+    pub halo: String,
     pub validator: bool,
 }
 
@@ -21,15 +19,23 @@ pub struct Members {
 }
 
 impl Members {
-    pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) {
-        let seated = seats
+    pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) -> Vec<PublicKey> {
+        let seated: HashMap<PublicKey, Seat> = seats
             .into_iter()
             .map(|seat| (seat.key.clone(), seat))
             .collect();
-        *self
+        let mut held = self
             .seats
             .write()
-            .expect("the seats lock is never poisoned") = seated;
+            .expect("the seats lock is never poisoned");
+        let removed = held.keys().filter(|key| !seated.contains_key(*key));
+        let moved = seated
+            .iter()
+            .filter(|(key, seat)| held.get(*key) != Some(*seat))
+            .map(|(key, _)| key);
+        let changed = removed.chain(moved).cloned().collect();
+        *held = seated;
+        changed
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<PublicKey, Seat>> {
@@ -44,8 +50,8 @@ impl Members {
         self.read().get(key).is_some_and(|seat| seat.validator)
     }
 
-    pub fn endpoint(&self, key: &PublicKey) -> Option<Endpoint> {
-        self.read().get(key)?.endpoint.clone()
+    pub fn halo(&self, key: &PublicKey) -> Option<String> {
+        Some(self.read().get(key)?.halo.clone())
     }
 
     pub fn candidates(&self, me: &PublicKey, first: Option<&PublicKey>) -> Vec<PublicKey> {
@@ -88,9 +94,35 @@ mod tests {
     fn seat(seed: u64, validator: bool) -> Seat {
         Seat {
             key: key(seed),
-            endpoint: None,
+            halo: format!("localhost:{seed}"),
             validator,
         }
+    }
+
+    #[test]
+    fn a_reseat_names_the_members_it_adds_removes_or_moves() {
+        let members = Members::default();
+        let mut first = members.seat([seat(0, true), seat(1, true), seat(2, false)]);
+        first.sort();
+        let mut all = vec![key(0), key(1), key(2)];
+        all.sort();
+        assert_eq!(first, all);
+        let moved = Seat {
+            halo: "elsewhere.example.org:9".into(),
+            ..seat(1, true)
+        };
+        let mut changed = members.seat([seat(0, true), moved, seat(2, true), seat(3, false)]);
+        changed.sort();
+        let mut expected = vec![key(1), key(2), key(3)];
+        expected.sort();
+        assert_eq!(changed, expected);
+        assert_eq!(
+            members.halo(&key(1)).as_deref(),
+            Some("elsewhere.example.org:9")
+        );
+        let removed = members.seat([seat(0, true)]);
+        assert_eq!(removed.len(), 3);
+        assert!(members.seat([seat(0, true)]).is_empty());
     }
 
     #[test]

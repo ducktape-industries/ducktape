@@ -1,19 +1,20 @@
 use std::path::Path;
 
-use abi::{Blob, BlobId, HashKind, HostOp, HostReply, Message, Outcome, reason, role::validators};
+use abi::{HostOp, HostReply, Message, Outcome, reason, role::validators};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
-use host::attach::{ATTACH, Attached, Attachment};
 use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Roles, Tip};
 use keyscheme::KeyScheme;
 use node::{BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Sequenced, Source, Taken};
 
-const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
+const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
+const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
@@ -31,6 +32,7 @@ fn member(key: &ed25519::PrivateKey, address: &str) -> validators::Member {
     validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: Some(address.to_owned()),
+        halo: address.to_owned(),
     }
 }
 
@@ -46,22 +48,26 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
         roles: Roles {
-            registry: "module-registry".into(),
+            programs: "programs".into(),
             validators: "valset".into(),
             identity: "identity".into(),
+            blobs: "blobs".into(),
+            awaits: "awaits".into(),
         },
         validators,
         programs: vec![
-            founding("module-registry", MODULE_REGISTRY, Vec::new()),
+            founding("programs", PROGRAMS, Vec::new()),
             founding("valset", VALSET, Vec::new()),
             founding(
                 "identity",
                 IDENTITY,
                 abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
             ),
+            founding("blobs", BLOBS, Vec::new()),
             founding("ping", RELAY, Vec::new()),
             founding("pong", RELAY, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
+            founding("awaits", AWAITS, Vec::new()),
         ],
         views: Vec::new(),
         hooks: Vec::new(),
@@ -788,6 +794,7 @@ fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
         let enroll = |key: &ed25519::PrivateKey, address: &str| {
             let enroll = validators::Op::Enroll {
                 address: Some(address.to_owned()),
+                halo: address.to_owned(),
                 invite: None,
             };
             frame(key, "valset", abi::encode(&enroll))
@@ -874,106 +881,4 @@ fn frames_verify_under_every_key_scheme() {
     let mut mislabeled = frame;
     mislabeled.body.scheme = KeyScheme::Ed25519;
     assert!(mislabeled.verify(NETWORK).is_err());
-}
-
-fn page(body: &[u8]) -> (Attachment, Vec<u8>) {
-    let framed = blobs::frame("page", body).unwrap();
-    let id = blobs::id_of(HashKind::Sha256, &framed);
-    let attachment = Attachment {
-        id,
-        len: framed.len() as u64,
-    };
-    (attachment, framed)
-}
-
-fn attaching(key: &ed25519::PrivateKey, steps: Vec<Step>, blobs: Vec<Attachment>) -> Vec<u8> {
-    let attached = Attached {
-        target: "probe".into(),
-        payload: script(steps),
-        blobs,
-    };
-    frame(key, ATTACH, abi::encode(&attached))
-}
-
-#[test]
-fn a_node_pools_an_attaching_frame_only_once_it_holds_what_the_frame_attaches() {
-    deterministic::Runner::default().start(|context| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut node, _) = found(context.child("holder"), dir.path()).await;
-        let signer = key(7);
-        let (attachment, framed) = page(b"body");
-        let read = Step::Op(HostOp::BlobGet(attachment.id));
-        let attached = attaching(&signer, vec![read], vec![attachment]);
-
-        let refusal = node
-            .submit(attached.clone(), Source::Client)
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(refusal.reason, reason::NOT_FOUND);
-        assert_eq!(node.pending(), 0);
-        assert_eq!(node.needs_frame(&attached).unwrap(), vec![attachment]);
-
-        node.install(attachment.id, &framed).unwrap();
-        assert!(node.needs_frame(&attached).unwrap().is_empty());
-        let receipt = new(node
-            .submit(attached.clone(), Source::Client)
-            .await
-            .unwrap()
-            .unwrap());
-        let read_back = Reply::Host(HostReply::Blob(Some(Blob {
-            kind: "page".into(),
-            body: b"body".to_vec(),
-        })));
-        assert_eq!(
-            receipt.outcome,
-            Outcome::Applied {
-                output: abi::encode(&vec![read_back])
-            }
-        );
-        let (block, _) = seal(&mut node).await;
-        assert_eq!(block.frames, vec![attached]);
-        assert!(node.needs(&block).unwrap().is_empty());
-        assert_eq!(node.held_blob(&attachment.id).unwrap(), Some(framed));
-
-        let other = tempfile::tempdir().unwrap();
-        let (lacking, _) = found(context.child("lacking"), other.path()).await;
-        assert_eq!(lacking.needs(&block).unwrap(), vec![attachment]);
-    });
-}
-
-#[test]
-fn a_block_carries_at_most_its_attachment_budget_and_the_rest_waits() {
-    deterministic::Runner::default().start(|context| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut node, _) = found(context, dir.path()).await;
-        let store = blobs::Blobs::open(&dir.path().join("blobs")).unwrap();
-        let big = |seed: u8| {
-            let attachment = Attachment {
-                id: BlobId::Sha256([seed; 32]),
-                len: 40 << 20,
-            };
-            store
-                .write(&attachment.id, &vec![0; attachment.len as usize])
-                .unwrap();
-            attachment
-        };
-        let signer = key(7);
-        let first = attaching(&signer, vec![set(b"a", b"1")], vec![big(1)]);
-        let second = attaching(&signer, vec![set(b"b", b"2")], vec![big(2)]);
-        let plain = frame(&signer, "probe", script(vec![set(b"c", b"3")]));
-        for frame in [&first, &second, &plain] {
-            node.submit(frame.clone(), Source::Client)
-                .await
-                .unwrap()
-                .unwrap();
-        }
-
-        let (block, _) = seal(&mut node).await;
-        assert_eq!(block.frames, vec![first, plain]);
-        assert_eq!(node.pending(), 1);
-        let (block, _) = seal(&mut node).await;
-        assert_eq!(block.frames, vec![second]);
-        assert_eq!(node.pending(), 0);
-    });
 }

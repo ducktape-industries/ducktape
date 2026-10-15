@@ -44,7 +44,7 @@ jobs:
       - run: rustup show
       - run: cargo test --locked -p noded -p consensus -p statesync -p node
 
-  # The host against its guests: the host suites run the committed fixture
+  # The host against its programs: the host suites run the committed fixture
   # programs (crates/kernel/fixtures/wasm) through the real wasm runtime.
   wasm-and-host:
     runs-on: ubuntu-latest

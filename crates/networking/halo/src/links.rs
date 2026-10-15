@@ -1,44 +1,43 @@
-//! The real medium. halo reaches a member whose endpoint is tcp:// or tls:// over QUIC on UDP
-//! at the same host and port, one connection per peer with a stream per open; where UDP does
-//! not answer in time, or the endpoint is ws:// or wss://, it opens a tcp path per stream. A
-//! silent UDP path is remembered per peer and tried again later. Only QUIC carries datagrams.
-//! A connection on the live ALPN is a desktop client's, not a member's: it is handed on whole.
+//! The real medium: QUIC on UDP at the halo address each member registers. A node dials every
+//! seated member and keeps one connection to each, which carries streams both ways, so a member
+//! no one can reach still takes part by dialing out. A connection on the live ALPN is a desktop
+//! client's, not a member's: it is handed on whole.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::Metrics;
 use commonware_runtime::telemetry::metrics::Registered;
 use commonware_runtime::telemetry::metrics::raw::Counter;
-use rustls::ClientConfig;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-use tokio::sync::mpsc;
-use tokio::time::Instant;
+use futures::future::Either;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{mpsc, watch};
 
-use crate::endpoint::{Endpoint, Scheme};
 use crate::members::Members;
 use crate::quic::{self, Quic};
-use crate::tcp::{self, Bytes as Conn, Context, Handshake};
 use crate::transport::{Error, Transport};
 
-const QUIC_ANSWER: Duration = Duration::from_secs(2);
-const QUIC_RETRY: Duration = Duration::from_secs(60);
+const DIAL: Duration = Duration::from_secs(5);
+const YIELD: Duration = Duration::from_secs(1);
+const REDIAL: Duration = Duration::from_secs(1);
+const REDIAL_MOST: Duration = Duration::from_secs(60);
 const INBOUND: usize = 256;
 const DATAGRAMS: usize = 1024;
-const HANDSHAKES: usize = 64;
 /// Client connections accepted and not yet taken by the relay; past it a client is told busy.
 const CLIENTS: usize = 256;
 
-pub enum Carried {
-    Quic(quinn::SendStream, quinn::RecvStream),
-    Tcp(DuplexStream),
+pub struct Carried {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 }
 
 impl AsyncRead for Carried {
@@ -47,10 +46,7 @@ impl AsyncRead for Carried {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Carried::Quic(_, recv) => Pin::new(recv).poll_read(cx, buf),
-            Carried::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
-        }
+        Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
     }
 }
 
@@ -60,164 +56,141 @@ impl AsyncWrite for Carried {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Carried::Quic(send, _) => Pin::new(send).poll_write(cx, buf).map_err(io::Error::from),
-            Carried::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
-        }
+        Pin::new(&mut self.get_mut().send)
+            .poll_write(cx, buf)
+            .map_err(io::Error::from)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Carried::Quic(send, _) => Pin::new(send).poll_flush(cx),
-            Carried::Tcp(stream) => Pin::new(stream).poll_flush(cx),
-        }
+        Pin::new(&mut self.get_mut().send).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Carried::Quic(send, _) => Pin::new(send).poll_shutdown(cx),
-            Carried::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
-        }
+        Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
     }
 }
 
-#[derive(Clone, Default)]
-enum Path {
-    #[default]
-    Untried,
-    Quic(quinn::Connection),
-    Tcp {
-        until: Instant,
-        attempts: u32,
-    },
+impl Carried {
+    /// Abandons the stream: the peer reads a reset, never a clean end.
+    pub fn reset(mut self) {
+        let _ = self.send.reset(0u32.into());
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    Untried,
-    Quic,
-    Tcp { attempts: u32 },
+enum Side {
+    Dialed,
+    Accepted,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Change {
-    FellToTcp { attempts: u32 },
-    StillTcp { attempts: u32 },
-    BackToQuic,
-}
-
-impl Path {
-    fn kind(&self) -> Kind {
-        match self {
-            Path::Untried => Kind::Untried,
-            Path::Quic(_) => Kind::Quic,
-            Path::Tcp { attempts, .. } => Kind::Tcp {
-                attempts: *attempts,
-            },
-        }
-    }
-
-    fn attempts(&self) -> u32 {
-        match self {
-            Path::Tcp { attempts, .. } => *attempts,
-            Path::Untried | Path::Quic(_) => 0,
-        }
+fn preferred(me: &PublicKey, peer: &PublicKey, side: Side) -> bool {
+    match side {
+        Side::Dialed => me < peer,
+        Side::Accepted => peer < me,
     }
 }
 
-fn change(before: Kind, after: Kind) -> Option<Change> {
-    match (before, after) {
-        (Kind::Untried | Kind::Quic, Kind::Tcp { attempts }) => {
-            Some(Change::FellToTcp { attempts })
-        }
-        (Kind::Tcp { .. }, Kind::Tcp { attempts }) => Some(Change::StillTcp { attempts }),
-        (Kind::Tcp { .. }, Kind::Quic) => Some(Change::BackToQuic),
-        (Kind::Untried | Kind::Quic, Kind::Quic) => None,
-        (Kind::Untried | Kind::Quic | Kind::Tcp { .. }, Kind::Untried) => None,
+struct Link {
+    connection: quinn::Connection,
+    preferred: bool,
+}
+
+impl Link {
+    fn open(&self) -> bool {
+        self.connection.close_reason().is_none()
     }
 }
 
-fn noted(peer: &PublicKey, before: &Path, after: &Path) {
-    let Some(change) = change(before.kind(), after.kind()) else {
-        return;
-    };
-    match change {
-        Change::FellToTcp { attempts } => {
-            tracing::info!(target: "ducktape::halo", event = "halo_path", %peer, path = "tcp", reason = "udp_silent", attempts, "halo reaches a member over tcp: its udp did not answer");
+struct Peer {
+    dialing: tokio::sync::Mutex<()>,
+    links: Mutex<Vec<Link>>,
+    changed: watch::Sender<()>,
+    kept: AtomicBool,
+}
+
+impl Default for Peer {
+    fn default() -> Peer {
+        Peer {
+            dialing: tokio::sync::Mutex::default(),
+            links: Mutex::default(),
+            changed: watch::channel(()).0,
+            kept: AtomicBool::new(false),
         }
-        Change::StillTcp { attempts } => {
-            tracing::debug!(target: "ducktape::halo", event = "halo_path", %peer, path = "tcp", reason = "udp_silent", attempts, "a member's udp still does not answer");
+    }
+}
+
+impl Peer {
+    fn held(&self) -> std::sync::MutexGuard<'_, Vec<Link>> {
+        self.links.lock().expect("the links lock is never poisoned")
+    }
+
+    fn live(&self) -> Option<quinn::Connection> {
+        let held = self.held();
+        let link = held
+            .iter()
+            .filter(|link| link.open())
+            .max_by_key(|link| link.preferred)?;
+        Some(link.connection.clone())
+    }
+
+    fn adopt(&self, link: Link) {
+        let mut held = self.held();
+        held.retain(Link::open);
+        held.push(link);
+        drop(held);
+        self.changed.send_replace(());
+    }
+
+    fn forget(&self, connection: &quinn::Connection) {
+        let mut held = self.held();
+        held.retain(|kept| kept.connection.stable_id() != connection.stable_id());
+        drop(held);
+        self.changed.send_replace(());
+    }
+
+    fn unseat(&self) {
+        let gone = std::mem::take(&mut *self.held());
+        for link in gone {
+            link.connection.close(0u32.into(), b"unseated");
         }
-        Change::BackToQuic => {
-            tracing::info!(target: "ducktape::halo", event = "halo_path", %peer, path = "quic", reason = "udp_answered", "halo reaches a member over QUIC again");
+    }
+
+    async fn arrival(&self, changed: &mut watch::Receiver<()>) -> Option<quinn::Connection> {
+        loop {
+            changed.changed().await.ok()?;
+            if let Some(connection) = self.live() {
+                return Some(connection);
+            }
         }
     }
 }
 
 #[derive(Default)]
-struct Peer {
-    dialing: tokio::sync::Mutex<()>,
-    path: Mutex<Path>,
+struct Redial {
+    failures: u32,
+    at: Option<String>,
+    yielded: bool,
 }
 
-impl Peer {
-    fn path(&self) -> Path {
-        self.path
-            .lock()
-            .expect("the path lock is never poisoned")
-            .clone()
-    }
-
-    fn replace(&self, path: Path) -> Path {
-        std::mem::replace(
-            &mut *self.path.lock().expect("the path lock is never poisoned"),
-            path,
-        )
-    }
-
-    fn live(&self) -> Option<quinn::Connection> {
-        let Path::Quic(connection) = self.path() else {
-            return None;
-        };
-        let closed = connection.close_reason().is_some();
-        if closed {
-            return None;
+impl Redial {
+    fn failed(&mut self, at: &str) -> Duration {
+        let moved = self.at.as_deref() != Some(at);
+        if moved {
+            *self = Redial {
+                failures: 0,
+                at: Some(at.to_owned()),
+                yielded: true,
+            };
         }
-        Some(connection)
-    }
-
-    fn adopt(&self, connection: &quinn::Connection) -> Option<Path> {
-        let mut path = self.path.lock().expect("the path lock is never poisoned");
-        let live = matches!(&*path, Path::Quic(held) if held.close_reason().is_none());
-        if live {
-            return None;
-        }
-        Some(std::mem::replace(
-            &mut *path,
-            Path::Quic(connection.clone()),
-        ))
-    }
-
-    fn forget(&self, connection: &quinn::Connection) {
-        let mut path = self.path.lock().expect("the path lock is never poisoned");
-        let same = matches!(&*path, Path::Quic(held) if held.stable_id() == connection.stable_id());
-        if same {
-            *path = Path::Untried;
-        }
+        self.failures += 1;
+        REDIAL.saturating_mul(self.failures).min(REDIAL_MOST)
     }
 }
 
-struct Opened {
-    quic: Registered<Counter>,
-    tcp: Registered<Counter>,
-}
-
-pub struct Links<E: Context> {
-    context: E,
-    handshake: Handshake,
+pub struct Links {
+    me: PublicKey,
     members: Arc<Members>,
-    quic: Option<Quic>,
-    client: Arc<ClientConfig>,
+    quic: Quic,
     peers: Mutex<HashMap<PublicKey, Arc<Peer>>>,
     inbound: mpsc::Sender<(PublicKey, Carried)>,
     accepted: tokio::sync::Mutex<mpsc::Receiver<(PublicKey, Carried)>>,
@@ -225,46 +198,29 @@ pub struct Links<E: Context> {
     datagrams: tokio::sync::Mutex<mpsc::Receiver<(PublicKey, Bytes)>>,
     clients: mpsc::Sender<quinn::Connection>,
     accepted_clients: tokio::sync::Mutex<mpsc::Receiver<quinn::Connection>>,
-    opened: Opened,
-    handshakes: Arc<tokio::sync::Semaphore>,
+    opened: Registered<Counter>,
 }
 
-impl<E: Context + Metrics> Links<E> {
-    pub fn start(
-        context: E,
+impl Links {
+    pub fn start<E: Metrics>(
+        context: &E,
         identity: PrivateKey,
-        namespace: &[u8],
         members: Arc<Members>,
-        udp: &[SocketAddr],
-    ) -> Result<Arc<Links<E>>, rustls::Error> {
-        let quic = match Quic::bind(udp, &identity, members.clone()) {
-            Ok(quic) => Some(quic),
-            Err(error) => {
-                tracing::warn!(target: "ducktape::halo", event = "halo_quic_unbound", %error, reason = "udp_unbound", "halo runs without QUIC: it could not bind its udp ports");
-                None
-            }
-        };
+        udp: SocketAddr,
+    ) -> Result<Arc<Links>, quic::Error> {
+        let quic = Quic::bind(udp, &identity, members.clone())?;
         let (inbound, accepted) = mpsc::channel(INBOUND);
         let (received, datagrams) = mpsc::channel(DATAGRAMS);
         let (clients, accepted_clients) = mpsc::channel(CLIENTS);
-        let opened = Opened {
-            quic: context.register(
-                "halo_streams_over_quic",
-                "streams this node opened to a member over QUIC",
-                Counter::default(),
-            ),
-            tcp: context.register(
-                "halo_streams_over_tcp",
-                "streams this node opened to a member over tcp, tls, ws or wss",
-                Counter::default(),
-            ),
-        };
+        let opened = context.register(
+            "halo_streams_opened",
+            "streams this node opened to a member over QUIC",
+            Counter::default(),
+        );
         let links = Arc::new(Links {
-            context,
-            handshake: Handshake::new(identity, namespace),
+            me: identity.public_key(),
             members,
             quic,
-            client: crate::dial::dialer()?,
             peers: Mutex::default(),
             inbound,
             accepted: tokio::sync::Mutex::new(accepted),
@@ -272,22 +228,17 @@ impl<E: Context + Metrics> Links<E> {
             datagrams: tokio::sync::Mutex::new(datagrams),
             clients,
             accepted_clients: tokio::sync::Mutex::new(accepted_clients),
-            handshakes: Arc::new(tokio::sync::Semaphore::new(HANDSHAKES)),
             opened,
         });
-        let endpoints = links
-            .quic
-            .as_ref()
-            .map(|quic| quic.endpoints().to_vec())
-            .unwrap_or_default();
-        for endpoint in endpoints {
-            tokio::spawn(accepting(Arc::downgrade(&links), endpoint));
-        }
+        tokio::spawn(accepting(
+            Arc::downgrade(&links),
+            links.quic.endpoint().clone(),
+        ));
         Ok(links)
     }
 
-    pub fn udp(&self) -> Vec<SocketAddr> {
-        self.quic.as_ref().map(Quic::local).unwrap_or_default()
+    pub fn udp(&self) -> io::Result<SocketAddr> {
+        self.quic.local()
     }
 
     /// Connections desktop clients opened on the live ALPN, for the relay that serves them.
@@ -295,30 +246,27 @@ impl<E: Context + Metrics> Links<E> {
         &self.accepted_clients
     }
 
-    pub fn inbound(self: &Arc<Self>, conn: impl Conn) {
-        let Ok(handshaking) = self.handshakes.clone().try_acquire_owned() else {
-            tracing::debug!(target: "ducktape::halo", reason = "handshakes_full", "halo dropped a tcp path");
+    pub fn seated(self: &Arc<Self>, changed: Vec<PublicKey>) {
+        for key in changed {
+            if key == self.me {
+                continue;
+            }
+            let peer = self.peer(&key);
+            let unkept = !peer.kept.swap(true, Ordering::AcqRel);
+            if unkept {
+                tokio::spawn(keeping(Arc::downgrade(self), key, peer.changed.subscribe()));
+            }
+            peer.changed.send_replace(());
+        }
+    }
+
+    pub async fn linked(&self, key: &PublicKey) {
+        let peer = self.peer(key);
+        let mut changed = peer.changed.subscribe();
+        if peer.live().is_some() {
             return;
-        };
-        let links = self.clone();
-        tokio::spawn(async move {
-            let listened = tcp::listen(
-                &links.context,
-                &links.handshake,
-                links.members.clone(),
-                conn,
-            )
-            .await;
-            drop(handshaking);
-            let (peer, stream) = match listened {
-                Ok(listened) => listened,
-                Err(error) => {
-                    tracing::debug!(target: "ducktape::halo", %error, reason = "handshake_failed", "halo refused a tcp path");
-                    return;
-                }
-            };
-            let _ = links.inbound.send((peer, Carried::Tcp(stream))).await;
-        });
+        }
+        peer.arrival(&mut changed).await;
     }
 
     fn peer(&self, key: &PublicKey) -> Arc<Peer> {
@@ -330,64 +278,124 @@ impl<E: Context + Metrics> Links<E> {
             .clone()
     }
 
-    fn quic_reaches(&self, peer: &Peer, endpoint: &Endpoint) -> bool {
-        let bound = self.quic.is_some();
-        let udp_scheme = matches!(endpoint.scheme, Scheme::Tcp | Scheme::Tls);
-        let resting = matches!(peer.path(), Path::Tcp { until, .. } if Instant::now() < until);
-        bound && udp_scheme && !resting
+    async fn connection(self: &Arc<Self>, to: &PublicKey) -> Result<quinn::Connection, Error> {
+        let peer = self.peer(to);
+        let mut changed = peer.changed.subscribe();
+        if let Some(connection) = peer.live() {
+            return Ok(connection);
+        }
+        let dialed = self.dial(to, &peer);
+        let arrived = peer.arrival(&mut changed);
+        futures::pin_mut!(dialed, arrived);
+        match futures::future::select(dialed, arrived).await {
+            Either::Left((dialed, _)) => dialed,
+            Either::Right((Some(connection), _)) => Ok(connection),
+            Either::Right((None, dialed)) => dialed.await,
+        }
     }
 
-    async fn quic_to(self: &Arc<Self>, to: &PublicKey) -> Option<quinn::Connection> {
-        let peer = self.peer(to);
-        if let Some(connection) = peer.live() {
-            return Some(connection);
-        }
-        let endpoint = self.members.endpoint(to)?;
-        if !self.quic_reaches(&peer, &endpoint) {
-            return None;
-        }
+    async fn dial(
+        self: &Arc<Self>,
+        to: &PublicKey,
+        peer: &Peer,
+    ) -> Result<quinn::Connection, Error> {
         let _dialing = peer.dialing.lock().await;
         if let Some(connection) = peer.live() {
-            return Some(connection);
+            return Ok(connection);
         }
-        let quic = self.quic.as_ref()?;
-        let dialed = tokio::time::timeout(QUIC_ANSWER, async {
-            let at = resolved(quic, &endpoint).await?;
-            quic.dial(to, at).await.ok()
+        let Some(halo) = self.members.halo(to) else {
+            return Err(Error::Unreachable(to.clone()));
+        };
+        let dialed = tokio::time::timeout(DIAL, async {
+            let at = resolved(&self.quic, &halo).await?;
+            self.quic.dial(to, at).await.ok()
         })
         .await;
         let Ok(Some(connection)) = dialed else {
-            let tcp = Path::Tcp {
-                until: Instant::now() + QUIC_RETRY,
-                attempts: peer.path().attempts() + 1,
-            };
-            let before = peer.replace(tcp.clone());
-            noted(to, &before, &tcp);
+            return Err(Error::Unreachable(to.clone()));
+        };
+        tracing::debug!(target: "ducktape::halo", peer = %to, at = %halo, "halo dialed a member at its halo address");
+        self.carry(to, connection, Side::Dialed);
+        peer.live().ok_or_else(|| Error::Unreachable(to.clone()))
+    }
+
+    fn carry(self: &Arc<Self>, key: &PublicKey, connection: quinn::Connection, side: Side) {
+        let link = Link {
+            connection: connection.clone(),
+            preferred: preferred(&self.me, key, side),
+        };
+        self.peer(key).adopt(link);
+        tokio::spawn(carried(Arc::downgrade(self), key.clone(), connection));
+    }
+
+    async fn keep(self: &Arc<Self>, key: &PublicKey, redial: &mut Redial) -> Option<Duration> {
+        let peer = self.peer(key);
+        let Some(halo) = self.members.halo(key) else {
+            peer.unseat();
             return None;
         };
-        let quic = Path::Quic(connection.clone());
-        let before = peer.replace(quic.clone());
-        noted(to, &before, &quic);
-        tokio::spawn(carrying(
-            Arc::downgrade(self),
-            to.clone(),
-            connection.clone(),
-        ));
-        Some(connection)
+        if peer.live().is_some() {
+            *redial = Redial::default();
+            return None;
+        }
+        let dials_first = preferred(&self.me, key, Side::Dialed);
+        let yields = !dials_first && !redial.yielded;
+        if yields {
+            redial.yielded = true;
+            return Some(YIELD);
+        }
+        if self.dial(key, &peer).await.is_ok() {
+            *redial = Redial::default();
+            return None;
+        }
+        let pause = redial.failed(&halo);
+        let attempts = redial.failures;
+        let worth_a_line = attempts == 1 || attempts.is_multiple_of(10);
+        if worth_a_line {
+            tracing::debug!(target: "ducktape::halo", peer = %key, at = %halo, attempts, reason = "undialed", "halo did not reach a member at its halo address; it dials again");
+        }
+        Some(pause)
     }
 }
 
-async fn resolved(quic: &Quic, endpoint: &Endpoint) -> Option<SocketAddr> {
-    let mut found = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
-        .await
-        .ok()?;
+impl Drop for Links {
+    fn drop(&mut self) {
+        self.quic.endpoint().close(0u32.into(), b"halo stopped");
+    }
+}
+
+async fn resolved(quic: &Quic, halo: &str) -> Option<SocketAddr> {
+    let mut found = tokio::net::lookup_host(halo).await.ok()?;
     found.find(|at| quic.reaches(at))
 }
 
-async fn accepting<E: Context + Metrics>(
-    links: std::sync::Weak<Links<E>>,
-    endpoint: quinn::Endpoint,
-) {
+async fn keeping(links: Weak<Links>, key: PublicKey, mut changed: watch::Receiver<()>) {
+    let mut redial = Redial::default();
+    loop {
+        let Some(strong) = links.upgrade() else {
+            return;
+        };
+        let pause = strong.keep(&key, &mut redial).await;
+        drop(strong);
+        let woken = match pause {
+            None => changed.changed().await.is_ok(),
+            Some(pause) => {
+                let woken = changed.changed();
+                let paused = tokio::time::sleep(pause);
+                futures::pin_mut!(woken, paused);
+                match futures::future::select(woken, paused).await {
+                    Either::Left((woken, _)) => woken.is_ok(),
+                    Either::Right(((), _)) => true,
+                }
+            }
+        };
+        if !woken {
+            return;
+        }
+    }
+}
+
+async fn accepting(links: Weak<Links>, endpoint: quinn::Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
         let links = links.clone();
         tokio::spawn(async move {
@@ -398,7 +406,7 @@ async fn accepting<E: Context + Metrics>(
                 return;
             };
             match arrival(&connection) {
-                Arrival::Member => member_arrived(links, connection).await,
+                Arrival::Member => member_arrived(&links, connection),
                 Arrival::Client => client_arrived(&links, connection),
                 Arrival::Unknown => connection.close(0u32.into(), b"unknown protocol"),
             }
@@ -420,19 +428,15 @@ fn arrival(connection: &quinn::Connection) -> Arrival {
     }
 }
 
-async fn member_arrived<E: Context + Metrics>(links: Arc<Links<E>>, connection: quinn::Connection) {
+fn member_arrived(links: &Arc<Links>, connection: quinn::Connection) {
     let Some(peer) = quic::peer_of(&connection) else {
         connection.close(0u32.into(), b"no node key");
         return;
     };
-    let adopted = links.peer(&peer).adopt(&connection);
-    if let Some(before) = adopted {
-        noted(&peer, &before, &Path::Quic(connection.clone()));
-    }
-    carrying(Arc::downgrade(&links), peer, connection).await;
+    links.carry(&peer, connection, Side::Accepted);
 }
 
-fn client_arrived<E: Context + Metrics>(links: &Links<E>, connection: quinn::Connection) {
+fn client_arrived(links: &Links, connection: quinn::Connection) {
     let queued = links.clients.try_send(connection);
     if let Err(full) = queued {
         full.into_inner().close(0u32.into(), b"busy");
@@ -440,11 +444,7 @@ fn client_arrived<E: Context + Metrics>(links: &Links<E>, connection: quinn::Con
     }
 }
 
-async fn carrying<E: Context + Metrics>(
-    links: std::sync::Weak<Links<E>>,
-    peer: PublicKey,
-    connection: quinn::Connection,
-) {
+async fn carried(links: Weak<Links>, peer: PublicKey, connection: quinn::Connection) {
     let streams = async {
         while let Ok((send, recv)) = connection.accept_bi().await {
             let Some(links) = links.upgrade() else {
@@ -452,7 +452,7 @@ async fn carrying<E: Context + Metrics>(
             };
             let _ = links
                 .inbound
-                .send((peer.clone(), Carried::Quic(send, recv)))
+                .send((peer.clone(), Carried { send, recv }))
                 .await;
         }
     };
@@ -471,30 +471,17 @@ async fn carrying<E: Context + Metrics>(
     }
 }
 
-impl<E: Context + Metrics> Transport for Arc<Links<E>> {
+impl Transport for Arc<Links> {
     type Stream = Carried;
 
     async fn connect(&self, to: &PublicKey) -> Result<Carried, Error> {
-        if let Some(connection) = self.quic_to(to).await {
-            let opened = connection.open_bi().await;
-            if let Ok((send, recv)) = opened {
-                self.opened.quic.inc();
-                return Ok(Carried::Quic(send, recv));
-            }
-        }
-        let Some(endpoint) = self.members.endpoint(to) else {
-            return Err(Error::Unreachable(to.clone()));
-        };
-        let stream = tcp::dial(
-            &self.context,
-            &self.handshake,
-            self.client.clone(),
-            &endpoint,
-            to.clone(),
-        )
-        .await?;
-        self.opened.tcp.inc();
-        Ok(Carried::Tcp(stream))
+        let connection = self.connection(to).await?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|_| Error::Unreachable(to.clone()))?;
+        self.opened.inc();
+        Ok(Carried { send, recv })
     }
 
     async fn accept(&self) -> Option<(PublicKey, Carried)> {
@@ -502,9 +489,7 @@ impl<E: Context + Metrics> Transport for Arc<Links<E>> {
     }
 
     async fn send_datagram(&self, to: &PublicKey, frame: Bytes) -> Result<(), Error> {
-        let Some(connection) = self.quic_to(to).await else {
-            return Err(Error::NoDatagrams(to.clone()));
-        };
+        let connection = self.connection(to).await?;
         let most = connection.max_datagram_size().unwrap_or(0);
         let fits = frame.len() <= most;
         if !fits {
@@ -522,25 +507,18 @@ impl<E: Context + Metrics> Transport for Arc<Links<E>> {
 
 #[cfg(test)]
 mod tests {
+    use commonware_cryptography::Signer as _;
+
     use super::*;
 
     #[test]
-    fn only_a_change_of_path_is_news_and_a_tcp_retry_counts_its_attempts() {
-        let tcp = |attempts| Kind::Tcp { attempts };
-        assert_eq!(
-            change(Kind::Untried, tcp(1)),
-            Some(Change::FellToTcp { attempts: 1 })
-        );
-        assert_eq!(
-            change(Kind::Quic, tcp(1)),
-            Some(Change::FellToTcp { attempts: 1 })
-        );
-        assert_eq!(
-            change(tcp(1), tcp(2)),
-            Some(Change::StillTcp { attempts: 2 })
-        );
-        assert_eq!(change(tcp(9), Kind::Quic), Some(Change::BackToQuic));
-        assert_eq!(change(Kind::Untried, Kind::Quic), None);
-        assert_eq!(change(Kind::Quic, Kind::Untried), None);
+    fn of_two_connections_between_a_pair_both_ends_prefer_the_one_the_lower_key_dialed() {
+        let one = PrivateKey::from_seed(1).public_key();
+        let two = PrivateKey::from_seed(2).public_key();
+        let (low, high) = if one < two { (one, two) } else { (two, one) };
+        assert!(preferred(&low, &high, Side::Dialed));
+        assert!(preferred(&high, &low, Side::Accepted));
+        assert!(!preferred(&high, &low, Side::Dialed));
+        assert!(!preferred(&low, &high, Side::Accepted));
     }
 }

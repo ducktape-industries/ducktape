@@ -13,12 +13,11 @@ use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
-use crate::dial::provider;
 use crate::members::Members;
 
 pub const ALPN: &[u8] = b"ducktape-halo";
@@ -40,6 +39,10 @@ pub enum Error {
     Quic(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
 }
 
 struct Certified {
@@ -286,14 +289,14 @@ pub fn transport() -> Arc<quinn::TransportConfig> {
 }
 
 pub struct Quic {
-    endpoints: Vec<quinn::Endpoint>,
+    endpoint: quinn::Endpoint,
     certified: Certified,
     members: Arc<Members>,
 }
 
 impl Quic {
     pub fn bind(
-        addresses: &[SocketAddr],
+        address: SocketAddr,
         identity: &PrivateKey,
         members: Arc<Members>,
     ) -> Result<Quic, Error> {
@@ -315,43 +318,31 @@ impl Quic {
             QuicServerConfig::try_from(crypto).map_err(|error| Error::Quic(error.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         server.transport_config(transport());
-        let endpoints = addresses
-            .iter()
-            .map(|address| quinn::Endpoint::server(server.clone(), *address))
-            .collect::<std::io::Result<Vec<_>>>()?;
+        let endpoint = quinn::Endpoint::server(server, address)?;
         Ok(Quic {
-            endpoints,
+            endpoint,
             certified,
             members,
         })
     }
 
-    pub fn endpoints(&self) -> &[quinn::Endpoint] {
-        &self.endpoints
+    pub fn endpoint(&self) -> &quinn::Endpoint {
+        &self.endpoint
     }
 
-    pub fn local(&self) -> Vec<SocketAddr> {
-        self.endpoints
-            .iter()
-            .filter_map(|endpoint| endpoint.local_addr().ok())
-            .collect()
+    pub fn local(&self) -> std::io::Result<SocketAddr> {
+        self.endpoint.local_addr()
     }
 
     pub fn reaches(&self, at: &SocketAddr) -> bool {
         self.local()
-            .iter()
-            .any(|local| local.is_ipv4() == at.is_ipv4())
+            .is_ok_and(|local| local.is_ipv4() == at.is_ipv4())
     }
 
     pub async fn dial(&self, peer: &PublicKey, at: SocketAddr) -> Result<quinn::Connection, Error> {
-        let same_family = |endpoint: &&quinn::Endpoint| {
-            endpoint
-                .local_addr()
-                .is_ok_and(|local| local.is_ipv4() == at.is_ipv4())
-        };
-        let Some(endpoint) = self.endpoints.iter().find(same_family) else {
+        if !self.reaches(&at) {
             return Err(Error::Quic("halo bound no udp of the peer's family".into()));
-        };
+        }
         let admit = Admit {
             members: self.members.clone(),
             expected: Some(peer.clone()),
@@ -370,7 +361,8 @@ impl Quic {
             QuicClientConfig::try_from(crypto).map_err(|error| Error::Quic(error.to_string()))?;
         let mut client = quinn::ClientConfig::new(Arc::new(crypto));
         client.transport_config(transport());
-        let connecting = endpoint
+        let connecting = self
+            .endpoint
             .connect_with(client, at, NAME)
             .map_err(|error| Error::Quic(error.to_string()))?;
         connecting

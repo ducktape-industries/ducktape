@@ -25,8 +25,6 @@ pub trait Chain: Clone + Send + Sync + 'static {
         ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> impl Future<Output = Option<Block>> + Send;
-    fn verify(&mut self, leader: PublicKey, block: Arc<Block>)
-    -> impl Future<Output = bool> + Send;
     fn deliver(&mut self, block: Arc<Block>, ack: Exact);
 }
 
@@ -107,15 +105,8 @@ where
         self.chain.propose(parent, ancestry, time).await
     }
 
-    async fn verify(
-        &mut self,
-        (_, context): (E, Self::Context),
-        mut ancestry: impl Ancestry<Block>,
-    ) -> bool {
-        let Some(block) = ancestry.next().await else {
-            return false;
-        };
-        self.chain.verify(context.leader, block).await
+    async fn verify(&mut self, _: (E, Self::Context), _: impl Ancestry<Block>) -> bool {
+        true
     }
 }
 

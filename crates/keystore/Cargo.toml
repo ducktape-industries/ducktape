@@ -6,7 +6,7 @@ version.workspace = true
 # The device keystore: `<duck>/keys/<name>.key` + the `active` pointer, and the
 # argon2id/XChaCha20-Poly1305 seal underneath them.
 #
-# NOT a consensus module — no MODULE_ID, no guest wasm. It was part of
+# NOT a program — no wasm. It was part of
 # node-bin until the desktop app's only way to reach it was to SPAWN `ducktape`
 # and pipe to it — which made "can the app find a binary on disk?" a
 # precondition for a person opening their own key. Both the CLI and the app

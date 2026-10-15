@@ -1,8 +1,8 @@
-use abi::{BlobId, ProgramId, Root, Scan};
+use abi::{ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Receipt, Tip};
 
-pub const NODE_CONTRACT: u32 = 4;
+pub const NODE_CONTRACT: u32 = 5;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {
@@ -76,12 +76,6 @@ pub struct Range {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct BlobPut {
-    pub id: BlobId,
-    pub framed: Vec<u8>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Admin {
     Shutdown,
     LogFilter(String),
@@ -98,7 +92,6 @@ pub struct Change {
 pub const MAX_BLOCKS: u32 = 100;
 
 pub const PAGE_BYTES: usize = 4 << 20;
-pub const QUERY_BYTES: usize = 4 << 20;
 
 pub const PREVIEW_BYTES: u32 = 4 << 10;
 

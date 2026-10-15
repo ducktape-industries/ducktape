@@ -36,9 +36,9 @@ use session::{Inbound, Link, Out, Outlet, Sent};
 use tracks::{Effect, SessionId, State};
 
 /// What the relay needs of the node's runtime: halo's context and a metrics registry.
-pub trait Context: halo::Context + commonware_runtime::Metrics {}
+pub trait Context: crate::Context {}
 
-impl<E> Context for E where E: halo::Context + commonware_runtime::Metrics {}
+impl<E> Context for E where E: crate::Context {}
 
 /// The control stream and the proof must arrive this soon after the connection.
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
@@ -78,7 +78,7 @@ pub struct Relay<E: Context> {
     context: E,
     network: Network,
     grants: Grants,
-    halo: Arc<Halo<E>>,
+    halo: Arc<Halo>,
     /// This node's key, which a proof names.
     me: PublicKey,
     metrics: tracks::Metrics,
@@ -109,7 +109,7 @@ impl<E: Context> Relay<E> {
         context: E,
         network: Network,
         chain: Arc<dyn Chain>,
-        halo: Arc<Halo<E>>,
+        halo: Arc<Halo>,
         me: PublicKey,
         shutdown: watch::Receiver<bool>,
     ) -> Arc<Relay<E>> {
@@ -418,7 +418,7 @@ fn watch_patterns(grant: Option<&Grant>) -> Option<Vec<String>> {
     covered(grant, Act::Watch, "*").then(|| grant.subscribe.clone())
 }
 
-async fn accepting<E: Context>(relay: Weak<Relay<E>>, halo: Arc<Halo<E>>) {
+async fn accepting<E: Context>(relay: Weak<Relay<E>>, halo: Arc<Halo>) {
     loop {
         let connection = halo.clients().lock().await.recv().await;
         let Some(connection) = connection else {
