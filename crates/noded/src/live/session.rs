@@ -14,7 +14,7 @@ use live_wire::{
     Alias, Control, DatagramHeader, GroupHeader, MAX_STREAM_OBJECT, Priority, WsFrame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// One control message's cap: a namespace, a track name and the fixed fields fit in it.
@@ -29,11 +29,6 @@ const INBOUND: usize = 1024;
 const OUTBOUND: usize = 4096;
 /// Objects waiting on one egress group stream; a group this far behind is reset.
 const GROUP_QUEUE: usize = 256;
-/// Group stream writers alive for one connection at once, each holding its queue and, once
-/// open, one of the 100 streams a QUIC peer lets us open by default; below that number so a
-/// stream never waits on the client's credit. A writer lives until its group ends on the wire,
-/// so a client that does not take its streams holds at most this many; one more is behind.
-pub const MAX_OPEN_GROUPS: usize = 64;
 /// The control stream outranks every group stream of the connection.
 const CONTROL_PRIORITY: i32 = 256;
 /// A last message (a refusal, a GoAway) gets this long to reach a client that stopped reading;
@@ -323,7 +318,6 @@ impl Link {
             connection.clone(),
             control_send,
             egress,
-            outlet.clone(),
             pacer,
         ));
         Link {
@@ -485,22 +479,18 @@ struct Groups {
     open: HashMap<(Alias, u64), mpsc::Sender<GroupOut>>,
     /// Groups reset for falling behind: the rest of their objects are dropped quiet.
     abandoned: HashSet<(Alias, u64)>,
-    /// One permit per writer alive: what holds memory and stream credit is what is counted.
-    writers: Arc<Semaphore>,
 }
 
 async fn quic_writing(
     connection: quinn::Connection,
     mut control: quinn::SendStream,
     mut egress: Egress,
-    outlet: Outlet,
     pacer: Pacer,
 ) {
     let _ = control.set_priority(CONTROL_PRIORITY);
     let mut groups = Groups {
         open: HashMap::new(),
         abandoned: HashSet::new(),
-        writers: Arc::new(Semaphore::new(MAX_OPEN_GROUPS)),
     };
     loop {
         match egress.next().await {
@@ -510,10 +500,7 @@ async fn quic_writing(
                 }
             }
             Drained::Out(Out::Object { header, body, .. }) => {
-                let room = quic_group_object(&connection, &pacer, &mut groups, header, body);
-                if !room {
-                    outlet.close("behind");
-                }
+                quic_group_object(&connection, &pacer, &mut groups, header, body);
             }
             Drained::Out(Out::GroupEnd {
                 alias,
@@ -544,41 +531,34 @@ async fn quic_writing(
     }
 }
 
-/// Queues the object on its group's stream, opening one for a new group; `false` when the
-/// connection has `MAX_OPEN_GROUPS` writers alive already, which is a client too far behind to
-/// keep.
+/// Queues the object on its group's stream, opening one for a new group; a group whose queue
+/// overflows is reset.
 fn quic_group_object(
     connection: &quinn::Connection,
     pacer: &Pacer,
     groups: &mut Groups,
     header: GroupHeader,
     body: Bytes,
-) -> bool {
+) {
     let key = (header.alias, header.group);
     if groups.abandoned.contains(&key) {
-        return true;
+        return;
     }
-    if !groups.open.contains_key(&key) {
-        let Ok(alive) = groups.writers.clone().try_acquire_owned() else {
-            return false;
-        };
+    let sending = groups.open.entry(key).or_insert_with(|| {
         let (sending, queue) = mpsc::channel(GROUP_QUEUE);
         tokio::spawn(quic_group_writing(
             connection.clone(),
             pacer.clone(),
             header,
             queue,
-            alive,
         ));
-        groups.open.insert(key, sending);
-    }
-    let sending = groups.open.get(&key).expect("inserted above");
+        sending
+    });
     let queued = sending.try_send(GroupOut::Object(body)).is_ok();
     if !queued {
         groups.open.remove(&key);
         groups.abandoned.insert(key);
     }
-    true
 }
 
 /// One egress group stream: opened at the track's priority, paced at the client class, finished
@@ -588,7 +568,6 @@ async fn quic_group_writing(
     pacer: Pacer,
     header: GroupHeader,
     mut queue: mpsc::Receiver<GroupOut>,
-    _alive: OwnedSemaphorePermit,
 ) {
     let Ok(stream) = connection.open_uni().await else {
         return;
@@ -690,12 +669,6 @@ fn ws_arrived(bytes: Bytes, counting: &mut HashMap<(Alias, u64), u32>) -> Vec<In
             end,
         } => {
             let key = (header.alias, header.group);
-            // Groups counted at once are bounded as the writer's are: a client that opens
-            // groups it never ends is not the wire.
-            let over = !counting.contains_key(&key) && counting.len() >= MAX_OPEN_GROUPS;
-            if over {
-                return vec![Inbound::Garbled];
-            }
             let next = counting.entry(key).or_default();
             let mut events = Vec::new();
             for body in objects {
@@ -865,31 +838,6 @@ mod tests {
             Some(Inbound::GroupEnd { complete: true, .. })
         ));
         assert!(counting.is_empty());
-    }
-
-    #[test]
-    fn a_websocket_client_counts_at_most_the_cap_of_open_groups() {
-        let mut counting = HashMap::new();
-        let frame = |group| WsFrame::Group {
-            header: GroupHeader {
-                alias: 1,
-                group,
-                priority: 128,
-            },
-            objects: Vec::new(),
-            end: false,
-        };
-        for group in 0..MAX_OPEN_GROUPS as u64 {
-            assert!(ws_arrived(abi::encode(&frame(group)).into(), &mut counting).is_empty());
-        }
-        assert!(matches!(
-            ws_arrived(
-                abi::encode(&frame(MAX_OPEN_GROUPS as u64)).into(),
-                &mut counting
-            )
-            .as_slice(),
-            [Inbound::Garbled]
-        ));
     }
 
     #[test]

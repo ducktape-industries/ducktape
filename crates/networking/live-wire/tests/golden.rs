@@ -157,14 +157,6 @@ fn controls() -> Vec<Control> {
         },
         Control::Refused {
             request: 1,
-            code: Code::Rate,
-        },
-        Control::Refused {
-            request: 1,
-            code: Code::Limit,
-        },
-        Control::Refused {
-            request: 1,
             code: Code::Malformed,
         },
         Control::GoAway { in_ms: 500 },
@@ -274,8 +266,6 @@ fn every_code_has_a_word_of_its_own() {
         Code::Unknown,
         Code::Duplicate,
         Code::TooLarge,
-        Code::Rate,
-        Code::Limit,
         Code::Malformed,
     ];
     let mut words: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();

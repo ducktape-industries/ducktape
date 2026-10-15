@@ -1,7 +1,7 @@
 // The relay on loopback: sessions prove a key and act as its account; a group published by one
 // client reaches another whole, and a late joiner gets the cached group; a stale datagram is
 // dropped and counted; the same over a websocket; a grant a block removes ends the request; the
-// caps refuse; and two nodes carry a track between their clients over halo's lane 7.
+// wire's size bounds refuse; and two nodes carry a track between their clients over halo's lane 7.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,15 +18,15 @@ use futures::{SinkExt as _, StreamExt as _};
 use halo::{Halo, Seat};
 use live_wire::{
     ALPN, Account, Challenge, Code, Control, DatagramHeader, End, GroupHeader, Hello, KeyScheme,
-    MAX_SESSIONS_PER_ACCOUNT, MAX_STREAM_OBJECT, MAX_TRACKS_PER_SESSION, Mode, NAMESPACE, Proof,
-    ROUTE, Start, Track, Welcome, WsFrame, proof_preimage,
+    MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, Welcome, WsFrame,
+    proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::grants::{Answered, Chain};
-use super::session::{MAX_OPEN_GROUPS, WS_MESSAGE};
+use super::session::WS_MESSAGE;
 use super::tracks::MAX_OPEN_INCOMING;
 use super::{Network, Relay, ws_upgrade};
 
@@ -568,11 +568,6 @@ fn a_group_reaches_a_subscriber_whole_and_a_late_joiner_gets_it_from_the_cache()
                 reason: End::TrackEnded
             }
         );
-        assert_eq!(
-            node.relay.state().cache_bytes(),
-            0,
-            "the cache dropped with the track"
-        );
     });
 }
 
@@ -831,42 +826,7 @@ fn a_grant_a_block_removes_ends_the_request_and_a_room_without_one_refuses() {
     });
 }
 
-// ---- (f) the caps ----
-
-#[test]
-fn a_session_publishes_at_most_its_cap_of_tracks() {
-    runtime::Runner::default().start(|context| async move {
-        let ledger = Arc::new(Ledger::default());
-        let alice = seated(&ledger, 11, 42);
-        ledger.grant("room", None, Grant::all());
-        let node = node(context, 1, ledger);
-
-        let (mut alice, _) = Client::open(&node, &alice).await;
-        for n in 0..MAX_TRACKS_PER_SESSION as u64 {
-            alice
-                .publish(n + 1, track("room", &format!("t/{n}")), Mode::Stream)
-                .await;
-        }
-        let over = MAX_TRACKS_PER_SESSION as u64 + 1;
-        alice
-            .send(Control::Publish {
-                request: over,
-                track: track("room", "one-more"),
-                mode: Mode::Stream,
-                priority: 128,
-            })
-            .await;
-        assert_eq!(
-            alice.recv().await,
-            Control::Refused {
-                request: over,
-                code: Code::Limit
-            }
-        );
-    });
-}
-
-// ---- (g) two nodes over lane 7 ----
+// ---- (f) two nodes over lane 7 ----
 
 #[test]
 fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
@@ -942,29 +902,7 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
     });
 }
 
-// ---- (h) one hostile or slow client ----
-
-#[test]
-fn an_account_holds_at_most_its_cap_of_sessions() {
-    runtime::Runner::default().start(|context| async move {
-        let ledger = Arc::new(Ledger::default());
-        let alice = seated(&ledger, 11, 42);
-        let node = node(context, 1, ledger);
-
-        let mut held = Vec::new();
-        for _ in 0..MAX_SESSIONS_PER_ACCOUNT {
-            held.push(Client::open(&node, &alice).await);
-        }
-        let mut one_more = Client::dial(&node).await;
-        assert_eq!(
-            one_more.handshake(&alice, GENESIS, &node.key, &alice).await,
-            Control::Refused {
-                request: 0,
-                code: Code::Limit
-            }
-        );
-    });
-}
+// ---- (g) one hostile or slow client ----
 
 #[test]
 fn a_websocket_message_over_the_cap_closes_the_socket_and_a_control_over_its_cap_is_malformed() {
@@ -1039,73 +977,6 @@ fn a_session_closed_by_a_recheck_leaves_the_table_without_the_client_saying_anyt
         assert!(
             alice_session.recv.read_u32_le().await.is_err(),
             "alice's connection is closed under her"
-        );
-    });
-}
-
-#[test]
-fn a_subscriber_with_too_many_groups_open_is_closed_as_behind() {
-    runtime::Runner::default().start(|context| async move {
-        let ledger = Arc::new(Ledger::default());
-        let alice = seated(&ledger, 11, 42);
-        let bob = seated(&ledger, 12, 43);
-        let carol = seated(&ledger, 13, 44);
-        ledger.grant("room", None, Grant::all());
-        let node = node(context, 1, ledger);
-
-        // alice publishes MAX_OPEN_GROUPS tracks over two sessions; bob subscribes to each
-        // and never reads a group stream; carol reads the one track that carries two groups,
-        // which is how the test orders them.
-        let (mut first, _) = Client::open(&node, &alice).await;
-        let (mut second, _) = Client::open(&node, &alice).await;
-        let (mut bob, _) = Client::open(&node, &bob).await;
-        let (mut carol, _) = Client::open(&node, &carol).await;
-        let mut aliases = Vec::new();
-        for n in 0..MAX_OPEN_GROUPS as u64 {
-            let publisher = match n < MAX_TRACKS_PER_SESSION as u64 {
-                true => &mut first,
-                false => &mut second,
-            };
-            let doc = track("room", &format!("doc/{n}"));
-            aliases.push(publisher.publish(n + 1, doc.clone(), Mode::Stream).await);
-            bob.subscribe(n + 1, doc, Start::Next).await;
-            publisher.recv().await;
-        }
-        let twice = track("room", "doc/0");
-        carol.subscribe(1, twice, Start::Next).await;
-        first.recv().await;
-
-        let mut open = Vec::new();
-        for (n, alias) in aliases.iter().enumerate() {
-            let publisher = match n < MAX_TRACKS_PER_SESSION {
-                true => &mut first,
-                false => &mut second,
-            };
-            open.push(publisher.group_open(*alias, 1, &[b"x"]).await);
-        }
-        let mut stream = carol.connection.accept_uni().await.unwrap();
-        let mut header = [0u8; 13];
-        stream.read_exact(&mut header).await.unwrap();
-        assert_eq!(abi::decode::<GroupHeader>(&header).unwrap().group, 1);
-        // The group past the cap: bob is closed as behind; carol, within it, stays.
-        open.push(first.group_open(aliases[0], 2, &[b"y"]).await);
-        let mut counts = HashMap::new();
-        for _ in 0..MAX_TRACKS_PER_SESSION {
-            match first.recv().await {
-                Control::Subscribers { request, count } => counts.insert(request, count),
-                other => panic!("a count: {other:?}"),
-            };
-        }
-        let expected: HashMap<u64, u32> = (1..=MAX_TRACKS_PER_SESSION as u64)
-            .map(|request| (request, u32::from(request == 1)))
-            .collect();
-        assert_eq!(
-            counts, expected,
-            "bob left every track; carol still reads one"
-        );
-        assert!(
-            bob.recv.read_u32_le().await.is_err(),
-            "bob's connection is closed as behind"
         );
     });
 }
@@ -1269,7 +1140,7 @@ fn data_in_the_wrong_mode_for_its_track_is_refused_malformed() {
     });
 }
 
-// ---- (i) lane 7 under failure ----
+// ---- (h) lane 7 under failure ----
 
 #[test]
 fn a_group_the_publisher_resets_crosses_the_lane_as_cut_short() {
@@ -1363,7 +1234,7 @@ fn a_member_seated_after_a_track_was_published_hears_it_when_the_lane_opens() {
     });
 }
 
-// ---- (j) a watcher hears what its grant covers ----
+// ---- (i) a watcher hears what its grant covers ----
 
 #[test]
 fn a_watcher_hears_the_announces_its_subscribe_patterns_cover() {
@@ -1421,7 +1292,7 @@ fn a_watcher_hears_the_announces_its_subscribe_patterns_cover() {
     });
 }
 
-// ---- (k) groups a publisher leaves open ----
+// ---- (j) groups a publisher leaves open ----
 
 #[test]
 fn a_group_superseded_past_the_cap_ends_short_and_its_late_end_is_nothing() {
@@ -1515,38 +1386,6 @@ fn a_late_joiner_is_offered_no_abandoned_group_and_holds_no_stream_for_it() {
         assert_eq!(
             (header.group, objects, complete),
             (2, vec![b"whole".to_vec()], true)
-        );
-    });
-}
-
-#[test]
-fn a_subscriber_that_never_takes_its_streams_is_closed_as_behind() {
-    runtime::Runner::default().start(|context| async move {
-        let ledger = Arc::new(Ledger::default());
-        let alice = seated(&ledger, 11, 42);
-        let bob = seated(&ledger, 12, 43);
-        ledger.grant("room", None, Grant::all());
-        let node = node(context, 1, ledger);
-        let doc = track("room", "doc");
-
-        let (mut alice, _) = Client::open(&node, &alice).await;
-        let (mut bob, _) = Client::open(&node, &bob).await;
-        let alias = alice.publish(1, doc.clone(), Mode::Stream).await;
-        bob.subscribe(1, doc.clone(), Start::Next).await;
-        alice.recv().await;
-
-        // Every group completes; bob accepts no stream. Once bob's stream credit (100) is used
-        // up the writers park, and the one past MAX_OPEN_GROUPS parked writers is behind.
-        let groups = 100 + MAX_OPEN_GROUPS as u64 + 1;
-        for group in 1..=groups {
-            alice.group(alias, group, &[b"x"]).await;
-        }
-        assert_eq!(
-            alice.recv().await,
-            Control::Subscribers {
-                request: 1,
-                count: 0
-            }
         );
     });
 }

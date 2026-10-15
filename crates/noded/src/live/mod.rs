@@ -21,13 +21,12 @@ use abi::live::Grant;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::telemetry::metrics::raw::{Counter, Gauge};
-use futures::SinkExt as _;
 use halo::Halo;
 use live_wire::{
     ALPN, Account, Challenge, Code, Control, IDLE_SESSION, Mode, NAMESPACE, Priority, Proof,
     RequestId, Start, Track, Welcome, proof_preimage,
 };
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -46,15 +45,10 @@ impl<E> Context for E where E: crate::Context {}
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
 /// What a client is told to wait before re-opening when the node goes away.
 const GOAWAY_MS: u32 = 1000;
-/// Handshakes in flight at once, TLS and proof together: past it a connection is refused, so
-/// unproven connections cost the node a bounded amount.
-const HANDSHAKES: usize = 64;
 /// A QUIC client unheard this long is gone; the node pings an idle one every
 /// [`QUIC_KEEP_ALIVE`], so a session holding tracks stays open through a NAT.
 const QUIC_IDLE: Duration = Duration::from_secs(30);
 const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(10);
-/// Sessions open at once, both doors counted; past it a connection is told busy.
-const MAX_SESSIONS: usize = 1024;
 
 /// The chain the relay serves: its id as namespaces spell it, its genesis digest as a hello
 /// names it, and the program bound to the identity role.
@@ -95,8 +89,6 @@ pub struct Relay<E: Context> {
     dirty: Mutex<Dirty>,
     rechecks: Arc<Notify>,
     lane: lane::Queue,
-    sessions: Arc<Semaphore>,
-    handshakes: Arc<Semaphore>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -138,11 +130,6 @@ impl<E: Context> Relay<E> {
                 "subscriptions held by live sessions",
                 Gauge::default(),
             ),
-            cache_bytes: context.register(
-                "live_cache_bytes",
-                "bytes of cached groups",
-                Gauge::default(),
-            ),
             objects_in: context.register(
                 "live_objects_in",
                 "objects published to this node",
@@ -168,11 +155,6 @@ impl<E: Context> Relay<E> {
                 "objects a slow session or peer did not get",
                 Counter::default(),
             ),
-            dropped_rate: context.register(
-                "live_dropped_rate",
-                "objects over an account's rate",
-                Counter::default(),
-            ),
         };
         let (lane, queued) = lane::queue();
         let rechecks = Arc::new(Notify::new());
@@ -188,8 +170,6 @@ impl<E: Context> Relay<E> {
             dirty: Mutex::default(),
             rechecks: rechecks.clone(),
             lane,
-            sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
-            handshakes: Arc::new(Semaphore::new(HANDSHAKES)),
             tasks: Mutex::default(),
         });
         // The tasks hold the relay weakly: it drops with its last owner, and they end with it.
@@ -220,15 +200,10 @@ impl<E: Context> Relay<E> {
     }
 
     /// A websocket on `/v1/live`: the same session over the http port.
-    pub async fn serve_ws(self: Arc<Self>, mut socket: axum::extract::ws::WebSocket) {
-        let Ok(handshaking) = self.handshakes.clone().try_acquire_owned() else {
-            tracing::debug!(target: "ducktape::live", reason = "handshakes_full", path = "ws", "the relay refused a connection it had no handshake slot for");
-            let _ = socket.close().await;
-            return;
-        };
+    pub async fn serve_ws(self: Arc<Self>, socket: axum::extract::ws::WebSocket) {
         let relay = Arc::downgrade(&self);
         drop(self);
-        serve(relay, Link::ws(socket), handshaking).await;
+        serve(relay, Link::ws(socket)).await;
     }
 
     /// A block was applied: grants of a module whose `live/` table it wrote, and every
@@ -457,16 +432,10 @@ async fn accepting<E: Context>(relay: Weak<Relay<E>>, door: quinn::Endpoint) {
         let Some(strong) = relay.upgrade() else {
             return;
         };
-        let Ok(handshaking) = strong.handshakes.clone().try_acquire_owned() else {
-            tracing::debug!(target: "ducktape::live", reason = "handshakes_full", path = "quic", "the relay refused a connection it had no handshake slot for");
-            incoming.refuse();
-            continue;
-        };
         tokio::spawn(serve_quic(
             relay.clone(),
             incoming,
             strong.halo.plane().pacer().clone(),
-            handshaking,
         ));
     }
 }
@@ -475,7 +444,6 @@ async fn serve_quic<E: Context>(
     relay: Weak<Relay<E>>,
     incoming: quinn::Incoming,
     pacer: halo::Pacer,
-    handshaking: OwnedSemaphorePermit,
 ) {
     let connected = tokio::time::timeout(HANDSHAKE_WAIT, incoming).await;
     let Ok(Ok(connection)) = connected else {
@@ -487,7 +455,7 @@ async fn serve_quic<E: Context>(
         return;
     };
     let link = Link::quic(connection, control, pacer);
-    serve(relay, link, handshaking).await;
+    serve(relay, link).await;
 }
 
 enum Handshake {
@@ -576,15 +544,9 @@ fn refused(link: &Link, code: Code) {
     link.outlet.close(code.as_str());
 }
 
-/// One session, from its handshake to its close. The connection holds one of `HANDSHAKES`
-/// until it is proven, and a seat among `MAX_SESSIONS` only from then: an unproven connection
-/// crowds out no session. The relay is held only while a step runs, so an open client never
-/// keeps a dropped relay alive.
-async fn serve<E: Context>(
-    relay: Weak<Relay<E>>,
-    mut link: Link,
-    handshaking: OwnedSemaphorePermit,
-) {
+/// One session, from its handshake to its close. The relay is held only while a step runs, so
+/// an open client never keeps a dropped relay alive.
+async fn serve<E: Context>(relay: Weak<Relay<E>>, mut link: Link) {
     let Some(strong) = relay.upgrade() else {
         return;
     };
@@ -594,14 +556,7 @@ async fn serve<E: Context>(
         Handshake::Refused(code) => return refused(&link, code),
         Handshake::Gone => return link.outlet.close("no_handshake"),
     };
-    let Ok(_seat) = strong.sessions.clone().try_acquire_owned() else {
-        tracing::debug!(target: "ducktape::live", reason = "sessions_full", path = link.path, "the relay refused a session it had no seat for");
-        return refused(&link, Code::Limit);
-    };
-    drop(handshaking);
-    let Some(id) = strong.state().opened(account, key, link.outlet.clone()) else {
-        return refused(&link, Code::Limit);
-    };
+    let id = strong.state().opened(account, key, link.outlet.clone());
     link.outlet.send(Out::Control(Control::Welcome(Welcome {
         account,
         datagrams: link.datagrams,

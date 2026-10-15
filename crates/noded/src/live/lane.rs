@@ -17,7 +17,7 @@ use live_wire::{
     MAX_STREAM_OBJECT, RequestId,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::mpsc;
 
 use super::Relay;
 use super::session::{CONTROL_BYTES, framed};
@@ -34,12 +34,6 @@ const QUEUE: usize = 4096;
 const PEER_QUEUE: usize = 1024;
 /// Objects waiting on one group stream to a peer; past it the group is dropped short.
 const GROUP_QUEUE: usize = 256;
-/// Group stream writers alive to one peer at once. A group is a bidirectional stream on the one
-/// connection halo keeps to that member, and every lane on it, blobs included, shares quinn's
-/// default of 100 concurrent bidirectional streams a peer may open
-/// (quinn-proto 0.11.15 `src/config/transport.rs:362`), so the lane takes a sixth of them and
-/// leaves the rest to the others.
-const PEER_GROUPS: usize = 16;
 /// A control stream that would not open logs its first attempt, then every tenth.
 const ATTEMPTS_PER_LINE: u32 = 10;
 
@@ -238,7 +232,6 @@ impl<E: super::Context> Lanes<E> {
                 attempts: 0,
                 groups: HashMap::new(),
                 abandoned: HashSet::new(),
-                writers: Arc::new(Semaphore::new(PEER_GROUPS)),
             };
             self.track(tokio::spawn(peer_writing(link, queue)));
             self.peers.insert(to.clone(), sending);
@@ -262,8 +255,6 @@ struct PeerLink<E: super::Context> {
     groups: HashMap<(Alias, u64), mpsc::Sender<GroupOut>>,
     /// Groups dropped short for falling behind: the rest of their objects are dropped quiet.
     abandoned: HashSet<(Alias, u64)>,
-    /// One permit per group writer alive to the peer: what holds its stream credit is counted.
-    writers: Arc<Semaphore>,
 }
 
 async fn peer_writing<E: super::Context>(mut link: PeerLink<E>, mut queue: mpsc::Receiver<ToPeer>) {
@@ -347,31 +338,23 @@ impl<E: super::Context> PeerLink<E> {
         written
     }
 
-    /// With `PEER_GROUPS` group writers alive to one peer a new group is dropped short and
-    /// counted: the peer's stream credit is shared with every lane, and a peer this far behind
-    /// gets the next group.
+    /// Queues the object on its group's stream to the peer, opening one for a new group; a
+    /// group whose queue overflows is dropped short and counted.
     fn group_object(&mut self, header: GroupHeader, body: Bytes) {
         let key = (header.alias, header.group);
         if self.abandoned.contains(&key) {
             return;
         }
-        if !self.groups.contains_key(&key) {
-            let Ok(alive) = self.writers.clone().try_acquire_owned() else {
-                self.abandoned.insert(key);
-                self.dropped.inc();
-                return;
-            };
+        let sending = self.groups.entry(key).or_insert_with(|| {
             let (sending, queue) = mpsc::channel(GROUP_QUEUE);
             tokio::spawn(group_writing(
                 self.streams.clone(),
                 self.to.clone(),
                 header,
                 queue,
-                alive,
             ));
-            self.groups.insert(key, sending);
-        }
-        let sending = self.groups.get(&key).expect("inserted above");
+            sending
+        });
         let queued = sending.try_send(GroupOut::Object(body)).is_ok();
         if !queued {
             self.groups.remove(&key);
@@ -388,7 +371,6 @@ async fn group_writing(
     to: PublicKey,
     header: GroupHeader,
     mut queue: mpsc::Receiver<GroupOut>,
-    _alive: OwnedSemaphorePermit,
 ) {
     let Ok(mut stream) = streams
         .open(&to, Class::Client, &abi::encode(&LaneMeta::Group))
@@ -526,8 +508,6 @@ fn heard<E: super::Context>(
                 | Code::Unknown
                 | Code::Duplicate
                 | Code::TooLarge
-                | Code::Rate
-                | Code::Limit
                 | Code::Malformed => End::PublisherGone,
             };
             ended(relay, from, request, reason);

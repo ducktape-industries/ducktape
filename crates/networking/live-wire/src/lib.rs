@@ -29,21 +29,6 @@ pub const MAX_DATAGRAM_OBJECT: usize = 1100;
 pub const MAX_TRACK_NAME: usize = 128;
 /// A namespace, in bytes: `<chain>/<module>/<room>` as the host stamps it.
 pub const MAX_NAMESPACE: usize = 192;
-/// Sessions one account holds at once on one node: the app's windows share one connection, so
-/// a handful is many; past it a handshake is refused `Limit`.
-pub const MAX_SESSIONS_PER_ACCOUNT: usize = 8;
-/// Tracks one connection publishes.
-pub const MAX_TRACKS_PER_SESSION: usize = 32;
-/// Subscriptions one connection holds.
-pub const MAX_SUBSCRIPTIONS_PER_SESSION: usize = 64;
-/// Subscribers one node fans a track out to.
-pub const MAX_SUBSCRIBERS_PER_TRACK: usize = 256;
-/// Objects one account publishes per second, over every session it holds.
-pub const RATE_OBJECTS_PER_SEC: u32 = 512;
-/// Bytes one account publishes per second, over every session it holds.
-pub const RATE_BYTES_PER_SEC: u32 = 1 << 20;
-/// Cached group bytes one node keeps over every track.
-pub const CACHE_BYTES_PER_NODE: usize = 256 << 20;
 /// A session with no track and no subscription this long is closed by the node.
 pub const IDLE_SESSION: Duration = Duration::from_secs(60);
 
@@ -224,9 +209,6 @@ pub enum Code {
     Duplicate,
     /// An object, group or name over its cap.
     TooLarge,
-    Rate,
-    /// Tracks, subscriptions or subscribers over their cap.
-    Limit,
     Malformed,
 }
 
@@ -240,8 +222,6 @@ impl Code {
             Code::Unknown => "unknown_track",
             Code::Duplicate => "duplicate_track",
             Code::TooLarge => "too_large",
-            Code::Rate => "rate_limit",
-            Code::Limit => "subscription_limit",
             Code::Malformed => "malformed_request",
         }
     }

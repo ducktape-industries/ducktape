@@ -2,18 +2,16 @@
 //! latest group each keeps for a late joiner, and every session's requests. Each step decides
 //! under one lock and returns what to send; the sessions' outlets carry it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_runtime::telemetry::metrics::{Counter, Gauge};
 use live_wire::{
-    Account, Alias, CACHE_BYTES_PER_NODE, Code, Control, DatagramHeader, End, Forward, GroupHeader,
-    MAX_DATAGRAM_OBJECT, MAX_GROUP_BYTES, MAX_NAMESPACE, MAX_SESSIONS_PER_ACCOUNT,
-    MAX_STREAM_OBJECT, MAX_SUBSCRIBERS_PER_TRACK, MAX_SUBSCRIPTIONS_PER_SESSION,
-    MAX_TRACKS_PER_SESSION, Mode, Priority, RATE_BYTES_PER_SEC, RATE_OBJECTS_PER_SEC, RequestId,
-    Start, Track, pattern_covers, well_named,
+    Account, Alias, Code, Control, DatagramHeader, End, Forward, GroupHeader, MAX_DATAGRAM_OBJECT,
+    MAX_GROUP_BYTES, MAX_NAMESPACE, MAX_STREAM_OBJECT, Mode, Priority, RequestId, Start, Track,
+    pattern_covers, well_named,
 };
 
 use super::grants::Act;
@@ -120,7 +118,6 @@ pub struct Cached {
     pub first: u32,
     pub objects: Vec<Bytes>,
     pub complete: bool,
-    pub bytes: usize,
 }
 
 /// A group the publisher is writing now.
@@ -217,52 +214,16 @@ impl Session {
     }
 }
 
-/// One account's publishing budget: objects and bytes refill at the rate, up to one second's
-/// worth.
-struct Bucket {
-    objects: f64,
-    bytes: f64,
-    refilled_at: Instant,
-}
-
-impl Bucket {
-    fn full(now: Instant) -> Bucket {
-        Bucket {
-            objects: f64::from(RATE_OBJECTS_PER_SEC),
-            bytes: f64::from(RATE_BYTES_PER_SEC),
-            refilled_at: now,
-        }
-    }
-
-    fn take(&mut self, bytes: usize, now: Instant) -> bool {
-        let elapsed = now.duration_since(self.refilled_at).as_secs_f64();
-        self.objects = (self.objects + elapsed * f64::from(RATE_OBJECTS_PER_SEC))
-            .min(f64::from(RATE_OBJECTS_PER_SEC));
-        self.bytes = (self.bytes + elapsed * f64::from(RATE_BYTES_PER_SEC))
-            .min(f64::from(RATE_BYTES_PER_SEC));
-        self.refilled_at = now;
-        let affordable = self.objects >= 1.0 && self.bytes >= bytes as f64;
-        if !affordable {
-            return false;
-        }
-        self.objects -= 1.0;
-        self.bytes -= bytes as f64;
-        true
-    }
-}
-
 #[derive(Clone)]
 pub struct Metrics {
     pub sessions: Gauge,
     pub tracks: Gauge,
     pub subscriptions: Gauge,
-    pub cache_bytes: Gauge,
     pub objects_in: Counter,
     pub objects_out: Counter,
     pub bytes_out: Counter,
     pub dropped_stale: Counter,
     pub dropped_behind: Counter,
-    pub dropped_rate: Counter,
 }
 
 pub struct State {
@@ -274,10 +235,6 @@ pub struct State {
     watches: HashMap<String, Vec<Watcher>>,
     sessions: HashMap<SessionId, Session>,
     next_session: SessionId,
-    cache_bytes: usize,
-    /// Tracks in the order their cached group began; the front is evicted first.
-    cached_order: VecDeque<Track>,
-    rates: HashMap<Account, Bucket>,
     metrics: Metrics,
 }
 
@@ -305,9 +262,6 @@ impl State {
             watches: HashMap::new(),
             sessions: HashMap::new(),
             next_session: 1,
-            cache_bytes: 0,
-            cached_order: VecDeque::new(),
-            rates: HashMap::new(),
             metrics,
         }
     }
@@ -323,11 +277,6 @@ impl State {
     #[cfg(test)]
     pub fn track(&self, track: &Track) -> Option<&Published> {
         self.tracks.get(track)
-    }
-
-    #[cfg(test)]
-    pub fn cache_bytes(&self) -> usize {
-        self.cache_bytes
     }
 
     fn outlet(&self, session: SessionId) -> Option<Outlet> {
@@ -358,17 +307,7 @@ impl State {
 
     // ---- sessions ----
 
-    /// `None` when the account holds its cap of sessions already.
-    pub fn opened(&mut self, account: Account, key: Vec<u8>, outlet: Outlet) -> Option<SessionId> {
-        let held = self
-            .sessions
-            .values()
-            .filter(|session| session.account == account)
-            .count();
-        let at_cap = held >= MAX_SESSIONS_PER_ACCOUNT;
-        if at_cap {
-            return None;
-        }
+    pub fn opened(&mut self, account: Account, key: Vec<u8>, outlet: Outlet) -> SessionId {
         let id = self.next_session;
         self.next_session += 1;
         self.sessions.insert(
@@ -383,7 +322,7 @@ impl State {
             },
         );
         self.metrics.sessions.set(self.sessions.len() as i64);
-        Some(id)
+        id
     }
 
     pub fn outlets(&self) -> Vec<Outlet> {
@@ -476,12 +415,10 @@ impl State {
             return effects;
         };
         let account = session.account;
-        let at_cap = session.published.len() >= MAX_TRACKS_PER_SESSION;
         let request_taken = Self::request_taken(session, request);
         let refusal = first_refused(&[
             (!self.admissible(&track), Code::Malformed),
             (request_taken, Code::Malformed),
-            (at_cap, Code::Limit),
             (!granted, Code::NotGranted),
         ]);
         if let Some(code) = refusal {
@@ -621,7 +558,6 @@ impl State {
             return;
         };
         self.aliases.remove(&held.alias);
-        self.drop_cache(track, &held);
         self.metrics.tracks.set(self.tracks.len() as i64);
         if let Origin::Local(publisher) = held.origin {
             if let Some(session) = self.sessions.get_mut(&publisher) {
@@ -759,15 +695,12 @@ impl State {
         let Some(session) = self.sessions.get(&id) else {
             return effects;
         };
-        let at_cap =
-            session.subscribed.len() + session.watching.len() >= MAX_SUBSCRIPTIONS_PER_SESSION;
         let request_taken = Self::request_taken(session, request);
         // One subscriber per session and track: two would share the alias and so the stream.
         let already = session.subscribed.values().any(|held| *held == track);
         let refusal = first_refused(&[
             (!self.admissible(&track), Code::Malformed),
             (request_taken, Code::Malformed),
-            (at_cap, Code::Limit),
             (!granted, Code::NotGranted),
             (!self.tracks.contains_key(&track), Code::Unknown),
             (already, Code::Duplicate),
@@ -781,7 +714,6 @@ impl State {
             request,
         };
         let Some(opened) = self.add_subscriber(&track, subscriber, from, &mut effects) else {
-            self.refuse(id, request, Code::Limit, &mut effects);
             return effects;
         };
         if let Some(session) = self.sessions.get_mut(&id) {
@@ -854,7 +786,7 @@ impl State {
             request,
         };
         let Some(opened) = self.add_subscriber(track, subscriber, from, &mut effects) else {
-            return Err(Code::Limit);
+            return Err(Code::Unknown);
         };
         if from == Start::Latest {
             self.replay_to_node(&peer, alias, track, &mut effects);
@@ -870,10 +802,6 @@ impl State {
         effects: &mut Vec<Effect>,
     ) -> Option<Opened> {
         let held = self.tracks.get_mut(track)?;
-        let full = held.subscribers.len() >= MAX_SUBSCRIBERS_PER_TRACK;
-        if full {
-            return None;
-        }
         let first_local = matches!(subscriber, Subscriber::Local { .. })
             && !held
                 .subscribers
@@ -1029,9 +957,7 @@ impl State {
                 to: peer.clone(),
                 request: held.request,
             }));
-            let freed = held.latest.take().map_or(0, |cached| cached.bytes);
-            self.cache_bytes -= freed;
-            self.cached_order.retain(|other| other != track);
+            held.latest = None;
         }
         self.count_moved(track, effects);
     }
@@ -1081,15 +1007,12 @@ impl State {
         let Some(session) = self.sessions.get(&id) else {
             return effects;
         };
-        let at_cap =
-            session.subscribed.len() + session.watching.len() >= MAX_SUBSCRIPTIONS_PER_SESSION;
         let request_taken = Self::request_taken(session, request);
         // One watcher per session and namespace: a re-check finds it by the session.
         let already = session.watching.values().any(|held| *held == namespace);
         let refusal = first_refused(&[
             (!self.admissible_namespace(&namespace), Code::Malformed),
             (request_taken, Code::Malformed),
-            (at_cap, Code::Limit),
             (patterns.is_none(), Code::NotGranted),
             (already, Code::Duplicate),
         ]);
@@ -1238,35 +1161,16 @@ impl State {
         cap: usize,
         now: Instant,
     ) -> Taken {
-        let Some(held) = self.tracks.get(track) else {
+        let Some(held) = self.tracks.get_mut(track) else {
             return Taken::Dropped;
         };
-        let by = held.by;
-        let remote = matches!(held.origin, Origin::Remote(_));
         let in_mode = held.mode == mode;
         let fits = bytes <= cap;
-        let affordable = remote
-            || self
-                .rates
-                .entry(by)
-                .or_insert_with(|| Bucket::full(now))
-                .take(bytes, now);
-        let code = first_refused(&[
-            (!in_mode, Code::Malformed),
-            (!fits, Code::TooLarge),
-            (!affordable, Code::Rate),
-        ]);
+        let code = first_refused(&[(!in_mode, Code::Malformed), (!fits, Code::TooLarge)]);
         let Some(code) = code else {
             self.metrics.objects_in.inc();
             return Taken::Allowed;
         };
-        if code == Code::Rate {
-            self.metrics.dropped_rate.inc();
-        }
-        let held = self
-            .tracks
-            .get_mut(track)
-            .expect("the track was read above");
         let told_lately = held
             .refused_at
             .is_some_and(|at| now.duration_since(at) < REFUSAL_PAUSE);
@@ -1591,7 +1495,6 @@ impl State {
         let Some(held) = self.tracks.get_mut(track) else {
             return;
         };
-        let bytes = body.len();
         let continues = !alone
             && held
                 .latest
@@ -1600,43 +1503,14 @@ impl State {
         if continues {
             let cached = held.latest.as_mut().expect("checked above");
             cached.objects.push(body);
-            cached.bytes += bytes;
-            self.cache_bytes += bytes;
-        } else {
-            let freed = held.latest.as_ref().map_or(0, |cached| cached.bytes);
-            held.latest = Some(Cached {
-                group,
-                first: object,
-                objects: vec![body],
-                complete: alone,
-                bytes,
-            });
-            self.cache_bytes = self.cache_bytes - freed + bytes;
-            self.cached_order.retain(|other| other != track);
-            self.cached_order.push_back(track.clone());
+            return;
         }
-        self.evict();
-        self.metrics.cache_bytes.set(self.cache_bytes as i64);
-    }
-
-    fn evict(&mut self) {
-        while self.cache_bytes > CACHE_BYTES_PER_NODE {
-            let Some(oldest) = self.cached_order.pop_front() else {
-                return;
-            };
-            let Some(held) = self.tracks.get_mut(&oldest) else {
-                continue;
-            };
-            let freed = held.latest.take().map_or(0, |cached| cached.bytes);
-            self.cache_bytes -= freed;
-        }
-    }
-
-    fn drop_cache(&mut self, track: &Track, held: &Published) {
-        let freed = held.latest.as_ref().map_or(0, |cached| cached.bytes);
-        self.cache_bytes -= freed;
-        self.cached_order.retain(|other| other != track);
-        self.metrics.cache_bytes.set(self.cache_bytes as i64);
+        held.latest = Some(Cached {
+            group,
+            first: object,
+            objects: vec![body],
+            complete: alone,
+        });
     }
 
     /// Every request of a session that lives in `module`'s rooms, for a grant re-check.
