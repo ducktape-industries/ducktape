@@ -229,14 +229,38 @@ async fn start<E: Context>(
                 udp: listen.halo,
             },
         )
-        .map_err(|error| Error::Tls(error.to_string()))?,
+        .map_err(|error| Error::Address(format!("--halo {}: {error}", listen.halo)))?,
     );
     halo.seat(halo_seats(&node, &network).await?);
     tabled(&halo, halo_lanes(&node).await?, tip.height);
     let blobs =
         blob::service::Service::start(halo.clone(), node.host().blobs().clone(), bundles(&node)?)?;
-
     let member_cap = node.member_cap()?;
+    let identity_role = node.host().roles().identity.clone();
+    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
+
+    // the live door binds its socket here, beside halo's, so a socket in use fails the start
+    // before consensus does any work
+    let (shutdown, _) = watch::channel(false);
+    let door = listen.live.map(|at| at.to_string()).unwrap_or_default();
+    let live = live::Relay::start(
+        context.child("live"),
+        live::Network {
+            id: live::Network::chain_id(
+                &descriptor.network,
+                &descriptor.genesis_block().digest().0,
+            ),
+            genesis: descriptor.genesis_block().digest().0,
+            identity: identity_role,
+        },
+        Arc::new(node.clone()),
+        halo.clone(),
+        &identity,
+        listen.live,
+        shutdown.subscribe(),
+    )
+    .map_err(|error| Error::Address(format!("--live {door}: {error}")))?;
+
     let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
         Mesh::start(
             context.child("mesh"),
@@ -254,7 +278,6 @@ async fn start<E: Context>(
         roster.seat(*epoch, validators);
     }
 
-    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
     let (inbox, deliveries) = mpsc::unbounded();
     let chain = Participant {
         node: node.clone(),
@@ -295,24 +318,6 @@ async fn start<E: Context>(
         "the node is up"
     );
 
-    let (shutdown, _) = watch::channel(false);
-    let live = live::Relay::start(
-        context.child("live"),
-        live::Network {
-            id: live::Network::chain_id(
-                &descriptor.network,
-                &descriptor.genesis_block().digest().0,
-            ),
-            genesis: descriptor.genesis_block().digest().0,
-            identity: node.lock().await.host().roles().identity.clone(),
-        },
-        Arc::new(node.clone()),
-        halo.clone(),
-        &identity,
-        listen.live,
-        shutdown.subscribe(),
-    )
-    .map_err(|error| Error::Tls(error.to_string()))?;
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         node,

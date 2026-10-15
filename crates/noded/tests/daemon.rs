@@ -743,6 +743,37 @@ fn a_changes_subscriber_that_closes_is_answered() {
 }
 
 #[test]
+fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let taken = seat.live.unwrap();
+    let _holder = UdpSocket::bind(taken).unwrap();
+    let listen = Listen {
+        p2p: seat.p2p,
+        http: seat.http,
+        tls: Some(seat.tls),
+        halo: seat.halo,
+        live: seat.live,
+    };
+    let workspace = seat.workspace.clone();
+    let refused = runner(&workspace.runtime_dir()).start(|context| async move {
+        let logs = Logs::install("info").unwrap();
+        noded::run(context, &workspace, logs, listen, HaloConfig::default())
+            .await
+            .err()
+    });
+    let Some(noded::Error::Address(sentence)) = refused else {
+        panic!("a taken live socket refuses the start as an address: {refused:?}");
+    };
+    assert!(
+        sentence.starts_with(&format!("--live {taken}: ")),
+        "{sentence}"
+    );
+}
+
+#[test]
 fn a_node_run_without_live_names_no_live_port() {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat {
