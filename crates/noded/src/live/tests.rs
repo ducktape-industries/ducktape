@@ -33,7 +33,7 @@ type Context = runtime::Context;
 
 const NETWORK: &str = "live-test";
 const GENESIS: [u8; 32] = [7; 32];
-const MODULE: &str = "chat";
+const PROGRAM: &str = "chat";
 
 type Row = (String, String, Option<Account>);
 
@@ -56,14 +56,14 @@ impl Ledger {
         self.grants
             .lock()
             .unwrap()
-            .insert((MODULE.into(), room.into(), who), grant);
+            .insert((PROGRAM.into(), room.into(), who), grant);
     }
 
     fn revoke(&self, room: &str, who: Option<Account>) {
         self.grants
             .lock()
             .unwrap()
-            .remove(&(MODULE.to_owned(), room.to_owned(), who));
+            .remove(&(PROGRAM.to_owned(), room.to_owned(), who));
     }
 
     fn unseat(&self, key: &PrivateKey) {
@@ -80,11 +80,11 @@ impl Chain for Ledger {
         Box::pin(async move { account })
     }
 
-    fn grant(&self, module: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>> {
+    fn grant(&self, program: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>> {
         let grants = self.grants.lock().unwrap();
-        let own = grants.get(&(module.to_owned(), room.to_owned(), Some(account)));
+        let own = grants.get(&(program.to_owned(), room.to_owned(), Some(account)));
         let grant = own
-            .or_else(|| grants.get(&(module.to_owned(), room.to_owned(), None)))
+            .or_else(|| grants.get(&(program.to_owned(), room.to_owned(), None)))
             .cloned();
         Box::pin(async move { grant })
     }
@@ -100,7 +100,7 @@ fn wrote(program: &str, key: Vec<u8>) -> state::Writes {
 }
 
 fn wrote_grants() -> state::Writes {
-    wrote(MODULE, abi::live::key("room", None))
+    wrote(PROGRAM, abi::live::key("room", None))
 }
 
 fn wrote_identity() -> state::Writes {
@@ -162,7 +162,7 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
 }
 
 fn namespace(room: &str) -> String {
-    format!("{}/{MODULE}/{room}", Network::chain_id(NETWORK, &GENESIS))
+    format!("{}/{PROGRAM}/{room}", Network::chain_id(NETWORK, &GENESIS))
 }
 
 fn track(room: &str, name: &str) -> Track {

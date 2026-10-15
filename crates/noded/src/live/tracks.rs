@@ -1463,25 +1463,25 @@ impl State {
         });
     }
 
-    /// Every request of a session that lives in `module`'s rooms, for a grant re-check.
-    pub fn requests_in(&self, module: &str) -> Vec<(SessionId, RequestId, Track, Act)> {
-        let in_module = |namespace: &str| {
-            super::grants::place(namespace).is_some_and(|place| place.module == module)
+    /// Every request of a session that lives in `program`'s rooms, for a grant re-check.
+    pub fn requests_in(&self, program: &str) -> Vec<(SessionId, RequestId, Track, Act)> {
+        let in_program = |namespace: &str| {
+            super::grants::place(namespace).is_some_and(|place| place.program == program)
         };
         let mut found = Vec::new();
         for (id, session) in &self.sessions {
             for (request, track) in &session.published {
-                if in_module(&track.namespace) {
+                if in_program(&track.namespace) {
                     found.push((*id, *request, track.clone(), Act::Publish));
                 }
             }
             for (request, track) in &session.subscribed {
-                if in_module(&track.namespace) {
+                if in_program(&track.namespace) {
                     found.push((*id, *request, track.clone(), Act::Subscribe));
                 }
             }
             for (request, namespace) in &session.watching {
-                if in_module(namespace) {
+                if in_program(namespace) {
                     let track = Track {
                         namespace: namespace.clone(),
                         name: "*".into(),

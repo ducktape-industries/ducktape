@@ -29,9 +29,9 @@ pub trait Chain: Send + Sync + 'static {
     /// The account the identity role answers for `key`; `None` when it holds none or does
     /// not act.
     fn account(&self, key: &[u8]) -> Answered<'_, Option<Account>>;
-    /// The grant of `module` for `account` in `room`: its own row, else the `*` row, read
+    /// The grant of `program` for `account` in `room`: its own row, else the `*` row, read
     /// together so no block falls between them. A row that does not decode is a deny.
-    fn grant(&self, module: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>>;
+    fn grant(&self, program: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>>;
 }
 
 /// A grant row as the relay reads it: absent, or decoded with a row that is not a grant read
@@ -61,17 +61,17 @@ impl<E: crate::Context> Chain for Shared<E> {
         })
     }
 
-    fn grant(&self, module: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>> {
+    fn grant(&self, program: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>> {
         let own = live::key(room, Some(account));
         let everyone = live::key(room, None);
-        let module = module.to_owned();
+        let program = program.to_owned();
         Box::pin(async move {
             let node = self.lock().await;
             let view = node.view(Layer::Confirmed);
-            let own = decoded(view.get(&module, &own).ok().flatten());
+            let own = decoded(view.get(&program, &own).ok().flatten());
             match own {
                 Some(grant) => Some(grant),
-                None => decoded(view.get(&module, &everyone).ok().flatten()),
+                None => decoded(view.get(&program, &everyone).ok().flatten()),
             }
         })
     }
@@ -86,21 +86,21 @@ pub enum Act {
     Watch,
 }
 
-/// Where a track lives, as its namespace spells it: `<chain>/<module>/<room>`.
+/// Where a track lives, as its namespace spells it: `<chain>/<program>/<room>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Place<'a> {
     pub chain: &'a str,
-    pub module: &'a str,
+    pub program: &'a str,
     pub room: &'a str,
 }
 
 pub fn place(namespace: &str) -> Option<Place<'_>> {
     let (chain, rest) = namespace.split_once('/')?;
-    let (module, room) = rest.split_once('/')?;
-    let whole = !chain.is_empty() && !module.is_empty() && !room.is_empty();
+    let (program, room) = rest.split_once('/')?;
+    let whole = !chain.is_empty() && !program.is_empty() && !room.is_empty();
     whole.then_some(Place {
         chain,
-        module,
+        program,
         room,
     })
 }
@@ -142,15 +142,15 @@ impl Grants {
         self.chain.account(key).await
     }
 
-    /// The grant `account` holds in `module`'s `room`, if the program wrote one, read under a
+    /// The grant `account` holds in `program`'s `room`, if the program wrote one, read under a
     /// permit.
-    pub async fn grant(&self, module: &str, room: &str, account: Account) -> Option<Grant> {
+    pub async fn grant(&self, program: &str, room: &str, account: Account) -> Option<Grant> {
         let _read = self
             .reads
             .acquire()
             .await
             .expect("the reads semaphore is never closed");
-        self.chain.grant(module, room, account).await
+        self.chain.grant(program, room, account).await
     }
 
     /// Moves when a block wrote grants: a decision read before and acted on after is re-read.
@@ -168,12 +168,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_namespace_is_a_chain_a_module_and_a_room() {
+    fn a_namespace_is_a_chain_a_program_and_a_room() {
         assert_eq!(
             place("net#0a1b2c3d/chat/general/sub"),
             Some(Place {
                 chain: "net#0a1b2c3d",
-                module: "chat",
+                program: "chat",
                 room: "general/sub",
             })
         );

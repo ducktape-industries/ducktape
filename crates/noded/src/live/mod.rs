@@ -67,10 +67,10 @@ impl Network {
     }
 }
 
-/// Which modules' grants and which sessions' accounts a block may have changed.
+/// Which programs' grants and which sessions' accounts a block may have changed.
 #[derive(Default)]
 struct Dirty {
-    modules: BTreeSet<ProgramId>,
+    programs: BTreeSet<ProgramId>,
     identity: bool,
 }
 
@@ -169,7 +169,7 @@ impl<E: Context> Relay<E> {
         serve(relay, Link::ws(socket)).await;
     }
 
-    /// A block was applied: grants of a module whose `live/` table it wrote, and every
+    /// A block was applied: grants of a program whose `live/` table it wrote, and every
     /// session's account when the identity program wrote, are re-read on the next turn. Sync
     /// and lock-free on the node, because the caller holds the node lock.
     pub fn invalidate(&self, writes: &state::Writes) {
@@ -183,7 +183,7 @@ impl<E: Context> Relay<E> {
             }
             let wrote_grants = keys.keys().any(|key| key.starts_with(b"live/"));
             if wrote_grants {
-                dirty.modules.insert(program.clone());
+                dirty.programs.insert(program.clone());
                 self.grants.moved();
                 changed = true;
             }
@@ -224,29 +224,29 @@ impl<E: Context> Relay<E> {
         let Some(place) = place(namespace) else {
             return Decided {
                 grant: None,
-                module: None,
+                program: None,
                 generation,
             };
         };
-        let grant = self.grants.grant(place.module, place.room, account).await;
+        let grant = self.grants.grant(place.program, place.room, account).await;
         Decided {
             grant,
-            module: Some(place.module.to_owned()),
+            program: Some(place.program.to_owned()),
             generation,
         }
     }
 
-    /// The request was registered: if grants moved since they were read, the module is re-read.
+    /// The request was registered: if grants moved since they were read, the program is re-read.
     fn settled(&self, decided: Decided) {
         let moved = self.grants.generation() != decided.generation;
-        let Some(module) = decided.module.filter(|_| moved) else {
+        let Some(program) = decided.program.filter(|_| moved) else {
             return;
         };
         self.dirty
             .lock()
             .expect("the dirty lock is never poisoned")
-            .modules
-            .insert(module);
+            .programs
+            .insert(program);
         self.rechecks.notify_one();
     }
 
@@ -407,10 +407,10 @@ fn metrics<E: Context>(context: &E) -> tracks::Metrics {
     }
 }
 
-/// A grant read for one request: the grant, the module it is of, and the generation read at.
+/// A grant read for one request: the grant, the program it is of, and the generation read at.
 struct Decided {
     grant: Option<Grant>,
-    module: Option<ProgramId>,
+    program: Option<ProgramId>,
     generation: u64,
 }
 
@@ -653,8 +653,8 @@ async fn rechecking<E: Context>(relay: Weak<Relay<E>>, rechecks: Arc<Notify>) {
                 .lock()
                 .expect("the dirty lock is never poisoned"),
         );
-        for module in &dirty.modules {
-            let requests = relay.state().requests_in(module);
+        for program in &dirty.programs {
+            let requests = relay.state().requests_in(program);
             for (id, request, track, act) in requests {
                 let Some(account) = relay.state().session(id).map(|session| session.account) else {
                     continue;
