@@ -1176,9 +1176,10 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
             panic!("the put applies: {receipt:?}");
         };
         let bundle: u64 = abi::decode(&output).unwrap();
-        ::tokio::time::timeout(Duration::from_secs(60), client.held(&role, bundle))
+        let gathered = &live[1].client;
+        ::tokio::time::timeout(Duration::from_secs(60), gathered.held(&role, bundle))
             .await
-            .expect("both validators receipt the bundle once each holds it")
+            .expect("the gatherer applies the block where both validators hold the bundle")
             .unwrap();
 
         let ids: Vec<BlobId> = entries.iter().map(|entry| entry.id).collect();
@@ -1186,7 +1187,6 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
             blob::frame("page", b"a small page").unwrap(),
             blob::frame("page", &vec![7u8; 3 << 20]).unwrap(),
         ];
-        let gathered = &live[1].client;
         assert_eq!(
             gathered.blobs(&ids).await.unwrap(),
             framed.clone().map(Some).to_vec()
@@ -1309,7 +1309,7 @@ fn a_lane_the_validators_vote_open_is_served_from_its_block() {
 
         let (id, bundle) = put_page(client, &page, 1).await;
         let role = client.status().await.unwrap().roles.blobs;
-        ::tokio::time::timeout(Duration::from_secs(60), client.held(&role, bundle))
+        ::tokio::time::timeout(Duration::from_secs(60), live[1].client.held(&role, bundle))
             .await
             .expect("the gatherer gathers and receipts the bundle over the lane the vote opened")
             .unwrap();
@@ -1345,6 +1345,10 @@ fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_di
             .unwrap();
         let framed = blob::frame("page", b"held through a hidden member").unwrap();
         for gathered in &live[..2] {
+            ::tokio::time::timeout(Duration::from_secs(60), gathered.client.held(&role, bundle))
+                .await
+                .expect("the gatherer applied the block that holds the bundle")
+                .unwrap();
             assert_eq!(
                 gathered.client.blobs(&[id]).await.unwrap(),
                 vec![Some(framed.clone())]
@@ -1388,6 +1392,10 @@ fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
             moved / EPOCH,
             "the move landed at {moved} and the bundle was held at {since}, past the epoch's end"
         );
+        ::tokio::time::timeout(Duration::from_secs(60), live[1].client.held(&role, bundle))
+            .await
+            .expect("the gatherer applied the block that holds the bundle")
+            .unwrap();
         let framed = blob::frame("page", b"gathered at the new address").unwrap();
         assert_eq!(
             live[1].client.blobs(&[id]).await.unwrap(),
