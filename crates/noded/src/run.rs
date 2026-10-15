@@ -460,6 +460,20 @@ async fn halo_lanes<E: Context>(node: &Node<E>) -> Result<Vec<Lane>> {
     Ok(lanes)
 }
 
+/// Whether a block's writes change what `program` answers: it wrote the program's state, or the
+/// host swapped its code (a write under `$programs` at the program's id).
+fn rewrites(writes: &state::Writes, program: &str) -> bool {
+    let state = writes
+        .programs
+        .get(program)
+        .is_some_and(|written| !written.is_empty());
+    let code = writes
+        .programs
+        .get(host::PROGRAMS)
+        .is_some_and(|written| written.contains_key(program.as_bytes()));
+    state || code
+}
+
 async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
     match halo_lanes(node).await {
         Ok(lanes) => daemon.halo.plane().lanes(lanes),
@@ -672,16 +686,8 @@ async fn applied<E: Context>(
             daemon.record(&node, block, ran, Some(receipts)).await?;
             daemon.publish(&applied);
             let roles = node.host().roles();
-            let members_written = applied
-                .writes
-                .programs
-                .get(&roles.validators)
-                .is_some_and(|writes| !writes.is_empty());
-            let lanes_written = applied
-                .writes
-                .programs
-                .get(&roles.halo)
-                .is_some_and(|writes| !writes.is_empty());
+            let members_written = rewrites(&applied.writes, &roles.validators);
+            let lanes_written = rewrites(&applied.writes, &roles.halo);
             if lanes_written {
                 retable_halo(daemon, &node, block.height).await;
             }
@@ -732,4 +738,26 @@ async fn applied<E: Context>(
         .send(due.iter().chain(&receipted).map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::rewrites;
+
+    #[test]
+    fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
+        let writes = |program: &str, key: &[u8]| state::Writes {
+            programs: BTreeMap::from([(
+                program.to_owned(),
+                BTreeMap::from([(key.to_vec(), Some(vec![1]))]),
+            )]),
+        };
+        assert!(rewrites(&writes("halo", b"l/x"), "halo"));
+        assert!(rewrites(&writes(host::PROGRAMS, b"halo"), "halo"));
+        assert!(!rewrites(&writes(host::PROGRAMS, b"blobs"), "halo"));
+        assert!(!rewrites(&writes("blobs", b"halo"), "halo"));
+        assert!(!rewrites(&state::Writes::default(), "halo"));
+    }
 }

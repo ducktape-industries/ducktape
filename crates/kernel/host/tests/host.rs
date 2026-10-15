@@ -1806,6 +1806,12 @@ fn the_roster_admits_swaps_and_drops_programs() {
         .unwrap();
         let applied = host.apply(block(5, Vec::new())).await.unwrap();
         assert_eq!(applied.admissions, vec![receipt("echo", ok(b""), vec![])]);
+        let swapped = applied
+            .writes
+            .programs
+            .get(host::PROGRAMS)
+            .is_some_and(|written| written.contains_key(b"echo".as_slice()));
+        assert!(swapped, "a swap writes `$programs` at the program's id");
         assert_eq!(host.programs().unwrap()["echo"], probe);
         let env = ask(&host, Layer::Confirmed, "echo", vec![Step::Env]).await;
         assert_eq!(
