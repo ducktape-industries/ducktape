@@ -1,3 +1,4 @@
+use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
@@ -72,17 +73,12 @@ where
         let (seats, seated) = mpsc::unbounded();
         let heard = heard
             .into_stream()
-            .map(|(epoch, peer, certificate)| Signal::Heard {
-                epoch,
-                peer,
-                certificate,
-            });
+            .map(|(epoch, peer)| Signal::Heard { epoch, peer });
         let signals = futures::stream::select(seated, heard);
         let catch_up = context.child("catch_up").spawn({
             let network = network.clone();
-            let roster = roster.clone();
             let marshal = marshal.mailbox().clone();
-            move |context| catchup::run(context, network, roster, marshal, signals)
+            move |_| catchup::run(network, marshal, signals)
         });
         Membership {
             context,
@@ -121,7 +117,7 @@ where
     }
 
     async fn engine(&mut self, epoch: u64, tip: Tip) -> Result<Standing, Error> {
-        let Some(scheme) = self.roster.scheme(epoch) else {
+        let Some((scheme, standing)) = self.seat_in(epoch) else {
             self.engine = None;
             self.votes.clear();
             return Ok(Standing::Follower);
@@ -146,6 +142,15 @@ where
             &self.marshal,
             self.chain.clone(),
         ));
-        Ok(Standing::Validator)
+        Ok(standing)
+    }
+
+    fn seat_in(&self, epoch: u64) -> Option<(Scheme, Standing)> {
+        if let Some(signer) = self.roster.scheme(epoch) {
+            return Some((signer, Standing::Validator));
+        }
+        let verifier = self.roster.verifier(epoch)?;
+        let seats_someone = !verifier.participants().is_empty();
+        seats_someone.then_some((verifier, Standing::Follower))
     }
 }

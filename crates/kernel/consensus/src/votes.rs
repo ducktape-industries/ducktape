@@ -88,9 +88,7 @@ impl Votes {
         self.book().signed.clone()
     }
 
-    /// Forgets every vote and takes none until the next [`Votes::seat`]: a
-    /// node that stops validating hears none, what it heard before would
-    /// only age, and its dropped engine can still report one more.
+    /// Forgets every vote and takes none until the next [`Votes::seat`].
     pub(crate) fn clear(&self) {
         *self.book() = Book::default();
     }

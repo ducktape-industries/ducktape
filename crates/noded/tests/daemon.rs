@@ -858,8 +858,8 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
 }
 
 /// One validator, and a stranger that joins: it enrolls, waits for the epoch
-/// that seats it as a resident, and state-syncs inside it. It runs no
-/// engine, yet it follows at the tip: it applies the changes the validator
+/// that seats it as a resident, and state-syncs inside it. It follows at
+/// the tip: it applies the changes the validator
 /// makes after it starts, and comes within two blocks of the validator before
 /// the validator applies the block that closes the epoch, so no next-epoch
 /// traffic carried it.
@@ -911,14 +911,26 @@ fn a_resident_follows_at_the_tip() {
         ::tokio::time::timeout(Duration::from_secs(120), follow)
             .await
             .expect("the resident applies each change");
-        // it runs no engine, so it hears no finalize vote: every member,
-        // the validator too, reads None on it
-        let network = follower.client.network().await.unwrap();
-        assert_eq!(network.members.len(), 2, "{network:?}");
-        assert!(
-            network.members.iter().all(|row| row.signed.is_none()),
-            "{network:?}"
-        );
+        let mut blocks = follower.client.changes(host::RECENT).await.unwrap();
+        let heard = async {
+            loop {
+                let network = follower.client.network().await.unwrap();
+                let signed = |key: Vec<u8>| {
+                    let row = network.members.iter().find(|row| row.key == key);
+                    row.and_then(|row| row.signed)
+                };
+                if let Some(height) = signed(seat.key()) {
+                    assert_eq!(network.members.len(), 2, "{network:?}");
+                    assert_eq!(signed(resident.key()), None, "{network:?}");
+                    assert!(height <= network.height, "{network:?}");
+                    return;
+                }
+                blocks.next().await.unwrap().unwrap();
+            }
+        };
+        ::tokio::time::timeout(Duration::from_secs(30), heard)
+            .await
+            .expect("the resident hears the validator's finalize votes");
         for (seat, node) in [(&seat, &live), (&resident, &follower)] {
             seat.admin(&node.client, Admin::Shutdown).await;
         }
