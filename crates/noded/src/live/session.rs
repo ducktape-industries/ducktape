@@ -2,7 +2,7 @@
 //! inbound events read by tasks that know the transport, and an outlet the relay writes to that
 //! a task per connection turns into control messages, group streams and datagrams.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +18,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::groups::{GroupOut, Groups};
+
 /// Inbound events waiting for the session's loop; a reader waits when it is full, so the
 /// transport's flow control holds the publisher back.
 const INBOUND: usize = 1024;
@@ -25,7 +27,6 @@ const INBOUND: usize = 1024;
 /// is closed rather than fed from a growing queue.
 const OUTBOUND: usize = 4096;
 /// Objects waiting on one egress group stream; a group this far behind is reset.
-const GROUP_QUEUE: usize = 256;
 /// The control stream outranks every group stream of the connection.
 const CONTROL_PRIORITY: i32 = 256;
 /// A last message (a refusal, a GoAway) gets this long to reach a client that stopped reading;
@@ -66,8 +67,8 @@ pub enum Out {
         header: GroupHeader,
         object: u32,
         body: Bytes,
-        /// The track's priority, which the egress sets its group stream to (the one source of
-        /// a track's priority, no longer a per-group header field).
+        /// The track's priority, which the egress sets its group stream to: the one source of
+        /// a track's priority.
         priority: Priority,
     },
     /// A whole cached group replayed to a late joiner, as one unit: the writer writes every
@@ -127,9 +128,9 @@ pub struct Outlet {
     ordered: mpsc::Sender<Out>,
     latest: Arc<Latest>,
     closing: watch::Sender<Option<&'static str>>,
-    /// Woken when the relay empties the session, so its loop re-arms the idle timer without
-    /// waiting on the client to send something (C1-7).
-    idle: Arc<Notify>,
+    /// Woken on every control message delivered: the session's loop re-reads what it holds, so
+    /// one the relay emptied re-arms its idle timer without waiting on the client.
+    told: Arc<Notify>,
 }
 
 impl std::fmt::Debug for Outlet {
@@ -149,6 +150,9 @@ pub enum Sent {
 
 impl Outlet {
     pub fn send(&self, out: Out) -> Sent {
+        if let Out::Control(_) = &out {
+            self.told.notify_one();
+        }
         if let Out::Datagram { header, payload } = out {
             return match self.latest.put(header, payload) {
                 true => Sent::Superseded,
@@ -178,14 +182,10 @@ impl Outlet {
         *self.closing.borrow()
     }
 
-    /// The relay emptied the session: wake its loop to re-arm its idle timer.
-    pub fn wake_idle(&self) {
-        self.idle.notify_one();
-    }
-
-    /// Resolves when the relay last emptied the session.
-    pub async fn emptied(&self) {
-        self.idle.notified().await;
+    /// Resolves once a control message was delivered since it was last awaited (a permit is
+    /// kept, so one delivered while the loop was in a step is not lost).
+    pub async fn told(&self) {
+        self.told.notified().await;
     }
 }
 
@@ -248,7 +248,7 @@ fn outlet() -> (Outlet, Egress) {
         ordered,
         latest: latest.clone(),
         closing,
-        idle: Arc::new(Notify::new()),
+        told: Arc::new(Notify::new()),
     };
     let egress = Egress {
         ordered: receiving,
@@ -398,7 +398,7 @@ async fn quic_groups_reading(connection: quinn::Connection, inbound: mpsc::Sende
 }
 
 async fn quic_group_reading(mut stream: quinn::RecvStream, inbound: mpsc::Sender<Inbound>) {
-    let mut header = [0u8; 12];
+    let mut header = [0u8; GroupHeader::LEN];
     if stream.read_exact(&mut header).await.is_err() {
         return;
     }
@@ -419,7 +419,7 @@ async fn quic_group_reading(mut stream: quinn::RecvStream, inbound: mpsc::Sender
         let fits = len <= MAX_STREAM_OBJECT;
         if !fits {
             // The stream is stopped at the object that does not fit; the publisher hears why,
-            // and the group ends short so no entry for it is left behind (C1-11).
+            // and the group ends short so no entry for it is left behind.
             let _ = stream.stop(0u32.into());
             let _ = inbound
                 .send(Inbound::Oversize {
@@ -507,22 +507,6 @@ fn datagram_arrived(mut bytes: Bytes) -> Option<Inbound> {
     })
 }
 
-enum GroupOut {
-    Object(Bytes),
-    /// A whole cached group's objects, written in one go: a replay is one queue item, not one
-    /// per object.
-    Batch(Arc<Vec<Bytes>>),
-    End {
-        complete: bool,
-    },
-}
-
-struct Groups {
-    open: HashMap<(Alias, u64), mpsc::Sender<GroupOut>>,
-    /// Groups reset for falling behind: the rest of their objects are dropped quiet.
-    abandoned: HashSet<(Alias, u64)>,
-}
-
 async fn quic_writing(
     connection: quinn::Connection,
     mut control: quinn::SendStream,
@@ -530,10 +514,7 @@ async fn quic_writing(
     pacer: Pacer,
 ) {
     let _ = control.set_priority(CONTROL_PRIORITY);
-    let mut groups = Groups {
-        open: HashMap::new(),
-        abandoned: HashSet::new(),
-    };
+    let mut groups = Groups::default();
     loop {
         match egress.next().await {
             Drained::Out(Out::Control(message)) => {
@@ -547,7 +528,15 @@ async fn quic_writing(
                 priority,
                 ..
             }) => {
-                quic_group_object(&connection, &pacer, &mut groups, header, priority, body);
+                groups.object(header, body, |header, queue| {
+                    tokio::spawn(quic_group_writing(
+                        connection.clone(),
+                        pacer.clone(),
+                        header,
+                        priority,
+                        queue,
+                    ));
+                });
             }
             Drained::Out(Out::Group {
                 header,
@@ -555,26 +544,21 @@ async fn quic_writing(
                 objects,
                 end,
             }) => {
-                quic_group_batch(
-                    &connection,
-                    &pacer,
-                    &mut groups,
-                    header,
-                    priority,
-                    objects,
-                    end,
-                );
+                groups.batch(header, objects, end, |header, queue| {
+                    tokio::spawn(quic_group_writing(
+                        connection.clone(),
+                        pacer.clone(),
+                        header,
+                        priority,
+                        queue,
+                    ));
+                });
             }
             Drained::Out(Out::GroupEnd {
                 alias,
                 group,
                 complete,
-            }) => {
-                groups.abandoned.remove(&(alias, group));
-                if let Some(sending) = groups.open.remove(&(alias, group)) {
-                    let _ = sending.try_send(GroupOut::End { complete });
-                }
-            }
+            }) => groups.end(alias, group, complete),
             Drained::Out(Out::Datagram { .. }) => {}
             Drained::Datagrams(datagrams) => {
                 for (header, payload) in datagrams {
@@ -595,77 +579,6 @@ async fn quic_writing(
 
 /// Queues the object on its group's stream, opening one for a new group; a group whose queue
 /// overflows is reset.
-fn quic_group_object(
-    connection: &quinn::Connection,
-    pacer: &Pacer,
-    groups: &mut Groups,
-    header: GroupHeader,
-    priority: Priority,
-    body: Bytes,
-) {
-    let key = (header.alias, header.group);
-    if groups.abandoned.contains(&key) {
-        return;
-    }
-    let sending = groups.open.entry(key).or_insert_with(|| {
-        let (sending, queue) = mpsc::channel(GROUP_QUEUE);
-        tokio::spawn(quic_group_writing(
-            connection.clone(),
-            pacer.clone(),
-            header,
-            priority,
-            queue,
-        ));
-        sending
-    });
-    let queued = sending.try_send(GroupOut::Object(body)).is_ok();
-    if !queued {
-        groups.open.remove(&key);
-        groups.abandoned.insert(key);
-    }
-}
-
-/// A whole cached group to a late joiner, as one queue item: the group's stream is opened and
-/// the batch handed to it; a still-open group's stream stays for live objects to follow.
-fn quic_group_batch(
-    connection: &quinn::Connection,
-    pacer: &Pacer,
-    groups: &mut Groups,
-    header: GroupHeader,
-    priority: Priority,
-    objects: Arc<Vec<Bytes>>,
-    end: Option<bool>,
-) {
-    let key = (header.alias, header.group);
-    if groups.abandoned.contains(&key) {
-        return;
-    }
-    let sending = groups.open.entry(key).or_insert_with(|| {
-        let (sending, queue) = mpsc::channel(GROUP_QUEUE);
-        tokio::spawn(quic_group_writing(
-            connection.clone(),
-            pacer.clone(),
-            header,
-            priority,
-            queue,
-        ));
-        sending
-    });
-    if sending.try_send(GroupOut::Batch(objects)).is_err() {
-        groups.open.remove(&key);
-        groups.abandoned.insert(key);
-        return;
-    }
-    // A closed group ends here; an open one keeps its stream for the live objects that follow.
-    if let Some(complete) = end
-        && let Some(sending) = groups.open.remove(&key)
-    {
-        let _ = sending.try_send(GroupOut::End { complete });
-    }
-}
-
-/// One egress group stream: opened at the track's priority, paced at the client class, finished
-/// when the group completes and reset when it is abandoned or its queue overflows.
 async fn quic_group_writing(
     connection: quinn::Connection,
     pacer: Pacer,
@@ -790,7 +703,7 @@ fn ws_arrived(bytes: Bytes, counting: &mut HashMap<(Alias, u64), u32>) -> Vec<In
                         alias: header.alias,
                         group: header.group,
                     });
-                    // The group ends short, so no entry for it is left behind (C1-11).
+                    // The group ends short, so no entry for it is left behind.
                     events.push(Inbound::GroupEnd {
                         alias: header.alias,
                         group: header.group,
@@ -823,6 +736,37 @@ fn ws_arrived(bytes: Bytes, counting: &mut HashMap<(Alias, u64), u32>) -> Vec<In
     }
 }
 
+/// A replayed group as websocket frames: its objects in slices of at most `MAX_STREAM_OBJECT`
+/// bytes each, so one big group does not hold the socket from control, the last slice ending
+/// the group when the cache holds it closed and complete; a still-open group's live objects
+/// follow in later frames. A complete group with no objects is one ending frame.
+fn ws_group_frames(header: GroupHeader, objects: &[Bytes], end: Option<bool>) -> Vec<WsFrame> {
+    let mut frames: Vec<WsFrame> = Vec::new();
+    let mut slice: Vec<Vec<u8>> = Vec::new();
+    let mut bytes = 0;
+    for body in objects {
+        if bytes + body.len() > MAX_STREAM_OBJECT && !slice.is_empty() {
+            frames.push(WsFrame::Group {
+                header,
+                objects: std::mem::take(&mut slice),
+                end: false,
+            });
+            bytes = 0;
+        }
+        bytes += body.len();
+        slice.push(body.to_vec());
+    }
+    let complete = end == Some(true);
+    if !slice.is_empty() || complete {
+        frames.push(WsFrame::Group {
+            header,
+            objects: slice,
+            end: complete,
+        });
+    }
+    frames
+}
+
 async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
     loop {
         let frames = match egress.next().await {
@@ -832,18 +776,12 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
                 objects: vec![body.to_vec()],
                 end: false,
             }],
-            // A replayed group is one frame: all its objects, ending it when the cache holds it
-            // closed and complete; a still-open group's live objects follow in later frames.
             Drained::Out(Out::Group {
                 header,
                 objects,
                 end,
                 ..
-            }) => vec![WsFrame::Group {
-                header,
-                objects: objects.iter().map(|body| body.to_vec()).collect(),
-                end: end == Some(true),
-            }],
+            }) => ws_group_frames(header, &objects, end),
             // The frame has no word for an abandoned group: a subscriber sees the next group
             // start instead.
             Drained::Out(Out::GroupEnd {
@@ -989,5 +927,85 @@ mod tests {
                 },
             ]
         ));
+    }
+
+    #[test]
+    fn a_replayed_group_within_one_object_size_is_one_ending_frame() {
+        let header = GroupHeader { alias: 1, group: 2 };
+        let objects = [Bytes::from_static(b"a"), Bytes::from_static(b"bc")];
+        let frames = ws_group_frames(header, &objects, Some(true));
+        assert_eq!(
+            frames,
+            vec![WsFrame::Group {
+                header,
+                objects: vec![b"a".to_vec(), b"bc".to_vec()],
+                end: true
+            }]
+        );
+        assert_eq!(
+            ws_group_frames(header, &[], Some(true)),
+            vec![WsFrame::Group {
+                header,
+                objects: Vec::new(),
+                end: true
+            }]
+        );
+        assert!(ws_group_frames(header, &[], None).is_empty());
+    }
+
+    #[test]
+    fn a_replayed_group_past_one_object_size_is_sliced_and_only_the_last_slice_ends_it() {
+        let header = GroupHeader { alias: 1, group: 2 };
+        let big = Bytes::from(vec![0; MAX_STREAM_OBJECT]);
+        let objects = [big.clone(), Bytes::from_static(b"x"), big.clone()];
+        let frames = ws_group_frames(header, &objects, Some(true));
+        let ends: Vec<bool> = frames
+            .iter()
+            .map(|frame| match frame {
+                WsFrame::Group { end, .. } => *end,
+                WsFrame::Control(_) | WsFrame::Datagram { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ends, vec![false, false, true]);
+        for frame in &frames {
+            assert!(
+                abi::encode(frame).len() <= WS_MESSAGE,
+                "each frame fits the socket"
+            );
+        }
+        let open = ws_group_frames(header, &objects, None);
+        assert_eq!(open.len(), 3);
+        assert!(matches!(
+            open.last(),
+            Some(WsFrame::Group { end: false, .. })
+        ));
+    }
+
+    #[test]
+    fn every_control_told_wakes_the_session_loop_and_an_object_does_not() {
+        use futures::FutureExt as _;
+        let (outlet, _egress) = outlet();
+        assert!(outlet.told().now_or_never().is_none(), "nothing told yet");
+        // A refusal on the admit path is a control message like any other: it wakes the loop,
+        // which re-reads the session's requests and re-arms its idle timer from them.
+        outlet.send(Out::Control(Control::Refused {
+            request: 1,
+            code: live_wire::Code::Duplicate,
+        }));
+        assert!(
+            outlet.told().now_or_never().is_some(),
+            "a control message wakes the loop"
+        );
+        assert!(outlet.told().now_or_never().is_none(), "once per delivery");
+        outlet.send(Out::Object {
+            header: GroupHeader { alias: 1, group: 1 },
+            object: 0,
+            body: Bytes::from_static(b"a"),
+            priority: 0,
+        });
+        assert!(
+            outlet.told().now_or_never().is_none(),
+            "an object is not a word to the session"
+        );
     }
 }

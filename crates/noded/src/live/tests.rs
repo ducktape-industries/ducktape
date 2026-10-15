@@ -441,7 +441,7 @@ impl Client {
     /// complete (FIN) rather than cut short (RESET).
     async fn received_group(&mut self) -> (GroupHeader, Vec<Vec<u8>>, bool) {
         let mut stream = self.connection.accept_uni().await.unwrap();
-        let mut header = [0u8; 12];
+        let mut header = [0u8; GroupHeader::LEN];
         stream.read_exact(&mut header).await.unwrap();
         let header: GroupHeader = abi::decode(&header).unwrap();
         let mut objects = Vec::new();
@@ -470,14 +470,14 @@ impl Client {
 
     async fn received_datagram(&self) -> (DatagramHeader, Vec<u8>) {
         let bytes = self.connection.read_datagram().await.unwrap();
-        let (header, payload) = bytes.split_at(16);
+        let (header, payload) = bytes.split_at(DatagramHeader::LEN);
         (abi::decode(header).unwrap(), payload.to_vec())
     }
 }
 
 /// A group stream's header, read off its front.
 async fn read_header(stream: &mut quinn::RecvStream) -> GroupHeader {
-    let mut header = [0u8; 12];
+    let mut header = [0u8; GroupHeader::LEN];
     stream.read_exact(&mut header).await.unwrap();
     abi::decode(&header).unwrap()
 }
@@ -1233,7 +1233,7 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
         );
 
         // The track's priority crossed the lane with its announce and is held on the second
-        // node, where its egress streams are set to it; it is no longer a per-group header byte.
+        // node, where its egress streams are set to it.
         assert_eq!(
             second
                 .relay
@@ -1411,7 +1411,7 @@ fn a_group_in_flight_ends_short_when_its_track_ends() {
         let _open = alice.group_open(alias, 1, &[b"first"]).await;
         // bob is mid-group when the track ends.
         let mut stream = bob.connection.accept_uni().await.unwrap();
-        let mut header = [0u8; 12];
+        let mut header = [0u8; GroupHeader::LEN];
         stream.read_exact(&mut header).await.unwrap();
         let len = stream.read_u32_le().await.unwrap();
         let mut body = vec![0u8; len as usize];
@@ -1473,7 +1473,7 @@ fn an_object_over_its_cap_is_refused_too_large_and_the_session_goes_on() {
             (header.group, objects, complete),
             (2, vec![b"fits".to_vec()], true)
         );
-        // The oversized group's entry was ended short, not left behind (C1-11): both groups'
+        // The oversized group's entry was ended short, not left behind: both groups'
         // entries are gone once group 2 completed, which the ordered session loop reached after
         // the oversized group's own short end.
         assert_eq!(
@@ -1618,7 +1618,7 @@ fn a_group_the_publisher_resets_crosses_the_lane_as_cut_short() {
 
         let mut open = alice.group_open(alias, 1, &[b"partial"]).await;
         let mut stream = bob.connection.accept_uni().await.unwrap();
-        let mut header = [0u8; 12];
+        let mut header = [0u8; GroupHeader::LEN];
         stream.read_exact(&mut header).await.unwrap();
         let len = stream.read_u32_le().await.unwrap();
         let mut body = vec![0u8; len as usize];
@@ -1664,12 +1664,54 @@ fn a_member_seated_after_a_track_was_published_hears_it_when_the_lane_opens() {
         .await;
 
         // Seating opens the lane between the nodes, and its resync carries the track published
-        // before anyone was seated: no second publish and no reconnect make it cross (W2).
+        // before anyone was seated: no second publish and no reconnect make it cross.
         match bob.recv().await {
             Control::Announce {
                 track, up: true, ..
             } => assert_eq!(track, early),
             other => panic!("an announce: {other:?}"),
+        }
+        first.shutdown.send_replace(true);
+        second.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn a_member_unseated_takes_its_tracks_down_for_the_watchers_of_the_others() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        ledger.grant("room", None, Grant::all());
+        let first = node(context.child("first"), 1, ledger.clone());
+        let second = node(context.child("second"), 2, ledger);
+        for node in [&first, &second] {
+            node.halo.seat([first.seat(), second.seat()]);
+        }
+        let doc = track("room", "doc");
+        let (mut bob, _) = Client::open(&second, &bob).await;
+        bob.send(Control::Watch {
+            request: 1,
+            namespace: namespace("room"),
+        })
+        .await;
+        let (mut alice, _) = Client::open(&first, &alice).await;
+        alice.publish(1, doc.clone(), Mode::Stream).await;
+        match bob.recv().await {
+            Control::Announce {
+                track, up: true, ..
+            } => assert_eq!(track, doc),
+            other => panic!("an announce: {other:?}"),
+        }
+
+        // The first node leaves the second's membership: what it published is gone for the
+        // second's watchers at once, with no stream to die first.
+        second.halo.seat([second.seat()]);
+        match bob.recv().await {
+            Control::Announce {
+                track, up: false, ..
+            } => assert_eq!(track, doc),
+            other => panic!("the track down: {other:?}"),
         }
         first.shutdown.send_replace(true);
         second.shutdown.send_replace(true);

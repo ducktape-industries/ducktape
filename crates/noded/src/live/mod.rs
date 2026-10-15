@@ -5,6 +5,7 @@
 //! subscriber and, over halo's live lane, to every node with a subscriber of its own.
 
 mod grants;
+mod groups;
 mod lane;
 mod session;
 #[cfg(test)]
@@ -13,6 +14,7 @@ mod tracks;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -80,6 +82,8 @@ pub struct Relay<E: crate::Context> {
     dirty: Mutex<Dirty>,
     rechecks: Arc<Notify>,
     lane: lane::Queue,
+    /// Set when `lane` was full: the lane task then drops every peer's writer and resyncs.
+    lane_behind: AtomicBool,
     /// Every task the relay runs, the live lane's included: dropped with the relay, they are
     /// aborted, and what they hold of halo goes with them.
     tasks: Mutex<JoinSet<()>>,
@@ -113,6 +117,7 @@ impl<E: crate::Context> Relay<E> {
             dirty: Mutex::default(),
             rechecks: rechecks.clone(),
             lane,
+            lane_behind: AtomicBool::new(false),
             tasks: Mutex::default(),
         });
         // The tasks hold the relay weakly: it drops with its last owner, and they end with it.
@@ -127,11 +132,12 @@ impl<E: crate::Context> Relay<E> {
     }
 
     /// A task that lives no longer than the relay.
-    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+    /// A task aborted with the relay; the handle aborts it sooner.
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> tokio::task::AbortHandle {
         self.tasks
             .lock()
             .expect("the tasks lock is never poisoned")
-            .spawn(task);
+            .spawn(task)
     }
 
     /// The UDP port of the QUIC door, `None` when the node opened none.
@@ -174,11 +180,21 @@ impl<E: crate::Context> Relay<E> {
 
     /// One step on the table, decided and delivered under the one lock: what steps send leaves
     /// in the order they were decided, so no step's word to a session overtakes another's, as a
-    /// re-check's end would overtake the answer to the request it re-checks.
+    /// re-check's end would overtake the answer to the request it re-checks. Delivery is here
+    /// and nowhere else: a session's outlet takes what it is sent or is closed as behind, and
+    /// nothing here takes a lock of the relay's. The handshake's refusal and go-away go straight
+    /// to a session that was never in the table.
     fn step(&self, decide: impl FnOnce(&mut State) -> Vec<Effect>) {
         let mut state = self.state();
         let effects = decide(&mut state);
-        self.perform(effects);
+        state.gauges();
+        for effect in effects {
+            match effect {
+                Effect::Send(outlet, out) => self.deliver(&outlet, out),
+                Effect::Lane(relayed) => lane::relay(self, relayed),
+                Effect::Close(outlet, reason) => outlet.close(reason),
+            }
+        }
     }
 
     /// A step a session's loop took, for the loop to go on.
@@ -187,35 +203,32 @@ impl<E: crate::Context> Relay<E> {
         Step::Done
     }
 
-    /// A proven session joins the table, welcomed under the lock `go_away` takes: a session
-    /// hears its welcome before any GoAway.
+    /// A proven session joins the table and is welcomed in the one step, under the lock
+    /// `go_away` takes: a session hears its welcome before any GoAway.
     fn welcomed(
         &self,
         account: Account,
         key: Vec<u8>,
         link: &Link,
     ) -> Result<SessionId, GoingAway> {
-        let mut state = self.state();
-        let id = state.opened(account, key, link.outlet.clone())?;
-        link.outlet.send(Out::Control(Control::Welcome(Welcome {
-            account,
-            datagrams: link.datagrams,
-        })));
-        Ok(id)
-    }
-
-    /// Everything a step decided, delivered: a session's outlet takes it or is closed as behind.
-    /// It takes no lock of the relay's, so a step delivers under the state lock. Only `step`
-    /// calls it, so nothing decides and delivers but the one place.
-    fn perform(&self, effects: Vec<Effect>) {
-        for effect in effects {
-            match effect {
-                Effect::Send(outlet, out) => self.deliver(&outlet, out),
-                Effect::Lane(relayed) => lane::relay(self, relayed),
-                Effect::Close(outlet, reason) => outlet.close(reason),
-                Effect::Idle(outlet) => outlet.wake_idle(),
+        let mut opened = None;
+        self.step(|state| {
+            let welcome = Out::Control(Control::Welcome(Welcome {
+                account,
+                datagrams: link.datagrams,
+            }));
+            match state.opened(account, key, link.outlet.clone()) {
+                Ok(id) => {
+                    opened = Some(Ok(id));
+                    vec![Effect::Send(link.outlet.clone(), welcome)]
+                }
+                Err(going) => {
+                    opened = Some(Err(going));
+                    Vec::new()
+                }
             }
-        }
+        });
+        opened.expect("the step ran")
     }
 
     fn deliver(&self, outlet: &Outlet, out: Out) {
@@ -502,7 +515,7 @@ enum Awaited {
     Gone,
     /// The outlet was closed by fan-out, a re-check or the node going away.
     Closed(&'static str),
-    /// The relay emptied the session: re-arm the idle timer (C1-7).
+    /// A control message was told to the session: re-read what it holds and re-arm idle.
     Recheck,
     /// Nothing held for `IDLE_SESSION`.
     Idle,
@@ -521,7 +534,7 @@ async fn awaited(link: &mut Link, idle_at: Option<Instant>) -> Awaited {
             None => Awaited::Gone,
         },
         reason = session::closed_elsewhere(&mut link.closing) => Awaited::Closed(reason),
-        () = link.outlet.emptied() => Awaited::Recheck,
+        () = link.outlet.told() => Awaited::Recheck,
         () = idle => Awaited::Idle,
     }
 }
@@ -580,8 +593,9 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
             Awaited::Inbound(inbound) => inbound,
             Awaited::Gone => break "closed",
             Awaited::Closed(reason) => break reason,
-            // The relay emptied the session; the loop's top re-arms `idle_at` from the now-empty
-            // session, so a session the relay emptied is closed after `IDLE_SESSION` like any other.
+            // Every change the relay makes to a session's requests is told to it as a control
+            // message, so the loop's top re-arms `idle_at` from what the session holds now: one
+            // the relay emptied is closed after `IDLE_SESSION` like one the client stopped using.
             Awaited::Recheck => continue,
             Awaited::Idle => break "idle",
         };

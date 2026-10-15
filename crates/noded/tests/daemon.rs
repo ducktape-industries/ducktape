@@ -90,7 +90,7 @@ impl Seat {
             http: free_port(),
             tls: free_port(),
             halo,
-            live: Some(free_udp_port()),
+            live: Some((outbound_ip(), 0).into()),
             registered: halo.to_string(),
             address: Some(format!("tcp://localhost:{}", p2p.port())),
         }
@@ -324,10 +324,13 @@ fn a_validator_serves_its_network_over_http() {
             seat.identity.public_key().as_ref().to_vec()
         );
         assert_eq!(status.contract, noded::NODE_CONTRACT);
-        assert_eq!(
-            client.live_port().await.unwrap(),
-            seat.live.map(|live| live.port()),
-            "live tracks are dialed at the relay's own udp, `run --live`"
+        assert!(
+            client
+                .live_port()
+                .await
+                .unwrap()
+                .is_some_and(|port| port != 0),
+            "live tracks are dialed at the relay's own udp, `run --live`, bound where the node says"
         );
         assert_eq!(
             status.genesis,

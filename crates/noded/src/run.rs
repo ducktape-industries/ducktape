@@ -21,7 +21,7 @@ use consensus::{
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use halo::{Halo, Lane, Seat};
+use halo::{Class, Halo, Lane, Seat};
 use host::Layer;
 use node::{Block, Frame, Node, Sequenced, Source, Taken};
 use tokio::sync::watch;
@@ -517,7 +517,12 @@ fn listing(lanes: &[Lane]) -> String {
             true => " pinned",
             false => "",
         };
-        format!("{}#{} {:?} {served}{pinned}", lane.name, lane.id, lane.cap)
+        let cap = match lane.cap {
+            Class::Critical => "critical",
+            Class::Member => "member",
+            Class::Client => "client",
+        };
+        format!("{}#{} {cap} {served}{pinned}", lane.name, lane.id)
     };
     lanes.iter().map(lane).collect::<Vec<_>>().join(", ")
 }

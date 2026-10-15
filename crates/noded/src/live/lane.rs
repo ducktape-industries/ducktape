@@ -4,7 +4,8 @@
 //! track would. One writer task per peer owns the one control stream to it, so a member that
 //! cannot be reached slows no one else; a group is a stream of its own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -18,9 +19,10 @@ use live_wire::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 
 use super::Relay;
+use super::groups::{GroupOut, Groups, Handed};
 use super::session::framed;
 use super::tracks::Relayed;
 
@@ -34,7 +36,6 @@ const QUEUE: usize = 4096;
 /// other peers are none the slower.
 const PEER_QUEUE: usize = 1024;
 /// Objects waiting on one group stream to a peer; past it the group is dropped short.
-const GROUP_QUEUE: usize = 256;
 /// A control stream that would not open logs its first attempt, then every tenth.
 const ATTEMPTS_PER_LINE: u32 = 10;
 
@@ -49,18 +50,21 @@ pub fn queue() -> (Queue, mpsc::Receiver<Relayed>) {
     mpsc::channel(QUEUE)
 }
 
-/// A step's lane effect, queued for the lane task; dropped and counted when the lane is behind.
+/// A step's lane effect, queued for the lane task. A full queue means every peer may now miss
+/// something: the item is counted dropped and the lane is marked behind, so it next drops every
+/// peer's writer and resyncs, and no peer keeps a hole in what it knows of us.
 pub fn relay<E: crate::Context>(relay: &Relay<E>, relayed: Relayed) {
     if relay.lane.try_send(relayed).is_err() {
         relay.metrics.dropped_behind.inc();
+        relay.lane_behind.store(true, Ordering::Relaxed);
     }
 }
 
 /// What one peer's writer is handed.
 enum ToPeer {
     Control(Forward),
-    /// Open the control stream and resync, with nothing else to send: the peer was seated, or
-    /// its fresh control stream asked us to (C1-5).
+    /// Open the control stream and resync, with nothing else to send: the peer was seated, its
+    /// fresh control stream asked us to, or its old writer was dropped.
     Resync,
     Object {
         header: GroupHeader,
@@ -82,12 +86,6 @@ enum ToPeer {
     },
 }
 
-enum GroupOut {
-    Object(Bytes),
-    Batch(Arc<Vec<Bytes>>),
-    End { complete: bool },
-}
-
 /// The dispatcher: one bounded queue per peer, fed without waiting.
 struct Lanes<E: crate::Context> {
     relay: Weak<Relay<E>>,
@@ -96,7 +94,8 @@ struct Lanes<E: crate::Context> {
     streams: Arc<Streams>,
     datagrams: Arc<Datagrams>,
     dropped: Counter,
-    peers: HashMap<PublicKey, mpsc::Sender<ToPeer>>,
+    /// Each peer's writer: its queue, and the handle that aborts it with its streams.
+    peers: HashMap<PublicKey, (mpsc::Sender<ToPeer>, AbortHandle)>,
 }
 
 pub async fn serving<E: crate::Context>(
@@ -147,6 +146,9 @@ pub async fn serving<E: crate::Context>(
             // waits only on its queue.
             Ok(()) = membership.changed() => lanes.reconcile(),
             Ok(()) = served.changed() => lanes.reconcile(),
+        }
+        if lanes.behind() {
+            lanes.restart();
         }
     }
 }
@@ -239,20 +241,56 @@ impl<E: crate::Context> Lanes<E> {
         }
     }
 
-    /// The lane's served state or the membership moved. Served: resync to every member, so one
-    /// seated after we last opened to it hears our tracks without a retable or a reconnect.
-    /// Unserved: drop every peer's control stream and end the tracks the mesh published to us,
-    /// so a paused or closed lane is silence, not a stall (W2, W4).
+    /// The lane's served state or the membership moved. Served: every member not seated any
+    /// more is gone (its writer aborted, its tracks ended and its asks dropped), and every one
+    /// seated is resynced, so one seated after we last opened to it hears our tracks without a
+    /// retable or a reconnect. Unserved: no peer at all, so a paused or closed lane is silence,
+    /// not a stall.
     fn reconcile(&mut self) {
         if !self.streams.served() {
-            self.peers.clear();
+            for (_, (_, aborting)) in self.peers.drain() {
+                aborting.abort();
+            }
             if let Some(relay) = self.relay.upgrade() {
-                relay.step(|state| state.end_all_remote());
+                relay.step(|state| state.peers_gone(|_| false));
             }
             return;
         }
-        for member in self.halo.members().candidates(&self.me, None) {
+        let seated = self.halo.members().candidates(&self.me, None);
+        for member in self.peers.keys().cloned().collect::<Vec<_>>() {
+            if !seated.contains(&member) {
+                self.drop_peer(&member);
+            }
+        }
+        if let Some(relay) = self.relay.upgrade() {
+            relay.step(|state| state.peers_gone(|peer| seated.contains(peer)));
+        }
+        for member in seated {
             self.hand(member, ToPeer::Resync);
+        }
+    }
+
+    /// Whether the relay's queue to this task overflowed since last asked.
+    fn behind(&self) -> bool {
+        self.relay
+            .upgrade()
+            .is_some_and(|relay| relay.lane_behind.swap(false, Ordering::Relaxed))
+    }
+
+    /// The relay's queue overflowed, so any peer may have missed anything: every writer goes
+    /// and every seated member is resynced.
+    fn restart(&mut self) {
+        for member in self.peers.keys().cloned().collect::<Vec<_>>() {
+            self.drop_peer(&member);
+        }
+        self.reconcile();
+    }
+
+    /// The peer's writer is aborted: with it go its control stream and its group writers, whose
+    /// unfinished streams the transport resets, so the peer sees every one of them cut.
+    fn drop_peer(&mut self, to: &PublicKey) {
+        if let Some((_, aborting)) = self.peers.remove(to) {
+            aborting.abort();
         }
     }
 
@@ -269,22 +307,29 @@ impl<E: crate::Context> Lanes<E> {
             let (sending, queue) = mpsc::channel(PEER_QUEUE);
             let link = PeerLink {
                 relay: self.relay.clone(),
+                halo: self.halo.clone(),
                 streams: self.streams.clone(),
                 datagrams: self.datagrams.clone(),
                 dropped: self.dropped.clone(),
                 to: to.clone(),
                 control: None,
+                unlinked: false,
                 attempts: 0,
-                groups: HashMap::new(),
-                abandoned: HashSet::new(),
+                groups: Groups::default(),
                 writing: JoinSet::new(),
             };
-            relay.spawn(peer_writing(link, queue));
-            self.peers.insert(to.clone(), sending);
+            let aborting = relay.spawn(peer_writing(link, queue));
+            self.peers.insert(to.clone(), (sending, aborting));
         }
-        let writer = self.peers.get(&to).expect("inserted above");
+        let (writer, _) = self.peers.get(&to).expect("inserted above");
         if writer.try_send(item).is_err() {
+            // A peer whose queue is full has missed something it cannot be told later: its
+            // writer goes, and a fresh one opens a control stream and resyncs, so the peer
+            // relearns our state whole instead of keeping a hole in it. The fresh queue is
+            // empty, so the resync is taken.
             self.dropped.inc();
+            self.drop_peer(&to);
+            self.hand(to, ToPeer::Resync);
         }
     }
 }
@@ -292,15 +337,17 @@ impl<E: crate::Context> Lanes<E> {
 /// One peer's writer: the control stream to it, and its open group streams.
 struct PeerLink<E: crate::Context> {
     relay: Weak<Relay<E>>,
+    halo: Arc<Halo>,
     streams: Arc<Streams>,
     datagrams: Arc<Datagrams>,
     dropped: Counter,
     to: PublicKey,
     control: Option<Stream>,
+    /// The last open found no connection to the peer: when halo links it again, the control
+    /// stream is reopened and the peer resynced, so what was lost in between reaches it.
+    unlinked: bool,
     attempts: u32,
-    groups: HashMap<(Alias, u64), mpsc::Sender<GroupOut>>,
-    /// Groups dropped short for falling behind: the rest of their objects are dropped quiet.
-    abandoned: HashSet<(Alias, u64)>,
+    groups: Groups,
     /// The group writers, aborted with the link and so with the relay.
     writing: JoinSet<()>,
 }
@@ -313,18 +360,23 @@ enum Ensured {
     Failed,
 }
 
+/// A control stream is reopened by an event, never on its own loss: the peer's knowledge of us
+/// stays true until something changes, and each change reaches it through here as an item
+/// (an announce or ask to write, a resync for a member seated or a fresh stream of the peer's)
+/// or through the link coming back after a partition. Nothing to send, nothing lost.
 async fn peer_writing<E: crate::Context>(mut link: PeerLink<E>, mut queue: mpsc::Receiver<ToPeer>) {
     loop {
+        let (halo, to) = (link.halo.clone(), link.to.clone());
         tokio::select! {
             item = queue.recv() => match item {
                 Some(item) => link.send(item).await,
                 None => return,
             },
             // The peer never writes on our outbound control stream, so a read returns only when
-            // the stream is lost: reopen and resync at once, not when we next have something to
-            // send, so a peer that restarts relearns our state without waiting on our traffic.
-            () = link.control_lost() => {
-                link.control = None;
+            // the stream is lost.
+            () = link.control_lost() => link.control = None,
+            () = halo.linked(&to), if link.unlinked => {
+                link.unlinked = false;
                 let _ = link.ensure_control(None).await;
             }
         }
@@ -338,22 +390,43 @@ impl<E: crate::Context> PeerLink<E> {
             ToPeer::Resync => {
                 let _ = self.ensure_control(None).await;
             }
-            ToPeer::Object { header, body } => self.group_object(header, body),
+            ToPeer::Object { header, body } => {
+                while self.writing.try_join_next().is_some() {}
+                let handed = self.groups.object(header, body, |header, queue| {
+                    self.writing.spawn(group_writing(
+                        self.streams.clone(),
+                        self.to.clone(),
+                        header,
+                        queue,
+                    ));
+                });
+                if let Handed::Dropped = handed {
+                    self.dropped.inc();
+                }
+            }
             ToPeer::Group {
                 header,
                 objects,
                 end,
-            } => self.group_batch(header, objects, end),
+            } => {
+                while self.writing.try_join_next().is_some() {}
+                let handed = self.groups.batch(header, objects, end, |header, queue| {
+                    self.writing.spawn(group_writing(
+                        self.streams.clone(),
+                        self.to.clone(),
+                        header,
+                        queue,
+                    ));
+                });
+                if let Handed::Dropped = handed {
+                    self.dropped.inc();
+                }
+            }
             ToPeer::GroupEnd {
                 alias,
                 group,
                 complete,
-            } => {
-                self.abandoned.remove(&(alias, group));
-                if let Some(sending) = self.groups.remove(&(alias, group)) {
-                    let _ = sending.try_send(GroupOut::End { complete });
-                }
-            }
+            } => self.groups.end(alias, group, complete),
             ToPeer::Datagram { header, payload } => {
                 let frame = [abi::encode(&header), payload.to_vec()].concat();
                 let _ = self.datagrams.send(&self.to, &frame).await;
@@ -362,8 +435,8 @@ impl<E: crate::Context> PeerLink<E> {
     }
 
     /// One control message to the peer, over the one control stream kept open to it. A stream
-    /// found dead is reopened and resynced once, so a message is never dropped for a stream that
-    /// died since we last wrote: the peer that restarted relearns our state and hears this too.
+    /// found dead on the write is reopened and resynced once, and the message is in that resync
+    /// or written after it, so the peer that restarted relearns our state and hears this too.
     async fn control(&mut self, forward: &Forward) {
         for _ in 0..2 {
             match self.ensure_control(Some(forward)).await {
@@ -380,8 +453,8 @@ impl<E: crate::Context> PeerLink<E> {
 
     /// Makes sure the control stream is open and the peer has our resync. A freshly opened stream
     /// leads with our every announce and ask, then a `Resynced` marker so the peer ends whatever
-    /// we no longer hold (C1-5). Reports whether it is ready for `forward`, already sent it in
-    /// the resync, or could not be opened.
+    /// we no longer hold. Reports whether it is ready for `forward`, already sent it in the
+    /// resync, or could not be opened.
     async fn ensure_control(&mut self, forward: Option<&Forward>) -> Ensured {
         if self.control.is_some() {
             return Ensured::Ready;
@@ -393,9 +466,11 @@ impl<E: crate::Context> PeerLink<E> {
         match opened {
             Ok(stream) => {
                 self.control = Some(stream);
+                self.unlinked = false;
                 self.attempts = 0;
             }
             Err(error) => {
+                self.unlinked = matches!(error, halo::Error::Unreachable(_));
                 self.attempts += 1;
                 let worth_a_line =
                     self.attempts == 1 || self.attempts.is_multiple_of(ATTEMPTS_PER_LINE);
@@ -446,63 +521,6 @@ impl<E: crate::Context> PeerLink<E> {
             self.control = None;
         }
         written
-    }
-
-    /// Queues the object on its group's stream to the peer, opening one for a new group; a
-    /// group whose queue overflows is dropped short and counted.
-    fn group_object(&mut self, header: GroupHeader, body: Bytes) {
-        let key = (header.alias, header.group);
-        if self.abandoned.contains(&key) {
-            return;
-        }
-        while self.writing.try_join_next().is_some() {}
-        let sending = self.groups.entry(key).or_insert_with(|| {
-            let (sending, queue) = mpsc::channel(GROUP_QUEUE);
-            self.writing.spawn(group_writing(
-                self.streams.clone(),
-                self.to.clone(),
-                header,
-                queue,
-            ));
-            sending
-        });
-        let queued = sending.try_send(GroupOut::Object(body)).is_ok();
-        if !queued {
-            self.groups.remove(&key);
-            self.abandoned.insert(key);
-            self.dropped.inc();
-        }
-    }
-
-    /// A whole cached group to a peer, as one queue item on its group stream; a still-open group
-    /// keeps its stream for the live objects that follow.
-    fn group_batch(&mut self, header: GroupHeader, objects: Arc<Vec<Bytes>>, end: Option<bool>) {
-        let key = (header.alias, header.group);
-        if self.abandoned.contains(&key) {
-            return;
-        }
-        while self.writing.try_join_next().is_some() {}
-        let sending = self.groups.entry(key).or_insert_with(|| {
-            let (sending, queue) = mpsc::channel(GROUP_QUEUE);
-            self.writing.spawn(group_writing(
-                self.streams.clone(),
-                self.to.clone(),
-                header,
-                queue,
-            ));
-            sending
-        });
-        if sending.try_send(GroupOut::Batch(objects)).is_err() {
-            self.groups.remove(&key);
-            self.abandoned.insert(key);
-            self.dropped.inc();
-            return;
-        }
-        if let Some(complete) = end
-            && let Some(sending) = self.groups.remove(&key)
-        {
-            let _ = sending.try_send(GroupOut::End { complete });
-        }
     }
 }
 
@@ -566,7 +584,7 @@ async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, streams: Arc<Stream
         match meta {
             LaneMeta::Control => strong.spawn(control_reading(relay.clone(), inbound)),
             LaneMeta::Group => strong.spawn(group_reading(relay.clone(), inbound)),
-        }
+        };
     }
 }
 
@@ -588,7 +606,7 @@ async fn control_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbo
     let mut stream = inbound.stream;
     // A control stream newly opened to us: the peer is new, or restarted and forgot us. Open our
     // own stream back and resync, and hold what it told us before as provisional until this
-    // stream's own resync repeats it (C1-5).
+    // stream's own resync repeats it.
     let Some(strong) = relay.upgrade() else {
         return;
     };
@@ -623,7 +641,6 @@ fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward
         Forward::Unsubscribe { request } => {
             relay.step(|state| state.node_unsubscribed(from, request))
         }
-        // The answer names the alias we asked with; the data already resolves by it.
         Forward::Forwarded { request, latest } => {
             relay.step(|state| state.node_forwarded(from, request, latest))
         }
@@ -645,7 +662,7 @@ fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward
 async fn group_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
     let from = inbound.from;
     let mut stream = inbound.stream;
-    let mut header = [0u8; 12];
+    let mut header = [0u8; GroupHeader::LEN];
     if stream.read_exact(&mut header).await.is_err() {
         return;
     }

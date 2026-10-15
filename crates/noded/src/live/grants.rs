@@ -112,33 +112,10 @@ pub fn place(namespace: &str) -> Option<Place<'_>> {
     })
 }
 
-/// Whether the grant lets `account` `act` on the track `name`, each pattern read as it reads
-/// for that account (`{account}` its number).
-pub fn covered(grant: &Grant, act: Act, name: &str, account: Account) -> bool {
-    match act {
-        Act::Publish => grant.publishes(name, account),
-        Act::Subscribe => grant.subscribes(name, account),
-        Act::Watch => may_watch(grant),
-    }
-}
-
-/// Whether `grant` lets its holder watch a room: any subscribe pattern is enough, so a watch
-/// turns on no track name and no account, unlike a publish or a subscribe.
-pub fn may_watch(grant: &Grant) -> bool {
-    !grant.subscribe.is_empty()
-}
-
 /// The subscribe patterns `account` hears a room's announces through, as they read for it,
-/// `None` when it may not watch.
+/// `None` without a grant or when it may not watch.
 pub fn watch_patterns(grant: Option<&Grant>, account: Account) -> Option<Vec<String>> {
-    let grant = grant?;
-    may_watch(grant).then(|| {
-        grant
-            .subscribe
-            .iter()
-            .map(|pattern| live::for_account(pattern, account))
-            .collect()
-    })
+    grant?.watch_patterns(account)
 }
 
 /// The chain's grants, read per request, and a count of the blocks that moved them so a
@@ -226,12 +203,12 @@ mod tests {
             publish: vec!["presence/*".into()],
             subscribe: vec!["*".into()],
         };
-        assert!(covered(&grant, Act::Publish, "presence/42", 42));
-        assert!(!covered(&grant, Act::Publish, "doc", 42));
-        assert!(covered(&grant, Act::Subscribe, "doc", 42));
-        assert!(may_watch(&grant));
-        assert!(!covered(&Grant::default(), Act::Subscribe, "doc", 42));
-        assert!(!may_watch(&Grant::default()));
+        assert!(grant.publishes("presence/42", 42));
+        assert!(!grant.publishes("doc", 42));
+        assert!(grant.subscribes("doc", 42));
+        assert!(grant.watches());
+        assert!(!Grant::default().subscribes("doc", 42));
+        assert!(!Grant::default().watches());
     }
 
     #[test]
@@ -240,11 +217,11 @@ mod tests {
             publish: vec!["echo/{account}".into(), "board/{account}/*".into()],
             subscribe: vec!["*".into()],
         };
-        assert!(covered(&room, Act::Publish, "echo/42", 42));
-        assert!(covered(&room, Act::Publish, "board/42/0b", 42));
-        assert!(!covered(&room, Act::Publish, "echo/42", 13));
-        assert!(!covered(&room, Act::Publish, "board/42/0b", 13));
-        assert!(covered(&room, Act::Subscribe, "echo/42", 13));
+        assert!(room.publishes("echo/42", 42));
+        assert!(room.publishes("board/42/0b", 42));
+        assert!(!room.publishes("echo/42", 13));
+        assert!(!room.publishes("board/42/0b", 13));
+        assert!(room.subscribes("echo/42", 13));
         let inbox = Grant {
             publish: Vec::new(),
             subscribe: vec!["inbox/{account}".into(), "lobby".into()],
