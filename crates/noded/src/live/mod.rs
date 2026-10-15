@@ -165,6 +165,7 @@ impl<E: crate::Context> Relay<E> {
             let wrote_identity = *program == self.network.identity;
             if wrote_identity {
                 dirty.identity = true;
+                self.grants.identity_moved();
             }
             let wrote_grants = keys.keys().any(|key| grants::is_grant_row(key));
             if wrote_grants {
@@ -267,6 +268,20 @@ impl<E: crate::Context> Relay<E> {
             .expect("the dirty lock is never poisoned")
             .programs
             .insert(program);
+        self.rechecks.notify_one();
+    }
+
+    /// The session is registered: if the identity table moved while it proved, the re-check
+    /// reads its account again now that it is in the table, and closes it if its key moved.
+    fn settled_identity(&self, generation: u64) {
+        let moved = self.grants.identity_generation() != generation;
+        if !moved {
+            return;
+        }
+        self.dirty
+            .lock()
+            .expect("the dirty lock is never poisoned")
+            .identity = true;
         self.rechecks.notify_one();
     }
 
@@ -435,7 +450,9 @@ async fn serve_quic<E: crate::Context>(
 }
 
 enum Handshake {
-    Welcomed(Account, Vec<u8>),
+    /// The account the key acts as, the key, and the identity generation the account was read
+    /// at, so a block that moved the identity table while the session registered is re-checked.
+    Welcomed(Account, Vec<u8>, u64),
     Refused(Code),
     Gone,
 }
@@ -473,10 +490,13 @@ async fn handshake<E: crate::Context>(relay: &Relay<E>, link: &mut Link) -> Hand
     if !proven {
         return Handshake::Refused(Code::BadProof);
     }
+    // Read the generation before the account, so a block that moves the identity table during
+    // or after the read is seen as a move once the session is registered.
+    let generation = relay.grants.identity_generation();
     let Some(account) = relay.grants.account(&hello.key).await else {
         return Handshake::Refused(Code::NoAccount);
     };
-    Handshake::Welcomed(account, hello.key)
+    Handshake::Welcomed(account, hello.key, generation)
 }
 
 /// What a session's loop does once a step is taken.
@@ -534,8 +554,8 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
         return;
     };
     let handshake = handshake(&strong, &mut link).await;
-    let (account, key) = match handshake {
-        Handshake::Welcomed(account, key) => (account, key),
+    let (account, key, generation) = match handshake {
+        Handshake::Welcomed(account, key, generation) => (account, key, generation),
         Handshake::Refused(code) => return refused(&link, code),
         Handshake::Gone => return link.outlet.close("no_handshake"),
     };
@@ -543,6 +563,9 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
         Ok(id) => id,
         Err(GoingAway { in_ms }) => return going_away(&link, in_ms),
     };
+    // Now the session is registered, a block that moved the identity table while it proved is
+    // re-checked: the re-check reads its account again and closes it if the key moved.
+    strong.settled_identity(generation);
     tracing::info!(target: "ducktape::live", event = "live_session", account, path = link.path, "a live session opened");
     drop(strong);
     let mut idle_since: Option<Instant> = None;

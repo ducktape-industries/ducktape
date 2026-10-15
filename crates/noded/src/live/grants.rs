@@ -144,6 +144,7 @@ pub fn watch_patterns(grant: Option<&Grant>, account: Account) -> Option<Vec<Str
 pub struct Grants {
     chain: Arc<dyn Chain>,
     generation: AtomicU64,
+    identity: AtomicU64,
     reads: Semaphore,
 }
 
@@ -152,6 +153,7 @@ impl Grants {
         Grants {
             chain,
             generation: AtomicU64::new(0),
+            identity: AtomicU64::new(0),
             reads: Semaphore::new(READS_IN_FLIGHT),
         }
     }
@@ -184,6 +186,16 @@ impl Grants {
 
     pub fn moved(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Moves when a block wrote the identity table: an account read for a session before and
+    /// registered after is re-checked, the mirror of `generation` for the handshake's account.
+    pub fn identity_generation(&self) -> u64 {
+        self.identity.load(Ordering::Acquire)
+    }
+
+    pub fn identity_moved(&self) {
+        self.identity.fetch_add(1, Ordering::AcqRel);
     }
 }
 

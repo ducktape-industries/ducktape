@@ -44,6 +44,7 @@ struct Ledger {
     accounts: Mutex<HashMap<Vec<u8>, Account>>,
     grants: Mutex<HashMap<Row, Grant>>,
     parked: Mutex<Option<Parked>>,
+    parked_account: Mutex<Option<Parked>>,
 }
 
 /// A grant read the test holds once its row is read: it says so, then waits for the word to
@@ -84,6 +85,15 @@ impl Ledger {
         (was_read, answers)
     }
 
+    /// The next account read parks, as `park` does for a grant read: the mirror of the grant
+    /// race, for a key that moves account while its session proves.
+    fn park_account(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (read, was_read) = oneshot::channel();
+        let (answers, answer) = oneshot::channel();
+        *self.parked_account.lock().unwrap() = Some(Parked { read, answer });
+        (was_read, answers)
+    }
+
     fn unseat(&self, key: &PrivateKey) {
         self.accounts
             .lock()
@@ -95,7 +105,14 @@ impl Ledger {
 impl Chain for Ledger {
     fn account(&self, key: &[u8]) -> Answered<'_, Option<Account>> {
         let account = self.accounts.lock().unwrap().get(key).copied();
-        Box::pin(async move { account })
+        let parked = self.parked_account.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(parked) = parked {
+                let _ = parked.read.send(());
+                let _ = parked.answer.await;
+            }
+            account
+        })
     }
 
     fn grant(&self, program: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>> {
@@ -1339,6 +1356,41 @@ fn a_session_closed_by_a_recheck_leaves_the_table_without_the_client_saying_anyt
                 reason: "no_account".into(),
             }),
             "alice's connection is closed under her, saying why"
+        );
+    });
+}
+
+#[test]
+fn a_key_that_moves_account_while_its_session_proves_is_closed_once_registered() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let node = node(context, 1, ledger.clone());
+
+        // alice's account is read as 42 and the read parks; while it parks, a block unseats her
+        // key and the relay is told the identity table moved. She registers as 42 (the read's
+        // stale value), but the re-check then reads her key again and closes her.
+        let (read, answer) = ledger.park_account();
+        let mut client = Client::dial(&node).await;
+        let handshake = async { client.handshake(&alice, GENESIS, &node.key, &alice).await };
+        let block = async {
+            read.await.unwrap();
+            ledger.unseat(&alice);
+            node.relay.invalidate(&wrote_identity());
+            answer.send(()).unwrap();
+        };
+        let (welcomed, ()) = tokio::join!(handshake, block);
+        assert!(
+            matches!(welcomed, Control::Welcome(_)),
+            "the stale read welcomes her: {welcomed:?}"
+        );
+        assert_eq!(
+            client.connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: 0u32.into(),
+                reason: "no_account".into(),
+            }),
+            "a block that moved her account while she proved closes her once registered"
         );
     });
 }
