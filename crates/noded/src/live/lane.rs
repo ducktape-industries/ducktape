@@ -4,9 +4,9 @@
 //! track would. One writer task per peer owns the one control stream to it, so a member that
 //! cannot be reached slows no one else; a group is a stream of its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -24,7 +24,7 @@ use tokio::task::{AbortHandle, JoinSet};
 use super::Relay;
 use super::groups::{GroupOut, Groups, Handed};
 use super::session::framed;
-use super::tracks::Relayed;
+use super::tracks::{Cut, Relayed};
 
 /// Streams peers opened and this node has not taken yet, over every peer.
 const BACKLOG: usize = 64;
@@ -47,11 +47,39 @@ type Streams = halo::Streams<Arc<Links>>;
 type Datagrams = halo::Datagrams<Arc<Links>>;
 
 /// What the relay's steps hand the lane task: the control plane (announces, asks, answers,
-/// resyncs) and the data plane (objects, groups, datagrams), each its own queue, so data
-/// overflowing drops data alone.
+/// resyncs, cuts) and the data plane (objects, groups, datagrams), each its own queue, so data
+/// overflowing drops data alone and tells the control plane each group it cut, once.
 pub struct Queue {
     control: mpsc::Sender<Relayed>,
     data: mpsc::Sender<Relayed>,
+    cuts: Mutex<Cuts<(PublicKey, Alias, u64)>>,
+}
+
+/// The groups a drop site told cut in the overload that is on: each once, so a burst of one
+/// group's items dropped does not fill the control plane with its cut. The set empties when
+/// the queue next takes an item: a later overload tells the group again, and the writer takes
+/// a cut it already holds as nothing new.
+struct Cuts<K> {
+    told: HashSet<K>,
+}
+
+impl<K> Default for Cuts<K> {
+    fn default() -> Self {
+        Cuts {
+            told: HashSet::new(),
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash> Cuts<K> {
+    fn taken(&mut self) {
+        self.told.clear();
+    }
+
+    /// Whether `key` is cut for the first time in this overload.
+    fn first(&mut self, key: K) -> bool {
+        self.told.insert(key)
+    }
 }
 
 pub struct Queued {
@@ -63,7 +91,11 @@ pub fn queue() -> (Queue, Queued) {
     let (control, controls) = mpsc::channel(QUEUE);
     let (data, datas) = mpsc::channel(QUEUE);
     (
-        Queue { control, data },
+        Queue {
+            control,
+            data,
+            cuts: Mutex::default(),
+        },
         Queued {
             control: controls,
             data: datas,
@@ -100,25 +132,44 @@ impl Relayed {
         }
     }
 
-    /// The cut a dropped data item is told as: the group it belonged to, at its peer. A
-    /// datagram is lossy and leaves no hole.
-    fn cut(&self) -> Option<Relayed> {
+    /// The cut a dropped data item is told as: its group at its peer, and the index of what
+    /// is missing. A datagram is lossy and leaves no hole.
+    fn cut(&self) -> Option<(PublicKey, Cut)> {
         match self {
-            Relayed::Object { to, header, .. } => Some(Relayed::Cut {
-                to: to.clone(),
-                alias: header.alias,
-                group: header.group,
-            }),
+            Relayed::Object {
+                to, header, object, ..
+            } => Some((
+                to.clone(),
+                Cut {
+                    alias: header.alias,
+                    group: header.group,
+                    at: *object,
+                },
+            )),
             Relayed::Group {
                 to, alias, group, ..
-            }
-            | Relayed::GroupEnd {
-                to, alias, group, ..
-            } => Some(Relayed::Cut {
-                to: to.clone(),
-                alias: *alias,
-                group: *group,
-            }),
+            } => Some((
+                to.clone(),
+                Cut {
+                    alias: *alias,
+                    group: *group,
+                    at: 0,
+                },
+            )),
+            Relayed::GroupEnd {
+                to,
+                alias,
+                group,
+                objects,
+                ..
+            } => Some((
+                to.clone(),
+                Cut {
+                    alias: *alias,
+                    group: *group,
+                    at: *objects,
+                },
+            )),
             Relayed::Datagram { .. }
             | Relayed::Fresh { .. }
             | Relayed::Cut { .. }
@@ -147,12 +198,28 @@ pub fn relay<E: crate::Context>(relay: &Relay<E>, relayed: Relayed) {
             }
         }
         Plane::Data => {
+            let cuts = || {
+                relay
+                    .lane
+                    .cuts
+                    .lock()
+                    .expect("the cuts lock is never poisoned")
+            };
             let Err(full) = relay.lane.data.try_send(relayed) else {
+                cuts().taken();
                 return;
             };
             relay.metrics.dropped_behind.inc();
-            if let Some(cut) = full.into_inner().cut()
-                && relay.lane.control.try_send(cut).is_err()
+            let Some((to, cut)) = full.into_inner().cut() else {
+                return;
+            };
+            let first = cuts().first((to.clone(), cut.alias, cut.group));
+            if first
+                && relay
+                    .lane
+                    .control
+                    .try_send(Relayed::Cut { to, cut })
+                    .is_err()
             {
                 behind();
             }
@@ -169,11 +236,8 @@ enum ToPeer {
     /// The peer opened a fresh control stream to us: resync, and know the peer for a live relay
     /// that answers, whose stream is worth reopening when it is lost.
     Fresh,
-    /// A data item to this peer was dropped: its group is cut, the stream reset if one is open.
-    Cut {
-        alias: Alias,
-        group: u64,
-    },
+    /// A data item to this peer was dropped: its group is cut at the index missing.
+    Cut(Cut),
     Object {
         header: GroupHeader,
         object: u32,
@@ -188,6 +252,7 @@ enum ToPeer {
         alias: Alias,
         group: u64,
         complete: bool,
+        objects: u32,
     },
     Datagram {
         header: DatagramHeader,
@@ -202,28 +267,38 @@ impl ToPeer {
             | ToPeer::Group { .. }
             | ToPeer::GroupEnd { .. }
             | ToPeer::Datagram { .. } => Plane::Data,
-            ToPeer::Control(_) | ToPeer::Resync | ToPeer::Fresh | ToPeer::Cut { .. } => {
-                Plane::Control
-            }
+            ToPeer::Control(_) | ToPeer::Resync | ToPeer::Fresh | ToPeer::Cut(_) => Plane::Control,
         }
     }
 
     /// The cut a dropped data item is told as; a datagram is lossy and leaves no hole.
-    fn cut(&self) -> Option<ToPeer> {
+    fn cut(&self) -> Option<Cut> {
         match self {
-            ToPeer::Object { header, .. } | ToPeer::Group { header, .. } => Some(ToPeer::Cut {
+            ToPeer::Object { header, object, .. } => Some(Cut {
                 alias: header.alias,
                 group: header.group,
+                at: *object,
             }),
-            ToPeer::GroupEnd { alias, group, .. } => Some(ToPeer::Cut {
+            ToPeer::Group { header, .. } => Some(Cut {
+                alias: header.alias,
+                group: header.group,
+                at: 0,
+            }),
+            ToPeer::GroupEnd {
+                alias,
+                group,
+                objects,
+                ..
+            } => Some(Cut {
                 alias: *alias,
                 group: *group,
+                at: *objects,
             }),
             ToPeer::Datagram { .. }
             | ToPeer::Control(_)
             | ToPeer::Resync
             | ToPeer::Fresh
-            | ToPeer::Cut { .. } => None,
+            | ToPeer::Cut(_) => None,
         }
     }
 
@@ -232,7 +307,7 @@ impl ToPeer {
     fn ends_reset(&self) -> bool {
         match self {
             ToPeer::Resync => false,
-            ToPeer::Control(_) | ToPeer::Fresh | ToPeer::Cut { .. } => true,
+            ToPeer::Control(_) | ToPeer::Fresh | ToPeer::Cut(_) => true,
             ToPeer::Object { .. }
             | ToPeer::Group { .. }
             | ToPeer::GroupEnd { .. }
@@ -246,6 +321,7 @@ impl ToPeer {
 struct Writer {
     control: mpsc::Sender<ToPeer>,
     data: mpsc::Sender<ToPeer>,
+    cuts: Cuts<(Alias, u64)>,
     aborting: AbortHandle,
 }
 
@@ -336,7 +412,7 @@ impl<E: crate::Context> Lanes<E> {
     fn dispatch(&mut self, relayed: Relayed) {
         match relayed {
             Relayed::Fresh { to } => self.hand(to, ToPeer::Fresh),
-            Relayed::Cut { to, alias, group } => self.hand(to, ToPeer::Cut { alias, group }),
+            Relayed::Cut { to, cut } => self.hand(to, ToPeer::Cut(cut)),
             Relayed::Announce {
                 track,
                 by,
@@ -412,12 +488,14 @@ impl<E: crate::Context> Lanes<E> {
                 alias,
                 group,
                 complete,
+                objects,
             } => self.hand(
                 to,
                 ToPeer::GroupEnd {
                     alias,
                     group,
                     complete,
+                    objects,
                 },
             ),
             Relayed::Datagram {
@@ -527,11 +605,12 @@ impl<E: crate::Context> Lanes<E> {
                 Writer {
                     control,
                     data,
+                    cuts: Cuts::default(),
                     aborting,
                 },
             );
         }
-        let writer = self.peers.get(&to).expect("inserted above");
+        let writer = self.peers.get_mut(&to).expect("inserted above");
         match item.plane() {
             Plane::Control => {
                 let ends_reset = item.ends_reset();
@@ -556,13 +635,17 @@ impl<E: crate::Context> Lanes<E> {
             }
             Plane::Data => {
                 let Err(full) = writer.data.try_send(item) else {
+                    writer.cuts.taken();
                     return;
                 };
                 // A data item dropped is told to the writer as its group's cut, on the control
                 // plane, so the peer's stream for that group is reset, never read with a hole.
                 self.dropped.inc();
-                if let Some(cut) = full.into_inner().cut() {
-                    self.hand(to, cut);
+                let Some(cut) = full.into_inner().cut() else {
+                    return;
+                };
+                if writer.cuts.first((cut.alias, cut.group)) {
+                    self.hand(to, ToPeer::Cut(cut));
                 }
             }
         }
@@ -667,9 +750,28 @@ async fn peer_writing<E: crate::Context>(
 }
 
 impl<E: crate::Context> PeerLink<E> {
+    /// A track ended for this peer leaves nothing of its groups open or held, so a cut held
+    /// for its last group does not outlive it. `request` is the peer's alias of the track; our
+    /// own unsubscribe names our request of the peer's track, nothing of this writer's.
+    fn forgotten(&mut self, forward: &Forward) {
+        match forward {
+            Forward::Ended { request, .. } => self.groups.forget(*request as Alias),
+            Forward::Announce { .. }
+            | Forward::Subscribe { .. }
+            | Forward::Unsubscribe { .. }
+            | Forward::Forwarded { .. }
+            | Forward::Refused { .. }
+            | Forward::Count { .. }
+            | Forward::Resynced => {}
+        }
+    }
+
     async fn send(&mut self, item: ToPeer) {
         match item {
-            ToPeer::Control(forward) => self.control(&forward).await,
+            ToPeer::Control(forward) => {
+                self.forgotten(&forward);
+                self.control(&forward).await;
+            }
             ToPeer::Resync => {
                 let _ = self.ensure_control(None).await;
             }
@@ -681,7 +783,7 @@ impl<E: crate::Context> PeerLink<E> {
                     Link::Unlinked => Link::Unlinked,
                 };
             }
-            ToPeer::Cut { alias, group } => self.groups.cut(alias, group),
+            ToPeer::Cut(cut) => self.groups.cut(cut.alias, cut.group, cut.at),
             ToPeer::Object {
                 header,
                 object,
@@ -696,7 +798,8 @@ impl<E: crate::Context> PeerLink<E> {
                 alias,
                 group,
                 complete,
-            } => self.groups.end(alias, group, complete),
+                objects,
+            } => self.groups.end(alias, group, complete, objects),
             ToPeer::Datagram { header, payload } => {
                 let frame = [abi::encode(&header), payload.to_vec()].concat();
                 let _ = self.datagrams.send(&self.to, &frame).await;
@@ -758,16 +861,18 @@ impl<E: crate::Context> PeerLink<E> {
                 // Unreachable names a member halo has no connection to, or a key that is no
                 // member: only the member is waited for, so a stale item for an unseated peer
                 // does not wake on a link that resolves at once.
-                self.link = match error {
-                    halo::Error::Unreachable(_) if self.halo.members().admits(&self.to) => {
-                        Link::Unlinked
-                    }
-                    halo::Error::Unreachable(_)
-                    | halo::Error::NoLane(_)
-                    | halo::Error::NoDatagrams(_)
-                    | halo::Error::Oversized(_)
-                    | halo::Error::Closed
-                    | halo::Error::Io(_) => Link::Closed,
+                let member = self.halo.members().admits(&self.to);
+                self.link = match (&error, member) {
+                    (halo::Error::Unreachable(_), true) => Link::Unlinked,
+                    (halo::Error::Unreachable(_), false)
+                    | (
+                        halo::Error::NoLane(_)
+                        | halo::Error::NoDatagrams(_)
+                        | halo::Error::Oversized(_)
+                        | halo::Error::Closed
+                        | halo::Error::Io(_),
+                        _,
+                    ) => Link::Closed,
                 };
                 self.attempts += 1;
                 if worth_a_line(self.attempts) {
@@ -1045,6 +1150,7 @@ mod tests {
             alias: 3,
             group: 9,
             complete: true,
+            objects: 2,
         };
         assert_eq!(
             end.plane(),
@@ -1053,12 +1159,15 @@ mod tests {
         );
         assert_eq!(
             end.cut(),
-            Some(Relayed::Cut {
-                to: to.clone(),
-                alias: 3,
-                group: 9
-            }),
-            "a dropped end cuts its group like a dropped object"
+            Some((
+                to.clone(),
+                Cut {
+                    alias: 3,
+                    group: 9,
+                    at: 2
+                }
+            )),
+            "a dropped end cuts its group at its object count"
         );
         let object = Relayed::Object {
             to: to.clone(),
@@ -1067,38 +1176,72 @@ mod tests {
             body: Bytes::from_static(b"x"),
         };
         assert_eq!(object.plane(), Plane::Data);
+        let (cut_to, cut) = object.cut().unwrap();
         assert_eq!(
-            object.cut(),
-            Some(Relayed::Cut {
-                to: to.clone(),
-                alias: 3,
-                group: 9
-            })
+            (cut_to, cut.clone()),
+            (
+                to.clone(),
+                Cut {
+                    alias: 3,
+                    group: 9,
+                    at: 4
+                }
+            ),
+            "a dropped object cuts its group at its index"
         );
-        assert_eq!(object.cut().unwrap().plane(), Plane::Control);
+        assert_eq!(Relayed::Cut { to, cut }.plane(), Plane::Control);
         let peer_end = ToPeer::GroupEnd {
             alias: 3,
             group: 9,
             complete: false,
+            objects: 2,
         };
         assert_eq!(peer_end.plane(), Plane::Data);
-        assert!(matches!(
+        assert_eq!(
             peer_end.cut(),
-            Some(ToPeer::Cut { alias: 3, group: 9 })
-        ));
+            Some(Cut {
+                alias: 3,
+                group: 9,
+                at: 2
+            })
+        );
         let peer_object = ToPeer::Object {
             header,
             object: 0,
             body: Bytes::from_static(b"x"),
         };
-        assert!(matches!(
+        assert_eq!(
             peer_object.cut(),
-            Some(ToPeer::Cut { alias: 3, group: 9 })
-        ));
+            Some(Cut {
+                alias: 3,
+                group: 9,
+                at: 0
+            })
+        );
         assert!(
             !ToPeer::Resync.ends_reset(),
             "the reset's own resync keeps the episode"
         );
-        assert!(ToPeer::Cut { alias: 3, group: 9 }.ends_reset());
+        assert!(
+            ToPeer::Cut(Cut {
+                alias: 3,
+                group: 9,
+                at: 0
+            })
+            .ends_reset()
+        );
+    }
+
+    #[test]
+    fn a_group_is_told_cut_once_per_overload() {
+        let mut cuts = Cuts::default();
+        assert!(cuts.first((1, 5)));
+        assert!(
+            !cuts.first((1, 5)),
+            "the same group's next drop tells nothing"
+        );
+        assert!(cuts.first((1, 6)));
+        cuts.taken();
+        assert!(cuts.first((1, 5)), "a later overload tells the group again");
     }
 }

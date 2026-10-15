@@ -792,7 +792,7 @@ impl<T, E: std::fmt::Display> Sentence<T> for Result<T, E> {
     }
 }
 
-/// Every role and the program bound to it, `role program`, in `Roles` order.
+/// Every bound role and its program, `role program`, in `Roles` order.
 fn roles(roles: &abi::Roles) -> String {
     roles
         .named()

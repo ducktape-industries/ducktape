@@ -84,6 +84,8 @@ pub enum Out {
         alias: Alias,
         group: u64,
         complete: bool,
+        /// The objects the group carried: a stream short of them is reset, not finished.
+        objects: u32,
     },
     Datagram {
         header: DatagramHeader,
@@ -551,7 +553,8 @@ async fn quic_writing(
                 alias,
                 group,
                 complete,
-            }) => groups.end(alias, group, complete),
+                objects,
+            }) => groups.end(alias, group, complete, objects),
             Drained::Out(Out::Datagram { .. }) => {}
             Drained::Datagrams(datagrams) => {
                 for (header, payload) in datagrams {
@@ -786,6 +789,7 @@ async fn ws_writing(mut sink: WsSink, mut egress: Egress) {
                 alias,
                 group,
                 complete: true,
+                ..
             }) => vec![WsFrame::Group {
                 header: GroupHeader { alias, group },
                 objects: Vec::new(),

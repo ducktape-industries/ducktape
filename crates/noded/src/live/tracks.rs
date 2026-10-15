@@ -63,6 +63,15 @@ pub enum Effect {
     Close(Outlet, &'static str),
 }
 
+/// What a dropped data item is told as: its group, and the index of the item missing from it
+/// (an object's index, 0 for a replay, the object count for an end).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub alias: Alias,
+    pub group: u64,
+    pub at: u32,
+}
+
 /// What the live lane carries for a step: announces to every member, and a group's objects or a
 /// datagram to the node that subscribed.
 #[derive(Debug, PartialEq, Eq)]
@@ -73,11 +82,7 @@ pub enum Relayed {
     Fresh { to: PublicKey },
     /// A data item to this peer was dropped on its way to the lane: the lane cuts the group
     /// short at that peer, so the peer never reads a group with a hole as whole.
-    Cut {
-        to: PublicKey,
-        alias: Alias,
-        group: u64,
-    },
+    Cut { to: PublicKey, cut: Cut },
     Announce {
         track: Track,
         by: Account,
@@ -105,6 +110,8 @@ pub enum Relayed {
         alias: Alias,
         group: u64,
         complete: bool,
+        /// The objects the group carried: its stream holds them all, or is reset.
+        objects: u32,
     },
     Datagram {
         to: PublicKey,
@@ -147,6 +154,8 @@ pub struct Cached {
 /// A group the publisher is writing now.
 struct Incoming {
     bytes: usize,
+    /// The objects of it heard so far: what its end says the group holds.
+    objects: u32,
     /// An object of it was refused or dropped: the subscribers heard it end short, and the
     /// rest of its objects are dropped quiet, so no one sees a hole as a complete group.
     abandoned: bool,
@@ -984,7 +993,7 @@ impl State {
     fn group_cut(&self, held: &Published, subscriber: &Subscriber, effects: &mut Vec<Effect>) {
         for (group, incoming) in &held.incoming {
             if !incoming.abandoned {
-                self.group_ended_for(held, subscriber, *group, false, effects);
+                self.group_ended_for(held, subscriber, *group, false, incoming.objects, effects);
             }
         }
     }
@@ -995,6 +1004,7 @@ impl State {
         subscriber: &Subscriber,
         group: u64,
         complete: bool,
+        objects: u32,
         effects: &mut Vec<Effect>,
     ) {
         // A subscriber that never heard this group's objects hears no end of it either.
@@ -1008,6 +1018,7 @@ impl State {
                     alias: held.alias,
                     group,
                     complete,
+                    objects,
                 },
                 effects,
             ),
@@ -1016,6 +1027,7 @@ impl State {
                 alias: *request as Alias,
                 group,
                 complete,
+                objects,
             })),
         }
     }
@@ -1953,13 +1965,13 @@ impl State {
         let Some(held) = self.tracks.get_mut(&track) else {
             return effects;
         };
-        held.incoming
-            .entry(header.group)
-            .or_insert(Incoming {
-                bytes: 0,
-                abandoned: false,
-            })
-            .bytes += body.len();
+        let incoming = held.incoming.entry(header.group).or_insert(Incoming {
+            bytes: 0,
+            objects: 0,
+            abandoned: false,
+        });
+        incoming.bytes += body.len();
+        incoming.objects += 1;
         let group = header.group;
         let priority = held.priority;
         let header = GroupHeader {
@@ -2024,7 +2036,7 @@ impl State {
             if let Some(cached) = held.latest.as_mut().filter(|cached| cached.group == group) {
                 cached.complete = complete;
             }
-            self.group_ended(&track, group, complete, &mut effects);
+            self.group_ended(&track, group, complete, incoming.objects, &mut effects);
         }
         // The group is over either way, and its end went only to those who heard it: no
         // subscriber waits to skip it any more.
@@ -2038,12 +2050,19 @@ impl State {
     }
 
     /// The group ends for every subscriber of the track, complete or short.
-    fn group_ended(&self, track: &Track, group: u64, complete: bool, effects: &mut Vec<Effect>) {
+    fn group_ended(
+        &self,
+        track: &Track,
+        group: u64,
+        complete: bool,
+        objects: u32,
+        effects: &mut Vec<Effect>,
+    ) {
         let Some(held) = self.tracks.get(track) else {
             return;
         };
         for subscriber in &held.subscribers {
-            self.group_ended_for(held, subscriber, group, complete, effects);
+            self.group_ended_for(held, subscriber, group, complete, objects, effects);
         }
     }
 
@@ -2062,6 +2081,7 @@ impl State {
                 group,
                 Incoming {
                     bytes: 0,
+                    objects: 0,
                     abandoned: true,
                 },
             );
@@ -2069,8 +2089,9 @@ impl State {
         };
         let was_open = !incoming.abandoned;
         incoming.abandoned = true;
+        let objects = incoming.objects;
         if was_open {
-            self.group_ended(track, group, false, effects);
+            self.group_ended(track, group, false, objects, effects);
         }
     }
 
@@ -2555,12 +2576,16 @@ fn relayed(to: PublicKey, alias: Alias, out: Out) -> Option<Relayed> {
             end,
         }),
         Out::GroupEnd {
-            group, complete, ..
+            group,
+            complete,
+            objects,
+            ..
         } => Some(Relayed::GroupEnd {
             to,
             alias,
             group,
             complete,
+            objects,
         }),
         Out::Datagram { header, payload } => Some(Relayed::Datagram {
             to,
