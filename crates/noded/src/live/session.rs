@@ -26,7 +26,6 @@ const INBOUND: usize = 1024;
 /// Control messages and stream objects waiting for the connection; a session this far behind
 /// is closed rather than fed from a growing queue.
 const OUTBOUND: usize = 4096;
-/// Objects waiting on one egress group stream; a group this far behind is reset.
 /// The control stream outranks every group stream of the connection.
 const CONTROL_PRIORITY: i32 = 256;
 /// A last message (a refusal, a GoAway) gets this long to reach a client that stopped reading;
@@ -515,6 +514,15 @@ async fn quic_writing(
 ) {
     let _ = control.set_priority(CONTROL_PRIORITY);
     let mut groups = Groups::default();
+    // One group writer per group stream, at the track's priority.
+    let spawn = |priority: Priority| {
+        let (connection, pacer) = (connection.clone(), pacer.clone());
+        move |header, queue| {
+            tokio::spawn(quic_group_writing(
+                connection, pacer, header, priority, queue,
+            ));
+        }
+    };
     loop {
         match egress.next().await {
             Drained::Out(Out::Control(message)) => {
@@ -524,19 +532,11 @@ async fn quic_writing(
             }
             Drained::Out(Out::Object {
                 header,
+                object,
                 body,
                 priority,
-                ..
             }) => {
-                groups.object(header, body, |header, queue| {
-                    tokio::spawn(quic_group_writing(
-                        connection.clone(),
-                        pacer.clone(),
-                        header,
-                        priority,
-                        queue,
-                    ));
-                });
+                groups.object(header, object, body, spawn(priority));
             }
             Drained::Out(Out::Group {
                 header,
@@ -544,15 +544,7 @@ async fn quic_writing(
                 objects,
                 end,
             }) => {
-                groups.batch(header, objects, end, |header, queue| {
-                    tokio::spawn(quic_group_writing(
-                        connection.clone(),
-                        pacer.clone(),
-                        header,
-                        priority,
-                        queue,
-                    ));
-                });
+                groups.batch(header, objects, end, spawn(priority));
             }
             Drained::Out(Out::GroupEnd {
                 alias,
@@ -577,8 +569,8 @@ async fn quic_writing(
     }
 }
 
-/// Queues the object on its group's stream, opening one for a new group; a group whose queue
-/// overflows is reset.
+/// One egress group stream: opened at the track's priority, paced, the header then each object
+/// as it is queued; finished when the group completes, reset when it is cut short.
 async fn quic_group_writing(
     connection: quinn::Connection,
     pacer: Pacer,
@@ -736,24 +728,29 @@ fn ws_arrived(bytes: Bytes, counting: &mut HashMap<(Alias, u64), u32>) -> Vec<In
     }
 }
 
-/// A replayed group as websocket frames: its objects in slices of at most `MAX_STREAM_OBJECT`
-/// bytes each, so one big group does not hold the socket from control, the last slice ending
-/// the group when the cache holds it closed and complete; a still-open group's live objects
-/// follow in later frames. A complete group with no objects is one ending frame.
+/// The bytes a `WsFrame::Group` takes beyond its objects: the tag, the header, the vector's
+/// length and `end`.
+const WS_GROUP_FRAME: usize = 1 + GroupHeader::LEN + 4 + 1;
+
+/// A replayed group as websocket frames, each within `WS_MESSAGE` encoded (an object costs its
+/// bytes and a 4-byte length), so one big group does not hold the socket from control; the last
+/// frame ends the group when the cache holds it closed and complete, and a still-open group's
+/// live objects follow in later frames. A complete group with no objects is one ending frame.
 fn ws_group_frames(header: GroupHeader, objects: &[Bytes], end: Option<bool>) -> Vec<WsFrame> {
     let mut frames: Vec<WsFrame> = Vec::new();
     let mut slice: Vec<Vec<u8>> = Vec::new();
-    let mut bytes = 0;
+    let mut bytes = WS_GROUP_FRAME;
     for body in objects {
-        if bytes + body.len() > MAX_STREAM_OBJECT && !slice.is_empty() {
+        let costs = 4 + body.len();
+        if bytes + costs > WS_MESSAGE && !slice.is_empty() {
             frames.push(WsFrame::Group {
                 header,
                 objects: std::mem::take(&mut slice),
                 end: false,
             });
-            bytes = 0;
+            bytes = WS_GROUP_FRAME;
         }
-        bytes += body.len();
+        bytes += costs;
         slice.push(body.to_vec());
     }
     let complete = end == Some(true);
@@ -966,7 +963,9 @@ mod tests {
                 WsFrame::Control(_) | WsFrame::Datagram { .. } => unreachable!(),
             })
             .collect();
-        assert_eq!(ends, vec![false, false, true]);
+        // The one-byte object rides with the first big one (both fit the message); the second
+        // big one does not, so it is the frame that ends the group.
+        assert_eq!(ends, vec![false, true]);
         for frame in &frames {
             assert!(
                 abi::encode(frame).len() <= WS_MESSAGE,
@@ -974,11 +973,34 @@ mod tests {
             );
         }
         let open = ws_group_frames(header, &objects, None);
-        assert_eq!(open.len(), 3);
+        assert_eq!(open.len(), 2);
         assert!(matches!(
             open.last(),
             Some(WsFrame::Group { end: false, .. })
         ));
+    }
+
+    #[test]
+    fn a_replayed_group_of_many_small_objects_is_sliced_to_the_message_cap() {
+        let header = GroupHeader { alias: 1, group: 2 };
+        let objects = vec![Bytes::from_static(b"x"); 70_000];
+        let frames = ws_group_frames(header, &objects, Some(true));
+        assert!(frames.len() > 1);
+        let mut carried = 0;
+        for frame in &frames {
+            assert!(
+                abi::encode(frame).len() <= WS_MESSAGE,
+                "each frame fits the socket"
+            );
+            if let WsFrame::Group { objects, .. } = frame {
+                carried += objects.len();
+            }
+        }
+        assert_eq!(carried, 70_000, "every object crosses once");
+        let empties = vec![Bytes::new(); 20_000];
+        for frame in ws_group_frames(header, &empties, Some(true)) {
+            assert!(abi::encode(&frame).len() <= WS_MESSAGE);
+        }
     }
 
     #[test]

@@ -148,7 +148,7 @@ impl<T: Transport> Plane<T> {
         for name in served {
             let bound = self.bound(&name);
             if !bound {
-                tracing::warn!(target: "ducktape::halo", event = "halo_unserved", lane = name, reason = "unbound", "the lane table serves a lane nothing on this node binds");
+                tracing::warn!(target: "ducktape::halo", event = "halo_unbound", lane = name, reason = "unbound", "the lane table serves a lane nothing on this node binds");
             }
         }
     }
@@ -245,7 +245,7 @@ async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stre
         .get(&lane.name)
         .cloned();
     let Some(backlog) = backlog else {
-        tracing::debug!(target: "ducktape::halo", event = "halo_unbound", %from, lane = hello.lane, reason = "unbound", "halo dropped a stream for a lane nothing on this node binds");
+        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane, reason = "unbound", "halo dropped a stream for a lane nothing on this node binds");
         return;
     };
     let admitted = shared.members.admits(&from);

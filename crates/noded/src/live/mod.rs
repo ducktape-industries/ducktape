@@ -25,7 +25,7 @@ use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::telemetry::metrics::raw::{Counter, Gauge};
 use halo::Halo;
 use live_wire::{
-    ALPN, Account, Challenge, Code, Control, IDLE_SESSION, NAMESPACE, Proof, RequestId, Welcome,
+    ALPN, Account, Challenge, Code, Control, IDLE_SESSION, NAMESPACE, Proof, RequestId,
     proof_preimage,
 };
 use tokio::sync::{Notify, watch};
@@ -180,13 +180,19 @@ impl<E: crate::Context> Relay<E> {
 
     /// One step on the table, decided and delivered under the one lock: what steps send leaves
     /// in the order they were decided, so no step's word to a session overtakes another's, as a
-    /// re-check's end would overtake the answer to the request it re-checks. Delivery is here
-    /// and nowhere else: a session's outlet takes what it is sent or is closed as behind, and
-    /// nothing here takes a lock of the relay's. The handshake's refusal and go-away go straight
-    /// to a session that was never in the table.
+    /// re-check's end would overtake the answer to the request it re-checks. Everything a step
+    /// decides is delivered here and nowhere else: a session's outlet takes what it is sent or
+    /// is closed as behind, and nothing here takes a lock of the relay's. Outside the table are
+    /// only the handshake's refusal and go-away, to a session that was never in it, and a
+    /// session's own loop closing its outlet when it ends.
     fn step(&self, decide: impl FnOnce(&mut State) -> Vec<Effect>) {
+        self.step_to(|state| ((), decide(state)));
+    }
+
+    /// A step whose decision the caller needs back, beside what it sends.
+    fn step_to<T>(&self, decide: impl FnOnce(&mut State) -> (T, Vec<Effect>)) -> T {
         let mut state = self.state();
-        let effects = decide(&mut state);
+        let (decision, effects) = decide(&mut state);
         state.gauges();
         for effect in effects {
             match effect {
@@ -195,6 +201,7 @@ impl<E: crate::Context> Relay<E> {
                 Effect::Close(outlet, reason) => outlet.close(reason),
             }
         }
+        decision
     }
 
     /// A step a session's loop took, for the loop to go on.
@@ -211,24 +218,7 @@ impl<E: crate::Context> Relay<E> {
         key: Vec<u8>,
         link: &Link,
     ) -> Result<SessionId, GoingAway> {
-        let mut opened = None;
-        self.step(|state| {
-            let welcome = Out::Control(Control::Welcome(Welcome {
-                account,
-                datagrams: link.datagrams,
-            }));
-            match state.opened(account, key, link.outlet.clone()) {
-                Ok(id) => {
-                    opened = Some(Ok(id));
-                    vec![Effect::Send(link.outlet.clone(), welcome)]
-                }
-                Err(going) => {
-                    opened = Some(Err(going));
-                    Vec::new()
-                }
-            }
-        });
-        opened.expect("the step ran")
+        self.step_to(|state| state.welcome(account, key, link.outlet.clone(), link.datagrams))
     }
 
     fn deliver(&self, outlet: &Outlet, out: Out) {
@@ -628,11 +618,7 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
             Step::Done => {}
             Step::Close(reason) => {
                 tracing::debug!(target: "ducktape::live", event = "live_refused", reason, path = link.path, "a live session sent what is not the wire");
-                link.outlet.send(Out::Control(Control::Refused {
-                    request: 0,
-                    code: Code::Malformed,
-                }));
-                link.outlet.close(reason);
+                relay.step(|state| state.garbled(id, reason));
                 break reason;
             }
         }

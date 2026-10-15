@@ -13,7 +13,7 @@ use commonware_runtime::telemetry::metrics::{Counter, Gauge};
 use live_wire::{
     Account, Alias, Code, Control, DatagramHeader, End, Forward, GroupHeader, MAX_DATAGRAM_OBJECT,
     MAX_GROUP_BYTES, MAX_NAMESPACE, MAX_STREAM_OBJECT, Mode, Priority, RequestId, Start, Track,
-    well_named,
+    Welcome, well_named,
 };
 
 use abi::live::{Grant, pattern_covers};
@@ -175,9 +175,9 @@ pub struct Published {
     /// local subscriber waits for the publisher's node's answer, and only the last answer is
     /// the one they hear (a `Latest` ask lifted over a standing `Next` one is answered twice).
     unanswered: u32,
-    /// For a local track, the `Start` each node asked with, so an ask lifted from `Next` to
-    /// `Latest` replays once and a resync's repeated ask does not.
-    node_asks: HashMap<PublicKey, Start>,
+    /// For a local track, what each node asked, so an ask lifted from `Next` to `Latest`
+    /// replays the one group the node missed, once, and a resync's repeated ask replays nothing.
+    node_asks: HashMap<PublicKey, Asked>,
 }
 
 impl Published {
@@ -341,6 +341,8 @@ impl Metrics {
 pub struct State {
     /// The chain id every namespace must start with, as the node spells it.
     chain: String,
+    /// Subscriptions held across the sessions, moved only where a session's `subscribed` is.
+    subscriptions: usize,
     tracks: HashMap<Track, Published>,
     aliases: HashMap<Alias, Track>,
     next_alias: Alias,
@@ -388,18 +390,17 @@ impl State {
             next_session: 1,
             going_away: None,
             resyncing: HashMap::new(),
+            subscriptions: 0,
             metrics,
         }
     }
 
-    /// The gauges, from the table's sizes, once per step: nothing in a decide fn sets one, so
-    /// none can drift from what the table holds. `subscriptions` walks the sessions each step.
-    // ponytail: O(sessions) per step; keep a count in add/drop_subscriber if sessions grow
-    // past what a step can walk.
+    /// The gauges, from the table's counts, once per step: nothing in a decide fn sets one, so
+    /// none can drift from what the table holds.
     pub fn gauges(&self) {
         self.metrics.sessions.set(self.sessions.len() as i64);
         self.metrics.tracks.set(self.tracks.len() as i64);
-        self.metrics.subscriptions.set(self.subscriptions() as i64);
+        self.metrics.subscriptions.set(self.subscriptions as i64);
     }
 
     pub fn session(&self, id: SessionId) -> Option<&Session> {
@@ -478,11 +479,49 @@ impl State {
     }
 
     /// The session is gone: its tracks end, its subscriptions and watches drop.
+    /// A proven session joins the table and hears its welcome, or hears why not.
+    pub fn welcome(
+        &mut self,
+        account: Account,
+        key: Vec<u8>,
+        outlet: Outlet,
+        datagrams: bool,
+    ) -> (Result<SessionId, GoingAway>, Vec<Effect>) {
+        let opened = self.opened(account, key, outlet.clone());
+        let effects = match &opened {
+            Ok(_) => vec![Effect::Send(
+                outlet,
+                Out::Control(Control::Welcome(Welcome { account, datagrams })),
+            )],
+            Err(_) => Vec::new(),
+        };
+        (opened, effects)
+    }
+
+    /// The session sent what is not the wire: it hears a refusal and is closed for it.
+    pub fn garbled(&mut self, id: SessionId, reason: &'static str) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let Some(session) = self.sessions.get(&id) else {
+            return effects;
+        };
+        let outlet = session.outlet.clone();
+        effects.push(Effect::Send(
+            outlet.clone(),
+            Out::Control(Control::Refused {
+                request: 0,
+                code: Code::Malformed,
+            }),
+        ));
+        effects.push(Effect::Close(outlet, reason));
+        effects
+    }
+
     pub fn closed(&mut self, id: SessionId) -> Vec<Effect> {
         let mut effects = Vec::new();
         let Some(session) = self.sessions.remove(&id) else {
             return effects;
         };
+        self.subscriptions -= session.subscribed.len();
         for track in session.published.values() {
             self.end_track(track, End::PublisherGone, &mut effects);
         }
@@ -912,9 +951,7 @@ impl State {
             self.group_cut(&held, subscriber, effects);
             match subscriber {
                 Subscriber::Local { session, request } => {
-                    if let Some(subscribing) = self.sessions.get_mut(session) {
-                        subscribing.subscribed.remove(request);
-                    }
+                    self.subscription_let_go(*session, *request);
                     self.tell(
                         *session,
                         Control::Ended {
@@ -975,11 +1012,20 @@ impl State {
         }
     }
 
-    fn subscriptions(&self) -> usize {
-        self.sessions
-            .values()
-            .map(|session| session.subscribed.len())
-            .sum()
+    /// A session holds a subscription under `request`; the count the gauge reads moves with it.
+    fn subscription_held(&mut self, id: SessionId, request: RequestId, track: Track) {
+        if let Some(session) = self.sessions.get_mut(&id)
+            && session.subscribed.insert(request, track).is_none()
+        {
+            self.subscriptions += 1;
+        }
+    }
+
+    /// A session lets go of the subscription under `request`, if it held one.
+    fn subscription_let_go(&mut self, id: SessionId, request: RequestId) -> Option<Track> {
+        let track = self.sessions.get_mut(&id)?.subscribed.remove(&request)?;
+        self.subscriptions -= 1;
+        Some(track)
     }
 
     /// Watchers of the namespace hear the track came or went; for a local track the members
@@ -1086,9 +1132,7 @@ impl State {
                 from: Start::Latest,
             }));
         }
-        if let Some(session) = self.sessions.get_mut(&id) {
-            session.subscribed.insert(request, track.clone());
-        }
+        self.subscription_held(id, request, track.clone());
         if defer {
             if let Some(held) = self.tracks.get_mut(&track) {
                 held.pending.push((id, request));
@@ -1201,6 +1245,7 @@ impl State {
             return Err(Code::Malformed);
         };
         let held = self.tracks.get_mut(track).expect("read above");
+        let cached = held.replayable().map(|cached| cached.group);
         let already = held
             .subscribers
             .iter_mut()
@@ -1213,24 +1258,38 @@ impl State {
             });
         // A peer asking again hears the answer again under its new request. A resync's repeated
         // ask carries nothing else: the one subscription it holds already carries the track. An
-        // ask lifted from `Next` to `Latest` is replayed the cached group once, which the node
-        // had skipped as in flight when it joined.
+        // ask lifted from `Next` to `Latest` is replayed the cached group once, if it is the one
+        // the node has not heard; a group begun since the node asked is flowing to it live.
         if let Some(theirs) = already {
             *theirs = request;
-            let lifted = held.node_asks.insert(peer.clone(), from) == Some(Start::Next)
-                && from == Start::Latest;
+            let before = held.node_asks.get(&peer).copied();
+            let lifts =
+                before.is_some_and(|asked| asked.start == Start::Next) && from == Start::Latest;
+            let replays =
+                lifts && cached.is_some() && cached == before.and_then(|asked| asked.unheard);
+            let unheard = match replays {
+                true => None,
+                false => before.and_then(|asked| asked.unheard),
+            };
+            held.node_asks.insert(
+                peer.clone(),
+                Asked {
+                    start: from,
+                    unheard,
+                },
+            );
             let opened = Opened {
                 alias,
                 by: held.by,
                 mode: held.mode,
-                latest: held.replayable().map(|cached| cached.group),
+                latest: cached,
             };
-            if lifted {
+            if replays {
                 let subscriber = Subscriber::Node {
                     peer: peer.clone(),
                     request,
                 };
-                if let Some(cached) = held.replayable().map(|cached| cached.group)
+                if let Some(cached) = cached
                     && let Some(skipped) = held.skip.get_mut(&subscriber)
                 {
                     skipped.remove(&cached);
@@ -1239,7 +1298,17 @@ impl State {
             }
             return Ok(opened);
         }
-        held.node_asks.insert(peer.clone(), from);
+        let unheard = match from {
+            Start::Next => held.latest.as_ref().map(|cached| cached.group),
+            Start::Latest => None,
+        };
+        held.node_asks.insert(
+            peer.clone(),
+            Asked {
+                start: from,
+                unheard,
+            },
+        );
         let subscriber = Subscriber::Node {
             peer: peer.clone(),
             request,
@@ -1373,11 +1442,7 @@ impl State {
 
     pub fn unsubscribe(&mut self, id: SessionId, request: RequestId) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let Some(track) = self
-            .sessions
-            .get_mut(&id)
-            .and_then(|session| session.subscribed.remove(&request))
-        else {
+        let Some(track) = self.subscription_let_go(id, request) else {
             let withdrawn = self.withdrawn(id, request, Act::Subscribe);
             if !withdrawn {
                 self.refuse(id, request, Code::Malformed, &mut effects);
@@ -1687,23 +1752,23 @@ impl State {
         let Some(account) = self.sessions.get(&id).map(|session| session.account) else {
             return Vec::new();
         };
-        let kept = match held {
+        match held {
             Held::Published(track) => {
-                grant.is_some_and(|grant| grant.publishes(&track.name, account))
+                match grant.is_some_and(|grant| grant.publishes(&track.name, account)) {
+                    true => Vec::new(),
+                    false => self.revoke(id, request, held),
+                }
             }
             Held::Subscribed(track) => {
-                grant.is_some_and(|grant| grant.subscribes(&track.name, account))
+                match grant.is_some_and(|grant| grant.subscribes(&track.name, account)) {
+                    true => Vec::new(),
+                    false => self.revoke(id, request, held),
+                }
             }
-            Held::Watching(namespace) => {
-                return match watch_patterns(grant, account) {
-                    Some(patterns) => self.rewatch(id, request, namespace, patterns),
-                    None => self.revoke(id, request, held),
-                };
-            }
-        };
-        match kept {
-            true => Vec::new(),
-            false => self.revoke(id, request, held),
+            Held::Watching(namespace) => match watch_patterns(grant, account) {
+                Some(patterns) => self.rewatch(id, request, namespace, patterns),
+                None => self.revoke(id, request, held),
+            },
         }
     }
 
@@ -1748,9 +1813,7 @@ impl State {
         track: &Track,
         effects: &mut Vec<Effect>,
     ) {
-        if let Some(session) = self.sessions.get_mut(&id) {
-            session.subscribed.remove(&request);
-        }
+        self.subscription_let_go(id, request);
         let subscriber = Subscriber::Local {
             session: id,
             request,
@@ -2188,17 +2251,22 @@ impl State {
         found
     }
 
-    /// What a peer whose control stream just opened must hear to be in step: every local track
-    /// up, and our asks for its tracks that local subscribers wait on. The resync carries one
-    /// ask per track, so the asks in flight to this peer fold into that one and its one answer
-    /// is the one the waiting subscribers hear.
-    pub fn resync(&mut self, peer: &PublicKey) -> Vec<Forward> {
+    /// Our control stream to `peer` is being reopened and will carry a resync: the asks in flight
+    /// to it fold into the resync's one ask per track, whose one answer is the one the waiting
+    /// subscribers hear.
+    pub fn asks_folded(&mut self, peer: &PublicKey) -> Vec<Effect> {
         for held in self.tracks.values_mut() {
             let theirs = held.origin == Origin::Remote(peer.clone());
             if theirs && held.unanswered > 1 {
                 held.unanswered = 1;
             }
         }
+        Vec::new()
+    }
+
+    /// What a peer whose control stream just opened must hear to be in step: every local track
+    /// up, and our asks for its tracks that local subscribers wait on.
+    pub fn resync(&self, peer: &PublicKey) -> Vec<Forward> {
         let mut tracks: Vec<(&Track, &Published)> = self.tracks.iter().collect();
         tracks.sort_by(|a, b| a.0.cmp(b.0));
         let mut forwards = Vec::new();
@@ -2352,6 +2420,16 @@ impl State {
             }
         }
     }
+}
+
+/// A node's standing ask on a local track.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Asked {
+    start: Start,
+    /// The group cached when the node asked `Next`: in flight then, it skipped it; complete
+    /// then, it missed it. Either way the node has not heard it, and a lift to `Latest` replays
+    /// it, and nothing else: a group begun since reached the node live from its object 0.
+    unheard: Option<u64>,
 }
 
 /// The word a request hears when its grant is taken back.
@@ -3038,6 +3116,7 @@ mod tests {
         state.subscribe(carol, 1, doc.clone(), Start::Latest, true);
         // Two asks are out when the stream to the peer dies; the resync asks once, and the one
         // answer to it is the one both waiting subscribers hear.
+        state.asks_folded(&peer);
         let asks = state
             .resync(&peer)
             .into_iter()
@@ -3053,6 +3132,36 @@ mod tests {
                 .count(),
             2,
             "{answered:?}"
+        );
+    }
+
+    #[test]
+    fn a_lift_does_not_replay_a_group_the_node_already_receives_live() {
+        let mut state = state();
+        let peer = PrivateKey::from_seed(9).public_key();
+        let publisher = open(&mut state, 42, 1);
+        let ours = room("ours");
+        state.publish(publisher, 1, ours.clone(), Mode::Stream, 128, true);
+        let alias = state.track(&ours).unwrap().alias;
+        // The node asks Next with nothing cached; group 1 then begins and flows to it live.
+        state.node_subscribed(peer.clone(), 7, &ours, Start::Next);
+        let live = lane(state.object(
+            Some(publisher),
+            GroupHeader { alias, group: 1 },
+            0,
+            Bytes::from_static(b"a"),
+            Instant::now(),
+        ));
+        assert!(
+            live.iter()
+                .any(|relayed| matches!(relayed, Relayed::Object { .. }))
+        );
+        let lifted = lane(state.node_subscribed(peer.clone(), 7, &ours, Start::Latest));
+        assert!(
+            !lifted
+                .iter()
+                .any(|relayed| matches!(relayed, Relayed::Group { .. })),
+            "the group the node receives live is not replayed onto its stream: {lifted:?}"
         );
     }
 
