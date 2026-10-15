@@ -177,6 +177,7 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
     let config = halo::Config {
         egress_bytes_per_sec: Some(1 << 30),
         udp: "127.0.0.1:0".parse().unwrap(),
+        queues: halo::Queues::default(),
     };
     let halo = Arc::new(Halo::start(&context.child("halo"), identity.clone(), config).unwrap());
     halo.plane().lanes(vec![Lane {

@@ -27,7 +27,7 @@ pub use client::{Client, Upload};
 pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
-pub use run::{HaloConfig, Listen, Running, init, invite, join, run};
+pub use run::{HaloConfig, Listen, LoadConfig, Running, init, invite, join, run};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
 
@@ -115,7 +115,6 @@ pub struct Daemon<E: Context> {
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
     subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,
-    recent: Mutex<blocks::Recent>,
 }
 
 impl<E: Context> Daemon<E> {

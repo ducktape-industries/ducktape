@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -25,12 +26,26 @@ use crate::members::Members;
 use crate::quic::{self, Quic};
 use crate::transport::{Error, Transport};
 
-const DIAL: Duration = Duration::from_secs(5);
 const YIELD: Duration = Duration::from_secs(1);
 const REDIAL: Duration = Duration::from_secs(1);
 const REDIAL_MOST: Duration = Duration::from_secs(60);
-const INBOUND: usize = 256;
-const DATAGRAMS: usize = 1024;
+const INBOUND: NonZeroUsize = NonZeroUsize::new(256).expect("nonzero");
+const DATAGRAMS: NonZeroUsize = NonZeroUsize::new(1024).expect("nonzero");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Queues {
+    pub inbound: NonZeroUsize,
+    pub datagrams: NonZeroUsize,
+}
+
+impl Default for Queues {
+    fn default() -> Queues {
+        Queues {
+            inbound: INBOUND,
+            datagrams: DATAGRAMS,
+        }
+    }
+}
 
 pub struct Carried {
     send: quinn::SendStream,
@@ -202,10 +217,11 @@ impl Links {
         identity: PrivateKey,
         members: Arc<Members>,
         udp: SocketAddr,
+        queues: Queues,
     ) -> Result<Arc<Links>, quic::Error> {
         let quic = Quic::bind(udp, &identity, members.clone())?;
-        let (inbound, accepted) = mpsc::channel(INBOUND);
-        let (received, datagrams) = mpsc::channel(DATAGRAMS);
+        let (inbound, accepted) = mpsc::channel(queues.inbound.get());
+        let (received, datagrams) = mpsc::channel(queues.datagrams.get());
         let opened = context.register(
             "halo_streams_opened",
             "streams this node opened to a member over QUIC",
@@ -293,12 +309,10 @@ impl Links {
         let Some(halo) = self.members.halo(to) else {
             return Err(Error::Unreachable(to.clone()));
         };
-        let dialed = tokio::time::timeout(DIAL, async {
-            let at = resolved(&self.quic, &halo).await?;
-            self.quic.dial(to, at).await.ok()
-        })
-        .await;
-        let Ok(Some(connection)) = dialed else {
+        let Some(at) = resolved(&self.quic, &halo).await else {
+            return Err(Error::Unreachable(to.clone()));
+        };
+        let Ok(connection) = self.quic.dial(to, at).await else {
             return Err(Error::Unreachable(to.clone()));
         };
         tracing::debug!(target: "ducktape::halo", peer = %to, at = %halo, "halo dialed a member at its halo address");

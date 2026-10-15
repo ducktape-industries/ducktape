@@ -8,7 +8,7 @@ use std::time::Instant;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _, tokio as runtime};
-use halo::{Class, Config, Halo, Lane, Links, Seat, Streams};
+use halo::{Class, Config, Halo, Lane, Links, Queues, Seat, Streams};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 type Context = runtime::Context;
@@ -45,6 +45,7 @@ fn node(context: &Context, seed: u64, egress: Option<u64>) -> Node {
     let config = Config {
         egress_bytes_per_sec: egress,
         udp: "127.0.0.1:0".parse().unwrap(),
+        queues: Queues::default(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());
     halo.plane().lanes(table());

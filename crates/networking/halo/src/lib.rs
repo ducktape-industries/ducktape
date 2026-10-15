@@ -22,7 +22,7 @@ use commonware_runtime::Metrics;
 
 pub use abi::role::halo::{Lane, LaneId};
 pub use class::Class;
-pub use links::{Carried, Links};
+pub use links::{Carried, Links, Queues};
 pub use members::{Members, Seat};
 pub use pacer::{Paced, Pacer};
 pub use plane::{Datagrams, Inbound, Plane, Streams, Taken};
@@ -33,6 +33,7 @@ const EGRESS_BURST: u64 = 256 << 10;
 pub struct Config {
     pub egress_bytes_per_sec: Option<u64>,
     pub udp: SocketAddr,
+    pub queues: Queues,
 }
 
 pub struct Halo {
@@ -51,7 +52,13 @@ impl Halo {
     ) -> Result<Halo, quic::Error> {
         let me = identity.public_key();
         let members = Arc::new(Members::default());
-        let links = Links::start(context, identity, members.clone(), config.udp)?;
+        let links = Links::start(
+            context,
+            identity,
+            members.clone(),
+            config.udp,
+            config.queues,
+        )?;
         let pacer = match config.egress_bytes_per_sec {
             Some(rate) => Pacer::new(rate, EGRESS_BURST),
             None => Pacer::unlimited(),
