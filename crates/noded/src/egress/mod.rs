@@ -7,7 +7,7 @@ mod desk;
 use std::sync::Arc;
 
 use abi::role::egress::{Answer, Op, Query, Reply, RequestRow};
-use abi::{BlobId, Origin, ProgramId, reason};
+use abi::{BlobId, Origin, ProgramId, reason, role};
 use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -39,7 +39,14 @@ pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Client
 }
 
 async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clients) {
-    let bound = daemon.node.lock().await.host().roles().egress.clone();
+    let bound = daemon
+        .node
+        .lock()
+        .await
+        .host()
+        .roles()
+        .get(role::EGRESS)
+        .cloned();
     let Some(role) = bound else {
         let unused = !config.served().is_empty();
         if unused {

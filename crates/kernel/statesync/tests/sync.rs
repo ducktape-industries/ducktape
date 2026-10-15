@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use abi::{HostOp, role::validators};
+use abi::{HostOp, role, role::validators};
 use commonware_consensus::marshal::Start;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::simplex::types::{Finalization, Finalize, Proposal};
@@ -50,14 +50,13 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
 fn genesis(members: &[validators::Member]) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles {
-            programs: "programs".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-            blobs: "blobs".into(),
-            awaits: "awaits".into(),
-            egress: None,
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+        ]),
         validators: members.to_vec(),
         programs: vec![
             Founding {

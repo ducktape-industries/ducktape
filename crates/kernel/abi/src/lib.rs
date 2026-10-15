@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use borsh::{BorshDeserialize, BorshSerialize};
 
 pub type ProgramId = String;
@@ -92,15 +94,49 @@ pub enum Principal {
 /// The founding program that fills each role the kernel calls, as genesis
 /// bound them. Every frame's env carries them, so a program asks a role by
 /// its binding, never by a name it assumes.
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct Roles {
-    pub programs: ProgramId,
-    pub validators: ProgramId,
-    /// Asked, once per frame, which account the frame acts as.
-    pub identity: ProgramId,
-    pub blobs: ProgramId,
-    pub awaits: ProgramId,
-    pub egress: Option<ProgramId>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Roles(BTreeMap<String, ProgramId>);
+
+impl Roles {
+    pub fn get(&self, role: &str) -> Option<&ProgramId> {
+        self.0.get(role)
+    }
+
+    pub fn bound(&self, role: &str) -> Result<&ProgramId, Refusal> {
+        self.get(role).ok_or_else(|| {
+            Refusal::new(
+                reason::UNSUPPORTED,
+                format!("this network binds no program to the {role} role"),
+            )
+        })
+    }
+
+    pub fn bind(&mut self, role: impl Into<String>, program: impl Into<ProgramId>) {
+        self.0.insert(role.into(), program.into());
+    }
+
+    pub fn unfilled(&self) -> Option<&'static str> {
+        role::REQUIRED
+            .iter()
+            .copied()
+            .find(|role| !self.0.contains_key(*role))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ProgramId)> {
+        self.0
+            .iter()
+            .map(|(role, program)| (role.as_str(), program))
+    }
+}
+
+impl<R: Into<String>, P: Into<ProgramId>> FromIterator<(R, P)> for Roles {
+    fn from_iter<I: IntoIterator<Item = (R, P)>>(rows: I) -> Self {
+        Roles(
+            rows.into_iter()
+                .map(|(role, program)| (role.into(), program.into()))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
@@ -392,6 +428,14 @@ pub mod hook {
 pub type ProgramReply = Result<(), Refusal>;
 
 pub mod role {
+    pub const PROGRAMS: &str = "programs";
+    pub const VALIDATORS: &str = "validators";
+    pub const IDENTITY: &str = "identity";
+    pub const BLOBS: &str = "blobs";
+    pub const AWAITS: &str = "awaits";
+    pub const EGRESS: &str = "egress";
+    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS];
+
     /// Which code runs at a height.
     pub mod programs {
         use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
@@ -1109,6 +1153,34 @@ mod tests {
     }
 
     #[test]
+    fn a_role_table_names_the_first_kernel_role_it_lacks() {
+        let full: Roles = role::REQUIRED.iter().map(|role| (*role, *role)).collect();
+        assert_eq!(full.unfilled(), None);
+        assert_eq!(full.get(role::EGRESS), None);
+        assert_eq!(
+            full.bound(role::EGRESS).map_err(|refusal| refusal.reason),
+            Err(reason::UNSUPPORTED.to_owned())
+        );
+        for lacking in role::REQUIRED {
+            let short: Roles = role::REQUIRED
+                .iter()
+                .filter(|role| *role != lacking)
+                .map(|role| (*role, *role))
+                .collect();
+            assert_eq!(short.unfilled(), Some(*lacking));
+        }
+    }
+
+    #[test]
+    fn a_role_table_carries_a_row_no_reader_names() {
+        let mut roles: Roles = role::REQUIRED.iter().map(|role| (*role, *role)).collect();
+        roles.bind("later", "later");
+        let read: Roles = decode(&encode(&roles)).unwrap();
+        assert_eq!(read.get("later").map(String::as_str), Some("later"));
+        assert_eq!(read, roles);
+    }
+
+    #[test]
     fn every_envelope_round_trips() {
         let env = Env {
             network: b"n".to_vec(),
@@ -1117,14 +1189,14 @@ mod tests {
             me: "a".into(),
             origin: Origin::Program("b".into()),
             sender: Some(Principal::Account(4)),
-            roles: Roles {
-                programs: "r".into(),
-                validators: "v".into(),
-                identity: "i".into(),
-                blobs: "b".into(),
-                awaits: "a".into(),
-                egress: Some("e".into()),
-            },
+            roles: Roles::from_iter([
+                (role::PROGRAMS, "r"),
+                (role::VALIDATORS, "v"),
+                (role::IDENTITY, "i"),
+                (role::BLOBS, "b"),
+                (role::AWAITS, "a"),
+                (role::EGRESS, "e"),
+            ]),
             cause: Cause::Completion {
                 item: ItemRef {
                     source: "a".into(),

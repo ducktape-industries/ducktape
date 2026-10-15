@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use abi::role::validators::{Grant, Invite, Motion, Op, Voted};
-use abi::{BlobId, HashKind, Outcome, Scan};
+use abi::{BlobId, HashKind, Outcome, Scan, role};
 use clap::{Parser, Subcommand};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::Runner as _;
@@ -412,16 +412,12 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             );
             println!("identity  {}", hex::encode(&status.identity));
             println!("contract  {}", status.contract);
-            let egress = status.roles.egress.as_deref().unwrap_or("none");
-            println!(
-                "roles     programs {}, validators {}, identity {}, blobs {}, awaits {}, egress {}",
-                status.roles.programs,
-                status.roles.validators,
-                status.roles.identity,
-                status.roles.blobs,
-                status.roles.awaits,
-                egress
-            );
+            let roles: Vec<String> = status
+                .roles
+                .iter()
+                .map(|(role, program)| format!("{role} {program}"))
+                .collect();
+            println!("roles     {}", roles.join(", "));
             Ok(())
         }
         Verb::Submit {
@@ -631,6 +627,10 @@ async fn put_blobs(
         entries.push(blob::file_entry(kind, file).map_err(|refusal| refusal.sentence)?);
     }
     let status = client.status().await.sentence()?;
+    let role = status
+        .roles
+        .bound(role::BLOBS)
+        .map_err(|refusal| refusal.sentence)?;
     let key = signer(workspace)?;
     let put = blob::contract::Op::Put {
         blobs: entries.clone(),
@@ -640,7 +640,7 @@ async fn put_blobs(
         status.network.as_bytes(),
         status.anchor(),
         Some(salt()),
-        &status.roles.blobs,
+        role,
         abi::encode(&put),
     );
     let uploads = files
@@ -670,7 +670,7 @@ async fn put_blobs(
     };
     let bundle: u64 = abi::decode(&output).map_err(|refusal| refusal.sentence)?;
     println!("bundle {bundle} put at block {height}");
-    let since = client.held(&status.roles.blobs, bundle).await.sentence()?;
+    let since = client.held(role, bundle).await.sentence()?;
     println!("bundle {bundle} held since block {since}");
     Ok(())
 }
@@ -682,12 +682,16 @@ async fn membership(
 ) -> Result<(u64, Vec<u8>), String> {
     let status = client.status().await.sentence()?;
     let identity = workspace.identity().sentence()?;
+    let role = status
+        .roles
+        .bound(role::VALIDATORS)
+        .map_err(|refusal| refusal.sentence)?;
     let frame = Frame::sign(
         &identity,
         status.network.as_bytes(),
         status.anchor(),
         Some(salt()),
-        &status.roles.validators,
+        role,
         abi::encode(&op),
     );
     let (height, receipt) = client.land(&frame).await.sentence()?;
