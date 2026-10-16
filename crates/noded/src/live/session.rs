@@ -149,6 +149,9 @@ pub enum Sent {
 
 impl Outlet {
     pub fn send(&self, out: Out) -> Sent {
+        if self.closed().is_some() {
+            return Sent::Behind;
+        }
         if let Out::Control(_) = &out {
             self.nudge();
         }
@@ -867,6 +870,32 @@ mod tests {
         }
         assert_eq!(outlet.send(message), Sent::Behind);
         assert_eq!(outlet.closed(), Some("behind"));
+    }
+
+    #[test]
+    fn a_session_closed_as_behind_takes_nothing_more() {
+        let config = Config::default();
+        let (outlet, mut egress) = outlet(&config);
+        let message = Out::Control(Control::GoAway { in_ms: 1 });
+        for _ in 0..config.session_outbound.get() {
+            assert_eq!(outlet.send(message.clone()), Sent::Queued);
+        }
+        // the dropped object: the queue is full, the session closes as behind
+        assert_eq!(outlet.send(message.clone()), Sent::Behind);
+        // the writer frees room, then the group's end arrives: it must be refused
+        assert!(egress.ordered.try_recv().is_ok());
+        let end = Out::GroupEnd {
+            alias: 1,
+            group: 0,
+            complete: true,
+        };
+        assert_eq!(outlet.send(end), Sent::Behind);
+        let mut left = 0;
+        while let Ok(out) = egress.ordered.try_recv() {
+            assert!(matches!(out, Out::Control(_)), "a group end was queued");
+            left += 1;
+        }
+        assert_eq!(left, config.session_outbound.get() - 1);
     }
 
     #[test]
