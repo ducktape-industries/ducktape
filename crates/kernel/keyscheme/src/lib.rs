@@ -87,6 +87,17 @@ impl KeyScheme {
         }
     }
 
+    /// the scheme a wire message names ([`abi::Scheme`]); `None` for one no
+    /// account key is (`Bls12381`, a validator's), so nothing here verifies it.
+    pub fn from_scheme(scheme: abi::Scheme) -> Option<Self> {
+        match scheme {
+            abi::Scheme::Ed25519 => Some(KeyScheme::Ed25519),
+            abi::Scheme::Secp256k1 => Some(KeyScheme::Secp256k1),
+            abi::Scheme::Secp256r1 => Some(KeyScheme::Secp256r1),
+            abi::Scheme::Bls12381 => None,
+        }
+    }
+
     /// a fast, allocation-free well-formedness check on a public key's bytes
     /// for this scheme — rules out bytes that could never be a key of this
     /// scheme, AND every non-canonical spelling of one that could

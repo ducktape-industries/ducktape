@@ -9,4 +9,3 @@ name = "live_wire"
 [dependencies]
 abi = { workspace = true }
 borsh = { workspace = true }
-keyscheme = { workspace = true }

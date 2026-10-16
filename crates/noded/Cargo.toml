@@ -19,6 +19,7 @@ consensus = { workspace = true }
 futures = { workspace = true }
 halo = { workspace = true }
 hex = "0.4"
+keyscheme = { workspace = true }
 live-wire = { workspace = true }
 http-body-util = "0.1"
 host = { workspace = true }
