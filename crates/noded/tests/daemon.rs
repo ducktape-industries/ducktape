@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use abi::role::halo;
 use abi::role::validators::{Motion, Op};
 use abi::{BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason, role};
 use blob::contract::Entry;
@@ -25,6 +26,7 @@ const IDENTITY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_ident
 const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
 const BLOBS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_halo.wasm");
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
@@ -69,6 +71,7 @@ struct Seat {
     http: SocketAddr,
     tls: SocketAddr,
     halo: SocketAddr,
+    live: Option<SocketAddr>,
     registered: String,
     address: Option<String>,
 }
@@ -89,6 +92,7 @@ impl Seat {
             http: free_port(),
             tls: free_port(),
             halo,
+            live: Some((outbound_ip(), 0).into()),
             registered: halo.to_string(),
             address: Some(format!("tcp://localhost:{}", p2p.port())),
         }
@@ -157,6 +161,7 @@ impl Seat {
             http: self.http,
             tls: Some(self.tls),
             halo: self.halo,
+            live: self.live,
         };
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
@@ -219,6 +224,24 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("identity.wasm"), IDENTITY).unwrap();
     std::fs::write(root.join("blobs.wasm"), BLOBS).unwrap();
     std::fs::write(root.join("awaits.wasm"), AWAITS).unwrap();
+    std::fs::write(root.join("halo.wasm"), HALO).unwrap();
+    let lanes = vec![
+        halo::Founded {
+            name: blob::contract::LANE.to_owned(),
+            cap: halo::Class::Critical,
+            pinned: true,
+        },
+        halo::Founded {
+            name: live_wire::LANE.to_owned(),
+            cap: halo::Class::Client,
+            pinned: false,
+        },
+    ];
+    std::fs::write(
+        root.join("halo.params"),
+        abi::encode(&halo::Genesis { lanes }),
+    )
+    .unwrap();
     let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
     let holders = vec![(putter.public_key().as_ref().to_vec(), PUTTER_ACCOUNT)];
     std::fs::write(root.join("holders.bin"), abi::encode(&holders)).unwrap();
@@ -228,7 +251,7 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
          block_time_ms = {BLOCK_TIME_MS}\nmember_cap = {MEMBER_CAP}\n\
          [roles]\nprograms = \"programs\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
-         blobs = \"blobs\"\nawaits = \"awaits\"\n\
+         blobs = \"blobs\"\nawaits = \"awaits\"\nhalo = \"halo\"\n\
          {validators}\
          [[programs]]\nid = \"programs\"\ncode = \"programs.wasm\"\n\
          [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\n\
@@ -236,7 +259,8 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
          [[programs]]\nid = \"blobs\"\ncode = \"blobs.wasm\"\n\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n\
-         [[programs]]\nid = \"awaits\"\ncode = \"awaits.wasm\"\n"
+         [[programs]]\nid = \"awaits\"\ncode = \"awaits.wasm\"\n\
+         [[programs]]\nid = \"halo\"\ncode = \"halo.wasm\"\nparams = \"halo.params\"\n"
     );
     let path = root.join("genesis.toml");
     std::fs::write(&path, text).unwrap();
@@ -343,6 +367,14 @@ fn a_validator_serves_its_network_over_http() {
             seat.identity.public_key().as_ref().to_vec()
         );
         assert_eq!(status.contract, noded::NODE_CONTRACT);
+        assert!(
+            client
+                .live_port()
+                .await
+                .unwrap()
+                .is_some_and(|port| port != 0),
+            "live tracks are dialed at the relay's own udp, `run --live`, bound where the node says"
+        );
         assert_eq!(
             status.genesis,
             node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0,
@@ -351,6 +383,23 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(
             status.roles.get(role::VALIDATORS).map(String::as_str),
             Some("valset")
+        );
+        assert_eq!(
+            status.roles.get(role::HALO).map(String::as_str),
+            Some("halo")
+        );
+        let pins: Vec<(String, bool)> = lanes(&client, &seat.identity)
+            .await
+            .into_iter()
+            .map(|lane| (lane.name, lane.pinned))
+            .collect();
+        assert_eq!(
+            pins,
+            [
+                (blob::contract::LANE.to_owned(), true),
+                (live_wire::LANE.to_owned(), false),
+            ],
+            "the founding pins the lane blocks are applied over"
         );
 
         let landing = frame(&client, &alice, vec![Step::Fail("landed".into())]).await;
@@ -767,6 +816,75 @@ fn a_changes_subscriber_that_closes_is_answered() {
         assert!(
             matches!(answered.as_slice(), [Message::Close(_)]),
             "{answered:?}"
+        );
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    // The one test that names a live port up front: the socket it holds is the one the node
+    // is told to bind.
+    let taken = free_udp_port();
+    let _holder = UdpSocket::bind(taken).unwrap();
+    let listen = Listen {
+        p2p: seat.p2p,
+        http: seat.http,
+        tls: Some(seat.tls),
+        halo: seat.halo,
+        live: Some(taken),
+    };
+    let workspace = seat.workspace.clone();
+    let refused = runner(&workspace.runtime_dir()).start(|context| async move {
+        let logs = Logs::install("info").unwrap();
+        let cadence = workspace
+            .descriptor()
+            .unwrap()
+            .cadence(consensus::Timeouts::default())
+            .unwrap();
+        noded::run(
+            context,
+            &workspace,
+            logs,
+            listen,
+            HaloConfig::default(),
+            LoadConfig::default(),
+            cadence,
+        )
+        .await
+        .err()
+    });
+    let Some(noded::Error::Address(sentence)) = refused else {
+        panic!("a taken live socket refuses the start as an address: {refused:?}");
+    };
+    assert!(
+        sentence.starts_with(&format!("--live {taken}: ")),
+        "{sentence}"
+    );
+}
+
+#[test]
+fn a_node_run_without_live_names_no_live_port() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat {
+        live: None,
+        ..Seat::new(root.path(), "n0")
+    };
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        assert_eq!(
+            client.live_port().await.unwrap(),
+            None,
+            "no QUIC door: a client takes the websocket alone"
         );
         seat.admin(&client, Admin::Shutdown).await;
     });
@@ -1259,9 +1377,10 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
             panic!("the put applies: {receipt:?}");
         };
         let bundle: u64 = abi::decode(&output).unwrap();
-        ::tokio::time::timeout(Duration::from_secs(60), client.held(&role, bundle))
+        let gathered = &live[1].client;
+        ::tokio::time::timeout(Duration::from_secs(60), gathered.held(&role, bundle))
             .await
-            .expect("both validators receipt the bundle once each holds it")
+            .expect("the gatherer applies the block where both validators hold the bundle")
             .unwrap();
 
         let ids: Vec<BlobId> = entries.iter().map(|entry| entry.id).collect();
@@ -1269,7 +1388,6 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
             blob::frame("page", b"a small page").unwrap(),
             blob::frame("page", &vec![7u8; 3 << 20]).unwrap(),
         ];
-        let gathered = &live[1].client;
         assert_eq!(
             gathered.blobs(&ids).await.unwrap(),
             framed.clone().map(Some).to_vec()
@@ -1344,6 +1462,75 @@ fn shut_down(runtime: &::tokio::runtime::Runtime, seats: &[&Seat], live: Vec<Liv
     }
 }
 
+async fn lanes(client: &Client, key: &ed25519::PrivateKey) -> Vec<halo::Lane> {
+    let asked = signed(client, key, "halo", abi::encode(&halo::Query::Lanes)).await;
+    let answer = client.query(Layer::Confirmed, asked).await.unwrap();
+    match abi::decode(&answer).unwrap() {
+        halo::Reply::Lanes(lanes) => lanes,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Founded with no lane: the block that votes blobs' lane open has both validators serve it, so a
+/// later put is gathered over it and held.
+#[test]
+fn a_lane_the_validators_vote_open_is_served_from_its_block() {
+    let root = tempfile::tempdir().unwrap();
+    let taker = Seat::new(root.path(), "n0");
+    let gatherer = Seat::new(root.path(), "n1");
+    let founding = founding(root.path(), &[&taker, &gatherer], EPOCH_LENGTH);
+    let unlaned = halo::Genesis { lanes: Vec::new() };
+    std::fs::write(root.path().join("halo.params"), abi::encode(&unlaned)).unwrap();
+    taker.init(&founding);
+    gatherer.init(&founding);
+    let live = vec![taker.start(), gatherer.start()];
+    let page = root.path().join("page");
+    std::fs::write(&page, b"gathered once the lane is open").unwrap();
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let client = &live[0].client;
+        assert_eq!(lanes(client, &taker.identity).await, []);
+        let open = halo::Op::Open {
+            name: blob::contract::LANE.into(),
+            cap: halo::Class::Critical,
+        };
+        let motion = Motion::Role {
+            role: role::HALO.into(),
+            op: abi::encode(&open),
+        };
+        let height = membership(client, &taker.identity, Op::Vote(motion)).await;
+        let opened = halo::Lane {
+            name: blob::contract::LANE.into(),
+            id: 0,
+            cap: halo::Class::Critical,
+            enabled: true,
+            pinned: false,
+            since: height,
+        };
+        assert_eq!(lanes(client, &taker.identity).await, [opened]);
+
+        let (id, bundle) = put_page(client, &page, 1).await;
+        let role = client
+            .status()
+            .await
+            .unwrap()
+            .roles
+            .bound(role::BLOBS)
+            .unwrap()
+            .clone();
+        ::tokio::time::timeout(Duration::from_secs(60), live[1].client.held(&role, bundle))
+            .await
+            .expect("the gatherer gathers and receipts the bundle over the lane the vote opened")
+            .unwrap();
+        let framed = blob::frame("page", b"gathered once the lane is open").unwrap();
+        assert_eq!(
+            live[1].client.blobs(&[id]).await.unwrap(),
+            vec![Some(framed)]
+        );
+    });
+    shut_down(&runtime, &[&taker, &gatherer], live);
+}
+
 #[test]
 fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_dials_and_held() {
     let root = tempfile::tempdir().unwrap();
@@ -1375,6 +1562,10 @@ fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_di
             .unwrap();
         let framed = blob::frame("page", b"held through a hidden member").unwrap();
         for gathered in &live[..2] {
+            ::tokio::time::timeout(Duration::from_secs(60), gathered.client.held(&role, bundle))
+                .await
+                .expect("the gatherer applied the block that holds the bundle")
+                .unwrap();
             assert_eq!(
                 gathered.client.blobs(&[id]).await.unwrap(),
                 vec![Some(framed.clone())]
@@ -1425,6 +1616,10 @@ fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
             moved / EPOCH,
             "the move landed at {moved} and the bundle was held at {since}, past the epoch's end"
         );
+        ::tokio::time::timeout(Duration::from_secs(60), live[1].client.held(&role, bundle))
+            .await
+            .expect("the gatherer applied the block that holds the bundle")
+            .unwrap();
         let framed = blob::frame("page", b"gathered at the new address").unwrap();
         assert_eq!(
             live[1].client.blobs(&[id]).await.unwrap(),

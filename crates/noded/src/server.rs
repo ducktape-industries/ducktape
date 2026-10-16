@@ -45,6 +45,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>, load: LoadConfig) -> Router {
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
+        .route(live_wire::PORT_ROUTE, get(live_port::<E>))
         .route(route::QUERY, post(query::<E>))
         .layer(middleware::from_fn_with_state(read_permits, bounded));
     let uploads = Router::new()
@@ -59,7 +60,8 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>, load: LoadConfig) -> Router {
             &format!("{}/{{program}}", route::CHANGES),
             get(changes::<E>),
         )
-        .route(route::P2P, get(p2p::<E>));
+        .route(route::P2P, get(p2p::<E>))
+        .route(live_wire::ROUTE, get(live_socket::<E>));
     reads.merge(uploads).merge(streams).with_state(daemon)
 }
 
@@ -551,6 +553,19 @@ async fn p2p<E: Context>(
 ) -> Response {
     let mesh = daemon.mesh;
     upgrade.on_upgrade(move |socket| crate::transport::inbound_websocket(socket, mesh))
+}
+
+/// The UDP port a client dials for live tracks, `None` when the node runs no QUIC door.
+async fn live_port<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Option<u16>> {
+    Reply::Answered(daemon.live.port())
+}
+
+async fn live_socket<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let live = daemon.live.clone();
+    crate::live::ws_upgrade(upgrade).on_upgrade(move |socket| live.serve_ws(socket))
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use abi::role::validators::{Grant, Invite, Motion, Op, Voted};
@@ -77,7 +77,7 @@ enum Verb {
         invite: Option<String>,
     },
     #[command(about = "run the node; a flag overrides the workspace's node.toml")]
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     #[command(about = "print the node's height, tip, root, epoch and identity")]
     Status,
     #[command(
@@ -165,6 +165,15 @@ struct RunArgs {
     http: Option<SocketAddr>,
     #[arg(long, help = setting("the socket peers reach over tls", "tls"))]
     tls: Option<SocketAddr>,
+    #[arg(
+        long,
+        help = setting(
+            "the UDP socket desktop clients reach live tracks on over QUIC; without it they take \
+             the websocket on the http port",
+            "live"
+        )
+    )]
+    live: Option<SocketAddr>,
     #[arg(
         long,
         help = setting(
@@ -257,6 +266,80 @@ struct RunArgs {
     blob_gatherers: Option<NonZeroUsize>,
     #[arg(
         long,
+        value_parser = permits,
+        help = defaulted(
+            "the live messages waiting for one session's loop; a full queue holds the publisher \
+             back through the transport",
+            "load.live_session_inbound",
+            LoadConfig::default().live_session_inbound
+        )
+    )]
+    live_session_inbound: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        value_parser = permits,
+        help = defaulted(
+            "the live messages and objects waiting for one session's connection; a session this \
+             far behind is closed",
+            "load.live_session_outbound",
+            LoadConfig::default().live_session_outbound
+        )
+    )]
+    live_session_outbound: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        value_parser = permits,
+        help = defaulted(
+            "the objects waiting for one live group stream's writer, to a client or a peer; past \
+             it the group is dropped short",
+            "load.live_group_queue",
+            LoadConfig::default().live_group_queue
+        )
+    )]
+    live_group_queue: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        value_parser = permits,
+        help = defaulted(
+            "the live lane items waiting for one peer's writer; past it the writer is dropped and \
+             the peer resynced",
+            "load.live_peer_queue",
+            LoadConfig::default().live_peer_queue
+        )
+    )]
+    live_peer_queue: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        value_parser = permits,
+        help = defaulted(
+            "the live lane streams peers opened that wait for this node to take them",
+            "load.live_lane_backlog",
+            LoadConfig::default().live_lane_backlog
+        )
+    )]
+    live_lane_backlog: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        value_parser = permits,
+        help = defaulted(
+            "the live lane datagrams waiting per peer; past it the oldest is dropped",
+            "load.live_lane_per_sender",
+            LoadConfig::default().live_lane_per_sender
+        )
+    )]
+    live_lane_per_sender: Option<NonZeroUsize>,
+    #[arg(
+        long,
+        help = defaulted(
+            "how long a closed live session's last message gets to reach the client, in \
+             milliseconds",
+            "load.live_linger_ms",
+            LoadConfig::default().live_linger.as_millis()
+        )
+    )]
+    live_linger_ms: Option<NonZeroU64>,
+    #[arg(
+        long,
         help = defaulted(
             "how long a view waits for its leader's proposal",
             "consensus.leader_timeout_ms",
@@ -291,6 +374,7 @@ impl RunArgs {
             http: self.http,
             tls: self.tls,
             halo: self.halo,
+            live: self.live,
             log: self.log,
             load: LoadSettings {
                 halo_egress: self.halo_egress,
@@ -301,6 +385,13 @@ impl RunArgs {
                 blob_serves_in_flight: self.blob_serves_in_flight,
                 blob_backlog: self.blob_backlog,
                 blob_gatherers: self.blob_gatherers,
+                live_session_inbound: self.live_session_inbound,
+                live_session_outbound: self.live_session_outbound,
+                live_group_queue: self.live_group_queue,
+                live_peer_queue: self.live_peer_queue,
+                live_lane_backlog: self.live_lane_backlog,
+                live_lane_per_sender: self.live_lane_per_sender,
+                live_linger_ms: self.live_linger_ms,
             },
             consensus: ConsensusSettings {
                 leader_timeout_ms: self.leader_timeout_ms,
@@ -352,9 +443,16 @@ enum VoteVerb {
     #[command(about = "make enrolling take an invite")]
     Close,
     #[command(
-        about = "send the programs role an op, a file or stdin: schedule or cancel a program change"
+        about = "send the program bound to a role an op, a file or stdin: `programs` schedules or cancels a program change, `halo` opens, sets or closes a lane"
     )]
-    Programs { op: Option<PathBuf> },
+    Role { role: String, op: Option<PathBuf> },
+    #[command(
+        about = "bind a program to a role, or unbind the role without a program; a role the network binds for its life is refused"
+    )]
+    Bind {
+        role: String,
+        program: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -791,7 +889,11 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
         VoteVerb::Remove { key: member } => Motion::Remove { key: key(member)? },
         VoteVerb::Open => Motion::Door { open: true },
         VoteVerb::Close => Motion::Door { open: false },
-        VoteVerb::Programs { op } => Motion::Programs { op: bytes(op)? },
+        VoteVerb::Role { role, op } => Motion::Role {
+            role,
+            op: bytes(op)?,
+        },
+        VoteVerb::Bind { role, program } => Motion::Bind { role, program },
     })
 }
 
@@ -951,7 +1053,9 @@ mod tests {
 
     use std::num::NonZeroUsize;
 
-    use super::{Cli, ConsensusSettings, LoadSettings, RunArgs, Settings, Verb};
+    use std::num::NonZeroU64;
+
+    use super::{Cli, ConsensusSettings, LoadSettings, Settings, Verb};
 
     #[test]
     fn a_registered_halo_address_refuses_a_bind_only_host_and_run_binds_one() {
@@ -992,10 +1096,10 @@ mod tests {
             "0.0.0.0:9100",
         ])
         .unwrap();
-        let Verb::Run(RunArgs { halo, .. }) = run.verb else {
+        let Verb::Run(args) = run.verb else {
             panic!("run parses");
         };
-        assert_eq!(halo, Some("0.0.0.0:9100".parse().unwrap()));
+        assert_eq!(args.halo, Some("0.0.0.0:9100".parse().unwrap()));
     }
 
     fn run(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -1023,12 +1127,22 @@ mod tests {
             "--uploads-in-flight",
             "--blob-serves-in-flight",
             "--blob-backlog",
+            "--live-session-inbound",
+            "--live-session-outbound",
+            "--live-group-queue",
+            "--live-peer-queue",
+            "--live-lane-backlog",
+            "--live-lane-per-sender",
         ] {
             assert!(run(&[flag, "0"]).is_err(), "{flag}");
             assert!(run(&[flag, &past_tokio]).is_err(), "{flag}");
             assert!(run(&[flag, "1"]).is_ok(), "{flag}");
         }
         assert!(run(&["--blob-gatherers", "0"]).is_err());
+        assert!(
+            run(&["--live-linger-ms", "0"]).is_err(),
+            "a live clock runs"
+        );
     }
 
     #[test]
@@ -1047,6 +1161,8 @@ mod tests {
             "127.0.0.1:9443",
             "--halo",
             "0.0.0.0:9100",
+            "--live",
+            "0.0.0.0:9200",
             "--log",
             "debug",
             "--halo-egress",
@@ -1065,6 +1181,20 @@ mod tests {
             "40",
             "--blob-gatherers",
             "5",
+            "--live-session-inbound",
+            "64",
+            "--live-session-outbound",
+            "256",
+            "--live-group-queue",
+            "8",
+            "--live-peer-queue",
+            "32",
+            "--live-lane-backlog",
+            "4",
+            "--live-lane-per-sender",
+            "16",
+            "--live-linger-ms",
+            "700",
             "--leader-timeout-ms",
             "4000",
             "--certification-timeout-ms",
@@ -1079,6 +1209,7 @@ mod tests {
                 http: Some("127.0.0.1:8844".parse().unwrap()),
                 tls: Some("127.0.0.1:9443".parse().unwrap()),
                 halo: Some("0.0.0.0:9100".parse().unwrap()),
+                live: Some("0.0.0.0:9200".parse().unwrap()),
                 log: Some("debug".into()),
                 load: LoadSettings {
                     halo_egress: Some(1_000_000),
@@ -1089,6 +1220,13 @@ mod tests {
                     blob_serves_in_flight: Some(count(3)),
                     blob_backlog: Some(count(40)),
                     blob_gatherers: Some(count(5)),
+                    live_session_inbound: Some(count(64)),
+                    live_session_outbound: Some(count(256)),
+                    live_group_queue: Some(count(8)),
+                    live_peer_queue: Some(count(32)),
+                    live_lane_backlog: Some(count(4)),
+                    live_lane_per_sender: Some(count(16)),
+                    live_linger_ms: NonZeroU64::new(700),
                 },
                 consensus: ConsensusSettings {
                     leader_timeout_ms: Some(4000),

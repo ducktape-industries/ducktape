@@ -6,13 +6,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use abi::BlobId;
-use blob::contract::{Bundle, Custody, Entry, bundle_key};
+use blob::contract::{Bundle, Custody, Entry, LANE, bundle_key};
 use blob::service::{self, Due, Service};
 use blob::{Blobs, frame};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
-use halo::{Config, Halo, Queues, Seat};
+use halo::{Class, Config, Halo, Lane, Queues, Seat};
 
 struct Node {
     service: Service,
@@ -29,6 +29,14 @@ fn node(context: &runtime::Context, seed: u64, validator: bool) -> (Node, Arc<Ha
         queues: Queues::default(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());
+    halo.plane().lanes(vec![Lane {
+        name: LANE.into(),
+        id: 0,
+        cap: Class::Critical,
+        enabled: true,
+        pinned: false,
+        since: 0,
+    }]);
     let seat = Seat {
         key,
         halo: format!("localhost:{}", halo.udp().unwrap().port()),
@@ -79,20 +87,45 @@ fn an_upload_is_staged_only_when_it_carries_the_blobs_its_put_names() {
         let (taker, _) = node(&context.child("taker"), 1, true);
         let (entry, framed) = page(b"carried");
         let mut short = &framed[..framed.len() - 1];
-        assert!(taker.service.stage(std::slice::from_ref(&entry), &mut short).await.is_err());
+        assert!(
+            taker
+                .service
+                .stage(std::slice::from_ref(&entry), &mut short)
+                .await
+                .is_err()
+        );
         let mut long = [framed.as_slice(), b"x"].concat();
         let mut long = long.as_mut_slice() as &[u8];
-        assert!(taker.service.stage(std::slice::from_ref(&entry), &mut long).await.is_err());
+        assert!(
+            taker
+                .service
+                .stage(std::slice::from_ref(&entry), &mut long)
+                .await
+                .is_err()
+        );
         let mut mislabelled = entry.clone();
         mislabelled.kind = "pack".into();
         let mut exact = framed.as_slice();
-        assert!(taker.service.stage(&[mislabelled], &mut exact).await.is_err());
+        assert!(
+            taker
+                .service
+                .stage(&[mislabelled], &mut exact)
+                .await
+                .is_err()
+        );
         let mut exact = framed.as_slice();
-        taker.service.stage(std::slice::from_ref(&entry), &mut exact).await.unwrap();
+        taker
+            .service
+            .stage(std::slice::from_ref(&entry), &mut exact)
+            .await
+            .unwrap();
         assert!(!taker.service.store().has(&entry.id));
         let put = bundle(vec![entry.clone()], Custody::Receipted(Vec::new()));
         taker.service.applied(1, &writes(0, &put));
-        assert_eq!(taker.service.store().framed(&entry.id).unwrap(), Some(framed));
+        assert_eq!(
+            taker.service.store().framed(&entry.id).unwrap(),
+            Some(framed)
+        );
     });
 }
 
@@ -111,7 +144,10 @@ fn a_resident_gathers_a_bundle_from_the_node_that_took_the_upload() {
             .stage(&[small.clone(), big.clone()], &mut body)
             .await
             .unwrap();
-        let put = bundle(vec![small.clone(), big.clone()], Custody::Receipted(Vec::new()));
+        let put = bundle(
+            vec![small.clone(), big.clone()],
+            Custody::Receipted(Vec::new()),
+        );
         taker.service.applied(1, &writes(0, &put));
         let mut landed = resident.service.landed();
         resident.service.applied(1, &writes(0, &put));
@@ -140,7 +176,11 @@ fn a_validator_receipts_a_bundle_it_holds_whole_keeps_its_posted_receipt_and_sto
         seat_all(&[&taker_halo, &validator_halo], &[&taker, &validator]);
         let (entry, framed) = page(b"receipted");
         let mut body = framed.as_slice();
-        taker.service.stage(std::slice::from_ref(&entry), &mut body).await.unwrap();
+        taker
+            .service
+            .stage(std::slice::from_ref(&entry), &mut body)
+            .await
+            .unwrap();
         let put = bundle(vec![entry.clone()], Custody::Receipted(Vec::new()));
         assert!(taker.service.applied(1, &writes(0, &put)).is_empty());
         let mut landed = validator.service.landed();
@@ -154,7 +194,12 @@ fn a_validator_receipts_a_bundle_it_holds_whole_keeps_its_posted_receipt_and_sto
         assert_eq!(validator.service.applied(3, &BTreeMap::new()), vec![posted]);
         let key = validator.seat.key.as_ref().to_vec();
         let receipted = bundle(vec![entry], Custody::Receipted(vec![key]));
-        assert!(validator.service.applied(4, &writes(0, &receipted)).is_empty());
+        assert!(
+            validator
+                .service
+                .applied(4, &writes(0, &receipted))
+                .is_empty()
+        );
         assert!(validator.service.applied(40, &BTreeMap::new()).is_empty());
     });
 }
@@ -168,7 +213,7 @@ fn a_fetch_takes_a_blob_no_bundle_names_from_a_member_that_holds_it() {
         let framed = frame("code", b"rostered").unwrap();
         let id: BlobId = blob::id_of(abi::HashKind::Sha256, &framed).unwrap();
         holder.service.store().write(&id, &framed).unwrap();
-        asker.service.fetch(id, halo::Class::Critical).await;
+        asker.service.fetch(id, Class::Critical).await;
         assert_eq!(asker.service.store().framed(&id).unwrap(), Some(framed));
     });
 }

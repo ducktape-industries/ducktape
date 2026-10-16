@@ -122,6 +122,11 @@ impl<S> Paced<S> {
     pub fn class(&self) -> Class {
         self.class
     }
+
+    /// The stream under the pacing, for what only the stream can do (a lane abandoning it).
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Paced<S> {

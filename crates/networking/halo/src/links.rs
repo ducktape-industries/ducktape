@@ -82,6 +82,13 @@ impl AsyncWrite for Carried {
     }
 }
 
+impl Carried {
+    /// Abandons the stream, so the peer reads a reset rather than a clean end.
+    pub fn reset(mut self) {
+        let _ = self.send.reset(0u32.into());
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
     Dialed,

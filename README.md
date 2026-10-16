@@ -65,6 +65,7 @@ identity = "identity"         # resolves a key or a program to its account
 blobs = "blobs"               # records each bundle of blobs put and which validators hold it
 awaits = "awaits"             # keeps the tickets of frames that await a call, and hands each its answer
 egress = "egress"             # optional: answers programs' calls outside the chain; nodes read it, the kernel never calls it
+halo = "halo"                 # holds the lane table halo serves: each lane's wire id, class cap, whether it is served and whether it is pinned
 scheduler = "scheduler"       # optional: keeps the runs programs schedule for later heights; the kernel runs each at the end of its block
 
 [[validators]]
@@ -91,6 +92,11 @@ code = "blobs.wasm"
 [[programs]]
 id = "awaits"
 code = "awaits.wasm"
+
+[[programs]]
+id = "halo"
+code = "halo.wasm"
+params = "halo.params"        # the founding lanes, in order from id 0, each pinned or not
 
 [[programs]]
 id = "ping"
@@ -120,7 +126,7 @@ runs as no one (`None`). A program may send a message as another account
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so a program account whose script calls a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
-validators, identity, awaits, egress, scheduler}`; the programs repository's `docs/roles.md` walks through them.
+validators, identity, awaits, egress, scheduler, halo}`; the programs repository's `docs/roles.md` walks through them.
 
 A program can wait for another program's answer. Its `execute` is an async
 Rust function (the program SDK's `awaiting_program!`), and each
@@ -197,10 +203,13 @@ Membership changes only by the validators' vote. The door starts closed, so
 a stranger needs an invite a validator signed: `ducktape invite` prints one,
 good for one enrollment for 72 hours (`--hours`). Validators vote with
 `ducktape vote promote|demote|remove <key>`, `ducktape vote open|close` (the
-door), and `ducktape vote programs <op>`, which sends the programs role a
-program change once it passes; the programs role takes a change from nothing
-else. A motion passes when more than two thirds of the current validators
-vote for it. `ducktape leave` takes the node out; the last validator cannot
+door), `ducktape vote role <role> <op>`, which runs `op` on the program bound
+to the role once it passes (`programs` takes a program change, `halo` a lane
+to open, set or close; neither takes a change from anything else), and
+`ducktape vote bind <role> [program]`, which binds a program to a role, or
+unbinds the role, on the running network (a role in `abi::role::REQUIRED` is
+bound for the network's life). A motion passes when more than two thirds of
+the current validators vote for it. `ducktape leave` takes the node out; the last validator cannot
 leave. Each prints the block that carried it.
 
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
@@ -300,6 +309,7 @@ listen = "127.0.0.1:9000"     # --listen; no default
 http = "127.0.0.1:8844"       # --http; default 127.0.0.1:0
 tls = "127.0.0.1:9443"        # --tls; default none
 halo = "0.0.0.0:9100"         # --halo; no default
+live = "0.0.0.0:9200"         # --live; default none: desktop clients take the websocket on the http port
 log = "info"                  # --log; default info
 
 [load]
@@ -311,6 +321,13 @@ uploads_in_flight = 16        # --uploads-in-flight
 blob_serves_in_flight = 32    # --blob-serves-in-flight
 blob_backlog = 128            # --blob-backlog
 blob_gatherers = 8            # --blob-gatherers
+live_session_inbound = 1024   # --live-session-inbound
+live_session_outbound = 4096  # --live-session-outbound
+live_group_queue = 256        # --live-group-queue
+live_peer_queue = 1024        # --live-peer-queue
+live_lane_backlog = 64        # --live-lane-backlog
+live_lane_per_sender = 256    # --live-lane-per-sender
+live_linger_ms = 5000         # --live-linger-ms
 
 [consensus]
 leader_timeout_ms = 5000          # --leader-timeout-ms; default 20 block times
@@ -386,7 +403,41 @@ uploads (submit, blob put) it serves together; the rest wait their turn.
 `--blob-serves-in-flight` and `--blob-gatherers` are the blobs it sends to
 members and gathers from members together. `--blob-backlog` is how many
 members' blob requests wait for a send; past it a request is refused.
-`ducktape run --help` shows each default and its `node.toml` key.
+The live relay's queues are `run` flags too: `--live-session-inbound` and
+`--live-session-outbound` are the messages waiting for one client session's
+loop and for its connection (a session that far behind is closed),
+`--live-group-queue` the objects waiting for one group stream's writer (past
+it the group is dropped short), `--live-peer-queue`, `--live-lane-backlog` and
+`--live-lane-per-sender` the lane items waiting for one peer's writer, the
+peers' streams waiting to be taken and the datagrams waiting per peer; its
+chain reads run under `--reads-in-flight`. `--live-linger-ms` is how long a
+closed session's last message gets to reach the client before the connection
+is closed under it. `ducktape run --help` shows each default and its
+`node.toml` key.
+
+Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). The halo
+role's program holds the lane table: each lane's name, the id its streams and datagrams carry
+on the wire, the highest class it is served at, whether it is served, and whether it is pinned.
+A node reads the table at start and again after any block that writes it or swaps the halo
+program's code, so every node changes lanes at the same block. Only the validators' vote
+changes it (`ducktape vote role halo <op>`, an `abi::role::halo::Op`): it opens a lane at the next
+id, sets a lane's class or pauses it, or closes one; an id is never handed out twice. A lane is pinned only at founding, and no
+vote pauses or closes a pinned lane. Pin `ducktape/blobs`: a node fetches the blobs a block
+reads over it, so a vote that paused it would cut a node off from the very block that undoes
+the vote. A stream is served at the lower of the class it asks and its lane's cap. A stream
+already open when its lane is paused or closed runs on.
+
+Live tracks: the relay in every node (`crates/noded/src/live/`) lets a desktop
+client publish and subscribe to tracks of a room off consensus, in what the
+room's program granted its account under the `live` table, over QUIC on a UDP
+socket of its own (`run --live 0.0.0.0:9200`, ALPN `ducktape-live`, the node
+key's certificate) or the WebSocket `/v1/live`; nodes carry a track between
+their clients over halo's lane `ducktape/live`. `GET /v1/live/port` names the QUIC port, or
+none without `--live`, and then clients take the WebSocket. A node built before the route
+answers 404, which the app reads as live unavailable, so the route moves no contract number
+(`noded::NODE_CONTRACT` stays 9). The clocks a client must honour are `live-wire`'s:
+`HANDSHAKE_WAIT` for each step of the handshake, `KEEP_ALIVE` and `IDLE` (a connection silent
+that long is closed, on either path), and `IDLE_SESSION` for a session holding nothing.
 
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844
@@ -454,9 +505,9 @@ node; the mutating ones are signed with the node's own identity key. Each verb's
 | Layer | Where | What |
 | --- | --- | --- |
 | Kernel | `crates/kernel/` | `abi` (the bytes ABI), `program` (the small program SDK the fixtures compile against), `runtime` (the wasmtime embedding), `state` (the authenticated store and its commitments), `host` (the sandbox: submit, query, and the messages a frame emits, run in that frame), `node` (frames, blocks, the mempool), `consensus` (Simplex BFT over marshal, per-epoch engines, catch-up), `statesync` (a joiner adopts a network's state); `fixtures/` is its own workspace of wasm32 test programs |
-| Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset`, `identity`, `blobs` and `awaits`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
+| Programs | [`ducktape-industries/programs`](https://github.com/ducktape-industries/programs) | The contracts a program compiles against (`crates/sdk/abi`, a copy of `crates/kernel/abi` here, and `crates/sdk/program`, the full program SDK), the boot set (`crates/system/`: `programs`, `valset`, `identity`, `blobs`, `awaits` and `halo`, whose suite founds this host over their bytes) and the app programs. The system programs beyond the boot set are archived at `ducktape-industries/ducktape-system-modules-archive` |
 | Blobs | `crates/blob/` | `blob`: the framing a blob's id hashes and the blobs program's contract (wasm32, no features); the content-addressed store (feature `store`); and the service a node gathers, serves and receipts blobs with over halo (feature `node`) |
-| Network | `crates/networking/halo/` | `halo`, the network between members off consensus: QUIC on UDP at each member's registered halo address, admission of current members by node key, lanes, the egress pacer and its priority classes |
+| Network | `crates/networking/halo/`, `crates/networking/live-wire/` | `halo`, the network between members off consensus: QUIC on UDP at each member's registered halo address, admission of current members by node key, lanes bound by name over the halo role's table, the egress pacer and its priority classes; `live-wire`, the messages a desktop client and a node speak to publish and subscribe to live tracks, which a client links on its own |
 | Daemon | `crates/noded/`, `bin/node/` | The `/v1` HTTP and WebSocket surface, the lookup mesh, the workspace on disk, the client, and the `ducktape` binary |
 
 ## Develop

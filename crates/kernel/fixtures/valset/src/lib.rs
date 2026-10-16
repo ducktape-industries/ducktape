@@ -1,5 +1,6 @@
 // A validators program for the kernel's tests: it speaks the role's ops with no rules. Anyone
-// enrolls as a resident, and any one vote enacts a promotion, a demotion or a removal at once.
+// enrolls as a resident, and any one vote enacts a promotion, a demotion or a removal at once,
+// or sends the halo role its op.
 
 pub const VALIDATORS: &[u8] = b"validators";
 pub const RESIDENTS: &[u8] = b"residents";
@@ -61,7 +62,9 @@ mod program {
                 .find(|member| member.key == key)
         }
 
-        fn enact(&mut self, motion: Motion) -> Result<(), Refusal> {
+        /// Enacts a roster motion; a role motion changes no roster and is
+        /// returned as the op the role's program runs, a bind as the row.
+        fn enact(&mut self, motion: Motion) -> Result<Option<Forwarded>, Refusal> {
             match motion {
                 Motion::Promote { key } => {
                     let member = self.take(&key).ok_or_else(not_a_member)?;
@@ -74,15 +77,31 @@ mod program {
                 Motion::Remove { key } => {
                     self.take(&key).ok_or_else(not_a_member)?;
                 }
-                Motion::Door { .. } | Motion::Programs { .. } => {
+                Motion::Role { role, op } => return Ok(Some(Forwarded::Op { role, op })),
+                Motion::Bind { role, program } => {
+                    return Ok(Some(Forwarded::Bind { role, program }));
+                }
+                Motion::Door { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
-                        "the fixture valset has no door and no programs motion",
+                        "the fixture valset has no door",
                     ));
                 }
             }
-            Ok(())
+            Ok(None)
         }
+    }
+
+    /// What a vote enacts outside the roster.
+    enum Forwarded {
+        Op {
+            role: String,
+            op: Vec<u8>,
+        },
+        Bind {
+            role: String,
+            program: Option<abi::ProgramId>,
+        },
     }
 
     fn not_a_member() -> Refusal {
@@ -119,7 +138,13 @@ mod program {
                     roster.take(signer).ok_or_else(not_a_member)?;
                 }
                 Op::Vote(motion) => {
-                    roster.enact(motion)?;
+                    match roster.enact(motion)? {
+                        Some(Forwarded::Op { role, op }) => {
+                            ctx.emit(env.roles.bound(&role)?.clone(), op, false);
+                        }
+                        Some(Forwarded::Bind { role, program }) => ctx.bind(role, program)?,
+                        None => {}
+                    }
                     ctx.output(abi::encode(&Voted::Enacted));
                 }
             }

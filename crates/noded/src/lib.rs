@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod egress;
 mod endpoint;
+pub mod live;
 mod logs;
 mod mesh;
 mod network;
@@ -128,6 +129,7 @@ pub struct Daemon<E: Context> {
     pub relay: relay::Relay<E>,
     pub blobs: blob::service::Service,
     halo: Arc<halo::Halo>,
+    pub live: Arc<live::Relay<E>>,
     key: commonware_cryptography::ed25519::PrivateKey,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
@@ -165,6 +167,7 @@ impl<E: Context> Daemon<E> {
     }
 
     pub fn publish(&self, applied: &Applied) {
+        self.live.invalidate(&applied.writes);
         let mut subscribers = self
             .subscribers
             .lock()

@@ -2,7 +2,7 @@
 //! resolved against the network descriptor into what `run` starts with.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use consensus::{Cadence, Timeouts};
@@ -23,6 +23,7 @@ pub struct Settings {
     pub http: Option<SocketAddr>,
     pub tls: Option<SocketAddr>,
     pub halo: Option<SocketAddr>,
+    pub live: Option<SocketAddr>,
     pub log: Option<String>,
     #[serde(default)]
     pub load: LoadSettings,
@@ -47,6 +48,19 @@ pub struct LoadSettings {
     #[serde(default, deserialize_with = "held_permits")]
     pub blob_backlog: Option<NonZeroUsize>,
     pub blob_gatherers: Option<NonZeroUsize>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub live_session_inbound: Option<NonZeroUsize>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub live_session_outbound: Option<NonZeroUsize>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub live_group_queue: Option<NonZeroUsize>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub live_peer_queue: Option<NonZeroUsize>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub live_lane_backlog: Option<NonZeroUsize>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub live_lane_per_sender: Option<NonZeroUsize>,
+    pub live_linger_ms: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -93,6 +107,7 @@ impl Settings {
             http: self.http.or(under.http),
             tls: self.tls.or(under.tls),
             halo: self.halo.or(under.halo),
+            live: self.live.or(under.live),
             log: self.log.or(under.log),
             load: self.load.over(under.load),
             consensus: self.consensus.over(under.consensus),
@@ -109,6 +124,7 @@ impl Settings {
                 http: self.http.unwrap_or(DEFAULT_HTTP),
                 tls: self.tls,
                 halo,
+                live: self.live,
             },
             log: self.log.unwrap_or_else(|| DEFAULT_LOG.to_string()),
             halo: self.load.halo(),
@@ -129,6 +145,13 @@ impl LoadSettings {
             blob_serves_in_flight: self.blob_serves_in_flight.or(under.blob_serves_in_flight),
             blob_backlog: self.blob_backlog.or(under.blob_backlog),
             blob_gatherers: self.blob_gatherers.or(under.blob_gatherers),
+            live_session_inbound: self.live_session_inbound.or(under.live_session_inbound),
+            live_session_outbound: self.live_session_outbound.or(under.live_session_outbound),
+            live_group_queue: self.live_group_queue.or(under.live_group_queue),
+            live_peer_queue: self.live_peer_queue.or(under.live_peer_queue),
+            live_lane_backlog: self.live_lane_backlog.or(under.live_lane_backlog),
+            live_lane_per_sender: self.live_lane_per_sender.or(under.live_lane_per_sender),
+            live_linger_ms: self.live_linger_ms.or(under.live_linger_ms),
         }
     }
 
@@ -151,6 +174,21 @@ impl LoadSettings {
                 .blob_serves_in_flight
                 .unwrap_or(default.blob_serves_in_flight),
             blob_gatherers: self.blob_gatherers.unwrap_or(default.blob_gatherers),
+            live_session_inbound: self
+                .live_session_inbound
+                .unwrap_or(default.live_session_inbound),
+            live_session_outbound: self
+                .live_session_outbound
+                .unwrap_or(default.live_session_outbound),
+            live_group_queue: self.live_group_queue.unwrap_or(default.live_group_queue),
+            live_peer_queue: self.live_peer_queue.unwrap_or(default.live_peer_queue),
+            live_lane_backlog: self.live_lane_backlog.unwrap_or(default.live_lane_backlog),
+            live_lane_per_sender: self
+                .live_lane_per_sender
+                .unwrap_or(default.live_lane_per_sender),
+            live_linger: self
+                .live_linger_ms
+                .map_or(default.live_linger, |ms| Duration::from_millis(ms.get())),
         }
     }
 }

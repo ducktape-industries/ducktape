@@ -8,8 +8,9 @@ mod unit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// The founding program that fills each role the kernel calls. A genesis
-/// that leaves a role empty, or names a program it does not found, is refused.
+/// Each role's program, bound at founding; a role outside `role::REQUIRED`
+/// moves on the validators' vote. A genesis without a required role, or with
+/// a role bound to a program it does not found, is refused.
 pub use abi::Roles;
 use abi::{
     BlobId, Cause, Env, HashKind, Invocation, ItemRef, Message, Origin, Outcome, Principal,
@@ -474,11 +475,7 @@ where
             .view(Vec::new())
             .get(NETWORK, namespace::ID)?
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
-        let roles = store
-            .view(Vec::new())
-            .get(NETWORK, namespace::ROLES)?
-            .ok_or_else(|| Error::Corrupt("the network records no roles".into()))?;
-        let roles = abi::decode(&roles).map_err(corrupt)?;
+        let roles = roles_of(&store.view(Vec::new()))?;
         let mut host = Host {
             store,
             blobs,
@@ -1577,13 +1574,17 @@ where
                 }
             }
         }
+        let mut dropped = BTreeSet::new();
         for program in running.keys() {
-            let dropped = !wanted.contains(program);
-            if dropped {
+            if !wanted.contains(program) {
                 overlay.delete(PROGRAMS, program.clone().into_bytes());
                 self.loaded.unload(program);
                 changed.push(program.clone());
+                dropped.insert(program.clone());
             }
+        }
+        if !dropped.is_empty() {
+            self.unbind_dropped(&dropped, overlay)?;
         }
         for program in changed {
             let cancelled = self
@@ -1592,6 +1593,24 @@ where
             receipts.extend(cancelled);
         }
         Ok(receipts)
+    }
+
+    /// The roles table names only running programs: a role bound to a program
+    /// this block drops is unbound in the same block. A role in `REQUIRED`
+    /// keeps its row, so a reopen still finds the table filled; the kernel
+    /// refuses every frame that asks the missing program until a swap brings
+    /// it back.
+    fn unbind_dropped(&self, dropped: &BTreeSet<ProgramId>, overlay: &mut Overlay) -> Result<()> {
+        let roles = roles_of(&View::new(self.store.storage(), vec![&*overlay]))?;
+        let kept: Roles = roles
+            .iter()
+            .filter(|(role, program)| role::REQUIRED.contains(role) || !dropped.contains(*program))
+            .map(|(role, program)| (role, program.clone()))
+            .collect();
+        if kept != roles {
+            overlay.set(NETWORK, namespace::ROLES.to_vec(), abi::encode(&kept));
+        }
+        Ok(())
     }
 
     async fn admit(
@@ -1729,6 +1748,9 @@ where
         let writes = overlay.into_writes();
         self.blobs.promote(stage)?;
         self.store.commit(tip.height, writes.clone()).await?;
+        // a vote may have bound or unbound a role: the table the next block's
+        // frames carry is the one just committed
+        self.roles = roles_of(&self.store.view(Vec::new()))?;
         // a commitment outlives neither its program's drop nor an undone
         // admission: the root is over the programs a reopened node opens
         let running: BTreeSet<ProgramId> = programs_in(self.store.storage())?.into_iter().collect();
@@ -1883,10 +1905,18 @@ fn member_cap_of(view: &View<'_>) -> Result<u32> {
     Ok(cap)
 }
 
-fn bound<'r>(roles: &'r Roles, role: &str) -> Result<&'r ProgramId> {
+pub(crate) fn bound<'r>(roles: &'r Roles, role: &str) -> Result<&'r ProgramId> {
     roles
         .get(role)
         .ok_or_else(|| Error::Unfilled { role: role.into() })
+}
+
+/// The roles table as `view` holds it.
+pub(crate) fn roles_of(view: &View<'_>) -> Result<Roles> {
+    let roles = view
+        .get(NETWORK, namespace::ROLES)?
+        .ok_or_else(|| Error::Corrupt("the network records no roles".into()))?;
+    abi::decode(&roles).map_err(corrupt)
 }
 
 fn corrupt(refusal: Refusal) -> Error {

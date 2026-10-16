@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use abi::{HostOp, HostReply, Message, Outcome, reason, role, role::validators};
+use abi::{
+    HostOp, HostReply, Message, Outcome, reason, role,
+    role::{halo, validators},
+};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -17,6 +20,7 @@ const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
 const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
@@ -55,6 +59,7 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
             (role::IDENTITY, "identity"),
             (role::BLOBS, "blobs"),
             (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
         ]),
         validators,
         programs: vec![
@@ -70,6 +75,11 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
             founding("pong", RELAY, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
             founding("awaits", AWAITS, Vec::new()),
+            founding(
+                "halo",
+                HALO,
+                abi::encode(&halo::Genesis { lanes: Vec::new() }),
+            ),
         ],
         views: Vec::new(),
         hooks: Vec::new(),

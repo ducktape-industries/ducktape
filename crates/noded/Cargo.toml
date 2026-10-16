@@ -19,9 +19,11 @@ consensus = { workspace = true }
 futures = { workspace = true }
 halo = { workspace = true }
 hex = "0.4"
+live-wire = { workspace = true }
 http-body-util = "0.1"
 host = { workspace = true }
 node = { workspace = true }
+quinn = { workspace = true }
 rand_core = { workspace = true }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 reqwest = { workspace = true }

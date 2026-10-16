@@ -2223,6 +2223,7 @@ dependencies = [
 name = "halo"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "bytes",
  "commonware-codec",
  "commonware-cryptography",
@@ -2235,6 +2236,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "x509-parser",
 ]
 
@@ -2786,6 +2788,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "live-wire"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "keyscheme",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2942,7 +2953,9 @@ dependencies = [
  "hex",
  "host",
  "http-body-util",
+ "live-wire",
  "node",
+ "quinn",
  "rand_core 0.10.1",
  "rcgen",
  "reqwest 0.12.28",

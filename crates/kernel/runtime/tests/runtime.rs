@@ -30,6 +30,7 @@ fn env() -> Env {
             (role::IDENTITY, "identity"),
             (role::BLOBS, "blobs"),
             (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
         ]),
         cause: Cause::Direct,
     }

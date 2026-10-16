@@ -91,9 +91,12 @@ pub enum Principal {
     System,
 }
 
-/// The founding program that fills each role the kernel calls, as genesis
-/// bound them. Every frame's env carries them, so a program asks a role by
-/// its binding, never by a name it assumes.
+/// Each role's program, by the role's name: bound at founding, and a role
+/// outside `role::REQUIRED` moves on the validators' vote (`Motion::Bind`)
+/// to any admitted program, or goes. The kernel calls some rows; others
+/// (egress, halo, scheduler, any name a program looks up) it never does.
+/// Every frame's env carries the table, so a program asks a role by its
+/// binding, never by a name it assumes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Roles(BTreeMap<String, ProgramId>);
 
@@ -113,6 +116,10 @@ impl Roles {
 
     pub fn bind(&mut self, role: impl Into<String>, program: impl Into<ProgramId>) {
         self.0.insert(role.into(), program.into());
+    }
+
+    pub fn unbind(&mut self, role: &str) {
+        self.0.remove(role);
     }
 
     pub fn unfilled(&self) -> Option<&'static str> {
@@ -384,6 +391,13 @@ pub enum HostOp {
         ticket: role::awaits::Ticket,
         answer: role::awaits::Answer,
     },
+    /// Bind `program` to `role` in the network's roles table, or unbind the
+    /// role when `program` is `None`: the validators role's alone, and never
+    /// a role in `role::REQUIRED`.
+    Bind {
+        role: String,
+        program: Option<ProgramId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -444,7 +458,12 @@ pub mod role {
     pub const AWAITS: &str = "awaits";
     pub const EGRESS: &str = "egress";
     pub const SCHEDULER: &str = "scheduler";
-    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS];
+    pub const HALO: &str = "halo";
+    /// The roles a network binds for its life: the kernel calls the first
+    /// five, and every node reads halo's lane table to serve its lanes, so
+    /// no network founds without them. The others may be bound, rebound or
+    /// unbound by the validators' vote.
+    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO];
 
     /// Which code runs at a height.
     pub mod programs {
@@ -541,11 +560,31 @@ pub mod role {
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Motion {
-            Promote { key: Vec<u8> },
-            Demote { key: Vec<u8> },
-            Remove { key: Vec<u8> },
-            Door { open: bool },
-            Programs { op: Vec<u8> },
+            Promote {
+                key: Vec<u8>,
+            },
+            Demote {
+                key: Vec<u8>,
+            },
+            Remove {
+                key: Vec<u8>,
+            },
+            Door {
+                open: bool,
+            },
+            /// The validators' vote on an op of the program bound to `role`:
+            /// on enactment the op runs on that program as the vote.
+            Role {
+                role: String,
+                op: Vec<u8>,
+            },
+            /// The validators' vote on the roles table: bind `program` to
+            /// `role`, or unbind the role when `program` is `None`. A role in
+            /// `REQUIRED` is refused: its program is fixed.
+            Bind {
+                role: String,
+                program: Option<crate::ProgramId>,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -770,6 +809,123 @@ pub mod role {
                 reason::WRONG_STATE,
                 format!("{program} changed code while its frame awaited"),
             )
+        }
+    }
+
+    /// The lanes halo carries between members: each named lane's wire id, the
+    /// class its streams are served at most, whether it is served and whether
+    /// it is pinned. Only the validators' vote changes the table, and no vote
+    /// pauses or closes a pinned lane.
+    pub mod halo {
+        use crate::{BorshDeserialize, BorshSerialize};
+
+        /// The lane byte on the wire: a stream hello's first byte, a
+        /// datagram's first byte.
+        pub type LaneId = u8;
+        pub const MAX_NAME: usize = 64;
+
+        /// The priority a halo stream is served at: Critical outranks
+        /// Member outranks Client.
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            BorshSerialize,
+            BorshDeserialize,
+        )]
+        pub enum Class {
+            Critical,
+            Member,
+            Client,
+        }
+
+        impl Class {
+            pub const COUNT: usize = 3;
+            pub const ALL: [Class; Class::COUNT] = [Class::Critical, Class::Member, Class::Client];
+
+            pub fn rank(self) -> usize {
+                self as usize
+            }
+        }
+
+        impl From<Class> for u8 {
+            fn from(class: Class) -> u8 {
+                class as u8
+            }
+        }
+
+        impl TryFrom<u8> for Class {
+            type Error = u8;
+
+            fn try_from(byte: u8) -> Result<Class, u8> {
+                Class::ALL.get(usize::from(byte)).copied().ok_or(byte)
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Lane {
+            pub name: String,
+            pub id: LaneId,
+            pub cap: Class,
+            pub enabled: bool,
+            /// Set at founding and never changed: a pinned lane is served for
+            /// the network's life, so a lane a node needs to apply blocks
+            /// cannot be voted away from under it.
+            pub pinned: bool,
+            /// The block that opened it.
+            pub since: u64,
+        }
+
+        /// Every op is the validators' vote (`Motion::Role`); a signed frame
+        /// is refused.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Op {
+            /// Lists `name` at the next free id, enabled and not pinned.
+            Open { name: String, cap: Class },
+            /// Changes the cap and whether the lane is served; the id stays.
+            /// A pinned lane refuses `enabled: false` (`invalid_input`).
+            Set {
+                name: String,
+                cap: Class,
+                enabled: bool,
+            },
+            /// Unlists `name`; its id is never handed out again. A pinned lane
+            /// refuses it (`invalid_input`).
+            Close { name: String },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Query {
+            /// Every listed lane, in id order.
+            Lanes,
+            Lane {
+                name: String,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Reply {
+            Lanes(Vec<Lane>),
+            Lane(Option<Lane>),
+        }
+
+        /// A lane the network is founded with.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Founded {
+            pub name: String,
+            pub cap: Class,
+            pub pinned: bool,
+        }
+
+        /// The founding lanes, listed in order from id 0.
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Genesis {
+            pub lanes: Vec<Founded>,
         }
     }
 
@@ -1098,6 +1254,117 @@ pub mod role {
     }
 }
 
+/// Who may publish and subscribe to a room's live tracks through a node:
+/// the program that owns the room decides in its own code and writes the
+/// decision as state under this table; the node reads it and enforces it.
+/// No row for an account and no `*` row means the account may do nothing in
+/// the room.
+pub mod live {
+    use crate::{BorshDeserialize, BorshSerialize, role::identity::AccountNumber};
+
+    /// The reserved table a program writes live grants in: key
+    /// `live/<room>/<who>`, `who` the account number in decimal or `*` for
+    /// every account that acts on this chain; value a borsh [`Grant`].
+    pub const TABLE: &str = "live";
+
+    /// A track name, in bytes: UTF-8, `/`-separated segments, none empty.
+    /// Here beside the grant grammar so a program names the bound it
+    /// publishes under instead of copying the number.
+    pub const MAX_TRACK_NAME: usize = 128;
+    /// A namespace, in bytes: `<chain>/<program>/<room>` as the host stamps it.
+    pub const MAX_NAMESPACE: usize = 192;
+
+    /// `live/<room>/<who>`: the key of one grant row.
+    pub fn key(room: &str, who: Option<AccountNumber>) -> Vec<u8> {
+        let who = match who {
+            Some(account) => account.to_string(),
+            None => "*".to_owned(),
+        };
+        format!("{TABLE}/{room}/{who}").into_bytes()
+    }
+
+    /// What one account, or every account, may do in one room. A pattern is
+    /// a track name exactly, a prefix ending in `/*` (`presence/*`), or `*`;
+    /// `{account}` in it is the asking account's number, so one `*` row binds
+    /// each name to its own account (`echo/{account}`).
+    #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Grant {
+        /// Track names this account may publish; empty = may not publish.
+        pub publish: Vec<String>,
+        /// Track names this account may subscribe to and watch; empty = may
+        /// not subscribe.
+        pub subscribe: Vec<String>,
+    }
+
+    impl Grant {
+        /// Publish and subscribe to every track of the room.
+        pub fn all() -> Grant {
+            Grant {
+                publish: vec!["*".into()],
+                subscribe: vec!["*".into()],
+            }
+        }
+
+        /// Whether `account` may publish the track `name`.
+        pub fn publishes(&self, name: &str, account: AccountNumber) -> bool {
+            covers(&self.publish, name, account)
+        }
+
+        /// Whether `account` may subscribe to the track `name`, and hears it when it watches
+        /// the room.
+        pub fn subscribes(&self, name: &str, account: AccountNumber) -> bool {
+            covers(&self.subscribe, name, account)
+        }
+
+        /// Whether the holder may watch the room: any subscribe pattern is enough, so a watch
+        /// turns on no track name and no account.
+        pub fn watches(&self) -> bool {
+            !self.subscribe.is_empty()
+        }
+
+        /// The subscribe patterns `account` hears the room's announces through, as they read
+        /// for it; `None` when it may not watch.
+        pub fn watch_patterns(&self, account: AccountNumber) -> Option<Vec<String>> {
+            self.watches().then(|| {
+                self.subscribe
+                    .iter()
+                    .map(|pattern| for_account(pattern, account))
+                    .collect()
+            })
+        }
+    }
+
+    /// What a grant pattern says for the account that asks: [`ACCOUNT`] in it is the account's
+    /// number in decimal, so one row binds each name to its own account (`echo/{account}`).
+    pub const ACCOUNT: &str = "{account}";
+
+    /// `pattern` as it reads for `account`: each [`ACCOUNT`] written as its number.
+    pub fn for_account(pattern: &str, account: AccountNumber) -> String {
+        pattern.replace(ACCOUNT, &account.to_string())
+    }
+
+    /// A grant pattern, as it reads for the account that asks ([`for_account`]), against a
+    /// track name: `*` matches every name, `<prefix>/*` every name under the prefix, anything
+    /// else exactly.
+    pub fn pattern_covers(pattern: &str, name: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+        match pattern.strip_suffix("/*") {
+            Some(prefix) => name
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/')),
+            None => pattern == name,
+        }
+    }
+
+    fn covers(patterns: &[String], name: &str, account: AccountNumber) -> bool {
+        patterns
+            .iter()
+            .any(|pattern| pattern_covers(&for_account(pattern, account), name))
+    }
+}
+
 pub fn encode<T: BorshSerialize>(value: &T) -> Vec<u8> {
     borsh::to_vec(value).expect("borsh serialization of an in-memory value cannot fail")
 }
@@ -1181,6 +1448,77 @@ mod tests {
                 .reason,
             reason::PROTOCOL
         );
+    }
+
+    #[test]
+    fn a_grant_row_is_keyed_by_room_and_account_or_star() {
+        assert_eq!(live::key("lobby", Some(42)), b"live/lobby/42".to_vec());
+        assert_eq!(live::key("lobby", None), b"live/lobby/*".to_vec());
+        let all = live::Grant::all();
+        assert_eq!(decode::<live::Grant>(&encode(&all)).unwrap(), all);
+        assert_eq!(
+            live::Grant::default(),
+            live::Grant {
+                publish: vec![],
+                subscribe: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn a_pattern_is_everything_a_prefix_or_one_name() {
+        use live::pattern_covers;
+        assert!(pattern_covers("*", "anything/at/all"));
+        assert!(pattern_covers("presence/*", "presence/42"));
+        assert!(pattern_covers("presence/*", "presence/a/b"));
+        assert!(!pattern_covers("presence/*", "presence"));
+        assert!(!pattern_covers("presence/*", "presencex/42"));
+        assert!(pattern_covers("doc", "doc"));
+        assert!(!pattern_covers("doc", "doc/1"));
+    }
+
+    #[test]
+    fn an_account_pattern_is_the_asking_accounts_own() {
+        use live::{for_account, pattern_covers};
+        let mine = for_account("echo/{account}", 42);
+        assert_eq!(mine, "echo/42");
+        assert!(pattern_covers(&mine, "echo/42"));
+        assert!(!pattern_covers(&mine, "echo/43"));
+        let under = for_account("ask/{account}/*", 42);
+        assert!(pattern_covers(&under, "ask/42/7/0b"));
+        assert!(!pattern_covers(&under, "ask/43/42/0b"));
+        assert!(!pattern_covers(
+            &for_account("ask/{account}/*", 4),
+            "ask/42/7"
+        ));
+        assert_eq!(for_account("doc", 42), "doc");
+    }
+
+    #[test]
+    fn a_grant_decides_each_side_by_its_own_patterns_as_they_read_for_the_account() {
+        let room = live::Grant {
+            publish: vec!["echo/{account}".into(), "board/{account}/*".into()],
+            subscribe: vec!["lobby".into(), "inbox/{account}".into()],
+        };
+        assert!(room.publishes("echo/42", 42));
+        assert!(room.publishes("board/42/0b", 42));
+        assert!(!room.publishes("echo/42", 13));
+        assert!(!room.publishes("lobby", 42));
+        assert!(room.subscribes("lobby", 13));
+        assert!(room.subscribes("inbox/13", 13));
+        assert!(!room.subscribes("inbox/42", 13));
+        assert!(!room.subscribes("echo/13", 13));
+        assert!(!live::Grant::default().subscribes("lobby", 13));
+        assert!(live::Grant::all().publishes("any/name", 13));
+    }
+
+    #[test]
+    fn a_class_survives_its_byte() {
+        use role::halo::Class;
+        for class in Class::ALL {
+            assert_eq!(Class::try_from(u8::from(class)), Ok(class));
+        }
+        assert_eq!(Class::try_from(3), Err(3));
     }
 
     #[test]
@@ -1355,6 +1693,7 @@ mod tests {
                 (role::AWAITS, "a"),
                 (role::EGRESS, "e"),
                 (role::SCHEDULER, "s"),
+                (role::HALO, "h"),
             ]),
             cause: Cause::Completion {
                 item: ItemRef {

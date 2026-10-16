@@ -7,7 +7,7 @@ use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use futures::FutureExt as _;
 use halo::sim::SimNet;
-use halo::{Lane, Members, Pacer, Plane, Seat, Transport as _};
+use halo::{Class, Lane, Members, Pacer, Plane, Seat, Transport as _};
 use tokio::io::AsyncReadExt as _;
 
 fn seated(keys: &[&PublicKey]) -> Arc<Members> {
@@ -31,7 +31,15 @@ async fn a_stranger_is_dropped_before_its_hello_and_a_silent_member_stays_open()
         seated(&[&server, &member]),
         Pacer::unlimited(),
     );
-    let _lane = plane.streams(Lane(9), 1).unwrap();
+    plane.lanes(vec![Lane {
+        name: "hello".into(),
+        id: 9,
+        cap: Class::Client,
+        enabled: true,
+        pinned: false,
+        since: 0,
+    }]);
+    let _lane = plane.streams("hello", 1).unwrap();
     let mut silent = net.join(member).connect(&server).await.unwrap();
     let mut unknown = net.join(stranger).connect(&server).await.unwrap();
     let mut byte = [0u8; 1];

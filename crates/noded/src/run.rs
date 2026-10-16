@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use abi::Outcome;
 use abi::Scan;
@@ -23,12 +24,13 @@ use consensus::{
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use halo::{Halo, Seat};
+use halo::{Class, Halo, Lane, Seat};
 use host::Layer;
 use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source, Taken};
 use tokio::sync::watch;
 
 use crate::endpoint::Endpoint;
+use crate::live;
 use crate::mesh::{Mesh, Tracker};
 use crate::relay::{self, Relay};
 use crate::transport;
@@ -46,6 +48,9 @@ pub struct Listen {
     pub http: SocketAddr,
     pub tls: Option<SocketAddr>,
     pub halo: SocketAddr,
+    /// The UDP socket desktop clients reach the live relay on over QUIC; without it they take
+    /// the websocket alone.
+    pub live: Option<SocketAddr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,17 +90,32 @@ pub struct LoadConfig {
     pub blob_backlog: NonZeroUsize,
     pub blob_serves_in_flight: NonZeroUsize,
     pub blob_gatherers: NonZeroUsize,
+    pub live_session_inbound: NonZeroUsize,
+    pub live_session_outbound: NonZeroUsize,
+    pub live_group_queue: NonZeroUsize,
+    pub live_peer_queue: NonZeroUsize,
+    pub live_lane_backlog: NonZeroUsize,
+    pub live_lane_per_sender: NonZeroUsize,
+    pub live_linger: Duration,
 }
 
 impl Default for LoadConfig {
     fn default() -> LoadConfig {
         let blobs = blob::service::Config::default();
+        let live = live::Config::default();
         LoadConfig {
             reads_in_flight: READS_IN_FLIGHT,
             uploads_in_flight: UPLOADS_IN_FLIGHT,
             blob_backlog: blobs.backlog,
             blob_serves_in_flight: blobs.serving,
             blob_gatherers: blobs.gatherers,
+            live_session_inbound: live.session_inbound,
+            live_session_outbound: live.session_outbound,
+            live_group_queue: live.group_queue,
+            live_peer_queue: live.peer_queue,
+            live_lane_backlog: live.lane_backlog,
+            live_lane_per_sender: live.lane_per_sender,
+            live_linger: live.linger,
         }
     }
 }
@@ -106,6 +126,20 @@ impl LoadConfig {
             backlog: self.blob_backlog,
             serving: self.blob_serves_in_flight,
             gatherers: self.blob_gatherers,
+        }
+    }
+
+    /// The relay's share; its chain reads run under the node's `reads_in_flight`.
+    fn live(&self) -> live::Config {
+        live::Config {
+            session_inbound: self.live_session_inbound,
+            session_outbound: self.live_session_outbound,
+            group_queue: self.live_group_queue,
+            peer_queue: self.live_peer_queue,
+            lane_backlog: self.live_lane_backlog,
+            lane_per_sender: self.live_lane_per_sender,
+            reads_in_flight: self.reads_in_flight,
+            linger: self.live_linger,
         }
     }
 }
@@ -294,17 +328,48 @@ async fn start<E: Context>(
                 queues: halo.queues(),
             },
         )
-        .map_err(|error| Error::Tls(error.to_string()))?,
+        .map_err(|error| Error::Address(format!("--halo {}: {error}", listen.halo)))?,
     );
     halo.seat(halo_seats(&node, &network).await?);
+    tabled(&halo, halo_lanes(&node).await?, tip.height);
     let blobs = blob::service::Service::start(
         halo.clone(),
         node.host().blobs().clone(),
         bundles(&node)?,
         load.blobs(),
     )?;
-
     let member_cap = node.member_cap()?;
+    let identity_role = node.host().role(role::IDENTITY)?.clone();
+    let proposer = node.proposer();
+    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
+
+    // the live door binds its socket here, beside halo's, so a socket in use fails the start
+    // before consensus does any work
+    let (shutdown, _) = watch::channel(false);
+    let door = listen
+        .live
+        .map(|at| {
+            live::door(&identity, at)
+                .map_err(|error| Error::Address(format!("--live {at}: {error}")))
+        })
+        .transpose()?;
+    let live = live::Relay::start(
+        context.child("live"),
+        live::Network {
+            id: live::Network::chain_id(
+                &descriptor.network,
+                &descriptor.genesis_block().digest().0,
+            ),
+            genesis: descriptor.genesis_block().digest().0,
+            identity: identity_role,
+        },
+        Arc::new(node.clone()),
+        halo.clone(),
+        door,
+        load.live(),
+        shutdown.subscribe(),
+    );
+
     let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
         Mesh::start(
             context.child("mesh"),
@@ -324,11 +389,7 @@ async fn start<E: Context>(
     }
 
     let (inbox, deliveries) = mpsc::unbounded();
-    let chain = Participant {
-        proposer: node.proposer(),
-        inbox,
-    };
-    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
+    let chain = Participant { proposer, inbox };
     let (marshal, summaries) = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
@@ -370,7 +431,6 @@ async fn start<E: Context>(
         "the node is up"
     );
 
-    let (shutdown, _) = watch::channel(false);
     let (tips, _) = watch::channel(tip.height);
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
@@ -387,6 +447,7 @@ async fn start<E: Context>(
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
         blobs,
         halo,
+        live,
         key: identity.clone(),
         mesh: transport::loopback(listen.p2p),
         subscribers: Mutex::new(Vec::new()),
@@ -490,6 +551,90 @@ async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec
         ));
     };
     Ok(seats(&members, &validators))
+}
+
+/// The lanes the halo role lists, at the confirmed tip.
+async fn halo_lanes<E: Context>(node: &Node<E>) -> Result<Vec<Lane>> {
+    let role = node.host().role(role::HALO)?.clone();
+    let asked = abi::encode(&abi::role::halo::Query::Lanes);
+    let answer = node
+        .query(Layer::Confirmed, abi::Origin::System, &role, asked)
+        .await?
+        .map_err(|refusal| Error::Corrupt(format!("the halo program refused Lanes: {refusal}")))?;
+    let abi::role::halo::Reply::Lanes(lanes) = abi::decode(&answer).map_err(|refusal| {
+        Error::Corrupt(format!(
+            "the Lanes answer does not decode: {}",
+            refusal.sentence
+        ))
+    })?
+    else {
+        return Err(Error::Corrupt(
+            "the halo program answered Lanes with another reply".into(),
+        ));
+    };
+    Ok(lanes)
+}
+
+/// Whether a block's writes change what `program` answers: it wrote the program's state, or the
+/// host swapped its code (a write under `$programs` at the program's id).
+fn rewrites(writes: &state::Writes, program: &str) -> bool {
+    let state = writes
+        .programs
+        .get(program)
+        .is_some_and(|written| !written.is_empty());
+    let code = writes
+        .programs
+        .get(host::PROGRAMS)
+        .is_some_and(|written| written.contains_key(program.as_bytes()));
+    state || code
+}
+
+async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
+    match halo_lanes(node).await {
+        Ok(lanes) => tabled(&daemon.halo, lanes, height),
+        Err(error) => tracing::warn!(
+            target: "ducktape::halo",
+            event = "halo_untabled",
+            height,
+            %error,
+            reason = "lanes_unread",
+            "halo keeps its lane table: the node could not read the halo program's lanes"
+        ),
+    }
+}
+
+/// Has halo serve `lanes`, the halo role's table at `height`, from now on, and says so.
+fn tabled(halo: &Halo, lanes: Vec<Lane>, height: u64) {
+    tracing::info!(
+        target: "ducktape::halo",
+        event = "halo_retabled",
+        height,
+        lanes = listing(&lanes),
+        "halo serves the halo role's lane table"
+    );
+    halo.plane().lanes(lanes);
+}
+
+/// The lane table as one log field, in id order: `name#id cap`, then `paused` or `served`, then
+/// `pinned` for a pinned lane.
+fn listing(lanes: &[Lane]) -> String {
+    let lane = |lane: &Lane| {
+        let served = match lane.enabled {
+            true => "served",
+            false => "paused",
+        };
+        let pinned = match lane.pinned {
+            true => " pinned",
+            false => "",
+        };
+        let cap = match lane.cap {
+            Class::Critical => "critical",
+            Class::Member => "member",
+            Class::Client => "client",
+        };
+        format!("{}#{} {cap} {served}{pinned}", lane.name, lane.id)
+    };
+    lanes.iter().map(lane).collect::<Vec<_>>().join(", ")
 }
 
 async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
@@ -724,6 +869,11 @@ async fn applied<E: Context>(
                 .programs
                 .get(validators)
                 .is_some_and(|writes| !writes.is_empty());
+            let halo = node.host().role(role::HALO)?;
+            let lanes_written = rewrites(&applied.writes, halo);
+            if lanes_written {
+                retable_halo(daemon, &node, block.height).await;
+            }
             let blobs = node.host().role(role::BLOBS)?;
             let writes = applied.writes.programs.get(blobs).cloned();
             let due = daemon
@@ -772,4 +922,46 @@ async fn applied<E: Context>(
         .send(due.iter().chain(&receipted).map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{listing, rewrites};
+
+    #[test]
+    fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
+        let writes = |program: &str, key: &[u8]| state::Writes {
+            programs: BTreeMap::from([(
+                program.to_owned(),
+                BTreeMap::from([(key.to_vec(), Some(vec![1]))]),
+            )]),
+        };
+        assert!(rewrites(&writes("halo", b"l/x"), "halo"));
+        assert!(rewrites(&writes(host::PROGRAMS, b"halo"), "halo"));
+        assert!(!rewrites(&writes(host::PROGRAMS, b"blobs"), "halo"));
+        assert!(!rewrites(&writes("blobs", b"halo"), "halo"));
+        assert!(!rewrites(&state::Writes::default(), "halo"));
+    }
+
+    #[test]
+    fn the_table_reads_as_one_line() {
+        let lane = |name: &str, id, enabled, pinned| halo::Lane {
+            name: name.into(),
+            id,
+            cap: halo::Class::Critical,
+            enabled,
+            pinned,
+            since: 0,
+        };
+        let table = [
+            lane("a/blobs", 0, true, true),
+            lane("a/live", 1, false, false),
+        ];
+        assert_eq!(
+            listing(&table),
+            "a/blobs#0 critical served pinned, a/live#1 critical paused"
+        );
+    }
 }

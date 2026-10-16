@@ -1,6 +1,7 @@
 use consensus::CadenceError;
 
 use super::*;
+use std::num::NonZeroU64;
 
 fn descriptor() -> Descriptor {
     Descriptor {
@@ -30,6 +31,7 @@ const EVERY_KEY: &str = "listen = \"127.0.0.1:9000\"\n\
                          http = \"127.0.0.1:8844\"\n\
                          tls = \"127.0.0.1:9443\"\n\
                          halo = \"127.0.0.1:9200\"\n\
+                         live = \"127.0.0.1:9300\"\n\
                          log = \"debug\"\n\
                          [load]\n\
                          halo_egress = 1000000\n\
@@ -40,6 +42,13 @@ const EVERY_KEY: &str = "listen = \"127.0.0.1:9000\"\n\
                          blob_serves_in_flight = 3\n\
                          blob_backlog = 40\n\
                          blob_gatherers = 5\n\
+                         live_session_inbound = 64\n\
+                         live_session_outbound = 256\n\
+                         live_group_queue = 8\n\
+                         live_peer_queue = 32\n\
+                         live_lane_backlog = 4\n\
+                         live_lane_per_sender = 16\n\
+                         live_linger_ms = 700\n\
                          [consensus]\n\
                          leader_timeout_ms = 4000\n\
                          certification_timeout_ms = 6000\n\
@@ -51,6 +60,7 @@ fn every_key() -> Settings {
         http: Some(socket(8844)),
         tls: Some(socket(9443)),
         halo: Some(socket(9200)),
+        live: Some(socket(9300)),
         log: Some("debug".into()),
         load: LoadSettings {
             halo_egress: Some(1_000_000),
@@ -61,6 +71,13 @@ fn every_key() -> Settings {
             blob_serves_in_flight: Some(count(3)),
             blob_backlog: Some(count(40)),
             blob_gatherers: Some(count(5)),
+            live_session_inbound: Some(count(64)),
+            live_session_outbound: Some(count(256)),
+            live_group_queue: Some(count(8)),
+            live_peer_queue: Some(count(32)),
+            live_lane_backlog: Some(count(4)),
+            live_lane_per_sender: Some(count(16)),
+            live_linger_ms: NonZeroU64::new(700),
         },
         consensus: ConsensusSettings {
             leader_timeout_ms: Some(4000),
@@ -149,6 +166,7 @@ fn file_only_settings_reach_the_config() {
             http: socket(8844),
             tls: Some(socket(9443)),
             halo: socket(9200),
+            live: Some(socket(9300)),
         }
     );
     assert_eq!(config.log, "debug");
@@ -168,6 +186,13 @@ fn file_only_settings_reach_the_config() {
             blob_backlog: count(40),
             blob_serves_in_flight: count(3),
             blob_gatherers: count(5),
+            live_session_inbound: count(64),
+            live_session_outbound: count(256),
+            live_group_queue: count(8),
+            live_peer_queue: count(32),
+            live_lane_backlog: count(4),
+            live_lane_per_sender: count(16),
+            live_linger: Duration::from_millis(700),
         }
     );
     assert_eq!(config.cadence.leader_timeout(), Duration::from_millis(4000));
@@ -183,6 +208,7 @@ fn a_flag_beats_the_file_and_the_file_beats_the_default() {
     let file = Settings {
         listen: Some(socket(9000)),
         http: Some(socket(8844)),
+        live: Some(socket(9300)),
         log: Some("debug".into()),
         load: LoadSettings {
             halo_datagrams: Some(count(128)),
@@ -219,6 +245,7 @@ fn a_flag_beats_the_file_and_the_file_beats_the_default() {
             http: socket(8844),
             tls: None,
             halo: socket(9200),
+            live: Some(socket(9300)),
         }
     );
     assert_eq!(config.log, "debug");

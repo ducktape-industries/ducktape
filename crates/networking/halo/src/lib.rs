@@ -1,6 +1,7 @@
 //! halo: the network between members, off consensus. It carries lanes of streams and
 //! datagrams between current members over QUIC, at the halo address each member registers,
-//! at a priority class capped by who asks.
+//! at a priority class capped by who asks and by the lane. Which lanes exist, and each one's
+//! wire id and cap, is the halo role's table; this crate names none.
 
 pub mod class;
 pub mod links;
@@ -19,11 +20,12 @@ use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::Metrics;
 
+pub use abi::role::halo::{Lane, LaneId};
 pub use class::Class;
 pub use links::{Carried, Links, Queues};
 pub use members::{Members, Seat};
 pub use pacer::{Paced, Pacer};
-pub use plane::{Datagrams, Inbound, Lane, Plane, Streams, Taken};
+pub use plane::{Datagrams, Inbound, Plane, Streams, Taken};
 pub use transport::{Error, Transport};
 
 const EGRESS_BURST: u64 = 256 << 10;
@@ -39,6 +41,7 @@ pub struct Halo {
     members: Arc<Members>,
     plane: Plane<Arc<Links>>,
     me: PublicKey,
+    membership: tokio::sync::watch::Sender<()>,
 }
 
 impl Halo {
@@ -66,12 +69,23 @@ impl Halo {
             members,
             plane,
             me,
+            membership: tokio::sync::watch::channel(()).0,
         })
     }
 
     pub fn seat(&self, seats: impl IntoIterator<Item = Seat>) {
         let changed = self.members.seat(seats);
+        let moved = !changed.is_empty();
         self.links.seated(changed);
+        // A binding that reconciles per-peer state learns the membership moved.
+        if moved {
+            let _ = self.membership.send(());
+        }
+    }
+
+    /// Fires whenever the seated members change, so a binding reconciles its per-peer state.
+    pub fn membership_changed(&self) -> tokio::sync::watch::Receiver<()> {
+        self.membership.subscribe()
     }
 
     pub async fn linked(&self, member: &PublicKey) {

@@ -63,6 +63,7 @@ fn at(height: u64, call: ProgramCall) -> Invocation {
                 (role::IDENTITY, "identity"),
                 (role::BLOBS, "blobs"),
                 (role::AWAITS, "awaits"),
+                (role::HALO, "halo"),
             ]),
             cause: Cause::Direct,
         },

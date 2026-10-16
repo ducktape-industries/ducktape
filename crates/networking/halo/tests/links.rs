@@ -13,7 +13,24 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 type Context = runtime::Context;
 
-const ECHO: Lane = Lane(8);
+const ECHO: &str = "echo";
+const BULK: &str = "bulk";
+
+/// The lanes these tests bind, capped at nothing below `Critical`.
+fn table() -> Vec<Lane> {
+    [ECHO, BULK]
+        .into_iter()
+        .zip(0..)
+        .map(|(name, id)| Lane {
+            name: name.into(),
+            id,
+            cap: Class::Critical,
+            enabled: true,
+            pinned: false,
+            since: 0,
+        })
+        .collect()
+}
 
 struct Node {
     key: PublicKey,
@@ -31,6 +48,7 @@ fn node(context: &Context, seed: u64, egress: Option<u64>) -> Node {
         queues: Queues::default(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());
+    halo.plane().lanes(table());
     let seat = Seat {
         key: key.clone(),
         halo: format!("localhost:{}", halo.udp().unwrap().port()),
@@ -173,7 +191,6 @@ const PACED: u64 = 4 << 20;
 const FETCHED: u64 = 4 << 20;
 const ENDLESS: u64 = 1 << 40;
 const LITTLE: u64 = FETCHED / 8;
-const BULK: Lane = Lane(9);
 const SATURATING: usize = 0;
 const MEASURING: usize = 1;
 
