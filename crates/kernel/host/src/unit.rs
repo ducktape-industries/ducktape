@@ -508,11 +508,7 @@ where
                 return Ok(HostReply::Refused(unknown(program)));
             }
         }
-        let roles = view
-            .get(namespace::NETWORK, namespace::ROLES)?
-            .ok_or_else(|| Error::Corrupt("the network records no roles".into()))?;
-        let mut roles: Roles =
-            abi::decode(&roles).map_err(|refusal| Error::Corrupt(refusal.sentence))?;
+        let mut roles = crate::roles_of(&view)?;
         match program {
             Some(program) => roles.bind(role, program),
             None => roles.unbind(&role),

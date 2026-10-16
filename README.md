@@ -394,7 +394,9 @@ room's program granted its account under the `live` table, over QUIC on a UDP
 socket of its own (`run --live 0.0.0.0:9200`, ALPN `ducktape-live`, the node
 key's certificate) or the WebSocket `/v1/live`; nodes carry a track between
 their clients over halo's lane `ducktape/live`. `GET /v1/live/port` names the QUIC port, or
-none without `--live`, and then clients take the WebSocket.
+none without `--live`, and then clients take the WebSocket. A node built before the route
+answers 404, which the app reads as live unavailable, so the route moves no contract number
+(`noded::NODE_CONTRACT` stays 9).
 
 ```sh
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844

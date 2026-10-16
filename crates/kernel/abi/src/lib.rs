@@ -91,9 +91,12 @@ pub enum Principal {
     System,
 }
 
-/// The founding program that fills each role the kernel calls, as genesis
-/// bound them. Every frame's env carries them, so a program asks a role by
-/// its binding, never by a name it assumes.
+/// Each role's program, by the role's name: bound at founding, and a role
+/// outside `role::REQUIRED` moves on the validators' vote (`Motion::Bind`)
+/// to any admitted program, or goes. The kernel calls some rows; others
+/// (egress, halo, scheduler, any name a program looks up) it never does.
+/// Every frame's env carries the table, so a program asks a role by its
+/// binding, never by a name it assumes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Roles(BTreeMap<String, ProgramId>);
 
@@ -1214,6 +1217,13 @@ pub mod live {
     /// `live/<room>/<who>`, `who` the account number in decimal or `*` for
     /// every account that acts on this chain; value a borsh [`Grant`].
     pub const TABLE: &str = "live";
+
+    /// A track name, in bytes: UTF-8, `/`-separated segments, none empty.
+    /// Here beside the grant grammar so a program names the bound it
+    /// publishes under instead of copying the number.
+    pub const MAX_TRACK_NAME: usize = 128;
+    /// A namespace, in bytes: `<chain>/<program>/<room>` as the host stamps it.
+    pub const MAX_NAMESPACE: usize = 192;
 
     /// `live/<room>/<who>`: the key of one grant row.
     pub fn key(room: &str, who: Option<AccountNumber>) -> Vec<u8> {

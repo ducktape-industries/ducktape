@@ -48,8 +48,7 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
     };
     let mut tips = daemon.tips.subscribe();
     let mut unread: u64 = 0;
-    // the egress role at the last tip read: a vote binds, rebinds or unbinds it
-    let mut bound: Option<ProgramId> = None;
+    let mut bound = Bound::Unread;
     loop {
         tokio::select! {
             changed = tips.changed() => {
@@ -77,30 +76,21 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
                 let (role, reading) = match read {
                     Some(read) => read,
                     None => {
-                        if bound.take().is_some() || !worker.config.served().is_empty() {
-                            tracing::warn!(
-                                target: TARGET,
-                                event = "egress_unbound",
-                                reason = "no_egress_role",
-                                "this node's egress.toml is unused: the network binds no egress role"
-                            );
+                        if bound.unbound(&worker.config) {
+                            desk = Desk::new(worker.config.served());
                         }
-                        desk = Desk::new(worker.config.served());
                         continue;
                     }
                 };
-                let rebound = bound.as_ref() != Some(&role);
-                if rebound {
-                    tracing::info!(target: TARGET, event = "egress_bound", role = %role);
+                if bound.bound(&role) {
                     desk = Desk::new(worker.config.served());
-                    bound = Some(role.clone());
                 }
                 for step in desk.read(reading) {
                     worker.execute(&mut desk, step, &role).await;
                 }
             }
             Some((id, answer)) = answered.next() => {
-                let Some(role) = &bound else {
+                let Bound::To(role) = &bound else {
                     continue;
                 };
                 if let Some(step) = desk.answered(id, answer) {
@@ -108,6 +98,62 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
                 }
             }
         }
+    }
+}
+
+/// The egress role as the worker last read it: a vote binds, rebinds or unbinds it, and the
+/// worker says so once per move, never once per block.
+enum Bound {
+    Unread,
+    Unbound,
+    To(ProgramId),
+}
+
+impl Bound {
+    /// Records that the tip binds no egress role; true when that is a move, which empties the
+    /// desk.
+    fn unbound(&mut self, config: &Config) -> bool {
+        match std::mem::replace(self, Bound::Unbound) {
+            Bound::Unread => {
+                let unused = !config.served().is_empty();
+                if unused {
+                    tracing::warn!(
+                        target: TARGET,
+                        event = "egress_unbound",
+                        reason = "no_egress_role",
+                        "this node's egress.toml is unused: the network binds no egress role"
+                    );
+                }
+                true
+            }
+            Bound::To(was) => {
+                tracing::warn!(
+                    target: TARGET,
+                    event = "egress_unbound",
+                    reason = "unbound_by_vote",
+                    was = %was,
+                    "the network unbound its egress role; this node answers no more requests"
+                );
+                true
+            }
+            Bound::Unbound => false,
+        }
+    }
+
+    /// Records that the tip binds `role`; true when that is a move, which empties the desk.
+    fn bound(&mut self, role: &ProgramId) -> bool {
+        let same = matches!(self, Bound::To(was) if was == role);
+        if same {
+            return false;
+        }
+        tracing::info!(
+            target: TARGET,
+            event = "egress_bound",
+            role = %role,
+            "the network binds its egress role; this node answers through it"
+        );
+        *self = Bound::To(role.clone());
+        true
     }
 }
 

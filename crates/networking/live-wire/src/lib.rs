@@ -22,7 +22,8 @@ pub const NAMESPACE: &[u8] = b"ducktape:live";
 pub const MAX_STREAM_OBJECT: usize = 64 << 10;
 /// One control message's cap: a namespace, a track name and the fixed fields fit in it.
 pub const CONTROL_BYTES: u32 = 1 << 10;
-/// One websocket message's cap: a slice of one object, or a control message, with its framing.
+/// One websocket message's cap: a slice of a group (one or more objects) or a control message,
+/// with its framing.
 pub const WS_MESSAGE: usize = MAX_STREAM_OBJECT + CONTROL_BYTES as usize;
 /// The most a group may be, the sum of its objects: a wire invariant, the group a publisher
 /// encodes and every node refuses alike. The cache keeps one group per track, so it is also the
@@ -31,10 +32,7 @@ pub const WS_MESSAGE: usize = MAX_STREAM_OBJECT + CONTROL_BYTES as usize;
 pub const MAX_GROUP_BYTES: usize = 4 << 20;
 /// A datagram's payload: with its header it fits the path's datagram size (~1200 bytes).
 pub const MAX_DATAGRAM_OBJECT: usize = 1100;
-/// A track name, in bytes: UTF-8, `/`-separated segments, none empty.
-pub const MAX_TRACK_NAME: usize = 128;
-/// A namespace, in bytes: `<chain>/<program>/<room>` as the host stamps it.
-pub const MAX_NAMESPACE: usize = 192;
+pub use abi::live::{MAX_NAMESPACE, MAX_TRACK_NAME};
 /// A session with no track, subscription, watch or waiting ask this long is closed by the node.
 pub const IDLE_SESSION: Duration = Duration::from_secs(60);
 
@@ -271,7 +269,7 @@ impl DatagramHeader {
 pub enum WsFrame {
     Control(Control),
     /// A whole stream-mode group or a slice of it; `end` says how the group stands after this
-    /// slice. A group is delivered in slices of at most [`MAX_STREAM_OBJECT`] so one big group
+    /// slice. A group is delivered in frames of at most [`WS_MESSAGE`] encoded so one big group
     /// does not starve control.
     Group {
         header: GroupHeader,
