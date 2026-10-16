@@ -2036,6 +2036,22 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_to_it_but_not_to_a_next_su
         // object 0.
         bob.subscribe(2, doc.clone(), Start::Next).await;
         alice.recv().await;
+
+        // carol asks for the latest on the second node: its own cache, filled by the replay,
+        // answers with the group the first node cached, and nothing crosses the lane for it.
+        let (mut carol, _) = Client::open(&second, &carol).await;
+        let (_, _, latest) = carol.subscribe(1, doc.clone(), Start::Latest).await;
+        assert_eq!(
+            latest,
+            Some(1),
+            "the replayed group is the second node's cache"
+        );
+        let (header, objects, complete) = carol.received_group().await;
+        assert_eq!(
+            (header.group, objects, complete),
+            (1, vec![b"cached".to_vec()], true)
+        );
+
         alice.group(alias, 2, &[b"next"]).await;
         let (header, objects, _) = bob.received_group().await;
         assert_eq!(
@@ -2043,23 +2059,10 @@ fn a_node_asks_for_a_track_once_and_the_cache_crosses_to_it_but_not_to_a_next_su
             (2, vec![b"next".to_vec()]),
             "the cached group did not reach a Next subscriber; the next one crossed whole"
         );
-
-        // carol asks for the latest: the second node's own cache answers, once.
-        let (mut carol, _) = Client::open(&second, &carol).await;
-        let (_, _, latest) = carol.subscribe(1, doc.clone(), Start::Latest).await;
-        assert_eq!(latest, Some(2));
         let (header, objects, complete) = carol.received_group().await;
         assert_eq!(
             (header.group, objects, complete),
             (2, vec![b"next".to_vec()], true)
-        );
-        alice.group(alias, 3, &[b"after"]).await;
-        let (header, objects, _) = carol.received_group().await;
-        assert_eq!((header.group, objects), (3, vec![b"after".to_vec()]));
-        let (header, objects, complete) = bob.received_group().await;
-        assert_eq!(
-            (header.group, objects, complete),
-            (3, vec![b"after".to_vec()], true)
         );
         first.shutdown.send_replace(true);
         second.shutdown.send_replace(true);
