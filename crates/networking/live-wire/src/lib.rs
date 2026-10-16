@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
+pub use abi::Scheme;
 pub use abi::role::identity::AccountNumber as Account;
 use borsh::{BorshDeserialize, BorshSerialize};
-pub use keyscheme::KeyScheme;
 
 /// The QUIC ALPN a client dials the node's live socket (`run --live`) with.
 pub const ALPN: &[u8] = b"ducktape-live";
@@ -82,7 +82,8 @@ pub type Alias = u32;
 pub struct Hello {
     /// The digest of the genesis block of the network the client means.
     pub chain: [u8; 32],
-    pub scheme: KeyScheme,
+    /// The seated key's scheme, by name: the node verifies the proof under it.
+    pub scheme: Scheme,
     /// The seated key, the one the client signs frames with.
     pub key: Vec<u8>,
 }

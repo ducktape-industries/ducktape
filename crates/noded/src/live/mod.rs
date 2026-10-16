@@ -23,6 +23,7 @@ use abi::live::Grant;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_runtime::telemetry::metrics::raw::{Counter, Gauge};
 use halo::Halo;
+use keyscheme::KeyScheme;
 use live_wire::{
     ALPN, Account, Challenge, Code, Control, HANDSHAKE_WAIT, Hello, IDLE, IDLE_SESSION, KEEP_ALIVE,
     NAMESPACE, Proof, RequestId, proof_preimage,
@@ -520,8 +521,11 @@ async fn proven<E: crate::Context>(relay: &Relay<E>, link: &mut Link) -> Result<
     let Some(Control::Hello(hello)) = next_control(link).await else {
         return Err(Handshake::Gone);
     };
+    // A scheme no account key is (BLS) passes the hello and fails at the proof, like any proof
+    // that cannot verify.
+    let scheme = KeyScheme::from_scheme(hello.scheme);
     let this_chain = hello.chain == relay.network.genesis;
-    let key_shaped = hello.scheme.pubkey_wellformed(&hello.key);
+    let key_shaped = scheme.is_none_or(|scheme| scheme.pubkey_wellformed(&hello.key));
     if !(this_chain && key_shaped) {
         return Err(Handshake::Refused(Code::Malformed));
     }
@@ -533,9 +537,8 @@ async fn proven<E: crate::Context>(relay: &Relay<E>, link: &mut Link) -> Result<
         return Err(Handshake::Gone);
     };
     let preimage = proof_preimage(&hello.chain, relay.me.as_ref(), &nonce, &hello.key);
-    let proven = hello
-        .scheme
-        .verify(&hello.key, NAMESPACE, &preimage, &signature);
+    let proven =
+        scheme.is_some_and(|scheme| scheme.verify(&hello.key, NAMESPACE, &preimage, &signature));
     if !proven {
         return Err(Handshake::Refused(Code::BadProof));
     }

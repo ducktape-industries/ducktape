@@ -18,9 +18,9 @@ use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _, tokio as ru
 use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Halo, Lane, Seat};
 use live_wire::{
-    ALPN, Account, Challenge, Code, Control, DatagramHeader, End, Ending, GroupHeader, Hello,
-    KeyScheme, LANE, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Start, Track, WS_MESSAGE,
-    Welcome, WsFrame, proof_preimage,
+    ALPN, Account, Challenge, Code, Control, DatagramHeader, End, Ending, GroupHeader, Hello, LANE,
+    MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Scheme, Start, Track, WS_MESSAGE, Welcome,
+    WsFrame, proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{oneshot, watch};
@@ -348,9 +348,22 @@ impl Client {
         node: &PublicKey,
         proof_of: &PrivateKey,
     ) -> Control {
+        self.handshake_as(Scheme::Ed25519, key, chain, node, proof_of)
+            .await
+    }
+
+    /// [`Client::handshake`] with the hello naming `scheme`.
+    async fn handshake_as(
+        &mut self,
+        scheme: Scheme,
+        key: &PrivateKey,
+        chain: [u8; 32],
+        node: &PublicKey,
+        proof_of: &PrivateKey,
+    ) -> Control {
         self.send(Control::Hello(Hello {
             chain,
-            scheme: KeyScheme::Ed25519,
+            scheme,
             key: key.public_key().as_ref().to_vec(),
         }))
         .await;
@@ -630,6 +643,19 @@ fn a_seated_key_is_welcomed_as_its_account_and_a_bad_proof_or_an_unseated_key_is
                 code: Code::BadProof
             }
         );
+
+        // A scheme no account key is (a validator's BLS) verifies no proof, a real signature
+        // included.
+        let mut validator = Client::dial(&node).await;
+        assert_eq!(
+            validator
+                .handshake_as(Scheme::Bls12381, &alice, GENESIS, &node.key, &alice)
+                .await,
+            Control::Refused {
+                request: 0,
+                code: Code::BadProof
+            }
+        );
     });
 }
 
@@ -811,7 +837,7 @@ impl WsClient {
         client
             .send(WsFrame::Control(Control::Hello(Hello {
                 chain: GENESIS,
-                scheme: KeyScheme::Ed25519,
+                scheme: Scheme::Ed25519,
                 key: key.public_key().as_ref().to_vec(),
             })))
             .await;

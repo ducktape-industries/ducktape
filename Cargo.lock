@@ -2711,6 +2711,7 @@ dependencies = [
 name = "keyscheme"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "base64",
  "borsh",
  "commonware-codec",
@@ -2793,7 +2794,6 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "borsh",
- "keyscheme",
 ]
 
 [[package]]
@@ -2953,6 +2953,7 @@ dependencies = [
  "hex",
  "host",
  "http-body-util",
+ "keyscheme",
  "live-wire",
  "node",
  "quinn",

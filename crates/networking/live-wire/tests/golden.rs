@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use live_wire::{
-    Challenge, Code, Control, DatagramHeader, End, Ending, Forward, GroupHeader, Hello, KeyScheme,
-    LaneMeta, Mode, Proof, Start, Track, Welcome, WsFrame, proof_preimage,
+    Challenge, Code, Control, DatagramHeader, End, Ending, Forward, GroupHeader, Hello, LaneMeta,
+    Mode, Proof, Scheme, Start, Track, Welcome, WsFrame, proof_preimage,
 };
 
 const MESSAGE: &str = "the live wire changed: if intended, regenerate with LIVE_GOLDEN_WRITE=1";
@@ -53,7 +53,7 @@ fn controls() -> Vec<Control> {
     vec![
         Control::Hello(Hello {
             chain: [1; 32],
-            scheme: KeyScheme::Ed25519,
+            scheme: Scheme::Ed25519,
             key: vec![2; 32],
         }),
         Control::Challenge(Challenge { nonce: [3; 32] }),
