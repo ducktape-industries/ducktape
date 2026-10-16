@@ -1,16 +1,19 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use abi::role::validators::Member;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
-use consensus::{Anchor, Cadence};
+use consensus::{Anchor, Cadence, CadenceError, Timeouts};
 use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits, Roles};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
 
+use crate::config::Settings;
 use crate::egress::Config as EgressConfig;
 use crate::endpoint::Endpoint;
 use crate::{Error, Result};
@@ -21,6 +24,7 @@ const ANCHOR: &str = "anchor";
 const HTTP: &str = "http";
 const RUNTIME: &str = "runtime";
 const EGRESS: &str = "egress.toml";
+const NODE: &str = "node.toml";
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Descriptor {
@@ -38,8 +42,8 @@ impl Descriptor {
         Block::genesis(self.network.as_bytes(), self.time)
     }
 
-    pub fn cadence(&self) -> Cadence {
-        Cadence::from_millis(self.block_time_ms)
+    pub fn cadence(&self, timeouts: Timeouts) -> std::result::Result<Cadence, CadenceError> {
+        Cadence::new(Duration::from_millis(self.block_time_ms), timeouts)
     }
 }
 
@@ -120,6 +124,22 @@ impl Workspace {
             .map_err(|problem| Error::Egress(format!("{} is refused: {problem}", path.display())))
     }
 
+    pub fn settings_file(&self) -> PathBuf {
+        self.dir.join(NODE)
+    }
+
+    pub fn settings(&self) -> Result<Settings> {
+        let path = self.settings_file();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Settings::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Settings::parse(&text).map_err(|reason| Error::Settings { path, reason })
+    }
+
     fn read_record<T: BorshDeserialize>(&self, name: &str) -> Result<T> {
         let bytes = std::fs::read(self.dir.join(name))?;
         abi::decode(&bytes).map_err(|refusal| Error::Corrupt(refusal.sentence))
@@ -158,7 +178,7 @@ pub struct Founding {
     /// the file leaves it out.
     #[serde(default = "default_member_cap")]
     pub member_cap: u32,
-    pub roles: RoleIds,
+    pub roles: BTreeMap<String, String>,
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
     #[serde(default)]
@@ -171,19 +191,6 @@ pub struct Founding {
 
 fn default_member_cap() -> u32 {
     16
-}
-
-/// Which founding program fills each role the kernel calls.
-#[derive(Debug, Deserialize)]
-pub struct RoleIds {
-    pub programs: String,
-    pub validators: String,
-    pub identity: String,
-    pub blobs: String,
-    pub awaits: String,
-    #[serde(default)]
-    pub egress: Option<String>,
-    pub halo: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -297,15 +304,7 @@ impl Founding {
             .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
-            roles: Roles {
-                programs: self.roles.programs.clone(),
-                validators: self.roles.validators.clone(),
-                identity: self.roles.identity.clone(),
-                blobs: self.roles.blobs.clone(),
-                awaits: self.roles.awaits.clone(),
-                egress: self.roles.egress.clone(),
-                halo: self.roles.halo.clone(),
-            },
+            roles: self.roles.iter().collect::<Roles>(),
             validators,
             programs,
             views,
@@ -355,6 +354,21 @@ mod tests {
          [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\nblobs = \"b\"\nawaits = \"a\"\nhalo = \"h\"\n\
          [[validators]]\nkey = \"00\"\nhalo = \"n0.example.org:1\"\n\
          [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
+
+    #[test]
+    fn the_founding_file_binds_each_role_row_it_names() {
+        let genesis = genesis_of(
+            &FILE
+                .replace("HOOKS", "")
+                .replace("awaits = \"a\"\n", "awaits = \"a\"\nlater = \"l\"\n"),
+        );
+        assert_eq!(genesis.roles.get("later").map(String::as_str), Some("l"));
+        assert_eq!(
+            genesis.roles.get(abi::role::AWAITS).map(String::as_str),
+            Some("a")
+        );
+        assert_eq!(genesis.roles.get(abi::role::EGRESS), None);
+    }
 
     #[test]
     fn the_founding_file_names_its_hooks_or_none() {

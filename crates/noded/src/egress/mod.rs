@@ -1,5 +1,5 @@
 //! The node's egress worker: after each applied block it reads the program bound to the egress
-//! role and answers, expires and serves through it with the node's key. Spawned by `run.rs`.
+//! role and answers and serves through it with the node's key. Spawned by `run.rs`.
 mod call;
 mod config;
 mod desk;
@@ -7,7 +7,7 @@ mod desk;
 use std::sync::Arc;
 
 use abi::role::egress::{Answer, Op, Query, Reply, RequestRow};
-use abi::{BlobId, Origin, ProgramId, reason};
+use abi::{BlobId, Origin, ProgramId, reason, role};
 use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -25,7 +25,6 @@ const TARGET: &str = "ducktape::egress";
 
 struct Worker<E: Context> {
     daemon: Arc<Daemon<E>>,
-    role: ProgramId,
     config: Arc<Config>,
     clients: Arc<Clients>,
     answers: mpsc::UnboundedSender<(u64, Answer)>,
@@ -39,38 +38,25 @@ pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Client
 }
 
 async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clients) {
-    let bound = daemon.node.lock().await.host().roles().egress.clone();
-    let Some(role) = bound else {
-        let unused = !config.served().is_empty();
-        if unused {
-            tracing::warn!(
-                target: TARGET,
-                event = "egress_unbound",
-                reason = "no_egress_role",
-                "this node's egress.toml is unused: the network binds no egress role"
-            );
-        }
-        return;
-    };
     let (answers, mut answered) = mpsc::unbounded();
     let mut desk = Desk::new(config.served());
     let worker = Worker {
         daemon: daemon.clone(),
-        role,
         config: Arc::new(config),
         clients: Arc::new(clients),
         answers,
     };
     let mut tips = daemon.tips.subscribe();
     let mut unread: u64 = 0;
+    let mut bound = Bound::Unread;
     loop {
         tokio::select! {
             changed = tips.changed() => {
                 if changed.is_err() {
                     return;
                 }
-                let reading = match worker.read().await {
-                    Ok(reading) => reading,
+                let read = match worker.read().await {
+                    Ok(read) => read,
                     Err(error) => {
                         unread += 1;
                         if unread.is_power_of_two() {
@@ -87,35 +73,111 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
                     }
                 };
                 unread = 0;
+                let (role, reading) = match read {
+                    Some(read) => read,
+                    None => {
+                        if bound.unbound(&worker.config) {
+                            desk = Desk::new(worker.config.served());
+                        }
+                        continue;
+                    }
+                };
+                if bound.bound(&role) {
+                    desk = Desk::new(worker.config.served());
+                }
                 for step in desk.read(reading) {
-                    worker.execute(&mut desk, step).await;
+                    worker.execute(&mut desk, step, &role).await;
                 }
             }
             Some((id, answer)) = answered.next() => {
+                let Bound::To(role) = &bound else {
+                    continue;
+                };
                 if let Some(step) = desk.answered(id, answer) {
-                    worker.execute(&mut desk, step).await;
+                    worker.execute(&mut desk, step, role).await;
                 }
             }
         }
     }
 }
 
+/// The egress role as the worker last read it: a vote binds, rebinds or unbinds it, and the
+/// worker says so once per move, never once per block.
+enum Bound {
+    Unread,
+    Unbound,
+    To(ProgramId),
+}
+
+impl Bound {
+    /// Records that the tip binds no egress role; true when that is a move, which empties the
+    /// desk.
+    fn unbound(&mut self, config: &Config) -> bool {
+        match std::mem::replace(self, Bound::Unbound) {
+            Bound::Unread => {
+                let unused = !config.served().is_empty();
+                if unused {
+                    tracing::warn!(
+                        target: TARGET,
+                        event = "egress_unbound",
+                        reason = "no_egress_role",
+                        "this node's egress.toml is unused: the network binds no egress role"
+                    );
+                }
+                true
+            }
+            Bound::To(was) => {
+                tracing::warn!(
+                    target: TARGET,
+                    event = "egress_unbound",
+                    reason = "unbound_by_vote",
+                    was = %was,
+                    "the network unbound its egress role; this node answers no more requests"
+                );
+                true
+            }
+            Bound::Unbound => false,
+        }
+    }
+
+    /// Records that the tip binds `role`; true when that is a move, which empties the desk.
+    fn bound(&mut self, role: &ProgramId) -> bool {
+        let same = matches!(self, Bound::To(was) if was == role);
+        if same {
+            return false;
+        }
+        tracing::info!(
+            target: TARGET,
+            event = "egress_bound",
+            role = %role,
+            "the network binds its egress role; this node answers through it"
+        );
+        *self = Bound::To(role.clone());
+        true
+    }
+}
+
 impl<E: Context> Worker<E> {
-    async fn ask(&self, node: &Node<E>, query: &Query) -> Result<Reply> {
+    /// The egress role at the node's tip, if the network binds one.
+    fn role(node: &Node<E>) -> Option<ProgramId> {
+        node.host().roles().get(role::EGRESS).cloned()
+    }
+
+    async fn ask(&self, node: &Node<E>, role: &ProgramId, query: &Query) -> Result<Reply> {
         let answer = node
-            .query(
-                Layer::Confirmed,
-                Origin::System,
-                &self.role,
-                abi::encode(query),
-            )
+            .query(Layer::Confirmed, Origin::System, role, abi::encode(query))
             .await?
             .map_err(Error::Refused)?;
         abi::decode(&answer).map_err(Error::Decode)
     }
 
-    async fn requests(&self, node: &Node<E>, query: &Query) -> Result<Vec<RequestRow>> {
-        match self.ask(node, query).await? {
+    async fn requests(
+        &self,
+        node: &Node<E>,
+        role: &ProgramId,
+        query: &Query,
+    ) -> Result<Vec<RequestRow>> {
+        match self.ask(node, role, query).await? {
             Reply::Requests(rows) => Ok(rows),
             Reply::Node(_) | Reply::Serving(_) => Err(Error::Corrupt(
                 "the egress program answered a request listing with something else".into(),
@@ -123,14 +185,21 @@ impl<E: Context> Worker<E> {
         }
     }
 
-    async fn read(&self) -> Result<Reading> {
+    /// The egress role and what it holds for this node at the tip; `None` when the network
+    /// binds no egress role there.
+    async fn read(&self) -> Result<Option<(ProgramId, Reading)>> {
         let node = self.daemon.node.lock().await;
+        let Some(role) = Self::role(&node) else {
+            return Ok(None);
+        };
         let key = self.daemon.identity.clone();
         let assigned = self
-            .requests(&node, &Query::Assigned { key: key.clone() })
+            .requests(&node, &role, &Query::Assigned { key: key.clone() })
             .await?;
-        let overdue = self.requests(&node, &Query::Overdue).await?;
-        let Reply::Node(row) = self.ask(&node, &Query::Node { key: key.clone() }).await? else {
+        let Reply::Node(row) = self
+            .ask(&node, &role, &Query::Node { key: key.clone() })
+            .await?
+        else {
             return Err(Error::Corrupt(
                 "the egress program answered a node with something else".into(),
             ));
@@ -141,18 +210,18 @@ impl<E: Context> Worker<E> {
             .is_some_and(|members| members.iter().any(|member| member.key == key));
         let mut serving = row.map(|row| row.services).unwrap_or_default();
         serving.sort();
-        Ok(Reading {
+        let reading = Reading {
             assigned,
-            overdue,
             serving,
             member,
-        })
+        };
+        Ok(Some((role, reading)))
     }
 
-    async fn execute(&self, desk: &mut Desk, step: Step) {
+    async fn execute(&self, desk: &mut Desk, step: Step, role: &ProgramId) {
         match step {
             Step::Call(row) => self.call(row),
-            Step::Send(purpose) => self.send(desk, purpose).await,
+            Step::Send(purpose) => self.send(desk, purpose, role).await,
         }
     }
 
@@ -186,14 +255,14 @@ impl<E: Context> Worker<E> {
             });
     }
 
-    async fn send(&self, desk: &mut Desk, purpose: Purpose) {
+    async fn send(&self, desk: &mut Desk, purpose: Purpose, role: &ProgramId) {
         let frame = match desk.frame(&purpose) {
             Some(frame) => frame.to_vec(),
             None => {
                 let Some(op) = desk.op(&purpose) else {
                     return;
                 };
-                match self.sign(&op).await {
+                match self.sign(&op, role).await {
                     Ok(frame) => frame,
                     Err(error) => {
                         tracing::warn!(
@@ -223,14 +292,14 @@ impl<E: Context> Worker<E> {
         desk.sent(&purpose, sent);
     }
 
-    async fn sign(&self, op: &Op) -> Result<Vec<u8>> {
+    async fn sign(&self, op: &Op, role: &ProgramId) -> Result<Vec<u8>> {
         let tip = self.daemon.node.lock().await.tip()?;
         let frame = Frame::sign(
             &self.daemon.key,
             &self.daemon.descriptor.id(),
             tip,
             None,
-            &self.role,
+            role,
             abi::encode(op),
         );
         Ok(frame.encode())

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use abi::{
-    HostOp, Root,
+    HostOp, Root, role,
     role::{halo, validators},
 };
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
@@ -57,7 +57,11 @@ type Seating = Membership<
 fn network(epoch_length: u64) -> Network {
     Network {
         epoch_length,
-        cadence: consensus::Cadence::from_millis(BLOCK_TIME_MS),
+        cadence: consensus::Cadence::new(
+            Duration::from_millis(BLOCK_TIME_MS),
+            consensus::Timeouts::default(),
+        )
+        .unwrap(),
     }
 }
 
@@ -89,15 +93,14 @@ fn enroll(key: &ed25519::PrivateKey) -> Vec<u8> {
 fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles {
-            programs: "programs".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-            blobs: "blobs".into(),
-            awaits: "awaits".into(),
-            egress: None,
-            halo: "halo".into(),
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
+        ]),
         validators: members.to_vec(),
         programs: vec![
             Founding {

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use abi::role::awaits::{Answer, Ticket};
 use abi::role::identity::AccountNumber;
+use abi::role::scheduler::{self, EntryId};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::context::{Execute, Query, host};
@@ -92,6 +93,26 @@ impl Ctx {
     ) -> Result<R, Refusal> {
         let answer = self.call_raw(target, abi::encode(op)).await?;
         abi::decode(&answer).map_err(|fault| Refusal::new(reason::PROTOCOL, fault.sentence))
+    }
+
+    pub async fn schedule<O: BorshSerialize>(
+        &self,
+        height: u64,
+        target: impl Into<ProgramId>,
+        op: &O,
+    ) -> Result<EntryId, Refusal> {
+        let scheduler = self.env().roles.bound(abi::role::SCHEDULER)?.clone();
+        let schedule = scheduler::Op::Schedule {
+            height,
+            target: target.into(),
+            payload: abi::encode(op),
+        };
+        self.call(scheduler, &schedule).await
+    }
+
+    pub async fn cancel(&self, entry: EntryId) -> Result<(), Refusal> {
+        let scheduler = self.env().roles.bound(abi::role::SCHEDULER)?.clone();
+        self.call(scheduler, &scheduler::Op::Cancel { entry }).await
     }
 }
 

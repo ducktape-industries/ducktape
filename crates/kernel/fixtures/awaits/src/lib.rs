@@ -1,11 +1,9 @@
-// An awaits program for the kernel's tests: it opens a ticket for each call a parked frame
-// waits on, and hands the frame its answer when the called program resolves it or it expires.
+//! An awaits program for the kernel's tests: it opens a ticket for each call a parked frame
+//! waits on, and hands the frame its answer when the called program resolves it.
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::role::awaits::{
-        Answer, Call, EXPIRY_BLOCKS, FrameId, Op, Query as Ask, Reply, Ticket, TicketRow, expired,
-    };
+    use abi::role::awaits::{Answer, Call, FrameId, Op, Query as Ask, Reply, Ticket, TicketRow};
     use abi::{Env, Origin, ProgramId, Refusal, Scan, reason};
     use program::{Execute, Program, Query, Reads};
 
@@ -49,7 +47,6 @@ mod program {
                 caller: program.clone(),
                 target: call.target,
                 opened: env.height,
-                deadline: env.height + EXPIRY_BLOCKS,
             };
             ctx.put(ticket_key(call.ticket), &row);
             ctx.set(frame_key(frame, call.ticket), Vec::new());
@@ -93,23 +90,6 @@ mod program {
         hand(ctx, row, answer)
     }
 
-    fn expire(ctx: &mut Execute, env: &Env, ticket: Ticket) -> Result<(), Refusal> {
-        let Some(row) = ctx.record::<TicketRow>(ticket_key(ticket))? else {
-            return Err(Refusal::new(
-                reason::NOT_FOUND,
-                format!("call {ticket} is not open"),
-            ));
-        };
-        let due = env.height >= row.deadline;
-        if !due {
-            return Err(Refusal::new(
-                reason::NOT_YET,
-                format!("call {ticket} expires at height {}", row.deadline),
-            ));
-        }
-        hand(ctx, row, Err(expired(ticket, env.height)))
-    }
-
     fn close(ctx: &mut Execute, env: &Env, frame: FrameId) -> Result<(), Refusal> {
         from_the_kernel(env)?;
         let prefix = frame_prefix(frame);
@@ -133,7 +113,6 @@ mod program {
                     calls,
                 } => park(ctx, env, frame, program, calls),
                 Op::Resolve { ticket, answer } => resolve(ctx, env, ticket, answer),
-                Op::Expire { ticket } => expire(ctx, env, ticket),
                 Op::Close { frame } => close(ctx, env, frame),
             }
         }
@@ -141,7 +120,7 @@ mod program {
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
             let reply = match abi::decode(request)? {
                 Ask::Ticket { ticket } => Reply::Ticket(ctx.record(ticket_key(ticket))?),
-                Ask::Owed { .. } | Ask::Overdue { .. } => {
+                Ask::Owed { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
                         "the fixture lists no tickets",

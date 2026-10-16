@@ -1,11 +1,12 @@
 //! Frames that await: a call answered at once resumes the frame in the same submission, a deferred
-//! call parks it until the called program resolves the ticket, expiry, or a code change ends it.
+//! call parks it until the called program resolves the ticket or a code change ends it.
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use abi::Receipt;
 use abi::role::awaits::{self, Answer, Ticket, TicketRow};
-use abi::role::{halo, programs, validators};
+use abi::role::{self, halo, programs, validators};
 use abi::{BlobId, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, reason};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Finished, Plan};
@@ -13,7 +14,7 @@ use fixture_oracle::{Ask, Op, owed_key};
 use fixture_programs::Change;
 use fixture_relay::Script;
 use host::{
-    Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Receipt, Roles,
+    Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Roles,
     Submission, Tip,
 };
 use state::{Commitment, SyncTarget, commitment_name};
@@ -45,15 +46,14 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 fn genesis() -> Genesis {
     Genesis {
         network: b"net".to_vec(),
-        roles: Roles {
-            programs: "programs".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-            blobs: "blobs".into(),
-            awaits: "awaits".into(),
-            egress: None,
-            halo: "halo".into(),
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
+        ]),
         validators: vec![validators::Member {
             key: b"v1".to_vec(),
             address: Some("v1:1".into()),
@@ -295,13 +295,8 @@ fn a_deferred_call_parks_the_frame_until_the_called_program_answers() {
         assert!(stored(&host, "oracle", &owed_key(0)).is_some());
         let row = ticket(&host, 0).await.expect("the call holds a ticket");
         assert_eq!(
-            (
-                row.caller.as_str(),
-                row.target.as_str(),
-                row.opened,
-                row.deadline
-            ),
-            ("awaiter", "oracle", 1, 1 + awaits::EXPIRY_BLOCKS)
+            (row.caller.as_str(), row.target.as_str(), row.opened),
+            ("awaiter", "oracle", 1)
         );
 
         apply(&mut host, 2, vec![answer(0, b"A")]).await;
@@ -398,40 +393,6 @@ fn only_the_called_program_resolves_its_ticket_and_only_the_kernel_parks() {
         );
         assert!(ticket(&host, 0).await.is_some());
         assert_eq!(frames(&host), 1);
-    });
-}
-
-#[test]
-fn an_overdue_call_expires_and_the_frame_resumes_with_the_refusal() {
-    deterministic::Runner::default().start(|context| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let mut host = found(context.child("found"), dir.path()).await;
-        apply(
-            &mut host,
-            1,
-            vec![submit(
-                "awaiter",
-                plan("oracle", vec![later()], false, false),
-            )],
-        )
-        .await;
-        let expire = abi::encode(&awaits::Op::Expire { ticket: 0 });
-        let early = apply(&mut host, 2, vec![submit("awaits", expire.clone())]).await;
-        assert_eq!(refusal(&early.submissions[0]).reason, reason::NOT_YET);
-        let deadline = 1 + awaits::EXPIRY_BLOCKS;
-        for height in 3..deadline {
-            apply(&mut host, height, Vec::new()).await;
-        }
-        let again = Submission {
-            salt: Some(1),
-            ..submit("awaits", expire)
-        };
-        let applied = apply(&mut host, deadline, vec![again]).await;
-        let finished = finished_in(&applied.submissions[0], "awaiter");
-        assert_eq!(finished.answers, vec![Err(awaits::expired(0, deadline))]);
-        assert_eq!(frames(&host), 0);
-        let late = apply(&mut host, deadline + 1, vec![answer(0, b"late")]).await;
-        output(&late.submissions[0]);
     });
 }
 

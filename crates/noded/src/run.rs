@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use abi::Outcome;
 use abi::Scan;
+use abi::role;
 use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
 use blob::contract::{BUNDLES, Bundle};
 use commonware_codec::DecodeExt as _;
@@ -18,7 +19,7 @@ use commonware_runtime::Handle;
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
-    Ancestry, Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
+    Ancestry, Anchor, Cadence, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
     validators_of,
 };
 use futures::StreamExt as _;
@@ -195,8 +196,9 @@ pub fn run<'a, E: Context>(
     listen: Listen,
     halo: HaloConfig,
     load: LoadConfig,
+    cadence: Cadence,
 ) -> Boxed<'a, Result<Running<E>>> {
-    Box::pin(start(context, workspace, logs, listen, halo, load))
+    Box::pin(start(context, workspace, logs, listen, halo, load, cadence))
 }
 
 async fn found<E: Context>(
@@ -243,7 +245,10 @@ async fn adopt<E: Context>(
         status.network.as_bytes(),
         status.anchor(),
         Some(salt),
-        &status.roles.validators,
+        status
+            .roles
+            .bound(role::VALIDATORS)
+            .map_err(Error::Refused)?,
         abi::encode(&enroll),
     );
     let (_, receipt) = source.land(&frame).await?;
@@ -287,6 +292,7 @@ async fn start<E: Context>(
     listen: Listen,
     halo: HaloConfig,
     load: LoadConfig,
+    cadence: Cadence,
 ) -> Result<Running<E>> {
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
@@ -296,7 +302,7 @@ async fn start<E: Context>(
     let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     let network = Network {
         epoch_length: node.epoch_length()?,
-        cadence: descriptor.cadence(),
+        cadence,
     };
     let seated = recorded_epochs(&node)?;
     let tip = node.tip()?;
@@ -333,7 +339,7 @@ async fn start<E: Context>(
         load.blobs(),
     )?;
     let member_cap = node.member_cap()?;
-    let identity_role = node.host().roles().identity.clone();
+    let identity_role = node.host().role(role::IDENTITY)?.clone();
     let proposer = node.proposer();
     let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
 
@@ -371,6 +377,7 @@ async fn start<E: Context>(
             &descriptor.id(),
             listen.p2p,
             member_cap,
+            cadence,
         )?;
     tracker.track(epoch, &members);
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
@@ -415,6 +422,12 @@ async fn start<E: Context>(
         network = descriptor.network,
         epoch,
         ?standing,
+        block_time_ms = cadence.block_time_ms(),
+        leader_timeout_ms = cadence.leader_timeout().as_millis() as u64,
+        certification_timeout_ms = cadence.certification_timeout().as_millis() as u64,
+        timeout_retry_ms = cadence.timeout_retry().as_millis() as u64,
+        link_timeout_ms = crate::mesh::link_timeout(cadence).as_millis() as u64,
+        ping_frequency_ms = crate::mesh::ping_frequency(cadence).as_millis() as u64,
         "the node is up"
     );
 
@@ -500,7 +513,7 @@ async fn start<E: Context>(
 }
 
 fn bundles<E: Context>(node: &Node<E>) -> Result<Vec<(u64, Bundle)>> {
-    let role = &node.host().roles().blobs;
+    let role = node.host().role(role::BLOBS)?;
     let entries = node
         .view(Layer::Confirmed)
         .scan(role, &Scan::prefix(BUNDLES))
@@ -518,7 +531,7 @@ async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec
     let validators = node.epoch_validators(epoch)?.ok_or(Error::Corrupt(format!(
         "the state records no validators for epoch {epoch}"
     )))?;
-    let role = node.host().roles().validators.clone();
+    let role = node.host().role(role::VALIDATORS)?.clone();
     let asked = abi::encode(&validators::Query::Members);
     let answer = node
         .query(Layer::Confirmed, abi::Origin::System, &role, asked)
@@ -542,7 +555,7 @@ async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec
 
 /// The lanes the halo role lists, at the confirmed tip.
 async fn halo_lanes<E: Context>(node: &Node<E>) -> Result<Vec<Lane>> {
-    let role = node.host().roles().halo.clone();
+    let role = node.host().role(role::HALO)?.clone();
     let asked = abi::encode(&abi::role::halo::Query::Lanes);
     let answer = node
         .query(Layer::Confirmed, abi::Origin::System, &role, asked)
@@ -773,7 +786,7 @@ async fn receipt_for<E: Context>(
     bundle: u64,
 ) -> Result<Option<Vec<u8>>> {
     let tip = node.tip()?;
-    let role = node.host().roles().blobs.clone();
+    let role = node.host().role(role::BLOBS)?.clone();
     let receipt = Frame::sign(
         &daemon.key,
         &daemon.descriptor.id(),
@@ -848,13 +861,19 @@ async fn applied<E: Context>(
             let receipts = std::mem::take(&mut applied.submissions);
             daemon.record(&node, block, ran, Some(receipts)).await?;
             daemon.publish(&applied);
-            let roles = node.host().roles();
-            let members_written = rewrites(&applied.writes, &roles.validators);
-            let lanes_written = rewrites(&applied.writes, &roles.halo);
+            let validators = node.host().role(role::VALIDATORS)?;
+            let members_written = applied
+                .writes
+                .programs
+                .get(validators)
+                .is_some_and(|writes| !writes.is_empty());
+            let halo = node.host().role(role::HALO)?;
+            let lanes_written = rewrites(&applied.writes, halo);
             if lanes_written {
                 retable_halo(daemon, &node, block.height).await;
             }
-            let writes = applied.writes.programs.get(&roles.blobs).cloned();
+            let blobs = node.host().role(role::BLOBS)?;
+            let writes = applied.writes.programs.get(blobs).cloned();
             let due = daemon
                 .blobs
                 .applied(block.height, &writes.unwrap_or_default());

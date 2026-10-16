@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use borsh::{BorshDeserialize, BorshSerialize};
 
 pub type ProgramId = String;
@@ -89,52 +91,58 @@ pub enum Principal {
     System,
 }
 
-/// The founding program that fills each role the kernel calls, as genesis
-/// bound them. Every frame's env carries them, so a program asks a role by
-/// its binding, never by a name it assumes.
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct Roles {
-    pub programs: ProgramId,
-    pub validators: ProgramId,
-    /// Asked, once per frame, which account the frame acts as.
-    pub identity: ProgramId,
-    pub blobs: ProgramId,
-    pub awaits: ProgramId,
-    /// Answers programs' calls outside the chain; nodes read it, the kernel
-    /// never calls it. A network may bind none.
-    pub egress: Option<ProgramId>,
-    /// Holds the lane table halo serves: each lane's wire id, class cap,
-    /// whether it is served and whether it is pinned.
-    pub halo: ProgramId,
-}
+/// Each role's program, by the role's name: bound at founding, and a role
+/// outside `role::REQUIRED` moves on the validators' vote (`Motion::Bind`)
+/// to any admitted program, or goes. The kernel calls some rows; others
+/// (egress, halo, scheduler, any name a program looks up) it never does.
+/// Every frame's env carries the table, so a program asks a role by its
+/// binding, never by a name it assumes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Roles(BTreeMap<String, ProgramId>);
 
 impl Roles {
-    /// Every bound role by its name, with the program bound to it, in field
-    /// order; an egress role is listed when the network binds one. The
-    /// pattern names every field, so a role added to `Roles` fails the build
-    /// here until it is named.
-    pub fn named(&self) -> Vec<(&'static str, &ProgramId)> {
-        let Roles {
-            programs,
-            validators,
-            identity,
-            blobs,
-            awaits,
-            egress,
-            halo,
-        } = self;
-        let mut named = vec![
-            ("programs", programs),
-            ("validators", validators),
-            ("identity", identity),
-            ("blobs", blobs),
-            ("awaits", awaits),
-        ];
-        if let Some(egress) = egress {
-            named.push(("egress", egress));
-        }
-        named.push(("halo", halo));
-        named
+    pub fn get(&self, role: &str) -> Option<&ProgramId> {
+        self.0.get(role)
+    }
+
+    pub fn bound(&self, role: &str) -> Result<&ProgramId, Refusal> {
+        self.get(role).ok_or_else(|| {
+            Refusal::new(
+                reason::UNSUPPORTED,
+                format!("this network binds no program to the {role} role"),
+            )
+        })
+    }
+
+    pub fn bind(&mut self, role: impl Into<String>, program: impl Into<ProgramId>) {
+        self.0.insert(role.into(), program.into());
+    }
+
+    pub fn unbind(&mut self, role: &str) {
+        self.0.remove(role);
+    }
+
+    pub fn unfilled(&self) -> Option<&'static str> {
+        role::REQUIRED
+            .iter()
+            .copied()
+            .find(|role| !self.0.contains_key(*role))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ProgramId)> {
+        self.0
+            .iter()
+            .map(|(role, program)| (role.as_str(), program))
+    }
+}
+
+impl<R: Into<String>, P: Into<ProgramId>> FromIterator<(R, P)> for Roles {
+    fn from_iter<I: IntoIterator<Item = (R, P)>>(rows: I) -> Self {
+        Roles(
+            rows.into_iter()
+                .map(|(role, program)| (role.into(), program.into()))
+                .collect(),
+        )
     }
 }
 
@@ -212,11 +220,20 @@ pub enum Outcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Receipt {
+    pub program: ProgramId,
+    pub outcome: Outcome,
+    pub events: Vec<Vec<u8>>,
+    pub nested: Vec<Receipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Cause {
     Direct,
     Message(ItemRef),
     Completion { item: ItemRef, outcome: Outcome },
     Call { ticket: role::awaits::Ticket },
+    Scheduled { entry: role::scheduler::EntryId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -374,6 +391,13 @@ pub enum HostOp {
         ticket: role::awaits::Ticket,
         answer: role::awaits::Answer,
     },
+    /// Bind `program` to `role` in the network's roles table, or unbind the
+    /// role when `program` is `None`: the validators role's alone, and never
+    /// a role in `role::REQUIRED`.
+    Bind {
+        role: String,
+        program: Option<ProgramId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -427,6 +451,20 @@ pub mod hook {
 pub type ProgramReply = Result<(), Refusal>;
 
 pub mod role {
+    pub const PROGRAMS: &str = "programs";
+    pub const VALIDATORS: &str = "validators";
+    pub const IDENTITY: &str = "identity";
+    pub const BLOBS: &str = "blobs";
+    pub const AWAITS: &str = "awaits";
+    pub const EGRESS: &str = "egress";
+    pub const SCHEDULER: &str = "scheduler";
+    pub const HALO: &str = "halo";
+    /// The roles a network binds for its life: the kernel calls the first
+    /// five, and every node reads halo's lane table to serve its lanes, so
+    /// no network founds without them. The others may be bound, rebound or
+    /// unbound by the validators' vote.
+    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO];
+
     /// Which code runs at a height.
     pub mod programs {
         use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
@@ -522,12 +560,31 @@ pub mod role {
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Motion {
-            Promote { key: Vec<u8> },
-            Demote { key: Vec<u8> },
-            Remove { key: Vec<u8> },
-            Door { open: bool },
-            Programs { op: Vec<u8> },
-            Halo { op: Vec<u8> },
+            Promote {
+                key: Vec<u8>,
+            },
+            Demote {
+                key: Vec<u8>,
+            },
+            Remove {
+                key: Vec<u8>,
+            },
+            Door {
+                open: bool,
+            },
+            /// The validators' vote on an op of the program bound to `role`:
+            /// on enactment the op runs on that program as the vote.
+            Role {
+                role: String,
+                op: Vec<u8>,
+            },
+            /// The validators' vote on the roles table: bind `program` to
+            /// `role`, or unbind the role when `program` is `None`. A role in
+            /// `REQUIRED` is refused: its program is fixed.
+            Bind {
+                role: String,
+                program: Option<crate::ProgramId>,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -689,8 +746,6 @@ pub mod role {
         pub type FrameId = u64;
         pub type Answer = Result<Vec<u8>, Refusal>;
 
-        pub const EXPIRY_BLOCKS: u64 = 64;
-
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct Call {
             pub ticket: Ticket,
@@ -708,9 +763,6 @@ pub mod role {
                 ticket: Ticket,
                 answer: Answer,
             },
-            Expire {
-                ticket: Ticket,
-            },
             Close {
                 frame: FrameId,
             },
@@ -723,7 +775,6 @@ pub mod role {
             pub caller: ProgramId,
             pub target: ProgramId,
             pub opened: u64,
-            pub deadline: u64,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -736,24 +787,12 @@ pub mod role {
                 after: Option<Ticket>,
                 limit: u32,
             },
-            Overdue {
-                height: u64,
-                after: Option<Ticket>,
-                limit: u32,
-            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Reply {
             Ticket(Option<TicketRow>),
             Tickets(Vec<TicketRow>),
-        }
-
-        pub fn expired(ticket: Ticket, height: u64) -> Refusal {
-            Refusal::new(
-                reason::WRONG_STATE,
-                format!("call {ticket} expired at height {height}"),
-            )
         }
 
         pub fn cancelled(program: &str) -> Refusal {
@@ -833,7 +872,7 @@ pub mod role {
             pub since: u64,
         }
 
-        /// Every op is the validators' vote (`Motion::Halo`); a signed frame
+        /// Every op is the validators' vote (`Motion::Role`); a signed frame
         /// is refused.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Op {
@@ -883,7 +922,10 @@ pub mod role {
 
     pub mod egress {
         use crate::role::identity::AccountNumber;
+        use crate::role::scheduler::EntryId;
         use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
+
+        pub const DEFAULT_WAIT: u64 = 64;
 
         pub const HTTP: &str = "http";
         pub const RELAY: &str = "relay";
@@ -901,7 +943,10 @@ pub mod role {
             Serve {
                 services: Vec<String>,
             },
-            Request(Request),
+            Request {
+                request: Request,
+                wait: Option<u64>,
+            },
             Answer {
                 id: u64,
                 answer: Answer,
@@ -960,7 +1005,7 @@ pub mod role {
             pub request: Request,
             pub node: Vec<u8>,
             pub made: u64,
-            pub deadline: u64,
+            pub expiry: EntryId,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -975,9 +1020,8 @@ pub mod role {
         #[repr(u8)]
         pub enum Query {
             Assigned { key: Vec<u8> } = 0,
-            Overdue = 1,
-            Node { key: Vec<u8> } = 2,
-            Serving { service: String } = 3,
+            Node { key: Vec<u8> } = 1,
+            Serving { service: String } = 2,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -1106,6 +1150,59 @@ pub mod role {
             }
         }
     }
+
+    pub mod scheduler {
+        use crate::{BorshDeserialize, BorshSerialize, ProgramId, Receipt};
+
+        pub type EntryId = u64;
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Op {
+            Schedule {
+                height: u64,
+                target: ProgramId,
+                payload: Vec<u8>,
+            },
+            Cancel {
+                entry: EntryId,
+            },
+            Ran {
+                entry: EntryId,
+                receipt: Receipt,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Entry {
+            pub id: EntryId,
+            pub scheduler: ProgramId,
+            pub height: u64,
+            pub target: ProgramId,
+            pub payload: Vec<u8>,
+            pub receipt: Option<Receipt>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Query {
+            Due {
+                height: u64,
+                after: Option<EntryId>,
+                limit: Option<u32>,
+            },
+            Entry {
+                id: EntryId,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Reply {
+            Due {
+                entries: Vec<Entry>,
+                next: Option<EntryId>,
+            },
+            Entry(Option<Entry>),
+        }
+    }
 }
 
 /// Who may publish and subscribe to a room's live tracks through a node:
@@ -1120,6 +1217,13 @@ pub mod live {
     /// `live/<room>/<who>`, `who` the account number in decimal or `*` for
     /// every account that acts on this chain; value a borsh [`Grant`].
     pub const TABLE: &str = "live";
+
+    /// A track name, in bytes: UTF-8, `/`-separated segments, none empty.
+    /// Here beside the grant grammar so a program names the bound it
+    /// publishes under instead of copying the number.
+    pub const MAX_TRACK_NAME: usize = 128;
+    /// A namespace, in bytes: `<chain>/<program>/<room>` as the host stamps it.
+    pub const MAX_NAMESPACE: usize = 192;
 
     /// `live/<room>/<who>`: the key of one grant row.
     pub fn key(room: &str, who: Option<AccountNumber>) -> Vec<u8> {
@@ -1360,60 +1464,6 @@ mod tests {
     }
 
     #[test]
-    fn every_role_is_named_in_field_order() {
-        let roles = Roles {
-            programs: "r".into(),
-            validators: "v".into(),
-            identity: "i".into(),
-            blobs: "b".into(),
-            awaits: "a".into(),
-            egress: Some("e".into()),
-            halo: "h".into(),
-        };
-        let named = |roles: &Roles| -> Vec<(&'static str, String)> {
-            roles
-                .named()
-                .into_iter()
-                .map(|(role, program)| (role, program.clone()))
-                .collect()
-        };
-        let expect = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
-            pairs
-                .iter()
-                .map(|(role, program)| (*role, program.to_string()))
-                .collect()
-        };
-        assert_eq!(
-            named(&roles),
-            expect(&[
-                ("programs", "r"),
-                ("validators", "v"),
-                ("identity", "i"),
-                ("blobs", "b"),
-                ("awaits", "a"),
-                ("egress", "e"),
-                ("halo", "h"),
-            ])
-        );
-        let unbound = Roles {
-            egress: None,
-            ..roles
-        };
-        assert_eq!(
-            named(&unbound),
-            expect(&[
-                ("programs", "r"),
-                ("validators", "v"),
-                ("identity", "i"),
-                ("blobs", "b"),
-                ("awaits", "a"),
-                ("halo", "h"),
-            ]),
-            "a network that binds no egress names none"
-        );
-    }
-
-    #[test]
     fn a_class_survives_its_byte() {
         use role::halo::Class;
         for class in Class::ALL {
@@ -1426,12 +1476,11 @@ mod tests {
     fn the_egress_role_asks_on_fixed_tags_a_program_extends_after() {
         use role::egress::{Query, Reply};
         assert_eq!(encode(&Query::Assigned { key: vec![7] })[0], 0);
-        assert_eq!(encode(&Query::Overdue), [1]);
-        assert_eq!(encode(&Query::Node { key: vec![7] })[0], 2);
+        assert_eq!(encode(&Query::Node { key: vec![7] })[0], 1);
         let serving = Query::Serving {
             service: "s".into(),
         };
-        assert_eq!(encode(&serving)[0], 3);
+        assert_eq!(encode(&serving)[0], 2);
         assert_eq!(encode(&Reply::Requests(Vec::new())), [0, 0, 0, 0, 0]);
         assert_eq!(encode(&Reply::Node(None)), [1, 0]);
         assert_eq!(encode(&Reply::Serving(Vec::new())), [2, 0, 0, 0, 0]);
@@ -1491,6 +1540,73 @@ mod tests {
     }
 
     #[test]
+    fn a_role_table_names_the_first_kernel_role_it_lacks() {
+        let full: Roles = role::REQUIRED.iter().map(|role| (*role, *role)).collect();
+        assert_eq!(full.unfilled(), None);
+        assert_eq!(full.get(role::EGRESS), None);
+        assert_eq!(
+            full.bound(role::EGRESS).map_err(|refusal| refusal.reason),
+            Err(reason::UNSUPPORTED.to_owned())
+        );
+        for lacking in role::REQUIRED {
+            let short: Roles = role::REQUIRED
+                .iter()
+                .filter(|role| *role != lacking)
+                .map(|role| (*role, *role))
+                .collect();
+            assert_eq!(short.unfilled(), Some(*lacking));
+        }
+    }
+
+    #[test]
+    fn a_role_table_carries_a_row_no_reader_names() {
+        let mut roles: Roles = role::REQUIRED.iter().map(|role| (*role, *role)).collect();
+        roles.bind("later", "later");
+        let read: Roles = decode(&encode(&roles)).unwrap();
+        assert_eq!(read.get("later").map(String::as_str), Some("later"));
+        assert_eq!(read, roles);
+    }
+
+    #[test]
+    fn a_scheduled_run_and_its_entry_round_trip() {
+        use role::scheduler::{Entry, Op, Query, Reply};
+        let receipt = Receipt {
+            program: "t".into(),
+            outcome: Outcome::Rejected(Refusal::new("x", "y")),
+            events: vec![vec![1]],
+            nested: vec![Receipt {
+                program: "n".into(),
+                outcome: Outcome::Applied { output: vec![2] },
+                events: Vec::new(),
+                nested: Vec::new(),
+            }],
+        };
+        let entry = Entry {
+            id: 3,
+            scheduler: "s".into(),
+            height: 9,
+            target: "t".into(),
+            payload: vec![4],
+            receipt: Some(receipt.clone()),
+        };
+        let ran = Op::Ran { entry: 3, receipt };
+        let due = Query::Due {
+            height: 9,
+            after: Some(2),
+            limit: None,
+        };
+        let page = Reply::Due {
+            entries: vec![entry],
+            next: None,
+        };
+        let cause = Cause::Scheduled { entry: 3 };
+        assert_eq!(decode::<Op>(&encode(&ran)).unwrap(), ran);
+        assert_eq!(decode::<Query>(&encode(&due)).unwrap(), due);
+        assert_eq!(decode::<Reply>(&encode(&page)).unwrap(), page);
+        assert_eq!(decode::<Cause>(&encode(&cause)).unwrap(), cause);
+    }
+
+    #[test]
     fn every_envelope_round_trips() {
         let env = Env {
             network: b"n".to_vec(),
@@ -1499,15 +1615,16 @@ mod tests {
             me: "a".into(),
             origin: Origin::Program("b".into()),
             sender: Some(Principal::Account(4)),
-            roles: Roles {
-                programs: "r".into(),
-                validators: "v".into(),
-                identity: "i".into(),
-                blobs: "b".into(),
-                awaits: "a".into(),
-                egress: Some("e".into()),
-                halo: "h".into(),
-            },
+            roles: Roles::from_iter([
+                (role::PROGRAMS, "r"),
+                (role::VALIDATORS, "v"),
+                (role::IDENTITY, "i"),
+                (role::BLOBS, "b"),
+                (role::AWAITS, "a"),
+                (role::EGRESS, "e"),
+                (role::SCHEDULER, "s"),
+                (role::HALO, "h"),
+            ]),
             cause: Cause::Completion {
                 item: ItemRef {
                     source: "a".into(),

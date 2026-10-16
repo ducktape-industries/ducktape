@@ -4,7 +4,7 @@ use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::role::identity::AccountNumber;
 use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
-    ProgramCall, ProgramId, Refusal, Roles, reason,
+    ProgramCall, ProgramId, Receipt, Refusal, Roles, reason, role,
 };
 use blob::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
@@ -12,7 +12,7 @@ use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Ran, Runtime, Suspended};
 use state::{Overlay, Storage, Store, View};
 
-use crate::{Error, Receipt, Result, crypto, namespace, parked};
+use crate::{Error, Result, crypto, namespace, parked};
 
 pub struct Loaded {
     runtime: Runtime,
@@ -269,7 +269,8 @@ where
             | HostOp::Emit(_)
             | HostOp::Event(_)
             | HostOp::Output(_)
-            | HostOp::Respond(_) => {
+            | HostOp::Respond(_)
+            | HostOp::Bind { .. } => {
                 HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not write"))
             }
         };
@@ -408,7 +409,7 @@ where
         stage,
         stack,
         Origin::System,
-        world.roles.blobs.clone(),
+        crate::bound(world.roles, role::BLOBS)?.clone(),
         abi::encode(&asked),
         fuel,
     )
@@ -483,6 +484,43 @@ where
         }
     }
 
+    /// The roles table moves on the validators' vote alone: `program` is bound to `role`, or
+    /// the role unbound, in this block's overlay, so the next block's frames carry it. A role in
+    /// `REQUIRED` is fixed; a program bound must be one the network admitted.
+    fn bind(&mut self, role: String, program: Option<ProgramId>) -> Result<HostReply> {
+        let validators = crate::bound(self.world.roles, abi::role::VALIDATORS)?;
+        if self.env.me != *validators {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::UNAUTHORIZED,
+                "only the validators role binds a role",
+            )));
+        }
+        if abi::role::REQUIRED.contains(&role.as_str()) {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::INVALID_INPUT,
+                format!("the {role} role is bound for the network's life"),
+            )));
+        }
+        let view = self.world.store.view(vec![&*self.overlay]);
+        if let Some(program) = &program {
+            let admitted = view.get(namespace::PROGRAMS, program.as_bytes())?.is_some();
+            if !admitted {
+                return Ok(HostReply::Refused(unknown(program)));
+            }
+        }
+        let mut roles = crate::roles_of(&view)?;
+        match program {
+            Some(program) => roles.bind(role, program),
+            None => roles.unbind(&role),
+        }
+        self.overlay.set(
+            namespace::NETWORK,
+            namespace::ROLES.to_vec(),
+            abi::encode(&roles),
+        );
+        Ok(HostReply::Done)
+    }
+
     /// Keeps the message for the frame to run once this handler returns.
     fn emit(&mut self, message: Message) -> HostReply {
         let item = ItemRef {
@@ -522,7 +560,7 @@ where
     }
 
     fn resume(&mut self, frame: FrameId, ticket: Ticket, answer: Answer) -> Result<HostReply> {
-        let from_the_role = self.env.me == self.world.roles.awaits;
+        let from_the_role = self.world.roles.get(role::AWAITS) == Some(&self.env.me);
         if !from_the_role {
             return Ok(HostReply::Refused(Refusal::new(
                 reason::UNAUTHORIZED,
@@ -568,6 +606,7 @@ where
                 Ok(HostReply::Done)
             }
             HostOp::BlobPut { hash, kind, body } => Ok(self.put(hash, &kind, &body)),
+            HostOp::Bind { role, program } => self.bind(role, program),
             HostOp::Emit(message) => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
                 Ok(self.emit(message))

@@ -1,5 +1,5 @@
-//! The egress worker's decisions after each block: which requests to call, and which answers,
-//! expiries and `Serve` frames to send. Pure; `mod.rs` performs what it decides.
+//! The egress worker's decisions after each block: which requests to call, and which answers
+//! and `Serve` frames to send. Pure; `mod.rs` performs what it decides.
 use std::collections::{BTreeMap, BTreeSet};
 
 use abi::role::egress::{Answer, Op, RequestRow};
@@ -7,7 +7,6 @@ use abi::{Refusal, reason};
 
 pub struct Reading {
     pub assigned: Vec<RequestRow>,
-    pub overdue: Vec<RequestRow>,
     pub serving: Vec<String>,
     pub member: bool,
 }
@@ -15,7 +14,6 @@ pub struct Reading {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Purpose {
     Answer(u64),
-    Expire(u64),
     Serve,
 }
 
@@ -49,12 +47,7 @@ enum Answering {
 pub struct Desk {
     wanted: Vec<String>,
     answers: BTreeMap<u64, Answering>,
-    expiries: BTreeMap<u64, Sending>,
     serve: Sending,
-}
-
-fn live(sending: &Sending) -> bool {
-    !matches!(sending, Sending::Done)
 }
 
 impl Desk {
@@ -62,7 +55,6 @@ impl Desk {
         Desk {
             wanted,
             answers: BTreeMap::new(),
-            expiries: BTreeMap::new(),
             serve: Sending::Unsigned,
         }
     }
@@ -89,14 +81,6 @@ impl Desk {
                         ..
                     },
                 ) => {}
-            }
-        }
-        let overdue: BTreeSet<u64> = reading.overdue.iter().map(|row| row.id).collect();
-        self.expiries.retain(|id, _| overdue.contains(id));
-        for id in overdue {
-            let sending = self.expiries.entry(id).or_insert(Sending::Unsigned);
-            if live(sending) {
-                steps.push(Step::Send(Purpose::Expire(id)));
             }
         }
         let settled = reading.serving == self.wanted;
@@ -130,7 +114,6 @@ impl Desk {
                 }),
                 Answering::Calling => None,
             },
-            Purpose::Expire(id) => Some(Op::Expire { id: *id }),
             Purpose::Serve => Some(Op::Serve {
                 services: self.wanted.clone(),
             }),
@@ -150,7 +133,6 @@ impl Desk {
                 Answering::Answered { sending, .. } => Some(sending),
                 Answering::Calling => None,
             },
-            Purpose::Expire(id) => self.expiries.get(id),
             Purpose::Serve => Some(&self.serve),
         }
     }
@@ -175,11 +157,6 @@ impl Desk {
                     return;
                 }
                 *sending = next;
-            }
-            Purpose::Expire(id) => {
-                if let Some(sending) = self.expiries.get_mut(id) {
-                    *sending = next;
-                }
             }
             Purpose::Serve => self.serve = next,
         }

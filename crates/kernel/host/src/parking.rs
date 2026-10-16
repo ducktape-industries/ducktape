@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use abi::role::awaits::{self, Answer, Call, FrameId, Ticket};
-use abi::{Cause, Env, Origin, Outcome, Principal, ProgramCall, Refusal, reason};
+use abi::{Cause, Env, Origin, Outcome, Principal, ProgramCall, Receipt, Refusal, reason, role};
 use blob::Stage;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
@@ -12,7 +12,7 @@ use state::{Checkpoint, Overlay};
 
 use crate::parked::{self, Parked, Waiter};
 use crate::unit::{self, Called, Frame, Resumed, refusal_of};
-use crate::{Host, MAX_DEPTH, Receipt, Result, rejected};
+use crate::{Host, MAX_DEPTH, Result, rejected};
 
 pub const PAGE_FUEL: u64 = 4_096;
 
@@ -437,7 +437,7 @@ where
         frame: &mut Frame,
         depth: u32,
     ) -> Result<Receipt> {
-        let role = self.roles.awaits.clone();
+        let role = self.role(role::AWAITS)?.clone();
         let sender = match &origin {
             Origin::Program(program) => {
                 self.account_of(program, env.height, env.time, overlay, stage, frame)
@@ -493,7 +493,7 @@ where
         let view = self.store.view(vec![&*overlay]);
         let Some((record, image)) = parked::load(&view, id)? else {
             let gone = Refusal::new(reason::NOT_FOUND, format!("frame {id} is not parked"));
-            return Ok(rejected(&self.roles.awaits, gone));
+            return Ok(rejected(self.role(role::AWAITS)?, gone));
         };
         let program = record.program.clone();
         let env = Env {

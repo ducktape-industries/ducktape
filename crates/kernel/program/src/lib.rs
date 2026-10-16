@@ -400,9 +400,29 @@ mod context {
             env: &Env,
             ticket: abi::role::awaits::Ticket,
             answer: abi::role::awaits::Answer,
-        ) {
+        ) -> Result<(), Refusal> {
+            let awaits = env.roles.bound(abi::role::AWAITS)?.clone();
             let op = abi::role::awaits::Op::Resolve { ticket, answer };
-            self.emit(env.roles.awaits.clone(), abi::encode(&op), false);
+            self.emit(awaits, abi::encode(&op), false);
+            Ok(())
+        }
+
+        /// Binds `program` to `role` in the network's roles table, or unbinds
+        /// the role when `program` is `None`; the validators role's alone, on
+        /// its vote, and never a role in `abi::role::REQUIRED`.
+        pub fn bind(
+            &mut self,
+            role: impl Into<String>,
+            program: Option<ProgramId>,
+        ) -> Result<(), Refusal> {
+            match host(&HostOp::Bind {
+                role: role.into(),
+                program,
+            }) {
+                HostReply::Done => Ok(()),
+                HostReply::Refused(refusal) => Err(refusal),
+                other => protocol("done", other),
+            }
         }
     }
 

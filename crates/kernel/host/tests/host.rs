@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use abi::Receipt;
 use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
     HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, Scheme, hook, reason,
-    role::{halo, identity, programs, validators},
+    role::{self, halo, identity, programs, validators},
 };
 use blob::contract as blobs;
 use commonware_codec::Encode as _;
@@ -19,7 +20,7 @@ use fixture_programs::Change;
 use fixture_relay::Script;
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
-    Limits, NETWORK, RECENT, Receipt, Roles, SPENT, Submission, Tip,
+    Limits, NETWORK, RECENT, Roles, SPENT, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -62,15 +63,14 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 const ACCOUNT: u64 = 1;
 
 fn roles() -> Roles {
-    Roles {
-        programs: "programs".into(),
-        validators: "valset".into(),
-        identity: "identity".into(),
-        blobs: "blobs".into(),
-        awaits: "awaits".into(),
-        egress: None,
-        halo: "halo".into(),
-    }
+    Roles::from_iter([
+        (role::PROGRAMS, "programs"),
+        (role::VALIDATORS, "valset"),
+        (role::IDENTITY, "identity"),
+        (role::BLOBS, "blobs"),
+        (role::AWAITS, "awaits"),
+        (role::HALO, "halo"),
+    ])
 }
 
 const PING: u64 = fixture_identity::PROGRAMS_FROM + 4;
@@ -461,19 +461,16 @@ fn founding_admits_every_program_and_the_host_reopens() {
 
 #[test]
 fn founding_refuses_an_unbound_role() {
-    type Binding = fn(&mut Roles) -> &mut String;
-    let identity: Binding = |roles| &mut roles.identity;
-    let halo: Binding = |roles| &mut roles.halo;
     deterministic::Runner::default().start(|context| async move {
-        for (name, bound, binding, program) in [
-            ("identity_empty", "identity", identity, ""),
-            ("identity_unfounded", "identity", identity, "nobody"),
-            ("halo_empty", "halo", halo, ""),
-            ("halo_unfounded", "halo", halo, "nobody"),
+        for (name, bound, program) in [
+            ("identity_empty", role::IDENTITY, ""),
+            ("identity_unfounded", role::IDENTITY, "nobody"),
+            ("halo_empty", role::HALO, ""),
+            ("halo_unfounded", role::HALO, "nobody"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut unbound = standard();
-            *binding(&mut unbound.roles) = program.into();
+            unbound.roles.bind(bound, program);
             let Err(Error::Unbound {
                 role,
                 program: named,
@@ -481,13 +478,13 @@ fn founding_refuses_an_unbound_role() {
             else {
                 panic!("a genesis with {bound} bound to {program:?} was founded");
             };
-            assert_eq!((role, named.as_str()), (bound, program));
+            assert_eq!((role.as_str(), named.as_str()), (bound, program));
             assert!(!dir.path().join("state").exists(), "{name} wrote state");
             assert!(!dir.path().join("blobs").exists(), "{name} wrote blobs");
         }
         let dir = tempfile::tempdir().unwrap();
         let mut unfounded = standard();
-        unfounded.roles.egress = Some("nobody".into());
+        unfounded.roles.bind(role::EGRESS, "nobody");
         let Err(Error::Unbound { role, program }) = Host::found(
             context.child("egress"),
             "egress",
@@ -499,7 +496,50 @@ fn founding_refuses_an_unbound_role() {
         else {
             panic!("a genesis with egress bound to an unfounded program was founded");
         };
-        assert_eq!((role, program.as_str()), ("egress", "nobody"));
+        assert_eq!((role.as_str(), program.as_str()), (role::EGRESS, "nobody"));
+    });
+}
+
+#[test]
+fn founding_refuses_a_role_table_without_a_kernel_role() {
+    deterministic::Runner::default().start(|context| async move {
+        for lacking in role::REQUIRED {
+            let dir = tempfile::tempdir().unwrap();
+            let mut short = standard();
+            short.roles = roles()
+                .iter()
+                .filter(|(role, _)| role != lacking)
+                .map(|(role, program)| (role, program.clone()))
+                .collect();
+            let Err(Error::Unfilled { role }) = Host::found(
+                context.child(lacking),
+                lacking,
+                dir.path(),
+                block_id(0),
+                short,
+            )
+            .await
+            else {
+                panic!("a genesis with no {lacking} role was founded");
+            };
+            assert_eq!(role.as_str(), *lacking);
+            assert!(!dir.path().join("state").exists(), "{lacking} wrote state");
+        }
+    });
+}
+
+#[test]
+fn founding_keeps_a_role_row_the_kernel_never_calls() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut extra = standard();
+        extra.roles.bind("later", "probe");
+        let expected = extra.roles.clone();
+        let (host, _) = Host::found(context, "later", dir.path(), block_id(0), extra)
+            .await
+            .unwrap();
+        assert_eq!(host.roles(), &expected);
+        assert_eq!(host.role("later").unwrap(), "probe");
     });
 }
 
@@ -555,7 +595,10 @@ fn the_halo_role_opens_a_lane_on_the_validators_vote_alone() {
             name: "third".into(),
             cap: halo::Class::Member,
         });
-        let motion = validators::Motion::Halo { op: open.clone() };
+        let motion = validators::Motion::Role {
+            role: role::HALO.into(),
+            op: open.clone(),
+        };
         let voted = submit("valset", abi::encode(&validators::Op::Vote(motion)));
         let applied = host
             .apply(block(1, vec![submit("halo", open), voted]))
@@ -572,14 +615,151 @@ fn the_halo_role_opens_a_lane_on_the_validators_vote_alone() {
     });
 }
 
-/// The validators' vote on `op` at `height`, through the fixture valset: its receipt.
-async fn halo_vote(host: &mut Host<Ctx>, height: u64, op: &halo::Op) -> Receipt {
-    let motion = validators::Motion::Halo {
-        op: abi::encode(op),
-    };
+/// The validators' vote on `motion`, through the fixture valset: its receipt.
+async fn vote(host: &mut Host<Ctx>, height: u64, motion: validators::Motion) -> Receipt {
     let voted = submit("valset", abi::encode(&validators::Op::Vote(motion)));
     let mut applied = host.apply(block(height, vec![voted])).await.unwrap();
     applied.submissions.remove(0)
+}
+
+#[test]
+fn a_role_motion_runs_its_op_on_the_program_bound_to_the_role() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+        let relay = host.programs().unwrap()["ping"];
+        let motion = validators::Motion::Role {
+            role: role::PROGRAMS.into(),
+            op: change("echo", relay, Vec::new()),
+        };
+        output(&vote(&mut host, 1, motion).await);
+        host.apply(block(2, Vec::new())).await.unwrap();
+        assert_eq!(host.programs().unwrap()["echo"], relay);
+
+        let motion = validators::Motion::Role {
+            role: "ledger".into(),
+            op: Vec::new(),
+        };
+        let refused = vote(&mut host, 3, motion).await;
+        assert_eq!(rejected(&refused).reason, reason::UNSUPPORTED);
+        assert!(rejected(&refused).sentence.contains("ledger"));
+    });
+}
+
+#[test]
+fn a_bind_motion_moves_the_roles_table_at_its_height_and_never_a_required_role() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+        let bind = |role: &str, program: Option<&str>| validators::Motion::Bind {
+            role: role.into(),
+            program: program.map(str::to_owned),
+        };
+        let bound = |host: &Host<Ctx>, role: &str| host.roles().get(role).cloned();
+
+        output(&vote(&mut host, 1, bind(role::EGRESS, Some("ping"))).await);
+        assert_eq!(bound(&host, role::EGRESS).as_deref(), Some("ping"));
+        output(&vote(&mut host, 2, bind(role::SCHEDULER, Some("pong"))).await);
+        assert_eq!(bound(&host, role::SCHEDULER).as_deref(), Some("pong"));
+        output(&vote(&mut host, 3, bind(role::EGRESS, None)).await);
+        assert_eq!(bound(&host, role::EGRESS), None);
+
+        let fixed = vote(&mut host, 4, bind(role::HALO, None)).await;
+        assert_eq!(rejected(&fixed).reason, reason::INVALID_INPUT);
+        let fixed = vote(&mut host, 5, bind(role::PROGRAMS, Some("ping"))).await;
+        assert_eq!(rejected(&fixed).reason, reason::INVALID_INPUT);
+        let unknown = vote(&mut host, 6, bind(role::EGRESS, Some("nobody"))).await;
+        assert_eq!(rejected(&unknown).reason, reason::UNKNOWN_PROGRAM);
+        let reserved = vote(&mut host, 7, bind(role::EGRESS, Some(NETWORK))).await;
+        assert_eq!(rejected(&reserved).reason, reason::UNKNOWN_PROGRAM);
+        assert_eq!(bound(&host, role::PROGRAMS).as_deref(), Some("programs"));
+        assert_eq!(bound(&host, role::HALO).as_deref(), Some("halo"));
+        assert_eq!(bound(&host, role::EGRESS), None);
+
+        let table = host.roles().clone();
+        drop(host);
+        let reopened = Host::open(context.child("reopen"), "net", dir.path())
+            .await
+            .unwrap();
+        assert_eq!(reopened.roles(), &table);
+    });
+}
+
+#[test]
+fn dropping_a_program_unbinds_every_role_it_filled_in_the_same_block() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+        let relay = host.programs().unwrap()["ping"];
+        host.apply(block(
+            1,
+            vec![submit("programs", change("echo", relay, Vec::new()))],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(2, Vec::new())).await.unwrap();
+        let bind = |role: &str, program: &str| validators::Motion::Bind {
+            role: role.into(),
+            program: Some(program.into()),
+        };
+        output(&vote(&mut host, 3, bind(role::SCHEDULER, "echo")).await);
+        output(&vote(&mut host, 4, bind(role::EGRESS, "echo")).await);
+        output(&vote(&mut host, 5, bind("ledger", "pong")).await);
+        assert_eq!(
+            host.roles().get(role::SCHEDULER).map(String::as_str),
+            Some("echo")
+        );
+
+        host.apply(block(
+            6,
+            vec![submit(
+                "programs",
+                abi::encode(&Change::Remove("echo".into())),
+            )],
+        ))
+        .await
+        .unwrap();
+        let applied = host.apply(block(7, Vec::new())).await.unwrap();
+        assert!(!host.programs().unwrap().contains_key("echo"));
+        let table_written = applied
+            .writes
+            .programs
+            .get(NETWORK)
+            .is_some_and(|written| written.contains_key(b"roles".as_slice()));
+        assert!(
+            table_written,
+            "the block that drops echo rewrites the roles table"
+        );
+        assert_eq!(host.roles().get(role::SCHEDULER), None);
+        assert_eq!(host.roles().get(role::EGRESS), None);
+        assert_eq!(host.roles().get("ledger").map(String::as_str), Some("pong"));
+        assert_eq!(
+            host.roles().get(role::HALO).map(String::as_str),
+            Some("halo")
+        );
+        let names: Vec<&str> = host.roles().iter().map(|(role, _)| role).collect();
+        assert_eq!(
+            names,
+            [
+                "awaits",
+                "blobs",
+                "halo",
+                "identity",
+                "ledger",
+                "programs",
+                "validators"
+            ]
+        );
+    });
+}
+
+/// The validators' vote on `op` at `height`, through the fixture valset: its receipt.
+async fn halo_vote(host: &mut Host<Ctx>, height: u64, op: &halo::Op) -> Receipt {
+    let motion = validators::Motion::Role {
+        role: role::HALO.into(),
+        op: abi::encode(op),
+    };
+    vote(host, height, motion).await
 }
 
 #[test]
