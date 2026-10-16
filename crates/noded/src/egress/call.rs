@@ -1,15 +1,20 @@
 //! One egress request answered by this node: a relay, a public `http` request, or a registered
-//! service's request at its configured base. Used by the egress worker in `mod.rs`.
+//! service's request at its configured base, its reply whole or as a stream of events. Used by the
+//! egress worker in `mod.rs`.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use abi::role::egress::http::{Head, Response};
-use abi::role::egress::{Answer, HTTP, Request};
+use abi::role::egress::{Answer, Delivery, HTTP, Request, StreamEnd};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use url::Url;
 
 use crate::egress::config::{Config, Reach, Upstream};
+use crate::egress::desk::Called;
+use crate::egress::stream::Splitter;
+
+const EVENT_STREAM: &str = "text/event-stream";
 
 pub struct Clients {
     internet: reqwest::Client,
@@ -152,19 +157,79 @@ pub async fn answer(
     config: &Config,
     caller: &Caller<'_>,
     request: &Request,
+    delivery: &Delivery,
     body: Vec<u8>,
-) -> Answer {
+    event: impl FnMut(Vec<u8>),
+) -> Called {
     let sent = match request {
-        Request::Relay { .. } => return relay(config),
+        Request::Relay { .. } => return Called::Whole(relay(config)),
         Request::Http { service, head, .. } => match service.as_str() {
             HTTP => to_internet(clients, config, head, body).await,
             named => to_service(clients, config, caller, named, head, body).await,
         },
     };
-    match sent {
-        Ok(response) => Answer::Output(abi::encode(&response)),
-        Err(reason) => Answer::Failed(reason),
+    let response = match sent {
+        Ok(response) => response,
+        Err(reason) => return Called::Whole(Answer::Failed(reason)),
+    };
+    let status = response.status().as_u16();
+    let headers = end_to_end(received(&response));
+    let streams = headers.iter().any(event_stream);
+    match (delivery, streams) {
+        (Delivery::Events { .. }, true) => {
+            let complete = StreamEnd::Complete { status, headers };
+            Called::End(stream(response, complete, event).await)
+        }
+        (Delivery::Events { .. }, false) | (Delivery::Whole, _) => {
+            let whole = match response.bytes().await {
+                Ok(body) => Answer::Output(abi::encode(&Response {
+                    status,
+                    headers,
+                    body: body.to_vec(),
+                })),
+                Err(error) => Answer::Failed(format!("the answer broke off: {error}")),
+            };
+            Called::Whole(whole)
+        }
     }
+}
+
+fn event_stream((name, value): &(String, String)) -> bool {
+    let media = value.split(';').next().unwrap_or_default().trim();
+    name.eq_ignore_ascii_case("content-type") && media.eq_ignore_ascii_case(EVENT_STREAM)
+}
+
+async fn stream(
+    mut response: reqwest::Response,
+    complete: StreamEnd,
+    mut event: impl FnMut(Vec<u8>),
+) -> StreamEnd {
+    let mut splitter = Splitter::default();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => {
+                splitter.finish().into_iter().for_each(event);
+                return complete;
+            }
+            Err(_) => {
+                return StreamEnd::Cut {
+                    reason: "stream_broken".to_owned(),
+                };
+            }
+        };
+        splitter.push(&chunk).into_iter().for_each(&mut event);
+    }
+}
+
+fn received(response: &reqwest::Response) -> Vec<(String, String)> {
+    response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+        })
+        .collect()
 }
 
 fn relay(config: &Config) -> Answer {
@@ -187,7 +252,7 @@ async fn to_internet(
     config: &Config,
     head: &Head,
     body: Vec<u8>,
-) -> Result<Response, String> {
+) -> Result<reqwest::Response, String> {
     if !config.http {
         return Err(format!("this node does not serve {HTTP}"));
     }
@@ -222,7 +287,7 @@ async fn to_service(
     name: &str,
     head: &Head,
     body: Vec<u8>,
-) -> Result<Response, String> {
+) -> Result<reqwest::Response, String> {
     let Some(Upstream { base, secrets }) = config.services.get(name) else {
         return Err(format!("this node does not serve {name}"));
     };
@@ -251,7 +316,7 @@ async fn send(
     url: Url,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-) -> Result<Response, String> {
+) -> Result<reqwest::Response, String> {
     let method = reqwest::Method::from_bytes(head.method.as_str().as_bytes())
         .map_err(|error| error.to_string())?;
     let mut request = client.request(method, url.clone());
@@ -261,29 +326,7 @@ async fn send(
     if !body.is_empty() {
         request = request.body(body);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| unreached(&url, error))?;
-    let status = response.status().as_u16();
-    let received = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
-        })
-        .collect();
-    let headers = end_to_end(received);
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| format!("the answer broke off: {error}"))?
-        .to_vec();
-    Ok(Response {
-        status,
-        headers,
-        body,
-    })
+    request.send().await.map_err(|error| unreached(&url, error))
 }
 
 #[cfg(test)]

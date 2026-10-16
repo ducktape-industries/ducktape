@@ -1,8 +1,7 @@
 //! Every member of the current epoch, served at `/v1/network`, with each
 //! validator's height from the finalize votes this node's engine heard
 //! (`consensus::Votes`). The book lives in memory: a restart empties it
-//! until the next votes arrive, and a node not seated this epoch runs no
-//! engine, so it hears none.
+//! until the next votes arrive.
 
 use std::collections::BTreeMap;
 

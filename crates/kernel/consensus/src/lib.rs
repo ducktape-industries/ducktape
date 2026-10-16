@@ -2,6 +2,7 @@ mod anchor;
 mod cadence;
 mod catchup;
 mod chain;
+mod elector;
 mod engine;
 mod lanes;
 mod marshal;

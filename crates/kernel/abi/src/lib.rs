@@ -654,30 +654,39 @@ pub mod role {
         pub type AccountNumber = u64;
 
         /// What an account is, in one field, so no account is two things
-        /// at once: a person holds their own keys; a managed account holds
-        /// the keys its `manager`, a person, gives it and acts only while
-        /// its `standing` is `Active`; a program's account is the program's own
-        /// and holds no keys.
+        /// at once. A `User` is a person who holds their own keys. A
+        /// `Program` account is managed by the user its `manager` names:
+        /// it holds the keys that user gives it, acts only while its
+        /// `standing` is `Active`, and its `script` runs its actions: the
+        /// script `calls` one program and hands it `config`, text that
+        /// program alone gives a meaning. A `System` account is a
+        /// program's own account and holds no keys.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Kind {
-            Person,
-            Managed {
+            User,
+            Program {
                 manager: AccountNumber,
                 category: Category,
                 standing: Standing,
-                runner: Option<ProgramId>,
+                script: Option<Script>,
             },
-            Program(ProgramId),
+            System(ProgramId),
         }
 
-        /// What a manager declares a managed account to be. The enum only
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Script {
+            pub calls: ProgramId,
+            pub config: String,
+        }
+
+        /// What a manager declares a program account to be. The enum only
         /// grows at its end.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Category {
             Agent,
         }
 
-        /// Whether a managed account acts. Its manager alone changes it;
+        /// Whether a program account acts. Its manager alone changes it;
         /// `Revoked` is final.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub enum Standing {
@@ -706,7 +715,7 @@ pub mod role {
         pub enum Query {
             /// The kernel's: the account a frame signed by this key acts
             /// as, `None` for a key that holds none. Refused while that
-            /// account does not act (a managed one whose [`Standing`] is
+            /// account does not act (a program account whose [`Standing`] is
             /// not `Active`). The host rejects a frame whose key is
             /// refused.
             Account(Vec<u8>),
@@ -945,11 +954,18 @@ pub mod role {
             },
             Request {
                 request: Request,
+                delivery: Delivery,
                 wait: Option<u64>,
             },
             Answer {
                 id: u64,
                 answer: Answer,
+            },
+            Event(Event),
+            EndStream {
+                id: u64,
+                events: u64,
+                end: StreamEnd,
             },
             Expire {
                 id: u64,
@@ -991,6 +1007,38 @@ pub mod role {
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum Delivery {
+            Whole,
+            Events { deliver: Vec<u8> },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub struct Event {
+            pub id: u64,
+            pub seq: u64,
+            pub data: Vec<u8>,
+        }
+
+        impl Event {
+            pub fn payload(&self, deliver: &[u8]) -> Vec<u8> {
+                let mut payload = deliver.to_vec();
+                payload.extend(crate::encode(self));
+                payload
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        pub enum StreamEnd {
+            Complete {
+                status: u16,
+                headers: Vec<(String, String)>,
+            },
+            Cut {
+                reason: String,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         pub struct ServiceRow {
             pub name: String,
             pub owner: AccountNumber,
@@ -1003,6 +1051,7 @@ pub mod role {
             pub id: u64,
             pub requester: ProgramId,
             pub request: Request,
+            pub delivery: Delivery,
             pub node: Vec<u8>,
             pub made: u64,
             pub expiry: EntryId,
@@ -1484,6 +1533,27 @@ mod tests {
         assert_eq!(encode(&Reply::Requests(Vec::new())), [0, 0, 0, 0, 0]);
         assert_eq!(encode(&Reply::Node(None)), [1, 0]);
         assert_eq!(encode(&Reply::Serving(Vec::new())), [2, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_streamed_event_reaches_its_requester_as_the_requesters_own_op() {
+        use role::egress::Event;
+        #[derive(Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        enum Requester {
+            Other,
+            Streamed(Event),
+        }
+        let event = Event {
+            id: 7,
+            seq: 3,
+            data: b"event: delta\ndata: {}\n".to_vec(),
+        };
+        let streamed_tag = encode(&Requester::Other)[0] + 1;
+        let delivered = event.payload(&[streamed_tag]);
+        assert_eq!(
+            decode::<Requester>(&delivered).unwrap(),
+            Requester::Streamed(event)
+        );
     }
 
     #[test]

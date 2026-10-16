@@ -496,9 +496,11 @@ impl Pump {
             if let Some(stall) = stall {
                 stall.hold().await;
             }
+            let sequenced = node.apply(&block).await.unwrap();
+            let replayed = matches!(sequenced, Sequenced::Replayed);
             if let Sequenced::Applied {
                 applied: outcome, ..
-            } = node.apply(&block).await.unwrap()
+            } = sequenced
             {
                 self.roots
                     .lock()
@@ -509,7 +511,8 @@ impl Pump {
                     .unwrap()
                     .insert(block.height, block.frames.clone());
             }
-            let seating = if self.network.closes_an_epoch(block.height) {
+            let opens_an_epoch = !replayed && self.network.closes_an_epoch(block.height);
+            let seating = if opens_an_epoch {
                 let epoch = self.network.epoch_after(block.height);
                 let validators = node
                     .epoch_validators(epoch)

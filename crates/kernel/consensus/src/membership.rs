@@ -1,7 +1,9 @@
+use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_runtime::Handle;
+use commonware_utils::ordered::Set;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::Tip;
@@ -22,6 +24,8 @@ pub enum Error {
     Validators { epoch: u64 },
     #[error("epoch {epoch} has no floor: neither an anchor block nor a finalization names the tip")]
     Floor { epoch: u64 },
+    #[error("epoch {epoch} follows an epoch the roster never seated")]
+    Previous { epoch: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,17 +76,12 @@ where
         let (seats, seated) = mpsc::unbounded();
         let heard = heard
             .into_stream()
-            .map(|(epoch, peer, certificate)| Signal::Heard {
-                epoch,
-                peer,
-                certificate,
-            });
+            .map(|(epoch, peer)| Signal::Heard { epoch, peer });
         let signals = futures::stream::select(seated, heard);
         let catch_up = context.child("catch_up").spawn({
             let network = network.clone();
-            let roster = roster.clone();
             let marshal = marshal.mailbox().clone();
-            move |context| catchup::run(context, network, roster, marshal, signals)
+            move |_| catchup::run(network, marshal, signals)
         });
         Membership {
             context,
@@ -121,11 +120,12 @@ where
     }
 
     async fn engine(&mut self, epoch: u64, tip: Tip) -> Result<Standing, Error> {
-        let Some(scheme) = self.roster.scheme(epoch) else {
+        let Some((scheme, standing)) = self.seat_in(epoch) else {
             self.engine = None;
             self.votes.clear();
             return Ok(Standing::Follower);
         };
+        let previous = self.previous(epoch)?;
         let floor = floor(&self.marshal, &self.anchor, &self.network, tip)
             .await
             .ok_or(Error::Floor { epoch })?;
@@ -139,6 +139,7 @@ where
             Epoch {
                 number: epoch,
                 scheme,
+                previous,
                 floor,
                 votes: self.votes.clone(),
             },
@@ -146,6 +147,26 @@ where
             &self.marshal,
             self.chain.clone(),
         ));
-        Ok(Standing::Validator)
+        Ok(standing)
+    }
+
+    fn previous(&self, epoch: u64) -> Result<Option<Set<PublicKey>>, Error> {
+        let Some(before) = epoch.checked_sub(1) else {
+            return Ok(None);
+        };
+        let previous = self
+            .roster
+            .seated(before)
+            .ok_or(Error::Previous { epoch })?;
+        Ok(Some(previous))
+    }
+
+    fn seat_in(&self, epoch: u64) -> Option<(Scheme, Standing)> {
+        if let Some(signer) = self.roster.scheme(epoch) {
+            return Some((signer, Standing::Validator));
+        }
+        let verifier = self.roster.verifier(epoch)?;
+        let seats_someone = !verifier.participants().is_empty();
+        seats_someone.then_some((verifier, Standing::Follower))
     }
 }

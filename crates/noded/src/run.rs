@@ -852,6 +852,8 @@ async fn applied<E: Context>(
     daemon.votes.applied(block.digest(), block.height);
     daemon.tips.send_replace(block.height);
     let closes = daemon.network.closes_an_epoch(block.height);
+    let replayed = matches!(sequenced, Sequenced::Replayed);
+    let opens_an_epoch = !replayed && closes;
     let (receipted, members_written) = match sequenced {
         Sequenced::Applied {
             mut applied,
@@ -890,7 +892,7 @@ async fn applied<E: Context>(
     if reseats {
         reseat_halo(daemon, &node, block.height).await;
     }
-    if !closes {
+    if !opens_an_epoch {
         let due = node.reoffer();
         drop(node);
         daemon

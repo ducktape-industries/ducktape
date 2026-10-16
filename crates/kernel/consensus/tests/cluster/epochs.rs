@@ -1,3 +1,9 @@
+use commonware_consensus::simplex::elector::{Config, Elector as _, RoundRobin};
+use commonware_consensus::simplex::scheme::ed25519::Scheme;
+use commonware_consensus::types::{Epoch, Round, View};
+use commonware_cryptography::Sha256;
+use commonware_utils::ordered::Set;
+
 use super::*;
 
 #[test]
@@ -150,5 +156,70 @@ fn an_epoch_boundary_reseats_the_validators() {
         assert_eq!(boundary.round().epoch().get(), 0);
         assert_eq!(after.round().epoch().get(), 1);
         assert_eq!(next.round().epoch().get(), 2);
+    });
+}
+
+#[test]
+fn the_new_epochs_first_view_finalizes_while_its_newcomer_is_cut_off() {
+    runner().start(|context| async move {
+        let network = network(8);
+        let epoch = 1;
+        let mut keys: Vec<_> = (1..=4).map(key).collect();
+        keys.sort_by_key(|key| key.public_key());
+        let seats =
+            Set::try_from(keys.iter().map(|key| key.public_key()).collect::<Vec<_>>()).unwrap();
+        let first_view = Round::new(Epoch::new(epoch), View::new(1));
+        let round_robin = Config::<Scheme>::build(RoundRobin::<Sha256>::default(), &seats);
+        let first_leader = round_robin.elect(first_view, None);
+        let newcomer = keys.remove(first_leader.get() as usize);
+        let founders = keys;
+        let everyone: Vec<_> = founders.iter().chain([&newcomer]).cloned().collect();
+        let public: Vec<_> = everyone.iter().map(|key| key.public_key()).collect();
+        let members: Vec<_> = founders.iter().map(member).collect();
+        let oracle = mesh(&context, &everyone).await;
+        let mut peers = validators(&context, &oracle, &founders, &members, &network).await;
+        let mut joiner = Peer::spawn(
+            context.child(LABELS[3]),
+            LABELS[3],
+            &oracle,
+            newcomer.clone(),
+            &members,
+            network.clone(),
+        )
+        .await;
+
+        let alice = key(11);
+        let promote = validators::Op::Vote(validators::Motion::Promote {
+            key: member(&newcomer).key,
+        });
+        for frame in [enroll(&newcomer), valset(&alice, &promote)] {
+            peers[0].submit(frame).await;
+        }
+        let closing = network.anchor(epoch);
+        joiner.reached(closing - 2).await;
+        sever(&oracle, &joiner.me(), &public).await;
+        for peer in &mut peers {
+            peer.reached(closing + 1).await;
+        }
+        heal(&oracle, &joiner.me(), &public).await;
+
+        let seated = peers[0].node.lock().await.epoch_validators(epoch).unwrap();
+        assert_eq!(
+            seated.as_deref().and_then(consensus::validators_of),
+            Some(seats.clone())
+        );
+        let opening = peers[0].marshal.certificate(closing + 1).await.unwrap();
+        assert_eq!(opening.round(), first_view, "the first view was nullified");
+        let previous = peers[0].roster.seated(epoch - 1);
+        let proposer = consensus::proposer(&opening, &seats, previous.as_ref()).unwrap();
+        assert!(
+            founders
+                .iter()
+                .any(|founder| founder.public_key() == proposer)
+        );
+
+        joiner.reached(closing + 2).await;
+        assert_eq!(joiner.root_at(closing + 1), peers[0].root_at(closing + 1));
+        assert!(joiner.roster.participates(epoch));
     });
 }
