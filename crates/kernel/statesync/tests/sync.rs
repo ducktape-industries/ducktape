@@ -4,7 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use abi::{HostOp, role::validators};
+use abi::{
+    HostOp, role,
+    role::{halo, validators},
+};
 use commonware_consensus::marshal::Start;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::simplex::types::{Finalization, Finalize, Proposal};
@@ -20,10 +23,13 @@ use node::{Block, Frame, Node, Sequenced};
 use state::{Storage, Store};
 use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, join, serve};
 
-const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
+const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
+const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"sync";
@@ -41,22 +47,26 @@ fn member(key: &ed25519::PrivateKey) -> validators::Member {
     validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: Some(format!("{}:1", key.public_key())),
+        halo: format!("{}:2", key.public_key()),
     }
 }
 
 fn genesis(members: &[validators::Member]) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles {
-            registry: "module-registry".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
+        ]),
         validators: members.to_vec(),
         programs: vec![
             Founding {
-                program: "module-registry".into(),
-                code: MODULE_REGISTRY.to_vec(),
+                program: "programs".into(),
+                code: PROGRAMS.to_vec(),
                 params: Vec::new(),
             },
             Founding {
@@ -70,6 +80,11 @@ fn genesis(members: &[validators::Member]) -> Genesis {
                 params: abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
             },
             Founding {
+                program: "blobs".into(),
+                code: BLOBS.to_vec(),
+                params: Vec::new(),
+            },
+            Founding {
                 program: "ping".into(),
                 code: RELAY.to_vec(),
                 params: Vec::new(),
@@ -79,8 +94,19 @@ fn genesis(members: &[validators::Member]) -> Genesis {
                 code: PROBE.to_vec(),
                 params: abi::encode(&Vec::<Step>::new()),
             },
+            Founding {
+                program: "awaits".into(),
+                code: AWAITS.to_vec(),
+                params: Vec::new(),
+            },
+            Founding {
+                program: "halo".into(),
+                code: HALO.to_vec(),
+                params: abi::encode(&halo::Genesis { lanes: Vec::new() }),
+            },
         ],
         views: Vec::new(),
+        hooks: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
@@ -110,9 +136,9 @@ fn frame(key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
 async fn seal(node: &mut Node<Ctx>) -> Block {
     let tip = node.tip().unwrap();
     let block = node
-        .build(tip, std::iter::empty(), TIME + tip.height + 1)
-        .unwrap();
-    let Sequenced::Applied(_) = node.apply(&block).await.unwrap() else {
+        .proposer()
+        .build(tip, std::iter::empty(), TIME + tip.height + 1);
+    let Sequenced::Applied { .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
     block
@@ -250,8 +276,8 @@ fn blobs(request: &Request) -> bool {
     matches!(request, Request::Blob(_))
 }
 
-/// `program`'s sync; the head lists the reserved programs, then identity,
-/// module-registry and ping, before probe.
+/// `program`'s sync; the head lists the reserved programs, then identity
+/// and ping, before probe.
 fn syncing(request: &Request, program: &str) -> bool {
     matches!(request, Request::Sync { program: asked, .. } if asked == program)
 }
@@ -319,14 +345,14 @@ impl Network {
         let mut node = self.source.node.lock().await;
         for frame in frames {
             let taken = node
-                .submit(frame, node::Source::Client)
+                .submit(frame, node::Source::Client, node::Preconfirm::On)
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(
-                taken.receipt().outcome,
-                abi::Outcome::Applied { .. }
-            ));
+            let prediction = taken
+                .prediction()
+                .expect("a preconfirmed frame is predicted");
+            assert!(matches!(prediction.outcome, abi::Outcome::Applied { .. }));
         }
         let tip = seal(&mut node).await.tip();
         drop(node);
@@ -442,12 +468,16 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
 
         let mut source = network.source.node.lock().await;
         source
-            .submit(frame(&alice, vec![set(b"c", b"3")]), node::Source::Client)
+            .submit(
+                frame(&alice, vec![set(b"c", b"3")]),
+                node::Source::Client,
+                node::Preconfirm::Off,
+            )
             .await
             .unwrap()
             .unwrap();
         let block = seal(&mut source).await;
-        let Sequenced::Applied(applied) = joined.node.apply(&block).await.unwrap() else {
+        let Sequenced::Applied { applied, .. } = joined.node.apply(&block).await.unwrap() else {
             panic!("the joiner had not seen block {}", block.height);
         };
         assert_eq!(applied.root, source.host().root().unwrap());
@@ -533,6 +563,7 @@ fn a_tip_certificate_verifies_against_the_validators_not_the_members() {
             let resident = key(seed);
             let enroll = validators::Op::Enroll {
                 address: member(&resident).address,
+                halo: member(&resident).halo,
                 invite: None,
             };
             Frame::sign(
@@ -865,8 +896,11 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         let alice = key(11);
-        // 256 keys: probe's log takes four fetches at the least
-        let frames = (0..4)
+        let tuning = state::Tuning::default();
+        let section = tuning.items_per_section.get() as usize;
+        let fetch = tuning.sync_fetch_batch.get() as usize;
+        let serves = 1 + 2 * section / fetch + 1;
+        let frames = (0..4 * section / 64)
             .map(|n| {
                 let steps = (0..64)
                     .map(|i| set(format!("{n}-{i}").as_bytes(), b"1"))
@@ -887,11 +921,8 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
         .await
         .unwrap();
         let whole = whole.load(Ordering::SeqCst);
-        assert!(whole >= 4, "a whole sync of probe asks {whole} times");
+        assert!(whole > serves, "a whole sync of probe asks {whole} times");
 
-        // the boundary, then three fetches of 64: a sync keeps its log a
-        // 64-op section at a time, sealed once the next one starts, so two
-        // whole sections are kept when the fifth request is refused
         let dir = tempfile::tempdir().unwrap();
         let refused = Arc::new(AtomicUsize::new(0));
         let error = join(
@@ -899,11 +930,11 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
-            network.counting(&refused, 4),
+            network.counting(&refused, serves),
         )
         .await
         .err()
-        .expect("probe's fifth request is refused");
+        .expect("a request past the second whole section is refused");
         assert!(
             matches!(error, Error::State(state::Error::Sync(_))),
             "{error}"

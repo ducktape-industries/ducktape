@@ -35,7 +35,7 @@ fn key(kind: &str, item: &ItemRef) -> Vec<u8> {
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::{Cause, Env, ItemRef, Outcome, Refusal, reason};
-    use guest::{Execute, Program, Query, Reads};
+    use program::{Execute, Program, Query, Reads};
 
     use crate::{Script, done, got, sent};
 
@@ -44,7 +44,9 @@ mod program {
     impl Program for Relay {
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             match &env.cause {
-                Cause::Direct => run(ctx, None, payload),
+                Cause::Direct | Cause::Call { .. } | Cause::Scheduled { .. } => {
+                    run(ctx, None, payload)
+                }
                 Cause::Message(item) => run(ctx, Some(item), payload),
                 Cause::Completion { item, outcome } => {
                     ctx.set(done(item), abi::encode(outcome));
@@ -78,7 +80,7 @@ mod program {
                 let mut items = Vec::new();
                 for message in messages {
                     let body = message.payload.clone();
-                    let item = ctx.emit(message.target, message.payload, message.reply);
+                    let item = ctx.send(message);
                     ctx.set(sent(&item), body);
                     items.push(item);
                 }
@@ -91,5 +93,5 @@ mod program {
         Ok(())
     }
 
-    guest::program!(Relay);
+    program::program!(Relay);
 }

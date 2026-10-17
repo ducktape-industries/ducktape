@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use abi::role::validators::Member;
 use commonware_codec::DecodeExt as _;
@@ -11,13 +12,21 @@ use commonware_runtime::{Handle, Quota};
 use commonware_utils::ordered::Map;
 use commonware_utils::{NZU32, NZUsize, hostname};
 use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE};
-use consensus::{EngineChannels, MarshalLanes};
+use consensus::{Cadence, EngineChannels, MarshalLanes};
 
 use crate::endpoint::Endpoint;
 use crate::transport::{self, Bridges};
 use crate::{Context, Result};
 
 pub const QUOTA_PER_SECOND: u32 = 1024;
+
+pub fn link_timeout(cadence: Cadence) -> Duration {
+    cadence.leader_timeout()
+}
+
+pub fn ping_frequency(cadence: Cadence) -> Duration {
+    cadence.leader_timeout() / 4
+}
 
 pub type Lane<E> = (Sender<PublicKey, E>, Receiver<PublicKey>);
 
@@ -48,6 +57,7 @@ impl<E: Context> Mesh<E> {
         namespace: &[u8],
         listen: SocketAddr,
         member_cap: u32,
+        cadence: Cadence,
     ) -> Result<Started<E>> {
         // An epoch seats at most `member_cap` members; this node takes one more
         // place whenever it is not among them (commonware `peer_set_limit`), and
@@ -57,6 +67,7 @@ impl<E: Context> Mesh<E> {
         let mut config = Config::local(identity, namespace, listen, peers, node::MESSAGE_BYTES);
         config.bypass_ip_check = true;
         config.allow_dns = false;
+        config.ping_frequency = ping_frequency(cadence);
         // only the current epoch's set: nothing reads an older one, and the
         // previous epoch's engine is gone at the switch
         config.tracked_peer_sets = NZUsize!(1);
@@ -179,6 +190,30 @@ mod tests {
 
     use super::*;
 
+    fn cadence() -> Cadence {
+        Cadence::new(Duration::from_millis(250), consensus::Timeouts::default()).unwrap()
+    }
+
+    #[test]
+    fn the_link_lives_a_leader_timeout_and_pings_four_times_in_it() {
+        assert_eq!(link_timeout(cadence()), Duration::from_secs(5));
+        assert_eq!(ping_frequency(cadence()), Duration::from_millis(1_250));
+        let one_second =
+            Cadence::new(Duration::from_secs(1), consensus::Timeouts::default()).unwrap();
+        assert_eq!(link_timeout(one_second), Duration::from_secs(20));
+        assert_eq!(ping_frequency(one_second), Duration::from_secs(5));
+        let tuned = Cadence::new(
+            Duration::from_secs(1),
+            consensus::Timeouts {
+                leader: Some(Duration::from_secs(8)),
+                ..consensus::Timeouts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(link_timeout(tuned), Duration::from_secs(8));
+        assert_eq!(ping_frequency(tuned), Duration::from_secs(2));
+    }
+
     /// Starts a mesh capped at three members and tracks `foreign` members,
     /// none of them this node.
     fn track_foreign(foreign: u64) {
@@ -189,11 +224,12 @@ mod tests {
                 .unwrap();
             let identity = PrivateKey::from_seed(0);
             let (_mesh, mut tracker, _, _, _) =
-                Mesh::start(context, identity, b"mesh", listen, 3).unwrap();
+                Mesh::start(context, identity, b"mesh", listen, 3, cadence()).unwrap();
             let members: Vec<Member> = (1..=foreign)
                 .map(|seed| Member {
                     key: PrivateKey::from_seed(seed).public_key().as_ref().to_vec(),
                     address: Some(format!("tcp://localhost:{}", 9_000 + seed)),
+                    halo: format!("localhost:{}", 9_000 + seed),
                 })
                 .collect();
             tracker.track(0, &members);
@@ -218,14 +254,22 @@ mod tests {
                 .unwrap()
                 .local_addr()
                 .unwrap();
-            let (mesh, mut tracker, _, _, _) =
-                Mesh::start(context, PrivateKey::from_seed(0), b"mesh", listen, 3).unwrap();
+            let (mesh, mut tracker, _, _, _) = Mesh::start(
+                context,
+                PrivateKey::from_seed(0),
+                b"mesh",
+                listen,
+                3,
+                cadence(),
+            )
+            .unwrap();
             let undialed = PrivateKey::from_seed(1).public_key();
             tracker.track(
                 0,
                 &[Member {
                     key: undialed.as_ref().to_vec(),
                     address: None,
+                    halo: "localhost:1".into(),
                 }],
             );
             let tracked = mesh.oracle().peer_set(0).await.unwrap();

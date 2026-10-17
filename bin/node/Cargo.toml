@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 abi = { workspace = true }
-blobs = { workspace = true }
+blob = { workspace = true, features = ["store"] }
 clap = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }

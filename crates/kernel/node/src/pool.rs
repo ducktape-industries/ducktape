@@ -1,9 +1,10 @@
 // The mempool: every frame a node has taken that no applied block has carried and whose anchor
-// is still recent, in the order the node took them. Owned by `Node`.
+// is still recent, in the order the node took them. `Node` writes it; its `Proposer` reads it.
 
 use std::collections::{BTreeMap, HashMap};
 
-use host::{Receipt, Submission, SubmissionId};
+use abi::Receipt;
+use host::{Submission, SubmissionId};
 
 const FIRST_WAIT: u64 = 4;
 const LONGEST_WAIT: u64 = 64;
@@ -13,9 +14,15 @@ pub struct Held {
     pub id: SubmissionId,
     pub frame: Vec<u8>,
     pub submission: Submission,
-    pub prediction: Receipt,
+    pub prediction: Option<Receipt>,
     arrival: u64,
     offer: Option<Offer>,
+}
+
+impl Held {
+    pub fn preconfirmed(&self) -> bool {
+        self.prediction.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,7 +62,7 @@ impl Pool {
         &mut self,
         frame: Vec<u8>,
         submission: Submission,
-        prediction: Receipt,
+        prediction: Option<Receipt>,
         offered: Option<u64>,
     ) {
         let id = submission.id();
@@ -78,7 +85,7 @@ impl Pool {
 
     pub fn predict(&mut self, id: &SubmissionId, prediction: Receipt) {
         if let Some(held) = self.held.get_mut(id) {
-            held.prediction = prediction;
+            held.prediction = Some(prediction);
         }
     }
 

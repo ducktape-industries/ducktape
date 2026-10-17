@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["probe", "module-registry", "valset", "relay", "identity"]
+members = ["awaiter", "awaits", "oracle", "probe", "programs", "valset", "relay", "identity", "blobs", "scheduler", "halo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,7 +8,8 @@ edition = "2024"
 
 [workspace.dependencies]
 abi = { path = "../abi" }
-guest = { path = "../guest" }
+program = { path = "../program" }
+blob = { path = "../../blob" }
 borsh = { version = "1", default-features = false, features = ["derive", "std"] }
 
 [profile.release]

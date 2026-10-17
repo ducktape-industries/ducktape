@@ -1,11 +1,17 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use abi::Outcome;
-use abi::role::validators::{Grant, INVITE_NAMESPACE, Invite, Op};
+use abi::Scan;
+use abi::role;
+use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
+use blob::contract::{BUNDLES, Bundle};
+use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};
@@ -13,15 +19,18 @@ use commonware_runtime::Handle;
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
-    Ancestry, Anchor, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
+    Ancestry, Anchor, Cadence, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
     validators_of,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use node::{Block, Frame, Node, Sequenced};
+use halo::{Class, Halo, Lane, Seat};
+use host::Layer;
+use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source, Taken};
 use tokio::sync::watch;
 
 use crate::endpoint::Endpoint;
+use crate::live;
 use crate::mesh::{Mesh, Tracker};
 use crate::relay::{self, Relay};
 use crate::transport;
@@ -31,13 +40,108 @@ use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Delivery = (Arc<Block>, Exact);
 type Seating<E> =
-    Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant<E>>;
+    Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Listen {
     pub p2p: SocketAddr,
     pub http: SocketAddr,
     pub tls: Option<SocketAddr>,
+    pub halo: SocketAddr,
+    /// The UDP socket desktop clients reach the live relay on over QUIC; without it they take
+    /// the websocket alone.
+    pub live: Option<SocketAddr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HaloConfig {
+    pub egress_bytes_per_sec: Option<u64>,
+    pub inbound_streams: NonZeroUsize,
+    pub datagrams: NonZeroUsize,
+}
+
+impl Default for HaloConfig {
+    fn default() -> HaloConfig {
+        let queues = halo::Queues::default();
+        HaloConfig {
+            egress_bytes_per_sec: None,
+            inbound_streams: queues.inbound,
+            datagrams: queues.datagrams,
+        }
+    }
+}
+
+impl HaloConfig {
+    fn queues(&self) -> halo::Queues {
+        halo::Queues {
+            inbound: self.inbound_streams,
+            datagrams: self.datagrams,
+        }
+    }
+}
+
+const READS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero");
+const UPLOADS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadConfig {
+    pub reads_in_flight: NonZeroUsize,
+    pub uploads_in_flight: NonZeroUsize,
+    pub blob_backlog: NonZeroUsize,
+    pub blob_serves_in_flight: NonZeroUsize,
+    pub blob_gatherers: NonZeroUsize,
+    pub live_session_inbound: NonZeroUsize,
+    pub live_session_outbound: NonZeroUsize,
+    pub live_group_queue: NonZeroUsize,
+    pub live_peer_queue: NonZeroUsize,
+    pub live_lane_backlog: NonZeroUsize,
+    pub live_lane_per_sender: NonZeroUsize,
+    pub live_linger: Duration,
+}
+
+impl Default for LoadConfig {
+    fn default() -> LoadConfig {
+        let blobs = blob::service::Config::default();
+        let live = live::Config::default();
+        LoadConfig {
+            reads_in_flight: READS_IN_FLIGHT,
+            uploads_in_flight: UPLOADS_IN_FLIGHT,
+            blob_backlog: blobs.backlog,
+            blob_serves_in_flight: blobs.serving,
+            blob_gatherers: blobs.gatherers,
+            live_session_inbound: live.session_inbound,
+            live_session_outbound: live.session_outbound,
+            live_group_queue: live.group_queue,
+            live_peer_queue: live.peer_queue,
+            live_lane_backlog: live.lane_backlog,
+            live_lane_per_sender: live.lane_per_sender,
+            live_linger: live.linger,
+        }
+    }
+}
+
+impl LoadConfig {
+    fn blobs(&self) -> blob::service::Config {
+        blob::service::Config {
+            backlog: self.blob_backlog,
+            serving: self.blob_serves_in_flight,
+            gatherers: self.blob_gatherers,
+        }
+    }
+
+    /// The relay's share; its chain reads run under the node's `reads_in_flight`.
+    fn live(&self) -> live::Config {
+        live::Config {
+            session_inbound: self.live_session_inbound,
+            session_outbound: self.live_session_outbound,
+            group_queue: self.live_group_queue,
+            peer_queue: self.live_peer_queue,
+            lane_backlog: self.live_lane_backlog,
+            lane_per_sender: self.live_lane_per_sender,
+            reads_in_flight: self.reads_in_flight,
+            linger: self.live_linger,
+        }
+    }
 }
 
 pub struct Running<E: Context> {
@@ -60,8 +164,9 @@ pub fn init<'a, E: Context>(
     context: E,
     workspace: &'a Workspace,
     founding: &'a Path,
+    halo: &'a str,
 ) -> Boxed<'a, Result<()>> {
-    Box::pin(found(context, workspace, founding))
+    Box::pin(found(context, workspace, founding, halo))
 }
 
 pub fn join<'a, E: Context>(
@@ -69,9 +174,10 @@ pub fn join<'a, E: Context>(
     workspace: &'a Workspace,
     source: Client,
     address: Option<Endpoint>,
+    halo: String,
     invite: Option<Invite>,
 ) -> Boxed<'a, Result<()>> {
-    Box::pin(adopt(context, workspace, source, address, invite))
+    Box::pin(adopt(context, workspace, source, address, halo, invite))
 }
 
 pub fn invite(identity: &PrivateKey, grant: Grant) -> Invite {
@@ -88,13 +194,22 @@ pub fn run<'a, E: Context>(
     workspace: &'a Workspace,
     logs: Logs,
     listen: Listen,
+    halo: HaloConfig,
+    load: LoadConfig,
+    cadence: Cadence,
 ) -> Boxed<'a, Result<Running<E>>> {
-    Box::pin(start(context, workspace, logs, listen))
+    Box::pin(start(context, workspace, logs, listen, halo, load, cadence))
 }
 
-async fn found<E: Context>(mut context: E, workspace: &Workspace, founding: &Path) -> Result<()> {
-    let (founding, base) = Founding::read(founding)?;
-    workspace.identity_or_create(&mut context)?;
+async fn found<E: Context>(
+    mut context: E,
+    workspace: &Workspace,
+    founding: &Path,
+    halo: &str,
+) -> Result<()> {
+    let (mut founding, base) = Founding::read(founding)?;
+    let identity = workspace.identity_or_create(&mut context)?;
+    founding.seat_halo(identity.public_key().as_ref(), halo)?;
     let descriptor = founding.descriptor();
     let genesis = founding.genesis(&base)?;
     let (_, block, _) = Node::found(
@@ -113,13 +228,16 @@ async fn adopt<E: Context>(
     workspace: &Workspace,
     source: Client,
     address: Option<Endpoint>,
+    halo: String,
     invite: Option<Invite>,
 ) -> Result<()> {
+    let halo = crate::workspace::halo_address(&halo)?;
     let status = source.status().await?;
     let identity = workspace.identity_or_create(&mut context)?;
     let salt = rand_core::Rng::next_u64(&mut context);
     let enroll = Op::Enroll {
         address: address.as_ref().map(Endpoint::to_string),
+        halo,
         invite,
     };
     let frame = Frame::sign(
@@ -127,7 +245,10 @@ async fn adopt<E: Context>(
         status.network.as_bytes(),
         status.anchor(),
         Some(salt),
-        &status.roles.validators,
+        status
+            .roles
+            .bound(role::VALIDATORS)
+            .map_err(Error::Refused)?,
         abi::encode(&enroll),
     );
     let (_, receipt) = source.land(&frame).await?;
@@ -169,14 +290,19 @@ async fn start<E: Context>(
     workspace: &Workspace,
     logs: Logs,
     listen: Listen,
+    halo: HaloConfig,
+    load: LoadConfig,
+    cadence: Cadence,
 ) -> Result<Running<E>> {
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
     let anchor = workspace.anchor()?;
+    let egress = workspace.egress()?;
+    let clients = crate::egress::Clients::new(egress.reach).map_err(Error::Egress)?;
     let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     let network = Network {
         epoch_length: node.epoch_length()?,
-        cadence: descriptor.cadence(),
+        cadence,
     };
     let seated = recorded_epochs(&node)?;
     let tip = node.tip()?;
@@ -192,7 +318,58 @@ async fn start<E: Context>(
         "epoch {epoch} seats an undecodable key"
     )))?;
 
+    let halo = Arc::new(
+        Halo::start(
+            &context.child("halo"),
+            identity.clone(),
+            halo::Config {
+                egress_bytes_per_sec: halo.egress_bytes_per_sec,
+                udp: listen.halo,
+                queues: halo.queues(),
+            },
+        )
+        .map_err(|error| Error::Address(format!("--halo {}: {error}", listen.halo)))?,
+    );
+    halo.seat(halo_seats(&node, &network).await?);
+    tabled(&halo, halo_lanes(&node).await?, tip.height);
+    let blobs = blob::service::Service::start(
+        halo.clone(),
+        node.host().blobs().clone(),
+        bundles(&node)?,
+        load.blobs(),
+    )?;
     let member_cap = node.member_cap()?;
+    let identity_role = node.host().role(role::IDENTITY)?.clone();
+    let proposer = node.proposer();
+    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
+
+    // the live door binds its socket here, beside halo's, so a socket in use fails the start
+    // before consensus does any work
+    let (shutdown, _) = watch::channel(false);
+    let door = listen
+        .live
+        .map(|at| {
+            live::door(&identity, at)
+                .map_err(|error| Error::Address(format!("--live {at}: {error}")))
+        })
+        .transpose()?;
+    let live = live::Relay::start(
+        context.child("live"),
+        live::Network {
+            id: live::Network::chain_id(
+                &descriptor.network,
+                &descriptor.genesis_block().digest().0,
+            ),
+            genesis: descriptor.genesis_block().digest().0,
+            identity: identity_role,
+        },
+        Arc::new(node.clone()),
+        halo.clone(),
+        door,
+        load.live(),
+        shutdown.subscribe(),
+    );
+
     let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
         Mesh::start(
             context.child("mesh"),
@@ -200,6 +377,7 @@ async fn start<E: Context>(
             &descriptor.id(),
             listen.p2p,
             member_cap,
+            cadence,
         )?;
     tracker.track(epoch, &members);
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
@@ -210,13 +388,9 @@ async fn start<E: Context>(
         roster.seat(*epoch, validators);
     }
 
-    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
     let (inbox, deliveries) = mpsc::unbounded();
-    let chain = Participant {
-        node: node.clone(),
-        inbox,
-    };
-    let (marshal, receipts) = Marshal::start(
+    let chain = Participant { proposer, inbox };
+    let (marshal, summaries) = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
         &network,
@@ -248,10 +422,16 @@ async fn start<E: Context>(
         network = descriptor.network,
         epoch,
         ?standing,
+        block_time_ms = cadence.block_time_ms(),
+        leader_timeout_ms = cadence.leader_timeout().as_millis() as u64,
+        certification_timeout_ms = cadence.certification_timeout().as_millis() as u64,
+        timeout_retry_ms = cadence.timeout_retry().as_millis() as u64,
+        link_timeout_ms = crate::mesh::link_timeout(cadence).as_millis() as u64,
+        ping_frequency_ms = crate::mesh::ping_frequency(cadence).as_millis() as u64,
         "the node is up"
     );
 
-    let (shutdown, _) = watch::channel(false);
+    let (tips, _) = watch::channel(tip.height);
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         node,
@@ -259,14 +439,26 @@ async fn start<E: Context>(
         network,
         identity: identity.public_key().as_ref().to_vec(),
         anchors: marshal.mailbox().clone(),
-        receipts,
+        summaries,
         logs,
         shutdown,
+        tips,
         votes: membership.votes().clone(),
         relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
+        blobs,
+        halo,
+        live,
+        key: identity.clone(),
         mesh: transport::loopback(listen.p2p),
         subscribers: Mutex::new(Vec::new()),
     });
+    let founding = tip.height == 0;
+    if let Anchor::Genesis(genesis) = marshal.anchor()
+        && founding
+    {
+        let node = daemon.node.lock().await;
+        daemon.record_unrecorded(&node, genesis).await?;
+    }
 
     let pump = context.child("pump").spawn({
         let daemon = daemon.clone();
@@ -286,7 +478,7 @@ async fn start<E: Context>(
         None => None,
     };
     let server = context.child("http").spawn({
-        let router = crate::server::router(daemon.clone());
+        let router = crate::server::router(daemon.clone(), load);
         let mut down = daemon.shutdown.subscribe();
         move |_| async move {
             let served = axum::serve(listener, router)
@@ -299,7 +491,8 @@ async fn start<E: Context>(
             }
         }
     });
-    let mut tasks = vec![pump, server, relayed];
+    let egressing = crate::egress::spawn(daemon.clone(), egress, clients);
+    let mut tasks = vec![pump, server, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(listen.p2p);
         tasks.push(
@@ -319,6 +512,160 @@ async fn start<E: Context>(
     })
 }
 
+fn bundles<E: Context>(node: &Node<E>) -> Result<Vec<(u64, Bundle)>> {
+    let role = node.host().role(role::BLOBS)?;
+    let entries = node
+        .view(Layer::Confirmed)
+        .scan(role, &Scan::prefix(BUNDLES))
+        .map_err(host::Error::from)?;
+    blob::contract::recorded(&entries).map_err(|unreadable| {
+        Error::Corrupt(format!(
+            "bundle {} does not decode: {}",
+            unreadable.bundle, unreadable.refusal.sentence
+        ))
+    })
+}
+
+async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec<Seat>> {
+    let epoch = network.epoch_after(node.tip()?.height);
+    let validators = node.epoch_validators(epoch)?.ok_or(Error::Corrupt(format!(
+        "the state records no validators for epoch {epoch}"
+    )))?;
+    let role = node.host().role(role::VALIDATORS)?.clone();
+    let asked = abi::encode(&validators::Query::Members);
+    let answer = node
+        .query(Layer::Confirmed, abi::Origin::System, &role, asked)
+        .await?
+        .map_err(|refusal| {
+            Error::Corrupt(format!("the validators program refused Members: {refusal}"))
+        })?;
+    let validators::Reply::Members(members) = abi::decode(&answer).map_err(|refusal| {
+        Error::Corrupt(format!(
+            "the Members answer does not decode: {}",
+            refusal.sentence
+        ))
+    })?
+    else {
+        return Err(Error::Corrupt(
+            "the validators program answered Members with another reply".into(),
+        ));
+    };
+    Ok(seats(&members, &validators))
+}
+
+/// The lanes the halo role lists, at the confirmed tip.
+async fn halo_lanes<E: Context>(node: &Node<E>) -> Result<Vec<Lane>> {
+    let role = node.host().role(role::HALO)?.clone();
+    let asked = abi::encode(&abi::role::halo::Query::Lanes);
+    let answer = node
+        .query(Layer::Confirmed, abi::Origin::System, &role, asked)
+        .await?
+        .map_err(|refusal| Error::Corrupt(format!("the halo program refused Lanes: {refusal}")))?;
+    let abi::role::halo::Reply::Lanes(lanes) = abi::decode(&answer).map_err(|refusal| {
+        Error::Corrupt(format!(
+            "the Lanes answer does not decode: {}",
+            refusal.sentence
+        ))
+    })?
+    else {
+        return Err(Error::Corrupt(
+            "the halo program answered Lanes with another reply".into(),
+        ));
+    };
+    Ok(lanes)
+}
+
+/// Whether a block's writes change what `program` answers: it wrote the program's state, or the
+/// host swapped its code (a write under `$programs` at the program's id).
+fn rewrites(writes: &state::Writes, program: &str) -> bool {
+    let state = writes
+        .programs
+        .get(program)
+        .is_some_and(|written| !written.is_empty());
+    let code = writes
+        .programs
+        .get(host::PROGRAMS)
+        .is_some_and(|written| written.contains_key(program.as_bytes()));
+    state || code
+}
+
+async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
+    match halo_lanes(node).await {
+        Ok(lanes) => tabled(&daemon.halo, lanes, height),
+        Err(error) => tracing::warn!(
+            target: "ducktape::halo",
+            event = "halo_untabled",
+            height,
+            %error,
+            reason = "lanes_unread",
+            "halo keeps its lane table: the node could not read the halo program's lanes"
+        ),
+    }
+}
+
+/// Has halo serve `lanes`, the halo role's table at `height`, from now on, and says so.
+fn tabled(halo: &Halo, lanes: Vec<Lane>, height: u64) {
+    tracing::info!(
+        target: "ducktape::halo",
+        event = "halo_retabled",
+        height,
+        lanes = listing(&lanes),
+        "halo serves the halo role's lane table"
+    );
+    halo.plane().lanes(lanes);
+}
+
+/// The lane table as one log field, in id order: `name#id cap`, then `paused` or `served`, then
+/// `pinned` for a pinned lane.
+fn listing(lanes: &[Lane]) -> String {
+    let lane = |lane: &Lane| {
+        let served = match lane.enabled {
+            true => "served",
+            false => "paused",
+        };
+        let pinned = match lane.pinned {
+            true => " pinned",
+            false => "",
+        };
+        let cap = match lane.cap {
+            Class::Critical => "critical",
+            Class::Member => "member",
+            Class::Client => "client",
+        };
+        format!("{}#{} {cap} {served}{pinned}", lane.name, lane.id)
+    };
+    lanes.iter().map(lane).collect::<Vec<_>>().join(", ")
+}
+
+async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) {
+    match halo_seats(node, &daemon.network).await {
+        Ok(seats) => daemon.halo.seat(seats),
+        Err(error) => tracing::warn!(
+            target: "ducktape::halo",
+            event = "halo_unseated",
+            height,
+            %error,
+            reason = "members_unread",
+            "halo keeps its seating: the node could not read the validators program's members"
+        ),
+    }
+}
+
+pub fn seats(members: &[Member], validators: &[Vec<u8>]) -> Vec<Seat> {
+    members
+        .iter()
+        .filter_map(|member| {
+            let key = PublicKey::decode(member.key.as_slice()).ok()?;
+            let validator = validators.contains(&member.key);
+            Some(Seat {
+                key,
+                halo: member.halo.clone(),
+                validator,
+            })
+        })
+        .collect()
+}
+
 /// Every recorded epoch's validator keys: the sets the roster verifies
 /// certificates against.
 fn recorded_epochs<E: Context>(
@@ -333,55 +680,25 @@ fn recorded_epochs<E: Context>(
     Ok(seated)
 }
 
-pub struct Participant<E: Context> {
-    node: Shared<E>,
+#[derive(Clone)]
+pub struct Participant {
+    proposer: Proposer,
     inbox: mpsc::UnboundedSender<Delivery>,
 }
 
-impl<E: Context> Clone for Participant<E> {
-    fn clone(&self) -> Self {
-        Participant {
-            node: self.node.clone(),
-            inbox: self.inbox.clone(),
-        }
-    }
-}
-
-impl<E: Context> Participant<E> {
-    async fn build(
-        &self,
-        parent: Arc<Block>,
-        ancestors: impl Ancestry<Block>,
-        time: u64,
-    ) -> node::Result<Block> {
-        let applied = self.node.lock().await.tip()?.height;
-        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
-        let node = self.node.lock().await;
-        node.build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time)
-    }
-}
-
-impl<E: Context> Chain for Participant<E> {
+impl Chain for Participant {
     async fn propose(
         &mut self,
         parent: Arc<Block>,
         ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> Option<Block> {
-        let height = parent.height + 1;
-        match self.build(parent, ancestors, time).await {
-            Ok(block) => Some(block),
-            Err(error) => {
-                tracing::error!(
-                    target: "ducktape::node",
-                    event = "build_failed",
-                    height,
-                    %error,
-                    "the node cannot build a block"
-                );
-                None
-            }
-        }
+        let applied = self.proposer.applied().height;
+        let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
+        let block = self
+            .proposer
+            .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
+        Some(block)
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
@@ -412,28 +729,175 @@ async fn pump<E: Context>(
     }
 }
 
+async fn holding<'a, E: Context>(
+    daemon: &'a Daemon<E>,
+    block: &Block,
+) -> Result<(futures::lock::MutexGuard<'a, Node<E>>, Sequenced)> {
+    loop {
+        let mut node = daemon.node.lock().await;
+        let applied = node.apply(block).await;
+        let Err(node::Error::Host(host::Error::BlobUnavailable(id))) = applied else {
+            return Ok((node, applied?));
+        };
+        drop(node);
+        tracing::warn!(
+            target: "ducktape::node",
+            event = "blob_unavailable",
+            height = block.height,
+            ?id,
+            reason = "blob_missing",
+            "the block reads a blob this node lacks; the node fetches it and applies again"
+        );
+        daemon.blobs.fetch(id, halo::Class::Critical).await;
+    }
+}
+
+enum Posted {
+    Pending,
+    Retaken(Vec<u8>),
+    Refused,
+    Unheld,
+}
+
+async fn reposted<E: Context>(node: &mut Node<E>, posted: Option<Vec<u8>>) -> Result<Posted> {
+    let Some(receipt) = posted else {
+        return Ok(Posted::Unheld);
+    };
+    match node
+        .submit(receipt.clone(), Source::Client, Preconfirm::Off)
+        .await?
+    {
+        Ok(Taken::Held(_)) => Ok(Posted::Pending),
+        Ok(Taken::New(_)) => Ok(Posted::Retaken(receipt)),
+        Err(refusal) => {
+            let carried = refusal.reason == abi::reason::DUPLICATE;
+            if carried {
+                return Ok(Posted::Refused);
+            }
+            Ok(Posted::Unheld)
+        }
+    }
+}
+
+async fn receipt_for<E: Context>(
+    daemon: &Daemon<E>,
+    node: &mut Node<E>,
+    height: u64,
+    bundle: u64,
+) -> Result<Option<Vec<u8>>> {
+    let tip = node.tip()?;
+    let role = node.host().role(role::BLOBS)?.clone();
+    let receipt = Frame::sign(
+        &daemon.key,
+        &daemon.descriptor.id(),
+        tip,
+        Some(height),
+        &role,
+        abi::encode(&blob::contract::Op::Receipt { bundle }),
+    )
+    .encode();
+    match node
+        .submit(receipt.clone(), Source::Client, Preconfirm::Off)
+        .await?
+    {
+        Ok(Taken::New(_)) => {
+            daemon.blobs.posted(bundle, receipt.clone());
+            Ok(Some(receipt))
+        }
+        Ok(Taken::Held(_)) => Ok(None),
+        Err(refusal) => {
+            tracing::debug!(
+                target: "ducktape::blob",
+                bundle,
+                reason = refusal.reason,
+                "the node did not take its own receipt"
+            );
+            Ok(None)
+        }
+    }
+}
+
+async fn receipts_for<E: Context>(
+    daemon: &Daemon<E>,
+    node: &mut Node<E>,
+    height: u64,
+    due: Vec<blob::service::Due>,
+    reseated: bool,
+) -> Result<Vec<Vec<u8>>> {
+    let mut taken = Vec::new();
+    for due in due {
+        match reposted(node, due.posted).await? {
+            Posted::Pending => {}
+            Posted::Retaken(receipt) => taken.push(receipt),
+            Posted::Refused => {
+                if reseated {
+                    taken.extend(receipt_for(daemon, node, height, due.bundle).await?);
+                }
+            }
+            Posted::Unheld => taken.extend(receipt_for(daemon, node, height, due.bundle).await?),
+        }
+    }
+    Ok(taken)
+}
+
 async fn applied<E: Context>(
     daemon: &Daemon<E>,
     membership: &mut Seating<E>,
     tracker: &mut Tracker,
     block: &Block,
 ) -> Result<()> {
-    let mut node = daemon.node.lock().await;
-    let sequenced = node.apply(block).await?;
+    let (mut node, sequenced) = holding(daemon, block).await?;
     // under the node lock, which a /v1/network read holds across the tip
     // and the book, so no height it serves passes its tip
     daemon.votes.applied(block.digest(), block.height);
-    if let Sequenced::Applied(outcome) = sequenced {
-        daemon
-            .receipts
-            .keep(block.height, block.digest(), &outcome.submissions)
-            .await?;
-        daemon.publish(&outcome);
+    daemon.tips.send_replace(block.height);
+    let closes = daemon.network.closes_an_epoch(block.height);
+    let replayed = matches!(sequenced, Sequenced::Replayed);
+    let opens_an_epoch = !replayed && closes;
+    let (receipted, members_written) = match sequenced {
+        Sequenced::Applied {
+            mut applied,
+            carried,
+        } => {
+            let ran = crate::blocks::ran(block, &carried)?;
+            let receipts = std::mem::take(&mut applied.submissions);
+            daemon.record(&node, block, ran, Some(receipts)).await?;
+            daemon.publish(&applied);
+            let validators = node.host().role(role::VALIDATORS)?;
+            let members_written = applied
+                .writes
+                .programs
+                .get(validators)
+                .is_some_and(|writes| !writes.is_empty());
+            let halo = node.host().role(role::HALO)?;
+            let lanes_written = rewrites(&applied.writes, halo);
+            if lanes_written {
+                retable_halo(daemon, &node, block.height).await;
+            }
+            let blobs = node.host().role(role::BLOBS)?;
+            let writes = applied.writes.programs.get(blobs).cloned();
+            let due = daemon
+                .blobs
+                .applied(block.height, &writes.unwrap_or_default());
+            let reseated = members_written || closes;
+            let receipted = receipts_for(daemon, &mut node, block.height, due, reseated).await?;
+            (receipted, members_written)
+        }
+        Sequenced::Replayed => {
+            daemon.record_unrecorded(&node, block).await?;
+            (Vec::new(), false)
+        }
+    };
+    let reseats = members_written || closes;
+    if reseats {
+        reseat_halo(daemon, &node, block.height).await;
     }
-    if !daemon.network.closes_an_epoch(block.height) {
-        let due = node.reoffer()?;
+    if !opens_an_epoch {
+        let due = node.reoffer();
         drop(node);
-        daemon.relay.send(due.iter().map(Vec::as_slice));
+        daemon
+            .relay
+            .send(due.iter().chain(&receipted).map(Vec::as_slice));
         return Ok(());
     }
     let epoch = daemon.network.epoch_after(block.height);
@@ -445,15 +909,59 @@ async fn applied<E: Context>(
     )))?;
     let reseated = daemon.relay.seat(seated.as_ref());
     let due = if reseated {
-        node.reoffer_all()?
+        node.reoffer_all()
     } else {
-        node.reoffer()?
+        node.reoffer()
     };
     drop(node);
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
     tracker.track(epoch, &members);
-    daemon.relay.send(due.iter().map(Vec::as_slice));
+    daemon
+        .relay
+        .send(due.iter().chain(&receipted).map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{listing, rewrites};
+
+    #[test]
+    fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
+        let writes = |program: &str, key: &[u8]| state::Writes {
+            programs: BTreeMap::from([(
+                program.to_owned(),
+                BTreeMap::from([(key.to_vec(), Some(vec![1]))]),
+            )]),
+        };
+        assert!(rewrites(&writes("halo", b"l/x"), "halo"));
+        assert!(rewrites(&writes(host::PROGRAMS, b"halo"), "halo"));
+        assert!(!rewrites(&writes(host::PROGRAMS, b"blobs"), "halo"));
+        assert!(!rewrites(&writes("blobs", b"halo"), "halo"));
+        assert!(!rewrites(&state::Writes::default(), "halo"));
+    }
+
+    #[test]
+    fn the_table_reads_as_one_line() {
+        let lane = |name: &str, id, enabled, pinned| halo::Lane {
+            name: name.into(),
+            id,
+            cap: halo::Class::Critical,
+            enabled,
+            pinned,
+            since: 0,
+        };
+        let table = [
+            lane("a/blobs", 0, true, true),
+            lane("a/live", 1, false, false),
+        ];
+        assert_eq!(
+            listing(&table),
+            "a/blobs#0 critical served pinned, a/live#1 critical paused"
+        );
+    }
 }

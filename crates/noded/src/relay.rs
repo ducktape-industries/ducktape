@@ -1,12 +1,13 @@
 // The frame relay: a node hands each frame a client gives it to the epoch's validators over the
-// mesh, and takes a frame another member relays into its own mempool. Used by run and server.
+// mesh, and takes a frame another member relays into its own mempool, telling the blob service
+// which member sent a put. Used by run and server.
 
 use std::sync::{Arc, Mutex};
 
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::authenticated::lookup::{Receiver, Sender};
 use commonware_p2p::{Receiver as _, Recipients, Sender as _};
-use node::{Source, Taken};
+use node::{Preconfirm, Source, Taken};
 
 use crate::{Context, Daemon};
 
@@ -69,14 +70,19 @@ impl<E: Context> Relay<E> {
 pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<PublicKey>) {
     while let Ok((peer, message)) = receiver.recv().await {
         let frame = message.as_ref().to_vec();
-        let taken = daemon.node.lock().await.submit(frame, Source::Peer).await;
+        let (taken, role) = {
+            let mut node = daemon.node.lock().await;
+            let role = node.host().roles().get(abi::role::BLOBS).cloned();
+            let taken = node
+                .submit(frame.clone(), Source::Peer, Preconfirm::Off)
+                .await;
+            (taken, role)
+        };
         match taken {
-            Ok(Ok(Taken::New(receipt))) => tracing::debug!(
-                target: "ducktape::relay",
-                %peer,
-                outcome = ?receipt.outcome,
-                "took a relayed frame"
-            ),
+            Ok(Ok(Taken::New(_))) => {
+                tracing::debug!(target: "ducktape::relay", %peer, "took a relayed frame");
+                sent(&daemon, role.as_deref(), &frame, &peer);
+            }
             Ok(Ok(Taken::Held(_))) => tracing::debug!(
                 target: "ducktape::relay",
                 %peer,
@@ -97,4 +103,21 @@ pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<Pu
             ),
         }
     }
+}
+
+fn sent<E: Context>(daemon: &Daemon<E>, role: Option<&str>, frame: &[u8], peer: &PublicKey) {
+    let Ok(submission) = node::verify(frame, &daemon.descriptor.id()) else {
+        return;
+    };
+    let to_the_blobs_program = role == Some(submission.target.as_str());
+    if !to_the_blobs_program {
+        return;
+    }
+    let Ok(blob::contract::Op::Put { blobs }) = abi::decode(&submission.payload) else {
+        return;
+    };
+    let carried_until = submission.anchor.height.saturating_add(host::ANCHOR_WINDOW);
+    daemon
+        .blobs
+        .sent(blobs.into_iter().map(|entry| entry.id), peer, carried_until);
 }

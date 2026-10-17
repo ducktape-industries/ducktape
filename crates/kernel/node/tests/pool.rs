@@ -1,5 +1,6 @@
 use abi::Outcome;
-use host::{ANCHOR_WINDOW, Receipt, Submission, Tip};
+use abi::Receipt;
+use host::{ANCHOR_WINDOW, Submission, Tip};
 use node::pool::Pool;
 
 fn submission(signer: &[u8], anchor: u64, payload: &[u8]) -> Submission {
@@ -27,7 +28,7 @@ fn applied() -> Receipt {
 fn admit(pool: &mut Pool, signer: &[u8], anchor: u64, payload: &[u8]) -> Submission {
     let submission = submission(signer, anchor, payload);
     let frame = [signer, payload].concat();
-    pool.admit(frame, submission.clone(), applied(), None);
+    pool.admit(frame, submission.clone(), Some(applied()), None);
     submission
 }
 
@@ -49,7 +50,12 @@ fn the_order_is_arrival() {
 fn one_body_is_held_once_whatever_bytes_carry_it() {
     let mut pool = Pool::default();
     let first = admit(&mut pool, b"alice", 0, b"a0");
-    pool.admit(b"another proof".to_vec(), first.clone(), applied(), None);
+    pool.admit(
+        b"another proof".to_vec(),
+        first.clone(),
+        Some(applied()),
+        None,
+    );
 
     assert_eq!(pool.len(), 1);
     assert_eq!(pool.get(&first.id()).unwrap().frame, b"alicea0".to_vec());
@@ -77,7 +83,7 @@ fn settling_drops_what_a_block_carried_and_every_frame_whose_anchor_aged_out() {
 fn an_offered_frame_comes_due_after_a_wait_that_doubles_up_to_64_blocks() {
     let mut pool = Pool::default();
     let offered = submission(b"alice", 0, b"a0");
-    pool.admit(b"a0".to_vec(), offered, applied(), Some(0));
+    pool.admit(b"a0".to_vec(), offered, Some(applied()), Some(0));
     admit(&mut pool, b"bob", 0, b"b0");
 
     let due: Vec<u64> = (1..=200)
@@ -97,7 +103,7 @@ fn a_frame_whose_anchor_aged_out_is_offered_no_more() {
     pool.admit(
         b"a0".to_vec(),
         submission(b"alice", 0, b"a0"),
-        applied(),
+        Some(applied()),
         Some(0),
     );
 

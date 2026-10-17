@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use abi::{
-    Cause, CryptoOp, CryptoReply, Entry, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef,
-    Message, Origin, Principal, Refusal, Roles, Scan, reason,
+    Cause, CryptoOp, CryptoReply, Entry, Env, HostOp, HostReply, Invocation, ItemRef, Message,
+    Origin, Principal, ProgramCall, Refusal, Roles, Scan, reason, role,
 };
 use fixture_probe::{Reply, Step};
 use runtime::{Fault, Host, Limits, Runtime};
@@ -24,11 +24,14 @@ fn env() -> Env {
         me: "probe".into(),
         origin: Origin::External(vec![7; 32]),
         sender: Some(Principal::Account(1)),
-        roles: Roles {
-            registry: "registry".into(),
-            validators: "validators".into(),
-            identity: "identity".into(),
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "validators"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
+        ]),
         cause: Cause::Direct,
     }
 }
@@ -89,7 +92,7 @@ fn script(steps: Vec<Step>) -> Vec<u8> {
     abi::encode(&steps)
 }
 
-fn invocation(call: GuestCall) -> Invocation {
+fn invocation(call: ProgramCall) -> Invocation {
     Invocation { env: env(), call }
 }
 
@@ -100,14 +103,14 @@ fn replies(bench: &Bench) -> Vec<Reply> {
     abi::decode(bytes).unwrap()
 }
 
-async fn execute(limits: Limits, steps: Vec<Step>) -> (Bench, Result<abi::GuestReply, Fault>) {
+async fn execute(limits: Limits, steps: Vec<Step>) -> (Bench, Result<abi::ProgramReply, Fault>) {
     let runtime = Runtime::new(limits);
     let code = runtime.load(PROBE).unwrap();
     let mut bench = Bench::default();
     let verdict = runtime
         .run(
             &code,
-            invocation(GuestCall::Execute(script(steps))),
+            invocation(ProgramCall::Execute(script(steps))),
             &mut bench,
             &mut limits.fuel.clone(),
         )
@@ -143,6 +146,7 @@ async fn every_host_op_crosses_the_boundary_and_back() {
             target: "oracle".into(),
             payload: vec![9],
             reply: true,
+            acting: None,
         })),
         Step::Op(HostOp::Event(b"happened".to_vec())),
         Step::Op(HostOp::Crypto(CryptoOp::Sha256(b"abc".to_vec()))),
@@ -189,7 +193,7 @@ async fn a_query_responds_with_bytes_and_sets_no_output() {
     let verdict = runtime
         .run(
             &code,
-            invocation(GuestCall::Query(steps)),
+            invocation(ProgramCall::Query(steps)),
             &mut bench,
             &mut None,
         )
@@ -218,7 +222,7 @@ async fn init_runs_the_program_once_with_its_parameters() {
     let verdict = runtime
         .run(
             &code,
-            invocation(GuestCall::Init(steps)),
+            invocation(ProgramCall::Init(steps)),
             &mut bench,
             &mut None,
         )
@@ -252,7 +256,7 @@ async fn an_undecodable_payload_is_refused_not_faulted() {
     let verdict = runtime
         .run(
             &code,
-            invocation(GuestCall::Execute(vec![0xff; 3])),
+            invocation(ProgramCall::Execute(vec![0xff; 3])),
             &mut bench,
             &mut None,
         )
@@ -309,7 +313,7 @@ async fn bytes_that_are_not_a_program_do_not_load() {
     let verdict = runtime
         .run(
             &code,
-            invocation(GuestCall::Execute(vec![])),
+            invocation(ProgramCall::Execute(vec![])),
             &mut bench,
             &mut None,
         )

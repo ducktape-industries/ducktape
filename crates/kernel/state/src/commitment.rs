@@ -48,16 +48,18 @@ pub struct Tuning {
 
 impl Default for Tuning {
     fn default() -> Tuning {
-        Tuning {
-            items_per_blob: NonZeroU64::new(64).unwrap(),
-            items_per_section: NonZeroU64::new(64).unwrap(),
-            write_buffer: NonZeroUsize::new(1024).unwrap(),
-            replay_buffer: NonZeroUsize::new(1 << 20).unwrap(),
-            page_size: NonZeroU16::new(128).unwrap(),
-            page_cache_pages: NonZeroUsize::new(64).unwrap(),
-            sync_fetch_batch: NonZeroU64::new(64).unwrap(),
-            sync_apply_batch: NonZeroU64::new(1024).unwrap(),
-            sync_retained_roots: 8,
+        const {
+            Tuning {
+                items_per_blob: NonZeroU64::new(4096).unwrap(),
+                items_per_section: NonZeroU64::new(4096).unwrap(),
+                write_buffer: NonZeroUsize::new(1024).unwrap(),
+                replay_buffer: NonZeroUsize::new(1 << 20).unwrap(),
+                page_size: NonZeroU16::new(128).unwrap(),
+                page_cache_pages: NonZeroUsize::new(64).unwrap(),
+                sync_fetch_batch: NonZeroU64::new(64).unwrap(),
+                sync_apply_batch: NonZeroU64::new(1024).unwrap(),
+                sync_retained_roots: 8,
+            }
         }
     }
 }

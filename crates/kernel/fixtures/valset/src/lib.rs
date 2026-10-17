@@ -1,5 +1,6 @@
 // A validators program for the kernel's tests: it speaks the role's ops with no rules. Anyone
-// enrolls as a resident, and any one vote enacts a promotion, a demotion or a removal at once.
+// enrolls as a resident, and any one vote enacts a promotion, a demotion or a removal at once,
+// or sends the halo role its op.
 
 pub const VALIDATORS: &[u8] = b"validators";
 pub const RESIDENTS: &[u8] = b"residents";
@@ -8,7 +9,7 @@ pub const RESIDENTS: &[u8] = b"residents";
 mod program {
     use abi::role::validators::{Genesis, Member, Motion, Op, Query as Ask, Reply, Voted};
     use abi::{Env, Origin, Refusal, reason};
-    use guest::{Execute, Program, Query, Reads};
+    use program::{Execute, Program, Query, Reads};
 
     use crate::{RESIDENTS, VALIDATORS};
 
@@ -44,19 +45,26 @@ mod program {
             held(&mut self.validators).or_else(|| held(&mut self.residents))
         }
 
-        fn enroll(&mut self, key: Vec<u8>, address: Option<String>) {
-            let moved = self
-                .validators
-                .iter_mut()
-                .chain(self.residents.iter_mut())
-                .find(|member| member.key == key);
-            match moved {
-                Some(member) => member.address = address,
-                None => self.residents.push(Member { key, address }),
+        fn enroll(&mut self, key: Vec<u8>, address: Option<String>, halo: String) {
+            match self.member(&key) {
+                Some(member) => {
+                    member.address = address;
+                    member.halo = halo;
+                }
+                None => self.residents.push(Member { key, address, halo }),
             }
         }
 
-        fn enact(&mut self, motion: Motion) -> Result<(), Refusal> {
+        fn member(&mut self, key: &[u8]) -> Option<&mut Member> {
+            self.validators
+                .iter_mut()
+                .chain(self.residents.iter_mut())
+                .find(|member| member.key == key)
+        }
+
+        /// Enacts a roster motion; a role motion changes no roster and is
+        /// returned as the op the role's program runs, a bind as the row.
+        fn enact(&mut self, motion: Motion) -> Result<Option<Forwarded>, Refusal> {
             match motion {
                 Motion::Promote { key } => {
                     let member = self.take(&key).ok_or_else(not_a_member)?;
@@ -69,15 +77,31 @@ mod program {
                 Motion::Remove { key } => {
                     self.take(&key).ok_or_else(not_a_member)?;
                 }
-                Motion::Door { .. } | Motion::Registry { .. } => {
+                Motion::Role { role, op } => return Ok(Some(Forwarded::Op { role, op })),
+                Motion::Bind { role, program } => {
+                    return Ok(Some(Forwarded::Bind { role, program }));
+                }
+                Motion::Door { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
-                        "the fixture valset has no door and no registry",
+                        "the fixture valset has no door",
                     ));
                 }
             }
-            Ok(())
+            Ok(None)
         }
+    }
+
+    /// What a vote enacts outside the roster.
+    enum Forwarded {
+        Op {
+            role: String,
+            op: Vec<u8>,
+        },
+        Bind {
+            role: String,
+            program: Option<abi::ProgramId>,
+        },
     }
 
     fn not_a_member() -> Refusal {
@@ -97,12 +121,30 @@ mod program {
             };
             let mut roster = Roster::read(ctx)?;
             match abi::decode(payload)? {
-                Op::Enroll { address, .. } => roster.enroll(signer.clone(), address),
+                Op::Enroll { address, halo, .. } => {
+                    if halo.is_empty() {
+                        return Err(Refusal::new(
+                            reason::INVALID_INPUT,
+                            "a member names its halo",
+                        ));
+                    }
+                    roster.enroll(signer.clone(), address, halo)
+                }
+                Op::SetHalo { halo } => {
+                    let member = roster.member(signer).ok_or_else(not_a_member)?;
+                    member.halo = halo;
+                }
                 Op::Leave => {
                     roster.take(signer).ok_or_else(not_a_member)?;
                 }
                 Op::Vote(motion) => {
-                    roster.enact(motion)?;
+                    match roster.enact(motion)? {
+                        Some(Forwarded::Op { role, op }) => {
+                            ctx.emit(env.roles.bound(&role)?.clone(), op, false);
+                        }
+                        Some(Forwarded::Bind { role, program }) => ctx.bind(role, program)?,
+                        None => {}
+                    }
                     ctx.output(abi::encode(&Voted::Enacted));
                 }
             }
@@ -127,5 +169,5 @@ mod program {
         }
     }
 
-    guest::program!(Valset);
+    program::program!(Valset);
 }

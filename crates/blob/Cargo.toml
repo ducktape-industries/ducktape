@@ -1,0 +1,35 @@
+[package]
+name = "blob"
+version.workspace = true
+edition.workspace = true
+
+[features]
+store = ["dep:thiserror"]
+node = [
+    "store",
+    "dep:commonware-cryptography",
+    "dep:futures",
+    "dep:halo",
+    "dep:tokio",
+    "dep:tracing",
+]
+
+[dependencies]
+abi = { workspace = true }
+borsh = { workspace = true }
+sha1-checked = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true, optional = true }
+commonware-cryptography = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+halo = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+blob = { path = ".", features = ["node"] }
+commonware-cryptography = { workspace = true }
+commonware-runtime = { workspace = true }
+halo = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 abi = { workspace = true }
 async-trait = { workspace = true }
-blobs = { workspace = true }
+blob = { workspace = true, features = ["store"] }
 borsh = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
@@ -17,10 +17,13 @@ runtime = { workspace = true }
 sha2 = { workspace = true }
 state = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+fixture-awaiter = { path = "../fixtures/awaiter" }
 fixture-identity = { path = "../fixtures/identity" }
-fixture-module-registry = { path = "../fixtures/module-registry" }
+fixture-oracle = { path = "../fixtures/oracle" }
+fixture-programs = { path = "../fixtures/programs" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }
 fixture-valset = { path = "../fixtures/valset" }

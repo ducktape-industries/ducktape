@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Builds the node image from a ducktape release, pushes it to the cluster node's registry, and applies a network's pod.
+# Usage: ops/k8s/deploy NETWORK COMMIT [--found]
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+network=${1:?usage: ops/k8s/deploy NETWORK COMMIT [--found]}
+commit=$(git -C "$here" rev-parse --verify "${2:?usage: ops/k8s/deploy NETWORK COMMIT [--found]}^{commit}")
+mode=${3:-}
+node=${DEPLOY_NODE:-fabrics@fabrics-1}
+tunnel_port=35311
+tag=${commit:0:12}
+
+stage=$(mktemp -d)
+socket="$stage.ssh"
+trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
+gh release download "bin-$commit" -R ducktape-industries/ducktape \
+  -p ducktape-x86_64-unknown-linux-gnu.tar.gz -D "$stage"
+tar -xzf "$stage/ducktape-x86_64-unknown-linux-gnu.tar.gz" -C "$stage"
+podman build --file "$here/Containerfile" --tag "localhost:$tunnel_port/ducktape:$tag" "$stage"
+ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
+podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/ducktape:$tag"
+image="localhost:5000/ducktape:$tag@$(cat "$stage/digest")"
+
+render() {
+  sed -e "s#NETWORK#$network#g" -e "s#image: IMAGE\$#image: $image#" "$here/$1"
+}
+render network.yaml | kubectl apply -f -
+case $mode in
+  --found)
+    render found.yaml | kubectl apply -f -
+    kubectl -n "$network" wait pod/found --for=condition=Ready --timeout=5m
+    ;;
+  "")
+    render node.yaml | kubectl apply -f -
+    kubectl -n "$network" rollout status deployment/node --timeout=5m
+    ;;
+  *)
+    echo "deploy: unknown mode $mode" >&2
+    exit 1
+    ;;
+esac

@@ -1,18 +1,26 @@
 use std::path::Path;
 
-use abi::{HostOp, HostReply, Message, Outcome, reason, role::validators};
+use abi::{
+    HostOp, HostReply, Message, Outcome, reason, role,
+    role::{halo, validators},
+};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
 use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Roles, Tip};
 use keyscheme::KeyScheme;
-use node::{BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Sequenced, Source, Taken};
+use node::{
+    BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Preconfirm, Sequenced, Source, Taken,
+};
 
-const MODULE_REGISTRY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_module_registry.wasm");
+const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
+const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
+const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
+const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
@@ -30,6 +38,7 @@ fn member(key: &ed25519::PrivateKey, address: &str) -> validators::Member {
     validators::Member {
         key: key.public_key().as_ref().to_vec(),
         address: Some(address.to_owned()),
+        halo: address.to_owned(),
     }
 }
 
@@ -44,25 +53,36 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles {
-            registry: "module-registry".into(),
-            validators: "valset".into(),
-            identity: "identity".into(),
-        },
+        roles: Roles::from_iter([
+            (role::PROGRAMS, "programs"),
+            (role::VALIDATORS, "valset"),
+            (role::IDENTITY, "identity"),
+            (role::BLOBS, "blobs"),
+            (role::AWAITS, "awaits"),
+            (role::HALO, "halo"),
+        ]),
         validators,
         programs: vec![
-            founding("module-registry", MODULE_REGISTRY, Vec::new()),
+            founding("programs", PROGRAMS, Vec::new()),
             founding("valset", VALSET, Vec::new()),
             founding(
                 "identity",
                 IDENTITY,
                 abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
             ),
+            founding("blobs", BLOBS, Vec::new()),
             founding("ping", RELAY, Vec::new()),
             founding("pong", RELAY, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
+            founding("awaits", AWAITS, Vec::new()),
+            founding(
+                "halo",
+                HALO,
+                abi::encode(&halo::Genesis { lanes: Vec::new() }),
+            ),
         ],
         views: Vec::new(),
+        hooks: Vec::new(),
         limits: Limits::default(),
         epoch_length: EPOCH_LENGTH,
         time: TIME,
@@ -102,35 +122,36 @@ fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
         target: target.to_owned(),
         payload: abi::encode(&fixture_relay::Script::Note(payload.to_vec())),
         reply,
+        acting: None,
     }]))
 }
 
 async fn seal(node: &mut TestNode) -> (Block, host::Applied) {
     let tip = node.tip().unwrap();
     let block = node
-        .build(tip, std::iter::empty(), TIME + tip.height + 1)
-        .unwrap();
-    let Sequenced::Applied(applied) = node.apply(&block).await.unwrap() else {
+        .proposer()
+        .build(tip, std::iter::empty(), TIME + tip.height + 1);
+    let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
     (block, applied)
 }
 
-fn new(taken: Taken) -> host::Receipt {
+fn new(taken: Taken) -> abi::Receipt {
     match taken {
-        Taken::New(receipt) => receipt,
-        Taken::Held(receipt) => panic!("the pool already held the frame: {receipt:?}"),
+        Taken::New(Some(receipt)) => receipt,
+        other => panic!("the pool did not take the frame as new and preconfirmed: {other:?}"),
     }
 }
 
-fn held(taken: Taken) -> host::Receipt {
+fn held(taken: Taken) -> abi::Receipt {
     match taken {
-        Taken::Held(receipt) => receipt,
-        Taken::New(receipt) => panic!("the pool took the frame as new: {receipt:?}"),
+        Taken::Held(Some(receipt)) => receipt,
+        other => panic!("the pool did not hold the frame preconfirmed: {other:?}"),
     }
 }
 
-fn rejected(receipt: &host::Receipt) -> &str {
+fn rejected(receipt: &abi::Receipt) -> &str {
     match &receipt.outcome {
         Outcome::Rejected(refusal) => &refusal.reason,
         Outcome::Applied { .. } => panic!("{} was applied", receipt.program),
@@ -150,7 +171,7 @@ fn founding_seals_the_genesis_block_as_the_tip() {
             node.epoch_members(0).unwrap(),
             Some(vec![member(&key(1), "v1:1")])
         );
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
 
         let decoded = Block::decode(block.encode()).unwrap();
         assert_eq!(decoded, block);
@@ -169,6 +190,7 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             .submit(
                 frame(&signer, "probe", script(vec![set(b"k", b"v")])),
                 Source::Client,
+                Preconfirm::On,
             )
             .await
             .unwrap()
@@ -180,7 +202,7 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             }
         );
         assert_eq!(node.pending(), 1);
-        assert!(node.due().unwrap());
+        assert!(node.due());
         assert_eq!(
             node.view(Layer::Preconfirmed).get("probe", b"k").unwrap(),
             Some(b"v".to_vec())
@@ -194,6 +216,7 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             node.submit(
                 frame(&signer, "probe", script(vec![set(b"k", b"v")])),
                 Source::Client,
+                Preconfirm::On,
             )
             .await
             .unwrap()
@@ -221,6 +244,7 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             .submit(
                 frame(&signer, "probe", script(vec![set(b"k", b"v")])),
                 Source::Client,
+                Preconfirm::On,
             )
             .await
             .unwrap()
@@ -236,7 +260,131 @@ fn a_frame_is_preconfirmed_built_and_applied_once() {
             Sequenced::Replayed
         ));
         assert_eq!(node.tip().unwrap(), block.tip());
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
+    });
+}
+
+fn unseen(node: &TestNode, frame: &[u8]) -> bool {
+    let submission = node::verify(frame, NETWORK).unwrap();
+    let preconfirmed = node.view(Layer::Preconfirmed);
+    let ran = preconfirmed
+        .get(host::SPENT, &host::spent(&submission))
+        .unwrap()
+        .is_some();
+    let wrote = preconfirmed.get("probe", b"k").unwrap().is_some();
+    !ran && !wrote
+}
+
+fn env_height(receipt: &abi::Receipt) -> u64 {
+    let Outcome::Applied { output } = &receipt.outcome else {
+        panic!("the probe runs: {receipt:?}");
+    };
+    let replies: Vec<Reply> = abi::decode(output).unwrap();
+    let env = replies.iter().find_map(|reply| match reply {
+        Reply::Env(env) => Some(env.height),
+        Reply::Host(_) => None,
+    });
+    env.expect("the probe answers its env")
+}
+
+#[test]
+fn a_frame_not_preconfirmed_first_runs_in_the_block_that_carries_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let pooled = frame(&key(7), "probe", script(vec![set(b"k", b"v")]));
+        let taken = node
+            .submit(pooled.clone(), Source::Client, Preconfirm::Off)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken, Taken::New(None));
+        assert!(unseen(&node, &pooled));
+
+        for height in 1..=3 {
+            let empty = Block::next(node.tip().unwrap(), TIME + height, Vec::new());
+            node.apply(&empty).await.unwrap();
+            assert_eq!(node.pending(), 1);
+            assert!(unseen(&node, &pooled));
+        }
+        let again = node
+            .submit(pooled.clone(), Source::Client, Preconfirm::Off)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, Taken::Held(None));
+
+        let (block, applied) = seal(&mut node).await;
+        assert_eq!(block.frames, vec![pooled]);
+        assert!(matches!(
+            applied.submissions[0].outcome,
+            Outcome::Applied { .. }
+        ));
+        assert_eq!(
+            node.view(Layer::Confirmed).get("probe", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+    });
+}
+
+#[test]
+fn a_heavy_frame_not_preconfirmed_waits_in_the_pool_unrun() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut metered = genesis(vec![member(&key(1), "v1:1")]);
+        metered.limits = Limits {
+            fuel: Some(10_000_000),
+            memory_bytes: None,
+        };
+        let (mut node, _, _) = Node::found(context, "net", dir.path(), metered)
+            .await
+            .unwrap();
+        let spinning = frame(&key(7), "probe", script(vec![Step::Spin]));
+        node.submit(spinning.clone(), Source::Client, Preconfirm::Off)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for height in 1..=3 {
+            let empty = Block::next(node.tip().unwrap(), TIME + height, Vec::new());
+            node.apply(&empty).await.unwrap();
+            assert!(unseen(&node, &spinning));
+        }
+
+        let (block, applied) = seal(&mut node).await;
+        assert_eq!(block.frames, vec![spinning]);
+        assert!(matches!(
+            applied.submissions[0].outcome,
+            Outcome::Rejected(_)
+        ));
+    });
+}
+
+#[test]
+fn a_preconfirmed_frame_runs_at_submit_and_again_after_each_block() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let previewed = frame(&key(7), "probe", script(vec![Step::Env, set(b"k", b"v")]));
+        let taken = node
+            .submit(previewed.clone(), Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(env_height(&new(taken)), 1);
+        assert!(!unseen(&node, &previewed));
+
+        for height in 1..=2 {
+            let empty = Block::next(node.tip().unwrap(), TIME + height, Vec::new());
+            node.apply(&empty).await.unwrap();
+            let again = node
+                .submit(previewed.clone(), Source::Client, Preconfirm::Off)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(env_height(&held(again)), height + 1);
+            assert!(!unseen(&node, &previewed));
+        }
     });
 }
 
@@ -249,6 +397,7 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
         node.submit(
             frame(&signer, "probe", script(vec![set(b"k", b"v")])),
             Source::Client,
+            Preconfirm::On,
         )
         .await
         .unwrap()
@@ -258,10 +407,10 @@ fn a_block_without_the_pending_frame_keeps_it_pending_and_preconfirmed() {
         let empty = Block::next(tip, TIME + 1, Vec::new());
         assert!(matches!(
             node.apply(&empty).await.unwrap(),
-            Sequenced::Applied(_)
+            Sequenced::Applied { .. }
         ));
         assert_eq!(node.pending(), 1);
-        assert!(node.due().unwrap());
+        assert!(node.due());
         assert_eq!(
             node.view(Layer::Preconfirmed).get("probe", b"k").unwrap(),
             Some(b"v".to_vec())
@@ -291,14 +440,14 @@ fn a_rejected_frame_rides_the_block_and_never_runs_again() {
         let failing = frame(&signer, "probe", script(vec![Step::Fail("no".into())]));
 
         let receipt = new(node
-            .submit(failing.clone(), Source::Client)
+            .submit(failing.clone(), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap());
         assert_eq!(rejected(&receipt), "probe");
         assert_eq!(node.pending(), 1);
         let resubmitted = held(
-            node.submit(failing.clone(), Source::Client)
+            node.submit(failing.clone(), Source::Client, Preconfirm::On)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -310,7 +459,7 @@ fn a_rejected_frame_rides_the_block_and_never_runs_again() {
         assert_eq!(block.frames, vec![failing.clone()]);
         assert_eq!(rejected(&applied.submissions[0]), "probe");
         let refusal = node
-            .submit(failing, Source::Client)
+            .submit(failing, Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap_err();
@@ -331,30 +480,30 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
         let alice_second = frame(&alice, "probe", script(vec![set(b"a", b"2")]));
         for frame in [&alice_first, &bob_first] {
             new(node
-                .submit(frame.clone(), Source::Client)
+                .submit(frame.clone(), Source::Client, Preconfirm::On)
                 .await
                 .unwrap()
                 .unwrap());
         }
 
         let tip = node.tip().unwrap();
-        let parent = node.build(tip, std::iter::empty(), TIME + 1).unwrap();
+        let parent = node.proposer().build(tip, std::iter::empty(), TIME + 1);
         assert_eq!(parent.frames, vec![alice_first.clone(), bob_first.clone()]);
         new(node
-            .submit(alice_second.clone(), Source::Client)
+            .submit(alice_second.clone(), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap());
 
-        let child = node.build(parent.tip(), [&parent], TIME + 2).unwrap();
+        let child = node.proposer().build(parent.tip(), [&parent], TIME + 2);
         assert_eq!(child.frames, vec![alice_second.clone()]);
         let again = node
-            .build(parent.tip(), std::iter::empty(), TIME + 2)
-            .unwrap();
+            .proposer()
+            .build(parent.tip(), std::iter::empty(), TIME + 2);
         assert_eq!(again.frames, vec![alice_first, bob_first, alice_second]);
 
         for block in [&parent, &child] {
-            let Sequenced::Applied(applied) = node.apply(block).await.unwrap() else {
+            let Sequenced::Applied { applied, .. } = node.apply(block).await.unwrap() else {
                 panic!("block {} was already applied", block.height);
             };
             assert!(
@@ -385,12 +534,12 @@ fn a_frame_a_client_gave_is_offered_again_until_it_lands_and_a_relayed_one_never
         let given = frame(&key(7), "probe", script(vec![set(b"a", b"1")]));
         let relayed = frame(&key(8), "probe", script(vec![set(b"b", b"1")]));
         new(node
-            .submit(given.clone(), Source::Client)
+            .submit(given.clone(), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap());
         new(node
-            .submit(relayed.clone(), Source::Peer)
+            .submit(relayed.clone(), Source::Peer, Preconfirm::On)
             .await
             .unwrap()
             .unwrap());
@@ -400,17 +549,17 @@ fn a_frame_a_client_gave_is_offered_again_until_it_lands_and_a_relayed_one_never
             let tip = node.tip().unwrap();
             let empty = Block::next(tip, TIME + tip.height + 1, Vec::new());
             node.apply(&empty).await.unwrap();
-            for frame in node.reoffer().unwrap() {
+            for frame in node.reoffer() {
                 offered.push((empty.height, frame));
             }
         }
         assert_eq!(offered, vec![(4, given.clone()), (12, given.clone())]);
-        assert_eq!(node.reoffer_all().unwrap(), vec![given]);
+        assert_eq!(node.reoffer_all(), vec![given]);
 
         let (block, _) = seal(&mut node).await;
         assert_eq!(block.frames.len(), 2);
         assert_eq!(node.pending(), 0);
-        assert!(node.reoffer_all().unwrap().is_empty());
+        assert!(node.reoffer_all().is_empty());
     });
 }
 
@@ -442,13 +591,13 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
         assert_ne!(one, two);
 
         let receipt = new(node
-            .submit(one.clone(), Source::Client)
+            .submit(one.clone(), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap());
         assert_eq!(
             held(
-                node.submit(two.clone(), Source::Client)
+                node.submit(two.clone(), Source::Client, Preconfirm::On)
                     .await
                     .unwrap()
                     .unwrap()
@@ -458,7 +607,7 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
         assert_eq!(node.pending(), 1);
 
         let block = Block::next(node.tip().unwrap(), TIME + 1, vec![two, one.clone()]);
-        let Sequenced::Applied(applied) = node.apply(&block).await.unwrap() else {
+        let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
             panic!("the block was already applied");
         };
         assert!(matches!(
@@ -467,8 +616,12 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
         ));
         assert_eq!(rejected(&applied.submissions[1]), reason::DUPLICATE);
         assert_eq!(node.pending(), 0);
-        assert!(!node.due().unwrap());
-        let refusal = node.submit(one, Source::Client).await.unwrap().unwrap_err();
+        assert!(!node.due());
+        let refusal = node
+            .submit(one, Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(refusal.reason, reason::DUPLICATE);
     });
 }
@@ -485,7 +638,7 @@ fn a_salt_makes_a_repeated_body_another_frame() {
         };
         for salt in [None, Some(1), Some(2)] {
             new(node
-                .submit(salted(salt), Source::Client)
+                .submit(salted(salt), Source::Client, Preconfirm::On)
                 .await
                 .unwrap()
                 .unwrap());
@@ -522,7 +675,7 @@ fn a_node_refuses_a_frame_whose_anchor_is_not_a_recent_block() {
         };
         for anchor in [ahead, forged] {
             let refusal = node
-                .submit(anchored(anchor), Source::Client)
+                .submit(anchored(anchor), Source::Client, Preconfirm::On)
                 .await
                 .unwrap()
                 .unwrap_err();
@@ -530,7 +683,7 @@ fn a_node_refuses_a_frame_whose_anchor_is_not_a_recent_block() {
         }
         assert_eq!(node.pending(), 0);
         new(node
-            .submit(anchored(origin()), Source::Client)
+            .submit(anchored(origin()), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap());
@@ -545,7 +698,7 @@ fn a_held_frame_leaves_the_pool_when_its_anchor_ages_out() {
         let signer = key(7);
         let aging = frame(&signer, "probe", script(vec![set(b"k", b"v")]));
         new(node
-            .submit(aging.clone(), Source::Client)
+            .submit(aging.clone(), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap());
@@ -557,20 +710,20 @@ fn a_held_frame_leaves_the_pool_when_its_anchor_ages_out() {
         assert_eq!(node.pending(), 1);
         let tip = node.tip().unwrap();
         let last = node
-            .build(tip, std::iter::empty(), TIME + ANCHOR_WINDOW)
-            .unwrap();
+            .proposer()
+            .build(tip, std::iter::empty(), TIME + ANCHOR_WINDOW);
         assert_eq!(last.frames, vec![aging.clone()]);
         let empty = Block::next(tip, TIME + ANCHOR_WINDOW, Vec::new());
         let past = node
-            .build(empty.tip(), [&empty], TIME + ANCHOR_WINDOW + 1)
-            .unwrap();
+            .proposer()
+            .build(empty.tip(), [&empty], TIME + ANCHOR_WINDOW + 1);
         assert_eq!(past.frames, Vec::<Vec<u8>>::new());
 
         node.apply(&empty).await.unwrap();
         assert_eq!(node.pending(), 0);
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
         let refusal = node
-            .submit(aging, Source::Client)
+            .submit(aging, Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap_err();
@@ -595,7 +748,7 @@ fn a_frame_is_refused_when_it_names_another_network_lies_about_its_signer_or_out
         )
         .encode();
         let refusal = node
-            .submit(foreign, Source::Client)
+            .submit(foreign, Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap_err();
@@ -611,14 +764,14 @@ fn a_frame_is_refused_when_it_names_another_network_lies_about_its_signer_or_out
         );
         forged.body.target = "ping".into();
         let refusal = node
-            .submit(forged.encode(), Source::Client)
+            .submit(forged.encode(), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap_err();
         assert_eq!(refusal.reason, reason::INVALID_INPUT);
 
         let refusal = node
-            .submit(b"junk".to_vec(), Source::Client)
+            .submit(b"junk".to_vec(), Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap_err();
@@ -626,13 +779,13 @@ fn a_frame_is_refused_when_it_names_another_network_lies_about_its_signer_or_out
 
         let uncarried = vec![0; BLOCK_BYTES + 1];
         let refusal = node
-            .submit(uncarried, Source::Client)
+            .submit(uncarried, Source::Client, Preconfirm::On)
             .await
             .unwrap()
             .unwrap_err();
         assert_eq!(refusal.reason, reason::CAPACITY);
         assert_eq!(node.pending(), 0);
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
     });
 }
 
@@ -651,7 +804,7 @@ fn a_block_applies_only_the_frames_that_verify() {
             vec![forged.encode(), b"junk".to_vec(), good],
         );
 
-        let Sequenced::Applied(applied) = node.apply(&block).await.unwrap() else {
+        let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
             panic!("the block was already applied");
         };
         assert_eq!(applied.submissions.len(), 1);
@@ -709,11 +862,12 @@ fn a_message_lands_in_the_block_that_carries_its_frame() {
         node.submit(
             frame(&signer, "ping", message("pong", b"hello", true)),
             Source::Client,
+            Preconfirm::On,
         )
         .await
         .unwrap()
         .unwrap();
-        assert!(node.due().unwrap());
+        assert!(node.due());
 
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);
@@ -723,7 +877,7 @@ fn a_message_lands_in_the_block_that_carries_its_frame() {
             .map(|receipt| receipt.program.as_str())
             .collect();
         assert_eq!(ran, ["pong", "ping"]);
-        assert!(!node.due().unwrap());
+        assert!(!node.due());
     });
 }
 
@@ -736,6 +890,7 @@ fn a_restart_reopens_at_the_tip() {
         node.submit(
             frame(&signer, "probe", script(vec![set(b"a", b"1")])),
             Source::Client,
+            Preconfirm::On,
         )
         .await
         .unwrap()
@@ -744,6 +899,7 @@ fn a_restart_reopens_at_the_tip() {
         node.submit(
             frame(&signer, "probe", script(vec![set(b"b", b"2")])),
             Source::Client,
+            Preconfirm::On,
         )
         .await
         .unwrap()
@@ -785,6 +941,7 @@ fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
         let enroll = |key: &ed25519::PrivateKey, address: &str| {
             let enroll = validators::Op::Enroll {
                 address: Some(address.to_owned()),
+                halo: address.to_owned(),
                 invite: None,
             };
             frame(key, "valset", abi::encode(&enroll))
@@ -798,7 +955,11 @@ fn an_epoch_seats_the_validators_the_boundary_block_leaves() {
             frame(&signer, "valset", abi::encode(&promote)),
         ];
         for frame in seating {
-            new(node.submit(frame, Source::Client).await.unwrap().unwrap());
+            new(node
+                .submit(frame, Source::Client, Preconfirm::On)
+                .await
+                .unwrap()
+                .unwrap());
         }
         let (_, applied) = seal(&mut node).await;
         assert_eq!(applied.height, 1);

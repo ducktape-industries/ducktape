@@ -12,7 +12,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all airlock-gateway-image rcodesign node install install-node test clean audit kernel-fixtures
+.PHONY: all node install install-node test clean audit kernel-fixtures
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -51,18 +51,6 @@ all: prereqs
 ## release build of the node
 node: prereqs
 	$(CARGO) build $(LOCKED) --release -p node-bin
-
-## stage the airlock enclave image root under target/airlock-gateway-image:
-## the release `airlock-gateway`, the pinned `rcodesign` it signs release
-## bundles with, and the entitlements it applies (ops/airlock-gateway/).
-airlock-gateway-image:
-	ops/airlock-gateway/stage-image.sh
-
-## the pinned `rcodesign` into $(BIN_DEST): what `cargo test -p airlock` signs
-## a fixture bundle with (the gateway's own `POST /sign/macos-bundle` path),
-## installed from the same pinned release the image carries.
-rcodesign:
-	ops/airlock-gateway/install-rcodesign.sh --prefix "$(patsubst %/,%,$(dir $(BIN_DEST)))"
 
 ## the `ducktape` binary into $(BIN_DEST). The binary embeds no wasm: a
 ## network's programs are files the founding file names, and a joiner receives
@@ -124,7 +112,7 @@ audit:
 clean:
 	$(CARGO) clean
 
-## rebuild the kernel fixture programs (wasm32 guests the runtime and host
+## rebuild the kernel fixture programs (wasm32 programs the runtime and host
 ## tests load) and refresh their committed bytes.
 kernel-fixtures:
 	$(CARGO) build --manifest-path crates/kernel/fixtures/Cargo.toml \

@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 
+use abi::role::awaits::{Answer, FrameId, Ticket};
+use abi::role::identity::AccountNumber;
 use abi::{
-    BlobId, Cause, Env, GuestCall, HostOp, HostReply, Invocation, ItemRef, Message, Origin,
-    Outcome, ProgramId, Refusal, Roles, reason,
+    BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
+    ProgramCall, ProgramId, Receipt, Refusal, Roles, reason, role,
 };
-use blobs::{Blobs, Layered, Stage};
+use blob::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use runtime::{Code, Fault, Limits, Runtime};
+use runtime::{Code, Fault, Limits, Ran, Runtime, Suspended};
 use state::{Overlay, Storage, Store, View};
 
-use crate::{Error, Receipt, Result, crypto, namespace};
+use crate::{Error, Result, crypto, namespace, parked};
 
 pub struct Loaded {
     runtime: Runtime,
@@ -45,6 +47,10 @@ impl Loaded {
         }
     }
 
+    pub fn code(&self, program: &str) -> Option<BlobId> {
+        self.running(program).copied()
+    }
+
     fn running(&self, program: &str) -> Option<&BlobId> {
         match self.programs.get(program)? {
             Slot::Running { code, .. } => Some(code),
@@ -77,11 +83,8 @@ impl Loaded {
         let Some(framed) = blobs.framed(id)? else {
             return Ok(None);
         };
-        let (_, body) = blobs::parse(&framed).ok_or_else(|| {
-            Error::Blobs(blobs::Error::Corrupt(
-                *id,
-                "the frame does not parse".into(),
-            ))
+        let (_, body) = blob::parse(&framed).ok_or_else(|| {
+            Error::Blobs(blob::Error::Corrupt(*id, "the frame does not parse".into()))
         })?;
         Ok(Some(self.runtime.load(body)))
     }
@@ -160,7 +163,7 @@ pub fn refusal_of(fault: Fault) -> Refusal {
     }
 }
 
-fn unknown(program: &str) -> Refusal {
+pub(crate) fn unknown(program: &str) -> Refusal {
     Refusal::new(reason::UNKNOWN_PROGRAM, program)
 }
 
@@ -194,16 +197,27 @@ where
         self.world.store.view(Vec::new())
     }
 
-    fn blob<T>(
+    async fn blob<T>(
         &self,
         id: &BlobId,
-        read: impl FnOnce(&Layered<'r>) -> blobs::Result<Option<T>>,
+        fuel: &mut Option<u64>,
+        read: impl FnOnce(&Layered<'r>) -> blob::Result<Option<T>>,
     ) -> Result<Option<T>> {
         let rostered = self
             .view()
             .get(namespace::BLOBS, &namespace::blob(id))?
             .is_some();
-        if !rostered {
+        let readable = rostered
+            || held(
+                self.world,
+                self.layers.clone(),
+                self.stage,
+                self.stack,
+                id,
+                fuel,
+            )
+            .await?;
+        if !readable {
             return Ok(None);
         }
         let layered = Layered {
@@ -221,13 +235,16 @@ where
             HostOp::Scan(scan) => HostReply::Entries(self.view().scan(me, &scan)?),
             HostOp::CommittedGet(key) => HostReply::Value(self.confirmed().get(me, &key)?),
             HostOp::CommittedScan(scan) => HostReply::Entries(self.confirmed().scan(me, &scan)?),
-            HostOp::BlobGet(id) => HostReply::Blob(self.blob(&id, |layered| layered.get(&id))?),
+            HostOp::BlobGet(id) => {
+                HostReply::Blob(self.blob(&id, fuel, |layered| layered.get(&id)).await?)
+            }
             HostOp::BlobStat(id) => {
-                HostReply::BlobHeader(self.blob(&id, |layered| layered.stat(&id))?)
+                HostReply::BlobHeader(self.blob(&id, fuel, |layered| layered.stat(&id)).await?)
             }
-            HostOp::BlobRead { id, offset, len } => {
-                HostReply::Value(self.blob(&id, |layered| layered.read(&id, offset, len))?)
-            }
+            HostOp::BlobRead { id, offset, len } => HostReply::Value(
+                self.blob(&id, fuel, |layered| layered.read(&id, offset, len))
+                    .await?,
+            ),
             HostOp::Root(program) => HostReply::Root(self.world.store.root(&program)?),
             HostOp::Query { program, request } => HostReply::Query(
                 query(
@@ -243,13 +260,17 @@ where
                 .await?,
             ),
             HostOp::Crypto(op) => crypto::serve(op),
+            HostOp::Await { .. } | HostOp::Defer | HostOp::Resume { .. } => {
+                HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not await"))
+            }
             HostOp::Set { .. }
             | HostOp::Delete(_)
             | HostOp::BlobPut { .. }
             | HostOp::Emit(_)
             | HostOp::Event(_)
             | HostOp::Output(_)
-            | HostOp::Respond(_) => {
+            | HostOp::Respond(_)
+            | HostOp::Bind { .. } => {
                 HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not write"))
             }
         };
@@ -344,7 +365,7 @@ where
     stack.push(program);
     let invocation = Invocation {
         env: env.clone(),
-        call: GuestCall::Query(request),
+        call: ProgramCall::Query(request),
     };
     let mut unit = Query {
         world,
@@ -370,17 +391,67 @@ where
     })
 }
 
+pub async fn held<'a, E>(
+    world: World<'a, E>,
+    layers: Vec<&'a Overlay>,
+    stage: &'a Stage,
+    stack: &[ProgramId],
+    id: &BlobId,
+    fuel: &mut Option<u64>,
+) -> Result<bool>
+where
+    E: Context + Spawner,
+{
+    let asked = blob::contract::Query::Held { blob: *id };
+    let answer = query(
+        world,
+        layers,
+        stage,
+        stack,
+        Origin::System,
+        crate::bound(world.roles, role::BLOBS)?.clone(),
+        abi::encode(&asked),
+        fuel,
+    )
+    .await?;
+    let Ok(bytes) = answer else {
+        return Ok(false);
+    };
+    let reply = abi::decode::<blob::contract::Reply>(&bytes);
+    Ok(matches!(reply, Ok(blob::contract::Reply::Held(Some(_)))))
+}
+
 /// What the frame is charged for each message a run emits, on top of the
 /// run it causes: the kernel's own work of dispatching it, which a message
 /// refused before any run (an unknown target, too deep) costs too.
 const EMIT_FUEL: u64 = 1_000;
 
-/// What one submission's runs share: the fuel left of the network's limit,
-/// and the number the next emitted message takes, so every item of the
-/// frame is distinct whichever run emitted it.
 pub struct Frame {
     pub fuel: Option<u64>,
+    pub first_item: u64,
     pub next_item: u64,
+}
+
+pub struct Called {
+    pub ticket: Ticket,
+    pub target: ProgramId,
+    pub payload: Vec<u8>,
+    pub acting: Option<AccountNumber>,
+}
+
+pub struct Resumed {
+    pub frame: FrameId,
+    pub ticket: Ticket,
+    pub answer: Answer,
+}
+
+#[derive(Default)]
+pub struct Effects {
+    pub emitted: Vec<(ItemRef, Message)>,
+    pub calls: Vec<Called>,
+    pub resumes: Vec<Resumed>,
+    pub deferred: bool,
+    pub parked: Option<Suspended>,
 }
 
 struct Execute<'a, E>
@@ -393,7 +464,7 @@ where
     stage: &'a mut Stage,
     frame: &'a mut Frame,
     events: Vec<Vec<u8>>,
-    emitted: Vec<(ItemRef, Message)>,
+    effects: Effects,
     output: Vec<u8>,
     fault: Option<Error>,
 }
@@ -413,6 +484,43 @@ where
         }
     }
 
+    /// The roles table moves on the validators' vote alone: `program` is bound to `role`, or
+    /// the role unbound, in this block's overlay, so the next block's frames carry it. A role in
+    /// `REQUIRED` is fixed; a program bound must be one the network admitted.
+    fn bind(&mut self, role: String, program: Option<ProgramId>) -> Result<HostReply> {
+        let validators = crate::bound(self.world.roles, abi::role::VALIDATORS)?;
+        if self.env.me != *validators {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::UNAUTHORIZED,
+                "only the validators role binds a role",
+            )));
+        }
+        if abi::role::REQUIRED.contains(&role.as_str()) {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::INVALID_INPUT,
+                format!("the {role} role is bound for the network's life"),
+            )));
+        }
+        let view = self.world.store.view(vec![&*self.overlay]);
+        if let Some(program) = &program {
+            let admitted = view.get(namespace::PROGRAMS, program.as_bytes())?.is_some();
+            if !admitted {
+                return Ok(HostReply::Refused(unknown(program)));
+            }
+        }
+        let mut roles = crate::roles_of(&view)?;
+        match program {
+            Some(program) => roles.bind(role, program),
+            None => roles.unbind(&role),
+        }
+        self.overlay.set(
+            namespace::NETWORK,
+            namespace::ROLES.to_vec(),
+            abi::encode(&roles),
+        );
+        Ok(HostReply::Done)
+    }
+
     /// Keeps the message for the frame to run once this handler returns.
     fn emit(&mut self, message: Message) -> HostReply {
         let item = ItemRef {
@@ -420,8 +528,64 @@ where
             item: self.frame.next_item,
         };
         self.frame.next_item += 1;
-        self.emitted.push((item.clone(), message));
+        self.effects.emitted.push((item.clone(), message));
         HostReply::Item(item)
+    }
+
+    fn call(
+        &mut self,
+        target: ProgramId,
+        payload: Vec<u8>,
+        acting: Option<AccountNumber>,
+    ) -> Result<HostReply> {
+        let ticket = parked::take_ticket(self.world.store.storage(), self.overlay)?;
+        self.effects.calls.push(Called {
+            ticket,
+            target,
+            payload,
+            acting,
+        });
+        Ok(HostReply::Ticket(ticket))
+    }
+
+    fn defer(&mut self) -> HostReply {
+        let Cause::Call { ticket } = self.env.cause else {
+            return HostReply::Refused(Refusal::new(
+                reason::WRONG_STATE,
+                "this run answers no call",
+            ));
+        };
+        self.effects.deferred = true;
+        HostReply::Ticket(ticket)
+    }
+
+    fn resume(&mut self, frame: FrameId, ticket: Ticket, answer: Answer) -> Result<HostReply> {
+        let from_the_role = self.world.roles.get(role::AWAITS) == Some(&self.env.me);
+        if !from_the_role {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::UNAUTHORIZED,
+                "only the awaits role resumes a frame",
+            )));
+        }
+        let view = View::new(self.world.store.storage(), vec![&*self.overlay]);
+        let parked = parked::record(&view, frame)?.is_some();
+        let resuming = self
+            .effects
+            .resumes
+            .iter()
+            .any(|resumed| resumed.frame == frame);
+        if !parked || resuming {
+            return Ok(HostReply::Refused(Refusal::new(
+                reason::NOT_FOUND,
+                format!("frame {frame} is not parked"),
+            )));
+        }
+        self.effects.resumes.push(Resumed {
+            frame,
+            ticket,
+            answer,
+        });
+        Ok(HostReply::Done)
     }
 }
 
@@ -442,10 +606,25 @@ where
                 Ok(HostReply::Done)
             }
             HostOp::BlobPut { hash, kind, body } => Ok(self.put(hash, &kind, &body)),
+            HostOp::Bind { role, program } => self.bind(role, program),
             HostOp::Emit(message) => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
                 Ok(self.emit(message))
             }
+            HostOp::Await {
+                target,
+                payload,
+                acting,
+            } => {
+                *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
+                self.call(target, payload, acting)
+            }
+            HostOp::Defer => Ok(self.defer()),
+            HostOp::Resume {
+                frame,
+                ticket,
+                answer,
+            } => self.resume(frame, ticket, answer),
             HostOp::Event(bytes) => {
                 self.events.push(bytes);
                 Ok(HostReply::Done)
@@ -479,25 +658,31 @@ where
     }
 }
 
-/// One run of `program`: its receipt, and what it emitted (nothing when it
-/// was rejected: its writes are undone here too).
 pub async fn execute<E>(
     world: World<'_, E>,
     overlay: &mut Overlay,
     stage: &mut Stage,
     frame: &mut Frame,
     program: &str,
+    suspended: Option<Suspended>,
     invocation: Invocation,
-) -> Result<(Receipt, Vec<(ItemRef, Message)>)>
+) -> Result<(Receipt, Effects)>
 where
     E: Context + Spawner,
 {
     let Some(module) = world.loaded.module(program) else {
-        return Ok((crate::rejected(program, unknown(program)), Vec::new()));
+        return Ok((
+            crate::rejected(program, unknown(program)),
+            Effects::default(),
+        ));
     };
     let checkpoint = overlay.checkpoint();
     let mut fuel = frame.fuel;
-    let (verdict, events, emitted, output, fault) = {
+    let may_park = matches!(
+        invocation.call,
+        ProgramCall::Execute(_) | ProgramCall::Resume { .. }
+    );
+    let (verdict, events, mut effects, output, fault) = {
         let mut unit = Execute {
             world,
             env: invocation.env.clone(),
@@ -505,32 +690,48 @@ where
             stage: &mut *stage,
             frame: &mut *frame,
             events: Vec::new(),
-            emitted: Vec::new(),
+            effects: Effects::default(),
             output: Vec::new(),
             fault: None,
         };
-        let verdict = world
-            .loaded
-            .runtime()
-            .run(module, invocation, &mut unit, &mut fuel)
-            .await;
-        (verdict, unit.events, unit.emitted, unit.output, unit.fault)
+        let runtime = world.loaded.runtime();
+        let verdict = match (suspended, may_park) {
+            (Some(suspended), _) => {
+                runtime
+                    .resume(suspended, invocation, &mut unit, &mut fuel)
+                    .await
+            }
+            (None, true) => {
+                runtime
+                    .start(module, invocation, &mut unit, &mut fuel)
+                    .await
+            }
+            (None, false) => runtime
+                .run(module, invocation, &mut unit, &mut fuel)
+                .await
+                .map(Ran::Done),
+        };
+        (verdict, unit.events, unit.effects, unit.output, unit.fault)
     };
     frame.fuel = fuel;
     if let Some(fault) = fault {
         return Err(fault);
     }
     let outcome = match verdict {
-        Ok(Ok(())) => Outcome::Applied { output },
-        Ok(Err(refusal)) => Outcome::Rejected(refusal),
+        Ok(Ran::Done(Ok(()))) => Outcome::Applied { output },
+        Ok(Ran::Done(Err(refusal))) => Outcome::Rejected(refusal),
+        Ok(Ran::Parked(suspended)) => {
+            effects.parked = Some(suspended);
+            Outcome::Applied { output }
+        }
         Err(fault) => Outcome::Rejected(refusal_of(fault)),
     };
-    let emitted = match &outcome {
-        Outcome::Applied { .. } => emitted,
+    let effects = match &outcome {
+        Outcome::Applied { .. } => effects,
         Outcome::Rejected(_) => {
             overlay.restore(checkpoint);
             discard_unrostered(world.store.storage(), overlay, stage)?;
-            Vec::new()
+            Effects::default()
         }
     };
     let receipt = Receipt {
@@ -539,7 +740,7 @@ where
         events,
         nested: Vec::new(),
     };
-    Ok((receipt, emitted))
+    Ok((receipt, effects))
 }
 
 pub(crate) fn discard_unrostered(

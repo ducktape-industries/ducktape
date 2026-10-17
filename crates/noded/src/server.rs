@@ -1,50 +1,118 @@
 use std::sync::Arc;
 
-use abi::{BlobId, Origin, ProgramId, Refusal, reason};
+use abi::Receipt;
+use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use borsh::BorshSerialize;
-use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::Receipt;
-use node::{Source, Taken};
-use statesync::Request;
+use futures::{SinkExt as _, StreamExt as _};
+use http_body_util::{BodyExt as _, LengthLimitError, Limited};
+use node::{BLOCK_BYTES, Preconfirm, Source, Taken};
+use statesync::Request as SyncRequest;
+use tokio::sync::Semaphore;
 
 use crate::wire::{
-    Admin, BlobPut, BlockRef, Blocks, Change, Finalized, Get, Network, Query, Range, route,
+    Admin, BlockAsk, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Submit,
+    Submitted, TxAsk, route,
 };
-use crate::{Context, Daemon};
+use crate::{Context, Daemon, LoadConfig};
 
-pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
-    Router::new()
+const SUBMIT_BYTES: usize = BLOCK_BYTES;
+const SUBMIT_BODY_BYTES: usize = SUBMIT_BYTES + size_of::<u32>() + size_of::<bool>();
+
+pub fn router<E: Context>(daemon: Arc<Daemon<E>>, load: LoadConfig) -> Router {
+    let read_permits = Arc::new(Semaphore::new(load.reads_in_flight.get()));
+    let reads = Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
-        .route(route::SUBMIT, post(submit::<E>))
-        .route(route::QUERY, post(query::<E>))
         .route(route::GET, post(get_value::<E>))
         .route(route::SCAN, post(scan::<E>))
         .route(route::BLOB_GET, post(blob_get::<E>))
-        .route(route::BLOB_PUT, post(blob_put::<E>))
+        .route(route::BLOBS, post(blobs::<E>))
         .route(route::BLOB_MISSING, get(blob_missing::<E>))
         .route(route::PROGRAMS, get(programs::<E>))
-        .route(
-            &format!("{}/{{program}}", route::CHANGES),
-            get(changes::<E>),
-        )
         .route(route::BLOCKS, post(blocks::<E>))
         .route(route::BLOCK, post(block::<E>))
+        .route(route::TX, post(tx::<E>))
         .route(route::LOGS, get(logs::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
+        .route(live_wire::PORT_ROUTE, get(live_port::<E>))
+        .route(route::QUERY, post(query::<E>))
+        .layer(middleware::from_fn_with_state(read_permits, bounded));
+    let uploads = Router::new()
+        .route(route::SUBMIT, post(submit::<E>))
+        .route(route::BLOB_PUT, post(blob_put::<E>))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(Semaphore::new(load.uploads_in_flight.get())),
+            bounded,
+        ));
+    let streams = Router::new()
+        .route(
+            &format!("{}/{{program}}", route::CHANGES),
+            get(changes::<E>),
+        )
         .route(route::P2P, get(p2p::<E>))
-        .layer(DefaultBodyLimit::disable())
-        .with_state(daemon)
+        .route(live_wire::ROUTE, get(live_socket::<E>));
+    reads.merge(uploads).merge(streams).with_state(daemon)
+}
+
+async fn bounded(
+    State(permits): State<Arc<Semaphore>>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let Ok(_permit) = permits.acquire_owned().await else {
+        let sentence = "the node stopped taking requests";
+        return (StatusCode::SERVICE_UNAVAILABLE, sentence).into_response();
+    };
+    next.run(request).await
+}
+
+struct Whole(Bytes);
+
+impl<S: Send + Sync> FromRequest<S> for Whole {
+    type Rejection = Reply<()>;
+
+    async fn from_request(request: Request, _: &S) -> Result<Self, Reply<()>> {
+        match request.into_body().collect().await {
+            Ok(body) => Ok(Whole(body.to_bytes())),
+            Err(error) => Err(cut(error)),
+        }
+    }
+}
+
+struct Capped<const MAX: usize>(Bytes);
+
+impl<S: Send + Sync, const MAX: usize> FromRequest<S> for Capped<MAX> {
+    type Rejection = Reply<()>;
+
+    async fn from_request(request: Request, _: &S) -> Result<Self, Reply<()>> {
+        let read = Limited::new(request.into_body(), MAX).collect().await;
+        match read {
+            Ok(body) => Ok(Capped(body.to_bytes())),
+            Err(error) if error.is::<LengthLimitError>() => Err(Reply::Refused(Refusal::new(
+                reason::CAPACITY,
+                format!("the request is over the {MAX} bytes this route reads"),
+            ))),
+            Err(error) => Err(cut(error)),
+        }
+    }
+}
+
+fn cut(error: impl std::fmt::Display) -> Reply<()> {
+    Reply::Refused(Refusal::new(
+        reason::INVALID_INPUT,
+        format!("the request body did not arrive whole: {error}"),
+    ))
 }
 
 pub enum Reply<T> {
@@ -85,21 +153,38 @@ async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Netw
     }
 }
 
-async fn submit<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<Receipt> {
+async fn submit<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Capped(body): Capped<SUBMIT_BODY_BYTES>,
+) -> Reply<Submitted> {
+    let Submit { frame, preconfirm } = match abi::decode(&body) {
+        Ok(submit) => submit,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
     let mut node = daemon.node.lock().await;
-    match node.submit(body.to_vec(), Source::Client).await {
-        Ok(Ok(Taken::New(receipt))) => {
+    match node.submit(frame.clone(), Source::Client, preconfirm).await {
+        Ok(Ok(Taken::New(prediction))) => {
             drop(node);
-            daemon.relay.send([body.as_ref()]);
-            Reply::Answered(receipt)
+            daemon.relay.send([frame.as_slice()]);
+            Reply::Answered(submitted(prediction))
         }
-        Ok(Ok(Taken::Held(receipt))) => Reply::Answered(receipt),
+        Ok(Ok(Taken::Held(prediction))) => Reply::Answered(submitted(prediction)),
         Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }
 }
 
-async fn query<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<Vec<u8>> {
+fn submitted(prediction: Option<Receipt>) -> Submitted {
+    match prediction {
+        Some(receipt) => Submitted::Preconfirmed(receipt),
+        None => Submitted::Pooled,
+    }
+}
+
+async fn query<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Whole(body): Whole,
+) -> Reply<Vec<u8>> {
     let query: Query = match abi::decode(&body) {
         Ok(query) => query,
         Err(refusal) => return Reply::Refused(refusal),
@@ -126,7 +211,7 @@ async fn query<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) ->
 
 async fn get_value<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Whole(body): Whole,
 ) -> Reply<Option<Vec<u8>>> {
     let get: Get = match abi::decode(&body) {
         Ok(get) => get,
@@ -141,7 +226,7 @@ async fn get_value<E: Context>(
 
 async fn scan<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Whole(body): Whole,
 ) -> Reply<Vec<abi::Entry>> {
     let range: Range = match abi::decode(&body) {
         Ok(range) => range,
@@ -156,32 +241,153 @@ async fn scan<E: Context>(
 
 async fn blob_get<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Whole(body): Whole,
 ) -> Reply<Option<Vec<u8>>> {
     let id: BlobId = match abi::decode(&body) {
         Ok(id) => id,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let node = daemon.node.lock().await;
-    match node.host().blob(&id) {
-        Ok(framed) => Reply::Answered(framed),
-        Err(host::Error::BlobUnavailable(_)) => Reply::Answered(None),
+    match served(&daemon, &[id]).await {
+        Ok(page) => Reply::Answered(page.into_iter().next().flatten()),
         Err(error) => failed(error),
     }
 }
 
-async fn blob_put<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<()> {
-    let put: BlobPut = match abi::decode(&body) {
-        Ok(put) => put,
+async fn blobs<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Whole(body): Whole,
+) -> Reply<Vec<Option<Vec<u8>>>> {
+    let ids: Vec<BlobId> = match abi::decode(&body) {
+        Ok(ids) => ids,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let mut node = daemon.node.lock().await;
-    match node.install(put.id, &put.framed) {
-        Ok(()) => Reply::Answered(()),
-        Err(node::Error::Host(host::Error::Corrupt(sentence))) => {
-            Reply::Refused(Refusal::new(reason::INVALID_INPUT, sentence))
-        }
+    match served(&daemon, &ids).await {
+        Ok(page) => Reply::Answered(page),
         Err(error) => failed(error),
+    }
+}
+
+async fn served<E: Context>(
+    daemon: &Daemon<E>,
+    ids: &[BlobId],
+) -> crate::Result<Vec<Option<Vec<u8>>>> {
+    let readable = {
+        let node = daemon.node.lock().await;
+        let now = node.now();
+        let mut readable = Vec::with_capacity(ids.len());
+        for id in ids {
+            readable.push(node.host().readable(id, now).await?);
+        }
+        readable
+    };
+    let store = daemon.blobs.store();
+    let mut page = Vec::with_capacity(ids.len());
+    for (id, readable) in ids.iter().zip(readable) {
+        if !readable {
+            page.push(None);
+            continue;
+        }
+        if !store.has(id) {
+            daemon.blobs.fetch(*id, halo::Class::Client).await;
+        }
+        page.push(store.framed(id)?);
+    }
+    Ok(page)
+}
+
+async fn blob_put<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    request: Request,
+) -> Reply<Submitted> {
+    let stream = request
+        .into_body()
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    let mut body = tokio_util::io::StreamReader::new(stream);
+    let frame = match framed_put(&mut body).await {
+        Ok(frame) => frame,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    let submission = match node::verify(&frame, &daemon.descriptor.id()) {
+        Ok(submission) => submission,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    let bound = daemon
+        .node
+        .lock()
+        .await
+        .host()
+        .roles()
+        .bound(role::BLOBS)
+        .cloned();
+    let role = match bound {
+        Ok(role) => role,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    let entries = match put_entries(&role, &submission) {
+        Ok(entries) => entries,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    if let Err(refusal) = daemon.blobs.stage(&entries, &mut body).await {
+        return Reply::Refused(refusal);
+    }
+    let mut node = daemon.node.lock().await;
+    match node
+        .submit(frame.clone(), Source::Client, Preconfirm::Off)
+        .await
+    {
+        Ok(Ok(Taken::New(prediction))) => {
+            drop(node);
+            daemon.relay.send([frame.as_slice()]);
+            Reply::Answered(submitted(prediction))
+        }
+        Ok(Ok(Taken::Held(prediction))) => Reply::Answered(submitted(prediction)),
+        Ok(Err(refusal)) => Reply::Refused(refusal),
+        Err(error) => failed(error),
+    }
+}
+
+async fn framed_put(body: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<u8>, Refusal> {
+    use tokio::io::AsyncReadExt as _;
+    let unread = |error: std::io::Error| {
+        Refusal::new(
+            reason::INVALID_INPUT,
+            format!("the upload does not open with a framed put: {error}"),
+        )
+    };
+    let len = body.read_u32_le().await.map_err(unread)? as usize;
+    let fits = len <= SUBMIT_BYTES;
+    if !fits {
+        return Err(Refusal::new(
+            reason::CAPACITY,
+            format!("the put frame is {len} bytes and a frame is at most {SUBMIT_BYTES}"),
+        ));
+    }
+    let mut frame = vec![0u8; len];
+    body.read_exact(&mut frame).await.map_err(unread)?;
+    Ok(frame)
+}
+
+fn put_entries(
+    role: &str,
+    submission: &host::Submission,
+) -> Result<Vec<blob::contract::Entry>, Refusal> {
+    let to_the_blobs_program = submission.target == role;
+    if !to_the_blobs_program {
+        return Err(Refusal::new(
+            reason::INVALID_INPUT,
+            format!(
+                "an upload carries a put to {role}, not to {}",
+                submission.target
+            ),
+        ));
+    }
+    match abi::decode(&submission.payload)? {
+        blob::contract::Op::Put { blobs } => Ok(blobs),
+        blob::contract::Op::Receipt { .. } => Err(Refusal::new(
+            reason::INVALID_INPUT,
+            "an upload carries a put, not a receipt",
+        )),
     }
 }
 
@@ -212,41 +418,75 @@ async fn changes<E: Context>(
     upgrade.on_upgrade(move |socket| stream(socket, subscription))
 }
 
-async fn stream(mut socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Change>) {
-    while let Some(change) = changes.next().await {
-        let sent = socket
-            .send(Message::Binary(abi::encode(&change).into()))
-            .await;
-        if sent.is_err() {
-            return;
+enum Next {
+    Change(Change),
+    Frame,
+    Ended,
+}
+
+async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Change>) {
+    let (mut client, mut frames) = socket.split();
+    loop {
+        let next = tokio::select! {
+            change = changes.next() => change.map_or(Next::Ended, Next::Change),
+            frame = frames.next() => match frame {
+                Some(Ok(_)) => Next::Frame,
+                Some(Err(_)) | None => Next::Ended,
+            },
+        };
+        match next {
+            Next::Change(change) => {
+                let sent = client
+                    .send(Message::Binary(abi::encode(&change).into()))
+                    .await;
+                if sent.is_err() {
+                    return;
+                }
+            }
+            Next::Frame => {}
+            Next::Ended => return,
         }
     }
 }
 
 async fn blocks<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
-) -> Reply<Vec<Finalized>> {
+    Whole(body): Whole,
+) -> Reply<Page> {
     let page: Blocks = match abi::decode(&body) {
         Ok(page) => page,
         Err(refusal) => return Reply::Refused(refusal),
     };
     match daemon.blocks(page).await {
-        Ok(blocks) => Reply::Answered(blocks),
+        Ok(page) => Reply::Answered(page),
         Err(error) => failed(error),
     }
 }
 
 async fn block<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Whole(body): Whole,
 ) -> Reply<Option<Finalized>> {
-    let by: BlockRef = match abi::decode(&body) {
-        Ok(by) => by,
+    let ask: BlockAsk = match abi::decode(&body) {
+        Ok(ask) => ask,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match daemon.block(by).await {
+    match daemon.block(ask).await {
         Ok(block) => Reply::Answered(block),
+        Err(error) => failed(error),
+    }
+}
+
+async fn tx<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    Whole(body): Whole,
+) -> Reply<Option<Located>> {
+    let ask: TxAsk = match abi::decode(&body) {
+        Ok(ask) => ask,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match daemon.tx(ask).await {
+        Ok(tx) => Reply::Answered(tx),
         Err(error) => failed(error),
     }
 }
@@ -255,7 +495,7 @@ async fn logs<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Vec<Str
     Reply::Answered(daemon.logs.lines())
 }
 
-async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) -> Reply<()> {
+async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, Whole(body): Whole) -> Reply<()> {
     let submission = match node::verify(&body, &daemon.descriptor.id()) {
         Ok(submission) => submission,
         Err(refusal) => return Reply::Refused(refusal),
@@ -293,9 +533,9 @@ async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, body: Bytes) ->
 
 async fn sync<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
-    body: Bytes,
+    Whole(body): Whole,
 ) -> Reply<statesync::Response> {
-    let request: Request = match abi::decode(&body) {
+    let request: SyncRequest = match abi::decode(&body) {
         Ok(request) => request,
         Err(refusal) => return Reply::Refused(refusal),
     };
@@ -313,4 +553,69 @@ async fn p2p<E: Context>(
 ) -> Response {
     let mesh = daemon.mesh;
     upgrade.on_upgrade(move |socket| crate::transport::inbound_websocket(socket, mesh))
+}
+
+/// The UDP port a client dials for live tracks, `None` when the node runs no QUIC door.
+async fn live_port<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Option<u16>> {
+    Reply::Answered(daemon.live.port())
+}
+
+async fn live_socket<E: Context>(
+    State(daemon): State<Arc<Daemon<E>>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let live = daemon.live.clone();
+    crate::live::ws_upgrade(upgrade).on_upgrade(move |socket| live.serve_ws(socket))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+
+    use super::*;
+
+    const CAP: usize = 16;
+
+    async fn read(bytes: usize) -> Result<Capped<CAP>, Reply<()>> {
+        let request = Request::new(Body::from(vec![0; bytes]));
+        Capped::<CAP>::from_request(request, &()).await
+    }
+
+    #[tokio::test]
+    async fn a_body_within_its_cap_is_read_whole() {
+        let Ok(Capped(body)) = read(CAP).await else {
+            panic!("a body at the cap is read");
+        };
+        assert_eq!(body.len(), CAP);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_its_cap_is_refused_for_capacity() {
+        let Err(Reply::Refused(refusal)) = read(CAP + 1).await else {
+            panic!("a body over the cap is refused");
+        };
+        assert_eq!(refusal.reason, reason::CAPACITY);
+    }
+
+    const PAST_AXUM_DEFAULT_LIMIT: usize = (2 << 20) + 1;
+
+    #[tokio::test]
+    async fn a_body_past_the_frameworks_default_limit_is_read_whole() {
+        let router = Router::new().route(
+            "/whole",
+            post(|Whole(body): Whole| async move { body.len().to_string() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/whole"))
+            .body(vec![0u8; PAST_AXUM_DEFAULT_LIMIT])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let read = response.text().await.unwrap();
+        assert_eq!(read, PAST_AXUM_DEFAULT_LIMIT.to_string());
+    }
 }

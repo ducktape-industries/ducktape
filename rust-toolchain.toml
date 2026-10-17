@@ -1,32 +1,15 @@
-# The one toolchain this tree builds with. The committed wasm component bytes
-# are rustc-dependent (see the Makefile's `wasm-modules` block), so a floating
-# channel means two operators hash different module bundles into the same
-# descriptor and a registry swap no validator will activate. Pinned exactly,
-# for the same reason `wasmtime` is.
+# The one toolchain this tree builds with. The committed wasm bytes are
+# rustc-dependent. Pinned exactly, for the same reason `wasmtime` is.
 #
 # 1.96.1 is not a preference, it is what the checked-in artifacts came out of:
-# every committed component.wasm carries `/rustc/31fca3adb283cc9dfd56b49cdee9a96
-# eb9c96ffd/` in its panic paths, and that commit IS 1.96.1. Moving the channel
-# without rebuilding the sweep makes this file lie about the bytes next to it.
+# every committed .wasm carries `/rustc/31fca3adb283cc9dfd56b49cdee9a96
+# eb9c96ffd/` in its panic paths, and that commit IS 1.96.1.
 #
-# `targets` lists every triple something in this tree passes to `--target`:
-#   wasm32-unknown-unknown — guest-builder and each `crates/guests` workspace
-#     compile module guests for it. No WASI guest exists, so no wasm32-wasip1.
-#   {x86_64,aarch64}-unknown-linux-musl — `ops/build-guest-rootfs.sh` builds
-#     the sandbox guest's static PID 1 (`duck-guest-init`) for the host's arch.
-#     One arch per host, but a toolchain file cannot be host-conditional, so
-#     both are listed; dropping them breaks that build under this pin.
-#
-# guest-builder compiles in a scratch workspace under target/ by default,
-# inside this file's directory search. A `--scratch` elsewhere (the mac smoke
-# workflow's runner temp) inherits the pin only because rustup exports
-# RUSTUP_TOOLCHAIN to proxied children, i.e. while guest-builder runs through
-# `cargo run`.
+# `targets` lists every triple something in this tree passes to `--target`.
+# No WASI program exists, so no wasm32-wasip1.
 [toolchain]
 channel = "1.96.1"
 components = ["rustfmt", "clippy"]
 targets = [
   "wasm32-unknown-unknown",
-  "x86_64-unknown-linux-musl",
-  "aarch64-unknown-linux-musl",
 ]

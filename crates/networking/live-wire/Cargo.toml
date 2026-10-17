@@ -1,0 +1,11 @@
+[package]
+name = "live-wire"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "live_wire"
+
+[dependencies]
+abi = { workspace = true }
+borsh = { workspace = true }

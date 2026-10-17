@@ -1,6 +1,9 @@
 mod blocks;
 mod client;
+mod config;
+mod egress;
 mod endpoint;
+pub mod live;
 mod logs;
 mod mesh;
 mod network;
@@ -15,17 +18,20 @@ use std::sync::{Arc, Mutex};
 
 use abi::{ProgramId, Refusal};
 use commonware_cryptography::Digestible as _;
-use consensus::{MarshalMailbox, Network, Receipts, Votes};
+use consensus::{MarshalMailbox, Network, Summaries, Votes};
 use futures::channel::mpsc;
 use host::Applied;
 use node::Node;
 use tokio::sync::watch;
 
-pub use client::Client;
+pub use client::{Client, Upload};
+pub use config::{
+    ConsensusSettings, DEFAULT_HTTP, DEFAULT_LOG, LoadSettings, NodeConfig, Settings, permits,
+};
 pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
-pub use run::{Listen, Running, init, invite, join, run};
+pub use run::{HaloConfig, Listen, LoadConfig, Running, init, invite, join, run};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
 
@@ -49,6 +55,22 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("the founding file does not parse: {0}")]
     Founding(#[from] toml::de::Error),
+    #[error("{} is refused: {reason}", .path.display())]
+    Settings {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    #[error("the node has no p2p socket: pass --listen or set listen in node.toml")]
+    NoListen,
+    #[error("the node has no halo socket: pass --halo or set halo in node.toml")]
+    NoHalo,
+    #[error("the consensus timeouts are refused: {0}")]
+    Cadence(#[from] consensus::CadenceError),
+    #[error("{count} is past the {most} a tokio semaphore holds")]
+    PastPermits {
+        count: std::num::NonZeroUsize,
+        most: usize,
+    },
     #[error("not hex: {0}")]
     Hex(#[from] hex::FromHexError),
     #[error("{0}")]
@@ -62,9 +84,11 @@ pub enum Error {
     #[error(transparent)]
     Host(#[from] host::Error),
     #[error(transparent)]
+    Blob(#[from] blob::Error),
+    #[error(transparent)]
     Sync(#[from] statesync::Error),
     #[error(transparent)]
-    Receipts(#[from] consensus::ReceiptsError),
+    Summaries(#[from] consensus::SummariesError),
     #[error(transparent)]
     Membership(#[from] consensus::MembershipError),
     #[error(transparent)]
@@ -79,6 +103,8 @@ pub enum Error {
     Failed { status: u16, sentence: String },
     #[error("the node closed its change stream")]
     Closed,
+    #[error("egress: {0}")]
+    Egress(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
@@ -96,10 +122,15 @@ pub struct Daemon<E: Context> {
     pub network: Network,
     pub identity: Vec<u8>,
     pub anchors: MarshalMailbox,
-    pub receipts: Receipts<E>,
+    pub summaries: Summaries<E>,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
+    pub tips: watch::Sender<u64>,
     pub relay: relay::Relay<E>,
+    pub blobs: blob::service::Service,
+    halo: Arc<halo::Halo>,
+    pub live: Arc<live::Relay<E>>,
+    key: commonware_cryptography::ed25519::PrivateKey,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
@@ -136,6 +167,7 @@ impl<E: Context> Daemon<E> {
     }
 
     pub fn publish(&self, applied: &Applied) {
+        self.live.invalidate(&applied.writes);
         let mut subscribers = self
             .subscribers
             .lock()

@@ -1,8 +1,10 @@
-use abi::{BlobId, ProgramId, Root, Scan};
+use abi::Receipt;
+use abi::{ProgramId, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
-use host::{Layer, Receipt, Tip};
+use host::{Layer, Tip};
+use node::Preconfirm;
 
-pub const NODE_CONTRACT: u32 = 3;
+pub const NODE_CONTRACT: u32 = 9;
 pub const ADMIN: &str = "$admin";
 
 pub mod route {
@@ -14,10 +16,12 @@ pub mod route {
     pub const BLOB_GET: &str = "/v1/blob/get";
     pub const BLOB_PUT: &str = "/v1/blob/put";
     pub const BLOB_MISSING: &str = "/v1/blob/missing";
+    pub const BLOBS: &str = "/v1/blobs";
     pub const PROGRAMS: &str = "/v1/programs";
     pub const CHANGES: &str = "/v1/changes";
     pub const BLOCKS: &str = "/v1/blocks";
     pub const BLOCK: &str = "/v1/block";
+    pub const TX: &str = "/v1/tx";
     pub const LOGS: &str = "/v1/logs";
     pub const ADMIN: &str = "/v1/admin";
     pub const SYNC: &str = "/v1/sync";
@@ -54,6 +58,18 @@ impl Status {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Submit {
+    pub frame: Vec<u8>,
+    pub preconfirm: Preconfirm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Submitted {
+    Pooled,
+    Preconfirmed(Receipt),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Query {
     pub layer: Layer,
     pub frame: Vec<u8>,
@@ -74,12 +90,6 @@ pub struct Range {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct BlobPut {
-    pub id: BlobId,
-    pub framed: Vec<u8>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Admin {
     Shutdown,
     LogFilter(String),
@@ -92,17 +102,17 @@ pub struct Change {
     pub writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
-/// The most blocks one `/v1/blocks` page answers.
-pub const MAX_BLOCKS: u32 = 100;
-
-/// A page of finalized blocks, newest first: those below `before` (from the
-/// applied tip when `None`), at most `limit` (capped at [`MAX_BLOCKS`]). A
-/// page ends early where the archive holds no older block (a node that
-/// joined by state sync keeps none below its anchor).
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Blocks {
     pub before: Option<u64>,
     pub limit: u32,
+    pub most: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Page {
+    pub blocks: Vec<Finalized>,
+    pub listed_from: Option<u64>,
 }
 
 /// One finalized block, by height or by its id (the block digest).
@@ -112,29 +122,23 @@ pub enum BlockRef {
     Id([u8; 32]),
 }
 
-/// One frame a block carries, decoded. A frame that does not verify was not
-/// applied and is left out.
-///
-/// `receipt` is the frame's run as this node recorded it when it applied
-/// the block: applied or rejected with its refusal, the events, the nested
-/// runs. It is node-local, derived data, not part of the block or its id,
-/// and `None` where this node never ran the block (one below its state-sync
-/// anchor) or stopped between applying it and keeping its receipts.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct BlockAsk {
+    pub by: BlockRef,
+    pub most: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Tx {
     pub hash: [u8; 32],
     pub signer: Vec<u8>,
     pub anchor: Tip,
     pub target: String,
-    pub payload: Vec<u8>,
+    pub size: u32,
+    pub payload: Option<Vec<u8>>,
     pub receipt: Option<Receipt>,
 }
 
-/// A finalized block as the marshal archive keeps it. `proposer` is the
-/// validator key that led the certified round, when this node holds the
-/// block's finalization certificate (a block finalized only as the ancestor
-/// of a later one has none of its own). There is no state root or write set
-/// here: the node keeps neither per height.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Finalized {
     pub height: u64,
@@ -144,6 +148,26 @@ pub struct Finalized {
     pub epoch: u64,
     pub proposer: Option<Vec<u8>>,
     pub txs: Vec<Tx>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum TxRef {
+    At { height: u64, position: u32 },
+    Hash([u8; 32]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct TxAsk {
+    pub tx: TxRef,
+    pub most: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Located {
+    pub height: u64,
+    pub position: u32,
+    pub time: u64,
+    pub tx: Tx,
 }
 
 /// Every member of the current epoch as this node sees it (`/v1/network`).
@@ -163,9 +187,7 @@ pub struct Network {
 /// not applied counts once it does. The vote's sender is authenticated but
 /// its signature is not checked, so a validator can misstate only its own
 /// row. `None` for a member not seated as a validator this epoch (a
-/// resident), for a validator not heard since this node started or last
-/// began validating, and for every member while this node is not itself a
-/// validator: it runs no engine, so it hears no votes.
+/// resident), and for a validator not heard since this node started.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct PeerStatus {
     pub key: Vec<u8>,

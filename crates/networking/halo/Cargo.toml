@@ -1,0 +1,27 @@
+[package]
+name = "halo"
+edition.workspace = true
+version.workspace = true
+
+[features]
+sim = []
+
+[dependencies]
+abi = { workspace = true }
+bytes = "1"
+commonware-codec = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-runtime = { workspace = true }
+futures = { workspace = true }
+quinn = { workspace = true }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time"] }
+tracing = { workspace = true }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+halo = { workspace = true, features = ["sim"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = "0.3"

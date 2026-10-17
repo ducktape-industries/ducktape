@@ -6,9 +6,11 @@ version.workspace = true
 # the CLOSED set of signature schemes a ducktape key can carry, and the one
 # `(scheme, pubkey, proof) -> verified?` dispatch every signed artifact rides:
 # op frames (kernel/node), account association proofs (identity), and later
-# request proofs and git push certificates. below modules on purpose — the
-# frame codec cannot depend on a module. pure, deterministic, wasm-clean.
+# request proofs and git push certificates. below programs on purpose — the
+# frame codec cannot depend on a program. pure, deterministic, wasm-clean.
 [dependencies]
+# the scheme names a wire message carries (`abi::Scheme`), mapped to the schemes here.
+abi = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 borsh = { workspace = true }
