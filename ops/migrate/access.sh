@@ -14,8 +14,8 @@ remote=${FOUNDING_REMOTE:-$founding}
 work=${MIGRATE_DIR:-$PWD/access-migration}
 mkdir -p "$work"
 
-temporary=(forge files harness)
-migrating=(forge files harness identity)
+temporary=(forge chat files harness)
+migrating=(forge chat files harness identity)
 
 read -r -d '' codec <<'PY' || true
 import hashlib, struct, sys, tomllib
@@ -288,6 +288,7 @@ if ! migrated; then
   for program in "${migrating[@]}"; do
     case $program in
       forge) tag=11 ;;
+      chat) tag=10 ;;
       files) tag=4 ;;
       harness) tag=7 ;;
       identity) tag=12 ;;
