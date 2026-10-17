@@ -1,6 +1,6 @@
 //! The egress worker's decisions after each block and each thing a call reports: which requests to
-//! call, and which answers, events and `Serve` frames to send, a request's frames one at a time
-//! in order. Pure; `mod.rs` performs what it decides.
+//! call, and which answers, events and `Serve` frames to send: a request's frames one at a time in
+//! order, each carrying every event read since the last. Pure; `mod.rs` performs what it decides.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use abi::role::egress::{Answer, Event, Op, RequestRow, StreamEnd};
@@ -76,12 +76,24 @@ enum Out {
     End { events: u64, end: StreamEnd },
 }
 
-impl Out {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Batch {
+    Answer(Answer),
+    Events(Vec<(u64, Vec<u8>)>),
+    End { events: u64, end: StreamEnd },
+}
+
+impl Batch {
     fn op(&self, id: u64) -> Op {
         match self.clone() {
-            Out::Answer(answer) => Op::Answer { id, answer },
-            Out::Event { seq, data } => Op::Event(Event { id, seq, data }),
-            Out::End { events, end } => Op::EndStream { id, events, end },
+            Batch::Answer(answer) => Op::Answer { id, answer },
+            Batch::Events(events) => Op::Events(
+                events
+                    .into_iter()
+                    .map(|(seq, data)| Event { id, seq, data })
+                    .collect(),
+            ),
+            Batch::End { events, end } => Op::EndStream { id, events, end },
         }
     }
 }
@@ -108,8 +120,8 @@ enum Call {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Queued {
-    out: Out,
+struct Flight {
+    batch: Batch,
     sending: Sending,
 }
 
@@ -117,7 +129,8 @@ struct Queued {
 struct Outbox {
     call: Call,
     events: u64,
-    queue: VecDeque<Queued>,
+    waiting: VecDeque<Out>,
+    flight: Option<Flight>,
 }
 
 impl Outbox {
@@ -125,7 +138,8 @@ impl Outbox {
         Outbox {
             call: Call::Running,
             events: 0,
-            queue: VecDeque::new(),
+            waiting: VecDeque::new(),
+            flight: None,
         }
     }
 
@@ -142,14 +156,10 @@ impl Outbox {
                 self.end(Out::End { events, end })
             }
         };
-        self.queue.push_back(Queued {
-            out,
-            sending: Sending::Unsigned,
-        });
-        let first = self.queue.len() == 1;
-        match first {
-            true => Next::Send,
-            false => Next::Wait,
+        self.waiting.push_back(out);
+        match self.flight {
+            Some(_) => Next::Wait,
+            None => self.launch(),
         }
     }
 
@@ -164,29 +174,89 @@ impl Outbox {
         out
     }
 
-    fn too_large(&mut self) -> Next {
-        let Some(head) = self.queue.front() else {
+    fn launch(&mut self) -> Next {
+        let Some(first) = self.waiting.pop_front() else {
+            self.flight = None;
             return Next::Wait;
         };
-        let cut = |events: u64, reason: &str| Out::End {
+        let batch = match first {
+            Out::Answer(answer) => Batch::Answer(answer),
+            Out::End { events, end } => Batch::End { events, end },
+            Out::Event { seq, data } => {
+                let following = self
+                    .waiting
+                    .iter()
+                    .take_while(|out| matches!(out, Out::Event { .. }))
+                    .count();
+                let rest = self.waiting.drain(..following).filter_map(|out| match out {
+                    Out::Event { seq, data } => Some((seq, data)),
+                    Out::Answer(_) | Out::End { .. } => None,
+                });
+                Batch::Events([(seq, data)].into_iter().chain(rest).collect())
+            }
+        };
+        self.flight = Some(Flight {
+            batch,
+            sending: Sending::Unsigned,
+        });
+        Next::Send
+    }
+
+    fn requeue(&mut self, batch: Batch) {
+        let outs = match batch {
+            Batch::Answer(answer) => vec![Out::Answer(answer)],
+            Batch::Events(events) => events
+                .into_iter()
+                .map(|(seq, data)| Out::Event { seq, data })
+                .collect(),
+            Batch::End { events, end } => vec![Out::End { events, end }],
+        };
+        for out in outs.into_iter().rev() {
+            self.waiting.push_front(out);
+        }
+    }
+
+    fn too_large(&mut self) -> Next {
+        let Some(flight) = self.flight.take() else {
+            return Next::Wait;
+        };
+        let cut = |events: u64, reason: &str| Batch::End {
             events,
             end: StreamEnd::Cut {
                 reason: reason.to_owned(),
             },
         };
-        let replacement = match &head.out {
-            Out::Answer(_) => Out::Answer(Answer::Failed(
-                "the answer is larger than a block carries".to_owned(),
-            )),
-            Out::Event { seq, .. } => cut(*seq, "event_too_large"),
-            Out::End { events, .. } => cut(*events, "end_too_large"),
+        let batch = match flight.batch {
+            Batch::Events(mut events) if events.len() > 1 => {
+                let rest = events.split_off(events.len() / 2);
+                self.requeue(Batch::Events(rest));
+                Batch::Events(events)
+            }
+            Batch::Events(events) => {
+                self.waiting.clear();
+                self.call = Call::Ended;
+                cut(
+                    events.first().map_or(self.events, |(seq, _)| *seq),
+                    "event_too_large",
+                )
+            }
+            Batch::Answer(_) => {
+                self.waiting.clear();
+                self.call = Call::Ended;
+                Batch::Answer(Answer::Failed(
+                    "the answer is larger than a block carries".to_owned(),
+                ))
+            }
+            Batch::End { events, .. } => {
+                self.waiting.clear();
+                self.call = Call::Ended;
+                cut(events, "end_too_large")
+            }
         };
-        self.queue.clear();
-        self.queue.push_back(Queued {
-            out: replacement,
+        self.flight = Some(Flight {
+            batch,
             sending: Sending::Unsigned,
         });
-        self.call = Call::Ended;
         Next::Send
     }
 
@@ -196,21 +266,24 @@ impl Outbox {
         if too_large {
             return self.too_large();
         }
-        let Some(head) = self.queue.front_mut() else {
+        let Some(flight) = self.flight.as_mut() else {
             return Next::Wait;
         };
         match sent {
-            Sent::Pending(frame) => head.sending = Sending::Pending(frame),
-            Sent::Stale => head.sending = Sending::Unsigned,
-            Sent::Carried | Sent::Refused(_) => {
-                self.queue.pop_front();
-                return match self.queue.front() {
-                    Some(_) => Next::Send,
-                    None => Next::Wait,
-                };
+            Sent::Pending(frame) => {
+                flight.sending = Sending::Pending(frame);
+                Next::Wait
             }
+            Sent::Stale => {
+                let Some(stale) = self.flight.take() else {
+                    return Next::Wait;
+                };
+                self.requeue(stale.batch);
+                self.launch();
+                Next::Wait
+            }
+            Sent::Carried | Sent::Refused(_) => self.launch(),
         }
-        Next::Wait
     }
 }
 
@@ -240,8 +313,8 @@ impl Desk {
                 steps.push(Step::Call(row));
                 continue;
             };
-            let waiting = outbox.queue.front().is_some();
-            if waiting {
+            let in_flight = outbox.flight.is_some();
+            if in_flight {
                 steps.push(Step::Send(Purpose::Request(id)));
             }
         }
@@ -264,8 +337,8 @@ impl Desk {
     pub fn op(&self, purpose: &Purpose) -> Option<Op> {
         match purpose {
             Purpose::Request(id) => {
-                let head = self.requests.get(id)?.queue.front()?;
-                Some(head.out.op(*id))
+                let flight = self.requests.get(id)?.flight.as_ref()?;
+                Some(flight.batch.op(*id))
             }
             Purpose::Serve => Some(Op::Serve {
                 services: self.wanted.clone(),
@@ -275,7 +348,7 @@ impl Desk {
 
     pub fn frame(&self, purpose: &Purpose) -> Option<&[u8]> {
         let sending = match purpose {
-            Purpose::Request(id) => &self.requests.get(id)?.queue.front()?.sending,
+            Purpose::Request(id) => &self.requests.get(id)?.flight.as_ref()?.sending,
             Purpose::Serve => &self.serve,
         };
         match sending {

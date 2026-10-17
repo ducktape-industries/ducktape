@@ -243,11 +243,11 @@ answer: the whole response, or a failure. `Delivery::Events { deliver }` asks
 for the response's events as they arrive; only the requester can ask its
 service for a stream (an Anthropic request sets `"stream": true` in the body it
 builds). When such a request's response is `text/event-stream`, the node reads
-the body as it arrives and sends each complete event as its own `Op::Event`
-frame: `seq` counts from 0 and `data` is the event's lines as received, without
-the blank line that ends it. Egress hands each one to the requester as
-`deliver` followed by the encoded `Event`, and pushes the request's expiry
-`wait` blocks past it. When the body ends, the node sends `Op::EndStream` with
+the body as it arrives and sends its complete events in `Op::Events` frames,
+in order: each `Event`'s `seq` counts from 0 and `data` is the event's lines as
+received, without the blank line that ends it. Egress hands each event to the
+requester, in the frame's order, as `deliver` followed by the encoded `Event`,
+and pushes the request's expiry `wait` blocks past the frame. When the body ends, the node sends `Op::EndStream` with
 the number of events it sent and `StreamEnd::Complete`, the response's status
 and headers. When the body breaks off, it sends `StreamEnd::Cut` with the
 reason `stream_broken`. An event unended when the body ends is dropped. Any
@@ -260,12 +260,14 @@ one and signs the answer with its own key. It also sends `Serve` while the chain
 record of the services it serves differs from its `egress.toml`. It submits each
 of these frames again every block until a block carries it, and signs one again
 when its anchor grows old. A request's frames go out one at a time: the node
-sends a stream's next event, or its end, only after a block has carried the one
-before. A frame carries no sequence number, and the relay to the validators
-may drop a frame and offer it again blocks later, so without this wait a later
-event could reach a block first. An answer larger than a block carries goes out as a failure; an event or
-end larger than a block carries ends the stream `Cut` (`event_too_large`,
-`end_too_large`) and the node drops the rest. On a network that binds no egress
+sends a stream's next frame only after a block has carried the one before, and
+that frame carries every event read since, or the end. A frame carries no
+sequence number, and the relay to the validators may drop a frame and offer it
+again blocks later, so two frames in flight could reach blocks out of order;
+events inside one frame cannot. Events together larger than a block carries go
+out in halves, in order. An answer larger than a block carries goes out as a
+failure; one event or an end larger than a block carries ends the stream `Cut`
+(`event_too_large`, `end_too_large`) and the node drops the rest. On a network that binds no egress
 role the node does none of this.
 
 ```toml
