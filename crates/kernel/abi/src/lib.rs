@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
 pub type ProgramId = String;
 
@@ -18,14 +18,26 @@ impl core::fmt::Debug for Root {
 }
 
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
 )]
 pub enum HashKind {
     Sha256,
     Sha1,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub enum BlobId {
     Sha256([u8; 32]),
     Sha1([u8; 20]),
@@ -97,7 +109,7 @@ pub enum Principal {
 /// (egress, halo, scheduler, any name a program looks up) it never does.
 /// Every frame's env carries the table, so a program asks a role by its
 /// binding, never by a name it assumes.
-#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Roles(BTreeMap<String, ProgramId>);
 
 impl Roles {
@@ -152,7 +164,7 @@ pub struct ItemRef {
     pub item: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Refusal {
     pub reason: String,
     pub sentence: String,
@@ -213,13 +225,13 @@ pub mod reason {
     pub const UNEXPECTED_REPLY: &str = "unexpected_reply";
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Outcome {
     Applied { output: Vec<u8> },
     Rejected(Refusal),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Receipt {
     pub program: ProgramId,
     pub outcome: Outcome,
@@ -321,7 +333,9 @@ pub struct Entry {
     pub value: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub enum Scheme {
     Ed25519,
     Secp256k1,
@@ -467,9 +481,9 @@ pub mod role {
 
     /// Which code runs at a height.
     pub mod programs {
-        use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
+        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Entry {
             pub program: ProgramId,
             pub code: BlobId,
@@ -478,7 +492,7 @@ pub mod role {
 
         /// A view with no program behind it: its name on the rail and the blob
         /// that is the view itself.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct View {
             pub name: ProgramId,
             pub view: BlobId,
@@ -510,12 +524,12 @@ pub mod role {
 
     /// The consensus set.
     pub mod validators {
-        use crate::{BorshDeserialize, BorshSerialize};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize};
 
         /// The most members a network's cap can name.
         pub const MAX_MEMBERS: u32 = 128;
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Member {
             pub key: Vec<u8>,
             pub address: Option<String>,
@@ -544,7 +558,7 @@ pub mod role {
 
         pub const INVITE_NAMESPACE: &[u8] = b"ducktape:invite";
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Enroll {
                 address: Option<String>,
@@ -558,7 +572,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Motion {
             Promote {
                 key: Vec<u8>,
@@ -593,7 +607,7 @@ pub mod role {
             Enacted,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Grant {
             pub network: Vec<u8>,
             pub nonce: [u8; 16],
@@ -606,7 +620,7 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Invite {
             pub issuer: Vec<u8>,
             pub grant: Grant,
@@ -649,7 +663,7 @@ pub mod role {
     /// Who holds a key or runs as a program (the account a frame acts as),
     /// and how each account reads to the programs and views that name it.
     pub mod identity {
-        use crate::{BorshDeserialize, BorshSerialize, ProgramId};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
 
         pub type AccountNumber = u64;
 
@@ -661,7 +675,7 @@ pub mod role {
         /// script `calls` one program and hands it `config`, text that
         /// program alone gives a meaning. A `System` account is a
         /// program's own account and holds no keys.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Kind {
             User,
             Program {
@@ -673,7 +687,7 @@ pub mod role {
             System(ProgramId),
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Script {
             pub calls: ProgramId,
             pub config: String,
@@ -681,14 +695,18 @@ pub mod role {
 
         /// What a manager declares a program account to be. The enum only
         /// grows at its end.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
         pub enum Category {
             Agent,
         }
 
         /// Whether a program account acts. Its manager alone changes it;
         /// `Revoked` is final.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
         pub enum Standing {
             Active,
             Suspended,
@@ -696,7 +714,7 @@ pub mod role {
         }
 
         /// An account as others show it: its name and what it is.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Profile {
             pub number: AccountNumber,
             pub name: String,
@@ -749,19 +767,19 @@ pub mod role {
     }
 
     pub mod awaits {
-        use crate::{BorshDeserialize, BorshSerialize, ProgramId, Refusal, reason};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Refusal, reason};
 
         pub type Ticket = u64;
         pub type FrameId = u64;
         pub type Answer = Result<Vec<u8>, Refusal>;
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Call {
             pub ticket: Ticket,
             pub target: ProgramId,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Park {
                 frame: FrameId,
@@ -777,7 +795,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct TicketRow {
             pub ticket: Ticket,
             pub frame: FrameId,
@@ -786,7 +804,7 @@ pub mod role {
             pub opened: u64,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Query {
             Ticket {
                 ticket: Ticket,
@@ -798,7 +816,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Reply {
             Ticket(Option<TicketRow>),
             Tickets(Vec<TicketRow>),
@@ -817,7 +835,7 @@ pub mod role {
     /// it is pinned. Only the validators' vote changes the table, and no vote
     /// pauses or closes a pinned lane.
     pub mod halo {
-        use crate::{BorshDeserialize, BorshSerialize};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize};
 
         /// The lane byte on the wire: a stream hello's first byte, a
         /// datagram's first byte.
@@ -837,6 +855,7 @@ pub mod role {
             Ord,
             BorshSerialize,
             BorshDeserialize,
+            BorshSchema,
         )]
         pub enum Class {
             Critical,
@@ -867,7 +886,7 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Lane {
             pub name: String,
             pub id: LaneId,
@@ -883,7 +902,7 @@ pub mod role {
 
         /// Every op is the validators' vote (`Motion::Role`); a signed frame
         /// is refused.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             /// Lists `name` at the next free id, enabled and not pinned.
             Open { name: String, cap: Class },
@@ -899,7 +918,7 @@ pub mod role {
             Close { name: String },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Query {
             /// Every listed lane, in id order.
             Lanes,
@@ -908,7 +927,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Reply {
             Lanes(Vec<Lane>),
             Lane(Option<Lane>),
@@ -932,7 +951,7 @@ pub mod role {
     pub mod egress {
         use crate::role::identity::AccountNumber;
         use crate::role::scheduler::EntryId;
-        use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
+        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
 
         pub const DEFAULT_WAIT: u64 = 64;
 
@@ -940,7 +959,7 @@ pub mod role {
         pub const RELAY: &str = "relay";
         pub const RESERVED: [&str; 2] = [HTTP, RELAY];
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Register {
                 service: String,
@@ -972,7 +991,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Request {
             Relay {
                 note: Vec<u8>,
@@ -1000,19 +1019,19 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Answer {
             Output(Vec<u8>),
             Failed(String),
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Delivery {
             Whole,
             Events { deliver: Vec<u8> },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Event {
             pub id: u64,
             pub seq: u64,
@@ -1027,7 +1046,7 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum StreamEnd {
             Complete {
                 status: u16,
@@ -1038,7 +1057,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct ServiceRow {
             pub name: String,
             pub owner: AccountNumber,
@@ -1046,7 +1065,7 @@ pub mod role {
             pub registered: u64,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct RequestRow {
             pub id: u64,
             pub requester: ProgramId,
@@ -1057,7 +1076,7 @@ pub mod role {
             pub expiry: EntryId,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct NodeRow {
             pub key: Vec<u8>,
             pub services: Vec<String>,
@@ -1083,14 +1102,16 @@ pub mod role {
         }
 
         pub mod http {
-            use crate::{BorshDeserialize, BorshSerialize, Refusal, reason};
+            use crate::{BorshDeserialize, BorshSchema, BorshSerialize, Refusal, reason};
 
             pub const FRAMING: [&str; 4] =
                 ["host", "content-length", "transfer-encoding", "connection"];
 
             pub const NODE_PREFIX: &str = "ducktape-";
 
-            #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+            #[derive(
+                Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+            )]
             pub enum Method {
                 Get,
                 Post,
@@ -1111,7 +1132,9 @@ pub mod role {
                 }
             }
 
-            #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+            #[derive(
+                Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+            )]
             pub struct Head {
                 pub method: Method,
                 pub target: String,
@@ -1201,11 +1224,11 @@ pub mod role {
     }
 
     pub mod scheduler {
-        use crate::{BorshDeserialize, BorshSerialize, ProgramId, Receipt};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Receipt};
 
         pub type EntryId = u64;
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Schedule {
                 height: u64,
@@ -1221,7 +1244,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Entry {
             pub id: EntryId,
             pub scheduler: ProgramId,
@@ -1231,7 +1254,7 @@ pub mod role {
             pub receipt: Option<Receipt>,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Query {
             Due {
                 height: u64,
@@ -1243,7 +1266,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Reply {
             Due {
                 entries: Vec<Entry>,

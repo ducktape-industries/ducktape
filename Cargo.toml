@@ -101,8 +101,9 @@ zeroize = "1"
 # fluent31 — the LSM engine under the state crate's storage.
 fluent31 = { git = "https://github.com/ducktape-industries/fluent31", rev = "76ba1867bc0ba9c09bb8387149c07844f1d2395c", default-features = false }
 # borsh — the record codec: the ABI, the wire records and the workspace files
-# share one byte layout with no map ordering games.
-borsh = { version = "1", default-features = false, features = ["derive", "std"] }
+# share one byte layout with no map ordering games. Its schemas describe a
+# program's ops, queries and replies to a reader with no Rust type for them.
+borsh = { version = "1", default-features = false, features = ["derive", "std", "unstable__schema"] }
 
 # wasmtime — the wasm runtime that executes a network's programs inside the
 # host. pinned EXACTLY: the runtime IS the program execution semantics, so it
