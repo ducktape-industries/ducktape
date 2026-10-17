@@ -4,6 +4,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod program {
+    use abi::role::access::{Need, Resource};
     use abi::role::halo::{Class, Founded, Genesis, Lane, Op, Query as Ask, Reply};
     use abi::{Env, Origin, Refusal, Scan, reason};
     use program::{Execute, Program, Query, Reads};
@@ -123,6 +124,14 @@ mod program {
                 Op::Set { name, cap, enabled } => set(ctx, name, cap, enabled),
                 Op::Close { name } => close(ctx, name),
             }
+        }
+
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {

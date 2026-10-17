@@ -9,9 +9,7 @@ use abi::{Cause, HostOp, HostReply, Message, Origin, Outcome, Principal, Receipt
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Plan};
 use fixture_probe::{Reply, Step};
-use host::{
-    Applied, Block, BlockId, Founding, Genesis, Host, Layer, Limits, Roles, Submission, Tip,
-};
+use host::{Applied, Block, BlockId, Founding, Genesis, Host, Layer, Limits, Submission, Tip};
 
 const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
 const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
@@ -22,6 +20,7 @@ const AWAITER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaiter.wasm"
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 const SCHEDULER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_scheduler.wasm");
 const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
+const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
 
 const SIGNER: &[u8] = b"signer";
 const TIME: u64 = 1_700_000_000;
@@ -29,28 +28,31 @@ const TIME: u64 = 1_700_000_000;
 type Ctx = deterministic::Context;
 
 fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
+    let roles: &[&str] = match program {
+        "programs" => &[role::PROGRAMS],
+        "valset" => &[role::VALIDATORS],
+        "identity" => &[role::IDENTITY],
+        "blobs" => &[role::BLOBS],
+        "awaits" => &[role::AWAITS],
+        "halo" => &[role::HALO],
+        "access" => &[role::ACCESS],
+        _ => &[],
+    };
     Founding {
         program: program.to_owned(),
         code: code.to_vec(),
         params,
+        roles: roles.iter().map(|role| (*role).to_owned()).collect(),
     }
 }
 
 fn genesis(bound: bool) -> Genesis {
-    let mut roles = Roles::from_iter([
-        (role::PROGRAMS, "programs"),
-        (role::VALIDATORS, "valset"),
-        (role::IDENTITY, "identity"),
-        (role::BLOBS, "blobs"),
-        (role::AWAITS, "awaits"),
-        (role::HALO, "halo"),
-    ]);
+    let mut scheduler = founding("scheduler", SCHEDULER, Vec::new());
     if bound {
-        roles.bind(role::SCHEDULER, "scheduler");
+        scheduler.roles.push(role::SCHEDULER.to_owned());
     }
     Genesis {
         network: b"net".to_vec(),
-        roles,
         validators: vec![validators::Member {
             key: b"v1".to_vec(),
             address: Some("v1:1".into()),
@@ -66,7 +68,7 @@ fn genesis(bound: bool) -> Genesis {
             ),
             founding("blobs", BLOBS_PROGRAM, Vec::new()),
             founding("awaits", AWAITS, Vec::new()),
-            founding("scheduler", SCHEDULER, Vec::new()),
+            scheduler,
             founding("awaiter", AWAITER, Vec::new()),
             founding("other", AWAITER, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
@@ -75,6 +77,7 @@ fn genesis(bound: bool) -> Genesis {
                 HALO,
                 abi::encode(&halo::Genesis { lanes: Vec::new() }),
             ),
+            founding("access", ACCESS, Vec::new()),
         ],
         views: Vec::new(),
         hooks: Vec::new(),

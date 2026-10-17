@@ -14,8 +14,7 @@ use fixture_oracle::{Ask, Op, owed_key};
 use fixture_programs::Change;
 use fixture_relay::Script;
 use host::{
-    Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Roles,
-    Submission, Tip,
+    Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Submission, Tip,
 };
 use state::{Commitment, SyncTarget, commitment_name};
 
@@ -25,6 +24,7 @@ const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.was
 const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
 const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
+const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
 const AWAITER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaiter.wasm");
 const ORACLE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_oracle.wasm");
 const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
@@ -40,20 +40,27 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
         program: program.to_owned(),
         code: code.to_vec(),
         params,
+        roles: roles_of(program),
     }
+}
+
+fn roles_of(program: &str) -> Vec<String> {
+    let roles: &[&str] = match program {
+        "programs" => &[role::PROGRAMS],
+        "valset" => &[role::VALIDATORS],
+        "identity" => &[role::IDENTITY],
+        "blobs" => &[role::BLOBS],
+        "awaits" => &[role::AWAITS],
+        "halo" => &[role::HALO],
+        "access" => &[role::ACCESS],
+        _ => &[],
+    };
+    roles.iter().map(|role| (*role).to_owned()).collect()
 }
 
 fn genesis() -> Genesis {
     Genesis {
         network: b"net".to_vec(),
-        roles: Roles::from_iter([
-            (role::PROGRAMS, "programs"),
-            (role::VALIDATORS, "valset"),
-            (role::IDENTITY, "identity"),
-            (role::BLOBS, "blobs"),
-            (role::AWAITS, "awaits"),
-            (role::HALO, "halo"),
-        ]),
         validators: vec![validators::Member {
             key: b"v1".to_vec(),
             address: Some("v1:1".into()),
@@ -82,6 +89,7 @@ fn genesis() -> Genesis {
                 HALO,
                 abi::encode(&halo::Genesis { lanes: Vec::new() }),
             ),
+            founding("access", ACCESS, Vec::new()),
         ],
         views: Vec::new(),
         hooks: Vec::new(),

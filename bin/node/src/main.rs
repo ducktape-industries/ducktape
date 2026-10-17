@@ -446,13 +446,6 @@ enum VoteVerb {
         about = "send the program bound to a role an op, a file or stdin: `programs` schedules or cancels a program change, `halo` opens, sets or closes a lane"
     )]
     Role { role: String, op: Option<PathBuf> },
-    #[command(
-        about = "bind a program to a role, or unbind the role without a program; a role the network binds for its life is refused"
-    )]
-    Bind {
-        role: String,
-        program: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -893,7 +886,6 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
             role,
             op: bytes(op)?,
         },
-        VoteVerb::Bind { role, program } => Motion::Bind { role, program },
     })
 }
 

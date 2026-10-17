@@ -259,6 +259,19 @@ where
                 )
                 .await?,
             ),
+            HostOp::Resource { program, key } => HostReply::Query(
+                resource(
+                    self.world,
+                    self.layers.clone(),
+                    self.stage,
+                    self.stack,
+                    Origin::Program(self.env.me.clone()),
+                    program,
+                    key,
+                    fuel,
+                )
+                .await?,
+            ),
             HostOp::Crypto(op) => crypto::serve(op),
             HostOp::Await { .. } | HostOp::Defer | HostOp::Resume { .. } => {
                 HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not await"))
@@ -269,8 +282,7 @@ where
             | HostOp::Emit(_)
             | HostOp::Event(_)
             | HostOp::Output(_)
-            | HostOp::Respond(_)
-            | HostOp::Bind { .. } => {
+            | HostOp::Respond(_) => {
                 HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not write"))
             }
         };
@@ -340,9 +352,42 @@ pub async fn query<'a, E>(
 where
     E: Context + Spawner,
 {
-    let Some(module) = world.loaded.module(&program) else {
-        return Ok(Err(unknown(&program)));
-    };
+    let call = ProgramCall::Query(request);
+    ask(world, layers, stage, stack, origin, program, call, fuel).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resource<'a, E>(
+    world: World<'a, E>,
+    layers: Vec<&'a Overlay>,
+    stage: &'a Stage,
+    stack: &[ProgramId],
+    origin: Origin,
+    program: ProgramId,
+    key: String,
+    fuel: &mut Option<u64>,
+) -> Result<std::result::Result<Vec<u8>, Refusal>>
+where
+    E: Context + Spawner,
+{
+    let call = ProgramCall::Resource(key);
+    ask(world, layers, stage, stack, origin, program, call, fuel).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ask<'a, E>(
+    world: World<'a, E>,
+    layers: Vec<&'a Overlay>,
+    stage: &'a Stage,
+    stack: &[ProgramId],
+    origin: Origin,
+    program: ProgramId,
+    call: ProgramCall,
+    fuel: &mut Option<u64>,
+) -> Result<std::result::Result<Vec<u8>, Refusal>>
+where
+    E: Context + Spawner,
+{
     let cycles = stack.contains(&program);
     if cycles {
         return Ok(Err(Refusal::new(
@@ -354,7 +399,7 @@ where
         network: world.network.to_vec(),
         height: world.height,
         time: world.time,
-        me: program.clone(),
+        me: program,
         origin,
         // a query acts as no one: it reads, and its origin says who asks
         sender: None,
@@ -362,10 +407,43 @@ where
         cause: Cause::Direct,
     };
     let mut stack = stack.to_vec();
-    stack.push(program);
+    stack.push(env.me.clone());
+    read(world, layers, stage, stack, env, call, fuel).await
+}
+
+pub async fn access<'a, E>(
+    world: World<'a, E>,
+    layers: Vec<&'a Overlay>,
+    stage: &'a Stage,
+    env: Env,
+    payload: Vec<u8>,
+    fuel: &mut Option<u64>,
+) -> Result<std::result::Result<Vec<u8>, Refusal>>
+where
+    E: Context + Spawner,
+{
+    let stack = vec![env.me.clone()];
+    read(world, layers, stage, stack, env, ProgramCall::Access(payload), fuel).await
+}
+
+async fn read<'a, E>(
+    world: World<'a, E>,
+    layers: Vec<&'a Overlay>,
+    stage: &'a Stage,
+    stack: Vec<ProgramId>,
+    env: Env,
+    call: ProgramCall,
+    fuel: &mut Option<u64>,
+) -> Result<std::result::Result<Vec<u8>, Refusal>>
+where
+    E: Context + Spawner,
+{
+    let Some(module) = world.loaded.module(&env.me) else {
+        return Ok(Err(unknown(&env.me)));
+    };
     let invocation = Invocation {
         env: env.clone(),
-        call: ProgramCall::Query(request),
+        call,
     };
     let mut unit = Query {
         world,
@@ -484,43 +562,6 @@ where
         }
     }
 
-    /// The roles table moves on the validators' vote alone: `program` is bound to `role`, or
-    /// the role unbound, in this block's overlay, so the next block's frames carry it. A role in
-    /// `REQUIRED` is fixed; a program bound must be one the network admitted.
-    fn bind(&mut self, role: String, program: Option<ProgramId>) -> Result<HostReply> {
-        let validators = crate::bound(self.world.roles, abi::role::VALIDATORS)?;
-        if self.env.me != *validators {
-            return Ok(HostReply::Refused(Refusal::new(
-                reason::UNAUTHORIZED,
-                "only the validators role binds a role",
-            )));
-        }
-        if abi::role::REQUIRED.contains(&role.as_str()) {
-            return Ok(HostReply::Refused(Refusal::new(
-                reason::INVALID_INPUT,
-                format!("the {role} role is bound for the network's life"),
-            )));
-        }
-        let view = self.world.store.view(vec![&*self.overlay]);
-        if let Some(program) = &program {
-            let admitted = view.get(namespace::PROGRAMS, program.as_bytes())?.is_some();
-            if !admitted {
-                return Ok(HostReply::Refused(unknown(program)));
-            }
-        }
-        let mut roles = crate::roles_of(&view)?;
-        match program {
-            Some(program) => roles.bind(role, program),
-            None => roles.unbind(&role),
-        }
-        self.overlay.set(
-            namespace::NETWORK,
-            namespace::ROLES.to_vec(),
-            abi::encode(&roles),
-        );
-        Ok(HostReply::Done)
-    }
-
     /// Keeps the message for the frame to run once this handler returns.
     fn emit(&mut self, message: Message) -> HostReply {
         let item = ItemRef {
@@ -606,7 +647,6 @@ where
                 Ok(HostReply::Done)
             }
             HostOp::BlobPut { hash, kind, body } => Ok(self.put(hash, &kind, &body)),
-            HostOp::Bind { role, program } => self.bind(role, program),
             HostOp::Emit(message) => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
                 Ok(self.emit(message))

@@ -8,7 +8,7 @@ use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
-use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Roles, Tip};
+use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Tip};
 use keyscheme::KeyScheme;
 use node::{
     BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Preconfirm, Sequenced, Source, Taken,
@@ -21,6 +21,7 @@ const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.was
 const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
 const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
+const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
@@ -47,20 +48,27 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
         program: program.to_owned(),
         code: code.to_vec(),
         params,
+        roles: roles_of(program),
     }
+}
+
+fn roles_of(program: &str) -> Vec<String> {
+    let roles: &[&str] = match program {
+        "programs" => &[role::PROGRAMS],
+        "valset" => &[role::VALIDATORS],
+        "identity" => &[role::IDENTITY],
+        "blobs" => &[role::BLOBS],
+        "awaits" => &[role::AWAITS],
+        "halo" => &[role::HALO],
+        "access" => &[role::ACCESS],
+        _ => &[],
+    };
+    roles.iter().map(|role| (*role).to_owned()).collect()
 }
 
 fn genesis(validators: Vec<validators::Member>) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles::from_iter([
-            (role::PROGRAMS, "programs"),
-            (role::VALIDATORS, "valset"),
-            (role::IDENTITY, "identity"),
-            (role::BLOBS, "blobs"),
-            (role::AWAITS, "awaits"),
-            (role::HALO, "halo"),
-        ]),
         validators,
         programs: vec![
             founding("programs", PROGRAMS, Vec::new()),
@@ -80,6 +88,7 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
                 HALO,
                 abi::encode(&halo::Genesis { lanes: Vec::new() }),
             ),
+            founding("access", ACCESS, Vec::new()),
         ],
         views: Vec::new(),
         hooks: Vec::new(),

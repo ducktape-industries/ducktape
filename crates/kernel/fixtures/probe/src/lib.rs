@@ -17,6 +17,11 @@ pub enum Reply {
 }
 
 pub const HOOK: &[u8] = b"#hook";
+pub const NEEDS: &[u8] = b"#needs";
+
+pub fn resource_key(key: &str) -> Vec<u8> {
+    format!("#resource/{key}").into_bytes()
+}
 
 pub fn seen(height: u64, position: u32) -> Vec<u8> {
     [
@@ -29,10 +34,11 @@ pub fn seen(height: u64, position: u32) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
+    use abi::role::access::{Need, Resource};
     use abi::{Env, Refusal, hook};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{HOOK, Reply, Step, seen};
+    use crate::{HOOK, NEEDS, Reply, Step, resource_key, seen};
 
     struct Probe;
 
@@ -45,6 +51,14 @@ mod program {
             let replies = run(ctx, env, payload)?;
             ctx.output(abi::encode(&replies));
             Ok(())
+        }
+
+        fn access(ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(ctx.record(NEEDS)?.unwrap_or_default())
+        }
+
+        fn resource(ctx: &mut Query, _env: &Env, key: &str) -> Result<Resource, Refusal> {
+            Ok(ctx.record(resource_key(key))?.unwrap_or_default())
         }
 
         fn query(ctx: &mut Query, env: &Env, request: &[u8]) -> Result<(), Refusal> {

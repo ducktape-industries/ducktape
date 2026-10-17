@@ -10,6 +10,7 @@ pub const PROGRAMS_FROM: u64 = 1000;
 
 #[cfg(target_arch = "wasm32")]
 mod program {
+    use abi::role::access::{Need, Resource};
     use abi::{Env, Origin, Refusal, reason, role::identity};
     use program::{Execute, Program, Query, Reads};
 
@@ -48,6 +49,14 @@ mod program {
             let (key, account): (Vec<u8>, identity::AccountNumber) = abi::decode(payload)?;
             ctx.set(key, abi::encode(&account));
             Ok(())
+        }
+
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {

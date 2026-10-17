@@ -102,8 +102,6 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
     }
 }
 
-/// The egress role as the worker last read it: a vote binds, rebinds or unbinds it, and the
-/// worker says so once per move, never once per block.
 enum Bound {
     Unread,
     Unbound,

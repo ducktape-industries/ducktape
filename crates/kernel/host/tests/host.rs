@@ -34,10 +34,11 @@ const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.w
 const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
 const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
+const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
 
 const SIGNER: &[u8] = b"signer";
 /// Fuel that runs one relay handler and a message of it, not a chain of eight.
-const FRAME_FUEL: u64 = 100_000;
+const FRAME_FUEL: u64 = 150_000;
 const EPOCH_LENGTH: u64 = 4;
 const TIME: u64 = 1_700_000_000;
 
@@ -56,7 +57,13 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
         program: program.to_owned(),
         code: code.to_vec(),
         params,
+        roles: Vec::new(),
     }
+}
+
+fn filling(role: &str, mut founding: Founding) -> Founding {
+    founding.roles.push(role.to_owned());
+    founding
 }
 
 /// The account [`SIGNER`] holds.
@@ -70,10 +77,11 @@ fn roles() -> Roles {
         (role::BLOBS, "blobs"),
         (role::AWAITS, "awaits"),
         (role::HALO, "halo"),
+        (role::ACCESS, "access"),
     ])
 }
 
-const PING: u64 = fixture_identity::PROGRAMS_FROM + 4;
+const PING: u64 = fixture_identity::PROGRAMS_FROM + 5;
 
 /// The lanes the halo role is founded with: `first` pinned, `second` not.
 fn lanes() -> Vec<u8> {
@@ -94,25 +102,28 @@ fn lanes() -> Vec<u8> {
 /// [`ACCOUNT`]), then `programs`.
 fn genesis(programs: Vec<Founding>) -> Genesis {
     let bound = vec![
-        founding("programs", PROGRAMS, Vec::new()),
-        founding("valset", VALSET, Vec::new()),
-        founding(
-            "identity",
-            IDENTITY,
-            abi::encode(&vec![(SIGNER.to_vec(), ACCOUNT)]),
+        filling(role::PROGRAMS, founding("programs", PROGRAMS, Vec::new())),
+        filling(role::VALIDATORS, founding("valset", VALSET, Vec::new())),
+        filling(
+            role::IDENTITY,
+            founding(
+                "identity",
+                IDENTITY,
+                abi::encode(&vec![(SIGNER.to_vec(), ACCOUNT)]),
+            ),
         ),
-        founding("blobs", BLOBS_PROGRAM, Vec::new()),
+        filling(role::BLOBS, founding("blobs", BLOBS_PROGRAM, Vec::new())),
     ];
     Genesis {
         network: b"net".to_vec(),
-        roles: roles(),
         validators: vec![member(b"v1", "v1:1")],
         programs: bound
             .into_iter()
             .chain(programs)
             .chain([
-                founding("awaits", AWAITS, Vec::new()),
-                founding("halo", HALO, lanes()),
+                filling(role::AWAITS, founding("awaits", AWAITS, Vec::new())),
+                filling(role::HALO, founding("halo", HALO, lanes())),
+                filling(role::ACCESS, founding("access", ACCESS, Vec::new())),
             ])
             .collect(),
         views: Vec::new(),
@@ -353,6 +364,14 @@ fn change(program: &str, code: BlobId, params: Vec<u8>) -> Vec<u8> {
     }))
 }
 
+fn fill(role: &str, program: Option<&str>) -> Submission {
+    let change = Change::Fill {
+        role: role.to_owned(),
+        program: program.map(str::to_owned),
+    };
+    submit("programs", abi::encode(&change))
+}
+
 #[test]
 fn founding_admits_every_program_and_the_host_reopens() {
     deterministic::Runner::default().start(|context| async move {
@@ -379,13 +398,13 @@ fn founding_admits_every_program_and_the_host_reopens() {
             .map(|r| r.program.as_str())
             .collect();
         let founded = [
-            "programs", "valset", "identity", "blobs", "ping", "pong", "probe",
+            "programs", "valset", "identity", "blobs", "access", "ping", "pong", "probe",
         ];
         // the roles' admissions and accounts, then each other program's
         // account before its admission
-        assert_eq!(admitted[..4], founded[..4]);
-        assert_eq!(admitted[4..8], ["identity"; 4]);
-        for (pair, program) in admitted[8..].chunks(2).zip(&founded[4..]) {
+        assert_eq!(admitted[..5], founded[..5]);
+        assert_eq!(admitted[5..10], ["identity"; 5]);
+        for (pair, program) in admitted[10..].chunks(2).zip(&founded[5..]) {
             assert_eq!(pair, ["identity", *program]);
         }
         for (at, program) in founded.into_iter().enumerate() {
@@ -403,8 +422,8 @@ fn founding_admits_every_program_and_the_host_reopens() {
         assert_eq!(
             ids,
             [
-                "awaits", "blobs", "halo", "identity", "ping", "pong", "probe", "programs",
-                "valset"
+                "access", "awaits", "blobs", "halo", "identity", "ping", "pong", "probe",
+                "programs", "valset"
             ]
         );
         assert_eq!(programs["ping"], programs["pong"]);
@@ -460,58 +479,46 @@ fn founding_admits_every_program_and_the_host_reopens() {
 }
 
 #[test]
-fn founding_refuses_an_unbound_role() {
+fn founding_refuses_a_role_two_programs_fill() {
     deterministic::Runner::default().start(|context| async move {
-        for (name, bound, program) in [
-            ("identity_empty", role::IDENTITY, ""),
-            ("identity_unfounded", role::IDENTITY, "nobody"),
-            ("halo_empty", role::HALO, ""),
-            ("halo_unfounded", role::HALO, "nobody"),
-        ] {
+        for twice in [role::IDENTITY, role::ACCESS, role::EGRESS] {
             let dir = tempfile::tempdir().unwrap();
-            let mut unbound = standard();
-            unbound.roles.bind(bound, program);
-            let Err(Error::Unbound {
-                role,
-                program: named,
-            }) = Host::found(context.child(name), name, dir.path(), block_id(0), unbound).await
+            let mut doubled = standard();
+            doubled
+                .programs
+                .push(filling(twice, founding("twin", PROBE, script(Vec::new()))));
+            doubled
+                .programs
+                .push(filling(role::EGRESS, founding("other", RELAY, Vec::new())));
+            let Err(Error::Roles(refusal)) = Host::found(
+                context.child(twice),
+                twice,
+                dir.path(),
+                block_id(0),
+                doubled,
+            )
+            .await
             else {
-                panic!("a genesis with {bound} bound to {program:?} was founded");
+                panic!("a genesis with {twice} filled twice was founded");
             };
-            assert_eq!((role.as_str(), named.as_str()), (bound, program));
-            assert!(!dir.path().join("state").exists(), "{name} wrote state");
-            assert!(!dir.path().join("blobs").exists(), "{name} wrote blobs");
+            assert_eq!(refusal.reason, reason::INVALID_INPUT);
+            assert!(refusal.sentence.contains(twice), "{refusal:?}");
+            assert!(!dir.path().join("state").exists(), "{twice} wrote state");
+            assert!(!dir.path().join("blobs").exists(), "{twice} wrote blobs");
         }
-        let dir = tempfile::tempdir().unwrap();
-        let mut unfounded = standard();
-        unfounded.roles.bind(role::EGRESS, "nobody");
-        let Err(Error::Unbound { role, program }) = Host::found(
-            context.child("egress"),
-            "egress",
-            dir.path(),
-            block_id(0),
-            unfounded,
-        )
-        .await
-        else {
-            panic!("a genesis with egress bound to an unfounded program was founded");
-        };
-        assert_eq!((role.as_str(), program.as_str()), (role::EGRESS, "nobody"));
     });
 }
 
 #[test]
-fn founding_refuses_a_role_table_without_a_kernel_role() {
+fn founding_refuses_a_roster_that_leaves_a_kernel_role_unfilled() {
     deterministic::Runner::default().start(|context| async move {
         for lacking in role::REQUIRED {
             let dir = tempfile::tempdir().unwrap();
             let mut short = standard();
-            short.roles = roles()
-                .iter()
-                .filter(|(role, _)| role != lacking)
-                .map(|(role, program)| (role, program.clone()))
-                .collect();
-            let Err(Error::Unfilled { role }) = Host::found(
+            for founding in &mut short.programs {
+                founding.roles.retain(|role| role != lacking);
+            }
+            let Err(Error::Roles(refusal)) = Host::found(
                 context.child(lacking),
                 lacking,
                 dir.path(),
@@ -522,7 +529,8 @@ fn founding_refuses_a_role_table_without_a_kernel_role() {
             else {
                 panic!("a genesis with no {lacking} role was founded");
             };
-            assert_eq!(role.as_str(), *lacking);
+            assert_eq!(refusal.reason, reason::INVALID_INPUT);
+            assert!(refusal.sentence.contains(lacking), "{refusal:?}");
             assert!(!dir.path().join("state").exists(), "{lacking} wrote state");
         }
     });
@@ -533,11 +541,19 @@ fn founding_keeps_a_role_row_the_kernel_never_calls() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut extra = standard();
-        extra.roles.bind("later", "probe");
-        let expected = extra.roles.clone();
+        for founding in &mut extra.programs {
+            if founding.program == "probe" {
+                founding.roles.push("later".into());
+            }
+        }
         let (host, _) = Host::found(context, "later", dir.path(), block_id(0), extra)
             .await
             .unwrap();
+        let expected: Roles = roles()
+            .iter()
+            .map(|(role, program)| (role, program.clone()))
+            .chain([("later", "probe".to_owned())])
+            .collect();
         assert_eq!(host.roles(), &expected);
         assert_eq!(host.role("later").unwrap(), "probe");
     });
@@ -647,71 +663,108 @@ fn a_role_motion_runs_its_op_on_the_program_bound_to_the_role() {
 }
 
 #[test]
-fn a_bind_motion_moves_the_roles_table_at_its_height_and_never_a_required_role() {
+fn the_roster_moves_a_role_at_its_height_and_refuses_a_table_it_cannot_run() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
-        let bind = |role: &str, program: Option<&str>| validators::Motion::Bind {
-            role: role.into(),
-            program: program.map(str::to_owned),
-        };
+        let relay = host.programs().unwrap()["ping"];
         let bound = |host: &Host<Ctx>, role: &str| host.roles().get(role).cloned();
+        let set = |program: &str| submit("programs", change(program, relay, Vec::new()));
 
-        output(&vote(&mut host, 1, bind(role::EGRESS, Some("ping"))).await);
-        assert_eq!(bound(&host, role::EGRESS).as_deref(), Some("ping"));
-        output(&vote(&mut host, 2, bind(role::SCHEDULER, Some("pong"))).await);
+        host.apply(block(
+            1,
+            vec![set("echo"), fill(role::EGRESS, Some("echo"))],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            bound(&host, role::EGRESS),
+            None,
+            "a role moves at its height"
+        );
+        host.apply(block(2, Vec::new())).await.unwrap();
+        assert_eq!(bound(&host, role::EGRESS).as_deref(), Some("echo"));
+
+        host.apply(block(
+            3,
+            vec![
+                fill(role::EGRESS, Some("pong")),
+                fill(role::SCHEDULER, Some("pong")),
+            ],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(4, Vec::new())).await.unwrap();
+        assert_eq!(bound(&host, role::EGRESS).as_deref(), Some("pong"));
         assert_eq!(bound(&host, role::SCHEDULER).as_deref(), Some("pong"));
-        output(&vote(&mut host, 3, bind(role::EGRESS, None)).await);
-        assert_eq!(bound(&host, role::EGRESS), None);
+        let moved = host.roles().clone();
 
-        let fixed = vote(&mut host, 4, bind(role::HALO, None)).await;
-        assert_eq!(rejected(&fixed).reason, reason::INVALID_INPUT);
-        let fixed = vote(&mut host, 5, bind(role::PROGRAMS, Some("ping"))).await;
-        assert_eq!(rejected(&fixed).reason, reason::INVALID_INPUT);
-        let unknown = vote(&mut host, 6, bind(role::EGRESS, Some("nobody"))).await;
-        assert_eq!(rejected(&unknown).reason, reason::UNKNOWN_PROGRAM);
-        let reserved = vote(&mut host, 7, bind(role::EGRESS, Some(NETWORK))).await;
-        assert_eq!(rejected(&reserved).reason, reason::UNKNOWN_PROGRAM);
-        assert_eq!(bound(&host, role::PROGRAMS).as_deref(), Some("programs"));
-        assert_eq!(bound(&host, role::HALO).as_deref(), Some("halo"));
-        assert_eq!(bound(&host, role::EGRESS), None);
+        host.apply(block(5, vec![set("fresh"), fill(role::HALO, None)]))
+            .await
+            .unwrap();
+        host.apply(block(6, Vec::new())).await.unwrap();
+        assert_eq!(host.roles(), &moved, "a table without halo moves nothing");
+        assert!(
+            !host.programs().unwrap().contains_key("fresh"),
+            "a refused roster lands no entry"
+        );
+        host.apply(block(7, vec![fill(role::HALO, Some("halo"))]))
+            .await
+            .unwrap();
+        host.apply(block(8, Vec::new())).await.unwrap();
+        assert!(host.programs().unwrap().contains_key("fresh"));
 
-        let table = host.roles().clone();
+        host.apply(block(9, vec![fill("ledger", Some("nobody"))]))
+            .await
+            .unwrap();
+        host.apply(block(10, vec![set("later")])).await.unwrap();
+        host.apply(block(11, Vec::new())).await.unwrap();
+        assert_eq!(
+            host.roles(),
+            &moved,
+            "a role naming no roster program moves nothing"
+        );
+        assert!(!host.programs().unwrap().contains_key("later"));
+        host.apply(block(12, vec![fill("ledger", None)]))
+            .await
+            .unwrap();
+        host.apply(block(13, Vec::new())).await.unwrap();
+        assert!(host.programs().unwrap().contains_key("later"));
+        assert_eq!(host.roles(), &moved);
+
         drop(host);
         let reopened = Host::open(context.child("reopen"), "net", dir.path())
             .await
             .unwrap();
-        assert_eq!(reopened.roles(), &table);
+        assert_eq!(reopened.roles(), &moved);
     });
 }
 
 #[test]
-fn dropping_a_program_unbinds_every_role_it_filled_in_the_same_block() {
+fn dropping_a_program_drops_every_role_it_filled_in_the_same_block() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
         let relay = host.programs().unwrap()["ping"];
         host.apply(block(
             1,
-            vec![submit("programs", change("echo", relay, Vec::new()))],
+            vec![
+                submit("programs", change("echo", relay, Vec::new())),
+                fill(role::SCHEDULER, Some("echo")),
+                fill(role::EGRESS, Some("echo")),
+                fill("ledger", Some("pong")),
+            ],
         ))
         .await
         .unwrap();
         host.apply(block(2, Vec::new())).await.unwrap();
-        let bind = |role: &str, program: &str| validators::Motion::Bind {
-            role: role.into(),
-            program: Some(program.into()),
-        };
-        output(&vote(&mut host, 3, bind(role::SCHEDULER, "echo")).await);
-        output(&vote(&mut host, 4, bind(role::EGRESS, "echo")).await);
-        output(&vote(&mut host, 5, bind("ledger", "pong")).await);
         assert_eq!(
             host.roles().get(role::SCHEDULER).map(String::as_str),
             Some("echo")
         );
 
         host.apply(block(
-            6,
+            3,
             vec![submit(
                 "programs",
                 abi::encode(&Change::Remove("echo".into())),
@@ -719,7 +772,7 @@ fn dropping_a_program_unbinds_every_role_it_filled_in_the_same_block() {
         ))
         .await
         .unwrap();
-        let applied = host.apply(block(7, Vec::new())).await.unwrap();
+        let applied = host.apply(block(4, Vec::new())).await.unwrap();
         assert!(!host.programs().unwrap().contains_key("echo"));
         let table_written = applied
             .writes
@@ -733,14 +786,11 @@ fn dropping_a_program_unbinds_every_role_it_filled_in_the_same_block() {
         assert_eq!(host.roles().get(role::SCHEDULER), None);
         assert_eq!(host.roles().get(role::EGRESS), None);
         assert_eq!(host.roles().get("ledger").map(String::as_str), Some("pong"));
-        assert_eq!(
-            host.roles().get(role::HALO).map(String::as_str),
-            Some("halo")
-        );
         let names: Vec<&str> = host.roles().iter().map(|(role, _)| role).collect();
         assert_eq!(
             names,
             [
+                "access",
                 "awaits",
                 "blobs",
                 "halo",
@@ -1973,8 +2023,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
                 receipt("echo", ok(b""), vec![]),
             ]
         );
-        let tenth = fixture_identity::PROGRAMS_FROM + 9;
-        assert_eq!(account_of(&host, "echo").await, Some(tenth));
+        let eleventh = fixture_identity::PROGRAMS_FROM + 10;
+        assert_eq!(account_of(&host, "echo").await, Some(eleventh));
         assert_eq!(host.programs().unwrap()["echo"], relay);
         let applied = host
             .apply(block(
@@ -2088,8 +2138,8 @@ fn the_roster_admits_swaps_and_drops_programs() {
         assert_eq!(
             ids,
             [
-                "awaits", "blobs", "halo", "identity", "ping", "pong", "probe", "programs",
-                "valset"
+                "access", "awaits", "blobs", "halo", "identity", "ping", "pong", "probe",
+                "programs", "valset"
             ]
         );
         // retried: registered and refused again
@@ -2515,7 +2565,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
             let id: BlobId = abi::decode(&entry.key).unwrap();
             framed.insert(id, upstream.blob(&id, TIME).await.unwrap().unwrap());
         }
-        assert_eq!(framed.len(), 9);
+        assert_eq!(framed.len(), 10);
         let targets: BTreeMap<String, SyncTarget> = upstream
             .store()
             .programs()

@@ -20,7 +20,7 @@ use consensus::{
 use fixture_probe::Step;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
-use host::{Founding, Genesis, Layer, Limits, Roles, Tip};
+use host::{Founding, Genesis, Layer, Limits, Tip};
 use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source};
 
 mod epochs;
@@ -32,6 +32,7 @@ const IDENTITY: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_identity.
 const BLOBS: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_awaits.wasm");
 const HALO: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_halo.wasm");
+const ACCESS: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_access.wasm");
 const PROBE: &[u8] = include_bytes!("../../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"cluster";
@@ -90,58 +91,78 @@ fn enroll(key: &ed25519::PrivateKey) -> Vec<u8> {
     valset(key, &enroll)
 }
 
+fn roles_of(program: &str) -> Vec<String> {
+    let roles: &[&str] = match program {
+        "programs" => &[role::PROGRAMS],
+        "valset" => &[role::VALIDATORS],
+        "identity" => &[role::IDENTITY],
+        "blobs" => &[role::BLOBS],
+        "awaits" => &[role::AWAITS],
+        "halo" => &[role::HALO],
+        "access" => &[role::ACCESS],
+        _ => &[],
+    };
+    roles.iter().map(|role| (*role).to_owned()).collect()
+}
+
 fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
     Genesis {
         network: NETWORK.to_vec(),
-        roles: Roles::from_iter([
-            (role::PROGRAMS, "programs"),
-            (role::VALIDATORS, "valset"),
-            (role::IDENTITY, "identity"),
-            (role::BLOBS, "blobs"),
-            (role::AWAITS, "awaits"),
-            (role::HALO, "halo"),
-        ]),
         validators: members.to_vec(),
         programs: vec![
             Founding {
                 program: "programs".into(),
+                roles: roles_of("programs"),
                 code: PROGRAMS.to_vec(),
                 params: Vec::new(),
             },
             Founding {
                 program: "valset".into(),
+                roles: roles_of("valset"),
                 code: VALSET.to_vec(),
                 params: Vec::new(),
             },
             Founding {
                 program: "identity".into(),
+                roles: roles_of("identity"),
                 code: IDENTITY.to_vec(),
                 params: abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
             },
             Founding {
                 program: "blobs".into(),
+                roles: roles_of("blobs"),
                 code: BLOBS.to_vec(),
                 params: Vec::new(),
             },
             Founding {
                 program: "ping".into(),
+                roles: roles_of("ping"),
                 code: RELAY.to_vec(),
                 params: Vec::new(),
             },
             Founding {
                 program: "probe".into(),
+                roles: roles_of("probe"),
                 code: PROBE.to_vec(),
                 params: abi::encode(&Vec::<Step>::new()),
             },
             Founding {
                 program: "awaits".into(),
+                roles: roles_of("awaits"),
                 code: AWAITS.to_vec(),
                 params: Vec::new(),
             },
             Founding {
                 program: "halo".into(),
+                roles: roles_of("halo"),
                 code: HALO.to_vec(),
                 params: abi::encode(&halo::Genesis { lanes: Vec::new() }),
+            },
+            Founding {
+                program: "access".into(),
+                roles: roles_of("access"),
+                code: ACCESS.to_vec(),
+                params: Vec::new(),
             },
         ],
         views: Vec::new(),
