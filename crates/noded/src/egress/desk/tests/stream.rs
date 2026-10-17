@@ -101,12 +101,21 @@ fn call(row: &RequestRow) -> mpsc::UnboundedReceiver<Called> {
     calls
 }
 
+fn events_op(id: u64, events: &[(u64, &str)]) -> Op {
+    Op::Events(
+        events
+            .iter()
+            .map(|(seq, data)| Event {
+                id,
+                seq: *seq,
+                data: data.as_bytes().to_vec(),
+            })
+            .collect(),
+    )
+}
+
 fn event(id: u64, seq: u64, data: &str) -> Op {
-    Op::Event(Event {
-        id,
-        seq,
-        data: data.as_bytes().to_vec(),
-    })
+    events_op(id, &[(seq, data)])
 }
 
 fn whole(called: Called) -> Response {
@@ -117,7 +126,7 @@ fn whole(called: Called) -> Response {
 }
 
 #[tokio::test]
-async fn a_stream_goes_out_one_event_frame_at_a_time_in_order_and_ends_with_its_count() {
+async fn a_stream_goes_out_one_frame_at_a_time_in_order_and_ends_with_its_count() {
     let (base, chunks) = service().await;
     let row = get_row(1, &base, "/stream", events());
     let mut desk = served();
@@ -261,9 +270,14 @@ fn an_event_too_large_for_a_block_cuts_the_stream_and_later_events_are_dropped()
     desk.called(5, Called::Event(vec![b'x'; 8]));
     desk.called(5, Called::Event(b"data: 2\n".to_vec()));
     desk.sent(&purpose, Sent::Carried);
-    let capacity = Refusal::new(reason::CAPACITY, "too large");
+    let capacity = || Sent::Refused(Refusal::new(reason::CAPACITY, "too large"));
     assert_eq!(
-        desk.sent(&purpose, Sent::Refused(capacity)),
+        desk.sent(&purpose, capacity()),
+        Some(Step::Send(purpose.clone()))
+    );
+    assert_eq!(desk.op(&purpose), Some(event(5, 1, "xxxxxxxx")));
+    assert_eq!(
+        desk.sent(&purpose, capacity()),
         Some(Step::Send(purpose.clone()))
     );
     let too_large = StreamEnd::Cut {
@@ -283,4 +297,85 @@ fn an_event_too_large_for_a_block_cuts_the_stream_and_later_events_are_dropped()
     assert_eq!(desk.called(5, Called::End(complete)), None);
     assert_eq!(desk.sent(&purpose, Sent::Carried), None);
     assert_eq!(desk.op(&purpose), None);
+}
+
+#[test]
+fn every_event_read_while_a_frame_waits_goes_out_together_in_the_next_frame() {
+    let mut desk = served();
+    desk.read(reading(&[6], &["relay"], true));
+    let purpose = Purpose::Request(6);
+    let first = desk.called(6, Called::Event(b"data: 0\n".to_vec()));
+    assert_eq!(first, Some(Step::Send(purpose.clone())));
+    desk.sent(&purpose, Sent::Pending(b"frame 0".to_vec()));
+    for n in 1..=3 {
+        let data = format!("data: {n}\n").into_bytes();
+        assert_eq!(desk.called(6, Called::Event(data)), None);
+    }
+    assert_eq!(desk.op(&purpose), Some(event(6, 0, "data: 0\n")));
+    assert_eq!(
+        desk.sent(&purpose, Sent::Carried),
+        Some(Step::Send(purpose.clone()))
+    );
+    let together = events_op(6, &[(1, "data: 1\n"), (2, "data: 2\n"), (3, "data: 3\n")]);
+    assert_eq!(desk.op(&purpose), Some(together));
+    desk.sent(&purpose, Sent::Pending(b"frame 1".to_vec()));
+    let complete = StreamEnd::Complete {
+        status: 200,
+        headers: Vec::new(),
+    };
+    assert_eq!(desk.called(6, Called::End(complete.clone())), None);
+    assert_eq!(
+        desk.sent(&purpose, Sent::Carried),
+        Some(Step::Send(purpose.clone()))
+    );
+    let closing = Op::EndStream {
+        id: 6,
+        events: 4,
+        end: complete,
+    };
+    assert_eq!(desk.op(&purpose), Some(closing));
+}
+
+#[test]
+fn a_stale_frame_is_signed_again_with_the_events_read_since() {
+    let mut desk = served();
+    desk.read(reading(&[7], &["relay"], true));
+    let purpose = Purpose::Request(7);
+    desk.called(7, Called::Event(b"data: 0\n".to_vec()));
+    desk.sent(&purpose, Sent::Pending(b"frame 0".to_vec()));
+    desk.called(7, Called::Event(b"data: 1\n".to_vec()));
+    assert_eq!(desk.sent(&purpose, Sent::Stale), None);
+    assert_eq!(desk.frame(&purpose), None);
+    let both = events_op(7, &[(0, "data: 0\n"), (1, "data: 1\n")]);
+    assert_eq!(desk.op(&purpose), Some(both));
+    assert_eq!(
+        desk.read(reading(&[7], &["relay"], true)),
+        [Step::Send(purpose)]
+    );
+}
+
+#[test]
+fn events_too_large_for_one_block_together_go_out_in_halves_in_order() {
+    let mut desk = served();
+    desk.read(reading(&[8], &["relay"], true));
+    let purpose = Purpose::Request(8);
+    desk.called(8, Called::Event(b"data: 0\n".to_vec()));
+    desk.sent(&purpose, Sent::Pending(b"frame 0".to_vec()));
+    for n in 1..=4 {
+        desk.called(8, Called::Event(format!("data: {n}\n").into_bytes()));
+    }
+    desk.sent(&purpose, Sent::Carried);
+    let capacity = || Sent::Refused(Refusal::new(reason::CAPACITY, "too large"));
+    assert_eq!(
+        desk.sent(&purpose, capacity()),
+        Some(Step::Send(purpose.clone()))
+    );
+    let front = events_op(8, &[(1, "data: 1\n"), (2, "data: 2\n")]);
+    assert_eq!(desk.op(&purpose), Some(front));
+    assert_eq!(
+        desk.sent(&purpose, Sent::Carried),
+        Some(Step::Send(purpose.clone()))
+    );
+    let back = events_op(8, &[(3, "data: 3\n"), (4, "data: 4\n")]);
+    assert_eq!(desk.op(&purpose), Some(back));
 }
