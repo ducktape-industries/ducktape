@@ -14,7 +14,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::context::{Execute, Query, host};
 use crate::{
-    Env, HostOp, HostReply, Invocation, ProgramCall, ProgramId, ProgramReply, Refusal, reason,
+    Env, HostOp, HostReply, Invocation, Need, ProgramCall, ProgramId, ProgramReply, Refusal,
+    Resource, reason,
 };
 
 #[link(wasm_import_module = "ducktape")]
@@ -24,6 +25,10 @@ unsafe extern "C" {
 
 pub trait AwaitingProgram: 'static {
     fn execute(ctx: Ctx, payload: Vec<u8>) -> impl Future<Output = ProgramReply> + 'static;
+
+    fn access(ctx: &mut Query, env: &Env, payload: &[u8]) -> Result<Vec<Need>, Refusal>;
+
+    fn resource(ctx: &mut Query, env: &Env, key: &str) -> Result<Resource, Refusal>;
 
     fn query(_ctx: &mut Query, _env: &Env, _request: &[u8]) -> ProgramReply {
         Err(Refusal::new(
@@ -200,6 +205,18 @@ fn run<P: AwaitingProgram>(invocation: Invocation) -> ProgramReply {
             poll(root)
         }
         ProgramCall::Query(request) => P::query(&mut Query::new(), &env, &request),
+        ProgramCall::Access(payload) => {
+            let mut ctx = Query::new();
+            let needs = P::access(&mut ctx, &env, &payload)?;
+            ctx.reply(&needs);
+            Ok(())
+        }
+        ProgramCall::Resource(key) => {
+            let mut ctx = Query::new();
+            let resource = P::resource(&mut ctx, &env, &key)?;
+            ctx.reply(&resource);
+            Ok(())
+        }
         ProgramCall::Init(_) => Ok(()),
         ProgramCall::Hook(_) => Err(Refusal::new(
             reason::UNSUPPORTED,

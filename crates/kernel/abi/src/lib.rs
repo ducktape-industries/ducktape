@@ -103,12 +103,6 @@ pub enum Principal {
     System,
 }
 
-/// Each role's program, by the role's name: bound at founding, and a role
-/// outside `role::REQUIRED` moves on the validators' vote (`Motion::Bind`)
-/// to any admitted program, or goes. The kernel calls some rows; others
-/// (egress, halo, scheduler, any name a program looks up) it never does.
-/// Every frame's env carries the table, so a program asks a role by its
-/// binding, never by a name it assumes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Roles(BTreeMap<String, ProgramId>);
 
@@ -126,12 +120,32 @@ impl Roles {
         })
     }
 
-    pub fn bind(&mut self, role: impl Into<String>, program: impl Into<ProgramId>) {
-        self.0.insert(role.into(), program.into());
+    pub fn declared<'d>(
+        declarations: impl IntoIterator<Item = (&'d str, &'d str)>,
+    ) -> Result<Roles, Refusal> {
+        let mut roles = Roles::default();
+        for (role, program) in declarations {
+            let Some(first) = roles.0.insert(role.to_owned(), program.to_owned()) else {
+                continue;
+            };
+            return Err(Refusal::new(
+                reason::INVALID_INPUT,
+                format!(
+                    "the {role} role names both {first} and {program}: a role names one program"
+                ),
+            ));
+        }
+        Ok(roles)
     }
 
-    pub fn unbind(&mut self, role: &str) {
-        self.0.remove(role);
+    pub fn filled(&self) -> Result<(), Refusal> {
+        match self.unfilled() {
+            Some(role) => Err(Refusal::new(
+                reason::INVALID_INPUT,
+                format!("no program fills the {role} role, which a network always fills"),
+            )),
+            None => Ok(()),
+        }
     }
 
     pub fn unfilled(&self) -> Option<&'static str> {
@@ -405,12 +419,9 @@ pub enum HostOp {
         ticket: role::awaits::Ticket,
         answer: role::awaits::Answer,
     },
-    /// Bind `program` to `role` in the network's roles table, or unbind the
-    /// role when `program` is `None`: the validators role's alone, and never
-    /// a role in `role::REQUIRED`.
-    Bind {
-        role: String,
-        program: Option<ProgramId>,
+    Resource {
+        program: ProgramId,
+        key: String,
     },
 }
 
@@ -446,6 +457,8 @@ pub enum ProgramCall {
         ticket: role::awaits::Ticket,
         answer: role::awaits::Answer,
     },
+    Access(Vec<u8>),
+    Resource(String),
 }
 
 pub mod hook {
@@ -473,15 +486,12 @@ pub mod role {
     pub const EGRESS: &str = "egress";
     pub const SCHEDULER: &str = "scheduler";
     pub const HALO: &str = "halo";
-    /// The roles a network binds for its life: the kernel calls the first
-    /// five, and every node reads halo's lane table to serve its lanes, so
-    /// no network founds without them. The others may be bound, rebound or
-    /// unbound by the validators' vote.
-    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO];
+    pub const ACCESS: &str = "access";
+    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO, ACCESS];
 
     /// Which code runs at a height.
     pub mod programs {
-        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
+        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Roles};
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Entry {
@@ -503,6 +513,7 @@ pub mod role {
         #[repr(u8)]
         pub enum Query {
             At(u64) = 0,
+            Roles = 4,
             Hooks(u64) = 5,
         }
 
@@ -511,6 +522,7 @@ pub mod role {
         #[repr(u8)]
         pub enum Reply {
             Programs(Vec<Entry>) = 0,
+            Roles(Roles) = 4,
             Hooks(Vec<ProgramId>) = 5,
         }
 
@@ -519,6 +531,7 @@ pub mod role {
             pub programs: Vec<Entry>,
             pub views: Vec<View>,
             pub hooks: Vec<ProgramId>,
+            pub roles: Roles,
         }
     }
 
@@ -591,13 +604,6 @@ pub mod role {
             Role {
                 role: String,
                 op: Vec<u8>,
-            },
-            /// The validators' vote on the roles table: bind `program` to
-            /// `role`, or unbind the role when `program` is `None`. A role in
-            /// `REQUIRED` is refused: its program is fixed.
-            Bind {
-                role: String,
-                program: Option<crate::ProgramId>,
             },
         }
 
@@ -1275,6 +1281,197 @@ pub mod role {
             Entry(Option<Entry>),
         }
     }
+
+    pub mod access {
+        use crate::role::identity::AccountNumber;
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
+
+        #[derive(
+            Clone,
+            Debug,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            BorshSerialize,
+            BorshDeserialize,
+            BorshSchema,
+        )]
+        pub enum Party {
+            Account(AccountNumber),
+            Program(ProgramId),
+        }
+
+        impl Party {
+            pub fn account(&self) -> Option<AccountNumber> {
+                match self {
+                    Party::Account(number) => Some(*number),
+                    Party::Program(_) => None,
+                }
+            }
+
+            pub fn program(&self) -> Option<&ProgramId> {
+                match self {
+                    Party::Account(_) => None,
+                    Party::Program(program) => Some(program),
+                }
+            }
+        }
+
+        #[derive(
+            Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        pub enum Ownership {
+            #[default]
+            Owner,
+            Listed(Vec<Party>),
+            Anyone,
+        }
+
+        impl Ownership {
+            pub fn allows(&self, owner: Option<&Party>, actor: &[Party]) -> bool {
+                let owns = owner.is_some_and(|owner| actor.contains(owner));
+                match self {
+                    Ownership::Owner => owns,
+                    Ownership::Listed(listed) => {
+                        owns || listed.iter().any(|party| actor.contains(party))
+                    }
+                    Ownership::Anyone => true,
+                }
+            }
+
+            pub fn settled(self, owner: Option<&Party>) -> Ownership {
+                let Ownership::Listed(mut listed) = self else {
+                    return self;
+                };
+                listed.sort_unstable();
+                listed.dedup();
+                listed.retain(|party| Some(party) != owner);
+                match listed.is_empty() {
+                    true => Ownership::Owner,
+                    false => Ownership::Listed(listed),
+                }
+            }
+
+            pub fn listed(&self) -> &[Party] {
+                match self {
+                    Ownership::Listed(listed) => listed,
+                    Ownership::Owner | Ownership::Anyone => &[],
+                }
+            }
+
+            pub fn accounts(&self) -> impl Iterator<Item = AccountNumber> + '_ {
+                self.listed().iter().filter_map(Party::account)
+            }
+
+            pub fn programs(&self) -> impl Iterator<Item = &ProgramId> {
+                self.listed().iter().filter_map(Party::program)
+            }
+        }
+
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        pub enum Action {
+            Write,
+            Delete,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Need {
+            pub key: String,
+            pub action: Action,
+        }
+
+        impl Need {
+            pub fn write(key: impl Into<String>) -> Need {
+                Need {
+                    key: key.into(),
+                    action: Action::Write,
+                }
+            }
+
+            pub fn delete(key: impl Into<String>) -> Need {
+                Need {
+                    key: key.into(),
+                    action: Action::Delete,
+                }
+            }
+        }
+
+        #[derive(
+            Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        pub struct Resource {
+            pub owner: Option<Party>,
+            pub default: Option<Ownership>,
+        }
+
+        impl Resource {
+            pub fn owned(owner: Party) -> Resource {
+                Resource {
+                    owner: Some(owner),
+                    default: None,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum Writers {
+            Anyone,
+            Listed {
+                at: String,
+                owner: Option<Party>,
+                list: Ownership,
+            },
+        }
+
+        impl Writers {
+            pub fn allows(&self, actor: &[Party]) -> bool {
+                match self {
+                    Writers::Anyone => true,
+                    Writers::Listed { owner, list, .. } => list.allows(owner.as_ref(), actor),
+                }
+            }
+        }
+
+        pub fn writers<E>(
+            key: &str,
+            mut list: impl FnMut(&str) -> Result<Option<Ownership>, E>,
+            mut resource: impl FnMut(&str) -> Result<Resource, E>,
+        ) -> Result<Writers, E> {
+            for at in ancestors(key) {
+                let set = list(at)?;
+                let Resource { owner, default } = resource(at)?;
+                let Some(list) = set.or(default) else {
+                    continue;
+                };
+                return Ok(Writers::Listed {
+                    at: at.to_owned(),
+                    owner,
+                    list,
+                });
+            }
+            Ok(Writers::Anyone)
+        }
+
+        pub fn ancestors(key: &str) -> impl Iterator<Item = &str> {
+            let cuts = key.match_indices('/').map(|(at, _)| at).collect::<Vec<_>>();
+            std::iter::once(key)
+                .chain(cuts.into_iter().rev().map(|at| &key[..at]))
+                .filter(|at| !at.is_empty() && !at.ends_with('/'))
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum Op {
+            Check {
+                program: ProgramId,
+                actor: Vec<Party>,
+                needs: Vec<Need>,
+            },
+        }
+    }
 }
 
 /// Who may publish and subscribe to a room's live tracks through a node:
@@ -1653,11 +1850,70 @@ mod tests {
 
     #[test]
     fn a_role_table_carries_a_row_no_reader_names() {
-        let mut roles: Roles = role::REQUIRED.iter().map(|role| (*role, *role)).collect();
-        roles.bind("later", "later");
+        let roles: Roles = role::REQUIRED
+            .iter()
+            .map(|role| (*role, *role))
+            .chain([("later", "later")])
+            .collect();
         let read: Roles = decode(&encode(&roles)).unwrap();
         assert_eq!(read.get("later").map(String::as_str), Some("later"));
         assert_eq!(read, roles);
+    }
+
+    #[test]
+    fn a_declared_role_names_one_program_and_a_full_table_every_kernel_role() {
+        let declared = Roles::declared(role::REQUIRED.iter().map(|role| (*role, "p"))).unwrap();
+        assert_eq!(declared.filled(), Ok(()));
+        let twice = Roles::declared([(role::EGRESS, "a"), (role::EGRESS, "b")]).unwrap_err();
+        assert_eq!(twice.reason, reason::INVALID_INPUT);
+        let short = Roles::declared([(role::PROGRAMS, "p")]).unwrap();
+        assert_eq!(short.filled().unwrap_err().reason, reason::INVALID_INPUT);
+    }
+
+    #[test]
+    fn a_key_answers_to_the_nearest_list_on_it_or_above_it() {
+        use role::access::{Ownership, Party, Resource, Writers, ancestors, writers};
+        assert_eq!(
+            ancestors("a/b/c").collect::<Vec<_>>(),
+            ["a/b/c", "a/b", "a"]
+        );
+        assert_eq!(
+            ancestors("/home/x").collect::<Vec<_>>(),
+            ["/home/x", "/home"]
+        );
+        let owner = Party::Account(1);
+        let resource = |at: &str| -> Result<Resource, ()> {
+            Ok(match at {
+                "a" => Resource::owned(owner.clone()),
+                "a/b/c" => Resource {
+                    owner: Some(Party::Account(2)),
+                    default: Some(Ownership::Owner),
+                },
+                _ => Resource::default(),
+            })
+        };
+        let set = |at: &str| -> Result<Option<Ownership>, ()> {
+            Ok((at == "a").then_some(Ownership::Owner))
+        };
+        let above = writers("a/b", set, resource).unwrap();
+        assert_eq!(
+            above,
+            Writers::Listed {
+                at: "a".into(),
+                owner: Some(owner.clone()),
+                list: Ownership::Owner
+            }
+        );
+        assert!(above.allows(std::slice::from_ref(&owner)));
+        assert!(!above.allows(&[Party::Program("x".into())]));
+        let defaulted = writers("a/b/c", set, resource).unwrap();
+        assert!(defaulted.allows(&[Party::Account(2)]));
+        assert!(!defaulted.allows(std::slice::from_ref(&owner)));
+        assert_eq!(
+            writers("z", set, resource).unwrap(),
+            Writers::Anyone,
+            "no list anywhere is anyone"
+        );
     }
 
     #[test]

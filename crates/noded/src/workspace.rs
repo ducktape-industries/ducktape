@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -8,7 +7,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use consensus::{Anchor, Cadence, CadenceError, Timeouts};
-use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits, Roles};
+use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits};
 use node::Block;
 use rand_core::CryptoRng;
 use serde::Deserialize;
@@ -178,7 +177,6 @@ pub struct Founding {
     /// the file leaves it out.
     #[serde(default = "default_member_cap")]
     pub member_cap: u32,
-    pub roles: BTreeMap<String, String>,
     pub validators: Vec<Validator>,
     pub programs: Vec<Program>,
     #[serde(default)]
@@ -211,6 +209,8 @@ pub struct Program {
     pub id: String,
     pub code: PathBuf,
     pub params: Option<PathBuf>,
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 /// A view with no program behind it, listed by the programs role under `name`.
@@ -289,6 +289,7 @@ impl Founding {
                     program: program.id.clone(),
                     code: std::fs::read(base.join(&program.code))?,
                     params,
+                    roles: program.roles.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -304,7 +305,6 @@ impl Founding {
             .collect::<Result<Vec<_>>>()?;
         Ok(Genesis {
             network: self.network.as_bytes().to_vec(),
-            roles: self.roles.iter().collect::<Roles>(),
             validators,
             programs,
             views,
@@ -351,30 +351,30 @@ mod tests {
 
     const FILE: &str = "network = \"n\"\ntime = 0\nepoch_length = 4\nblock_time_ms = 1000\n\
          HOOKS\
-         [roles]\nprograms = \"r\"\nvalidators = \"v\"\nidentity = \"i\"\nblobs = \"b\"\nawaits = \"a\"\nhalo = \"h\"\n\
          [[validators]]\nkey = \"00\"\nhalo = \"n0.example.org:1\"\n\
-         [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\n";
+         [[programs]]\nid = \"activity\"\ncode = \"code.wasm\"\nROLES";
 
     #[test]
-    fn the_founding_file_binds_each_role_row_it_names() {
-        let genesis = genesis_of(
+    fn a_founding_program_declares_the_roles_it_fills_or_none() {
+        let filling = genesis_of(
             &FILE
                 .replace("HOOKS", "")
-                .replace("awaits = \"a\"\n", "awaits = \"a\"\nlater = \"l\"\n"),
+                .replace("ROLES", "roles = [\"egress\", \"later\"]\n"),
         );
-        assert_eq!(genesis.roles.get("later").map(String::as_str), Some("l"));
-        assert_eq!(
-            genesis.roles.get(abi::role::AWAITS).map(String::as_str),
-            Some("a")
-        );
-        assert_eq!(genesis.roles.get(abi::role::EGRESS), None);
+        assert_eq!(filling.programs[0].roles, ["egress", "later"]);
+        let plain = genesis_of(&FILE.replace("HOOKS", "").replace("ROLES", ""));
+        assert!(plain.programs[0].roles.is_empty());
     }
 
     #[test]
     fn the_founding_file_names_its_hooks_or_none() {
-        let hooked = genesis_of(&FILE.replace("HOOKS", "hooks = [\"activity\"]\n"));
+        let hooked = genesis_of(
+            &FILE
+                .replace("HOOKS", "hooks = [\"activity\"]\n")
+                .replace("ROLES", ""),
+        );
         assert_eq!(hooked.hooks, ["activity"]);
-        let plain = genesis_of(&FILE.replace("HOOKS", ""));
+        let plain = genesis_of(&FILE.replace("HOOKS", "").replace("ROLES", ""));
         assert!(plain.hooks.is_empty());
     }
 
@@ -394,6 +394,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let file = FILE
                 .replace("HOOKS", "")
+                .replace("ROLES", "")
                 .replace("n0.example.org:1", unregistrable);
             let founding: Founding = toml::from_str(&file).unwrap();
             refused_for_its_halo(

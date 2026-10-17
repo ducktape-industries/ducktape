@@ -8,14 +8,11 @@ mod unit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// Each role's program, bound at founding; a role outside `role::REQUIRED`
-/// moves on the validators' vote. A genesis without a required role, or with
-/// a role bound to a program it does not found, is refused.
 pub use abi::Roles;
 use abi::{
     BlobId, Cause, Env, HashKind, Invocation, ItemRef, Message, Origin, Outcome, Principal,
     ProgramCall, ProgramId, Receipt, Refusal, Root, Scan, hook, reason,
-    role::{self, identity, programs, validators},
+    role::{self, access, identity, programs, validators},
 };
 use blob::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -64,8 +61,8 @@ pub enum Error {
         program: ProgramId,
         refusal: Refusal,
     },
-    #[error("genesis binds the {role} role to {program:?}, which is not a founding program")]
-    Unbound { role: String, program: ProgramId },
+    #[error("the founding programs' roles are refused: {0}")]
+    Roles(Refusal),
     #[error("the network binds no program to the {role} role, which the kernel calls")]
     Unfilled { role: String },
     #[error("genesis hooks {0:?}, which is not a founding program")]
@@ -90,7 +87,6 @@ type Sender = std::result::Result<Option<Principal>, Refusal>;
 
 pub struct Genesis {
     pub network: Vec<u8>,
-    pub roles: Roles,
     /// The validators program's founding params: the kernel writes them.
     pub validators: Vec<validators::Member>,
     /// The programs role's founding params are the kernel's too: every founding
@@ -112,6 +108,7 @@ pub struct Founding {
     pub program: ProgramId,
     pub code: Vec<u8>,
     pub params: Vec<u8>,
+    pub roles: Vec<String>,
 }
 
 pub struct FoundingView {
@@ -180,6 +177,7 @@ where
     preconfirmed: Overlay,
     hook_streaks: BTreeMap<ProgramId, u64>,
     scheduler_streak: u64,
+    roster_streak: u64,
 }
 
 enum Submitted {
@@ -280,11 +278,17 @@ where
             namespace::MEMBER_CAP.to_vec(),
             abi::encode(&genesis.member_cap),
         );
-        overlay.set(
-            NETWORK,
-            namespace::ROLES.to_vec(),
-            abi::encode(&genesis.roles),
-        );
+        let declared = genesis.programs.iter().flat_map(|founding| {
+            founding
+                .roles
+                .iter()
+                .map(|role| (role.as_str(), founding.program.as_str()))
+        });
+        let roles = Roles::declared(declared)
+            .and_then(|roles| roles.filled().map(|()| roles))
+            .map_err(Error::Roles)?;
+        overlay.set(NETWORK, namespace::ROLES.to_vec(), abi::encode(&roles));
+        let roles = &roles;
         let mut entries: Vec<programs::Entry> = genesis
             .programs
             .into_iter()
@@ -294,19 +298,6 @@ where
                 params: founding.params,
             })
             .collect();
-        let roles = &genesis.roles;
-        if let Some(role) = roles.unfilled() {
-            return Err(Error::Unfilled { role: role.into() });
-        }
-        for (role, program) in roles.iter() {
-            let founded = entries.iter().any(|entry| entry.program == *program);
-            if !founded {
-                return Err(Error::Unbound {
-                    role: role.into(),
-                    program: program.clone(),
-                });
-            }
-        }
         for hook in &genesis.hooks {
             let founded = entries.iter().any(|entry| entry.program == *hook);
             if !founded {
@@ -318,6 +309,7 @@ where
             role::VALIDATORS,
             role::IDENTITY,
             role::BLOBS,
+            role::ACCESS,
         ]
         .into_iter()
         .map(|role| bound(roles, role))
@@ -364,6 +356,7 @@ where
             programs: entries.clone(),
             views,
             hooks: genesis.hooks,
+            roles: roles.clone(),
         });
         // the roles init before identity can give an account; every other
         // program has its account before its init runs, so what it emits
@@ -385,11 +378,12 @@ where
             store,
             blobs,
             network: genesis.network,
-            roles: genesis.roles.clone(),
+            roles: roles.clone(),
             loaded: Loaded::new(genesis.limits),
             preconfirmed: Overlay::default(),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
+            roster_streak: 0,
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -485,6 +479,7 @@ where
             preconfirmed: Overlay::default(),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
+            roster_streak: 0,
         };
         host.sync_code()?;
         Ok(host)
@@ -1278,9 +1273,23 @@ where
             return Ok(Run::finished(rejected(program, too_deep)));
         }
         let checkpoint = overlay.checkpoint();
+        if let Some(payload) = gated(&call, &env)
+            && let Err(refusal) = self
+                .gate(program, payload, &env, overlay, stage, frame)
+                .await?
+        {
+            overlay.restore(checkpoint);
+            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+            return Ok(Run::finished(rejected(program, refusal)));
+        }
         let segment = self
             .segment(program, &env, None, call, overlay, stage, frame, depth)
             .await?;
+        let refused = matches!(segment.receipt.outcome, Outcome::Rejected(_));
+        if refused {
+            overlay.restore(checkpoint);
+            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+        }
         let start = Start {
             frame: None,
             waiter,
@@ -1288,6 +1297,75 @@ where
         };
         self.follow(program, env, start, segment, overlay, stage, frame, depth)
             .await
+    }
+
+    async fn gate(
+        &self,
+        program: &str,
+        payload: &[u8],
+        env: &Env,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+        frame: &mut Frame,
+    ) -> Result<std::result::Result<(), Refusal>> {
+        let world = self.world(env.height, env.time);
+        let answered = unit::access(
+            world,
+            vec![&*overlay],
+            &*stage,
+            env.clone(),
+            payload.to_vec(),
+            &mut frame.fuel,
+        )
+        .await?;
+        let needs = match answered.and_then(|bytes| needs_of(program, &bytes)) {
+            Ok(needs) => needs,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        if needs.is_empty() {
+            return Ok(Ok(()));
+        }
+        let checker = match self.roles.bound(role::ACCESS) {
+            Ok(checker) => checker.clone(),
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let check = access::Op::Check {
+            program: program.to_owned(),
+            actor: actor_of(env),
+            needs,
+        };
+        let invocation = Invocation {
+            env: Env {
+                me: checker.clone(),
+                origin: Origin::System,
+                sender: Some(Principal::System),
+                cause: Cause::Direct,
+                ..env.clone()
+            },
+            call: ProgramCall::Execute(abi::encode(&check)),
+        };
+        let (receipt, effects) =
+            unit::execute(world, overlay, stage, frame, &checker, None, invocation).await?;
+        let unit::Effects {
+            emitted,
+            calls,
+            resumes,
+            deferred,
+            parked,
+        } = effects;
+        let quiet = emitted.is_empty()
+            && calls.is_empty()
+            && resumes.is_empty()
+            && !deferred
+            && parked.is_none();
+        match (receipt.outcome, quiet) {
+            (Outcome::Rejected(refusal), _) => Ok(Err(refusal)),
+            (Outcome::Applied { .. }, true) => Ok(Ok(())),
+            (Outcome::Applied { .. }, false) => Ok(Err(Refusal::new(
+                reason::UNSUPPORTED,
+                format!("{checker} sends no message while it checks access"),
+            ))),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1527,6 +1605,17 @@ where
         let Ok(programs::Reply::Programs(entries)) = abi::decode::<programs::Reply>(&bytes) else {
             return Ok(Vec::new());
         };
+        let roles = match self
+            .roster_roles(&entries, height, time, overlay, stage)
+            .await?
+        {
+            Ok(roles) => roles,
+            Err(refusal) => {
+                self.log_roster(height, refusal);
+                return Ok(Vec::new());
+            }
+        };
+        self.roster_streak = 0;
         let running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
         let mut receipts = Vec::new();
         let mut wanted = BTreeSet::new();
@@ -1574,18 +1663,14 @@ where
                 }
             }
         }
-        let mut dropped = BTreeSet::new();
         for program in running.keys() {
             if !wanted.contains(program) {
                 overlay.delete(PROGRAMS, program.clone().into_bytes());
                 self.loaded.unload(program);
                 changed.push(program.clone());
-                dropped.insert(program.clone());
             }
         }
-        if !dropped.is_empty() {
-            self.unbind_dropped(&dropped, overlay)?;
-        }
+        self.fill_roles(roles, overlay)?;
         for program in changed {
             let cancelled = self
                 .cancel_parked(&program, height, time, overlay, stage)
@@ -1595,22 +1680,78 @@ where
         Ok(receipts)
     }
 
-    /// The roles table names only running programs: a role bound to a program
-    /// this block drops is unbound in the same block. A role in `REQUIRED`
-    /// keeps its row, so a reopen still finds the table filled; the kernel
-    /// refuses every frame that asks the missing program until a swap brings
-    /// it back.
-    fn unbind_dropped(&self, dropped: &BTreeSet<ProgramId>, overlay: &mut Overlay) -> Result<()> {
-        let roles = roles_of(&View::new(self.store.storage(), vec![&*overlay]))?;
-        let kept: Roles = roles
+    async fn roster_roles(
+        &self,
+        entries: &[programs::Entry],
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<std::result::Result<Roles, Refusal>> {
+        let reply = unit::query(
+            self.world(height, time),
+            vec![overlay],
+            stage,
+            &[],
+            Origin::System,
+            self.role(role::PROGRAMS)?.clone(),
+            abi::encode(&programs::Query::Roles),
+            &mut self.loaded.limits().fuel,
+        )
+        .await?;
+        Ok(reply.and_then(|bytes| {
+            let roles = match abi::decode::<programs::Reply>(&bytes) {
+                Ok(programs::Reply::Roles(roles)) => roles,
+                Ok(_) | Err(_) => {
+                    return Err(Refusal::new(
+                        reason::UNEXPECTED_REPLY,
+                        "the programs role answered Roles with another reply",
+                    ));
+                }
+            };
+            roles.filled()?;
+            let unlisted = roles.iter().find(|(_, program)| {
+                !entries.iter().any(|entry| entry.program == **program)
+            });
+            match unlisted {
+                Some((role, program)) => Err(Refusal::new(
+                    reason::INVALID_INPUT,
+                    format!("the {role} role names {program}, which the roster does not run"),
+                )),
+                None => Ok(roles),
+            }
+        }))
+    }
+
+    fn fill_roles(&mut self, roles: Roles, overlay: &mut Overlay) -> Result<()> {
+        let view = View::new(self.store.storage(), vec![&*overlay]);
+        let running = programs_of(&view)?;
+        let filled: Roles = roles
             .iter()
-            .filter(|(role, program)| role::REQUIRED.contains(role) || !dropped.contains(*program))
+            .filter(|(role, program)| role::REQUIRED.contains(role) || running.contains_key(*program))
             .map(|(role, program)| (role, program.clone()))
             .collect();
-        if kept != roles {
-            overlay.set(NETWORK, namespace::ROLES.to_vec(), abi::encode(&kept));
+        let recorded = roles_of(&view)?;
+        if filled != recorded {
+            overlay.set(NETWORK, namespace::ROLES.to_vec(), abi::encode(&filled));
         }
+        self.roles = filled;
         Ok(())
+    }
+
+    fn log_roster(&mut self, height: u64, refusal: Refusal) {
+        self.roster_streak += 1;
+        let blocks = self.roster_streak;
+        let due = blocks == 1 || blocks.is_multiple_of(STREAK_LOG_EVERY);
+        if due {
+            tracing::warn!(
+                target: "ducktape::programs",
+                event = "roster_refused",
+                height,
+                blocks,
+                reason = %refusal.reason,
+            );
+        }
     }
 
     async fn admit(
@@ -1748,8 +1889,6 @@ where
         let writes = overlay.into_writes();
         self.blobs.promote(stage)?;
         self.store.commit(tip.height, writes.clone()).await?;
-        // a vote may have bound or unbound a role: the table the next block's
-        // frames carry is the one just committed
         self.roles = roles_of(&self.store.view(Vec::new()))?;
         // a commitment outlives neither its program's drop nor an undone
         // admission: the root is over the programs a reopened node opens
@@ -1785,6 +1924,42 @@ where
         overlay.delete(RECENT, key);
         Ok(())
     }
+}
+
+fn gated<'c>(call: &'c ProgramCall, env: &Env) -> Option<&'c [u8]> {
+    let ProgramCall::Execute(payload) = call else {
+        return None;
+    };
+    let completes = matches!(env.cause, Cause::Completion { .. });
+    let by_the_system = env.origin == Origin::System;
+    match completes || by_the_system {
+        true => None,
+        false => Some(payload),
+    }
+}
+
+fn needs_of(program: &str, bytes: &[u8]) -> std::result::Result<Vec<access::Need>, Refusal> {
+    abi::decode(bytes).map_err(|refusal| {
+        Refusal::new(
+            reason::UNEXPECTED_REPLY,
+            format!(
+                "{program} answered what its op touches with {}",
+                refusal.sentence
+            ),
+        )
+    })
+}
+
+fn actor_of(env: &Env) -> Vec<access::Party> {
+    let account = match env.sender {
+        Some(Principal::Account(number)) => Some(access::Party::Account(number)),
+        Some(Principal::System) | None => None,
+    };
+    let program = match &env.origin {
+        Origin::Program(program) => Some(access::Party::Program(program.clone())),
+        Origin::External(_) | Origin::System => None,
+    };
+    account.into_iter().chain(program).collect()
 }
 
 /// A founding run's receipt, or the refusal that stops the founding.

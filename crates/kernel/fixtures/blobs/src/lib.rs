@@ -3,6 +3,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod program {
+    use abi::role::access::{Need, Resource};
     use abi::role::{self, validators};
     use abi::{Env, Origin, Principal, Refusal, Scan, reason};
     use blob::contract::{
@@ -110,6 +111,14 @@ mod program {
                 Op::Put { blobs } => put(ctx, env, blobs),
                 Op::Receipt { bundle } => receipt(ctx, env, bundle),
             }
+        }
+
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {

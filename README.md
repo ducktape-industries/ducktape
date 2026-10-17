@@ -58,16 +58,6 @@ block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
-[roles]                       # one row per role: its name = the founding program that fills it; egress and scheduler optional, the rest required
-programs = "programs"         # registers and swaps programs
-validators = "valset"         # seats each epoch's validators; runs membership and the validators' votes
-identity = "identity"         # resolves a key or a program to its account
-blobs = "blobs"               # records each bundle of blobs put and which validators hold it
-awaits = "awaits"             # keeps the tickets of frames that await a call, and hands each its answer
-egress = "egress"             # optional: answers programs' calls outside the chain; nodes read it, the kernel never calls it
-halo = "halo"                 # holds the lane table halo serves: each lane's wire id, class cap, whether it is served and whether it is pinned
-scheduler = "scheduler"       # optional: keeps the runs programs schedule for later heights; the kernel runs each at the end of its block
-
 [[validators]]
 key = "…"                     # hex ed25519 public key: `ducktape identity`
 address = "tcp://a.example.org:9000"  # optional: where peers dial it; see Reach a node
@@ -76,27 +66,38 @@ halo = "a.example.org:9100"   # host:port where members reach it over halo; `ini
 [[programs]]
 id = "programs"               # one entry per program; the programs and validators roles' params are the kernel's
 code = "programs.wasm"
+roles = ["programs"]          # the roles it fills; a program that fills none leaves this out
 
 [[programs]]
 id = "valset"
 code = "valset.wasm"
+roles = ["validators"]
 
 [[programs]]
 id = "identity"
 code = "identity.wasm"
+roles = ["identity"]
 
 [[programs]]
 id = "blobs"
 code = "blobs.wasm"
+roles = ["blobs"]
 
 [[programs]]
 id = "awaits"
 code = "awaits.wasm"
+roles = ["awaits"]
 
 [[programs]]
 id = "halo"
 code = "halo.wasm"
 params = "halo.params"        # the founding lanes, in order from id 0, each pinned or not
+roles = ["halo"]
+
+[[programs]]
+id = "access"
+code = "access.wasm"
+roles = ["access"]
 
 [[programs]]
 id = "ping"
@@ -110,11 +111,29 @@ memory_bytes = 268435456
 
 The kernel calls programs by role, never by id. The roles are a table, a map
 from role name to program (`abi::Roles`; the names are constants in
-`abi::role`), so a new role is a new row. Founding refuses a role bound to a
-program the file does not list, and a table missing a role the kernel calls
-(programs, validators, identity, blobs, awaits), naming the missing role. Every
-frame's env carries the table (`Env.roles`); a program looks a role up by name
-and gets nothing for a role the network does not bind. As the kernel admits a
+`abi::role`), so a new role is a new row. A program declares the roles it
+fills where it is published: `roles` on its `[[programs]]` entry at founding,
+and on the change that publishes it after. The programs role keeps the table
+and answers it (`programs::Query::Roles`); the kernel reads it each block with
+the roster and keeps it in its own state. Founding refuses a role two programs
+declare and a table missing a role in `abi::role::REQUIRED` (programs,
+validators, identity, blobs, awaits, halo, access), naming the role; a roster
+whose table misses one, or names a program the roster does not run, changes
+nothing. Every frame's env carries the table (`Env.roles`); a program looks a
+role up by name and gets nothing for a role the network does not fill.
+
+Before an op runs, the kernel asks its target program what the op touches
+(`ProgramCall::Access`, answered as `role::access::Need`s: a key in the
+program's own space and whether the op writes or deletes it). When the answer
+names anything, the program filling the access role checks it for the parties
+the frame acts as (the account, and the sending program for a message) before
+the op runs, as part of the op: a refusal refuses the op, and the check's
+writes fall with a refused op. The access program keeps the lists owners set;
+the owner of a key and the list that holds until one is set are the target
+program's to say (`ProgramCall::Resource`), which the access program asks
+through `HostOp::Resource`. A key shaped like a path answers to the nearest
+list on it or above it, and no list anywhere means anyone may act. A query is
+never checked. As the kernel admits a
 program, at founding or later off the programs role, it gives the program an
 account: the identity role's
 `RegisterProgram`, executed with the `System` origin. Once per frame the host
@@ -126,7 +145,7 @@ runs as no one (`None`). A program may send a message as another account
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so a program account whose script calls a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
-validators, identity, awaits, egress, scheduler, halo}`; the programs repository's `docs/roles.md` walks through them.
+validators, identity, awaits, egress, scheduler, halo, access}`; the programs repository's `docs/roles.md` walks through them.
 
 A program can wait for another program's answer. Its `execute` is an async
 Rust function (the program SDK's `awaiting_program!`), and each
@@ -205,10 +224,9 @@ good for one enrollment for 72 hours (`--hours`). Validators vote with
 `ducktape vote promote|demote|remove <key>`, `ducktape vote open|close` (the
 door), `ducktape vote role <role> <op>`, which runs `op` on the program bound
 to the role once it passes (`programs` takes a program change, `halo` a lane
-to open, set or close; neither takes a change from anything else), and
-`ducktape vote bind <role> [program]`, which binds a program to a role, or
-unbinds the role, on the running network (a role in `abi::role::REQUIRED` is
-bound for the network's life). A motion passes when more than two thirds of
+to open, set or close; neither takes a change from anything else). A role
+moves only with the program change that publishes the program declaring it,
+which only the validators' vote schedules. A motion passes when more than two thirds of
 the current validators vote for it. `ducktape leave` takes the node out; the last validator cannot
 leave. Each prints the block that carried it.
 

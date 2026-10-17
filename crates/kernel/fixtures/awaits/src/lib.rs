@@ -3,6 +3,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod program {
+    use abi::role::access::{Need, Resource};
     use abi::role::awaits::{Answer, Call, FrameId, Op, Query as Ask, Reply, Ticket, TicketRow};
     use abi::{Env, Origin, ProgramId, Refusal, Scan, reason};
     use program::{Execute, Program, Query, Reads};
@@ -115,6 +116,14 @@ mod program {
                 Op::Resolve { ticket, answer } => resolve(ctx, env, ticket, answer),
                 Op::Close { frame } => close(ctx, env, frame),
             }
+        }
+
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
