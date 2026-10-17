@@ -7,6 +7,7 @@ pub const RESIDENTS: &[u8] = b"residents";
 
 #[cfg(target_arch = "wasm32")]
 mod program {
+    use abi::role::access::{Need, Resource};
     use abi::role::validators::{Genesis, Member, Motion, Op, Query as Ask, Reply, Voted};
     use abi::{Env, Origin, Refusal, reason};
     use program::{Execute, Program, Query, Reads};
@@ -62,8 +63,6 @@ mod program {
                 .find(|member| member.key == key)
         }
 
-        /// Enacts a roster motion; a role motion changes no roster and is
-        /// returned as the op the role's program runs, a bind as the row.
         fn enact(&mut self, motion: Motion) -> Result<Option<Forwarded>, Refusal> {
             match motion {
                 Motion::Promote { key } => {
@@ -77,10 +76,7 @@ mod program {
                 Motion::Remove { key } => {
                     self.take(&key).ok_or_else(not_a_member)?;
                 }
-                Motion::Role { role, op } => return Ok(Some(Forwarded::Op { role, op })),
-                Motion::Bind { role, program } => {
-                    return Ok(Some(Forwarded::Bind { role, program }));
-                }
+                Motion::Role { role, op } => return Ok(Some(Forwarded { role, op })),
                 Motion::Door { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
@@ -92,16 +88,9 @@ mod program {
         }
     }
 
-    /// What a vote enacts outside the roster.
-    enum Forwarded {
-        Op {
-            role: String,
-            op: Vec<u8>,
-        },
-        Bind {
-            role: String,
-            program: Option<abi::ProgramId>,
-        },
+    struct Forwarded {
+        role: String,
+        op: Vec<u8>,
     }
 
     fn not_a_member() -> Refusal {
@@ -138,18 +127,22 @@ mod program {
                     roster.take(signer).ok_or_else(not_a_member)?;
                 }
                 Op::Vote(motion) => {
-                    match roster.enact(motion)? {
-                        Some(Forwarded::Op { role, op }) => {
-                            ctx.emit(env.roles.bound(&role)?.clone(), op, false);
-                        }
-                        Some(Forwarded::Bind { role, program }) => ctx.bind(role, program)?,
-                        None => {}
+                    if let Some(Forwarded { role, op }) = roster.enact(motion)? {
+                        ctx.emit(env.roles.bound(&role)?.clone(), op, false);
                     }
                     ctx.output(abi::encode(&Voted::Enacted));
                 }
             }
             roster.write(ctx);
             Ok(())
+        }
+
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {

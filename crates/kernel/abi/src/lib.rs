@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
 pub type ProgramId = String;
 
@@ -18,14 +18,26 @@ impl core::fmt::Debug for Root {
 }
 
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
 )]
 pub enum HashKind {
     Sha256,
     Sha1,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub enum BlobId {
     Sha256([u8; 32]),
     Sha1([u8; 20]),
@@ -91,13 +103,7 @@ pub enum Principal {
     System,
 }
 
-/// Each role's program, by the role's name: bound at founding, and a role
-/// outside `role::REQUIRED` moves on the validators' vote (`Motion::Bind`)
-/// to any admitted program, or goes. The kernel calls some rows; others
-/// (egress, halo, scheduler, any name a program looks up) it never does.
-/// Every frame's env carries the table, so a program asks a role by its
-/// binding, never by a name it assumes.
-#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Roles(BTreeMap<String, ProgramId>);
 
 impl Roles {
@@ -114,12 +120,32 @@ impl Roles {
         })
     }
 
-    pub fn bind(&mut self, role: impl Into<String>, program: impl Into<ProgramId>) {
-        self.0.insert(role.into(), program.into());
+    pub fn declared<'d>(
+        declarations: impl IntoIterator<Item = (&'d str, &'d str)>,
+    ) -> Result<Roles, Refusal> {
+        let mut roles = Roles::default();
+        for (role, program) in declarations {
+            let Some(first) = roles.0.insert(role.to_owned(), program.to_owned()) else {
+                continue;
+            };
+            return Err(Refusal::new(
+                reason::INVALID_INPUT,
+                format!(
+                    "the {role} role names both {first} and {program}: a role names one program"
+                ),
+            ));
+        }
+        Ok(roles)
     }
 
-    pub fn unbind(&mut self, role: &str) {
-        self.0.remove(role);
+    pub fn filled(&self) -> Result<(), Refusal> {
+        match self.unfilled() {
+            Some(role) => Err(Refusal::new(
+                reason::INVALID_INPUT,
+                format!("no program fills the {role} role, which a network always fills"),
+            )),
+            None => Ok(()),
+        }
     }
 
     pub fn unfilled(&self) -> Option<&'static str> {
@@ -152,7 +178,7 @@ pub struct ItemRef {
     pub item: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Refusal {
     pub reason: String,
     pub sentence: String,
@@ -213,13 +239,13 @@ pub mod reason {
     pub const UNEXPECTED_REPLY: &str = "unexpected_reply";
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Outcome {
     Applied { output: Vec<u8> },
     Rejected(Refusal),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Receipt {
     pub program: ProgramId,
     pub outcome: Outcome,
@@ -321,7 +347,9 @@ pub struct Entry {
     pub value: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub enum Scheme {
     Ed25519,
     Secp256k1,
@@ -391,12 +419,9 @@ pub enum HostOp {
         ticket: role::awaits::Ticket,
         answer: role::awaits::Answer,
     },
-    /// Bind `program` to `role` in the network's roles table, or unbind the
-    /// role when `program` is `None`: the validators role's alone, and never
-    /// a role in `role::REQUIRED`.
-    Bind {
-        role: String,
-        program: Option<ProgramId>,
+    Resource {
+        program: ProgramId,
+        key: String,
     },
 }
 
@@ -432,6 +457,8 @@ pub enum ProgramCall {
         ticket: role::awaits::Ticket,
         answer: role::awaits::Answer,
     },
+    Access(Vec<u8>),
+    Resource(String),
 }
 
 pub mod hook {
@@ -459,17 +486,14 @@ pub mod role {
     pub const EGRESS: &str = "egress";
     pub const SCHEDULER: &str = "scheduler";
     pub const HALO: &str = "halo";
-    /// The roles a network binds for its life: the kernel calls the first
-    /// five, and every node reads halo's lane table to serve its lanes, so
-    /// no network founds without them. The others may be bound, rebound or
-    /// unbound by the validators' vote.
-    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO];
+    pub const ACCESS: &str = "access";
+    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO, ACCESS];
 
     /// Which code runs at a height.
     pub mod programs {
-        use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
+        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Roles};
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Entry {
             pub program: ProgramId,
             pub code: BlobId,
@@ -478,7 +502,7 @@ pub mod role {
 
         /// A view with no program behind it: its name on the rail and the blob
         /// that is the view itself.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct View {
             pub name: ProgramId,
             pub view: BlobId,
@@ -489,6 +513,7 @@ pub mod role {
         #[repr(u8)]
         pub enum Query {
             At(u64) = 0,
+            Roles = 4,
             Hooks(u64) = 5,
         }
 
@@ -497,6 +522,7 @@ pub mod role {
         #[repr(u8)]
         pub enum Reply {
             Programs(Vec<Entry>) = 0,
+            Roles(Roles) = 4,
             Hooks(Vec<ProgramId>) = 5,
         }
 
@@ -505,17 +531,18 @@ pub mod role {
             pub programs: Vec<Entry>,
             pub views: Vec<View>,
             pub hooks: Vec<ProgramId>,
+            pub roles: Roles,
         }
     }
 
     /// The consensus set.
     pub mod validators {
-        use crate::{BorshDeserialize, BorshSerialize};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize};
 
         /// The most members a network's cap can name.
         pub const MAX_MEMBERS: u32 = 128;
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Member {
             pub key: Vec<u8>,
             pub address: Option<String>,
@@ -544,7 +571,7 @@ pub mod role {
 
         pub const INVITE_NAMESPACE: &[u8] = b"ducktape:invite";
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Enroll {
                 address: Option<String>,
@@ -558,7 +585,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Motion {
             Promote {
                 key: Vec<u8>,
@@ -578,13 +605,6 @@ pub mod role {
                 role: String,
                 op: Vec<u8>,
             },
-            /// The validators' vote on the roles table: bind `program` to
-            /// `role`, or unbind the role when `program` is `None`. A role in
-            /// `REQUIRED` is refused: its program is fixed.
-            Bind {
-                role: String,
-                program: Option<crate::ProgramId>,
-            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -593,7 +613,7 @@ pub mod role {
             Enacted,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Grant {
             pub network: Vec<u8>,
             pub nonce: [u8; 16],
@@ -606,7 +626,7 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Invite {
             pub issuer: Vec<u8>,
             pub grant: Grant,
@@ -649,7 +669,7 @@ pub mod role {
     /// Who holds a key or runs as a program (the account a frame acts as),
     /// and how each account reads to the programs and views that name it.
     pub mod identity {
-        use crate::{BorshDeserialize, BorshSerialize, ProgramId};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
 
         pub type AccountNumber = u64;
 
@@ -661,7 +681,7 @@ pub mod role {
         /// script `calls` one program and hands it `config`, text that
         /// program alone gives a meaning. A `System` account is a
         /// program's own account and holds no keys.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Kind {
             User,
             Program {
@@ -673,7 +693,7 @@ pub mod role {
             System(ProgramId),
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Script {
             pub calls: ProgramId,
             pub config: String,
@@ -681,14 +701,18 @@ pub mod role {
 
         /// What a manager declares a program account to be. The enum only
         /// grows at its end.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
         pub enum Category {
             Agent,
         }
 
         /// Whether a program account acts. Its manager alone changes it;
         /// `Revoked` is final.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
         pub enum Standing {
             Active,
             Suspended,
@@ -696,7 +720,7 @@ pub mod role {
         }
 
         /// An account as others show it: its name and what it is.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Profile {
             pub number: AccountNumber,
             pub name: String,
@@ -749,19 +773,19 @@ pub mod role {
     }
 
     pub mod awaits {
-        use crate::{BorshDeserialize, BorshSerialize, ProgramId, Refusal, reason};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Refusal, reason};
 
         pub type Ticket = u64;
         pub type FrameId = u64;
         pub type Answer = Result<Vec<u8>, Refusal>;
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Call {
             pub ticket: Ticket,
             pub target: ProgramId,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Park {
                 frame: FrameId,
@@ -777,7 +801,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct TicketRow {
             pub ticket: Ticket,
             pub frame: FrameId,
@@ -786,7 +810,7 @@ pub mod role {
             pub opened: u64,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Query {
             Ticket {
                 ticket: Ticket,
@@ -798,7 +822,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Reply {
             Ticket(Option<TicketRow>),
             Tickets(Vec<TicketRow>),
@@ -817,7 +841,7 @@ pub mod role {
     /// it is pinned. Only the validators' vote changes the table, and no vote
     /// pauses or closes a pinned lane.
     pub mod halo {
-        use crate::{BorshDeserialize, BorshSerialize};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize};
 
         /// The lane byte on the wire: a stream hello's first byte, a
         /// datagram's first byte.
@@ -837,6 +861,7 @@ pub mod role {
             Ord,
             BorshSerialize,
             BorshDeserialize,
+            BorshSchema,
         )]
         pub enum Class {
             Critical,
@@ -867,7 +892,7 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Lane {
             pub name: String,
             pub id: LaneId,
@@ -883,7 +908,7 @@ pub mod role {
 
         /// Every op is the validators' vote (`Motion::Role`); a signed frame
         /// is refused.
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             /// Lists `name` at the next free id, enabled and not pinned.
             Open { name: String, cap: Class },
@@ -899,7 +924,7 @@ pub mod role {
             Close { name: String },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Query {
             /// Every listed lane, in id order.
             Lanes,
@@ -908,7 +933,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Reply {
             Lanes(Vec<Lane>),
             Lane(Option<Lane>),
@@ -932,7 +957,7 @@ pub mod role {
     pub mod egress {
         use crate::role::identity::AccountNumber;
         use crate::role::scheduler::EntryId;
-        use crate::{BlobId, BorshDeserialize, BorshSerialize, ProgramId};
+        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
 
         pub const DEFAULT_WAIT: u64 = 64;
 
@@ -940,7 +965,7 @@ pub mod role {
         pub const RELAY: &str = "relay";
         pub const RESERVED: [&str; 2] = [HTTP, RELAY];
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Register {
                 service: String,
@@ -961,7 +986,7 @@ pub mod role {
                 id: u64,
                 answer: Answer,
             },
-            Event(Event),
+            Events(Vec<Event>),
             EndStream {
                 id: u64,
                 events: u64,
@@ -972,7 +997,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Request {
             Relay {
                 note: Vec<u8>,
@@ -1000,19 +1025,19 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Answer {
             Output(Vec<u8>),
             Failed(String),
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Delivery {
             Whole,
             Events { deliver: Vec<u8> },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Event {
             pub id: u64,
             pub seq: u64,
@@ -1027,7 +1052,7 @@ pub mod role {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum StreamEnd {
             Complete {
                 status: u16,
@@ -1038,7 +1063,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct ServiceRow {
             pub name: String,
             pub owner: AccountNumber,
@@ -1046,7 +1071,7 @@ pub mod role {
             pub registered: u64,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct RequestRow {
             pub id: u64,
             pub requester: ProgramId,
@@ -1057,7 +1082,7 @@ pub mod role {
             pub expiry: EntryId,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct NodeRow {
             pub key: Vec<u8>,
             pub services: Vec<String>,
@@ -1083,14 +1108,16 @@ pub mod role {
         }
 
         pub mod http {
-            use crate::{BorshDeserialize, BorshSerialize, Refusal, reason};
+            use crate::{BorshDeserialize, BorshSchema, BorshSerialize, Refusal, reason};
 
             pub const FRAMING: [&str; 4] =
                 ["host", "content-length", "transfer-encoding", "connection"];
 
             pub const NODE_PREFIX: &str = "ducktape-";
 
-            #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+            #[derive(
+                Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+            )]
             pub enum Method {
                 Get,
                 Post,
@@ -1111,7 +1138,9 @@ pub mod role {
                 }
             }
 
-            #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+            #[derive(
+                Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+            )]
             pub struct Head {
                 pub method: Method,
                 pub target: String,
@@ -1201,11 +1230,11 @@ pub mod role {
     }
 
     pub mod scheduler {
-        use crate::{BorshDeserialize, BorshSerialize, ProgramId, Receipt};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Receipt};
 
         pub type EntryId = u64;
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
             Schedule {
                 height: u64,
@@ -1221,7 +1250,7 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Entry {
             pub id: EntryId,
             pub scheduler: ProgramId,
@@ -1231,7 +1260,7 @@ pub mod role {
             pub receipt: Option<Receipt>,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Query {
             Due {
                 height: u64,
@@ -1243,13 +1272,204 @@ pub mod role {
             },
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Reply {
             Due {
                 entries: Vec<Entry>,
                 next: Option<EntryId>,
             },
             Entry(Option<Entry>),
+        }
+    }
+
+    pub mod access {
+        use crate::role::identity::AccountNumber;
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
+
+        #[derive(
+            Clone,
+            Debug,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            BorshSerialize,
+            BorshDeserialize,
+            BorshSchema,
+        )]
+        pub enum Party {
+            Account(AccountNumber),
+            Program(ProgramId),
+        }
+
+        impl Party {
+            pub fn account(&self) -> Option<AccountNumber> {
+                match self {
+                    Party::Account(number) => Some(*number),
+                    Party::Program(_) => None,
+                }
+            }
+
+            pub fn program(&self) -> Option<&ProgramId> {
+                match self {
+                    Party::Account(_) => None,
+                    Party::Program(program) => Some(program),
+                }
+            }
+        }
+
+        #[derive(
+            Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        pub enum Ownership {
+            #[default]
+            Owner,
+            Listed(Vec<Party>),
+            Anyone,
+        }
+
+        impl Ownership {
+            pub fn allows(&self, owner: Option<&Party>, actor: &[Party]) -> bool {
+                let owns = owner.is_some_and(|owner| actor.contains(owner));
+                match self {
+                    Ownership::Owner => owns,
+                    Ownership::Listed(listed) => {
+                        owns || listed.iter().any(|party| actor.contains(party))
+                    }
+                    Ownership::Anyone => true,
+                }
+            }
+
+            pub fn settled(self, owner: Option<&Party>) -> Ownership {
+                let Ownership::Listed(mut listed) = self else {
+                    return self;
+                };
+                listed.sort_unstable();
+                listed.dedup();
+                listed.retain(|party| Some(party) != owner);
+                match listed.is_empty() {
+                    true => Ownership::Owner,
+                    false => Ownership::Listed(listed),
+                }
+            }
+
+            pub fn listed(&self) -> &[Party] {
+                match self {
+                    Ownership::Listed(listed) => listed,
+                    Ownership::Owner | Ownership::Anyone => &[],
+                }
+            }
+
+            pub fn accounts(&self) -> impl Iterator<Item = AccountNumber> + '_ {
+                self.listed().iter().filter_map(Party::account)
+            }
+
+            pub fn programs(&self) -> impl Iterator<Item = &ProgramId> {
+                self.listed().iter().filter_map(Party::program)
+            }
+        }
+
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        pub enum Action {
+            Write,
+            Delete,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Need {
+            pub key: String,
+            pub action: Action,
+        }
+
+        impl Need {
+            pub fn write(key: impl Into<String>) -> Need {
+                Need {
+                    key: key.into(),
+                    action: Action::Write,
+                }
+            }
+
+            pub fn delete(key: impl Into<String>) -> Need {
+                Need {
+                    key: key.into(),
+                    action: Action::Delete,
+                }
+            }
+        }
+
+        #[derive(
+            Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        pub struct Resource {
+            pub owner: Option<Party>,
+            pub default: Option<Ownership>,
+        }
+
+        impl Resource {
+            pub fn owned(owner: Party) -> Resource {
+                Resource {
+                    owner: Some(owner),
+                    default: None,
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum Writers {
+            Anyone,
+            Listed {
+                at: String,
+                owner: Option<Party>,
+                list: Ownership,
+            },
+        }
+
+        impl Writers {
+            pub fn allows(&self, actor: &[Party]) -> bool {
+                match self {
+                    Writers::Anyone => true,
+                    Writers::Listed { owner, list, .. } => list.allows(owner.as_ref(), actor),
+                }
+            }
+        }
+
+        pub fn writers<E>(
+            key: &str,
+            mut list: impl FnMut(&str) -> Result<Option<Ownership>, E>,
+            mut resource: impl FnMut(&str) -> Result<Resource, E>,
+        ) -> Result<Writers, E> {
+            for at in ancestors(key) {
+                let set = list(at)?;
+                let Resource { owner, default } = resource(at)?;
+                let Some(list) = set.or(default) else {
+                    continue;
+                };
+                return Ok(Writers::Listed {
+                    at: at.to_owned(),
+                    owner,
+                    list,
+                });
+            }
+            Ok(Writers::Anyone)
+        }
+
+        pub fn ancestors(key: &str) -> impl Iterator<Item = &str> {
+            let cuts = key.match_indices('/').map(|(at, _)| at).collect::<Vec<_>>();
+            std::iter::once(key)
+                .chain(cuts.into_iter().rev().map(|at| &key[..at]))
+                .filter(|at| !at.is_empty() && !at.ends_with('/'))
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum Op {
+            Check {
+                program: ProgramId,
+                actor: Vec<Party>,
+                needs: Vec<Need>,
+            },
         }
     }
 }
@@ -1630,11 +1850,70 @@ mod tests {
 
     #[test]
     fn a_role_table_carries_a_row_no_reader_names() {
-        let mut roles: Roles = role::REQUIRED.iter().map(|role| (*role, *role)).collect();
-        roles.bind("later", "later");
+        let roles: Roles = role::REQUIRED
+            .iter()
+            .map(|role| (*role, *role))
+            .chain([("later", "later")])
+            .collect();
         let read: Roles = decode(&encode(&roles)).unwrap();
         assert_eq!(read.get("later").map(String::as_str), Some("later"));
         assert_eq!(read, roles);
+    }
+
+    #[test]
+    fn a_declared_role_names_one_program_and_a_full_table_every_kernel_role() {
+        let declared = Roles::declared(role::REQUIRED.iter().map(|role| (*role, "p"))).unwrap();
+        assert_eq!(declared.filled(), Ok(()));
+        let twice = Roles::declared([(role::EGRESS, "a"), (role::EGRESS, "b")]).unwrap_err();
+        assert_eq!(twice.reason, reason::INVALID_INPUT);
+        let short = Roles::declared([(role::PROGRAMS, "p")]).unwrap();
+        assert_eq!(short.filled().unwrap_err().reason, reason::INVALID_INPUT);
+    }
+
+    #[test]
+    fn a_key_answers_to_the_nearest_list_on_it_or_above_it() {
+        use role::access::{Ownership, Party, Resource, Writers, ancestors, writers};
+        assert_eq!(
+            ancestors("a/b/c").collect::<Vec<_>>(),
+            ["a/b/c", "a/b", "a"]
+        );
+        assert_eq!(
+            ancestors("/home/x").collect::<Vec<_>>(),
+            ["/home/x", "/home"]
+        );
+        let owner = Party::Account(1);
+        let resource = |at: &str| -> Result<Resource, ()> {
+            Ok(match at {
+                "a" => Resource::owned(owner.clone()),
+                "a/b/c" => Resource {
+                    owner: Some(Party::Account(2)),
+                    default: Some(Ownership::Owner),
+                },
+                _ => Resource::default(),
+            })
+        };
+        let set = |at: &str| -> Result<Option<Ownership>, ()> {
+            Ok((at == "a").then_some(Ownership::Owner))
+        };
+        let above = writers("a/b", set, resource).unwrap();
+        assert_eq!(
+            above,
+            Writers::Listed {
+                at: "a".into(),
+                owner: Some(owner.clone()),
+                list: Ownership::Owner
+            }
+        );
+        assert!(above.allows(std::slice::from_ref(&owner)));
+        assert!(!above.allows(&[Party::Program("x".into())]));
+        let defaulted = writers("a/b/c", set, resource).unwrap();
+        assert!(defaulted.allows(&[Party::Account(2)]));
+        assert!(!defaulted.allows(std::slice::from_ref(&owner)));
+        assert_eq!(
+            writers("z", set, resource).unwrap(),
+            Writers::Anyone,
+            "no list anywhere is anyone"
+        );
     }
 
     #[test]

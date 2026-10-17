@@ -48,6 +48,49 @@ scripts back a `make` target; see the repository `Makefile`.
   runs two. Reach the node with
   `kubectl -n NETWORK exec deploy/node -c node -- ducktape <verb>`.
 
+## Moving a running network onto the access role
+
+- `migrate/access.sh FOUNDING_DIR LEAD_BLOCKS [DEPLOY_COMMAND...]` moves a
+  network founded before the access role onto it in place, through the
+  validators' vote, while its node still runs the binary it was founded
+  with. `FOUNDING_DIR` is the founding the programs repository publishes
+  for the release (`founding.toml` and every file it names). A batch of
+  program changes lands `LEAD_BLOCKS` blocks, plus one per ballot in the
+  batch, after the tip it starts from; it must outlast the vote, so a
+  network of several validators gives it room.
+  In order, it:
+  - puts every program and view whose code changes as `program` blobs, signed
+    by `DUCKTAPE_PUT`'s wallet, which needs an account;
+  - admits `access`, then binds the access role to it, and binds a role to
+    `forge`, `chat`, `files` and `harness` each, so the vote reaches their one-time
+    `Migrate` op (`ducktape vote bind`);
+  - swaps every program but `programs` and `valset`, and every view, to its
+    new code at one block, and checks the programs program holds each change
+    (a vote is enacted even when the op it carries is refused);
+  - runs `Migrate` by vote on forge, chat (which records who took part in
+    each thread from the replies it holds), files, harness, then identity
+    (harness reads the old answer lists identity drops), and unbinds the
+    roles bound for the move;
+  - swaps the programs program, then runs its `Migrate`, which copies the
+    kernel's role table into its own (its new code refuses every change
+    while that table is empty);
+  - swaps `valset`, which has no `Motion::Bind` once swapped;
+  - verifies each program's code, that the role table equals both the
+    kernel's and the roles `founding.toml` declares, and prints the access
+    lists the move wrote;
+  - runs `DEPLOY_COMMAND`, or prints the deploy step for the new binary
+    (`k8s/deploy NETWORK COMMIT`).
+- Each step checks the state first, so the script runs again safely. A vote
+  that only counts stops it with exit 3: every other validator casts the
+  same ballot, from the op file kept in `MIGRATE_DIR` (default
+  `./access-migration`), and the script runs again.
+- `DUCKTAPE` is the command that runs the `ducktape` CLI of the binary the
+  network still runs (the one with `vote bind`) with the validator's
+  workspace, reading an op on stdin (for a pod:
+  `kubectl -n NETWORK exec -i deploy/node -c node -- ducktape`);
+  `FOUNDING_REMOTE` is where `DUCKTAPE_PUT` sees the founding's files.
+  It needs `bash` and `python3` where it runs.
+
 ## Worktrees
 
 - `worktree-clean.sh` — removes task worktrees whose branch is fully merged

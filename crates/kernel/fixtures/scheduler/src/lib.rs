@@ -3,6 +3,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod program {
+    use abi::role::access::{Need, Resource};
     use abi::role::scheduler::{Entry, EntryId, Op, Query as Ask, Reply};
     use abi::{Env, Origin, ProgramId, Receipt, Refusal, Scan, reason};
     use program::{Execute, Program, Query, Reads};
@@ -151,6 +152,14 @@ mod program {
                 Op::Cancel { entry } => cancel(ctx, env, entry),
                 Op::Ran { entry, receipt } => ran(ctx, env, entry, receipt),
             }
+        }
+
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {

@@ -7,7 +7,13 @@ pub enum Change {
     Remove(ProgramId),
     Hook(ProgramId),
     Unhook(ProgramId),
+    Fill {
+        role: String,
+        program: Option<ProgramId>,
+    },
 }
+
+pub const ROLES: &[u8] = b"roles";
 
 pub fn key(program: &str) -> Vec<u8> {
     format!("p/{program}").into_bytes()
@@ -19,10 +25,27 @@ pub fn hook_key(program: &str) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::{Env, Refusal, Scan, role::programs};
+    use abi::role::access::{Need, Resource};
+    use abi::{Env, ProgramId, Refusal, Roles, Scan, role::programs};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{Change, hook_key, key};
+    use crate::{Change, ROLES, hook_key, key};
+
+    fn refill(
+        ctx: &mut Execute,
+        keep: impl Fn(&str, &ProgramId) -> bool,
+        add: Option<(String, ProgramId)>,
+    ) -> Result<(), Refusal> {
+        let roles: Roles = ctx.record(ROLES)?.unwrap_or_default();
+        let roles: Roles = roles
+            .iter()
+            .filter(|(role, program)| keep(role, program))
+            .map(|(role, program)| (role.to_owned(), program.clone()))
+            .chain(add)
+            .collect();
+        ctx.put(ROLES, &roles);
+        Ok(())
+    }
 
     struct Programs;
 
@@ -35,17 +58,33 @@ mod program {
             for hook in genesis.hooks {
                 ctx.set(hook_key(&hook), Vec::new());
             }
+            ctx.put(ROLES, &genesis.roles);
             Ok(())
         }
 
         fn execute(ctx: &mut Execute, _env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             match abi::decode(payload)? {
                 Change::Set(entry) => ctx.set(key(&entry.program), abi::encode(&entry)),
-                Change::Remove(program) => ctx.delete(key(&program)),
+                Change::Remove(program) => {
+                    ctx.delete(key(&program));
+                    refill(ctx, |_, named| *named != program, None)?;
+                }
                 Change::Hook(program) => ctx.set(hook_key(&program), Vec::new()),
                 Change::Unhook(program) => ctx.delete(hook_key(&program)),
+                Change::Fill { role, program } => {
+                    let row = program.map(|program| (role.clone(), program));
+                    refill(ctx, |named, _| named != role, row)?;
+                }
             }
             Ok(())
+        }
+
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
@@ -56,6 +95,9 @@ mod program {
                         .map(|entry| abi::decode(&entry.value))
                         .collect::<Result<Vec<programs::Entry>, Refusal>>()?,
                 ),
+                programs::Query::Roles => {
+                    programs::Reply::Roles(ctx.record(ROLES)?.unwrap_or_default())
+                }
                 programs::Query::Hooks(_) => programs::Reply::Hooks(
                     ctx.scan(Scan::prefix(b"h/"))
                         .into_iter()

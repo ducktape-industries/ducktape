@@ -3,6 +3,7 @@ pub use abi::{
     Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
     HostReply, Invocation, ItemRef, Message, Origin, Outcome, ProgramCall, ProgramId, ProgramReply,
     Refusal, Root, Scan, Scheme, reason,
+    role::access::{Need, Resource},
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -106,6 +107,8 @@ mod context {
             Ok(())
         }
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal>;
+        fn access(ctx: &mut Query, env: &Env, payload: &[u8]) -> Result<Vec<Need>, Refusal>;
+        fn resource(ctx: &mut Query, env: &Env, key: &str) -> Result<Resource, Refusal>;
         fn query(ctx: &mut Query, env: &Env, request: &[u8]) -> Result<(), Refusal>;
         fn hook(_ctx: &mut Execute, _env: &Env, _record: abi::hook::Record) -> Result<(), Refusal> {
             Err(Refusal::new(reason::UNSUPPORTED, "this program is no hook"))
@@ -118,12 +121,28 @@ mod context {
             ProgramCall::Init(params) => P::init(&mut Execute(()), &env, &params),
             ProgramCall::Execute(payload) => P::execute(&mut Execute(()), &env, &payload),
             ProgramCall::Query(request) => P::query(&mut Query(()), &env, &request),
+            ProgramCall::Access(payload) => access::<P>(&env, &payload),
+            ProgramCall::Resource(key) => resource::<P>(&env, &key),
             ProgramCall::Hook(record) => hook::<P>(&env, record),
             ProgramCall::Resume { .. } => Err(Refusal::new(
                 reason::UNSUPPORTED,
                 "this program awaits nothing",
             )),
         }
+    }
+
+    fn access<P: Program>(env: &Env, payload: &[u8]) -> ProgramReply {
+        let mut ctx = Query(());
+        let needs = P::access(&mut ctx, env, payload)?;
+        ctx.reply(&needs);
+        Ok(())
+    }
+
+    fn resource<P: Program>(env: &Env, key: &str) -> ProgramReply {
+        let mut ctx = Query(());
+        let resource = P::resource(&mut ctx, env, key)?;
+        ctx.reply(&resource);
+        Ok(())
     }
 
     fn hook<P: Program>(env: &Env, record: abi::hook::Record) -> ProgramReply {
@@ -217,6 +236,20 @@ mod context {
                 request: request.into(),
             }) {
                 HostReply::Query(answer) => answer,
+                other => protocol("query answer", other),
+            }
+        }
+
+        fn resource(
+            &self,
+            program: impl Into<ProgramId>,
+            key: impl Into<String>,
+        ) -> Result<Resource, Refusal> {
+            match self.host(&HostOp::Resource {
+                program: program.into(),
+                key: key.into(),
+            }) {
+                HostReply::Query(answer) => abi::decode(&answer?),
                 other => protocol("query answer", other),
             }
         }
@@ -405,24 +438,6 @@ mod context {
             let op = abi::role::awaits::Op::Resolve { ticket, answer };
             self.emit(awaits, abi::encode(&op), false);
             Ok(())
-        }
-
-        /// Binds `program` to `role` in the network's roles table, or unbinds
-        /// the role when `program` is `None`; the validators role's alone, on
-        /// its vote, and never a role in `abi::role::REQUIRED`.
-        pub fn bind(
-            &mut self,
-            role: impl Into<String>,
-            program: Option<ProgramId>,
-        ) -> Result<(), Refusal> {
-            match host(&HostOp::Bind {
-                role: role.into(),
-                program,
-            }) {
-                HostReply::Done => Ok(()),
-                HostReply::Refused(refusal) => Err(refusal),
-                other => protocol("done", other),
-            }
         }
     }
 

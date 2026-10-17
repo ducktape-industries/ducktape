@@ -31,8 +31,11 @@ mod program {
     use core::pin::Pin;
     use core::task::Poll;
 
+    use abi::Env;
+    use abi::role::access::{Need, Resource};
     use abi::role::awaits::Answer;
     use abi::{ProgramReply, Refusal, reason};
+    use program::Query;
     use program::awaiting::{AwaitingProgram, Call, Ctx};
 
     use crate::{ANSWERS, Finished, Plan};
@@ -104,6 +107,14 @@ mod program {
     }
 
     impl AwaitingProgram for Awaiter {
+        fn access(_ctx: &mut Query, _env: &Env, _payload: &[u8]) -> Result<Vec<Need>, Refusal> {
+            Ok(Vec::new())
+        }
+
+        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
+            Ok(Resource::default())
+        }
+
         async fn execute(ctx: Ctx, payload: Vec<u8>) -> ProgramReply {
             let plan: Plan = abi::decode(&payload)
                 .map_err(|fault| Refusal::new(reason::INVALID_INPUT, fault.sentence))?;

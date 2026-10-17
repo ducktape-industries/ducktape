@@ -3,7 +3,7 @@
 
 use abi::BlobId;
 use abi::role::identity::AccountNumber;
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
 use crate::{Collision, id_of, parse};
 
@@ -13,7 +13,7 @@ pub const BUNDLES: &[u8] = b"b/";
 pub const INDEX: &[u8] = b"i/";
 pub const NEXT: &[u8] = b"next";
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Entry {
     pub id: BlobId,
     pub len: u64,
@@ -41,25 +41,25 @@ impl Entry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Op {
     Put { blobs: Vec<Entry> },
     Receipt { bundle: u64 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Query {
     Held { blob: BlobId },
     Bundle { n: u64 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Custody {
     Receipted(Vec<Vec<u8>>),
     Held { since: u64 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Bundle {
     pub putter: AccountNumber,
     pub height: u64,
@@ -87,7 +87,7 @@ impl Bundle {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct Holding {
     pub bundle: u64,
     pub len: u64,
@@ -95,7 +95,7 @@ pub struct Holding {
     pub since: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Reply {
     Held(Option<Holding>),
     Bundle(Option<Bundle>),

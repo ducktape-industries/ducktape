@@ -27,6 +27,7 @@ const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wa
 const BLOBS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_blobs.wasm");
 const AWAITS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_awaits.wasm");
 const HALO: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_halo.wasm");
+const ACCESS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_access.wasm");
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
@@ -225,6 +226,7 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("blobs.wasm"), BLOBS).unwrap();
     std::fs::write(root.join("awaits.wasm"), AWAITS).unwrap();
     std::fs::write(root.join("halo.wasm"), HALO).unwrap();
+    std::fs::write(root.join("access.wasm"), ACCESS).unwrap();
     let lanes = vec![
         halo::Founded {
             name: blob::contract::LANE.to_owned(),
@@ -250,17 +252,18 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
          block_time_ms = {BLOCK_TIME_MS}\nmember_cap = {MEMBER_CAP}\n\
-         [roles]\nprograms = \"programs\"\nvalidators = \"valset\"\nidentity = \"identity\"\n\
-         blobs = \"blobs\"\nawaits = \"awaits\"\nhalo = \"halo\"\n\
          {validators}\
-         [[programs]]\nid = \"programs\"\ncode = \"programs.wasm\"\n\
-         [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\n\
+         [[programs]]\nid = \"programs\"\ncode = \"programs.wasm\"\nroles = [\"programs\"]\n\
+         [[programs]]\nid = \"valset\"\ncode = \"valset.wasm\"\nroles = [\"validators\"]\n\
          [[programs]]\nid = \"identity\"\ncode = \"identity.wasm\"\nparams = \"holders.bin\"\n\
-         [[programs]]\nid = \"blobs\"\ncode = \"blobs.wasm\"\n\
+         roles = [\"identity\"]\n\
+         [[programs]]\nid = \"blobs\"\ncode = \"blobs.wasm\"\nroles = [\"blobs\"]\n\
          [[programs]]\nid = \"ping\"\ncode = \"relay.wasm\"\n\
          [[programs]]\nid = \"probe\"\ncode = \"probe.wasm\"\nparams = \"params.bin\"\n\
-         [[programs]]\nid = \"awaits\"\ncode = \"awaits.wasm\"\n\
-         [[programs]]\nid = \"halo\"\ncode = \"halo.wasm\"\nparams = \"halo.params\"\n"
+         [[programs]]\nid = \"awaits\"\ncode = \"awaits.wasm\"\nroles = [\"awaits\"]\n\
+         [[programs]]\nid = \"halo\"\ncode = \"halo.wasm\"\nparams = \"halo.params\"\n\
+         roles = [\"halo\"]\n\
+         [[programs]]\nid = \"access\"\ncode = \"access.wasm\"\nroles = [\"access\"]\n"
     );
     let path = root.join("genesis.toml");
     std::fs::write(&path, text).unwrap();
