@@ -62,14 +62,15 @@ scripts back a `make` target; see the repository `Makefile`.
   - puts every program and view whose code changes as `program` blobs, signed
     by `DUCKTAPE_PUT`'s wallet, which needs an account;
   - admits `access`, then binds the access role to it, and binds a role to
-    `forge`, `files` and `harness` each, so the vote reaches their one-time
+    `forge`, `chat`, `files` and `harness` each, so the vote reaches their one-time
     `Migrate` op (`ducktape vote bind`);
   - swaps every program but `programs` and `valset`, and every view, to its
     new code at one block, and checks the programs program holds each change
     (a vote is enacted even when the op it carries is refused);
-  - runs `Migrate` by vote on forge, files, harness, then identity (harness
-    reads the old answer lists identity drops), and unbinds the roles bound
-    for the move;
+  - runs `Migrate` by vote on forge, chat (which records who took part in
+    each thread from the replies it holds), files, harness, then identity
+    (harness reads the old answer lists identity drops), and unbinds the
+    roles bound for the move;
   - swaps the programs program, then runs its `Migrate`, which copies the
     kernel's role table into its own (its new code refuses every change
     while that table is empty);
