@@ -708,7 +708,7 @@ pub mod role {
             Agent,
         }
 
-        /// Whether a program account acts. Its manager alone changes it;
+        /// Whether a program account acts.
         /// `Revoked` is final.
         #[derive(
             Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
