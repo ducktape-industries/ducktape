@@ -74,7 +74,8 @@ scripts back a `make` target; see the repository `Makefile`.
   (`[services.pods] base = "http://10.43.80.80:8080"` in the node's
   `egress.toml`); a NetworkPolicy admits only the duckpond node pod, so the
   `ducktape-chain`, `ducktape-program` and `ducktape-request` headers it reads
-  are the node's.
+  are the node's. A call whose `ducktape-request` is not an egress request
+  number is refused with 400, since the service asks egress about it.
 - `k8s/pods/server.py` is the service, and `server.py fetch` the init
   container that fetches a pod's inputs. Its routes, under `/v1`: `pods`
   (create, list), `pods/NAME` (status, delete), `pods/NAME/logs`,
@@ -128,7 +129,9 @@ scripts back a `make` target; see the repository `Makefile`.
   already running, or answers what it answered once it ended, its exit code
   included, streamed or whole. The service keeps that answer while egress
   says the request is open, asking again whenever an exec starts or ends,
-  and forgets it once the request is gone. A restart of the service itself
+  and forgets it once the request is gone. An answer whose request egress
+  does not answer about stays until a later sweep can ask; it holds up no
+  other answer. A restart of the service itself
   forgets every answer and ends each open stream with nothing more: the
   command goes on in the pod, but its answer is lost.
 - The `run` and `out` containers both mount `/out` and every input at its

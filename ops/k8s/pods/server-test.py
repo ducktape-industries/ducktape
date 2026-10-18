@@ -525,6 +525,15 @@ class Asked(Served):
         self.assertIn("ducktape-program, ducktape-request", answer["error"])
         self.assertEqual(self.kube.calls, [])
 
+    def test_a_request_header_that_is_not_a_request_number_is_refused_before_anything_runs(self):
+        for request in ("operator-probe", "-1", "1.5", str(1 << 64)):
+            with self.subTest(request=request):
+                status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]}, asked(request))
+                self.assertEqual(status, 400)
+                self.assertIn("is not an egress request number", answer["error"])
+        self.assertEqual(self.kube.calls, [])
+        self.assertEqual(self.service.execs, {})
+
     def test_a_path_outside_the_routes_is_not_found(self):
         self.assertEqual(self.call("GET", "/v2/pods")[0], 404)
         self.assertEqual(self.call("PUT", "/v1/pods")[0], 404)
@@ -999,6 +1008,38 @@ class Repeated(Streamed):
         self.signer.request = ran(GONE)
         self.service.sweep()
         self.assertEqual((self.service.execs, self.signer.queries), ({}, [("egress", server.egress_request(41))] * 2))
+
+    def ended(self, *requests):
+        for request in requests:
+            running = server.Execution({"chain": "duckpond", "program": "operator", "request": request})
+            running.end(ran())
+            self.service.execs[("duckpond", "operator", request)] = running
+
+    def said(self):
+        events = []
+        self.addCleanup(setattr, server, "say", server.say)
+        server.say = lambda event, **fields: events.append((event, fields))
+        return events
+
+    def test_a_record_that_cannot_be_asked_about_stays_and_the_records_after_it_are_still_swept(self):
+        said = self.said()
+        self.ended("operator-probe", "5")
+        self.signer.request = ran(GONE)
+        for _ in range(4):
+            self.service.sweep()
+        self.assertEqual(list(self.service.execs), [("duckpond", "operator", "operator-probe")])
+        self.assertEqual([fields["attempts"] for event, fields in said if event == "pods_unswept"], [1, 2, 4])
+        self.assertEqual({fields["reason"] for event, fields in said}, {"request_unreadable"})
+
+    def test_a_record_egress_did_not_answer_for_stays_until_egress_says_its_request_is_gone(self):
+        said = self.said()
+        self.ended("7", "8")
+        self.signer.request = [ran(code=1, err="Error: the node refused the query"), ran(GONE)]
+        self.service.sweep()
+        self.assertEqual(list(self.service.execs), [("duckpond", "operator", "7")])
+        self.assertEqual([(event, fields["reason"]) for event, fields in said], [("pods_unswept", "egress_unanswered")])
+        self.service.sweep()
+        self.assertEqual(self.service.execs, {})
 
     def test_a_refusal_is_recorded_too(self):
         self.kube.answer("exec", ran(code=1, err=NOT_FOUND))

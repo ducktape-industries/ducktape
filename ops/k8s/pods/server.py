@@ -134,6 +134,7 @@ DROPPED = (
 )
 UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
 UNPLACED = "does not have a host assigned"
+REQUEST_NUMBER = re.compile(r"[0-9]+")
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
 RESOLVING = SAFE_GIT + 'cd "$1" && git rev-parse --verify --quiet "$2^{commit}"\n'
@@ -257,6 +258,7 @@ class Execution:
         self.asked = asked
         self.ended = threading.Event()
         self.result = None
+        self.unswept = 0
 
     def end(self, result):
         self.result = result
@@ -584,11 +586,20 @@ def absolute(path, field):
     return path
 
 
+def request_number(text):
+    if not REQUEST_NUMBER.fullmatch(text):
+        return None
+    number = int(text)
+    return number if number < 1 << 64 else None
+
+
 def asked_by(headers):
     asked = {name: headers.get(f"ducktape-{name}") for name in ASKED}
     missing = [f"ducktape-{name}" for name, value in asked.items() if not value]
     if missing:
         raise Refused(400, f"this service answers a network's egress calls only, and {', '.join(missing)} is missing")
+    if request_number(asked["request"]) is None:
+        raise Refused(400, f"ducktape-request {asked['request']!r} is not an egress request number, so this service could not ask egress about it")
     return asked
 
 
@@ -1281,13 +1292,19 @@ class Service:
         with self.lock:
             ended = [(key, run) for key, run in self.execs.items() if run.ended.is_set()]
         for key, run in ended:
-            try:
-                waits = self.waiting(run.asked)
-            except Refused:
-                continue
-            if not waits:
+            if not self.still_waits(run):
                 with self.lock:
                     self.execs.pop(key, None)
+
+    def still_waits(self, run):
+        try:
+            return self.waiting(run.asked)
+        except Exception as error:
+            run.unswept += 1
+            if run.unswept & (run.unswept - 1) == 0:
+                reason = "egress_unanswered" if isinstance(error, Refused) else "request_unreadable"
+                say("pods_unswept", attempts=run.unswept, reason=reason, detail=json.dumps(repr(error)))
+            return True
 
     def sweeper(self):
         while True:
