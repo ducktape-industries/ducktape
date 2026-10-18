@@ -104,8 +104,9 @@ scripts back a `make` target; see the repository `Makefile`.
   before the pod fetches it and local-path enforces no size. The kubelet
   measures a local-path claim as the whole disk under it, not the claim's
   own bytes, so `usage` gives no pod's share of that disk. A pod's
-  `disk_bytes` is its ephemeral storage on the root filesystem, without its
-  inputs and `/out`. `volume_disks` holds, once per node, the used and
+  `disk_bytes` is the kubelet's ephemeral-storage figure for it: its
+  containers' writable layers, its logs and its emptyDirs. It leaves out
+  the pod's inputs and `/out`. `volume_disks` holds, once per node, the used and
   capacity bytes of the disk under the pods' inputs and `/out`. `claims`
   lists only the claims no pod owns.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
