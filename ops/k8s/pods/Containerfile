@@ -6,6 +6,8 @@ COPY src/ .
 RUN cargo build --locked --release -p node-bin
 
 FROM docker.io/library/debian:trixie-slim
+ARG COMMIT
+LABEL org.opencontainers.image.revision=$COMMIT
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --user-group --create-home --home-dir /home/pods pods

@@ -6,6 +6,9 @@ import io
 import json
 import os
 import pathlib
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1415,6 +1418,21 @@ class Fetch(unittest.TestCase):
         self.assertEqual(self.calls[1][1], self.calls[2][1])
         self.assertEqual((self.root / "0" / "data").read_bytes(), b"abc")
         self.assertEqual((self.root / "1" / "data").read_bytes(), b"\x00asm")
+
+
+class Stopped(unittest.TestCase):
+    def test_a_sigterm_ends_the_service_at_once(self):
+        with tempfile.TemporaryDirectory() as keys:
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE="https://node", PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
+            process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(process.kill)
+            serving = next(line for line in iter(process.stderr.readline, "") if "event=pods_serving" in line)
+            self.assertIn("namespace=agents", serving)
+            process.send_signal(signal.SIGTERM)
+            said = process.stderr.read()
+            process.stderr.close()
+            self.assertEqual(process.wait(), 0)
+            self.assertIn("event=pods_stopping signal=SIGTERM", said)
 
 
 class Keys(unittest.TestCase):

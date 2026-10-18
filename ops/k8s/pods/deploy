@@ -29,7 +29,8 @@ echo "$duck_sha256  $stage/git-remote-duck" | sha256sum --check --quiet
 chmod +x "$stage/kubectl" "$stage/git-remote-duck"
 cp "$here/server.py" "$stage/server.py"
 tag=$(cat "$here/Containerfile" "$stage/server.py" <(echo "$commit $kubectl_version $duck_release") | sha256sum | cut -c1-12)
-nice -n 19 podman build --file "$here/Containerfile" --tag "localhost:$tunnel_port/pods:$tag" "$stage"
+nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \
+  --tag "localhost:$tunnel_port/pods:$tag" "$stage"
 ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
 podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/pods:$tag"
 image="localhost:5000/pods:$tag@$(cat "$stage/digest")"

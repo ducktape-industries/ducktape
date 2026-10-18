@@ -9,6 +9,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -1763,6 +1764,11 @@ def fetch_main():
         sys.exit(1)
 
 
+def exit_on_signal(number, frame):
+    say("pods_stopping", signal=signal.Signals(number).name)
+    sys.exit(0)
+
+
 def main():
     fetching = Fetching(
         image=os.environ.get("PODS_OUT_IMAGE", ""),
@@ -1779,6 +1785,7 @@ def main():
     threading.Thread(target=service.notifier.watch, daemon=True).start()
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), handler(service))
+    signal.signal(signal.SIGTERM, exit_on_signal)
     say("pods_serving", namespace=kube.namespace, listen=f"{host}:{port}", keyed=signer.held())
     server.serve_forever()
 
