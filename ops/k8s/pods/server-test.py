@@ -911,7 +911,9 @@ class Usage(Served):
         self.kube.answer("list", ran({"items": [building, done, unstated, web]}))
         self.kube.answer("claims", ran({"items": [claim]}))
         self.kube.answer("quotas", ran({"items": [quota]}))
+        whole_disk = {"usedBytes": 211394891776, "capacityBytes": 887466962944}
         self.stats.summaries["192.168.75.48"] = {
+            "node": {"nodeName": "fabrics-1"},
             "pods": [
                 {
                     "podRef": {"name": "b", "namespace": "agents"},
@@ -919,8 +921,8 @@ class Usage(Served):
                     "memory": {"workingSetBytes": 1000},
                     "ephemeral-storage": {"usedBytes": 50},
                     "volume": [
-                        {"name": "out", "usedBytes": 7, "pvcRef": {"name": "b-out", "namespace": "agents"}},
-                        {"name": "in-0", "usedBytes": 300, "pvcRef": {"name": "b-in-0", "namespace": "agents"}},
+                        {"name": "out", **whole_disk, "pvcRef": {"name": "b-out", "namespace": "agents"}},
+                        {"name": "in-0", **whole_disk, "pvcRef": {"name": "b-in-0", "namespace": "agents"}},
                         {"name": "cache", "usedBytes": 4000, "pvcRef": {"name": "cache", "namespace": "agents"}},
                     ],
                 },
@@ -942,7 +944,7 @@ class Usage(Served):
                 "memory_limit_bytes": 4 * 2**30,
                 "cpu_nanocores": 900,
                 "memory_bytes": 1000,
-                "disk_bytes": 357,
+                "disk_bytes": 50,
                 "storage_requested_bytes": 10 * 2**30,
             },
         )
@@ -950,6 +952,7 @@ class Usage(Served):
         self.assertEqual([row["pod"] for row in answer["pods"]], ["b", "d", "u", "w"])
         self.assertEqual((answer["pods"][2]["cpu_limit"], answer["pods"][2]["memory_limit_bytes"]), (0, 0))
         self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30}])
+        self.assertEqual(answer["volume_disks"], [{"node": "fabrics-1", "used_bytes": 211394891776, "capacity_bytes": 887466962944}])
 
     def test_usage_lists_no_claim_kubernetes_made_for_a_pods_volume(self):
         building = pod_json(name="b", phase="Running", requester="15")
@@ -965,6 +968,7 @@ class Usage(Served):
         self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30}])
         (total,) = answer["requesters"]
         self.assertEqual((total["pods"], total["claims"], total["storage_requested_bytes"]), (1, 1, 10 * 2**30))
+        self.assertEqual(answer["volume_disks"], [])
 
     def test_quantities_read_every_suffix(self):
         self.assertEqual(server.quantity("250m"), 0.25)

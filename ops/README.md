@@ -101,9 +101,13 @@ scripts back a `make` target; see the repository `Makefile`.
   PersistentVolumes, not on the node's root filesystem. Kubernetes creates
   each claim with its pod and deletes it with the pod. Each claim requests 1
   byte, the least the API accepts, because the service knows no input's size
-  before the pod fetches it and local-path enforces no size. `usage` counts
-  the bytes a pod's ephemeral volumes hold in its `disk_bytes`, and its
-  `claims` list only the claims no pod owns.
+  before the pod fetches it and local-path enforces no size. The kubelet
+  measures a local-path claim as the whole disk under it, not the claim's
+  own bytes, so `usage` gives no pod's share of that disk. A pod's
+  `disk_bytes` is its ephemeral storage on the root filesystem, without its
+  inputs and `/out`. `volume_disks` holds, once per node, the used and
+  capacity bytes of the disk under the pods' inputs and `/out`. `claims`
+  lists only the claims no pod owns.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. A pod

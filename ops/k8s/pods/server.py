@@ -930,10 +930,22 @@ def pod_limit(spec, resource):
     return max(running, starting)
 
 
-def disk_of(pod, entry):
-    claims = {volume["name"] for volume in (pod.get("spec") or {}).get("volumes") or [] if "ephemeral" in volume}
-    held = sum(volume.get("usedBytes") or 0 for volume in entry.get("volume") or [] if volume.get("name") in claims)
-    return ((entry.get("ephemeral-storage") or {}).get("usedBytes") or 0) + held
+def volume_disks(pods, summaries, namespace):
+    ephemeral = {pod["metadata"]["name"]: {volume["name"] for volume in (pod.get("spec") or {}).get("volumes") or [] if "ephemeral" in volume} for pod in pods}
+    disks = []
+    for summary in summaries:
+        held = [
+            volume
+            for entry in summary.get("pods", [])
+            if entry.get("podRef", {}).get("namespace") == namespace
+            for volume in entry.get("volume") or []
+            if volume.get("name") in ephemeral.get(entry.get("podRef", {}).get("name"), set())
+        ]
+        if not held:
+            continue
+        node = (summary.get("node") or {}).get("nodeName")
+        disks.append({"node": node, "used_bytes": held[0].get("usedBytes") or 0, "capacity_bytes": held[0].get("capacityBytes") or 0})
+    return disks
 
 
 def made_for_a_pod(claim):
@@ -962,7 +974,7 @@ def usage_of(pods, claims, summaries, quotas, namespace):
                 "memory_limit_bytes": int(pod_limit(pod.get("spec", {}), "memory")) if live else 0,
                 "cpu_nanocores": (entry.get("cpu") or {}).get("usageNanoCores") or 0,
                 "memory_bytes": (entry.get("memory") or {}).get("workingSetBytes") or 0,
-                "disk_bytes": disk_of(pod, entry),
+                "disk_bytes": (entry.get("ephemeral-storage") or {}).get("usedBytes") or 0,
             }
         )
     held = [
@@ -983,7 +995,7 @@ def usage_of(pods, claims, summaries, quotas, namespace):
             total[field] += row.get(field, 0)
     ordered = sorted(totals.values(), key=lambda total: (total["requester"] is None, total["requester"] or 0))
     quota = {item["metadata"]["name"]: {"hard": item.get("status", {}).get("hard", {}), "used": item.get("status", {}).get("used", {})} for item in quotas}
-    return {"quota": quota, "requesters": ordered, "pods": rows, "claims": held}
+    return {"quota": quota, "requesters": ordered, "pods": rows, "claims": held, "volume_disks": volume_disks(pods, summaries, namespace)}
 
 
 class Notifier:
