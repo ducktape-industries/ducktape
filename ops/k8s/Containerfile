@@ -8,4 +8,4 @@ COPY ducktape /usr/local/bin/ducktape
 ENV DUCKTAPE_HOME=/data NO_COLOR=1
 USER 1000:1000
 ENTRYPOINT ["ducktape"]
-CMD ["run", "--listen", "127.0.0.1:9000", "--http", "127.0.0.1:8844", "--halo", "0.0.0.0:9100"]
+CMD ["run", "--listen", "127.0.0.1:9000", "--http", "0.0.0.0:8844", "--halo", "0.0.0.0:9100"]

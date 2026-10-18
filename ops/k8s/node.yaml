@@ -1,5 +1,16 @@
-# The network's node: ducktape on its home, and cloudflared carrying the node's HTTP port to the address on chain.
-# Applied by ops/k8s/deploy, which substitutes NETWORK and IMAGE; the tunnel's token is the Secret `tunnel`.
+# The network's node: ducktape on its home, and the Service node-http that carries its HTTP port inside the cluster.
+# Applied by ops/k8s/deploy, which substitutes NETWORK and IMAGE.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-http
+  namespace: NETWORK
+spec:
+  selector:
+    app: node
+  ports:
+    - {name: http, port: 8844, targetPort: 8844}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,6 +28,7 @@ spec:
       labels:
         app: node
     spec:
+      priorityClassName: system-node-critical
       hostUsers: false
       dnsPolicy: None
       dnsConfig:
@@ -26,19 +38,10 @@ spec:
       containers:
         - name: node
           image: IMAGE
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
           volumeMounts:
             - {name: home, mountPath: /data}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            seccompProfile: {type: RuntimeDefault}
-        - name: tunnel
-          image: docker.io/cloudflare/cloudflared:2026.10.0
-          args: [tunnel, --no-autoupdate, --url, "http://127.0.0.1:8844", run]
-          env:
-            - name: TUNNEL_TOKEN
-              valueFrom:
-                secretKeyRef: {name: tunnel, key: token}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}

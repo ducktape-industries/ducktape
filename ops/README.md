@@ -30,8 +30,10 @@ scripts back a `make` target; see the repository `Makefile`.
   kubectl -n NETWORK delete pod found
   ```
 
-- Without it, it applies `k8s/node.yaml`: one pod running the node on
-  `home` and cloudflared, which carries the node's HTTP port, and the
+- Without it, it applies `k8s/tunnel.yaml` and `k8s/node.yaml`.
+  `node.yaml` is the deployment `node`, one pod running the node on `home`,
+  and the Service `node-http` on the node's HTTP port, `8844`. `tunnel.yaml`
+  is the deployment `tunnel`: cloudflared, which carries `node-http`, and the
   WebSocket on it that peers dial, through a Cloudflare tunnel. The founding
   file's `address` is `wss://` and the tunnel's hostname. The node binds halo
   at `0.0.0.0:9100` and registers the host:port given to `init --halo`.
@@ -44,9 +46,20 @@ scripts back a `make` target; see the repository `Makefile`.
   kubectl -n NETWORK create secret generic tunnel --from-literal=token="$(cloudflared tunnel token NETWORK)"
   ```
 
-- The pod is the only writer of `home`: the deployment replaces it, never
-  runs two. Reach the node with
+- The node's pod is the only writer of `home`: the deployment replaces it,
+  never runs two. Reach the node with
   `kubectl -n NETWORK exec deploy/node -c node -- ducktape <verb>`.
+- Cloudflare spreads a tunnel's traffic over every connector it has, so the
+  tunnel deployment starts a new cloudflared, waits until its `/ready`
+  answers, and only then stops the old one. Restarting the node leaves the
+  tunnel up; the public address fails only while the node is down.
+- The node's pod runs at PriorityClass `system-node-critical`, the tunnel's
+  at `system-cluster-critical`. The kubelet never evicts a pod of either
+  class when the machine runs short. It gives the node's processes OOM score
+  -997 whatever they request, so the kernel kills an agent's process before
+  the node's. The tunnel's score follows from its memory request, as for any
+  pod that requests some. Both request the CPU and memory they were measured
+  to use and set no limit, so nothing kills the node for passing one.
 
 ## Agents' computing on Kubernetes
 
