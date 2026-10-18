@@ -528,6 +528,10 @@ async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, Whole(body): Wh
             Ok(()) => Reply::Answered(()),
             Err(error) => Reply::Refused(Refusal::new(reason::INVALID_INPUT, error)),
         },
+        Admin::EgressReload => match daemon.egress.reload() {
+            Ok(()) => Reply::Answered(()),
+            Err(refused) => Reply::Refused(Refusal::new(refused.reason(), refused.to_string())),
+        },
     }
 }
 

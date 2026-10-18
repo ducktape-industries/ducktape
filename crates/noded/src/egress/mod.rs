@@ -3,6 +3,7 @@
 mod call;
 mod config;
 mod desk;
+mod station;
 mod stream;
 
 use std::sync::Arc;
@@ -15,36 +16,31 @@ use futures::channel::mpsc;
 use host::Layer;
 use node::{Frame, Node, Preconfirm, Source, Taken};
 
-pub use call::Clients;
-pub use config::Config;
+pub use config::{Config, Refused};
+pub use station::Station;
 
 use crate::egress::call::Caller;
 use crate::egress::desk::{Called, Desk, Purpose, Reading, Sent, Step};
+use crate::egress::station::Serving;
 use crate::{Context, Daemon, Error, Result};
 
 const TARGET: &str = "ducktape::egress";
 
 struct Worker<E: Context> {
     daemon: Arc<Daemon<E>>,
-    config: Arc<Config>,
-    clients: Arc<Clients>,
     answers: mpsc::UnboundedSender<(u64, Called)>,
 }
 
-pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clients) -> Handle<()> {
-    daemon
-        .context
-        .child("egress")
-        .spawn(move |_| work(daemon, config, clients))
+pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>) -> Handle<()> {
+    daemon.context.child("egress").spawn(move |_| work(daemon))
 }
 
-async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clients) {
+async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
     let (answers, mut answered) = mpsc::unbounded();
-    let mut desk = Desk::new(config.served());
+    let mut reloads = daemon.egress.subscribe();
+    let mut desk = Desk::new(reloads.borrow_and_update().config.served());
     let worker = Worker {
         daemon: daemon.clone(),
-        config: Arc::new(config),
-        clients: Arc::new(clients),
         answers,
     };
     let mut tips = daemon.tips.subscribe();
@@ -77,14 +73,15 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
                 let (role, reading) = match read {
                     Some(read) => read,
                     None => {
-                        if bound.unbound(&worker.config) {
-                            desk = Desk::new(worker.config.served());
+                        let serving = daemon.egress.current();
+                        if bound.unbound(&serving.config) {
+                            desk = Desk::new(serving.config.served());
                         }
                         continue;
                     }
                 };
                 if bound.bound(&role) {
-                    desk = Desk::new(worker.config.served());
+                    desk = Desk::new(daemon.egress.current().config.served());
                 }
                 for step in desk.read(reading) {
                     worker.execute(&mut desk, step, &role).await;
@@ -97,6 +94,12 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>, config: Config, clients: Clien
                 if let Some(step) = desk.called(id, called) {
                     worker.execute(&mut desk, step, role).await;
                 }
+            }
+            reloaded = reloads.changed() => {
+                if reloaded.is_err() {
+                    return;
+                }
+                desk.want(reloads.borrow_and_update().config.served());
             }
         }
     }
@@ -229,8 +232,7 @@ impl<E: Context> Worker<E> {
 
     fn call(&self, row: RequestRow) -> Option<Step> {
         let daemon = self.daemon.clone();
-        let config = self.config.clone();
-        let clients = self.clients.clone();
+        let serving = self.daemon.egress.current();
         let answers = self.answers.clone();
         tracing::debug!(
             target: TARGET,
@@ -253,10 +255,10 @@ impl<E: Context> Worker<E> {
                             program: &row.requester,
                             id,
                         };
+                        let Serving { config, clients } = serving.as_ref();
                         let request = &row.request;
                         let delivery = &row.delivery;
-                        call::answer(&clients, &config, &caller, request, delivery, body, event)
-                            .await
+                        call::answer(clients, config, &caller, request, delivery, body, event).await
                     }
                     Err(reason) => Called::Whole(Answer::Failed(reason)),
                 };

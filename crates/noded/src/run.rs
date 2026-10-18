@@ -297,8 +297,7 @@ async fn start<E: Context>(
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
     let anchor = workspace.anchor()?;
-    let egress = workspace.egress()?;
-    let clients = crate::egress::Clients::new(egress.reach).map_err(Error::Egress)?;
+    let egress = crate::egress::Station::open(workspace.clone())?;
     let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     let network = Network {
         epoch_length: node.epoch_length()?,
@@ -448,6 +447,7 @@ async fn start<E: Context>(
         blobs,
         halo,
         live,
+        egress,
         key: identity.clone(),
         mesh: transport::loopback(listen.p2p),
         subscribers: Mutex::new(Vec::new()),
@@ -491,7 +491,7 @@ async fn start<E: Context>(
             }
         }
     });
-    let egressing = crate::egress::spawn(daemon.clone(), egress, clients);
+    let egressing = crate::egress::spawn(daemon.clone());
     let mut tasks = vec![pump, server, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(listen.p2p);

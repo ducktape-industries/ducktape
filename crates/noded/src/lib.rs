@@ -104,7 +104,7 @@ pub enum Error {
     #[error("the node closed its change stream")]
     Closed,
     #[error("egress: {0}")]
-    Egress(String),
+    Egress(#[from] egress::Refused),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
@@ -130,6 +130,7 @@ pub struct Daemon<E: Context> {
     pub blobs: blob::service::Service,
     halo: Arc<halo::Halo>,
     pub live: Arc<live::Relay<E>>,
+    egress: egress::Station,
     key: commonware_cryptography::ed25519::PrivateKey,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).

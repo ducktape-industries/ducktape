@@ -10,7 +10,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use url::Url;
 
-use crate::egress::config::{Config, Reach, Upstream};
+use crate::egress::config::{Config, Reach, Refused, Upstream};
 use crate::egress::desk::Called;
 use crate::egress::stream::Splitter;
 
@@ -22,16 +22,12 @@ pub struct Clients {
 }
 
 impl Clients {
-    pub fn new(reach: Reach) -> Result<Clients, String> {
+    pub fn new(reach: Reach) -> Result<Clients, Refused> {
         let internet = match reach {
             Reach::Public => builder().dns_resolver(Arc::new(PublicOnly)),
             Reach::Private => builder(),
         };
-        let built = |builder: reqwest::ClientBuilder| {
-            builder
-                .build()
-                .map_err(|error| format!("the HTTP client does not build: {error}"))
-        };
+        let built = |builder: reqwest::ClientBuilder| builder.build().map_err(Refused::Client);
         Ok(Clients {
             internet: built(internet)?,
             services: built(builder())?,

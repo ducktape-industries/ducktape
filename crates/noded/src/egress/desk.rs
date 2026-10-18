@@ -302,6 +302,15 @@ impl Desk {
         }
     }
 
+    pub fn want(&mut self, wanted: Vec<String>) {
+        let same = wanted == self.wanted;
+        if same {
+            return;
+        }
+        self.wanted = wanted;
+        self.serve = Sending::Unsigned;
+    }
+
     pub fn read(&mut self, reading: Reading) -> Vec<Step> {
         let mut steps = Vec::new();
         let assigned: BTreeSet<u64> = reading.assigned.iter().map(|row| row.id).collect();
