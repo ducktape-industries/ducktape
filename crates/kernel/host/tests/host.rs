@@ -2311,6 +2311,169 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
     });
 }
 
+fn put_blob(kind: &str, body: &[u8]) -> Step {
+    op(HostOp::BlobPut {
+        hash: HashKind::Sha256,
+        kind: kind.to_owned(),
+        body: body.to_vec(),
+    })
+}
+
+fn blob_id(kind: &str, body: &[u8]) -> BlobId {
+    blob::id_of(HashKind::Sha256, &blob::frame(kind, body).unwrap()).unwrap()
+}
+
+fn read_blob(id: BlobId) -> Vec<Step> {
+    vec![op(HostOp::BlobGet(id))]
+}
+
+fn blob_reply(kind: &str, body: &[u8]) -> Vec<Reply> {
+    vec![Reply::Host(HostReply::Blob(Some(Blob {
+        kind: kind.to_owned(),
+        body: body.to_vec(),
+    })))]
+}
+
+fn no_blob_reply() -> Vec<Reply> {
+    vec![Reply::Host(HostReply::Blob(None))]
+}
+
+#[test]
+fn a_preconfirmed_blob_reads_in_the_preconfirmed_layer_before_its_block_commits() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let id = blob_id("page", b"body");
+        let put = submit("probe", script(vec![put_blob("page", b"body")]));
+
+        let predicted = host.preconfirm(TIME, vec![put.clone()]).await.unwrap();
+        assert_eq!(
+            replies(&predicted[0]),
+            vec![Reply::Host(HostReply::BlobId(id))]
+        );
+        assert_eq!(
+            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            blob_reply("page", b"body")
+        );
+        assert_eq!(
+            ask(&host, Layer::Confirmed, "probe", read_blob(id)).await,
+            no_blob_reply()
+        );
+        assert_eq!(host.blob(&id, TIME).await.unwrap(), None);
+
+        host.apply(block(1, Vec::new())).await.unwrap();
+        assert_eq!(
+            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            no_blob_reply()
+        );
+        host.preconfirm(TIME, vec![put.clone()]).await.unwrap();
+        assert_eq!(
+            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            blob_reply("page", b"body")
+        );
+
+        host.apply(block(2, vec![put])).await.unwrap();
+        assert_eq!(
+            ask(&host, Layer::Confirmed, "probe", read_blob(id)).await,
+            blob_reply("page", b"body")
+        );
+        assert_eq!(
+            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            blob_reply("page", b"body")
+        );
+        assert_eq!(
+            host.blob(&id, TIME).await.unwrap(),
+            Some(blob::frame("page", b"body").unwrap())
+        );
+    });
+}
+
+#[test]
+fn a_failed_preconfirm_keeps_what_was_preconfirmed_before_it_and_nothing_of_its_own() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let lacking =
+            blobs::Entry::of(&blob::frame("page", b"held, never gathered").unwrap()).unwrap();
+        let lacked = lacking.id;
+        let lacking = abi::encode(&blobs::Op::Put {
+            blobs: vec![lacking],
+        });
+        let receipt = abi::encode(&blobs::Op::Receipt { bundle: 0 });
+        host.apply(block(1, vec![submit("blobs", lacking)]))
+            .await
+            .unwrap();
+        host.apply(block(
+            2,
+            vec![Submission {
+                signer: b"v1".to_vec(),
+                ..submit("blobs", receipt)
+            }],
+        ))
+        .await
+        .unwrap();
+
+        let earlier = submit(
+            "probe",
+            script(vec![set(b"k", b"v"), put_blob("page", b"body")]),
+        );
+        host.preconfirm(TIME, vec![earlier]).await.unwrap();
+
+        let beside = submit("probe", script(vec![set(b"m", b"y")]));
+        let failing = submit(
+            "probe",
+            script(vec![
+                set(b"j", b"x"),
+                put_blob("note", b"lost"),
+                op(HostOp::BlobGet(lacked)),
+            ]),
+        );
+        let failed = host
+            .preconfirm(TIME, vec![beside.clone(), failing.clone()])
+            .await;
+        assert!(
+            matches!(failed, Err(Error::BlobUnavailable(missing)) if missing == lacked),
+            "{failed:?}"
+        );
+
+        let preconfirmed = host.view(Layer::Preconfirmed);
+        assert_eq!(
+            preconfirmed.get("probe", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(preconfirmed.get("probe", b"j").unwrap(), None);
+        assert_eq!(preconfirmed.get("probe", b"m").unwrap(), None);
+        assert_eq!(
+            ask(
+                &host,
+                Layer::Preconfirmed,
+                "probe",
+                read_blob(blob_id("page", b"body"))
+            )
+            .await,
+            blob_reply("page", b"body")
+        );
+        assert_eq!(
+            ask(
+                &host,
+                Layer::Preconfirmed,
+                "probe",
+                read_blob(blob_id("note", b"lost"))
+            )
+            .await,
+            no_blob_reply()
+        );
+
+        let again = host.preconfirm(TIME, vec![failing]).await;
+        assert!(
+            matches!(again, Err(Error::BlobUnavailable(missing)) if missing == lacked),
+            "{again:?}"
+        );
+        let predicted = host.preconfirm(TIME, vec![beside]).await.unwrap();
+        assert_eq!(replies(&predicted[0]), vec![Reply::Host(HostReply::Done)]);
+    });
+}
+
 #[test]
 fn sibling_queries_route_by_id_and_a_cycle_is_refused() {
     deterministic::Runner::default().start(|context| async move {

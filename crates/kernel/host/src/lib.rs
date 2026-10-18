@@ -20,7 +20,7 @@ use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::{Fault, Suspended};
 use sha2::{Digest as _, Sha256};
-use state::{Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
+use state::{Checkpoint, Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
 
 use crate::parked::Waiter;
 use crate::parking::{Run, Segment, Start, Status};
@@ -174,10 +174,35 @@ where
     network: Vec<u8>,
     roles: Roles,
     loaded: Loaded,
-    preconfirmed: Overlay,
+    preconfirmed: Preconfirmed,
     hook_streaks: BTreeMap<ProgramId, u64>,
     scheduler_streak: u64,
     roster_streak: u64,
+}
+
+#[derive(Default)]
+struct Preconfirmed {
+    overlay: Overlay,
+    stage: Stage,
+}
+
+struct Mark {
+    checkpoint: Checkpoint,
+    staged: BTreeSet<BlobId>,
+}
+
+impl Preconfirmed {
+    fn mark(&self) -> Mark {
+        Mark {
+            checkpoint: self.overlay.checkpoint(),
+            staged: self.stage.ids().copied().collect(),
+        }
+    }
+
+    fn rewind(&mut self, mark: Mark) {
+        self.overlay.restore(mark.checkpoint);
+        self.stage.retain(|id| mark.staged.contains(id));
+    }
 }
 
 enum Submitted {
@@ -380,7 +405,7 @@ where
             network: genesis.network,
             roles: roles.clone(),
             loaded: Loaded::new(genesis.limits),
-            preconfirmed: Overlay::default(),
+            preconfirmed: Preconfirmed::default(),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
@@ -476,7 +501,7 @@ where
             network,
             roles,
             loaded: Loaded::new(limits),
-            preconfirmed: Overlay::default(),
+            preconfirmed: Preconfirmed::default(),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
@@ -596,7 +621,7 @@ where
     fn layers(&self, layer: Layer) -> Vec<&Overlay> {
         match layer {
             Layer::Confirmed => Vec::new(),
-            Layer::Preconfirmed => vec![&self.preconfirmed],
+            Layer::Preconfirmed => vec![&self.preconfirmed.overlay],
         }
     }
 
@@ -703,11 +728,15 @@ where
             return Err(Error::BlobUnavailable(code));
         }
         let height = self.height_of(layer)?;
-        let stage = Stage::default();
+        let confirmed = Stage::default();
+        let stage = match layer {
+            Layer::Confirmed => &confirmed,
+            Layer::Preconfirmed => &self.preconfirmed.stage,
+        };
         unit::query(
             self.world(height, time),
             self.layers(layer),
-            &stage,
+            stage,
             &[],
             origin,
             program.to_owned(),
@@ -797,16 +826,38 @@ where
     ) -> Result<Vec<Receipt>> {
         self.ready()?;
         let height = self.next_height()?;
-        let mut overlay = std::mem::take(&mut self.preconfirmed);
-        let mut stage = Stage::default();
+        let mut preconfirmed = std::mem::take(&mut self.preconfirmed);
+        let mark = preconfirmed.mark();
+        let predicted = self
+            .predict(submissions, height, time, &mut preconfirmed)
+            .await;
+        if predicted.is_err() {
+            preconfirmed.rewind(mark);
+        }
+        self.preconfirmed = preconfirmed;
+        predicted
+    }
+
+    async fn predict(
+        &self,
+        submissions: Vec<Submission>,
+        height: u64,
+        time: u64,
+        preconfirmed: &mut Preconfirmed,
+    ) -> Result<Vec<Receipt>> {
         let mut receipts = Vec::new();
         for submission in submissions {
             let submitted = self
-                .submit(submission, height, time, &mut overlay, &mut stage)
+                .submit(
+                    submission,
+                    height,
+                    time,
+                    &mut preconfirmed.overlay,
+                    &mut preconfirmed.stage,
+                )
                 .await?;
             receipts.push(submitted.receipt());
         }
-        self.preconfirmed = overlay;
         Ok(receipts)
     }
 
@@ -1966,7 +2017,7 @@ where
         for program in stale {
             self.store.remove_program(&program).await?;
         }
-        self.preconfirmed = Overlay::default();
+        self.preconfirmed = Preconfirmed::default();
         Ok(Applied {
             height: tip.height,
             admissions,
