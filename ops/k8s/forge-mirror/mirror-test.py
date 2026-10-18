@@ -202,7 +202,7 @@ class App(unittest.TestCase):
         from cryptography.hazmat.primitives.asymmetric import padding
 
         key, pem = app_key()
-        token = mirror.App("1234", "99", pem, clock=lambda: 1_000_000).jwt()
+        token = mirror.App("1234", "99", pem, ["ducktape"], clock=lambda: 1_000_000).jwt()
         header, claims, signature = token.split(".")
         self.assertEqual(json.loads(unpadded(header)), {"alg": "RS256", "typ": "JWT"})
         self.assertEqual(json.loads(unpadded(claims)), {"iat": 999_940, "exp": 1_000_540, "iss": 1234})
@@ -213,12 +213,13 @@ class App(unittest.TestCase):
         self.assertEqual(auth["GIT_CONFIG_KEY_0"], "http.https://github.com/.extraheader")
         self.assertEqual(auth["GIT_CONFIG_VALUE_0"], "AUTHORIZATION: basic " + mirror.base64.b64encode(b"x-access-token:tok").decode())
 
-    def test_a_token_is_minted_for_the_installation_and_kept_until_github_expires_it(self):
+    def test_a_token_is_minted_for_the_installation_and_its_repositories_and_kept_until_github_expires_it(self):
         minted = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
-                minted.append((self.path, self.headers["Authorization"].split()[0]))
+                asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                minted.append((self.path, self.headers["Authorization"].split()[0], asked))
                 body = json.dumps({"token": f"tok-{len(minted)}", "expires_at": "2026-10-19T00:00:00Z"}).encode()
                 self.send_response(201)
                 self.send_header("Content-Length", str(len(body)))
@@ -230,7 +231,7 @@ class App(unittest.TestCase):
 
         server, url = serve(Handler)
         now = [mirror.datetime.fromisoformat("2026-10-18T23:00:00Z").timestamp()]
-        app = mirror.App("1234", "99", app_key()[1], api=url, clock=lambda: now[0])
+        app = mirror.App("1234", "99", app_key()[1], ["ducktape", "programs", "app"], api=url, clock=lambda: now[0])
         first = app.auth()
         self.assertEqual(app.auth(), first)
         now[0] = mirror.datetime.fromisoformat("2026-10-19T00:00:00Z").timestamp()
@@ -238,7 +239,8 @@ class App(unittest.TestCase):
         server.shutdown()
         server.server_close()
         self.assertEqual(first, mirror.git_auth("tok-1"))
-        self.assertEqual(minted, [("/app/installations/99/access_tokens", "Bearer")] * 2)
+        asked = {"repositories": ["ducktape", "programs", "app"]}
+        self.assertEqual(minted, [("/app/installations/99/access_tokens", "Bearer", asked)] * 2)
 
     def test_a_refused_mint_stops_the_job_with_a_reason(self):
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -251,7 +253,7 @@ class App(unittest.TestCase):
                 pass
 
         server, url = serve(Handler)
-        app = mirror.App("1234", "99", app_key()[1], api=url)
+        app = mirror.App("1234", "99", app_key()[1], ["ducktape"], api=url)
         with self.assertRaises(mirror.Stopped) as stopped:
             app.auth()
         server.shutdown()
@@ -264,8 +266,8 @@ class App(unittest.TestCase):
             (root / "app_id").write_text("1234\n")
             (root / "installation_id").write_text("99\n")
             (root / "private_key").write_bytes(app_key()[1])
-            app = mirror.App.from_dir(root, "https://api")
-        self.assertEqual((app.app_id, app.installation, app.api), ("1234", "99", "https://api"))
+            app = mirror.App.from_dir(root, ("ducktape", "app"), "https://api")
+        self.assertEqual((app.app_id, app.installation, app.repositories, app.api), ("1234", "99", ["ducktape", "app"], "https://api"))
 
 
 class FakeNode:
@@ -308,6 +310,7 @@ class Sync(unittest.TestCase):
             state=root / "state",
             app=root / "app",
             pairs=(mirror.Pair("core", "ducktape-industries/ducktape", "dev"),),
+            repositories=("ducktape",),
             forge_url=f"file://{root}/forge/{{forge}}.git",
             github_url=f"file://{root}/github/{{github}}.git",
             api="http://api",
@@ -491,7 +494,7 @@ class Sync(unittest.TestCase):
 
 
 class ConfigFromEnv(unittest.TestCase):
-    def test_pairs_are_every_repo_on_every_branch_and_github_is_reached_over_https(self):
+    def test_pairs_are_every_repo_on_every_branch_and_the_token_asks_for_those_repositories(self):
         config = mirror.Config.from_env(
             {
                 "FORGE_MIRROR_NODE": "https://duckpond.ducktape.industries",
@@ -512,6 +515,7 @@ class ConfigFromEnv(unittest.TestCase):
                 ("programs", "ducktape-industries/programs", "main"),
             ],
         )
+        self.assertEqual(config.repositories, ("ducktape", "programs"))
         self.assertEqual(config.forge_url.format(forge="core"), "duck://duckpond-725bcad1/forge/core")
         self.assertEqual(config.github_url.format(github="ducktape-industries/app"), "https://github.com/ducktape-industries/app.git")
         self.assertEqual(config.api, "https://api.github.com")

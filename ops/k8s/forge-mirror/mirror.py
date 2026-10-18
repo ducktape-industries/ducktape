@@ -227,11 +227,12 @@ def issuer(app_id):
 
 
 class App:
-    def __init__(self, app_id, installation, key_pem, api=API, clock=time.time):
+    def __init__(self, app_id, installation, key_pem, repositories, api=API, clock=time.time):
         from cryptography.hazmat.primitives import serialization
 
         self.app_id = app_id
         self.installation = installation
+        self.repositories = list(repositories)
         self.key = serialization.load_pem_private_key(key_pem, password=None)
         self.api = api
         self.clock = clock
@@ -239,9 +240,9 @@ class App:
         self.expires = 0.0
 
     @staticmethod
-    def from_dir(path, api):
+    def from_dir(path, repositories, api):
         path = Path(path)
-        return App((path / "app_id").read_text().strip(), (path / "installation_id").read_text().strip(), (path / "private_key").read_bytes(), api)
+        return App((path / "app_id").read_text().strip(), (path / "installation_id").read_text().strip(), (path / "private_key").read_bytes(), repositories, api)
 
     def jwt(self):
         from cryptography.hazmat.primitives import hashes
@@ -256,11 +257,12 @@ class App:
     def mint(self):
         request = urllib.request.Request(
             f"{self.api}/app/installations/{self.installation}/access_tokens",
-            data=b"",
+            data=json.dumps({"repositories": self.repositories}).encode(),
             method="POST",
             headers={
                 "Authorization": f"Bearer {self.jwt()}",
                 "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": "forge-mirror",
             },
@@ -337,6 +339,7 @@ class Config:
     state: Path
     app: Path
     pairs: tuple
+    repositories: tuple
     forge_url: str
     github_url: str
     api: str
@@ -353,6 +356,7 @@ class Config:
             state=Path(env["FORGE_MIRROR_STATE"]),
             app=Path(env["FORGE_MIRROR_APP"]),
             pairs=tuple(Pair(forge, github, branch) for forge, github in repos for branch in branches),
+            repositories=tuple(dict.fromkeys(github.rsplit("/", 1)[-1] for _, github in repos)),
             forge_url=env.get("FORGE_MIRROR_FORGE_URL", f"duck://{chain}/forge/{{forge}}"),
             github_url=env.get("FORGE_MIRROR_GITHUB_URL", "https://github.com/{github}.git"),
             api=env.get("FORGE_MIRROR_API", API),
@@ -513,7 +517,7 @@ def main():
     home = config.state / "ducktape"
     home.mkdir(parents=True, exist_ok=True)
     os.environ["DUCKTAPE_HOME"] = str(home)
-    app = App.from_dir(config.app, config.api)
+    app = App.from_dir(config.app, config.repositories, config.api)
     try:
         Follower(config, Node(config.node), app).run()
     except Stopped as stopped:
