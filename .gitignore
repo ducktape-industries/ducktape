@@ -1,6 +1,7 @@
 /target
 /.worktree/
 **/*.rs.bk
+__pycache__/
 .DS_Store
 .claude/worktrees/
 .codex/worktrees/
