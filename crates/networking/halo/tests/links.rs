@@ -1,6 +1,6 @@
 // halo between nodes on loopback over QUIC: a stream each way on one connection, a member
 // no one can reach taking part by dialing out and reached over the connection it dials when
-// seated, the class an asker is served at, and the pacer's classes on a real link.
+// seated, and the class an asker is served at.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -187,13 +187,6 @@ fn a_resident_claiming_critical_is_served_at_member_and_a_validator_at_critical(
     });
 }
 
-const PACED: u64 = 4 << 20;
-const FETCHED: u64 = 4 << 20;
-const ENDLESS: u64 = 1 << 40;
-const LITTLE: u64 = FETCHED / 8;
-const SATURATING: usize = 0;
-const MEASURING: usize = 1;
-
 fn serve_bulk(server: &Node) {
     let served = server
         .halo
@@ -216,123 +209,6 @@ fn serve_bulk(server: &Node) {
                 let _ = stream.shutdown().await;
             });
         }
-    });
-}
-
-#[derive(Clone, Debug, Default)]
-struct Ledger {
-    sent: [u64; 2],
-    other_at_first: [Option<u64>; 2],
-    other_at_last: [Option<u64>; 2],
-}
-
-impl Ledger {
-    fn other_sent_during(&self, stream: usize) -> u64 {
-        let first = self.other_at_first[stream].expect("the stream sent its first chunk");
-        let last = self.other_at_last[stream].expect("the stream sent its last chunk");
-        last - first
-    }
-}
-
-fn asked(stream: usize, bytes: u64) -> Vec<u8> {
-    let mut meta = vec![stream as u8];
-    meta.extend_from_slice(&bytes.to_le_bytes());
-    meta
-}
-
-fn serve_ledgered(server: &Node, ledger: tokio::sync::watch::Sender<Ledger>) {
-    let served = server
-        .halo
-        .plane()
-        .streams(BULK, 4)
-        .unwrap_or_else(|_| unreachable!());
-    tokio::spawn(async move {
-        while let Some(inbound) = served.accept().await {
-            let stream_of = usize::from(inbound.meta[0]);
-            let other = 1 - stream_of;
-            let mut left = u64::from_le_bytes(inbound.meta[1..9].try_into().unwrap());
-            let mut stream = inbound.stream;
-            let ledger = ledger.clone();
-            tokio::spawn(async move {
-                let chunk = vec![7u8; 16 << 10];
-                while left > 0 {
-                    let now = left.min(chunk.len() as u64) as usize;
-                    if stream.write_all(&chunk[..now]).await.is_err() {
-                        return;
-                    }
-                    left -= now as u64;
-                    ledger.send_modify(|ledger| {
-                        ledger.sent[stream_of] += now as u64;
-                        let first = ledger.sent[other];
-                        ledger.other_at_first[stream_of].get_or_insert(first);
-                    });
-                }
-                ledger.send_modify(|ledger| {
-                    ledger.other_at_last[stream_of] = Some(ledger.sent[other]);
-                });
-                let _ = stream.shutdown().await;
-            });
-        }
-    });
-}
-
-async fn beside_bulk(context: &Context, bulk: Class, bulk_bytes: u64, fetch: Class) -> Ledger {
-    let server = node(&context.child("server"), 1, Some(PACED));
-    let client = node(&context.child("client"), 2, None);
-    seat_all(&[&server, &client], &[]);
-    let (ledger, mut ledgered) = tokio::sync::watch::channel(Ledger::default());
-    serve_ledgered(&server, ledger);
-    let wanting = client
-        .halo
-        .plane()
-        .streams(BULK, 4)
-        .unwrap_or_else(|_| unreachable!());
-    let mut saturating = wanting
-        .open(&server.key, bulk, &asked(SATURATING, bulk_bytes))
-        .await
-        .unwrap();
-    let mut buf = vec![0u8; 512 << 10];
-    saturating.read_exact(&mut buf).await.unwrap();
-    tokio::spawn(async move { while saturating.read(&mut buf).await.is_ok_and(|n| n > 0) {} });
-
-    let mut measuring = wanting
-        .open(&server.key, fetch, &asked(MEASURING, FETCHED))
-        .await
-        .unwrap();
-    let mut buf = vec![0u8; FETCHED as usize];
-    measuring.read_exact(&mut buf).await.unwrap();
-    let bulk_outranks = bulk.rank() < fetch.rank();
-    let higher = if bulk_outranks { SATURATING } else { MEASURING };
-    let finished = ledgered
-        .wait_for(|ledger| ledger.other_at_last[higher].is_some())
-        .await
-        .unwrap();
-    finished.clone()
-}
-
-#[test]
-fn client_bulk_sends_almost_nothing_while_a_critical_fetch_is_sent() {
-    runtime::Runner::default().start(|context| async move {
-        let ledger = beside_bulk(&context, Class::Client, ENDLESS, Class::Critical).await;
-        assert_eq!(opened(&context, "client"), 2);
-        let bulk = ledger.other_sent_during(MEASURING);
-        assert!(
-            bulk < LITTLE,
-            "client bulk sent {bulk} bytes while a critical fetch of {FETCHED} was sent: {ledger:?}"
-        );
-    });
-}
-
-#[test]
-fn a_client_fetch_sends_almost_nothing_while_critical_bulk_is_sent() {
-    runtime::Runner::default().start(|context| async move {
-        let ledger = beside_bulk(&context, Class::Critical, 2 * FETCHED, Class::Client).await;
-        assert_eq!(opened(&context, "client"), 2);
-        let fetched = ledger.other_sent_during(SATURATING);
-        assert!(
-            fetched < LITTLE,
-            "a client fetch sent {fetched} bytes while critical bulk was sent: {ledger:?}"
-        );
     });
 }
 

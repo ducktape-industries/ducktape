@@ -1,5 +1,6 @@
 // The pacer's classes on the sim medium under a paused clock: a stream of a higher class
-// keeps the server's whole budget while a lower class saturates it.
+// keeps the server's whole budget while a lower class saturates it, at a slow budget and at a
+// fast one, whose two grant-times are shorter than one tick of the timer a waiting stream sleeps on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,12 +11,13 @@ use halo::{Class, Lane, Members, Pacer, Plane, Seat};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::time::Instant;
 
-const BUDGET: u64 = 1 << 20;
+const SLOW: u64 = 1 << 20;
+const FAST: u64 = 64 << 20;
 const FETCHED: usize = 1 << 20;
 const ENDLESS: u64 = 1 << 40;
 const LANE: &str = "bulk";
 
-async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Duration {
+async fn fetch_beside_bulk(budget: u64, bulk: Class, bulk_bytes: u64, fetch: Class) -> Duration {
     let server = PrivateKey::from_seed(1).public_key();
     let client = PrivateKey::from_seed(2).public_key();
     let members = Arc::new(Members::default());
@@ -28,12 +30,12 @@ async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Durati
     let serving = Plane::new(
         Arc::new(net.join(server.clone())),
         members.clone(),
-        Pacer::new(BUDGET, 64 << 10),
+        Pacer::new(budget, 64 << 10),
     );
     let asking = Plane::new(
         Arc::new(net.join(client)),
         members,
-        Pacer::new(100 * BUDGET, 64 << 10),
+        Pacer::new(100 * budget, 64 << 10),
     );
     let table = vec![Lane {
         name: LANE.into(),
@@ -78,7 +80,7 @@ async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Durati
         .await
         .unwrap();
     let mut buf = vec![0u8; FETCHED];
-    let fetched = tokio::time::timeout(alone() * 10, fetching.read_exact(&mut buf)).await;
+    let fetched = tokio::time::timeout(alone(budget) * 10, fetching.read_exact(&mut buf)).await;
     fetched.expect("the fetch is never served").unwrap();
     let took = started.elapsed();
     drop(serving);
@@ -86,36 +88,55 @@ async fn fetch_beside_bulk(bulk: Class, bulk_bytes: u64, fetch: Class) -> Durati
     took
 }
 
-fn alone() -> Duration {
-    Duration::from_secs_f64(FETCHED as f64 / BUDGET as f64)
+fn alone(budget: u64) -> Duration {
+    Duration::from_secs_f64(FETCHED as f64 / budget as f64)
+}
+
+async fn critical_fetch_beside_saturating(budget: u64, bulk: Class) {
+    let took = fetch_beside_bulk(budget, bulk, ENDLESS, Class::Critical).await;
+    let alone = alone(budget);
+    assert!(
+        took < alone.mul_f64(1.2),
+        "a critical fetch beside saturating {bulk:?} bulk at {budget} bytes/s took {took:?}, alone {alone:?}"
+    );
+}
+
+async fn client_fetch_beside_critical(budget: u64) {
+    let bulk = 2 * FETCHED as u64;
+    let took = fetch_beside_bulk(budget, Class::Critical, bulk, Class::Client).await;
+    let alone = alone(budget);
+    assert!(
+        took > alone.mul_f64(2.0),
+        "a client fetch beside critical bulk at {budget} bytes/s took {took:?}, alone {alone:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_saturated_client_class_does_not_delay_a_critical_fetch() {
-    let took = fetch_beside_bulk(Class::Client, ENDLESS, Class::Critical).await;
-    assert!(
-        took < alone().mul_f64(1.2),
-        "a critical fetch beside saturating client bulk took {took:?}, alone {:?}",
-        alone()
-    );
+    critical_fetch_beside_saturating(SLOW, Class::Client).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn member_bulk_does_not_delay_a_critical_fetch() {
-    let took = fetch_beside_bulk(Class::Member, ENDLESS, Class::Critical).await;
-    assert!(
-        took < alone().mul_f64(1.2),
-        "a critical fetch beside saturating member bulk took {took:?}, alone {:?}",
-        alone()
-    );
+    critical_fetch_beside_saturating(SLOW, Class::Member).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_client_fetch_waits_until_critical_bulk_is_done() {
-    let took = fetch_beside_bulk(Class::Critical, 2 * FETCHED as u64, Class::Client).await;
-    assert!(
-        took > alone().mul_f64(2.0),
-        "a client fetch beside critical bulk took {took:?}, alone {:?}",
-        alone()
-    );
+    client_fetch_beside_critical(SLOW).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_a_fast_budget_a_saturated_client_class_does_not_delay_a_critical_fetch() {
+    critical_fetch_beside_saturating(FAST, Class::Client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_a_fast_budget_member_bulk_does_not_delay_a_critical_fetch() {
+    critical_fetch_beside_saturating(FAST, Class::Member).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_a_fast_budget_a_client_fetch_waits_until_critical_bulk_is_done() {
+    client_fetch_beside_critical(FAST).await;
 }

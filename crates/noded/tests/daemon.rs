@@ -432,6 +432,7 @@ fn a_validator_serves_its_network_over_http() {
         );
 
         let mut changes = client.changes("probe").await.unwrap();
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
         let failed = frame(&client, &alice, vec![Step::Fail("no".into())]).await;
         let rejected = preconfirmed(&client, failed.clone()).await;
         let Outcome::Rejected(refusal) = &rejected.outcome else {
@@ -463,7 +464,16 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(entries.len(), 1);
         let status = client.status().await.unwrap();
         assert!(status.height >= change.height);
-        assert_eq!(status.root, change.root);
+        // a block may land after the change's; the status names the root its
+        // own height published, and every block publishes its height
+        let at_status = loop {
+            let block = blocks.next().await.unwrap().unwrap();
+            if block.height >= status.height {
+                break block;
+            }
+        };
+        assert_eq!(at_status.height, status.height);
+        assert_eq!(status.root, at_status.root);
 
         // the lone validator's row: its engine booked its own finalize vote
         // for the block that wrote the change before that block could be
@@ -992,86 +1002,101 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
     live.thread.join().unwrap();
 }
 
-/// One validator, and a stranger that joins: it enrolls, waits for the epoch
-/// that seats it as a resident, and state-syncs inside it. It follows at
-/// the tip: it applies the changes the validator
-/// makes after it starts, and comes within two blocks of the validator before
-/// the validator applies the block that closes the epoch, so no next-epoch
-/// traffic carried it.
+/// Two validators, and a stranger that joins: it enrolls, waits for the
+/// epoch that seats it as a resident, and state-syncs inside it. The set of
+/// two needs both, so once the second shuts down the chain stops inside that
+/// epoch, and the resident follows at the tip however long it takes: it
+/// comes within two blocks of the validator before the validator applies
+/// the block that closes the epoch, so no next-epoch traffic carried it.
+/// With the second validator back, the resident applies a change the
+/// validators make after it started, and hears their finalize votes. The
+/// second validator registers no address and dials out, so it comes back on
+/// ports of its own: none it left free can be taken in between.
 #[test]
 fn a_resident_follows_at_the_tip() {
-    // long enough that the resident joins, starts and catches up inside
-    // one epoch
+    // long enough that the resident joins and the chain stops inside one
+    // epoch
     const EPOCH: u64 = 100;
     let root = tempfile::tempdir().unwrap();
-    let seat = Seat::new(root.path(), "n0");
-    let mut resident = Seat::new(root.path(), "n1");
+    let mut seats: Vec<Seat> = (0..2)
+        .map(|i| Seat::new(root.path(), &format!("n{i}")))
+        .collect();
+    seats[1].address = None;
+    let mut resident = Seat::new(root.path(), "n2");
     resident.address = None;
-    let founding = founding(root.path(), &[&seat], EPOCH);
-    seat.init(&founding);
-    let live = seat.start();
-    let client = live.client.clone();
+    let founding = founding(root.path(), &seats.iter().collect::<Vec<_>>(), EPOCH);
+    for seat in &seats {
+        seat.init(&founding);
+    }
+    let mut live: Vec<Live> = seats.iter().map(Seat::start).collect();
+    let client = live[0].client.clone();
     let alice = ed25519::PrivateKey::from_seed(11);
     let runtime = client_runtime();
 
     resident.join(&client);
     let epoch = runtime.block_on(client.status()).unwrap().epoch;
     let closing = (epoch + 1) * EPOCH - 1;
+    runtime.block_on(seats[1].admin(&live[1].client, Admin::Shutdown));
+    let stopped = live.pop().unwrap();
+    stopped.thread.join().unwrap();
     let follower = resident.start();
     runtime.block_on(async {
-        let mut changes = follower.client.changes("probe").await.unwrap();
-        let follow = async {
-            let mut round: u64 = 1;
-            loop {
-                let write = set(b"a", &round.to_be_bytes());
-                client
-                    .submit(frame(&client, &alice, vec![write]).await, Preconfirm::Off)
-                    .await
-                    .unwrap();
-                changes.next().await.unwrap().unwrap();
-                // the resident first, so the validator's height bounds it
-                let followed = follower.client.status().await.unwrap().height;
-                let validator = client.status().await.unwrap().height;
-                assert!(
-                    validator < closing,
-                    "the resident was at {followed} once the validator applied {validator}: \
-                     block {closing} closes epoch {epoch}, so it followed only across the boundary"
-                );
-                if followed + 2 >= validator {
-                    return;
-                }
-                round += 1;
-            }
-        };
-        ::tokio::time::timeout(Duration::from_secs(120), follow)
-            .await
-            .expect("the resident applies each change");
         let mut blocks = follower.client.changes(host::RECENT).await.unwrap();
-        let heard = async {
-            loop {
-                let network = follower.client.network().await.unwrap();
-                let signed = |key: Vec<u8>| {
-                    let row = network.members.iter().find(|row| row.key == key);
-                    row.and_then(|row| row.signed)
-                };
-                if let Some(height) = signed(seat.key()) {
-                    assert_eq!(network.members.len(), 2, "{network:?}");
-                    assert_eq!(signed(resident.key()), None, "{network:?}");
-                    assert!(height <= network.height, "{network:?}");
-                    return;
-                }
-                blocks.next().await.unwrap().unwrap();
+        loop {
+            // the resident first, so the validator's height bounds it
+            let followed = follower.client.status().await.unwrap().height;
+            let validator = client.status().await.unwrap().height;
+            assert!(
+                validator < closing,
+                "the resident was at {followed} once the validator applied {validator}: \
+                 block {closing} closes epoch {epoch}, so the chain went on past the epoch \
+                 the second validator left in"
+            );
+            if followed + 2 >= validator {
+                return;
             }
-        };
-        ::tokio::time::timeout(Duration::from_secs(30), heard)
+            blocks.next().await.unwrap().unwrap();
+        }
+    });
+
+    let back = &mut seats[1];
+    (back.p2p, back.http, back.tls) = (free_port(), free_port(), free_port());
+    back.halo = free_udp_port();
+    live.push(seats[1].start());
+    runtime.block_on(async {
+        let mut changes = follower.client.changes("probe").await.unwrap();
+        let write = set(b"a", b"after");
+        client
+            .submit(frame(&client, &alice, vec![write]).await, Preconfirm::Off)
             .await
-            .expect("the resident hears the validator's finalize votes");
-        for (seat, node) in [(&seat, &live), (&resident, &follower)] {
+            .unwrap();
+        let change = changes.next().await.unwrap().unwrap();
+        assert_eq!(
+            change.writes,
+            vec![(b"a".to_vec(), Some(b"after".to_vec()))]
+        );
+        let mut blocks = follower.client.changes(host::RECENT).await.unwrap();
+        loop {
+            let network = follower.client.network().await.unwrap();
+            let signed = |key: Vec<u8>| {
+                let row = network.members.iter().find(|row| row.key == key);
+                row.and_then(|row| row.signed)
+            };
+            if let Some(height) = signed(seats[0].key()) {
+                assert_eq!(network.members.len(), 3, "{network:?}");
+                assert_eq!(signed(resident.key()), None, "{network:?}");
+                assert!(height <= network.height, "{network:?}");
+                break;
+            }
+            blocks.next().await.unwrap().unwrap();
+        }
+        for (seat, node) in seats.iter().zip(&live).chain([(&resident, &follower)]) {
             seat.admin(&node.client, Admin::Shutdown).await;
         }
     });
-    live.thread.join().unwrap();
-    follower.thread.join().unwrap();
+    for node in live.into_iter().chain([follower]) {
+        node.thread.join().unwrap();
+    }
 }
 
 /// Three validators, and the valset drops the third. Once the chain is in
