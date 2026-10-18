@@ -1,7 +1,9 @@
 """Exercise forge-mirror against local git repositories standing in for forge and GitHub, a local websocket and HTTP node, and a local GitHub API; run by `make test`."""
+import contextlib
 import dataclasses
 import http.server
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -15,6 +17,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("mirror", HERE / "mirror.py")
 mirror = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mirror)
+SAY = mirror.say
 mirror.say = lambda event, **fields: None
 
 CORE_DEV_KEY = "722f636f72650000726566732f68656164732f6465760000"
@@ -52,6 +55,21 @@ class Said:
 
     def named(self, name):
         return [fields for event, fields in self.events if event == name]
+
+
+class Logging(unittest.TestCase):
+    def said(self, event, **fields):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            SAY(event, **fields)
+        return json.loads(out.getvalue())
+
+    def test_a_held_branch_and_a_failed_push_are_warnings_and_a_stop_is_an_error(self):
+        self.assertEqual(self.said("mirror_diverged", branch="dev"), {"level": "warn", "event": "mirror_diverged", "branch": "dev"})
+        self.assertEqual(self.said("push_failed")["level"], "warn")
+        self.assertEqual(self.said("stopped")["level"], "error")
+
+    def test_a_lifecycle_fact_is_info(self):
+        self.assertEqual(self.said("synced", outcome="pushed"), {"level": "info", "event": "synced", "outcome": "pushed"})
 
 
 class Encoding(unittest.TestCase):
@@ -372,26 +390,38 @@ class Sync(unittest.TestCase):
         self.assertEqual(self.mirror.sync(self.pair, "test"), "pushed")
         self.assertEqual(self.head(self.github), self.base)
 
-    def test_github_ahead_is_reset_to_forge_and_the_dropped_commits_logged(self):
+    def test_github_ahead_is_held_and_logged_and_keeps_its_commit(self):
         ahead = self.commit("github-only", self.base)
         self.put(self.github, ahead)
         with Said() as said:
-            self.assertEqual(self.mirror.sync(self.pair, "test"), "reset")
-        self.assertEqual(self.head(self.github), self.base)
-        self.assertEqual(said.named("reset"), [{"forge": "core", "github": "ducktape-industries/ducktape", "branch": "dev", "old": ahead, "new": self.base, "dropped": [ahead]}])
+            self.assertEqual(self.mirror.sync(self.pair, "test"), "held")
+        self.assertEqual(self.head(self.github), ahead)
+        self.assertEqual(
+            said.named("mirror_diverged"),
+            [{"forge": "core", "github": "ducktape-industries/ducktape", "branch": "dev", "cause": "test", "attempts": 1, "forge_head": self.base, "github_head": ahead}],
+        )
 
-    def test_a_divergence_resets_github_to_forge(self):
-        github_one = self.commit("github-1", self.base)
+    def test_a_divergence_is_held_on_each_later_block_until_a_person_resolves_it(self):
+        self.commit("github-1", self.base)
         github_two = self.commit("github-2")
         self.put(self.github, github_two)
         forge = self.commit("forge-1", self.base)
         self.on_forge(forge)
         with Said() as said:
-            self.assertEqual(self.mirror.sync(self.pair, "test"), "reset")
+            self.assertEqual(self.mirror.sync(self.pair, "test"), "held")
+            for height in range(2, 13):
+                self.mirror.wake([self.tick(height)])
+            self.assertEqual(self.mirror.attempts, {self.pair: 12})
+            self.assertEqual(self.head(self.github), github_two)
+            self.put(self.github, self.base)
+            self.mirror.wake([self.tick(13)])
+        self.assertEqual([fields["attempts"] for fields in said.named("mirror_diverged")], [1, 10])
+        self.assertEqual({(fields["forge_head"], fields["github_head"]) for fields in said.named("mirror_diverged")}, {(forge, github_two)})
+        self.assertEqual(said.named("push_recovered"), [{"forge": "core", "github": "ducktape-industries/ducktape", "branch": "dev", "attempts": 12}])
+        self.assertEqual(self.mirror.attempts, {})
         self.assertEqual(self.head(self.github), forge)
-        self.assertEqual(said.named("reset")[0]["dropped"], [github_two, github_one])
 
-    def test_a_push_that_loses_a_race_runs_the_job_again_against_the_new_head(self):
+    def test_a_push_that_loses_a_race_to_a_commit_forge_lacks_holds_and_keeps_that_commit(self):
         forge = self.commit("forge-1", self.base)
         self.on_forge(forge)
         raced = self.commit("github-raced", self.base)
@@ -399,16 +429,33 @@ class Sync(unittest.TestCase):
         push = clone.push
         moves = [raced]
 
-        def racing(branch, oid, lease, auth):
+        def racing(branch, oid, auth):
             if moves:
                 self.put(self.github, moves.pop())
-            return push(branch, oid, lease, auth)
+            return push(branch, oid, auth)
 
         clone.push = racing
         with Said() as said:
-            self.assertEqual(self.mirror.sync(self.pair, "test"), "reset")
-        self.assertEqual([fields["outcome"] for fields in said.named("synced")], ["raced", "reset"])
-        self.assertEqual(said.named("reset")[0]["dropped"], [raced])
+            self.assertEqual(self.mirror.sync(self.pair, "test"), "held")
+        self.assertEqual([fields["outcome"] for fields in said.named("synced")], ["raced"])
+        self.assertEqual(said.named("mirror_diverged")[0]["github_head"], raced)
+        self.assertEqual(self.head(self.github), raced)
+
+    def test_a_push_that_loses_a_race_to_a_commit_forge_holds_fast_forwards_past_it(self):
+        middle = self.commit("middle", self.base)
+        forge = self.commit("forge-1")
+        self.on_forge(forge)
+        clone = self.mirror.mirror(self.pair)
+        push = clone.push
+        moves = [middle]
+
+        def racing(branch, oid, auth):
+            if moves:
+                self.put(self.github, moves.pop())
+            return push(branch, oid, auth)
+
+        clone.push = racing
+        self.assertEqual(self.mirror.sync(self.pair, "test"), "pushed")
         self.assertEqual(self.head(self.github), forge)
 
     def test_a_refused_push_is_tried_again_on_each_later_block_and_logged_on_attempt_one_and_every_tenth(self):

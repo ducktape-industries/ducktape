@@ -110,14 +110,16 @@ scripts back a `make` target; see the repository `Makefile`.
 - `k8s/forge-mirror/mirror.py` is forge-mirror, which carries the other
   direction. It follows duckpond's forge writes over `/v1/changes/forge`. A
   block that moves a followed forge branch starts one job for that branch, and
-  so does a start. A job pushes forge's head to GitHub's branch of the same
-  name with `--force-with-lease` on the GitHub head it just read, so forge
-  always wins; a push that drops GitHub commits logs them as `reset`. A push
-  that loses a race with another GitHub push runs again. A job that fails
-  otherwise runs again at each later block that writes forge or the clock
-  program (`FORGE_MIRROR_CLOCK`, `scheduler`), and logs its first attempt and
-  every tenth with an `attempts` field. `k8s/forge-mirror/mirror-test.py`
-  covers it.
+  so does a start. A job fast-forwards GitHub's branch of the same name to
+  forge's head with a plain push, so it never drops a commit. When GitHub's
+  branch holds a commit forge lacks, the job pushes nothing to that branch
+  and logs the warning `mirror_diverged` with both heads: the branch is held
+  until a person makes GitHub's head one that forge's head contains. A push
+  that loses a race with another GitHub push runs again. A held branch, and a
+  job that fails otherwise, runs again at each later block that writes forge
+  or the clock program (`FORGE_MIRROR_CLOCK`, `scheduler`), and logs its first
+  attempt and every tenth with an `attempts` field.
+  `k8s/forge-mirror/mirror-test.py` covers it.
 - forge-mirror pushes over HTTPS as the GitHub App "ducktape forge-mirror",
   with an installation token it mints from the App's key. The Secret
   `forge-mirror/github-app` holds `app_id`, `installation_id` and

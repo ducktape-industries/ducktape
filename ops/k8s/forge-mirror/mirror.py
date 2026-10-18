@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# forge-mirror: pushes duckpond forge's dev and main of core, programs and app to GitHub's ducktape, programs and app, forge always winning, woken by the blocks that write them.
+# forge-mirror: fast-forwards GitHub's dev and main of ducktape, programs and app to duckpond forge's dev and main of core, programs and app, woken by the blocks that write them; a branch where GitHub holds a commit forge lacks is held, never overwritten.
 # ops/k8s/forge-mirror/forge-mirror.yaml runs it on fabrics-1 as the GitHub App in the Secret github-app; mirror-test.py tests it.
 import base64
 import json
@@ -23,6 +23,7 @@ API = "https://api.github.com"
 GITHUB_HEADER = "http.https://github.com/.extraheader"
 ATTEMPTS_PER_LINE = 10
 READ = object()
+LEVELS = {"mirror_diverged": "warn", "push_failed": "warn", "follow_broke": "warn", "stopped": "error"}
 
 
 class Stopped(Exception):
@@ -32,8 +33,15 @@ class Stopped(Exception):
         self.detail = detail
 
 
+class Diverged(Exception):
+    def __init__(self, forge, github):
+        super().__init__(f"GitHub holds {github}, which forge's {forge} lacks")
+        self.forge = forge
+        self.github = github
+
+
 def say(event, **fields):
-    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
+    print(json.dumps({"level": LEVELS.get(event, "info"), "event": event, **fields}, sort_keys=True), flush=True)
 
 
 def worth_a_line(attempts):
@@ -323,12 +331,11 @@ class Mirror:
         if not self.has(oid):
             raise Stopped("forge_moved", f"forge {self.path.stem} {branch} holds {oid}, which its fetch did not bring")
 
-    def only_in(self, tip, base):
-        return self.must("rev-list", tip, f"^{base}").split()
+    def descends(self, tip, ancestor):
+        return self.git("merge-base", "--is-ancestor", ancestor, tip).returncode == 0
 
-    def push(self, branch, oid, lease, auth):
-        guard = f"--force-with-lease=refs/heads/{branch}:{lease or ''}"
-        return self.git("push", "--quiet", "--porcelain", guard, self.github_url, f"{oid}:refs/heads/{branch}", auth=auth)
+    def push(self, branch, oid, auth):
+        return self.git("push", "--quiet", "--porcelain", self.github_url, f"{oid}:refs/heads/{branch}", auth=auth)
 
 
 @dataclass(frozen=True)
@@ -455,6 +462,9 @@ class Follower:
         try:
             forge = self.forge_head(pair) if head is READ else head
             outcome = self.settled(pair, forge, cause)
+        except Diverged as diverged:
+            self.held(pair, cause, diverged)
+            return "held"
         except Stopped as failed:
             self.failed(pair, cause, failed.reason, failed.detail)
             return "failed"
@@ -472,9 +482,18 @@ class Follower:
             if outcome != "raced":
                 return outcome
 
-    def failed(self, pair, cause, reason, detail):
+    def counted(self, pair):
         attempts = self.attempts.get(pair, 0) + 1
         self.attempts[pair] = attempts
+        return attempts
+
+    def held(self, pair, cause, diverged):
+        attempts = self.counted(pair)
+        if worth_a_line(attempts):
+            say("mirror_diverged", forge=pair.forge, github=pair.github, branch=pair.branch, cause=cause, attempts=attempts, forge_head=diverged.forge, github_head=diverged.github)
+
+    def failed(self, pair, cause, reason, detail):
+        attempts = self.counted(pair)
         if worth_a_line(attempts):
             say("push_failed", forge=pair.forge, github=pair.github, branch=pair.branch, cause=cause, attempts=attempts, reason=reason, detail=detail)
 
@@ -495,14 +514,13 @@ class Follower:
         if not fetched:
             return "raced"
         mirror.fetch_forge(pair.branch, forge)
-        dropped = [] if github is None else mirror.only_in(github, forge)
-        pushed = mirror.push(pair.branch, forge, github, auth)
+        behind = github is None or mirror.descends(forge, github)
+        if not behind:
+            raise Diverged(forge, github)
+        pushed = mirror.push(pair.branch, forge, auth)
         if pushed.returncode != 0:
             return self.refused(mirror, pair, github, pushed, auth)
-        if not dropped:
-            return "pushed"
-        say("reset", forge=pair.forge, github=pair.github, branch=pair.branch, old=github, new=forge, dropped=dropped)
-        return "reset"
+        return "pushed"
 
     def refused(self, mirror, pair, github, pushed, auth):
         now = mirror.github_head(pair.branch, auth)
