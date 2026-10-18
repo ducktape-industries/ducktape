@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the node image from a ducktape release, pushes it to the cluster node's registry, and applies a network's node and tunnel.
+# Builds the node image from the source of a ducktape commit, pushes it to the cluster node's registry, and applies a network's node and tunnel.
 # Usage: ops/k8s/deploy NETWORK COMMIT [--found]
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,10 +13,10 @@ tag=${commit:0:12}
 stage=$(mktemp -d)
 socket="$stage.ssh"
 trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
-gh release download "bin-$commit" -R ducktape-industries/ducktape \
-  -p ducktape-x86_64-unknown-linux-gnu.tar.gz -D "$stage"
-tar -xzf "$stage/ducktape-x86_64-unknown-linux-gnu.tar.gz" -C "$stage"
-podman build --file "$here/Containerfile" --tag "localhost:$tunnel_port/ducktape:$tag" "$stage"
+mkdir "$stage/src"
+git -C "$here" archive "$commit" | tar -x -C "$stage/src"
+nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \
+  --tag "localhost:$tunnel_port/ducktape:$tag" "$stage"
 ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
 podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/ducktape:$tag"
 image="localhost:5000/ducktape:$tag@$(cat "$stage/digest")"

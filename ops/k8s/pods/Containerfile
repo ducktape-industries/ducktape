@@ -1,10 +1,16 @@
-# The pods service image: Python, kubectl, git with git-remote-duck and a released ducktape CLI, running server.py as uid 1000.
-# Built by ops/k8s/pods/deploy from a staged context holding kubectl, ducktape, git-remote-duck and server.py.
+# The pods service image: Python, kubectl, git with git-remote-duck and the ducktape CLI built from one forge commit, running server.py as uid 1000.
+# Built by ops/k8s/pods/deploy from a staged context holding `git archive` of that commit under src/, kubectl, git-remote-duck and server.py.
+FROM docker.io/library/rust:1.96.1-trixie AS build
+WORKDIR /src
+COPY src/ .
+RUN cargo build --locked --release -p node-bin
+
 FROM docker.io/library/debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --user-group --create-home --home-dir /home/pods pods
-COPY kubectl ducktape git-remote-duck /usr/local/bin/
+COPY kubectl git-remote-duck /usr/local/bin/
+COPY --from=build /src/target/release/ducktape /usr/local/bin/ducktape
 COPY server.py /usr/local/lib/pods/server.py
 ENV NO_COLOR=1 PYTHONDONTWRITEBYTECODE=1 DUCKTAPE_DEVICE_KEY_STORE=file
 USER 1000:1000

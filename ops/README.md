@@ -13,8 +13,9 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## A network's node on Kubernetes
 
-- `k8s/deploy NETWORK COMMIT [--found]` builds `k8s/Containerfile`
-  around the Linux ducktape that release `bin-COMMIT` carries, pushes it to
+- `k8s/deploy NETWORK COMMIT [--found]` builds `k8s/Containerfile`: its
+  first stage builds ducktape from `git archive COMMIT` with Rust 1.96.1 on
+  Debian trixie, and the image runs that binary on trixie. It pushes it to
   the registry on the cluster node (`DEPLOY_NODE`, default
   `fabrics@fabrics-1`, at its `127.0.0.1:5000`), and applies
   `k8s/network.yaml`: the namespace `NETWORK` and the claim `home`, whose
@@ -64,9 +65,8 @@ scripts back a `make` target; see the repository `Makefile`.
 ## Agents' computing on Kubernetes
 
 - `AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY k8s/pods/deploy NODE_URL FORGE COMMIT` builds `k8s/pods/Containerfile` around
-  the Linux ducktape that release `bin-COMMIT` carries, kubectl and
-  git-remote-duck (a dev commit has no release, so `COMMIT` is the one the
-  network's node runs), pushes it to the cluster node's registry, and applies
+  the ducktape CLI built from `git archive COMMIT` the same way, kubectl and
+  git-remote-duck, pushes it to the cluster node's registry, and applies
   `k8s/pods/pods.yaml`: the service `pods` in namespace `pods` at
   `http://10.43.80.80:8080`, and namespace `agents`, where it runs what agents
   ask for; a pod's inputs come from the node at `NODE_URL` and its forge
