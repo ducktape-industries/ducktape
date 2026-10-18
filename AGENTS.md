@@ -91,6 +91,10 @@ under `ops/`.
 - All task work targets `dev`: worktrees fork from `origin/dev`, PRs are based
   on `dev`, and high-confidence reviewed PRs merge into `dev`. `main` advances
   only by an explicit, user-requested release of `dev`.
+- A hosted network (duckpond) runs released programs only. A request to put a
+  change on a hosted network is the request to release it: merge `dev` into
+  `main` in programs, wait for its `wasm-<commit>` release, and swap from that
+  release's founding. Never swap a build of `dev` or of a branch onto one.
 - Default feature/fix/doc work happens in an isolated git worktree rather than
   directly in the primary checkout. Use the current checkout only when the user
   explicitly asks for in-place work or the task is limited to repo-state repair.
