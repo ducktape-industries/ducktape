@@ -8,21 +8,12 @@ use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{Reply, Step};
+use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET};
 use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Tip};
 use keyscheme::KeyScheme;
 use node::{
     BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Preconfirm, Sequenced, Source, Taken,
 };
-
-const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
-const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
-const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
-const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
-const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
-const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
-const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
-const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"net";
 const TIME: u64 = 1_700_000_000;

@@ -8,9 +8,9 @@ use abi::{
     reason, role,
 };
 use fixture_awaiter::{ANSWERS, Finished, Plan};
+use fixture_wasm::AWAITER;
 use runtime::{Fault, Host, Limits, PAGE_BYTES, Ran, Runtime, Suspended};
 
-const AWAITER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaiter.wasm");
 const LIMITS: Limits = Limits {
     fuel: Some(500_000_000),
     memory_bytes: Some(64 << 20),

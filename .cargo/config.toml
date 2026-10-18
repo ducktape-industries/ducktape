@@ -9,6 +9,6 @@ git-fetch-with-cli = true
 # table in bin/node/Cargo.toml that turns the `taskdump` feature on: tokio
 # refuses that feature on any other OS, and a macOS build must stay a plain
 # stable-tokio build. wasm32 programs are outside `target_os = "linux"` too, so
-# a program's committed bytes never see this flag.
+# a program's bytes never see this flag.
 [target.'cfg(target_os = "linux")']
 rustflags = ["--cfg", "tokio_unstable"]

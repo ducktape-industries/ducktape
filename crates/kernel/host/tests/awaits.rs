@@ -13,21 +13,14 @@ use fixture_awaiter::{ANSWERS, Finished, Plan};
 use fixture_oracle::{Ask, Op, owed_key};
 use fixture_programs::Change;
 use fixture_relay::Script;
+use fixture_wasm::{
+    ACCESS, AWAITER, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, ORACLE, PROGRAMS, RELAY,
+    VALSET,
+};
 use host::{
     Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Submission, Tip,
 };
 use state::{Commitment, SyncTarget, commitment_name};
-
-const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
-const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
-const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
-const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
-const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
-const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
-const AWAITER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaiter.wasm");
-const ORACLE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_oracle.wasm");
-const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 
 const SIGNER: &[u8] = b"signer";
 const AGENT: u64 = 77;

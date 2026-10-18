@@ -13,21 +13,12 @@ use blob::contract::Entry;
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
+use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET};
 use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
 use noded::wire::{Admin, BlockAsk, BlockRef, Blocks, Submitted, TxAsk, TxRef};
 use noded::{Client, Endpoint, HaloConfig, Listen, LoadConfig, Logs, Upload, Workspace};
-
-const PROGRAMS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_programs.wasm");
-const VALSET: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_valset.wasm");
-const RELAY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_relay.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_identity.wasm");
-const PROBE: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_probe.wasm");
-const BLOBS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_blobs.wasm");
-const AWAITS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_awaits.wasm");
-const HALO: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_halo.wasm");
-const ACCESS: &[u8] = include_bytes!("../../kernel/fixtures/wasm/fixture_access.wasm");
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;

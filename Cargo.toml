@@ -7,7 +7,8 @@
 #                        consensus (simplex BFT over marshal, per-epoch
 #                        engines, catch-up), statesync (a joiner adopts a
 #                        network's state); fixtures/ is its own workspace of
-#                        wasm32 test programs
+#                        wasm32 test programs, which fixture-wasm compiles for
+#                        the test suites
 #   crates/blob/       — blobs: the content-addressed store, the blobs program's
 #                        contract, and (feature `node`) how a node gathers,
 #                        serves and receipts them over halo
@@ -31,6 +32,7 @@ members = [
     "crates/kernel/consensus",
     "crates/kernel/statesync",
     "crates/kernel/keyscheme",
+    "crates/kernel/fixture-wasm",
     "crates/blob",
     "crates/networking/halo",
     "crates/networking/live-wire",
@@ -123,6 +125,7 @@ host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
+fixture-wasm = { path = "crates/kernel/fixture-wasm" }
 # internal — cross-plane libraries: neither kernel nor service.
 # the device keystore, linked by both the CLI and the desktop app.
 keystore = { path = "crates/keystore" }

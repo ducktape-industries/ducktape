@@ -8,17 +8,10 @@ use abi::role::{self, halo, validators};
 use abi::{HostOp, Message, Outcome, Receipt, Refusal, reason};
 use commonware_runtime::{Runner as _, deterministic};
 use fixture_probe::{NEEDS, Step, resource_key};
+use fixture_wasm::{
+    ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET,
+};
 use host::{Block, BlockId, Founding, Genesis, Host, Layer, Limits, Submission, Tip};
-
-const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
-const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
-const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
-const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
-const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
-const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
-const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
-const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
 
 const OWNER: &[u8] = b"owner";
 const OTHER: &[u8] = b"other";
