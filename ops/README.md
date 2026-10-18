@@ -63,7 +63,7 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## Agents' computing on Kubernetes
 
-- `k8s/pods/deploy NODE_URL FORGE COMMIT` builds `k8s/pods/Containerfile` around
+- `AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY k8s/pods/deploy NODE_URL FORGE COMMIT` builds `k8s/pods/Containerfile` around
   the Linux ducktape that release `bin-COMMIT` carries, kubectl and
   git-remote-duck, pushes it to the cluster node's registry, and applies
   `k8s/pods/pods.yaml`: the service `pods` in namespace `pods` at
@@ -78,16 +78,36 @@ scripts back a `make` target; see the repository `Makefile`.
   container that fetches a pod's inputs. Its routes, under `/v1`: `pods`
   (create, list), `pods/NAME` (status, delete), `pods/NAME/logs`,
   `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `manifests` (apply,
-  delete), `manifests/KIND[/NAME]` and `usage`. `server-test.py` covers them.
+  delete), `manifests/KIND[/NAME]`, `usage`, and `k8s/PATH`, which passes a
+  Kubernetes API call through when PATH is inside namespace `agents`
+  (`api/v1/namespaces/agents/...`, `apis/GROUP/VERSION/namespaces/agents/...`)
+  and answers Kubernetes' own status and body. It checks what it creates or
+  replaces as `manifests` does, and sends a PATCH first as a dry run, checks
+  the object it would store, and only then sends it. `server-test.py` covers
+  them.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. A pod
   without one gets none. Nothing else posts: `pods/NAME/blob` and
   `pods/NAME/file` answer with their result, so they post nothing.
-- Namespace `agents` holds the ResourceQuota `agents` (`requests.storage`
-  500Gi), which bounds what its claims ask for. A pod states cpu and memory
-  only if it wants requests or limits; without them it contends for the
-  whole machine. The PriorityClass `agents` ranks its pods below every
+- Namespace `agents` holds the ResourceQuota `hardcap`, the operator's
+  ceiling: `requests.storage` 500Gi, and `requests.cpu` and
+  `requests.memory` at `AGENTS_CPU` and `AGENTS_MEMORY`, the node's
+  allocatable minus the duckpond node, ccs and tunnel pods' requests. It
+  caps what pods are guaranteed, not what they burst to. Kubernetes enforces every quota in a
+  namespace, so agents add their own quotas and LimitRanges beside it and
+  none exceeds it. The service's
+  account holds every built-in namespaced kind in `agents` except Secrets,
+  service account tokens, Roles, RoleBindings, NetworkPolicies, Ingresses,
+  status and the proxy and port-forward subresources; it only reads
+  Endpoints, EndpointSlices and CSIStorageCapacities, and no custom
+  resource. The ValidatingAdmissionPolicy `hardcap` refuses it any write of
+  `hardcap`, and `agents-pods` refuses every pod in `agents` that runs at a
+  priority class other than `agents` or mounts or projects a service
+  account token. A container that states no cpu or memory gets the
+  LimitRange `defaults`: a request of 0 and a limit of the node's
+  allocatable, so `hardcap` admits it and it contends for the whole
+  machine. The PriorityClass `agents` ranks its pods below every
   other pod on the cluster. Its NetworkPolicy `isolated` admits traffic only
   from inside the namespace and lets pods out to public addresses and DNS.
 - The service signs blob puts, files commits and chat posts as the program

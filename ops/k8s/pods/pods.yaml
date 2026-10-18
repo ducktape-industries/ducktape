@@ -1,5 +1,5 @@
-# The pods service and the agents namespace it manages: priority, quota, RBAC, isolation, its Deployment and its fixed-address Service.
-# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@ and @FORGE@; the key it signs with is the Secret `blob-key`.
+# The pods service and the agents namespace it manages: priority, RBAC, the admission policies on the operator's quota hardcap and on every pod, hardcap itself and the LimitRange defaults, isolation, its Deployment and its fixed-address Service.
+# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@, @AGENTS_MEMORY@, @NODE_CPU@ and @NODE_MEMORY@; the key it signs with is the Secret `blob-key`.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -23,15 +23,6 @@ globalDefault: false
 description: Everything in namespace agents, below every other pod on the cluster, so the kubelet evicts it first.
 ---
 apiVersion: v1
-kind: ResourceQuota
-metadata:
-  name: agents
-  namespace: agents
-spec:
-  hard:
-    requests.storage: 500Gi
----
-apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: pods
@@ -51,29 +42,59 @@ metadata:
   namespace: agents
 rules:
   - apiGroups: [""]
-    resources: [pods, configmaps, services, persistentvolumeclaims, serviceaccounts, replicationcontrollers, podtemplates]
-    verbs: [create, get, list, watch, patch, update, delete]
+    resources: [pods, configmaps, services, persistentvolumeclaims, serviceaccounts, replicationcontrollers, podtemplates, limitranges, events]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [""]
+    resources: [resourcequotas]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [endpoints]
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [pods/log]
     verbs: [get]
   - apiGroups: [""]
-    resources: [pods/exec]
-    verbs: [create, get]
+    resources: [pods/exec, pods/attach]
+    verbs: [get, create]
   - apiGroups: [""]
-    resources: [resourcequotas]
-    verbs: [get, list]
+    resources: [pods/eviction]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [pods/ephemeralcontainers, pods/resize, replicationcontrollers/scale]
+    verbs: [get, update, patch]
   - apiGroups: [apps]
-    resources: [deployments, statefulsets, daemonsets, replicasets]
-    verbs: [create, get, list, watch, patch, update, delete]
+    resources: [deployments, statefulsets, daemonsets, replicasets, controllerrevisions]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [apps]
+    resources: [deployments/scale, statefulsets/scale, replicasets/scale]
+    verbs: [get, update, patch]
   - apiGroups: [batch]
     resources: [jobs, cronjobs]
-    verbs: [create, get, list, watch, patch, update, delete]
-  - apiGroups: [policy]
-    resources: [poddisruptionbudgets]
-    verbs: [create, get, list, watch, patch, update, delete]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
   - apiGroups: [autoscaling]
     resources: [horizontalpodautoscalers]
-    verbs: [create, get, list, watch, patch, update, delete]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [resource.k8s.io]
+    resources: [resourceclaims, resourceclaimtemplates]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [csistoragecapacities]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods]
+    verbs: [get, list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -110,6 +131,94 @@ subjects:
   - kind: ServiceAccount
     name: pods
     namespace: pods
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: hardcap
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: agents}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [resourcequotas]
+  matchConditions:
+    - name: pods-service
+      expression: "request.userInfo.username == 'system:serviceaccount:pods:pods'"
+  validations:
+    - expression: "request.name != 'hardcap'"
+      reason: Forbidden
+      message: ResourceQuota hardcap is the operator's ceiling on namespace agents; agents manage every other quota in it
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: hardcap
+spec:
+  policyName: hardcap
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: agents-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: agents}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+  validations:
+    - expression: "has(object.spec.priorityClassName) && object.spec.priorityClassName == 'agents'"
+      reason: Forbidden
+      message: every pod in namespace agents runs at priority class agents, below the rest of the cluster
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      reason: Forbidden
+      message: a pod in namespace agents mounts no service account token
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(volume, !has(volume.projected) || !has(volume.projected.sources) || volume.projected.sources.all(source, !has(source.serviceAccountToken)))"
+      reason: Forbidden
+      message: a pod in namespace agents projects no service account token
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: agents-pods
+spec:
+  policyName: agents-pods
+  validationActions: [Deny]
+---
+# hardcap caps what agents' pods are guaranteed, not what they burst to: AGENTS_CPU and AGENTS_MEMORY are the node's
+# allocatable cpu and memory minus the requests of the duckpond node, ccs and tunnel pods (kubectl describe node).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: hardcap
+  namespace: agents
+spec:
+  hard:
+    requests.cpu: "@AGENTS_CPU@"
+    requests.memory: "@AGENTS_MEMORY@"
+    requests.storage: 500Gi
+---
+# A container that states no cpu or memory requests none and may use the whole node, so hardcap admits it.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: agents
+spec:
+  limits:
+    - type: Container
+      defaultRequest: {cpu: "0", memory: "0"}
+      default: {cpu: "@NODE_CPU@", memory: "@NODE_MEMORY@"}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

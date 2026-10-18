@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs, exec, logs, manifests applied and deleted, outputs put as blobs or files, posts when work ends, and usage.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs, exec, logs, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, posts when work ends, and usage.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
+import copy
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -122,6 +124,13 @@ class Ran:
     code: int
     out: bytes
     err: str
+
+
+@dataclass
+class Answered:
+    status: int
+    kind: str
+    body: bytes
 
 
 def run(argv, stdin=None, env=None):
@@ -365,6 +374,28 @@ class Stats:
             return json.load(answer)
 
 
+class Api:
+    def __init__(self, mount=SERVICE_ACCOUNT, environ=os.environ):
+        self.mount = mount
+        self.environ = environ
+
+    def call(self, method, path, query, body, kind):
+        token = (self.mount / "token").read_text().strip()
+        context = ssl.create_default_context(cafile=str(self.mount / "ca.crt"))
+        host = self.environ["KUBERNETES_SERVICE_HOST"]
+        bracketed = f"[{host}]" if ":" in host else host
+        target = f"https://{bracketed}:{self.environ['KUBERNETES_SERVICE_PORT']}{path}" + (f"?{query}" if query else "")
+        headers = {"Authorization": f"Bearer {token}", **({"Content-Type": kind} if kind else {})}
+        request = urllib.request.Request(target, data=body or None, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(request, context=context) as answer:
+                return Answered(answer.status, answer.headers.get("content-type") or "application/json", answer.read())
+        except urllib.error.HTTPError as refusal:
+            return Answered(refusal.code, refusal.headers.get("content-type") or "application/json", refusal.read())
+        except urllib.error.URLError as error:
+            raise Refused(502, f"the Kubernetes API was not reached: {error.reason}") from error
+
+
 def checked(body, shape, what):
     if not isinstance(body, dict):
         raise Refused(400, f"{what} is a JSON object")
@@ -582,8 +613,7 @@ def confine_pod(spec, where):
     spec["automountServiceAccountToken"] = False
 
 
-def confine_manifest(manifest, index, cluster_kinds, namespace, labels):
-    what = f"manifest {index}"
+def confine_manifest(manifest, what, cluster_kinds, namespace, labels):
     if not isinstance(manifest, dict) or not manifest.get("kind") or not manifest.get("apiVersion"):
         raise Refused(400, f"{what} is a Kubernetes object with an apiVersion and a kind")
     kind = manifest["kind"]
@@ -622,6 +652,41 @@ def trial_pod(manifest, template, spec, namespace):
         "metadata": {"generateName": f"{name}-", "namespace": namespace, "labels": labels},
         "spec": spec,
     }
+
+
+@dataclass
+class Target:
+    path: str
+    resource: str
+    subresource: str | None
+
+
+def target_of(segments, namespace):
+    path = "/" + "/".join(segments)
+    outside = Refused(
+        403,
+        f"{path} is not inside namespace {namespace}: /v1/k8s/ passes through api/v1/namespaces/{namespace}/... and apis/GROUP/VERSION/namespaces/{namespace}/...",
+    )
+    escaping = any(segment in (".", "..") or "%" in segment for segment in segments)
+    match segments:
+        case ["api", _, "namespaces", named, resource, *rest] | ["apis", _, _, "namespaces", named, resource, *rest]:
+            inside = named == namespace and not escaping
+        case _:
+            raise outside
+    if not inside:
+        raise outside
+    return Target(path, resource, rest[1] if len(rest) > 1 else None)
+
+
+def forced_holds(manifest):
+    specs = [spec for _, spec in pod_specs(manifest)]
+    pods_hold = all(spec.get("priorityClassName") == PRIORITY and spec.get("automountServiceAccountToken") is False for spec in specs)
+    account_holds = manifest.get("kind") != "ServiceAccount" or manifest.get("automountServiceAccountToken") is False
+    return pods_hold and account_holds
+
+
+def dry_run(query):
+    return "&".join([*([query] if query else []), "dryRun=All"])
 
 
 def state_of(statuses, name):
@@ -877,11 +942,12 @@ def json_stream(stream):
 
 
 class Service:
-    def __init__(self, kube, signer, fetching, stats):
+    def __init__(self, kube, signer, fetching, stats, api):
         self.kube = kube
         self.signer = signer
         self.fetching = fetching
         self.stats = stats
+        self.api = api
         self.notifier = Notifier(kube, signer)
 
     def pod(self, name):
@@ -997,18 +1063,21 @@ class Service:
             raise kube_refusal(ran, doing)
         return json.loads(ran.out)["items"]
 
+    def tried(self, manifest, what):
+        templated = manifest["kind"] != "Pod"
+        for template, spec in pod_specs(manifest) if templated else []:
+            tried = self.kube.trial(trial_pod(manifest, template, spec, self.kube.namespace))
+            if tried.code != 0:
+                raise kube_refusal(tried, f"{what} ({manifest['kind']} {manifest['metadata'].get('name', '')})'s pods would be refused")
+
     def apply(self, asked, body):
         request = named(checked(body, APPLY, "an apply"), ["manifests"], "an apply")
         labels = labels_for(asked, request.get("requester"))
         kinds = self.cluster_kinds()
         namespace = self.kube.namespace
-        objects = [confine_manifest(manifest, index, kinds, namespace, labels) for index, manifest in enumerate(request["manifests"])]
+        objects = [confine_manifest(manifest, f"manifest {index}", kinds, namespace, labels) for index, manifest in enumerate(request["manifests"])]
         for index, manifest in enumerate(objects):
-            templated = manifest["kind"] != "Pod"
-            for template, spec in pod_specs(manifest) if templated else []:
-                tried = self.kube.trial(trial_pod(manifest, template, spec, namespace))
-                if tried.code != 0:
-                    raise kube_refusal(tried, f"manifest {index} ({manifest['kind']} {manifest['metadata'].get('name', '')})'s pods would be refused")
+            self.tried(manifest, f"manifest {index}")
         tried = self.kube.apply(objects, dry=True)
         if tried.code != 0:
             raise kube_refusal(tried, "the manifests were not applied")
@@ -1038,6 +1107,39 @@ class Service:
         if ran.code != 0:
             raise kube_refusal(ran, f"{asked['kind']} {asked['name']} was not deleted")
         return 200, {"deleted": ran.out.decode().strip()}
+
+    def passthrough(self, method, segments, query, asked, headers, body):
+        target = target_of(segments, self.kube.namespace)
+        self.readable(target.resource, None)
+        kind = headers.get("content-type")
+        whole = target.subresource in (None, "ephemeralcontainers")
+        match (method, whole):
+            case ("POST" | "PUT", True):
+                body, kind = self.confined(asked, parsed(body)), "application/json"
+            case ("PATCH", True):
+                tried = self.api.call(method, target.path, dry_run(query), body, kind)
+                refused = not 200 <= tried.status < 300
+                if refused:
+                    return tried.status, tried
+                self.patchable(json.loads(tried.body))
+        answered = self.api.call(method, target.path, query, body, kind)
+        return answered.status, answered
+
+    def confined(self, asked, manifest):
+        what = "the object"
+        confined = confine_manifest(manifest, what, self.cluster_kinds(), self.kube.namespace, labels_for(asked, None))
+        self.tried(confined, what)
+        return json.dumps(confined).encode()
+
+    def patchable(self, result):
+        what = "the patched object"
+        confine_manifest(copy.deepcopy(result), what, self.cluster_kinds(), self.kube.namespace, {})
+        if not forced_holds(result):
+            name = (result.get("metadata") or {}).get("name", "")
+            raise Refused(
+                403,
+                f"{what} ({result.get('kind')} {name}) would run outside priority class {PRIORITY} or mount a service account token: a patch can't be confined, only refused, so send the whole object with PUT",
+            )
 
     def usage(self):
         pods = self.items(self.kube.list(), "the pods were not listed")
@@ -1084,6 +1186,8 @@ class Service:
                 return self.read(kind, name)
             case ("GET", "usage"):
                 return self.usage()
+            case (_, "k8s", *path):
+                return self.passthrough(method, path, parts.query, asked, headers, body)
             case _:
                 raise Refused(404, f"{method} {parts.path} is not a route")
 
@@ -1107,9 +1211,13 @@ def handler(service):
                 status, answer = service.answer(method, self.path, headers, body)
             except Refused as refusal:
                 status, answer = refusal.status, {"error": refusal.sentence}
-            text = isinstance(answer, bytes)
-            payload = answer if text else json.dumps(answer).encode()
-            kind = "text/plain; charset=utf-8" if text else "application/json"
+            match answer:
+                case Answered(kind=kind, body=payload):
+                    pass
+                case bytes():
+                    payload, kind = answer, "text/plain; charset=utf-8"
+                case _:
+                    payload, kind = json.dumps(answer).encode(), "application/json"
             self.send_response(status)
             self.send_header("content-type", kind)
             self.send_header("content-length", str(len(payload)))
@@ -1124,6 +1232,12 @@ def handler(service):
 
         def do_DELETE(self):
             self.respond("DELETE")
+
+        def do_PUT(self):
+            self.respond("PUT")
+
+        def do_PATCH(self):
+            self.respond("PATCH")
 
         def log_message(self, form, *args):
             route = urlsplit(self.path).path
@@ -1239,7 +1353,7 @@ def main():
         sys.exit(f"{', '.join(unset)} must be set: the image of each pod's fetch and out containers, the node they read inputs from, and its forge")
     kube = Kube(shlex.split(os.environ.get("PODS_KUBECTL", "kubectl")), os.environ.get("PODS_NAMESPACE", "agents"))
     signer = Signer(shlex.split(os.environ.get("PODS_DUCKTAPE", "ducktape")), Path(os.environ.get("PODS_KEYS", "/keys")))
-    service = Service(kube, signer, fetching, Stats())
+    service = Service(kube, signer, fetching, Stats(), Api())
     threading.Thread(target=service.notifier.watch, daemon=True).start()
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), handler(service))

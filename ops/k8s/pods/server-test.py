@@ -155,13 +155,24 @@ class Stats:
         return self.summaries.get(host, {"pods": []})
 
 
+class Api:
+    def __init__(self):
+        self.calls = []
+        self.answers = []
+
+    def call(self, method, path, query, body, kind):
+        self.calls.append((method, path, query, body, kind))
+        return self.answers.pop(0) if self.answers else server.Answered(200, "application/json", b"{}")
+
+
 class Served(unittest.TestCase):
     def serve(self, signer=None):
         self.kube = Kube()
         self.kube.answer("cluster_kinds", ran(KINDS))
         self.signer = signer or Signer()
         self.stats = Stats()
-        service = server.Service(self.kube, self.signer, FETCHING, self.stats)
+        self.api = Api()
+        service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api)
         quiet = type("Quiet", (server.handler(service),), {"log_message": lambda *_: None})
         self.http = server.ThreadingHTTPServer(("127.0.0.1", 0), quiet)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
@@ -173,7 +184,7 @@ class Served(unittest.TestCase):
 
     def call(self, method, path, body=None, headers=ASKED):
         connection = http.client.HTTPConnection(*self.http.server_address)
-        payload = None if body is None else json.dumps(body).encode()
+        payload = body if body is None or isinstance(body, bytes) else json.dumps(body).encode()
         connection.request(method, path, body=payload, headers=headers)
         response = connection.getresponse()
         data = response.read()
@@ -319,7 +330,8 @@ class Asked(Served):
 
     def test_a_path_outside_the_routes_is_not_found(self):
         self.assertEqual(self.call("GET", "/v2/pods")[0], 404)
-        self.assertEqual(self.call("PUT", "/v1/pods")[0], 501)
+        self.assertEqual(self.call("PUT", "/v1/pods")[0], 404)
+        self.assertEqual(self.call("OPTIONS", "/v1/pods")[0], 501)
         self.assertEqual(self.call("GET", "/v1/pods/a/b/c")[0], 404)
 
     def test_a_body_that_is_not_json_is_refused(self):
@@ -628,6 +640,96 @@ class Manifests(Served):
         self.assertEqual(self.call("GET", "/v1/manifests/deployments")[1], {"items": [{"metadata": {"name": "web"}}]})
         self.assertEqual(self.kube.calls[-2:], [("objects", "deployment", "web"), ("objects", "deployments", None)])
         self.refused("GET", "/v1/manifests/secrets", None, 403, ["credential"])
+
+
+MERGE = {**ASKED, "content-type": "application/merge-patch+json"}
+DEPLOYMENTS = "/v1/k8s/apis/apps/v1/namespaces/agents/deployments"
+
+
+def answered(status, body):
+    return server.Answered(status, "application/json", json.dumps(body).encode())
+
+
+class Passthrough(Served):
+    def forced(self, **template_spec):
+        return deployment(priorityClassName="agents", automountServiceAccountToken=False, **template_spec)
+
+    def test_a_read_reaches_its_path_in_the_namespace_and_answers_kubernetes_verbatim(self):
+        missing = {"kind": "Status", "status": "Failure", "reason": "NotFound", "code": 404}
+        self.api.answers = [answered(404, missing)]
+        status, answer = self.call("GET", "/v1/k8s/api/v1/namespaces/agents/configmaps/m?labelSelector=a%3Db")
+        self.assertEqual((status, answer), (404, missing))
+        self.assertEqual(self.api.calls, [("GET", "/api/v1/namespaces/agents/configmaps/m", "labelSelector=a%3Db", b"", None)])
+
+    def test_a_path_outside_the_namespace_is_refused_before_kubernetes_sees_it(self):
+        paths = (
+            "/v1/k8s/api/v1/namespaces/kube-system/pods",
+            "/v1/k8s/api/v1/nodes",
+            "/v1/k8s/version",
+            "/v1/k8s/api/v1/namespaces/agents",
+            DEPLOYMENTS + "/../../kube-system/deployments",
+            "/v1/k8s/api/v1/namespaces/agents/pods/%2e%2e",
+        )
+        for path in paths:
+            self.refused("GET", path, None, 403, ["not inside namespace agents"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_a_refused_resource_is_refused_for_every_method(self):
+        self.refused("GET", "/v1/k8s/api/v1/namespaces/agents/secrets", None, 403, ["credential"])
+        self.refused("DELETE", "/v1/k8s/apis/rbac.authorization.k8s.io/v1/namespaces/agents/roles/r", None, 403, ["grants permissions"])
+        self.refused("POST", "/v1/k8s/apis/networking.k8s.io/v1/namespaces/agents/networkpolicies", {}, 403, ["undo"])
+        self.refused("PATCH", "/v1/k8s/apis/networking.k8s.io/v1/namespaces/agents/ingresses/i", {}, 403, ["outside the cluster"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_a_created_object_is_confined_labelled_tried_and_sent_as_json(self):
+        self.api.answers = [answered(201, {"kind": "Deployment"})]
+        status, answer = self.call("POST", DEPLOYMENTS + "?fieldManager=agents", deployment(), headers={**ASKED, "content-type": "application/json"})
+        self.assertEqual((status, answer), (201, {"kind": "Deployment"}))
+        self.assertEqual(self.kube.verbs(), ["cluster_kinds", "trial"])
+        ((method, target, query, body, kind),) = self.api.calls
+        self.assertEqual((method, target, query, kind), ("POST", "/apis/apps/v1/namespaces/agents/deployments", "fieldManager=agents", "application/json"))
+        sent = json.loads(body)
+        self.assertEqual(sent["metadata"]["namespace"], "agents")
+        self.assertEqual(sent["metadata"]["labels"]["ducktape.industries/request"], "41")
+        self.assertEqual(sent["spec"]["template"]["spec"]["priorityClassName"], "agents")
+        self.assertFalse(sent["spec"]["template"]["spec"]["automountServiceAccountToken"])
+
+    def test_a_created_object_that_breaks_a_rule_is_refused_before_kubernetes_sees_it(self):
+        self.refused("POST", DEPLOYMENTS, deployment(hostNetwork=True), 403, ["the object (Deployment web)", "host namespace"])
+        service = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "s"}, "spec": {"type": "NodePort"}}
+        self.refused("PUT", "/v1/k8s/api/v1/namespaces/agents/services/s", service, 403, ["NodePort"])
+        self.refused("POST", "/v1/k8s/api/v1/namespaces/agents/configmaps", {}, 400, ["apiVersion and a kind"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_a_patch_is_dry_run_and_checked_then_sent(self):
+        patch = b'{"spec": {"replicas": 2}}'
+        self.api.answers = [answered(200, self.forced()), answered(200, self.forced())]
+        self.assertEqual(self.call("PATCH", DEPLOYMENTS + "/web", patch, headers=MERGE)[0], 200)
+        target = "/apis/apps/v1/namespaces/agents/deployments/web"
+        kind = "application/merge-patch+json"
+        self.assertEqual(self.api.calls, [("PATCH", target, "dryRun=All", patch, kind), ("PATCH", target, "", patch, kind)])
+
+    def test_a_patch_whose_result_breaks_a_rule_is_refused_after_the_dry_run(self):
+        results = (
+            (deployment(), ["would run outside priority class agents", "PUT"]),
+            (self.forced(volumes=[{"name": "h", "hostPath": {"path": "/"}}]), ["hostPath"]),
+        )
+        for result, words in results:
+            self.api.calls, self.api.answers = [], [answered(200, result)]
+            self.refused("PATCH", DEPLOYMENTS + "/web?fieldManager=agents", {"spec": {}}, 403, words)
+            self.assertEqual([call[2] for call in self.api.calls], ["fieldManager=agents&dryRun=All"])
+
+    def test_kubernetes_refusing_the_dry_run_answers_its_refusal_and_sends_nothing_else(self):
+        invalid = {"kind": "Status", "reason": "Invalid", "code": 422}
+        self.api.answers = [answered(422, invalid)]
+        self.assertEqual(self.call("PATCH", DEPLOYMENTS + "/web", b"{}", headers=MERGE), (422, invalid))
+        self.assertEqual(len(self.api.calls), 1)
+
+    def test_a_subresource_passes_through_unchecked(self):
+        self.call("PATCH", DEPLOYMENTS + "/web/scale", b'{"spec": {"replicas": 0}}', headers=MERGE)
+        self.call("POST", "/v1/k8s/api/v1/namespaces/agents/pods/p/eviction", {"apiVersion": "policy/v1", "kind": "Eviction"})
+        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("PATCH", ""), ("POST", "")])
+        self.assertEqual(self.kube.calls, [])
 
 
 class Usage(Served):
