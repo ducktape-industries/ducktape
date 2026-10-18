@@ -1,0 +1,211 @@
+# The pods service and the agents namespace it manages: priority, quota, RBAC, isolation, its Deployment and its fixed-address Service.
+# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@ and @FORGE@; the key it signs with is the Secret `blob-key`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pods
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: agents
+value: -1
+preemptionPolicy: Never
+globalDefault: false
+description: Everything in namespace agents, below every other pod on the cluster, so the kubelet evicts it first.
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: agents
+  namespace: agents
+spec:
+  hard:
+    limits.cpu: "48"
+    limits.memory: 96Gi
+    requests.storage: 500Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pods
+  namespace: pods
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent
+  namespace: agents
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pods
+  namespace: agents
+rules:
+  - apiGroups: [""]
+    resources: [pods, configmaps, services, persistentvolumeclaims, serviceaccounts, replicationcontrollers, podtemplates]
+    verbs: [create, get, list, watch, patch, update, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
+  - apiGroups: [""]
+    resources: [resourcequotas]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [create, get, list, watch, patch, update, delete]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [create, get, list, watch, patch, update, delete]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [create, get, list, watch, patch, update, delete]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [create, get, list, watch, patch, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pods
+  namespace: agents
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pods
+subjects:
+  - kind: ServiceAccount
+    name: pods
+    namespace: pods
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pods-stats
+rules:
+  - apiGroups: [""]
+    resources: [nodes/stats]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pods-stats
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pods-stats
+subjects:
+  - kind: ServiceAccount
+    name: pods
+    namespace: pods
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: node-only
+  namespace: pods
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: duckpond}
+          podSelector:
+            matchLabels: {app: node}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolated
+  namespace: agents
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pods
+  namespace: pods
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pods
+  template:
+    metadata:
+      labels:
+        app: pods
+    spec:
+      serviceAccountName: pods
+      containers:
+        - name: pods
+          image: "@IMAGE@"
+          env:
+            - {name: PODS_OUT_IMAGE, value: "@IMAGE@"}
+            - {name: PODS_NAMESPACE, value: agents}
+            - {name: PODS_NODE, value: "@NODE_URL@"}
+            - {name: PODS_FORGE, value: "@FORGE@"}
+            - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node @NODE_URL@"}
+            - {name: PODS_KEYS, value: /keys}
+          ports:
+            - {name: http, containerPort: 8080}
+          volumeMounts:
+            - {name: keys, mountPath: /keys, readOnly: true}
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+      volumes:
+        - name: keys
+          secret:
+            secretName: blob-key
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pods
+  namespace: pods
+spec:
+  clusterIP: 10.43.80.80
+  selector:
+    app: pods
+  ports:
+    - {name: http, port: 8080, targetPort: http}

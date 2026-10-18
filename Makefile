@@ -84,13 +84,13 @@ test:
 	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
 	mkdir -p "$(TEST_TMPDIR)"
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) --workspace
-# the ops/ scripts' own tests: offline, against a real temporary git
-# repository. `worktree-clean.sh`'s refusal to remove a worktree that is
+# the ops/ scripts' own tests, offline. `worktree-clean.sh`'s refusal to remove a worktree that is
 # dirty, unmerged or in use is precisely what its test covers.
 # PYTHONDONTWRITEBYTECODE because `__pycache__` beside a tracked script is
 # untracked litter the gate would leave in everyone's `git status`.
 	@if python3 -c 'import tomllib' >/dev/null 2>&1; then \
-	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py; \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/pods/server-test.py; \
 	else echo "[test] skipped the ops/ script tests — they need python 3.11 (tomllib)" >&2; fi
 # the unified install contract: `make install` delegates to the App pinned in
 # ops/app/APP_REV, and the checkout it pins lives under target/ where this

@@ -1,0 +1,37 @@
+# The agents' build image: Rust 1.96.1 with wasm32, binaryen 132, wasm-tools, git-remote-duck for duckpond's forge, and the native packages ducktape, programs and the app build with.
+# Built and pushed to the cluster node's registry by ops/k8s/toolchain/deploy; an agent names it as a pod's image.
+FROM docker.io/library/debian:trixie-slim
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+ARG BINARYEN_VERSION=132
+ARG BINARYEN_SHA256=195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572
+ARG WASM_TOOLS_VERSION=1.262.0
+ARG GIT_REMOTE_DUCK_RELEASE=git-remote-duck-7acf453
+ARG GIT_REMOTE_DUCK_SHA256=c03d7b0d02327af0a1d8eef2d80e778ec8a67850aa42dd2b43022f85269b5b75
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates clang cmake curl git libclang-dev make perl pkg-config python3 xz-utils \
+      libasound2-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
+      mesa-vulkan-drivers libvulkan1 \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:/opt/binaryen/bin:$PATH
+RUN curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/x86_64-unknown-linux-gnu/rustup-init" \
+    && echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum --check \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.96.1 \
+      --component rustfmt,clippy --target wasm32-unknown-unknown \
+    && rm /tmp/rustup-init
+RUN curl -fsSL -o /tmp/binaryen.tar.gz \
+      "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/binaryen-version_$BINARYEN_VERSION-x86_64-linux.tar.gz" \
+    && echo "$BINARYEN_SHA256  /tmp/binaryen.tar.gz" | sha256sum --check \
+    && mkdir /opt/binaryen \
+    && tar -xzf /tmp/binaryen.tar.gz -C /opt/binaryen --strip-components=1 \
+    && rm /tmp/binaryen.tar.gz
+RUN cargo install --locked wasm-tools --version "$WASM_TOOLS_VERSION" \
+    && rm -rf /opt/cargo/registry /opt/cargo/git
+RUN curl -fsSL -o /usr/local/bin/git-remote-duck \
+      "https://github.com/ducktape-industries/ducktape/releases/download/$GIT_REMOTE_DUCK_RELEASE/git-remote-duck-x86_64-unknown-linux-gnu" \
+    && echo "$GIT_REMOTE_DUCK_SHA256  /usr/local/bin/git-remote-duck" | sha256sum --check \
+    && chmod +x /usr/local/bin/git-remote-duck \
+    && git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
+ENV DUCKTAPE_DEVICE_KEY_STORE=file
+WORKDIR /work
