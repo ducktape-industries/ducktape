@@ -52,8 +52,8 @@ INPUT = {"path": str, "forge": dict, "files": dict, "blob": str}
 SOURCES = ("forge", "files", "blob")
 FORGE = {"repo": str, "commit": str}
 FILES = {"path": str, "snapshot": str}
-BLOB = {"path": str, "kind": str, "container": str, "requester": int, "notify": dict}
-FILE = {"path": str, "to": str, "message": str, "container": str, "requester": int, "notify": dict}
+BLOB = {"path": str, "kind": str, "container": str}
+FILE = {"path": str, "to": str, "message": str, "container": str}
 EXEC = {"command": list, "container": str}
 APPLY = {"manifests": list, "requester": int}
 DELETE = {"kind": str, "name": str}
@@ -901,15 +901,7 @@ class Service:
         ran = self.kube.exec(name, container, ["cat", "--", absolute(asked["path"], "path")])
         if ran.code != 0:
             raise kube_refusal(ran, f"{asked['path']} was not read from pod {name}")
-        return pod, ran.out
-
-    def requester(self, asked, pod):
-        if "requester" in asked:
-            return number(asked["requester"], "requester")
-        return requester_of(pod["metadata"].get("labels") or {})
-
-    def notes(self, asked, pod):
-        return notify_notes(asked) or (pod["metadata"].get("annotations") or {})
+        return ran.out
 
     def create(self, asked, body):
         spec = checked(body, SPEC, "a pod")
@@ -955,7 +947,7 @@ class Service:
     def blob(self, name, body):
         asked = named(checked(body, BLOB, "a blob"), ["path", "kind"], "a blob")
         self.keyed("put blobs")
-        pod, data = self.output(name, asked)
+        data = self.output(name, asked)
         with tempfile.TemporaryDirectory() as temp:
             file = Path(temp) / "blob"
             file.write_bytes(data)
@@ -964,18 +956,13 @@ class Service:
             raise Refused(502, f"the blob was not put: {put.err or put.out.decode(errors='replace')}")
         held = put_answer(put.out.decode(), 1)
         blob = held.pop("blobs")[0]
-        answer = {"blob": blob, "size": len(data), "kind": asked["kind"], **held}
-        since = f" since block {answer['held_since']}" if "held_since" in answer else ""
-        digest = blob.rsplit(":", 1)[-1][:16]
-        line = f"pod {name}: blob {blob} is held{since}"
-        self.notifier.post(self.notes(asked, pod), self.requester(asked, pod), f"pods-{name}-blob-{digest}", line)
-        return 200, answer
+        return 200, {"blob": blob, "size": len(data), "kind": asked["kind"], **held}
 
     def file(self, name, body):
         asked = named(checked(body, FILE, "a file"), ["path", "to"], "a file")
         to = absolute(asked["to"], "to")
         self.keyed("write files")
-        pod, data = self.output(name, asked)
+        data = self.output(name, asked)
         pieces = [data[start : start + CHUNK_SIZE] for start in range(0, len(data), CHUNK_SIZE)]
         chunks = []
         with tempfile.TemporaryDirectory() as temp:
@@ -997,9 +984,6 @@ class Service:
             raise Refused(REJECTED.get(reason, 422), f"files refused the write: {reason}: {sentence}")
         if outcome == "failed":
             raise Refused(502, f"the write was not sent: {sentence}")
-        digest = (chunks[0].rsplit(":", 1)[-1] if chunks else "empty")[:16]
-        line = f"pod {name}: wrote {to} into files ({len(data)} bytes)"
-        self.notifier.post(self.notes(asked, pod), self.requester(asked, pod), f"pods-{name}-file-{digest}", line)
         return 200, {"written": to, "size": len(data), "chunks": chunks, "base": base, "preconfirmed": True}
 
     def cluster_kinds(self):

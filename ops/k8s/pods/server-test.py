@@ -425,13 +425,10 @@ class Blob(Served):
         self.assertEqual(self.kube.calls[1], ("exec", "duckpond-41", "out", ["cat", "--", "/out/fixture.wasm"]))
         self.assertEqual(self.signer.puts, [([b"\x00asm"], "program")])
 
-    def test_a_held_blob_is_posted_where_the_pod_asked_mentioning_its_requester(self):
+    def test_a_blob_is_read_from_the_container_asked_and_posts_nothing_where_the_pod_asked(self):
         self.call("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program", "container": "run"})
         self.assertEqual(self.kube.calls[1][2], "run")
-        ((program, payload),) = self.signer.submits
-        self.assertEqual(program, "chat")
-        line = "pod duckpond-41: blob sha256:ab12cd34ef56ab78cd90 is held since block 901"
-        self.assertEqual(payload, server.post_message("builds", "pods-duckpond-41-blob-ab12cd34ef56ab78", 17, line, None))
+        self.assertEqual((self.signer.submits, self.kube.verbs()), ([], ["get", "exec"]))
 
     def test_a_blob_names_its_path_and_kind_and_the_path_is_absolute(self):
         self.refused("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a"}, 400, ["names its kind"])
@@ -461,18 +458,16 @@ class File(Served):
         server.CHUNK_SIZE = 4
         self.addCleanup(setattr, server, "CHUNK_SIZE", chunk_size)
 
-    def test_an_output_is_put_as_chunks_and_committed_onto_files_head_as_pods(self):
+    def test_an_output_is_put_as_chunks_and_committed_onto_files_head_as_pods_posting_nothing(self):
         status, answer = self.call("POST", "/v1/pods/duckpond-41/file", {"path": "/out/report.md", "to": "/reports/41.md", "message": "build report"})
         self.assertEqual(status, 200, answer)
         self.assertEqual(answer, {"written": "/reports/41.md", "size": 10, "chunks": CHUNKS, "base": SNAPSHOT, "preconfirmed": True})
         self.assertEqual(self.signer.puts, [([b"abcd", b"efgh", b"ij"], "chunk")])
         self.assertEqual(self.signer.queries, [("files", bytes([0]))])
-        (program, payload), post = self.signer.submits
+        ((program, payload),) = self.signer.submits
         self.assertEqual(program, "files")
         self.assertEqual(payload, server.files_commit(SNAPSHOT, "build report", "/reports/41.md", 10, CHUNKS))
-        self.assertEqual(post[0], "chat")
-        line = "pod duckpond-41: wrote /reports/41.md into files (10 bytes)"
-        self.assertEqual(post[1], server.post_message("builds", "pods-duckpond-41-file-0101010101010101", 17, line, None))
+        self.assertEqual(self.kube.verbs(), ["get", "exec"])
 
     def test_files_refusing_the_write_passes_its_reason_through(self):
         self.signer.submitted = ran(b"preconfirmed rejected unauthorized: /reports is written by its write list only\n")
@@ -493,6 +488,12 @@ class File(Served):
     def test_a_write_names_an_absolute_destination(self):
         self.refused("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r"}, 400, ["names its to"])
         self.refused("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "e"}, 400, ["to is an absolute path"])
+
+    def test_a_blob_or_a_write_names_no_notify_or_requester_because_neither_posts(self):
+        notify = {"path": "/out/a", "kind": "program", "notify": {"channel": "builds"}}
+        self.refused("POST", "/v1/pods/duckpond-41/blob", notify, 400, ["no field notify"])
+        self.refused("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/e", "requester": 17}, 400, ["no field requester"])
+        self.assertEqual((self.signer.submits, self.kube.calls), ([], []))
 
 
 class Keyless(Served):

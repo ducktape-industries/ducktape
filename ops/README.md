@@ -66,6 +66,11 @@ scripts back a `make` target; see the repository `Makefile`.
   (create, list), `pods/NAME` (status, delete), `pods/NAME/logs`,
   `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `manifests` (apply,
   delete), `manifests/KIND[/NAME]` and `usage`. `server-test.py` covers them.
+- A pod created with a `notify` (a chat channel, and optionally a thread in
+  it) gets one post there when it ends, mentioning its `requester`: the run
+  container's exit code, or why fetching its inputs or the pod failed. A pod
+  without one gets none. Nothing else posts: `pods/NAME/blob` and
+  `pods/NAME/file` answer with their result, so they post nothing.
 - Namespace `agents` holds the ResourceQuota `agents` (`requests.storage`
   500Gi), which bounds what its claims ask for. A pod states cpu and memory
   only if it wants requests or limits; without them it contends for the
