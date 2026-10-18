@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the node image from a ducktape release, pushes it to the cluster node's registry, and applies a network's pod.
+# Builds the node image from a ducktape release, pushes it to the cluster node's registry, and applies a network's node and tunnel.
 # Usage: ops/k8s/deploy NETWORK COMMIT [--found]
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +31,9 @@ case $mode in
     kubectl -n "$network" wait pod/found --for=condition=Ready --timeout=5m
     ;;
   "")
+    render tunnel.yaml | kubectl apply -f -
     render node.yaml | kubectl apply -f -
+    kubectl -n "$network" rollout status deployment/tunnel --timeout=5m
     kubectl -n "$network" rollout status deployment/node --timeout=5m
     ;;
   *)
