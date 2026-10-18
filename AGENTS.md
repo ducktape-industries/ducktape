@@ -93,14 +93,15 @@ under `ops/`.
   only by an explicit, user-requested release of `dev`.
 - A program reaches a hosted network (duckpond) as a build of a commit on
   that network's forge, on the repo's `dev`, which holds only merged work.
-  The network's pods service builds it with the repo's pinned toolchain and
-  `--locked`, packs it the way a founding packs a program (its view, describe
-  module and any notifier embedded), and puts it as a blob from the pod.
-  GitHub releases (`wasm-<commit>`) and programs' `main` play no part in a
-  deploy: the programs release workflow publishes wasm for local foundings
-  (kit, qa), not for a hosted network. Never deploy a build of a branch that
-  is not merged, or a build made outside the pods service from a working
-  tree. A role program (programs, identity, valset, blobs, awaits, halo,
+  Two builders make it: the network's pods service, or eddy-claude (account
+  24). The builder builds it with the repo's pinned toolchain and `--locked`,
+  packs it the way a founding packs a program (its view, describe module and
+  any notifier embedded), and puts the blob itself. GitHub releases
+  (`wasm-<commit>`) and programs' `main` play no part in a deploy: the
+  programs release workflow publishes wasm for local foundings (kit, qa), not
+  for a hosted network. Never deploy a build of a branch that is not merged,
+  a build of a working tree with local changes, or a build made by any other
+  builder. A role program (programs, identity, valset, blobs, awaits, halo,
   access, scheduler, egress) changes only by the validators' vote, which the
   operator sends. Any account schedules an app program.
 - Default feature/fix/doc work happens in an isolated git worktree rather than
