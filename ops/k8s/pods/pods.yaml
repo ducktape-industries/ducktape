@@ -29,8 +29,6 @@ metadata:
   namespace: agents
 spec:
   hard:
-    limits.cpu: "48"
-    limits.memory: 96Gi
     requests.storage: 500Gi
 ---
 apiVersion: v1

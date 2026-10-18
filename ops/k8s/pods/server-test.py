@@ -17,7 +17,8 @@ server.say = lambda event, **fields: None
 
 ASKED = {"ducktape-chain": "duckpond", "ducktape-program": "harness", "ducktape-request": "41"}
 NOT_FOUND = 'Error from server (NotFound): pods "duckpond-9" not found'
-QUOTA = 'Error from server (Forbidden): error when creating "STDIN": pods "duckpond-41" is forbidden: failed quota: agents: must specify limits.cpu for: out,run'
+TERMINATING = 'Error from server (Forbidden): error when creating "STDIN": pods "duckpond-41" is forbidden: unable to create new content in namespace agents because it is being terminated'
+BASELINE = 'Error from server (Forbidden): error when creating "STDIN": pods "web-" is forbidden: violates PodSecurity "baseline:latest": non-default capabilities (container "web" must not include "NET_ADMIN" in securityContext.capabilities.add)'
 SNAPSHOT = "sha256:" + "ab" * 32
 CHUNKS = ["sha256:" + "01" * 32, "sha256:" + "02" * 32, "sha256:" + "03" * 32]
 NOTIFY = {"ducktape.industries/notify-channel": "builds"}
@@ -238,10 +239,10 @@ class Create(Served):
         self.refused("POST", "/v1/pods", {"image": "t", "resources": {"limits": {"cpu": 1}}}, 400, ["cpu is a JSON str"])
         self.assertNotIn("create", self.kube.verbs())
 
-    def test_kubernetes_refusing_a_pod_without_limits_passes_its_reason_through(self):
-        self.kube.answer("create", ran(code=1, err=QUOTA))
+    def test_kubernetes_refusing_a_pod_passes_its_reason_through(self):
+        self.kube.answer("create", ran(code=1, err=TERMINATING))
         answer = self.refused("POST", "/v1/pods", {"image": "toolchain"}, 403, [])
-        self.assertIn("must specify limits.cpu for: out,run", answer["error"])
+        self.assertIn("namespace agents because it is being terminated", answer["error"])
 
     def test_each_input_is_fetched_before_run_and_mounted_at_its_path(self):
         self.kube.answer("create", ran(pod_json()))
@@ -548,8 +549,8 @@ class Manifests(Served):
         self.assertFalse(template["spec"]["automountServiceAccountToken"])
 
     def test_kubernetes_refusing_a_templates_pod_passes_its_reason_through_before_anything_applies(self):
-        self.kube.answer("trial", ran(code=1, err=QUOTA))
-        answer = self.refused("POST", "/v1/manifests", {"manifests": [deployment()]}, 403, ["manifest 0 (Deployment web)", "must specify limits.cpu"])
+        self.kube.answer("trial", ran(code=1, err=BASELINE))
+        answer = self.refused("POST", "/v1/manifests", {"manifests": [deployment()]}, 403, ["manifest 0 (Deployment web)", "violates PodSecurity"])
         self.assertNotIn("apply", self.kube.verbs())
         self.assertNotIn("requester", answer)
 
@@ -635,13 +636,14 @@ class Usage(Served):
         building["status"]["hostIP"] = "192.168.75.48"
         done = pod_json(name="d", phase="Succeeded", requester="15")
         done["spec"]["resources"] = {"limits": {"cpu": "8", "memory": "8Gi"}}
+        unstated = pod_json(name="u", phase="Running", requester="15")
         web = pod_json(name="w", phase="Running", requester=None)
         web["spec"]["containers"] = [{"name": "a", "resources": {"limits": {"cpu": "500m", "memory": "1Gi"}}}, {"name": "b", "resources": {"limits": {"cpu": "250m", "memory": "512Mi"}}}]
         web["spec"]["initContainers"] = [{"name": "i", "resources": {"limits": {"cpu": "1", "memory": "1Mi"}}}]
         web["status"]["hostIP"] = "192.168.75.48"
         claim = {"metadata": {"name": "cache", "labels": {"ducktape.industries/requester": "15"}}, "spec": {"resources": {"requests": {"storage": "10Gi"}}}}
-        quota = {"metadata": {"name": "agents"}, "status": {"hard": {"limits.cpu": "48"}, "used": {"limits.cpu": "2750m"}}}
-        self.kube.answer("list", ran({"items": [building, done, web]}))
+        quota = {"metadata": {"name": "agents"}, "status": {"hard": {"requests.storage": "500Gi"}, "used": {"requests.storage": "10Gi"}}}
+        self.kube.answer("list", ran({"items": [building, done, unstated, web]}))
         self.kube.answer("claims", ran({"items": [claim]}))
         self.kube.answer("quotas", ran({"items": [quota]}))
         self.stats.summaries["192.168.75.48"] = {
@@ -653,13 +655,13 @@ class Usage(Served):
         status, answer = self.call("GET", "/v1/usage")
         self.assertEqual(status, 200)
         self.assertEqual(self.stats.hosts, ["192.168.75.48"])
-        self.assertEqual(answer["quota"], {"agents": {"hard": {"limits.cpu": "48"}, "used": {"limits.cpu": "2750m"}}})
+        self.assertEqual(answer["quota"], {"agents": {"hard": {"requests.storage": "500Gi"}, "used": {"requests.storage": "10Gi"}}})
         first, second = answer["requesters"]
         self.assertEqual(
             first,
             {
                 "requester": 15,
-                "pods": 2,
+                "pods": 3,
                 "claims": 1,
                 "cpu_limit": 2,
                 "memory_limit_bytes": 4 * 2**30,
@@ -670,7 +672,8 @@ class Usage(Served):
             },
         )
         self.assertEqual((second["requester"], second["cpu_limit"], second["memory_limit_bytes"]), (None, 1, 1536 * 2**20))
-        self.assertEqual([row["pod"] for row in answer["pods"]], ["b", "d", "w"])
+        self.assertEqual([row["pod"] for row in answer["pods"]], ["b", "d", "u", "w"])
+        self.assertEqual((answer["pods"][2]["cpu_limit"], answer["pods"][2]["memory_limit_bytes"]), (0, 0))
         self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30}])
 
     def test_quantities_read_every_suffix(self):

@@ -66,9 +66,10 @@ scripts back a `make` target; see the repository `Makefile`.
   (create, list), `pods/NAME` (status, delete), `pods/NAME/logs`,
   `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `manifests` (apply,
   delete), `manifests/KIND[/NAME]` and `usage`. `server-test.py` covers them.
-- Namespace `agents` holds the ResourceQuota `agents` (`limits.cpu` 48,
-  `limits.memory` 96Gi, `requests.storage` 500Gi), so every pod states cpu
-  and memory limits; the PriorityClass `agents` ranks its pods below every
+- Namespace `agents` holds the ResourceQuota `agents` (`requests.storage`
+  500Gi), which bounds what its claims ask for. A pod states cpu and memory
+  only if it wants requests or limits; without them it contends for the
+  whole machine. The PriorityClass `agents` ranks its pods below every
   other pod on the cluster. Its NetworkPolicy `isolated` admits traffic only
   from inside the namespace and lets pods out to public addresses and DNS.
 - The service signs blob puts, files commits and chat posts as the program
