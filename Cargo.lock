@@ -2981,6 +2981,7 @@ dependencies = [
  "fixture-valset",
  "fixture-wasm",
  "futures",
+ "governor",
  "halo",
  "hex",
  "host",

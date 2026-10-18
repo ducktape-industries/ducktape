@@ -5,20 +5,21 @@
 use std::sync::{Arc, Mutex};
 
 use commonware_cryptography::ed25519::PublicKey;
-use commonware_p2p::authenticated::lookup::{Receiver, Sender};
+use commonware_p2p::authenticated::lookup::Receiver;
 use commonware_p2p::{Receiver as _, Recipients, Sender as _};
 use node::{Preconfirm, Source, Taken};
 
+use crate::mesh::Outbound;
 use crate::{Context, Daemon};
 
 pub struct Relay<E: Context> {
     me: PublicKey,
-    sender: Sender<PublicKey, E>,
+    sender: Outbound<E>,
     validators: Mutex<Vec<PublicKey>>,
 }
 
 impl<E: Context> Relay<E> {
-    pub fn new(me: PublicKey, sender: Sender<PublicKey, E>, validators: &[PublicKey]) -> Relay<E> {
+    pub fn new(me: PublicKey, sender: Outbound<E>, validators: &[PublicKey]) -> Relay<E> {
         let relay = Relay {
             me,
             sender,

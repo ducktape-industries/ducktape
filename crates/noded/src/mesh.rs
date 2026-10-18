@@ -15,26 +15,29 @@ use consensus::channel::{BACKFILL, BROADCAST, CERTIFICATE, RELAY, RESOLVER, VOTE
 use consensus::{Cadence, EngineChannels, MarshalLanes};
 
 use crate::endpoint::Endpoint;
+use crate::link::Linked;
 use crate::transport::{self, Bridges};
 use crate::{Context, Result};
 
 pub const QUOTA_PER_SECOND: u32 = 1024;
 
-pub fn link_timeout(cadence: Cadence) -> Duration {
-    cadence.leader_timeout()
-}
-
 pub fn ping_frequency(cadence: Cadence) -> Duration {
-    cadence.leader_timeout() / 4
+    Duration::from_millis(cadence.block_time_ms()) * 5
 }
 
-pub type Lane<E> = (Sender<PublicKey, E>, Receiver<PublicKey>);
+pub fn link_timeout(cadence: Cadence) -> Duration {
+    ping_frequency(cadence) * 4
+}
+
+pub type Outbound<E> = Sender<PublicKey, Linked<E>>;
+
+pub type Lane<E> = (Outbound<E>, Receiver<PublicKey>);
 
 pub type Started<E> = (
     Mesh<E>,
     Tracker,
-    MarshalLanes<Sender<PublicKey, E>, Receiver<PublicKey>>,
-    EngineChannels<Sender<PublicKey, E>, Receiver<PublicKey>>,
+    MarshalLanes<Outbound<E>, Receiver<PublicKey>>,
+    EngineChannels<Outbound<E>, Receiver<PublicKey>>,
     Lane<E>,
 );
 
@@ -71,7 +74,8 @@ impl<E: Context> Mesh<E> {
         // only the current epoch's set: nothing reads an older one, and the
         // previous epoch's engine is gone at the switch
         config.tracked_peer_sets = NZUsize!(1);
-        let (mut network, oracle) = Network::new(context, config);
+        let linked = Linked::new(context, link_timeout(cadence));
+        let (mut network, oracle) = Network::new(linked, config);
         let quota = Quota::per_second(NZU32!(QUOTA_PER_SECOND));
         let marshal = MarshalLanes {
             broadcast: network.register(BROADCAST, quota),
@@ -195,23 +199,30 @@ mod tests {
     }
 
     #[test]
-    fn the_link_lives_a_leader_timeout_and_pings_four_times_in_it() {
-        assert_eq!(link_timeout(cadence()), Duration::from_secs(5));
+    fn a_link_pings_every_five_block_times_and_dies_after_twenty_silent_ones() {
         assert_eq!(ping_frequency(cadence()), Duration::from_millis(1_250));
+        assert_eq!(link_timeout(cadence()), Duration::from_secs(5));
         let one_second =
             Cadence::new(Duration::from_secs(1), consensus::Timeouts::default()).unwrap();
-        assert_eq!(link_timeout(one_second), Duration::from_secs(20));
         assert_eq!(ping_frequency(one_second), Duration::from_secs(5));
+        assert_eq!(link_timeout(one_second), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn the_consensus_timeouts_leave_the_link_alone() {
+        let one_second =
+            Cadence::new(Duration::from_secs(1), consensus::Timeouts::default()).unwrap();
         let tuned = Cadence::new(
             Duration::from_secs(1),
             consensus::Timeouts {
                 leader: Some(Duration::from_secs(8)),
-                ..consensus::Timeouts::default()
+                certification: Some(Duration::from_secs(12)),
+                retry: Some(Duration::from_secs(4)),
             },
         )
         .unwrap();
-        assert_eq!(link_timeout(tuned), Duration::from_secs(8));
-        assert_eq!(ping_frequency(tuned), Duration::from_secs(2));
+        assert_eq!(ping_frequency(tuned), ping_frequency(one_second));
+        assert_eq!(link_timeout(tuned), link_timeout(one_second));
     }
 
     /// Starts a mesh capped at three members and tracks `foreign` members,

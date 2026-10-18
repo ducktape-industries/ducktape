@@ -348,7 +348,7 @@ struct RunArgs {
         help = defaulted(
             "how long a view waits for its leader's proposal",
             "consensus.leader_timeout_ms",
-            "20 block times"
+            "one block time"
         )
     )]
     leader_timeout_ms: Option<u64>,
@@ -366,7 +366,7 @@ struct RunArgs {
         help = defaulted(
             "how often a timed-out view resends its timeout vote",
             "consensus.timeout_retry_ms",
-            "10 block times"
+            "2 block times"
         )
     )]
     timeout_retry_ms: Option<u64>,

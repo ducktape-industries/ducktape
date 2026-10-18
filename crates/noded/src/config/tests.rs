@@ -269,7 +269,7 @@ fn a_flag_beats_the_file_and_the_file_beats_the_default() {
         config.cadence.certification_timeout(),
         Duration::from_millis(6000)
     );
-    assert_eq!(config.cadence.timeout_retry(), Duration::from_millis(2500));
+    assert_eq!(config.cadence.timeout_retry(), Duration::from_millis(500));
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn invalid_timeouts_are_refused() {
 }
 
 #[test]
-fn the_link_follows_the_leader_timeout() {
+fn the_link_follows_the_block_time_and_not_the_leader_timeout() {
     let flags = Settings {
         consensus: ConsensusSettings {
             leader_timeout_ms: Some(8000),
@@ -356,7 +356,7 @@ fn the_link_follows_the_leader_timeout() {
         ..required()
     };
     let config = flags.resolve(&descriptor()).unwrap();
-    assert_eq!(config.link_timeout(), Duration::from_millis(8000));
+    assert_eq!(config.link_timeout(), Duration::from_secs(5));
 }
 
 #[test]

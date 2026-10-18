@@ -85,6 +85,7 @@ commonware-stream = "2026.9.0"
 commonware-parallel = "2026.9.0"
 commonware-utils = "2026.9.0"
 commonware-actor = "2026.9.0"
+governor = "0.10.4"
 base64 = "0.22"
 # tests only: isolated on-disk data dirs.
 tempfile = "3"
