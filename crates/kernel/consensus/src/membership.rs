@@ -45,6 +45,7 @@ pub struct Membership<E, S: Sender, R: Receiver, B, C> {
     chain: C,
     votes: Votes,
     engine: Option<Engine>,
+    retiring: Option<Engine>,
     seats: mpsc::UnboundedSender<Signal>,
     catch_up: Handle<()>,
 }
@@ -94,6 +95,7 @@ where
             chain,
             votes: Votes::default(),
             engine: None,
+            retiring: None,
             seats,
             catch_up,
         }
@@ -114,14 +116,24 @@ where
         let epoch = self.network.epoch_after(tip.height);
         let validators = validators_of(validators).ok_or(Error::Validators { epoch })?;
         self.roster.seat(epoch, validators);
+        self.retiring = self.engine.take();
         let standing = self.engine(epoch, tip).await?;
         let _ = self.seats.unbounded_send(Signal::Seated(epoch));
         Ok(standing)
     }
 
+    pub fn finalized(&mut self, height: u64) {
+        let Some(retiring) = &self.retiring else {
+            return;
+        };
+        let its_successor_finalized = height > self.network.anchor(retiring.epoch() + 1);
+        if its_successor_finalized {
+            self.retiring = None;
+        }
+    }
+
     async fn engine(&mut self, epoch: u64, tip: Tip) -> Result<Standing, Error> {
         let Some((scheme, standing)) = self.seat_in(epoch) else {
-            self.engine = None;
             self.votes.clear();
             return Ok(Standing::Follower);
         };
@@ -130,7 +142,6 @@ where
             .await
             .ok_or(Error::Floor { epoch })?;
         let lanes = self.lanes.register(epoch).await;
-        self.engine = None;
         self.votes.seat(scheme.participants());
         self.engine = Some(Engine::start(
             self.context.child("engine").with_attribute("epoch", epoch),

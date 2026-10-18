@@ -713,6 +713,7 @@ async fn pump<E: Context>(
     mut deliveries: mpsc::UnboundedReceiver<Delivery>,
 ) {
     while let Some((block, ack)) = deliveries.next().await {
+        membership.finalized(block.height);
         let outcome = applied(&daemon, &mut membership, &mut tracker, &block).await;
         if let Err(error) = outcome {
             tracing::error!(

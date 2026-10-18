@@ -137,7 +137,6 @@ impl Votes {
             pending,
             signed,
         } = &mut *book;
-        // a dropped engine can report once more after its seat moved on
         if !seated.contains(&key) {
             return;
         }

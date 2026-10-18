@@ -2,6 +2,7 @@ use commonware_consensus::simplex::elector::{Config, Elector as _, RoundRobin};
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::types::{Epoch, Round, View};
 use commonware_cryptography::Sha256;
+use commonware_runtime::Clock as _;
 use commonware_utils::ordered::Set;
 
 use super::*;
@@ -221,5 +222,59 @@ fn the_new_epochs_first_view_finalizes_while_its_newcomer_is_cut_off() {
         joiner.reached(closing + 2).await;
         assert_eq!(joiner.root_at(closing + 1), peers[0].root_at(closing + 1));
         assert!(joiner.roster.participates(epoch));
+    });
+}
+
+#[test]
+fn a_newcomer_that_misses_an_epochs_last_block_gets_it_from_the_retiring_engine() {
+    runner().start(|context| async move {
+        let network = network(8);
+        let epoch = 1;
+        let founder = key(1);
+        let newcomer = key(2);
+        let everyone = [founder.clone(), newcomer.clone()];
+        let public: Vec<_> = everyone.iter().map(|key| key.public_key()).collect();
+        let members = [member(&founder)];
+        let oracle = mesh(&context, &everyone).await;
+        let mut peers = validators(&context, &oracle, &everyone[..1], &members, &network).await;
+        let mut joiner = Peer::spawn(
+            context.child(LABELS[1]),
+            LABELS[1],
+            &oracle,
+            newcomer.clone(),
+            &members,
+            network.clone(),
+        )
+        .await;
+
+        let alice = key(11);
+        let promote = validators::Op::Vote(validators::Motion::Promote {
+            key: member(&newcomer).key,
+        });
+        for frame in [enroll(&newcomer), valset(&alice, &promote)] {
+            peers[0].submit(frame).await;
+        }
+        let closing = network.anchor(epoch);
+        joiner.reached(closing - 2).await;
+        sever(&oracle, &joiner.me(), &public).await;
+        peers[0].reached(closing).await;
+        let healed = context.current();
+        heal(&oracle, &joiner.me(), &public).await;
+
+        joiner.reached(closing + 1).await;
+        let recovered = context.current().duration_since(healed).unwrap();
+        assert!(
+            recovered < network.cadence.certification_timeout(),
+            "the joiner applied the new epoch's first block {recovered:?} after the heal"
+        );
+        let opening = peers[0].marshal.certificate(closing + 1).await.unwrap();
+        assert_eq!(opening.round(), Round::new(Epoch::new(epoch), View::new(1)));
+        assert_eq!(joiner.root_at(closing + 1), peers[0].root_at(closing + 1));
+
+        let finalized = peers[0].marshal.certificate(closing).await.unwrap();
+        let refinalized = joiner.marshal.certificate(closing).await.unwrap();
+        assert_eq!(refinalized.round().epoch(), Epoch::new(epoch - 1));
+        assert!(refinalized.round().view() > finalized.round().view());
+        assert_eq!(refinalized.proposal.payload, finalized.proposal.payload);
     });
 }

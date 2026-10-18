@@ -499,6 +499,7 @@ struct Pump {
 impl Pump {
     async fn run(self, mut membership: Seating, mut deliveries: mpsc::UnboundedReceiver<Delivery>) {
         while let Some((block, ack)) = deliveries.next().await {
+            membership.finalized(block.height);
             let mut node = self.node.lock().await;
             let stall = self
                 .stalls

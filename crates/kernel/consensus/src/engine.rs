@@ -42,6 +42,7 @@ pub(crate) struct Epoch {
 }
 
 pub(crate) struct Engine {
+    epoch: u64,
     handle: Handle<()>,
 }
 
@@ -69,6 +70,7 @@ impl Engine {
         B: Blocker<PublicKey = PublicKey>,
     {
         let cadence = network.cadence;
+        let number = epoch.number;
         let inline = Inline::new(
             context.child("inline"),
             App::<E, C>::new(chain, cadence),
@@ -116,7 +118,14 @@ impl Engine {
             },
         );
         let handle = engine.start(lanes.vote, lanes.certificate, lanes.resolver);
-        Engine { handle }
+        Engine {
+            epoch: number,
+            handle,
+        }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
