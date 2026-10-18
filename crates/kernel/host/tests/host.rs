@@ -18,6 +18,9 @@ use commonware_runtime::{Runner as _, Storage as _, Supervisor as _, determinist
 use fixture_probe::{Reply, Step};
 use fixture_programs::Change;
 use fixture_relay::Script;
+use fixture_wasm::{
+    ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET,
+};
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
     Limits, NETWORK, RECENT, Roles, SPENT, Submission, Tip,
@@ -25,16 +28,6 @@ use host::{
 use keyscheme::testkit;
 use sha2::Digest as _;
 use state::{Commitment, SyncTarget, commitment_name};
-
-const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
-const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
-const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
-const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
-const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
-const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
-const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
-const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
 
 const SIGNER: &[u8] = b"signer";
 /// Fuel that runs one relay handler and a message of it, not a chain of eight.

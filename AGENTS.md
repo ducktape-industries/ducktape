@@ -40,9 +40,11 @@ under `ops/`.
   at a block through the program bound to the programs role. Bytes compiled
   into a binary are a second copy of a program that only a rebuild can change, and a rebuild
   changing what a node founds or joins with is a silent network change.
-- Tests may `include_bytes!` a committed fixture
-  (`crates/kernel/fixtures/wasm/`, rebuilt by `make kernel-fixtures`) — a
-  test pins bytes on purpose. Nothing else may.
+- Tests take a fixture program's bytes from `fixture-wasm`
+  (`crates/kernel/fixture-wasm`), a dev-dependency only: its build script
+  compiles the `crates/kernel/fixtures/` workspace for wasm32 whenever a suite
+  that loads a fixture builds, and its constants include those fresh files. No
+  `.wasm` is committed, and no test includes a checked-in blob.
 
 ## No Invented Restrictions (an invented limit is an invented cap)
 
@@ -129,14 +131,8 @@ under `ops/`.
 - **Merged means gone.** Remove the worktree and delete the branch as soon as
   the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
   merge commit can revert it.
-- **A fixture's bytes move with everything it compiles in.** The kernel
-  suites run committed programs (`crates/kernel/fixtures/wasm/fixture_*.wasm`)
-  built out of `crates/kernel/fixtures/`. A change to a fixture crate, to the
-  `program` crate they compile against, or to any shape a program decodes
-  (`abi`) ships the rebuilt artifacts in the SAME PR: `make kernel-fixtures`,
-  then commit what changed. Even a deletion moves bytes: panic paths carry
-  line numbers. The programs a network founds with live in
-  `ducktape-industries/programs`. Its `crates/sdk/abi` is a copy of
+- **`abi` lives in two repositories.** The programs a network founds with
+  live in `ducktape-industries/programs`. Its `crates/sdk/abi` is a copy of
   `crates/kernel/abi` here: a change to either copy is carried to the other
   in the same change. `crates/kernel/program` here is the small program SDK
   the kernel fixtures build against; that repository's `crates/sdk/program`

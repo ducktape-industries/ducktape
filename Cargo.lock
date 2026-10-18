@@ -1084,6 +1084,7 @@ dependencies = [
  "fixture-programs",
  "fixture-relay",
  "fixture-valset",
+ "fixture-wasm",
  "futures",
  "host",
  "node",
@@ -1953,6 +1954,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-wasm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fluent31"
 version = "0.1.0"
 source = "git+https://github.com/ducktape-industries/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
@@ -2342,6 +2352,7 @@ dependencies = [
  "fixture-programs",
  "fixture-relay",
  "fixture-valset",
+ "fixture-wasm",
  "keyscheme",
  "runtime",
  "sha2 0.10.9",
@@ -2909,6 +2920,7 @@ dependencies = [
  "fixture-programs",
  "fixture-relay",
  "fixture-valset",
+ "fixture-wasm",
  "host",
  "keyscheme",
  "state",
@@ -2958,6 +2970,7 @@ dependencies = [
  "fixture-programs",
  "fixture-relay",
  "fixture-valset",
+ "fixture-wasm",
  "futures",
  "halo",
  "hex",
@@ -4057,6 +4070,7 @@ dependencies = [
  "borsh",
  "fixture-awaiter",
  "fixture-probe",
+ "fixture-wasm",
  "futures",
  "sha2 0.10.9",
  "tokio",
@@ -4507,6 +4521,7 @@ dependencies = [
  "fixture-programs",
  "fixture-relay",
  "fixture-valset",
+ "fixture-wasm",
  "futures",
  "host",
  "node",

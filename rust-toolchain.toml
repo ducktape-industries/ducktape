@@ -1,9 +1,4 @@
-# The one toolchain this tree builds with. The committed wasm bytes are
-# rustc-dependent. Pinned exactly, for the same reason `wasmtime` is.
-#
-# 1.96.1 is not a preference, it is what the checked-in artifacts came out of:
-# every committed .wasm carries `/rustc/31fca3adb283cc9dfd56b49cdee9a96
-# eb9c96ffd/` in its panic paths, and that commit IS 1.96.1.
+# The one toolchain this tree builds with, pinned exactly.
 #
 # `targets` lists every triple something in this tree passes to `--target`.
 # No WASI program exists, so no wasm32-wasip1.

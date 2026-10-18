@@ -24,5 +24,6 @@ fixture-programs = { path = "../fixtures/programs" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }
 fixture-valset = { path = "../fixtures/valset" }
+fixture-wasm = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }

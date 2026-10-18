@@ -9,18 +9,11 @@ use abi::{Cause, HostOp, HostReply, Message, Origin, Outcome, Principal, Receipt
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Plan};
 use fixture_probe::{Reply, Step};
+use fixture_wasm::{
+    ACCESS, AWAITER, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, SCHEDULER,
+    VALSET,
+};
 use host::{Applied, Block, BlockId, Founding, Genesis, Host, Layer, Limits, Submission, Tip};
-
-const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
-const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
-const BLOBS_PROGRAM: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
-const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
-const AWAITER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaiter.wasm");
-const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
-const SCHEDULER: &[u8] = include_bytes!("../../fixtures/wasm/fixture_scheduler.wasm");
-const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
-const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
 
 const SIGNER: &[u8] = b"signer";
 const TIME: u64 = 1_700_000_000;

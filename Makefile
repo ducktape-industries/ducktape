@@ -12,7 +12,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all node install install-node test clean audit kernel-fixtures
+.PHONY: all node install install-node test clean audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -111,11 +111,3 @@ audit:
 
 clean:
 	$(CARGO) clean
-
-## rebuild the kernel fixture programs (wasm32 programs the runtime and host
-## tests load) and refresh their committed bytes.
-kernel-fixtures:
-	$(CARGO) build --manifest-path crates/kernel/fixtures/Cargo.toml \
-	  --target wasm32-unknown-unknown --release
-	cp crates/kernel/fixtures/target/wasm32-unknown-unknown/release/fixture_*.wasm \
-	  crates/kernel/fixtures/wasm/

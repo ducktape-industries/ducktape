@@ -5,10 +5,9 @@ use abi::{
     Origin, Principal, ProgramCall, Refusal, Roles, Scan, reason, role,
 };
 use fixture_probe::{Reply, Step};
+use fixture_wasm::PROBE;
 use runtime::{Fault, Host, Limits, Runtime};
 use sha2::{Digest as _, Sha256};
-
-const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 #[derive(Default)]
 struct Bench {

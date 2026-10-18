@@ -18,20 +18,11 @@ use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic
 use commonware_utils::iter::NonEmpty;
 use consensus::{Certificate, validators_of};
 use fixture_probe::Step;
+use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET};
 use host::{Founding, Genesis, Layer, Limits, Tip};
 use node::{Block, Frame, Node, Sequenced};
 use state::{Storage, Store};
 use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, join, serve};
-
-const PROGRAMS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_programs.wasm");
-const VALSET: &[u8] = include_bytes!("../../fixtures/wasm/fixture_valset.wasm");
-const RELAY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_relay.wasm");
-const IDENTITY: &[u8] = include_bytes!("../../fixtures/wasm/fixture_identity.wasm");
-const BLOBS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_blobs.wasm");
-const AWAITS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_awaits.wasm");
-const HALO: &[u8] = include_bytes!("../../fixtures/wasm/fixture_halo.wasm");
-const ACCESS: &[u8] = include_bytes!("../../fixtures/wasm/fixture_access.wasm");
-const PROBE: &[u8] = include_bytes!("../../fixtures/wasm/fixture_probe.wasm");
 
 const NETWORK: &[u8] = b"sync";
 const TIME: u64 = 1_700_000_000;
