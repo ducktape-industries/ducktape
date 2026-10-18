@@ -799,6 +799,21 @@ class Usage(Served):
         self.assertEqual((answer["pods"][2]["cpu_limit"], answer["pods"][2]["memory_limit_bytes"]), (0, 0))
         self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30}])
 
+    def test_usage_lists_no_claim_kubernetes_made_for_a_pods_volume(self):
+        building = pod_json(name="b", phase="Running", requester="15")
+        building["spec"]["volumes"] = [claimed("out", {}), {"name": "cache", "persistentVolumeClaim": {"claimName": "cache"}}]
+        labels = {"ducktape.industries/requester": "15"}
+        made = {"metadata": {"name": "b-out", "labels": labels, "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "b", "controller": True}]}, "spec": {"resources": {"requests": {"storage": "1"}}}}
+        cache = {"metadata": {"name": "cache", "labels": labels}, "spec": {"resources": {"requests": {"storage": "10Gi"}}}}
+        self.kube.answer("list", ran({"items": [building]}))
+        self.kube.answer("claims", ran({"items": [made, cache]}))
+        self.kube.answer("quotas", ran({"items": []}))
+        status, answer = self.call("GET", "/v1/usage")
+        self.assertEqual(status, 200)
+        self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30}])
+        (total,) = answer["requesters"]
+        self.assertEqual((total["pods"], total["claims"], total["storage_requested_bytes"]), (1, 1, 10 * 2**30))
+
     def test_quantities_read_every_suffix(self):
         self.assertEqual(server.quantity("250m"), 0.25)
         self.assertEqual(server.quantity("2Gi"), 2 * 2**30)

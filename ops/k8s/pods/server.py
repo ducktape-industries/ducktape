@@ -853,6 +853,11 @@ def disk_of(pod, entry):
     return ((entry.get("ephemeral-storage") or {}).get("usedBytes") or 0) + held
 
 
+def made_for_a_pod(claim):
+    owners = (claim.get("metadata") or {}).get("ownerReferences") or []
+    return any(owner.get("kind") == "Pod" and owner.get("controller") for owner in owners)
+
+
 def usage_of(pods, claims, summaries, quotas, namespace):
     measured = {}
     for summary in summaries:
@@ -884,6 +889,7 @@ def usage_of(pods, claims, summaries, quotas, namespace):
             "storage_requested_bytes": int(quantity(((claim.get("spec") or {}).get("resources") or {}).get("requests", {}).get("storage", "0"))),
         }
         for claim in claims
+        if not made_for_a_pod(claim)
     ]
     totals = {}
     fields = ("cpu_limit", "memory_limit_bytes", "cpu_nanocores", "memory_bytes", "disk_bytes", "storage_requested_bytes")

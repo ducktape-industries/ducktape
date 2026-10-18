@@ -92,7 +92,8 @@ scripts back a `make` target; see the repository `Makefile`.
   each claim with its pod and deletes it with the pod. Each claim requests 1
   byte, the least the API accepts, because the service knows no input's size
   before the pod fetches it and local-path enforces no size. `usage` counts
-  the bytes a pod's ephemeral volumes hold in its `disk_bytes`.
+  the bytes a pod's ephemeral volumes hold in its `disk_bytes`, and its
+  `claims` list only the claims no pod owns.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. A pod
