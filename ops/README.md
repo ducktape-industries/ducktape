@@ -85,6 +85,13 @@ scripts back a `make` target; see the repository `Makefile`.
   replaces as `manifests` does, and sends a PATCH first as a dry run, checks
   the object it would store, and only then sends it. `server-test.py` covers
   them.
+- A pod's inputs and `/out` are generic ephemeral volumes of storage class
+  `local-path`, so they sit on the disk that holds the cluster's
+  PersistentVolumes, not on the node's root filesystem. Kubernetes creates
+  each claim with its pod and deletes it with the pod. Each claim requests 1
+  byte, the least the API accepts, because the service knows no input's size
+  before the pod fetches it and local-path enforces no size. `usage` counts
+  the bytes a pod's ephemeral volumes hold in its `disk_bytes`.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. A pod

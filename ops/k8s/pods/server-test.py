@@ -36,6 +36,11 @@ def ran(out=b"", code=0, err=""):
     return server.Ran(code, out if isinstance(out, bytes) else json.dumps(out).encode(), err)
 
 
+def claimed(name, labels):
+    claim = {"accessModes": ["ReadWriteOnce"], "storageClassName": "local-path", "resources": {"requests": {"storage": "1"}}}
+    return {"name": name, "ephemeral": {"volumeClaimTemplate": {"metadata": {"labels": labels}, "spec": claim}}}
+
+
 def pod_json(name="duckpond-41", state=None, phase="Pending", notes=None, reason=None, requester="17", init=None):
     status = {"phase": phase}
     if reason is not None:
@@ -237,6 +242,9 @@ class Create(Served):
         self.assertNotIn("resources", run)
         self.assertFalse(run["securityContext"]["allowPrivilegeEscalation"])
         self.assertEqual((out["name"], out["image"], out["command"]), ("out", FETCHING.image, ["sleep", "infinity"]))
+        self.assertEqual(run["volumeMounts"], [{"name": "out", "mountPath": "/out"}])
+        self.assertEqual(out["volumeMounts"], [{"name": "out", "mountPath": "/out"}])
+        self.assertEqual(body["volumes"], [claimed("out", pod["metadata"]["labels"])])
 
     def test_resources_are_the_pods_own_limits_and_requests_as_given(self):
         self.kube.answer("create", ran(pod_json()))
@@ -284,7 +292,8 @@ class Create(Served):
                 {"name": "in-2", "mountPath": "/work/fixture.wasm", "subPath": "data"},
             ],
         )
-        self.assertEqual([volume["name"] for volume in body["volumes"]], ["out", "in-0", "in-1", "in-2"])
+        labels = self.created()["metadata"]["labels"]
+        self.assertEqual(body["volumes"], [claimed(name, labels) for name in ("out", "in-0", "in-1", "in-2")])
 
     def test_an_input_names_one_source_an_absolute_path_and_well_formed_ids(self):
         two = {"path": "/a", "blob": CHUNKS[0], "files": {"path": "/b"}}
@@ -737,6 +746,7 @@ class Usage(Served):
         building = pod_json(name="b", phase="Running", requester="15")
         building["spec"]["resources"] = {"limits": {"cpu": "2", "memory": "4Gi"}}
         building["status"]["hostIP"] = "192.168.75.48"
+        building["spec"]["volumes"] = [claimed("out", {}), claimed("in-0", {}), {"name": "cache", "persistentVolumeClaim": {"claimName": "cache"}}]
         done = pod_json(name="d", phase="Succeeded", requester="15")
         done["spec"]["resources"] = {"limits": {"cpu": "8", "memory": "8Gi"}}
         unstated = pod_json(name="u", phase="Running", requester="15")
@@ -751,7 +761,17 @@ class Usage(Served):
         self.kube.answer("quotas", ran({"items": [quota]}))
         self.stats.summaries["192.168.75.48"] = {
             "pods": [
-                {"podRef": {"name": "b", "namespace": "agents"}, "cpu": {"usageNanoCores": 900}, "memory": {"workingSetBytes": 1000}, "ephemeral-storage": {"usedBytes": 50}},
+                {
+                    "podRef": {"name": "b", "namespace": "agents"},
+                    "cpu": {"usageNanoCores": 900},
+                    "memory": {"workingSetBytes": 1000},
+                    "ephemeral-storage": {"usedBytes": 50},
+                    "volume": [
+                        {"name": "out", "usedBytes": 7, "pvcRef": {"name": "b-out", "namespace": "agents"}},
+                        {"name": "in-0", "usedBytes": 300, "pvcRef": {"name": "b-in-0", "namespace": "agents"}},
+                        {"name": "cache", "usedBytes": 4000, "pvcRef": {"name": "cache", "namespace": "agents"}},
+                    ],
+                },
                 {"podRef": {"name": "node", "namespace": "duckpond"}, "cpu": {"usageNanoCores": 1}},
             ]
         }
@@ -770,7 +790,7 @@ class Usage(Served):
                 "memory_limit_bytes": 4 * 2**30,
                 "cpu_nanocores": 900,
                 "memory_bytes": 1000,
-                "disk_bytes": 50,
+                "disk_bytes": 357,
                 "storage_requested_bytes": 10 * 2**30,
             },
         )

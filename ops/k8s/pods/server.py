@@ -25,6 +25,8 @@ OUT = "out"
 FETCH = "fetch"
 OUT_PATH = "/out"
 IN_ROOT = "/in"
+CLAIM_CLASS = "local-path"
+CLAIM_STORAGE = "1"
 SERVER = "/usr/local/lib/pods/server.py"
 PRIORITY = "agents"
 AGENT_ACCOUNT = "agent"
@@ -496,6 +498,18 @@ def resources_of(given):
     return {group: dict(checked(given[group], AMOUNTS, f"resources' {group}")) for group in RESOURCES if group in given}
 
 
+def claimed(name, labels):
+    template = {
+        "metadata": {"labels": labels},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": CLAIM_CLASS,
+            "resources": {"requests": {"storage": CLAIM_STORAGE}},
+        },
+    }
+    return {"name": name, "ephemeral": {"volumeClaimTemplate": template}}
+
+
 def pod_spec(asked, spec, fetching, namespace):
     named(spec, ["image"], "a pod")
     env = spec.get("env", {})
@@ -533,10 +547,11 @@ def pod_spec(asked, spec, fetching, namespace):
         "hostUsers": False,
         "priorityClassName": PRIORITY,
         "containers": [run_container, out_container],
-        "volumes": [{"name": OUT, "emptyDir": {}}] + [{"name": f"in-{index}", "emptyDir": {}} for index in range(len(inputs))],
     }
     if "resources" in spec:
         body["resources"] = resources_of(spec["resources"])
+    labels = {**dict([MANAGED]), **labels_for(asked, spec.get("requester"))}
+    body["volumes"] = [claimed(OUT, labels)] + [claimed(f"in-{index}", labels) for index in range(len(inputs))]
     if inputs:
         body["initContainers"] = [fetch_container(inputs, fetching)]
     return {
@@ -545,7 +560,7 @@ def pod_spec(asked, spec, fetching, namespace):
         "metadata": {
             "name": f"{asked['chain']}-{asked['request']}",
             "namespace": namespace,
-            "labels": {**dict([MANAGED]), **labels_for(asked, spec.get("requester"))},
+            "labels": labels,
             "annotations": {DEFAULT_CONTAINER: RUN, **notify_notes(spec)},
         },
         "spec": body,
@@ -832,6 +847,12 @@ def pod_limit(spec, resource):
     return max(running, starting)
 
 
+def disk_of(pod, entry):
+    claims = {volume["name"] for volume in (pod.get("spec") or {}).get("volumes") or [] if "ephemeral" in volume}
+    held = sum(volume.get("usedBytes") or 0 for volume in entry.get("volume") or [] if volume.get("name") in claims)
+    return ((entry.get("ephemeral-storage") or {}).get("usedBytes") or 0) + held
+
+
 def usage_of(pods, claims, summaries, quotas, namespace):
     measured = {}
     for summary in summaries:
@@ -853,7 +874,7 @@ def usage_of(pods, claims, summaries, quotas, namespace):
                 "memory_limit_bytes": int(pod_limit(pod.get("spec", {}), "memory")) if live else 0,
                 "cpu_nanocores": (entry.get("cpu") or {}).get("usageNanoCores") or 0,
                 "memory_bytes": (entry.get("memory") or {}).get("workingSetBytes") or 0,
-                "disk_bytes": (entry.get("ephemeral-storage") or {}).get("usedBytes") or 0,
+                "disk_bytes": disk_of(pod, entry),
             }
         )
     held = [
