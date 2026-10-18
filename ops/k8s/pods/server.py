@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs, exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, posts when work ends, and usage.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs, exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends, and usage.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import copy
 import json
@@ -60,6 +60,7 @@ FILES = {"path": str, "snapshot": str}
 BLOB = {"path": str, "kind": str, "container": str}
 FILE = {"path": str, "to": str, "message": str, "container": str}
 EXEC = {"command": list, "container": str, "every": int}
+PUSH = {"path": str, "ref": str, "have": list, "container": str}
 APPLY = {"manifests": list, "requester": int}
 DELETE = {"kind": str, "name": str}
 LOGS = {"tail", "since", "container"}
@@ -112,6 +113,40 @@ CHAT = "chat"
 FILES_PROGRAM = "files"
 CHUNK = "chunk"
 CHUNK_SIZE = 1 << 20
+EGRESS = "egress"
+PACK = "pack"
+RETRY_PAUSE = 1
+DROPPED = (
+    "connection closed before message completed",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "error sending request",
+    "error trying to connect",
+    "error dialing backend",
+    "unexpected eof",
+    "i/o timeout",
+    "tls handshake timeout",
+    "use of closed network connection",
+    "http2: client connection lost",
+)
+OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
+RESOLVING = SAFE_GIT + 'cd "$1" && git rev-parse --verify --quiet "$2^{commit}"\n'
+PACKING = (
+    SAFE_GIT
+    + """cd "$1" || exit
+new=$2
+shift 2
+{
+  echo "$new"
+  for have in "$@"; do
+    if git cat-file -e "$have^{commit}" 2>/dev/null; then echo "^$have"; fi
+  done
+  git for-each-ref --format='^%(objectname)' refs/remotes
+} | git pack-objects --revs --stdout -q
+"""
+)
 WATCH_PAUSE = 1
 SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 
@@ -156,6 +191,17 @@ def kube_refusal(ran, doing):
     found = re.search(r"Error from server \((\w+)\)", ran.err)
     status = STATUS.get(found.group(1), 502) if found else 502
     return Refused(status, f"{doing}: {ran.err or f'kubectl exited {ran.code}'}")
+
+
+def dropped(text):
+    lowered = text.lower()
+    return any(words in lowered for words in DROPPED)
+
+
+def failed(ran):
+    if ran.code == 0:
+        return None
+    return ran.err or ran.out.decode(errors="replace").strip() or f"exited {ran.code}"
 
 
 def text_or_hex(data, field):
@@ -264,10 +310,31 @@ def contents_of(reply):
     return snapshot, size, offset, data, eof
 
 
+def files_commit_of(message, path, size, chunks):
+    return lambda base: files_commit(base, message, path, size, chunks)
+
+
 def files_commit(base, message, path, size, chunks):
     content = u8(1) + u64(size) + borsh_vec([blob_id(chunk) for chunk in chunks])
     put = u8(0) + borsh_text(path) + u8(0) + (0).to_bytes(4, "little") + content
     return u8(1) + borsh_option(base, blob_id) + borsh_text(message) + borsh_vec([put])
+
+
+def egress_request(request):
+    return u8(3) + u64(request)
+
+
+def open_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != 3:
+        raise Refused(502, "egress answered a request with something else")
+    return reader.u8() == 1
+
+
+def objects_of(pack):
+    if pack[:4] != b"PACK" or len(pack) < 12:
+        raise Refused(502, "git pack-objects wrote no pack")
+    return int.from_bytes(pack[8:12], "big")
 
 
 def receipt(ran):
@@ -873,12 +940,23 @@ def relay(process, events):
     events.put(("closed", process.wait()))
 
 
-def exec_answer(name, ran):
-    reached = re.search(r"command terminated with exit code (\d+)", ran.err)
-    server_refused = ran.code != 0 and reached is None and "Error from server" in ran.err
+def reached(name, ran):
+    answered = re.search(r"command terminated with exit code (\d+)", ran.err)
+    server_refused = ran.code != 0 and answered is None and "Error from server" in ran.err
     if server_refused:
         raise kube_refusal(ran, f"pod {name} was not reached")
-    stderr = re.sub(r"\n?command terminated with exit code \d+\s*$", "", ran.err)
+    return re.sub(r"\n?command terminated with exit code \d+\s*$", "", ran.err)
+
+
+def git_output(name, ran, doing):
+    stderr = reached(name, ran)
+    if ran.code != 0:
+        raise Refused(422, f"{doing}: {stderr.strip() or f'git exited {ran.code}'}")
+    return ran.out
+
+
+def exec_answer(name, ran):
+    stderr = reached(name, ran)
     return {"exit_code": ran.code, **text_or_hex(ran.out, "stdout"), **text_or_hex(stderr.encode(), "stderr")}
 
 
@@ -1071,6 +1149,7 @@ class Service:
         self.stats = stats
         self.api = api
         self.notifier = Notifier(kube, signer)
+        self.pause = time.sleep
 
     def pod(self, name):
         ran = self.kube.get(name)
@@ -1082,11 +1161,38 @@ class Service:
         if not self.signer.held():
             raise Refused(503, f"this service holds no key to {doing} with")
 
-    def output(self, name, asked):
+    def waiting(self, asked):
+        request = int(asked["request"])
+        reply = self.signer.query(EGRESS, egress_request(request))
+        why = failed(reply)
+        if why is None:
+            return open_of(reply.out)
+        if dropped(why):
+            return True
+        raise Refused(502, f"egress was not asked whether request {request} still waits: {why}")
+
+    def retried(self, asked, attempt, failure):
+        pause = RETRY_PAUSE
+        attempts = 0
+        while True:
+            answer = attempt()
+            why = failure(answer)
+            if why is None or not dropped(why):
+                return answer
+            attempts += 1
+            if attempts & (attempts - 1) == 0:
+                say("pods_retried", attempts=attempts, reason="connection_dropped", detail=json.dumps(why))
+            if not self.waiting(asked):
+                raise Refused(502, f"{why}; request {asked['request']}, which asked for this, is gone, so it was not tried again")
+            self.pause(pause)
+            pause *= 2
+
+    def output(self, name, asked_by, asked):
         pod = self.pod(name)
         names = [container["name"] for container in pod["spec"]["containers"]]
         container = asked.get("container") or (OUT if OUT in names else None)
-        ran = self.kube.exec(name, container, ["cat", "--", absolute(asked["path"], "path")])
+        command = ["cat", "--", absolute(asked["path"], "path")]
+        ran = self.retried(asked_by, lambda: self.kube.exec(name, container, command), failed)
         if ran.code != 0:
             raise kube_refusal(ran, f"{asked['path']} was not read from pod {name}")
         return ran.out
@@ -1177,25 +1283,25 @@ class Service:
             answer = "refused", {"status": refusal.status, "error": refusal.sentence}
         yield sse(*answer)
 
-    def blob(self, name, body):
+    def blob(self, name, asked_by, body):
         asked = named(checked(body, BLOB, "a blob"), ["path", "kind"], "a blob")
         self.keyed("put blobs")
-        data = self.output(name, asked)
+        data = self.output(name, asked_by, asked)
         with tempfile.TemporaryDirectory() as temp:
             file = Path(temp) / "blob"
             file.write_bytes(data)
-            put = self.signer.put([file], asked["kind"])
+            put = self.retried(asked_by, lambda: self.signer.put([file], asked["kind"]), failed)
         if put.code != 0:
             raise Refused(502, f"the blob was not put: {put.err or put.out.decode(errors='replace')}")
         held = put_answer(put.out.decode(), 1)
         blob = held.pop("blobs")[0]
         return 200, {"blob": blob, "size": len(data), "kind": asked["kind"], **held}
 
-    def file(self, name, body):
+    def file(self, name, asked_by, body):
         asked = named(checked(body, FILE, "a file"), ["path", "to"], "a file")
         to = absolute(asked["to"], "to")
         self.keyed("write files")
-        data = self.output(name, asked)
+        data = self.output(name, asked_by, asked)
         pieces = [data[start : start + CHUNK_SIZE] for start in range(0, len(data), CHUNK_SIZE)]
         chunks = []
         with tempfile.TemporaryDirectory() as temp:
@@ -1203,21 +1309,59 @@ class Service:
             for path, piece in zip(paths, pieces):
                 path.write_bytes(piece)
             if paths:
-                put = self.signer.put(paths, CHUNK)
+                put = self.retried(asked_by, lambda: self.signer.put(paths, CHUNK), failed)
                 if put.code != 0:
                     raise Refused(502, f"the file's chunks were not put: {put.err or put.out.decode(errors='replace')}")
                 chunks = put_answer(put.out.decode(), len(paths))["blobs"]
-        head = self.signer.query(FILES_PROGRAM, files_head())
-        if head.code != 0:
-            raise Refused(502, f"files' head was not read: {head.err}")
-        base = head_of(head.out)
         message = asked.get("message") or f"pods: {name} wrote {to}"
-        outcome, reason, sentence = receipt(self.signer.submit(FILES_PROGRAM, files_commit(base, message, to, len(data), chunks)))
+        base, (outcome, reason, sentence) = self.committed(asked_by, files_commit_of(message, to, len(data), chunks))
         if outcome == "rejected":
             raise Refused(REJECTED.get(reason, 422), f"files refused the write: {reason}: {sentence}")
         if outcome == "failed":
             raise Refused(502, f"the write was not sent: {sentence}")
         return 200, {"written": to, "size": len(data), "chunks": chunks, "base": base, "preconfirmed": True}
+
+    def committed(self, asked_by, commit):
+        def attempt():
+            head = self.retried(asked_by, lambda: self.signer.query(FILES_PROGRAM, files_head()), failed)
+            if head.code != 0:
+                raise Refused(502, f"files' head was not read: {head.err}")
+            base = head_of(head.out)
+            return base, receipt(self.signer.submit(FILES_PROGRAM, commit(base)))
+
+        unsent = lambda tried: tried[1][2] if tried[1][0] == "failed" else None
+        return self.retried(asked_by, attempt, unsent)
+
+    def push(self, name, asked_by, body):
+        asked = named(checked(body, PUSH, "a push"), ["path"], "a push")
+        path = absolute(asked["path"], "path")
+        rev = asked.get("ref") or "HEAD"
+        if rev.startswith("-"):
+            raise Refused(400, f"ref {rev} names a revision, not an option")
+        have = asked.get("have", [])
+        unnamed = [oid for oid in have if not isinstance(oid, str) or not OID.fullmatch(oid)]
+        if unnamed:
+            raise Refused(400, f"have holds commit ids, 40 or 64 lowercase hex digits, not {unnamed[0]!r}")
+        self.keyed("put the pack")
+        container = asked.get("container")
+        resolve = ["sh", "-c", RESOLVING, "resolve", path, rev]
+        resolved = self.retried(asked_by, lambda: self.kube.exec(name, container, resolve), failed)
+        commit = git_output(name, resolved, f"{rev} names no commit in {path}").decode().strip()
+        packing = ["sh", "-c", PACKING, "pack", path, commit, *have]
+        packed = self.retried(asked_by, lambda: self.kube.exec(name, container, packing), failed)
+        pack = git_output(name, packed, f"{commit} was not packed in {path}")
+        objects = objects_of(pack)
+        answer = {"commit": commit, "objects": objects, "size": len(pack), "kind": PACK}
+        if objects == 0:
+            return 200, {**answer, "pack": None}
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "pack"
+            file.write_bytes(pack)
+            put = self.retried(asked_by, lambda: self.signer.put([file], PACK), failed)
+        if put.code != 0:
+            raise Refused(502, f"the pack was not put: {put.err or put.out.decode(errors='replace')}")
+        held = put_answer(put.out.decode(), 1)
+        return 200, {**answer, "pack": held.pop("blobs")[0], **held}
 
     def cluster_kinds(self):
         ran = self.kube.cluster_kinds()
@@ -1340,9 +1484,11 @@ class Service:
             case ("POST", "pods", name, "exec"):
                 return self.exec(name, parsed(body))
             case ("POST", "pods", name, "blob"):
-                return self.blob(name, parsed(body))
+                return self.blob(name, asked, parsed(body))
             case ("POST", "pods", name, "file"):
-                return self.file(name, parsed(body))
+                return self.file(name, asked, parsed(body))
+            case ("POST", "pods", name, "push"):
+                return self.push(name, asked, parsed(body))
             case ("DELETE", "pods", name):
                 return self.delete(name)
             case ("POST", "manifests"):
@@ -1380,6 +1526,9 @@ def handler(service):
                 status, answer = service.answer(method, self.path, headers, body)
             except Refused as refusal:
                 status, answer = refusal.status, {"error": refusal.sentence}
+            except Exception as error:
+                say("pods_failed", reason="unexpected", detail=json.dumps(repr(error)))
+                status, answer = 500, {"error": f"the pods service failed: {error!r}"}
             if isinstance(answer, Stream):
                 self.stream(status, answer.events)
                 return

@@ -34,6 +34,24 @@ KINDS = b"namespaces  ns  v1  false  Namespace\nclusterroles    rbac.authorizati
 FETCHING = server.Fetching(image="localhost:5000/pods@sha256:00", node="https://node.example", forge="duck://duckpond/forge")
 
 
+DROPPED = "error: unable to upgrade connection: read tcp: connection reset by peer"
+OPEN = bytes([3, 1]) + b"the request's row"
+GONE = bytes([3, 0])
+COMMIT = "c0ffee" + "0" * 34
+HAVE = "be" * 20
+
+
+def taken(holder, field):
+    value = getattr(holder, field)
+    if isinstance(value, list):
+        return value.pop(0) if len(value) > 1 else value[0]
+    return value
+
+
+def pack_of(objects):
+    return b"PACK" + (2).to_bytes(4, "big") + objects.to_bytes(4, "big") + b"objects" * objects
+
+
 def ran(out=b"", code=0, err=""):
     return server.Ran(code, out if isinstance(out, bytes) else json.dumps(out).encode(), err)
 
@@ -166,21 +184,22 @@ class Signer:
         self.put_ran = ran(b"sha256:ab12cd34ef56ab78cd90\nbundle 7 put at block 900\nbundle 7 held since block 901\n")
         self.submitted = ran(b"preconfirmed applied 00ff\n")
         self.head = ran(bytes([0, 1, 0]) + bytes.fromhex("ab" * 32) + b"rest of the row")
+        self.request = ran(OPEN)
 
     def held(self):
         return self.keyed
 
     def put(self, paths, kind):
         self.puts.append(([pathlib.Path(path).read_bytes() for path in paths], kind))
-        return self.put_ran
+        return taken(self, "put_ran")
 
     def submit(self, program, payload):
         self.submits.append((program, payload))
-        return self.submitted
+        return taken(self, "submitted")
 
     def query(self, program, request):
         self.queries.append((program, request))
-        return self.head
+        return taken(self, "request" if program == "egress" else "head")
 
 
 class Stats:
@@ -211,6 +230,8 @@ class Served(unittest.TestCase):
         self.stats = Stats()
         self.api = Api()
         service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api)
+        self.paused = []
+        service.pause = self.paused.append
         quiet = type("Quiet", (server.handler(service),), {"log_message": lambda *_: None})
         self.http = server.ThreadingHTTPServer(("127.0.0.1", 0), quiet)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
@@ -669,6 +690,118 @@ class File(Served):
         self.assertEqual((self.signer.submits, self.kube.calls), ([], []))
 
 
+class Push(Served):
+    def setUp(self):
+        super().setUp()
+        self.signer.put_ran = ran(b"sha256:" + b"cd" * 32 + b"\nbundle 9 put at block 990\nbundle 9 held since block 991\n")
+
+    def execs(self):
+        return [call for call in self.kube.calls if call[0] == "exec"]
+
+    def test_a_commit_is_resolved_packed_against_what_forge_has_and_put_as_a_pack_blob(self):
+        self.kube.answer("exec", ran(f"{COMMIT}\n".encode()), ran(pack_of(3)))
+        body = {"path": "/work/programs", "ref": "j-057/x", "have": [HAVE]}
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/push", body)
+        self.assertEqual(status, 200, answer)
+        expected = {
+            "commit": COMMIT,
+            "objects": 3,
+            "size": len(pack_of(3)),
+            "kind": "pack",
+            "pack": "sha256:" + "cd" * 32,
+            "bundle": 9,
+            "put_at": 990,
+            "held_since": 991,
+        }
+        self.assertEqual(answer, expected)
+        resolve, pack = self.execs()
+        self.assertEqual(resolve, ("exec", "duckpond-41", None, ["sh", "-c", server.RESOLVING, "resolve", "/work/programs", "j-057/x"]))
+        self.assertEqual(pack, ("exec", "duckpond-41", None, ["sh", "-c", server.PACKING, "pack", "/work/programs", COMMIT, HAVE]))
+        self.assertEqual(self.signer.puts, [([pack_of(3)], "pack")])
+        self.assertEqual((self.signer.submits, self.paused), ([], []))
+
+    def test_head_is_the_default_ref_and_the_container_asked_runs_git(self):
+        self.kube.answer("exec", ran(f"{COMMIT}\n".encode()), ran(pack_of(1)))
+        self.call("POST", "/v1/pods/duckpond-41/push", {"path": "/work/core", "container": "out"})
+        resolve, pack = self.execs()
+        self.assertEqual((resolve[2], resolve[3][-1], pack[3][4:]), ("out", "HEAD", ["/work/core", COMMIT]))
+
+    def test_a_commit_forge_already_holds_answers_no_pack_and_puts_nothing(self):
+        self.kube.answer("exec", ran(f"{COMMIT}\n".encode()), ran(pack_of(0)))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/push", {"path": "/work/core", "have": [COMMIT]})
+        self.assertEqual((status, answer["pack"], answer["objects"], answer["commit"]), (200, None, 0, COMMIT))
+        self.assertEqual(self.signer.puts, [])
+
+    def test_a_ref_that_names_no_commit_is_refused_in_gits_words(self):
+        self.kube.answer("exec", ran(code=1, err="fatal: not a git repository\ncommand terminated with exit code 128"))
+        self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/work/x"}, 422, ["HEAD names no commit in /work/x", "not a git repository"])
+        self.assertEqual((len(self.execs()), self.signer.puts), (1, []))
+
+    def test_a_pod_kubernetes_cannot_reach_is_refused_with_why(self):
+        self.kube.answer("exec", ran(code=1, err=NOT_FOUND))
+        self.refused("POST", "/v1/pods/duckpond-9/push", {"path": "/work/x"}, 404, ["duckpond-9"])
+
+    def test_a_push_names_an_absolute_path_a_revision_and_commit_ids(self):
+        self.refused("POST", "/v1/pods/duckpond-41/push", {}, 400, ["names its path"])
+        self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "work"}, 400, ["absolute path"])
+        self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "ref": "--all"}, 400, ["not an option"])
+        self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "have": ["main"]}, 400, ["commit ids"])
+        self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "repo": "core"}, 400, ["no field repo"])
+        self.assertEqual(self.kube.calls, [])
+
+
+class Retried(Served):
+    def setUp(self):
+        super().setUp()
+        self.kube.answer("get", ran(pod_json()))
+
+    def test_a_read_that_loses_its_connection_is_read_again_while_its_request_waits(self):
+        self.kube.answer("exec", ran(code=1, err=DROPPED), ran(b"\x00asm"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"})
+        self.assertEqual((status, answer["size"]), (200, 4), answer)
+        self.assertEqual(self.kube.verbs(), ["get", "exec", "exec"])
+        self.assertEqual(self.signer.queries, [("egress", server.egress_request(41))])
+        self.assertEqual(self.paused, [1])
+
+    def test_the_pause_doubles_with_each_lost_connection(self):
+        dropped = ran(code=1, err="connection closed before message completed")
+        self.signer.put_ran = [dropped, dropped, dropped, ran(b"sha256:ab12cd34ef56ab78cd90\n")]
+        self.kube.answer("exec", ran(b"\x00asm"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"})
+        self.assertEqual((status, answer["blob"]), (200, "sha256:ab12cd34ef56ab78cd90"), answer)
+        self.assertEqual((len(self.signer.puts), self.paused), (4, [1, 2, 4]))
+
+    def test_nothing_is_tried_again_once_the_request_that_asked_is_gone(self):
+        self.kube.answer("exec", ran(code=1, err=DROPPED))
+        self.signer.request = ran(GONE)
+        self.refused("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"}, 502, ["connection reset", "request 41", "is gone"])
+        self.assertEqual((self.kube.verbs(), self.paused), (["get", "exec"], []))
+
+    def test_any_other_failure_is_answered_at_once(self):
+        self.kube.answer("exec", ran(code=1, err="cat: /out/a: No such file or directory\ncommand terminated with exit code 1"))
+        self.refused("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"}, 502, ["No such file"])
+        self.signer.put_ran = ran(code=1, err="blob kind program refused: too large")
+        self.kube.answer("exec", ran(b"x"))
+        self.refused("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"}, 502, ["too large"])
+        self.assertEqual((self.signer.queries, self.paused), ([], []))
+
+    def test_a_write_whose_submit_lost_its_connection_reads_the_head_again_and_commits_onto_it(self):
+        self.kube.answer("exec", ran(b"abc"))
+        self.signer.put_ran = ran(CHUNKS[0].encode() + b"\n")
+        self.signer.submitted = [ran(code=1, err="the node failed: connection closed before message completed"), ran(b"preconfirmed applied 00ff\n")]
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/r", "message": "m"})
+        self.assertEqual((status, answer["base"]), (200, SNAPSHOT), answer)
+        files = [query for query in self.signer.queries if query[0] == "files"]
+        self.assertEqual((len(files), len(self.signer.submits), self.paused), (2, 2, [1]))
+        self.assertEqual(self.signer.submits[0], self.signer.submits[1])
+
+    def test_a_failure_the_service_did_not_foresee_answers_500_with_why(self):
+        self.kube.answer("get", ran(b"not json"))
+        status, answer = self.call("GET", "/v1/pods/duckpond-41")
+        self.assertEqual(status, 500)
+        self.assertIn("the pods service failed", answer["error"])
+
+
 class Keyless(Served):
     def setUp(self):
         self.serve(Signer(keyed=False))
@@ -676,6 +809,7 @@ class Keyless(Served):
     def test_a_service_without_a_key_says_so_and_reads_nothing(self):
         self.refused("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"}, 503, ["holds no key to put blobs"])
         self.refused("POST", "/v1/pods/duckpond-41/file", {"path": "/out/a", "to": "/a"}, 503, ["holds no key to write files"])
+        self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/work/a"}, 503, ["holds no key to put the pack"])
         self.assertEqual(self.kube.calls, [])
 
 

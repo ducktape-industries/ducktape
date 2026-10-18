@@ -78,7 +78,7 @@ scripts back a `make` target; see the repository `Makefile`.
 - `k8s/pods/server.py` is the service, and `server.py fetch` the init
   container that fetches a pod's inputs. Its routes, under `/v1`: `pods`
   (create, list), `pods/NAME` (status, delete), `pods/NAME/logs`,
-  `pods/NAME/wait`, `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `manifests` (apply,
+  `pods/NAME/wait`, `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `pods/NAME/push`, `manifests` (apply,
   delete), `manifests/KIND[/NAME]`, `usage`, and `k8s/PATH`, which passes a
   Kubernetes API call through when PATH is inside namespace `agents`
   (`api/v1/namespaces/agents/...`, `apis/GROUP/VERSION/namespaces/agents/...`)
@@ -96,6 +96,23 @@ scripts back a `make` target; see the repository `Makefile`.
   So a build that outlives a request's `wait` still answers. `every` is the
   caller's: only it knows its request's `wait` and the time an event takes
   to reach its chain. A pod that is not there is refused before any stream.
+- `pods/NAME/push` `{path, ref, have, container}` packs a commit of the git
+  work tree at `path` in the pod for a forge push: `ref` (`HEAD` when left
+  out) resolved to its commit, and every object it reaches but the commits
+  in `have` and the pod's `refs/remotes` reach, which forge already holds.
+  The pack is put as a blob of kind `pack`, and the answer names the
+  `commit`, the `pack` blob (`null` when forge holds every object), its
+  `size` and `objects`. The service pushes nothing: the caller sends forge's
+  `Push` with the pack as its own account, so forge's write list decides as
+  for any push.
+- `pods/NAME/blob`, `pods/NAME/file` and `pods/NAME/push` try a step again
+  when it lost its connection (kubectl's exec, a blob put, files' head or
+  the files commit, which is made again onto files' head as read then): the
+  pause doubles from a second, with no last attempt, while the egress
+  request that asked is open (`egress` `Request { id }`, the
+  `ducktape-request` header). Once it is gone the step is not tried again.
+  Any other failure answers at once, and a failure the service did not
+  foresee answers 500 with `{"error"}` rather than closing the connection.
 - A pod's inputs and `/out` are generic ephemeral volumes of storage class
   `local-path`, so they sit on the disk that holds the cluster's
   PersistentVolumes, not on the node's root filesystem. Kubernetes creates
