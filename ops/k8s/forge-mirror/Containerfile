@@ -1,0 +1,12 @@
+# The forge-mirror image: Python with cryptography for the GitHub App's JWT, git with git-remote-duck, running mirror.py as uid 1000.
+# Built by ops/k8s/forge-mirror/deploy from a staged context holding git-remote-duck and mirror.py.
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 python3-cryptography \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --user-group --create-home --home-dir /home/forge-mirror forge-mirror
+COPY git-remote-duck /usr/local/bin/
+COPY mirror.py /usr/local/lib/forge-mirror/mirror.py
+ENV NO_COLOR=1 PYTHONDONTWRITEBYTECODE=1
+USER 1000:1000
+WORKDIR /home/forge-mirror
+ENTRYPOINT ["python3", "/usr/local/lib/forge-mirror/mirror.py"]

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Makes GitHub's dev and main of ducktape, programs and app read-only except to the forge-mirror App: one ruleset per repository blocking update, force push and deletion, then deletes the classic protection it replaces.
+# Usage: ops/k8s/forge-mirror/protect APP_ID [--apply]; without --apply it prints each ruleset and the classic protection it replaces.
+set -euo pipefail
+usage="usage: ops/k8s/forge-mirror/protect APP_ID [--apply]"
+app_id=${1:?$usage}
+apply=${2:-}
+org=ducktape-industries
+name="release mirror: only forge-mirror writes"
+
+body=$(jq -n --arg name "$name" --argjson app "$app_id" '{
+  name: $name,
+  target: "branch",
+  enforcement: "active",
+  conditions: {ref_name: {include: ["refs/heads/dev", "refs/heads/main"], exclude: []}},
+  rules: [
+    {type: "update", parameters: {update_allows_fetch_and_merge: false}},
+    {type: "non_fast_forward"},
+    {type: "deletion"}
+  ],
+  bypass_actors: [{actor_id: $app, actor_type: "Integration", bypass_mode: "always"}]
+}')
+
+put() {
+  local repo=$1 id
+  if [ "$apply" != "--apply" ]; then
+    echo "== $org/$repo ruleset \"$name\""
+    jq . <<<"$body"
+    return
+  fi
+  id=$(gh api "repos/$org/$repo/rulesets" --jq ".[] | select(.name == \"$name\") | .id")
+  if [ -n "$id" ]; then
+    gh api -X PUT "repos/$org/$repo/rulesets/$id" --input - <<<"$body" --jq '"updated \(.name) \(.id)"'
+  else
+    gh api -X POST "repos/$org/$repo/rulesets" --input - <<<"$body" --jq '"created \(.name) \(.id)"'
+  fi
+}
+
+unprotect() {
+  local repo=$1 branch=$2
+  if ! gh api "repos/$org/$repo/branches/$branch/protection" >/dev/null 2>&1; then
+    echo "== $org/$repo $branch has no classic protection"
+    return
+  fi
+  if [ "$apply" != "--apply" ]; then
+    echo "== $org/$repo classic protection of $branch, deleted once the ruleset exists"
+    gh api "repos/$org/$repo/branches/$branch/protection" | jq -c '{required_status_checks: [.required_status_checks.checks[]?.context], enforce_admins: .enforce_admins.enabled, allow_force_pushes: .allow_force_pushes.enabled, allow_deletions: .allow_deletions.enabled}'
+    return
+  fi
+  gh api -X DELETE "repos/$org/$repo/branches/$branch/protection"
+  echo "deleted the classic protection of $org/$repo $branch"
+}
+
+for repo in ducktape programs app; do
+  put "$repo"
+done
+for repo in ducktape programs app; do
+  for branch in dev main; do
+    unprotect "$repo" "$branch"
+  done
+done

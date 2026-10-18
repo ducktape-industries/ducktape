@@ -1,0 +1,95 @@
+# forge-mirror on fabrics-1: its namespace, its state claim, a policy closing every inbound port, and the mirror Deployment.
+# Applied by ops/k8s/forge-mirror/deploy, which substitutes @IMAGE@; the mirror pushes to GitHub as the App in the Secret github-app.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: forge-mirror
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forge-mirror
+  namespace: forge-mirror
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path-retain
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: no-ingress
+  namespace: forge-mirror
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge-mirror
+  namespace: forge-mirror
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: forge-mirror
+  template:
+    metadata:
+      labels:
+        app: forge-mirror
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mirror
+          image: "@IMAGE@"
+          env:
+            - name: FORGE_MIRROR_NODE
+              value: https://duckpond.ducktape.industries
+            - name: FORGE_MIRROR_CHAIN
+              value: duckpond-725bcad1
+            - name: FORGE_MIRROR_CLOCK
+              value: scheduler
+            - name: FORGE_MIRROR_STATE
+              value: /state
+            - name: FORGE_MIRROR_APP
+              value: /keys/github-app
+            - name: FORGE_MIRROR_REPOS
+              value: core=ducktape-industries/ducktape programs=ducktape-industries/programs app=ducktape-industries/app
+            - name: FORGE_MIRROR_BRANCHES
+              value: dev main
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: tmp
+              mountPath: /tmp
+            - name: github-app
+              mountPath: /keys/github-app
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: forge-mirror
+        - name: tmp
+          emptyDir: {}
+        - name: github-app
+          secret:
+            secretName: github-app
+            defaultMode: 0440
