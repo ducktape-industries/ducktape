@@ -13,8 +13,8 @@ agents_memory=${AGENTS_MEMORY:?AGENTS_MEMORY is the requests.memory of hardcap: 
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 context=${DEPLOY_CONTEXT:-fabrics-1}
 kubectl_version=v1.36.5
-duck_release=git-remote-duck-7acf453
-duck_sha256=c03d7b0d02327af0a1d8eef2d80e778ec8a67850aa42dd2b43022f85269b5b75
+duck_release=git-remote-duck-628d7c1
+duck_sha256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7
 tunnel_port=35312
 
 stage=$(mktemp -d)

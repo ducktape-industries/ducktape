@@ -6,8 +6,8 @@ ARG RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb
 ARG BINARYEN_VERSION=132
 ARG BINARYEN_SHA256=195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572
 ARG WASM_TOOLS_VERSION=1.262.0
-ARG GIT_REMOTE_DUCK_RELEASE=git-remote-duck-7acf453
-ARG GIT_REMOTE_DUCK_SHA256=c03d7b0d02327af0a1d8eef2d80e778ec8a67850aa42dd2b43022f85269b5b75
+ARG GIT_REMOTE_DUCK_RELEASE=git-remote-duck-628d7c1
+ARG GIT_REMOTE_DUCK_SHA256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates clang cmake curl git libclang-dev make perl pkg-config python3 xz-utils \
       libasound2-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
