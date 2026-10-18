@@ -20,7 +20,7 @@ stage=$(mktemp -d)
 socket="$stage.ssh"
 trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
 mkdir "$stage/src"
-git -C "$here" archive "$commit" | tar -x -C "$stage/src"
+git -C "$(git -C "$here" rev-parse --show-toplevel)" archive "$commit" | tar -x -C "$stage/src"
 curl -fsSL -o "$stage/kubectl" "https://dl.k8s.io/release/$kubectl_version/bin/linux/amd64/kubectl"
 echo "$(curl -fsSL "https://dl.k8s.io/release/$kubectl_version/bin/linux/amd64/kubectl.sha256")  $stage/kubectl" | sha256sum --check --quiet
 curl -fsSL -o "$stage/git-remote-duck" \
