@@ -141,6 +141,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-egress"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "program",
+]
+
+[[package]]
 name = "fixture-halo"
 version = "0.1.0"
 dependencies = [

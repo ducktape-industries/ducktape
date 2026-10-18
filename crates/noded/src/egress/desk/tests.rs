@@ -3,6 +3,7 @@ use abi::role::egress::{Delivery, Request};
 use super::*;
 
 mod stream;
+mod want;
 
 fn row(id: u64) -> RequestRow {
     RequestRow {

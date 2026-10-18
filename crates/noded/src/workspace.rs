@@ -13,7 +13,7 @@ use rand_core::CryptoRng;
 use serde::Deserialize;
 
 use crate::config::Settings;
-use crate::egress::Config as EgressConfig;
+use crate::egress::{Config as EgressConfig, Refused as EgressRefused};
 use crate::endpoint::Endpoint;
 use crate::{Error, Result};
 
@@ -110,17 +110,19 @@ impl Workspace {
         Ok(std::fs::write(self.dir.join(HTTP), address.to_string())?)
     }
 
-    pub(crate) fn egress(&self) -> Result<EgressConfig> {
-        let path = self.dir.join(EGRESS);
-        let text = match std::fs::read_to_string(&path) {
+    pub(crate) fn egress(&self) -> std::result::Result<EgressConfig, EgressRefused> {
+        let text = match std::fs::read_to_string(self.dir.join(EGRESS)) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(EgressConfig::default());
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(EgressRefused::Unread(error)),
         };
-        EgressConfig::parse(&text, |variable| std::env::var(variable).ok())
-            .map_err(|problem| Error::Egress(format!("{} is refused: {problem}", path.display())))
+        EgressConfig::parse(
+            &text,
+            |variable| std::env::var(variable).ok(),
+            |file| std::fs::read_to_string(self.dir.join(file)),
+        )
     }
 
     pub fn settings_file(&self) -> PathBuf {

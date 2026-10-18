@@ -93,6 +93,7 @@ pub struct Range {
 pub enum Admin {
     Shutdown,
     LogFilter(String),
+    EgressReload,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

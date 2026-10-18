@@ -1902,6 +1902,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-egress"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "program",
+]
+
+[[package]]
 name = "fixture-identity"
 version = "0.1.0"
 dependencies = [
@@ -2966,6 +2974,7 @@ dependencies = [
  "commonware-runtime",
  "commonware-utils",
  "consensus",
+ "fixture-egress",
  "fixture-probe",
  "fixture-programs",
  "fixture-relay",

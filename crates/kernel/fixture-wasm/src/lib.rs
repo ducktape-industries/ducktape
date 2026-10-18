@@ -11,6 +11,7 @@ fixtures! {
     AWAITER => "fixture_awaiter",
     AWAITS => "fixture_awaits",
     BLOBS => "fixture_blobs",
+    EGRESS => "fixture_egress",
     HALO => "fixture_halo",
     IDENTITY => "fixture_identity",
     ORACLE => "fixture_oracle",

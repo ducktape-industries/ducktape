@@ -1,5 +1,7 @@
 use super::*;
 
+mod file;
+
 const TEXT: &str = r#"
 relay = true
 http = true
@@ -13,9 +15,16 @@ fn env(variable: &str) -> Option<String> {
     (variable == "CCS_KEY").then(|| "gateway-key".to_owned())
 }
 
+fn unread(path: &Path) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        path.display().to_string(),
+    ))
+}
+
 #[test]
 fn a_config_names_what_it_serves_and_reads_each_services_secrets_from_the_environment() {
-    let config = Config::parse(TEXT, env).unwrap();
+    let config = Config::parse(TEXT, env, unread).unwrap();
     assert_eq!(config.served(), ["ccs", HTTP, RELAY]);
     assert_eq!(config.reach, Reach::Public);
     assert_eq!(
@@ -29,23 +38,34 @@ fn a_config_names_what_it_serves_and_reads_each_services_secrets_from_the_enviro
 
 #[test]
 fn an_unset_variable_a_reserved_name_or_a_base_that_is_not_a_plain_url_is_refused() {
-    let unset = Config::parse(TEXT, |_| None).unwrap_err();
-    assert!(unset.contains("CCS_KEY"), "{unset}");
+    let unset = Config::parse(TEXT, |_| None, unread).unwrap_err();
+    let Refused::Unset { variable, .. } = &unset else {
+        panic!("not refused for its variable: {unset:?}");
+    };
+    assert_eq!(variable, "CCS_KEY");
+    assert_eq!(unset.reason(), reason::NOT_FOUND);
     for reserved in RESERVED {
         let text = format!("[services.{reserved}]\nbase = \"https://example.com\"");
-        assert!(Config::parse(&text, env).is_err(), "{reserved}");
+        let refused = Config::parse(&text, env, unread).unwrap_err();
+        assert!(matches!(refused, Refused::Reserved { .. }), "{refused:?}");
     }
-    for base in [
-        "127.0.0.1:4141",
-        "ftp://host",
-        "https://host/?q=1",
-        "https://user:pass@host",
-    ] {
+    let unparsed = Config::parse("[services.x]\nbase = \"127.0.0.1:4141\"", env, unread);
+    assert!(
+        matches!(unparsed, Err(Refused::Base { .. })),
+        "{unparsed:?}"
+    );
+    for base in ["ftp://host", "https://host/?q=1", "https://user:pass@host"] {
         let text = format!("[services.x]\nbase = \"{base}\"");
-        assert!(Config::parse(&text, env).is_err(), "{base}");
+        let refused = Config::parse(&text, env, unread).unwrap_err();
+        assert!(matches!(refused, Refused::Unfit { .. }), "{base}");
+        assert_eq!(refused.reason(), reason::INVALID_INPUT);
     }
-    assert!(Config::parse("relay = true\nrelya = true", env).is_err());
-    let quiet = Config::parse("private = true", env).unwrap();
+    let misspelled = Config::parse("relay = true\nrelya = true", env, unread);
+    assert!(
+        matches!(misspelled, Err(Refused::Unparsed(_))),
+        "{misspelled:?}"
+    );
+    let quiet = Config::parse("private = true", env, unread).unwrap();
     assert!(quiet.served().is_empty());
     assert_eq!(quiet.reach, Reach::Private);
 }

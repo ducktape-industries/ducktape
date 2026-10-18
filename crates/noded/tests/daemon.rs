@@ -6,18 +6,18 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use abi::role::halo;
 use abi::role::validators::{Motion, Op};
+use abi::role::{egress, halo};
 use abi::{BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason, role};
 use blob::contract::Entry;
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_runtime::{Runner as _, tokio};
 use fixture_probe::{Reply, Step};
-use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET};
+use fixture_wasm::{ACCESS, AWAITS, BLOBS, EGRESS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET};
 use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
-use noded::wire::{Admin, BlockAsk, BlockRef, Blocks, Submitted, TxAsk, TxRef};
+use noded::wire::{Admin, BlockAsk, BlockRef, Blocks, Change, Submitted, TxAsk, TxRef};
 use noded::{Client, Endpoint, HaloConfig, Listen, LoadConfig, Logs, Upload, Workspace};
 
 const NETWORK: &str = "daemon";
@@ -218,6 +218,7 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
     std::fs::write(root.join("awaits.wasm"), AWAITS).unwrap();
     std::fs::write(root.join("halo.wasm"), HALO).unwrap();
     std::fs::write(root.join("access.wasm"), ACCESS).unwrap();
+    std::fs::write(root.join("egress.wasm"), EGRESS).unwrap();
     let lanes = vec![
         halo::Founded {
             name: blob::contract::LANE.to_owned(),
@@ -254,7 +255,8 @@ fn founding(root: &Path, seats: &[&Seat], epoch_length: u64) -> PathBuf {
          [[programs]]\nid = \"awaits\"\ncode = \"awaits.wasm\"\nroles = [\"awaits\"]\n\
          [[programs]]\nid = \"halo\"\ncode = \"halo.wasm\"\nparams = \"halo.params\"\n\
          roles = [\"halo\"]\n\
-         [[programs]]\nid = \"access\"\ncode = \"access.wasm\"\nroles = [\"access\"]\n"
+         [[programs]]\nid = \"access\"\ncode = \"access.wasm\"\nroles = [\"access\"]\n\
+         [[programs]]\nid = \"egress\"\ncode = \"egress.wasm\"\nroles = [\"egress\"]\n"
     );
     let path = root.join("genesis.toml");
     std::fs::write(&path, text).unwrap();
@@ -1689,4 +1691,149 @@ fn a_validator_is_dialed_over_wss_through_a_tls_terminator() {
     dialer.address = None;
     dialed.address = Some(format!("wss://localhost:{}", terminator.port()));
     reached(&runtime, root.path(), dialer, dialed);
+}
+
+const PONG: &str = "pong";
+
+async fn upstream() -> SocketAddr {
+    let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let at = listener.local_addr().unwrap();
+    let router = axum::Router::new().route("/ping", axum::routing::get(|| async { PONG }));
+    ::tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    at
+}
+
+fn write_egress(seat: &Seat, text: &str) {
+    std::fs::write(seat.workspace.dir().join("egress.toml"), text).unwrap();
+}
+
+async fn reload(seat: &Seat, client: &Client) -> noded::Result<()> {
+    let anchor = client.status().await.unwrap().anchor();
+    client
+        .admin(seat.admin_frame(anchor, Admin::EgressReload))
+        .await
+}
+
+async fn recorded_services(client: &Client, key: &[u8]) -> Vec<String> {
+    let row = client
+        .get(Layer::Confirmed, "egress", &fixture_egress::node_key(key))
+        .await
+        .unwrap();
+    row.map(|bytes| abi::decode::<egress::NodeRow>(&bytes).unwrap().services)
+        .unwrap_or_default()
+}
+
+async fn recorded(
+    client: &Client,
+    changes: &mut (impl futures::Stream<Item = noded::Result<Change>> + Unpin),
+    key: &[u8],
+    wanted: &[&str],
+) {
+    while recorded_services(client, key).await != wanted {
+        changes.next().await.unwrap().unwrap();
+    }
+}
+
+fn ping(service: &str) -> egress::Op {
+    egress::Op::Request {
+        request: egress::Request::Http {
+            service: service.to_owned(),
+            head: egress::http::Head {
+                method: egress::http::Method::Get,
+                target: "/ping".to_owned(),
+                headers: Vec::new(),
+            },
+            body: Vec::new(),
+        },
+        delivery: egress::Delivery::Whole,
+        wait: None,
+    }
+}
+
+async fn request(client: &Client, service: &str) -> Outcome {
+    let anchor = client.status().await.unwrap().anchor();
+    let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
+    let op = abi::encode(&ping(service));
+    let frame = Frame::sign(&putter, NETWORK.as_bytes(), anchor, None, "egress", op);
+    client.land(&frame).await.unwrap().1.outcome
+}
+
+async fn answered(
+    client: &Client,
+    changes: &mut (impl futures::Stream<Item = noded::Result<Change>> + Unpin),
+    id: u64,
+) -> egress::Answer {
+    let key = fixture_egress::answer_key(id);
+    loop {
+        let answer = client.get(Layer::Confirmed, "egress", &key).await.unwrap();
+        if let Some(bytes) = answer {
+            return abi::decode(&bytes).unwrap();
+        }
+        changes.next().await.unwrap().unwrap();
+    }
+}
+
+async fn pinged(
+    client: &Client,
+    changes: &mut (impl futures::Stream<Item = noded::Result<Change>> + Unpin),
+    service: &str,
+) {
+    let Outcome::Applied { output } = request(client, service).await else {
+        panic!("the request for {service} was not taken");
+    };
+    let id: u64 = abi::decode(&output).unwrap();
+    let egress::Answer::Output(bytes) = answered(client, changes, id).await else {
+        panic!("{service} answered request {id} with a failure");
+    };
+    let response: egress::http::Response = abi::decode(&bytes).unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, PONG.as_bytes());
+}
+
+#[test]
+fn a_running_node_serves_what_each_egress_reload_reads_and_keeps_its_services_on_a_bad_file() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        let echo = upstream().await;
+        let mut changes = client.changes("egress").await.unwrap();
+        let unserved = request(&client, "echo").await;
+        assert!(
+            matches!(&unserved, Outcome::Rejected(refusal) if refusal.reason == reason::NOT_FOUND),
+            "{unserved:?}"
+        );
+
+        write_egress(
+            &seat,
+            &format!("[services.echo]\nbase = \"http://{echo}\"\n"),
+        );
+        reload(&seat, &client).await.unwrap();
+        recorded(&client, &mut changes, &seat.key(), &["echo"]).await;
+        pinged(&client, &mut changes, "echo").await;
+
+        write_egress(&seat, "relya = true\n");
+        let Err(noded::Error::Refused(refusal)) = reload(&seat, &client).await else {
+            panic!("a file that does not parse is refused");
+        };
+        assert_eq!(refusal.reason, reason::INVALID_INPUT);
+        pinged(&client, &mut changes, "echo").await;
+
+        write_egress(&seat, "");
+        reload(&seat, &client).await.unwrap();
+        recorded(&client, &mut changes, &seat.key(), &[]).await;
+        let gone = request(&client, "echo").await;
+        assert!(
+            matches!(&gone, Outcome::Rejected(refusal) if refusal.reason == reason::NOT_FOUND),
+            "{gone:?}"
+        );
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
 }

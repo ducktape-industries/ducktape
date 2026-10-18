@@ -130,6 +130,11 @@ enum Verb {
     LogFilter { directives: String },
     #[command(about = "stop the running node")]
     Shutdown,
+    #[command(
+        subcommand,
+        about = "what the running node serves through the egress role"
+    )]
+    Egress(EgressVerb),
     #[command(about = "print the node's metrics")]
     Metrics,
     #[command(about = "print an invite this node signs: one stranger enrolls with it, once")]
@@ -428,6 +433,15 @@ enum BlobVerb {
     },
     #[command(about = "list the blob ids the state names and the node lacks")]
     Missing,
+}
+
+#[derive(Subcommand)]
+enum EgressVerb {
+    #[command(
+        about = "make the running node re-read egress.toml and serve what it now names; \
+                 an invalid file leaves what it serves unchanged"
+    )]
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -735,6 +749,10 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         }
         Verb::Shutdown => {
             let frame = admin(workspace, client, Admin::Shutdown).await?;
+            client.admin(frame).await.sentence()
+        }
+        Verb::Egress(EgressVerb::Reload) => {
+            let frame = admin(workspace, client, Admin::EgressReload).await?;
             client.admin(frame).await.sentence()
         }
         Verb::Metrics => {

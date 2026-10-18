@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [dev-dependencies]
+fixture-egress = { path = "../kernel/fixtures/egress" }
 fixture-programs = { path = "../kernel/fixtures/programs" }
 fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }

@@ -289,7 +289,8 @@ failure; one event or an end larger than a block carries ends the stream `Cut`
 role the node does none of this.
 
 ```toml
-# $DUCKTAPE_HOME/egress.toml: read when the node starts; absent means it serves nothing
+# $DUCKTAPE_HOME/egress.toml: read when the node starts and on `ducktape egress reload`;
+# absent means it serves nothing
 relay = true                  # answer `relay` requests
 http = true                   # answer `http` requests, to the public internet
 private = false               # optional: let `http` reach loopback, private and link-local addresses
@@ -297,7 +298,25 @@ private = false               # optional: let `http` reach loopback, private and
 [services.ccs]                # a registered service this node fronts
 base = "http://127.0.0.1:4141"
 secrets = { x-api-key = "CCS_KEY" }   # header = the environment variable holding its value
+
+[services.pods]
+base = "http://10.0.0.5:8080"
+secrets = { authorization = { file = "pods.key" } }   # header = a file, under the workspace
 ```
+
+A secret is the name of an environment variable or `{ file = "<path>" }`, a
+file read whole with its surrounding whitespace trimmed; a relative path is
+under the workspace. The node reads every secret each time it loads the file.
+A variable is set when the process starts, so a new secret that must arrive
+while the node runs is a file.
+
+`ducktape egress reload` makes the running node load `egress.toml` again; no
+restart is needed. From the next request on, the node calls each service at its
+new base with its new secrets, and it sends `Serve` while the chain's record
+differs from the new list. A request already being called finishes against the
+service it started with. If the file does not load (it does not parse, a
+variable is not set, a secret file does not read), the node refuses the reload
+with the reason and the problem, and it keeps serving what it served before.
 
 A service request goes to `base` joined with its path; a path that would leave
 `base` fails. The node adds the service's secrets, and it adds
@@ -516,8 +535,9 @@ preconfirmed layer, the node runs it again after each block until a block
 carries it, and the receipt `submit` prints is that prediction, not a verdict.
 A frame predicted to fail is still relayed and waits for a block. `blob put`,
 votes and `ducktape halo` never preconfirm. `ducktape logs`,
-`ducktape log-filter`, `ducktape metrics` and `ducktape shutdown` operate the
-node; the mutating ones are signed with the node's own identity key. Each verb's
+`ducktape log-filter`, `ducktape egress reload`, `ducktape metrics` and
+`ducktape shutdown` operate the node; the mutating ones are signed with the
+node's own identity key. Each verb's
 `--help` carries the rest.
 
 ## How it is built
