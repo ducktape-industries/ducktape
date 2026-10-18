@@ -1,6 +1,6 @@
 //! The egress worker's decisions after each block and each thing a call reports: which requests to
-//! call, and which answers, events and `Serve` frames to send: a request's frames one at a time in
-//! order, each carrying every event read since the last. Pure; `mod.rs` performs what it decides.
+//! call, and which answers, events and `Serve` frames to send: a request's next frame as soon as the
+//! one before is in the pool, carrying every event read since. Pure; `mod.rs` performs them.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use abi::role::egress::{Answer, Event, Op, RequestRow, StreamEnd};
@@ -14,7 +14,7 @@ pub struct Reading {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Purpose {
-    Request(u64),
+    Request { id: u64, flight: u64 },
     Serve,
 }
 
@@ -48,6 +48,7 @@ pub enum Sent {
     Pending(Vec<u8>),
     Stale,
     Carried,
+    Untaken,
     Refused(Refusal),
 }
 
@@ -57,6 +58,7 @@ impl Sent {
             Sent::Pending(_) => "pending",
             Sent::Stale => "stale",
             Sent::Carried => "carried",
+            Sent::Untaken => "untaken",
             Sent::Refused(_) => "refused",
         }
     }
@@ -99,21 +101,6 @@ impl Batch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Next {
-    Send,
-    Wait,
-}
-
-impl Next {
-    fn step(self, purpose: Purpose) -> Option<Step> {
-        match self {
-            Next::Send => Some(Step::Send(purpose)),
-            Next::Wait => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Call {
     Running,
     Ended,
@@ -130,7 +117,8 @@ struct Outbox {
     call: Call,
     events: u64,
     waiting: VecDeque<Out>,
-    flight: Option<Flight>,
+    flights: BTreeMap<u64, Flight>,
+    launched: u64,
 }
 
 impl Outbox {
@@ -139,14 +127,15 @@ impl Outbox {
             call: Call::Running,
             events: 0,
             waiting: VecDeque::new(),
-            flight: None,
+            flights: BTreeMap::new(),
+            launched: 0,
         }
     }
 
-    fn take(&mut self, called: Called) -> Next {
+    fn take(&mut self, called: Called) {
         let running = self.call == Call::Running;
         if !running {
-            return Next::Wait;
+            return;
         }
         let out = match called {
             Called::Whole(answer) => self.end(Out::Answer(answer)),
@@ -157,10 +146,6 @@ impl Outbox {
             }
         };
         self.waiting.push_back(out);
-        match self.flight {
-            Some(_) => Next::Wait,
-            None => self.launch(),
-        }
     }
 
     fn event(&mut self, data: Vec<u8>) -> Out {
@@ -174,11 +159,15 @@ impl Outbox {
         out
     }
 
-    fn launch(&mut self) -> Next {
-        let Some(first) = self.waiting.pop_front() else {
-            self.flight = None;
-            return Next::Wait;
-        };
+    fn launch(&mut self) -> Option<u64> {
+        let unpooled = self
+            .flights
+            .values()
+            .any(|flight| flight.sending == Sending::Unsigned);
+        if unpooled {
+            return None;
+        }
+        let first = self.waiting.pop_front()?;
         let batch = match first {
             Out::Answer(answer) => Batch::Answer(answer),
             Out::End { events, end } => Batch::End { events, end },
@@ -195,11 +184,16 @@ impl Outbox {
                 Batch::Events([(seq, data)].into_iter().chain(rest).collect())
             }
         };
-        self.flight = Some(Flight {
-            batch,
-            sending: Sending::Unsigned,
-        });
-        Next::Send
+        let flight = self.launched;
+        self.launched += 1;
+        self.flights.insert(
+            flight,
+            Flight {
+                batch,
+                sending: Sending::Unsigned,
+            },
+        );
+        Some(flight)
     }
 
     fn requeue(&mut self, batch: Batch) {
@@ -216,17 +210,15 @@ impl Outbox {
         }
     }
 
-    fn too_large(&mut self) -> Next {
-        let Some(flight) = self.flight.take() else {
-            return Next::Wait;
-        };
+    fn too_large(&mut self, flight: u64) -> Option<u64> {
+        let refused = self.flights.remove(&flight)?;
         let cut = |events: u64, reason: &str| Batch::End {
             events,
             end: StreamEnd::Cut {
                 reason: reason.to_owned(),
             },
         };
-        let batch = match flight.batch {
+        let batch = match refused.batch {
             Batch::Events(mut events) if events.len() > 1 => {
                 let rest = events.split_off(events.len() / 2);
                 self.requeue(Batch::Events(rest));
@@ -253,36 +245,37 @@ impl Outbox {
                 cut(events, "end_too_large")
             }
         };
-        self.flight = Some(Flight {
-            batch,
-            sending: Sending::Unsigned,
-        });
-        Next::Send
+        self.flights.insert(
+            flight,
+            Flight {
+                batch,
+                sending: Sending::Unsigned,
+            },
+        );
+        Some(flight)
     }
 
-    fn sent(&mut self, sent: Sent) -> Next {
+    fn sent(&mut self, flight: u64, sent: Sent) -> Option<u64> {
         let too_large =
             matches!(&sent, Sent::Refused(refusal) if refusal.reason == reason::CAPACITY);
         if too_large {
-            return self.too_large();
+            return self.too_large(flight);
         }
-        let Some(flight) = self.flight.as_mut() else {
-            return Next::Wait;
-        };
+        let sending = &mut self.flights.get_mut(&flight)?.sending;
         match sent {
             Sent::Pending(frame) => {
-                flight.sending = Sending::Pending(frame);
-                Next::Wait
+                *sending = Sending::Pending(frame);
+                self.launch()
             }
             Sent::Stale => {
-                let Some(stale) = self.flight.take() else {
-                    return Next::Wait;
-                };
-                self.requeue(stale.batch);
-                self.launch();
-                Next::Wait
+                *sending = Sending::Unsigned;
+                Some(flight)
             }
-            Sent::Carried | Sent::Refused(_) => self.launch(),
+            Sent::Untaken => None,
+            Sent::Carried | Sent::Refused(_) => {
+                self.flights.remove(&flight);
+                self.launch()
+            }
         }
     }
 }
@@ -322,10 +315,11 @@ impl Desk {
                 steps.push(Step::Call(row));
                 continue;
             };
-            let in_flight = outbox.flight.is_some();
-            if in_flight {
-                steps.push(Step::Send(Purpose::Request(id)));
-            }
+            let flights = outbox
+                .flights
+                .keys()
+                .map(|&flight| Purpose::Request { id, flight });
+            steps.extend(flights.map(Step::Send));
         }
         let settled = reading.serving == self.wanted;
         match (settled, reading.member, &self.serve) {
@@ -338,15 +332,26 @@ impl Desk {
         steps
     }
 
-    pub fn called(&mut self, id: u64, called: Called) -> Option<Step> {
-        let next = self.requests.get_mut(&id)?.take(called);
-        next.step(Purpose::Request(id))
+    pub fn called(&mut self, id: u64, called: Called) {
+        if let Some(outbox) = self.requests.get_mut(&id) {
+            outbox.take(called);
+        }
+    }
+
+    pub fn launch(&mut self) -> Vec<Step> {
+        self.requests
+            .iter_mut()
+            .filter_map(|(&id, outbox)| {
+                let flight = outbox.launch()?;
+                Some(Step::Send(Purpose::Request { id, flight }))
+            })
+            .collect()
     }
 
     pub fn op(&self, purpose: &Purpose) -> Option<Op> {
         match purpose {
-            Purpose::Request(id) => {
-                let flight = self.requests.get(id)?.flight.as_ref()?;
+            Purpose::Request { id, flight } => {
+                let flight = self.requests.get(id)?.flights.get(flight)?;
                 Some(flight.batch.op(*id))
             }
             Purpose::Serve => Some(Op::Serve {
@@ -357,7 +362,7 @@ impl Desk {
 
     pub fn frame(&self, purpose: &Purpose) -> Option<&[u8]> {
         let sending = match purpose {
-            Purpose::Request(id) => &self.requests.get(id)?.flight.as_ref()?.sending,
+            Purpose::Request { id, flight } => &self.requests.get(id)?.flights.get(flight)?.sending,
             Purpose::Serve => &self.serve,
         };
         match sending {
@@ -368,16 +373,30 @@ impl Desk {
 
     pub fn sent(&mut self, purpose: &Purpose, sent: Sent) -> Option<Step> {
         match purpose {
-            Purpose::Request(id) => {
-                let next = self.requests.get_mut(id)?.sent(sent);
-                next.step(purpose.clone())
+            Purpose::Request { id, flight } => {
+                let next = self.requests.get_mut(id)?.sent(*flight, sent)?;
+                Some(Step::Send(Purpose::Request {
+                    id: *id,
+                    flight: next,
+                }))
             }
-            Purpose::Serve => {
-                self.serve = match sent {
-                    Sent::Pending(frame) => Sending::Pending(frame),
-                    Sent::Stale => Sending::Unsigned,
-                    Sent::Carried | Sent::Refused(_) => Sending::Done,
-                };
+            Purpose::Serve => self.served(sent),
+        }
+    }
+
+    fn served(&mut self, sent: Sent) -> Option<Step> {
+        match sent {
+            Sent::Pending(frame) => {
+                self.serve = Sending::Pending(frame);
+                None
+            }
+            Sent::Stale => {
+                self.serve = Sending::Unsigned;
+                Some(Step::Send(Purpose::Serve))
+            }
+            Sent::Untaken => None,
+            Sent::Carried | Sent::Refused(_) => {
+                self.serve = Sending::Done;
                 None
             }
         }

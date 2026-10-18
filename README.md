@@ -264,8 +264,11 @@ builds). When such a request's response is `text/event-stream`, the node reads
 the body as it arrives and sends its complete events in `Op::Events` frames,
 in order: each `Event`'s `seq` counts from 0 and `data` is the event's lines as
 received, without the blank line that ends it. Egress hands each event to the
-requester, in the frame's order, as `deliver` followed by the encoded `Event`,
-and pushes the request's expiry `wait` blocks past the frame. When the body ends, the node sends `Op::EndStream` with
+requester as `deliver` followed by the encoded `Event`, each `seq` once and in
+order whatever order the frames land in: it keeps an event that lands early
+until the ones before it arrive, drops a repeat, and holds the end until every
+event it counts is heard. It pushes the request's expiry `wait` blocks past
+each block that carries a frame. When the body ends, the node sends `Op::EndStream` with
 the number of events it sent and `StreamEnd::Complete`, the response's status
 and headers. When the body breaks off, it sends `StreamEnd::Cut` with the
 reason `stream_broken`. An event unended when the body ends is dropped. Any
@@ -277,13 +280,15 @@ egress program which open requests the chain elected it for. It calls each new
 one and signs the answer with its own key. It also sends `Serve` while the chain's
 record of the services it serves differs from its `egress.toml`. It submits each
 of these frames again every block until a block carries it, and signs one again
-when its anchor grows old. A request's frames go out one at a time: the node
-sends a stream's next frame only after a block has carried the one before, and
-that frame carries every event read since, or the end. A frame carries no
-sequence number, and the relay to the validators may drop a frame and offer it
-again blocks later, so two frames in flight could reach blocks out of order;
-events inside one frame cannot. Events together larger than a block carries go
-out in halves, in order. An answer larger than a block carries goes out as a
+at once when its anchor grows old. A stream's frames go out as its events
+arrive: the node sends the next frame as soon as the one before is in its pool,
+without waiting for a block to carry it, and that frame carries every event
+read since, or the end. Several frames of one stream may wait for blocks at
+once. The node's own blocks carry its pool in the order it took them, but the
+relay to the validators may drop a frame and offer it again blocks later, so on
+a network of several validators frames may land out of order; egress puts the
+events back in order. Events together larger than a block carries go out in
+halves, in order. An answer larger than a block carries goes out as a
 failure; one event or an end larger than a block carries ends the stream `Cut`
 (`event_too_large`, `end_too_large`) and the node drops the rest. On a network that binds no egress
 role the node does none of this.

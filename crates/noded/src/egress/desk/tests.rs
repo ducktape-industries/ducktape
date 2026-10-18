@@ -29,6 +29,10 @@ fn served() -> Desk {
     Desk::new(vec!["relay".into()])
 }
 
+fn flight(id: u64, flight: u64) -> Purpose {
+    Purpose::Request { id, flight }
+}
+
 #[test]
 fn a_new_request_is_called_once_and_its_answer_is_sent_each_block_until_carried() {
     let mut desk = served();
@@ -36,11 +40,10 @@ fn a_new_request_is_called_once_and_its_answer_is_sent_each_block_until_carried(
     assert_eq!(first, [Step::Call(row(1))]);
     assert!(desk.read(reading(&[1], &["relay"], true)).is_empty());
     let answer = Answer::Output(b"pong".to_vec());
-    assert_eq!(
-        desk.called(1, Called::Whole(answer.clone())),
-        Some(Step::Send(Purpose::Request(1)))
-    );
-    let purpose = Purpose::Request(1);
+    desk.called(1, Called::Whole(answer.clone()));
+    let purpose = flight(1, 0);
+    assert_eq!(desk.launch(), [Step::Send(purpose.clone())]);
+    assert!(desk.launch().is_empty());
     assert_eq!(desk.op(&purpose), Some(Op::Answer { id: 1, answer }));
     assert_eq!(desk.frame(&purpose), None);
     desk.sent(&purpose, Sent::Pending(b"frame".to_vec()));
@@ -50,18 +53,20 @@ fn a_new_request_is_called_once_and_its_answer_is_sent_each_block_until_carried(
     desk.sent(&purpose, Sent::Carried);
     assert!(desk.read(reading(&[1], &["relay"], true)).is_empty());
     assert!(desk.read(reading(&[], &["relay"], true)).is_empty());
-    let late = Called::Whole(Answer::Output(Vec::new()));
-    assert_eq!(desk.called(1, late), None);
+    desk.called(1, Called::Whole(Answer::Output(Vec::new())));
+    assert!(desk.launch().is_empty());
 }
 
 #[test]
-fn a_stale_frame_is_signed_again_and_an_answer_too_large_for_a_block_becomes_a_failure() {
+fn a_stale_frame_is_signed_again_at_once_and_an_answer_too_large_for_a_block_becomes_a_failure() {
     let mut desk = served();
     desk.read(reading(&[1], &["relay"], true));
     desk.called(1, Called::Whole(Answer::Output(vec![0; 8])));
-    let purpose = Purpose::Request(1);
+    let purpose = flight(1, 0);
+    assert_eq!(desk.launch(), [Step::Send(purpose.clone())]);
     desk.sent(&purpose, Sent::Pending(b"frame".to_vec()));
-    desk.sent(&purpose, Sent::Stale);
+    let resigned = desk.sent(&purpose, Sent::Stale);
+    assert_eq!(resigned, Some(Step::Send(purpose.clone())));
     assert_eq!(desk.frame(&purpose), None);
     let capacity = Refusal::new(reason::CAPACITY, "too large");
     let failing = desk.sent(&purpose, Sent::Refused(capacity));
@@ -81,6 +86,24 @@ fn a_stale_frame_is_signed_again_and_an_answer_too_large_for_a_block_becomes_a_f
 }
 
 #[test]
+fn a_frame_the_node_failed_to_take_is_sent_again_next_block_as_it_was() {
+    let mut desk = served();
+    desk.read(reading(&[1], &["relay"], true));
+    desk.called(1, Called::Whole(Answer::Output(b"pong".to_vec())));
+    let purpose = flight(1, 0);
+    desk.launch();
+    assert_eq!(desk.sent(&purpose, Sent::Untaken), None);
+    assert_eq!(desk.frame(&purpose), None);
+    assert_eq!(
+        desk.read(reading(&[1], &["relay"], true)),
+        [Step::Send(purpose.clone())]
+    );
+    desk.sent(&purpose, Sent::Pending(b"frame".to_vec()));
+    assert_eq!(desk.sent(&purpose, Sent::Untaken), None);
+    assert_eq!(desk.frame(&purpose), Some(&b"frame"[..]));
+}
+
+#[test]
 fn serve_is_sent_by_a_member_while_the_chain_records_other_services() {
     let mut desk = served();
     assert!(desk.read(reading(&[], &[], false)).is_empty());
@@ -91,6 +114,10 @@ fn serve_is_sent_by_a_member_while_the_chain_records_other_services() {
         Some(Op::Serve {
             services: vec!["relay".into()]
         })
+    );
+    assert_eq!(
+        desk.sent(&Purpose::Serve, Sent::Stale),
+        Some(Step::Send(Purpose::Serve))
     );
     let refused = Refusal::new(reason::UNAUTHORIZED, "not a member");
     desk.sent(&Purpose::Serve, Sent::Refused(refused));
