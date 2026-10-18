@@ -26,7 +26,7 @@ use commonware_storage::{
 use commonware_utils::range::NonEmptyRange;
 use sha2::Digest as _;
 
-use crate::{Error, Result, Slot};
+use crate::{Error, Result, Slot, SyncFailure};
 
 pub type Family = merkle::mmr::Family;
 pub type Db<E> = Qmdb<Family, E, Digest, Vec<u8>, Sha256, TwoCap, Sequential>;
@@ -166,7 +166,7 @@ where
         name: &str,
         target: SyncTarget,
         source: S,
-    ) -> Result<Commitment<E>>
+    ) -> std::result::Result<Commitment<E>, SyncFailure<S::Error>>
     where
         S: SourceFor<Db<E>>,
     {
@@ -181,7 +181,7 @@ where
             }
             first => first,
         };
-        let db = outcome.map_err(|e| Error::Sync(format!("{e:?}")))?;
+        let db = outcome.map_err(failure)?;
         Ok(Commitment {
             name: name.to_owned(),
             db: Some(db),
@@ -246,8 +246,24 @@ where
             }
         };
         let (db, _) = db.apply_batch(batch).await?;
-        self.db = Some(db.commit().await?);
+        let db = db.commit().await?;
+        self.db = Some(self.pruned(db).await?);
         Ok(())
+    }
+
+    async fn pruned(&self, db: Db<E>) -> Result<Db<E>> {
+        let floor = db.sync_boundary();
+        let from = db.bounds().start;
+        let db = db.prune(floor).await?;
+        tracing::debug!(
+            target: "ducktape::state",
+            event = "commitment_pruned",
+            commitment = %self.name,
+            floor = *floor,
+            from = *from,
+            to = *db.bounds().start,
+        );
+        Ok(db)
     }
 
     pub async fn entries(&self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
@@ -284,6 +300,17 @@ where
             }
         }
         Ok(live)
+    }
+}
+
+fn failure<X>(error: sync::Error<Family, X, Digest>) -> SyncFailure<X>
+where
+    X: std::error::Error + Send + 'static,
+{
+    match error {
+        sync::Error::Source(source) => SyncFailure::Source(source),
+        sync::Error::Database(database) => SyncFailure::State(Error::Commitment(database)),
+        sync::Error::Engine(engine) => SyncFailure::State(Error::Sync(format!("{engine:?}"))),
     }
 }
 

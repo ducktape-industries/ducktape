@@ -81,6 +81,22 @@ async fn sync<E: Context>(node: &Node<E>, program: &str, request: &[u8]) -> Resp
         Ok(db) => db,
         Err(error) => return refused(reason::NOT_FOUND, error),
     };
+    let retained = db.bounds().start;
+    let pruned_past = request.start() < retained;
+    if pruned_past {
+        tracing::debug!(
+            target: "ducktape::sync",
+            event = "sync_refused",
+            program,
+            reason = "pruned",
+            start = *request.start(),
+            retained = *retained,
+        );
+        return refused(
+            reason::STALE,
+            "this node pruned the operations the request starts at; read the head again",
+        );
+    }
     match db.serve(request).await {
         Ok((response, _)) => Response::Sync(response.encode().to_vec()),
         Err(error) => refused(reason::INVALID_INPUT, error),

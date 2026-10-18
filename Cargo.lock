@@ -2984,7 +2984,9 @@ dependencies = [
  "commonware-runtime",
  "commonware-utils",
  "consensus",
+ "fixture-awaiter",
  "fixture-egress",
+ "fixture-oracle",
  "fixture-probe",
  "fixture-programs",
  "fixture-relay",
@@ -4522,6 +4524,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -4549,6 +4552,7 @@ dependencies = [
  "state",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

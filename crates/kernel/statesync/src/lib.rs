@@ -5,13 +5,13 @@ mod wire;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use abi::{BlobId, Refusal};
+use abi::{BlobId, ProgramId, Refusal, reason};
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_parallel::Sequential;
 use commonware_storage::qmdb::sync;
 use consensus::{Certificate, validators_of};
 use node::{Digest, Node, Synced};
-use state::{Commitment, commitment_name};
+use state::{Commitment, SyncFailure, SyncTarget, commitment_name};
 
 pub use consensus::Anchor;
 pub use consensus::Context;
@@ -75,28 +75,7 @@ pub async fn join<E: Context, X: Exchange>(
     network: Vec<u8>,
     exchange: X,
 ) -> Result<Joined<E>> {
-    let head = head(&exchange).await?;
-    let anchor_names_the_tip = head.anchor.names(head.tip);
-    if !anchor_names_the_tip {
-        return Err(Error::Head);
-    }
-    let mut commitments = BTreeMap::new();
-    for (program, target) in head.targets {
-        let source = Remote {
-            exchange: exchange.clone(),
-            program: program.clone(),
-        };
-        let commitment = Commitment::sync_from(
-            context
-                .child("sync")
-                .with_attribute("program", program.as_str()),
-            &commitment_name(name, &program),
-            target,
-            source,
-        )
-        .await?;
-        commitments.insert(program, commitment);
-    }
+    let (head, commitments) = adopted_head(&context, name, &exchange).await?;
     let synced = Synced {
         height: head.tip.height,
         commitments,
@@ -121,6 +100,71 @@ pub async fn join<E: Context, X: Exchange>(
         node,
         anchor: head.anchor,
     })
+}
+
+async fn adopted_head<E: Context, X: Exchange>(
+    context: &E,
+    name: &str,
+    exchange: &X,
+) -> Result<(Head, BTreeMap<ProgramId, Commitment<E>>)> {
+    let mut retargets: u64 = 0;
+    loop {
+        let head = head(exchange).await?;
+        let anchor_names_the_tip = head.anchor.names(head.tip);
+        if !anchor_names_the_tip {
+            return Err(Error::Head);
+        }
+        let error = match synced_to(context, name, exchange, &head.targets).await {
+            Ok(commitments) => return Ok((head, commitments)),
+            Err(error) => error,
+        };
+        if !pruned_past(&error) {
+            return Err(error);
+        }
+        retargets += 1;
+        tracing::info!(
+            target: "ducktape::sync",
+            event = "join_retargeted",
+            reason = "source_pruned",
+            height = head.tip.height,
+            retargets,
+            "the source pruned past the head this join synced to; it reads the head again"
+        );
+    }
+}
+
+async fn synced_to<E: Context, X: Exchange>(
+    context: &E,
+    name: &str,
+    exchange: &X,
+    targets: &BTreeMap<ProgramId, SyncTarget>,
+) -> Result<BTreeMap<ProgramId, Commitment<E>>> {
+    let mut commitments = BTreeMap::new();
+    for (program, target) in targets {
+        let source = Remote {
+            exchange: exchange.clone(),
+            program: program.clone(),
+        };
+        let commitment = Commitment::sync_from(
+            context
+                .child("sync")
+                .with_attribute("program", program.as_str()),
+            &commitment_name(name, program),
+            target.clone(),
+            source,
+        )
+        .await
+        .map_err(|failure| match failure {
+            SyncFailure::Source(error) => error,
+            SyncFailure::State(error) => Error::State(error),
+        })?;
+        commitments.insert(program.clone(), commitment);
+    }
+    Ok(commitments)
+}
+
+fn pruned_past(error: &Error) -> bool {
+    matches!(error, Error::Refused(refusal) if refusal.reason == reason::STALE)
 }
 
 fn verified<E: Context>(

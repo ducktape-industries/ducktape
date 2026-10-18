@@ -31,6 +31,14 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug, thiserror::Error)]
+pub enum SyncFailure<X: std::error::Error + 'static> {
+    #[error("the sync source failed: {0}")]
+    Source(#[source] X),
+    #[error(transparent)]
+    State(#[from] Error),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Writes {
     pub programs: BTreeMap<ProgramId, BTreeMap<Vec<u8>, Slot>>,

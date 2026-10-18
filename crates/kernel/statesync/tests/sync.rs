@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use abi::{
     HostOp, role,
@@ -189,7 +189,7 @@ fn certify(
 struct Source {
     node: Shared,
     genesis: Block,
-    certificates: BTreeMap<u64, Certificate>,
+    certificates: Mutex<BTreeMap<u64, Certificate>>,
 }
 
 impl Anchors for Source {
@@ -198,6 +198,8 @@ impl Anchors for Source {
             return Some(Anchor::Genesis(self.genesis.clone()));
         }
         self.certificates
+            .lock()
+            .unwrap()
             .get(&tip.height)
             .cloned()
             .map(Anchor::Finalized)
@@ -316,6 +318,35 @@ async fn cut_off<X: Exchange>(context: &Ctx, name: &'static str, dir: &Path, exc
     );
 }
 
+async fn advance(
+    source: &Source,
+    keys: &[ed25519::PrivateKey],
+    members: &[validators::Member],
+    frames: Vec<Vec<u8>>,
+) -> Tip {
+    let mut node = source.node.lock().await;
+    for frame in frames {
+        let taken = node
+            .submit(frame, node::Source::Client, node::Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap();
+        let prediction = taken
+            .prediction()
+            .expect("a preconfirmed frame is predicted");
+        assert!(matches!(prediction.outcome, abi::Outcome::Applied { .. }));
+    }
+    let tip = seal(&mut node).await.tip();
+    drop(node);
+    let certificate = certify(keys, members, tip);
+    source
+        .certificates
+        .lock()
+        .unwrap()
+        .insert(tip.height, certificate);
+    tip
+}
+
 struct Network {
     keys: Vec<ed25519::PrivateKey>,
     members: Vec<validators::Member>,
@@ -346,7 +377,7 @@ async fn found_as(context: &Ctx, name: &'static str) -> Network {
         source: Arc::new(Source {
             node: Arc::new(futures::lock::Mutex::new(node)),
             genesis,
-            certificates: BTreeMap::new(),
+            certificates: Mutex::new(BTreeMap::new()),
         }),
         _dir: dir,
     }
@@ -354,26 +385,7 @@ async fn found_as(context: &Ctx, name: &'static str) -> Network {
 
 impl Network {
     async fn advance(&mut self, frames: Vec<Vec<u8>>) -> Tip {
-        let mut node = self.source.node.lock().await;
-        for frame in frames {
-            let taken = node
-                .submit(frame, node::Source::Client, node::Preconfirm::On)
-                .await
-                .unwrap()
-                .unwrap();
-            let prediction = taken
-                .prediction()
-                .expect("a preconfirmed frame is predicted");
-            assert!(matches!(prediction.outcome, abi::Outcome::Applied { .. }));
-        }
-        let tip = seal(&mut node).await.tip();
-        drop(node);
-        let certificate = certify(&self.keys, &self.members, tip);
-        Arc::get_mut(&mut self.source)
-            .expect("no exchange holds the source between blocks")
-            .certificates
-            .insert(tip.height, certificate);
-        tip
+        advance(&self.source, &self.keys, &self.members, frames).await
     }
 
     fn exchange(&self) -> Loopback {
@@ -455,7 +467,7 @@ fn a_joiner_adopts_the_state_at_a_finalized_tip() {
         let Start::Floor(certificate) = joined.anchor.start() else {
             panic!("a finalized tip starts from its certificate");
         };
-        assert_eq!(certificate, network.source.certificates[&2]);
+        assert_eq!(certificate, network.source.certificates.lock().unwrap()[&2]);
     });
 }
 
@@ -543,9 +555,11 @@ fn a_certificate_from_strangers_is_rejected() {
         let strangers: Vec<_> = (21..=23).map(key).collect();
         let stranger_members: Vec<_> = strangers.iter().map(member).collect();
         let forged = certify(&strangers, &stranger_members, tip);
-        Arc::get_mut(&mut network.source)
-            .unwrap()
+        network
+            .source
             .certificates
+            .lock()
+            .unwrap()
             .insert(tip.height, forged);
 
         let dir = tempfile::tempdir().unwrap();
@@ -619,9 +633,11 @@ fn a_certificate_naming_an_unrecorded_epoch_is_rejected() {
             ..tip
         };
         let forged = certify(&network.keys, &network.members, unrecorded);
-        Arc::get_mut(&mut network.source)
-            .unwrap()
+        network
+            .source
             .certificates
+            .lock()
+            .unwrap()
             .insert(tip.height, forged);
 
         let dir = tempfile::tempdir().unwrap();
@@ -948,7 +964,7 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
         .err()
         .expect("a request past the second whole section is refused");
         assert!(
-            matches!(error, Error::State(state::Error::Sync(_))),
+            matches!(&error, Error::Refused(refusal) if refusal.reason == abi::reason::NOT_FOUND),
             "{error}"
         );
 
@@ -1002,5 +1018,138 @@ fn a_dropped_program_left_half_synced_is_removed() {
         .await
         .unwrap();
         store.remove_program("probe").await.unwrap();
+    });
+}
+
+const PRUNES: usize = 3;
+const CHURN_ROUNDS: u64 = 200;
+
+#[derive(Clone)]
+struct Pruning {
+    source: Loopback,
+    keys: Vec<ed25519::PrivateKey>,
+    members: Vec<validators::Member>,
+    held: Arc<AtomicUsize>,
+    heads: Arc<AtomicUsize>,
+    stale: Arc<AtomicUsize>,
+    prunes: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Pruning {
+    async fn probe_start(&self) -> u64 {
+        let node = self.source.0.node.lock().await;
+        let commitment = node.host().store().commitment("probe").unwrap();
+        *commitment.db().unwrap().bounds().start
+    }
+
+    async fn prune_past(&self, start: u64) {
+        let mut starts = vec![self.probe_start().await];
+        for round in 0..CHURN_ROUNDS {
+            let past = *starts.last().unwrap() > start;
+            let prunes = starts.windows(2).filter(|pair| pair[1] > pair[0]).count();
+            if past && prunes >= PRUNES {
+                break;
+            }
+            advance(&self.source.0, &self.keys, &self.members, churn(round)).await;
+            starts.push(self.probe_start().await);
+        }
+        starts.dedup();
+        *self.prunes.lock().unwrap() = starts;
+    }
+}
+
+impl Exchange for Pruning {
+    type Error = Infallible;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
+        let held = probe_sync(&request) && self.held.fetch_add(1, Ordering::SeqCst) == 0;
+        if let (true, Some(start)) = (held, sync_start(&request)) {
+            self.prune_past(start).await;
+        }
+        let response = self.source.exchange(request).await?;
+        match &response {
+            Response::Head(_) => {
+                self.heads.fetch_add(1, Ordering::SeqCst);
+            }
+            Response::Refused(refusal) if refusal.reason == abi::reason::STALE => {
+                self.stale.fetch_add(1, Ordering::SeqCst);
+            }
+            Response::Sync(_) | Response::Blob(_) | Response::Refused(_) => {}
+        }
+        Ok(response)
+    }
+}
+
+fn sync_start(request: &Request) -> Option<u64> {
+    let Request::Sync { request, .. } = request else {
+        return None;
+    };
+    let decoded =
+        <statesync::SyncRequest as commonware_codec::DecodeExt<_>>::decode(request.as_slice())
+            .unwrap();
+    Some(*decoded.start())
+}
+
+fn churn(round: u64) -> Vec<Vec<u8>> {
+    let alice = key(11);
+    (0..8)
+        .map(|n| {
+            let steps = (0..64)
+                .map(|i| set(format!("churn-{n}-{i}").as_bytes(), &round.to_be_bytes()))
+                .collect();
+            frame(&alice, steps)
+        })
+        .collect()
+}
+
+#[test]
+fn a_join_the_source_prunes_past_reads_the_head_again_and_adopts_the_later_root() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let first = network.advance(churn(CHURN_ROUNDS)).await;
+        let pruning = Pruning {
+            source: network.exchange(),
+            keys: network.keys.clone(),
+            members: network.members.clone(),
+            held: Arc::new(AtomicUsize::new(0)),
+            heads: Arc::new(AtomicUsize::new(0)),
+            stale: Arc::new(AtomicUsize::new(0)),
+            prunes: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            pruning.clone(),
+        )
+        .await
+        .unwrap();
+
+        let prunes = pruning.prunes.lock().unwrap().clone();
+        assert!(prunes.len() > PRUNES, "probe's log start moved {prunes:?}");
+        assert!(pruning.stale.load(Ordering::SeqCst) >= 1);
+        assert!(pruning.heads.load(Ordering::SeqCst) >= 2);
+        let source = network.source.node.lock().await;
+        let tip = source.tip().unwrap();
+        assert!(tip.height > first.height);
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(
+            joined.node.host().root().unwrap(),
+            source.host().root().unwrap()
+        );
+        assert_eq!(
+            joined
+                .node
+                .view(Layer::Confirmed)
+                .get("probe", b"churn-7-63")
+                .unwrap(),
+            source
+                .view(Layer::Confirmed)
+                .get("probe", b"churn-7-63")
+                .unwrap()
+        );
     });
 }
