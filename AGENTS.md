@@ -91,10 +91,18 @@ under `ops/`.
 - All task work targets `dev`: worktrees fork from `origin/dev`, PRs are based
   on `dev`, and high-confidence reviewed PRs merge into `dev`. `main` advances
   only by an explicit, user-requested release of `dev`.
-- A hosted network (duckpond) runs released programs only. A request to put a
-  change on a hosted network is the request to release it: merge `dev` into
-  `main` in programs, wait for its `wasm-<commit>` release, and swap from that
-  release's founding. Never swap a build of `dev` or of a branch onto one.
+- A program reaches a hosted network (duckpond) as a build of a commit on
+  that network's forge, on the repo's `dev`, which holds only merged work.
+  The network's pods service builds it with the repo's pinned toolchain and
+  `--locked`, packs it the way a founding packs a program (its view, describe
+  module and any notifier embedded), and puts it as a blob from the pod.
+  GitHub releases (`wasm-<commit>`) and programs' `main` play no part in a
+  deploy: the programs release workflow publishes wasm for local foundings
+  (kit, qa), not for a hosted network. Never deploy a build of a branch that
+  is not merged, or a build made outside the pods service from a working
+  tree. A role program (programs, identity, valset, blobs, awaits, halo,
+  access, scheduler, egress) changes only by the validators' vote, which the
+  operator sends. Any account schedules an app program.
 - Default feature/fix/doc work happens in an isolated git worktree rather than
   directly in the primary checkout. Use the current checkout only when the user
   explicitly asks for in-place work or the task is limited to repo-state repair.
