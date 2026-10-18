@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Builds the pods service image around a released ducktape CLI and git-remote-duck, pushes it to the cluster node's registry, and applies pods.yaml.
 # Usage: AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY ops/k8s/pods/deploy NODE_URL FORGE DUCKTAPE_COMMIT
+# DUCKTAPE_COMMIT names a GitHub release bin-DUCKTAPE_COMMIT; a dev commit has none, so give the one the network's node runs.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 usage="usage: AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY ops/k8s/pods/deploy NODE_URL FORGE DUCKTAPE_COMMIT"
 node_url=${1:?$usage}
 forge=${2:?$usage}
 commit=$(git -C "$here" rev-parse --verify "${3:?$usage}^{commit}")
-agents_cpu=${AGENTS_CPU:?AGENTS_CPU is hardcap's requests.cpu: the node's allocatable cpu minus the duckpond node, ccs and tunnel pods' requests (kubectl describe node)}
-agents_memory=${AGENTS_MEMORY:?AGENTS_MEMORY is hardcap's requests.memory: the node's allocatable memory minus those pods' requests}
+agents_cpu=${AGENTS_CPU:?AGENTS_CPU is the requests.cpu of hardcap: the allocatable cpu of the node minus the requests of the duckpond node, ccs and tunnel pods (kubectl describe node)}
+agents_memory=${AGENTS_MEMORY:?AGENTS_MEMORY is the requests.memory of hardcap: the allocatable memory of the node minus the requests of those pods}
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 context=${DEPLOY_CONTEXT:-fabrics-1}
 kubectl_version=v1.36.5
@@ -34,11 +35,8 @@ podman build --file "$here/Containerfile" --tag "localhost:$tunnel_port/pods:$ta
 ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
 podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/pods:$tag"
 image="localhost:5000/pods:$tag@$(cat "$stage/digest")"
-node_cpu=$(kubectl --context "$context" get nodes -o jsonpath='{.items[0].status.allocatable.cpu}')
-node_memory=$(kubectl --context "$context" get nodes -o jsonpath='{.items[0].status.allocatable.memory}')
 sed -e "s#@IMAGE@#$image#g" -e "s#@NODE_URL@#$node_url#g" -e "s#@FORGE@#$forge#g" \
   -e "s#@AGENTS_CPU@#$agents_cpu#g" -e "s#@AGENTS_MEMORY@#$agents_memory#g" \
-  -e "s#@NODE_CPU@#$node_cpu#g" -e "s#@NODE_MEMORY@#$node_memory#g" \
   "$here/pods.yaml" | kubectl --context "$context" apply -f -
 kubectl --context "$context" -n pods rollout status deployment/pods
 echo "$image"

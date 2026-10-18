@@ -1,5 +1,5 @@
 # The pods service and the agents namespace it manages: priority, RBAC, the admission policies on the operator's quota hardcap and on every pod, hardcap itself and the LimitRange defaults, isolation, its Deployment and its fixed-address Service.
-# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@, @AGENTS_MEMORY@, @NODE_CPU@ and @NODE_MEMORY@; the key it signs with is the Secret `blob-key`.
+# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@ and @AGENTS_MEMORY@; the key it signs with is the Secret `blob-key`.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -208,7 +208,8 @@ spec:
     requests.memory: "@AGENTS_MEMORY@"
     requests.storage: 500Gi
 ---
-# A container that states no cpu or memory requests none and may use the whole node, so hardcap admits it.
+# A container that states no cpu or memory requests none, so hardcap admits it, and has no limit, so it may use the
+# whole node. No default limit: Kubernetes refuses a container limit above the pod-level limit a pod states.
 apiVersion: v1
 kind: LimitRange
 metadata:
@@ -218,7 +219,6 @@ spec:
   limits:
     - type: Container
       defaultRequest: {cpu: "0", memory: "0"}
-      default: {cpu: "@NODE_CPU@", memory: "@NODE_MEMORY@"}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

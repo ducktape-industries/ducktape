@@ -65,7 +65,8 @@ scripts back a `make` target; see the repository `Makefile`.
 
 - `AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY k8s/pods/deploy NODE_URL FORGE COMMIT` builds `k8s/pods/Containerfile` around
   the Linux ducktape that release `bin-COMMIT` carries, kubectl and
-  git-remote-duck, pushes it to the cluster node's registry, and applies
+  git-remote-duck (a dev commit has no release, so `COMMIT` is the one the
+  network's node runs), pushes it to the cluster node's registry, and applies
   `k8s/pods/pods.yaml`: the service `pods` in namespace `pods` at
   `http://10.43.80.80:8080`, and namespace `agents`, where it runs what agents
   ask for; a pod's inputs come from the node at `NODE_URL` and its forge
@@ -112,9 +113,10 @@ scripts back a `make` target; see the repository `Makefile`.
   `hardcap`, and `agents-pods` refuses every pod in `agents` that runs at a
   priority class other than `agents` or mounts or projects a service
   account token. A container that states no cpu or memory gets the
-  LimitRange `defaults`: a request of 0 and a limit of the node's
-  allocatable, so `hardcap` admits it and it contends for the whole
-  machine. The PriorityClass `agents` ranks its pods below every
+  LimitRange `defaults`: a request of 0 and no limit, so `hardcap` admits
+  it and it contends for the whole machine. `defaults` sets no default
+  limit, since Kubernetes refuses a container limit above the pod-level
+  limit a pod states. The PriorityClass `agents` ranks its pods below every
   other pod on the cluster. Its NetworkPolicy `isolated` admits traffic only
   from inside the namespace and lets pods out to public addresses and DNS.
 - The service signs blob puts, files commits and chat posts as the program
