@@ -1,6 +1,6 @@
-# The fast lane: what a push to `dev` proves in minutes. The `unit` job is
-# required for PRs into `dev`. It also runs after a push to `dev` and on
-# demand for a branch (`gh workflow run ci.yml --ref <branch>`).
+# The fast lane: what a push to `dev` proves in minutes. The `unit` job runs
+# after a push to `dev` and on demand for a branch
+# (`gh workflow run ci.yml --ref <branch>`).
 #
 # One job, one cache. `unit` restores one `target/` for everything the
 # workspace compiles: clippy is check-mode over the workspace, and `--lib`
@@ -13,7 +13,6 @@ name: ci
 on:
   push:
     branches: [dev]
-  # `unit` is a required check on dev, so it must also run on the PR head.
   pull_request:
     branches: [dev]
   workflow_dispatch:

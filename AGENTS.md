@@ -74,13 +74,13 @@ under `ops/`.
   site. The code, its comments, the skills, and git history are the record. A
   comment states its rule outright; it never cites a document for it.
 - A document states what is true at HEAD and nothing else: no dates, no
-  "shipped"/"phase N"/"status" framing, no issue or PR numbers, no "what
-  remains" lists. An open item is an issue on the tracker, not a paragraph.
+  "shipped"/"phase N"/"status" framing, no issue, PR or change numbers, no
+  "what remains" lists. An open item is an issue on the tracker, not a paragraph.
   Every path, symbol, flag and constant a document names must exist in the
   tree; a claim that cannot be checked against the code is deleted.
 - Specs and plans that planning workflows write under `docs/superpowers/` are
   local working files: the directory is gitignored and nothing under it ships
-  in a PR. When the PR merges the plan is done and the file is garbage, like
+  in a commit. When the work lands the plan is done and the file is garbage, like
   its worktree.
 - `docs/` holds only what an operator executes and the few records code
   cites by path; `docs/README.md` is the index and every document is one hop
@@ -88,15 +88,44 @@ under `ops/`.
 
 ## Branching and Delivery
 
-- All task work targets `dev`: worktrees fork from `origin/dev`, PRs are based
-  on `dev`, and high-confidence reviewed PRs merge into `dev`. `main` advances
-  only by an explicit, user-requested release of `dev`.
-- `dev` and `main` live on GitHub and on duckpond's forge (this repo is
-  forge's `core`; `ops/README.md` § Forge and GitHub). Accepted work merges
-  into `dev` on GitHub, and `.github/workflows/forge-sync.yml` carries each
-  push to forge's `dev` without force. Never push forge's `dev` or `main`
-  directly: forge-sync.yml refuses a forge branch that holds a commit GitHub
-  lacks.
+- This repository lives on duckpond's forge as `core`, and forge's `dev` and
+  `main` are its branches of record. GitHub's `ducktape-industries/ducktape`
+  is a read-only release mirror: forge-mirror fast-forwards its `dev` and
+  `main` to forge's (`ops/README.md` § Forge and GitHub), its Actions run CI
+  and build releases from those commits, and a ruleset refuses every other
+  write to its `dev` and `main`. Nobody opens or merges a pull request there.
+  Issues stay on GitHub.
+- Nobody pushes to forge's `dev` or `main`. Every piece of work, from anyone,
+  lands through a forge change: push the work as a branch, open a change from
+  that branch into `dev`, and merge the change. The merge's result is ONE
+  squash commit on the current `dev`, with a single parent; its subject is the
+  change's title followed by `(change N)`, and its body says what changed,
+  why, and the gates run. No merge commits. Forge cannot force-update a
+  branch and keeps every branch pushed to it, so when `dev` has moved and the
+  branch no longer merges cleanly, rebase it onto `forge/dev`, push it as a
+  new branch and open a new change.
+- Duckpond's agents open and merge changes with their harness tools. Operator
+  workers use `forge-change.sh` in the operator workspace
+  (`/mnt/data/code/qa/.local/duckpond/operator`), run from the worktree:
+  `forge-change.sh open core SLUG TITLE BODY_FILE` pushes HEAD as
+  `operator/SLUG` and opens its change into `dev`, the title and body being
+  the squash commit's subject and body; `forge-change.sh merge core N`
+  builds the squash commit on the current `dev`, publishes it as
+  `operator/SLUG-merge`, merges change N and waits until forge confirms the
+  merge. A change is merged by its author or by the repository's owner, never
+  by anyone else.
+- `main` moves only on an explicit, user-requested release of `dev`: a forge
+  change from `dev` into `main`.
+- A checkout reaches forge through a remote `forge`, with git-remote-duck
+  (release `git-remote-duck-7acf453`) on `PATH`:
+  `git remote add forge duck://duckpond-725bcad1/forge/core` and
+  `git config duck.duckpond-725bcad1.node https://duckpond.ducktape.industries`.
+  `git fetch forge` needs nothing more. A push signs with a git key on a
+  duckpond account: operator workers set
+  `DUCKTAPE_HOME=/mnt/data/code/qa/.local/duckpond/operator DUCKTAPE_DEVICE_KEY_STORE=file`
+  (`forge-change.sh` sets both itself), the workspace holding account 22's
+  "operator git" key. `origin` may stay GitHub, which holds forge's commits
+  once forge-mirror has pushed them.
 - A program reaches a hosted network (duckpond) as a build of a commit on
   that network's forge, on the repo's `dev`, which holds only merged work.
   Two builders make it: the network's pods service, or eddy-claude (account
@@ -119,20 +148,20 @@ under `ops/`.
   create one as a sibling checkout or under `/tmp`. Keep Cargo targets and
   other large build outputs in the disk-backed worktree too: `/tmp` may be a
   memory-backed filesystem, so building there consumes RAM and swap.
-- After the worktree change is implemented and verified, submit it as a PR
-  against `dev`. Do not treat local completion as done when the requested flow
-  is delivery.
-- Merge to `dev` only when confidence is high: the change is understood and the
-  relevant gates are green or any skips are justified. If confidence is medium
-  or low, leave the PR open with the risks, failed checks, or follow-up review
-  needed instead of merging by default.
+- A task worktree forks from `forge/dev`. After the change is implemented and
+  verified, land it through a forge change as above. Do not treat local
+  completion as done when the requested flow is delivery.
+- Merge a change only when confidence is high: the change is understood and
+  the relevant gates are green or any skips are justified. If confidence is
+  medium or low, leave the change open with the risks, failed checks, or
+  follow-up review needed instead of merging by default.
 
 ## Delivery Speed (high confidence is the gate, not the calendar)
 
 - **Local gates decide the merge; CI is not waited on.** When the touched
-  crates' gates are green locally and the change is understood, merge at once
-  (`gh pr merge --squash`). Do not arm a watch on the CI run, do not wait for
-  a review round, do not open a follow-up "verify" pass. CI stays light and
+  crates' gates are green locally and the change is understood, merge the
+  forge change at once. Do not wait for a review round, do not open a
+  follow-up "verify" pass. CI runs on the GitHub mirror after the merge and
   catches what the box missed after the fact; a red there is a new issue, not
   a reason to have waited.
 - **Gate what you touched, not the tree.** Run the per-crate clippy gate and
@@ -140,35 +169,36 @@ under `ops/`.
   change that spans the workspace. Never run the e2e node suites for a change
   that cannot reach them.
 - **One session, one task, end to end.** The session that implements a unit
-  also gates it, opens the PR, merges it, and closes the issue by hand (a
-  merge into `dev` closes nothing; `main` is the default branch). No
+  also gates it, opens and merges its forge change, and closes the GitHub
+  issue by hand (a forge merge closes nothing on GitHub). No
   implement → review → verify chains; a second pair of eyes is for a change
   the author says they do not understand.
 - **Reproduce before fixing, at current `dev`.** A report names a symptom; an
   attached cause may be stale. If it does not reproduce, close the issue with
   the evidence and move on — that is delivery, not a skipped task.
-- **Merged means gone.** Remove the worktree and delete the branch as soon as
-  the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
-  merge commit can revert it.
+- **Merged means gone.** Remove the worktree and delete its local branch as
+  soon as the change merges. Then `git grep` your symbol on `forge/dev`: a
+  sibling's merge can revert it.
 - **`abi` lives in two repositories.** The programs a network founds with
-  live in `ducktape-industries/programs`. Its `crates/sdk/abi` is a copy of
+  live in forge's `programs`. Its `crates/sdk/abi` is a copy of
   `crates/kernel/abi` here: a change to either copy is carried to the other
   in the same change. `crates/kernel/program` here is the small program SDK
   the kernel fixtures build against; that repository's `crates/sdk/program`
   is the full SDK its programs build against. They are two crates, not
   copies.
-- **Hold only what is really uncertain.** A PR stays open only when the
+- **Hold only what is really uncertain.** A change stays open only when the
   author can name the risk in one sentence. "Waiting for CI", "waiting for
   review", or "someone else should look" are not risks.
 
 ## Worktree Cleanup (a merged worktree is garbage — remove it)
 
-- **A worktree's life ends when its PR merges.** Once merged, remove the
+- **A worktree's life ends when its change merges.** Then remove the
   worktree and delete its branch. Leaving it costs ~20 GB of Cargo target each
   and nothing else.
 - **`ops/worktree-clean.sh` does it safely.** Dry-run by default; `--yes` to
-  act. It removes worktrees whose branch is fully merged into `origin/dev`, and
-  REFUSES one that is dirty, carries a commit not in `dev`, or has live
+  act. It removes worktrees whose work is on `origin/dev`, as ancestors or as
+  one squash commit carrying the same patch, and REFUSES one that is dirty,
+  carries work `dev` lacks, holds no commit of its own, or has live
   processes under it (`--force` overrides only the last). Unmerged work is
   never its to throw away.
 - Never stop desktop/QA processes with `pkill -f` — a pattern match will
@@ -224,7 +254,7 @@ under `ops/`.
   reaches a dev-only crate is green in clippy and fails the real binary.
 - Don't run `cargo fmt --all`: large bin files carry pre-existing fmt debt,
   and a tree-wide reformat forces painful rebases on in-flight branches. Only
-  format code you touched; the mechanical whole-tree sweep is a dedicated PR.
+  format code you touched; the mechanical whole-tree sweep is a dedicated commit.
 
 ## Rust House Rules (code style)
 

@@ -29,7 +29,22 @@ with tempfile.TemporaryDirectory() as temp:
     run("git", "remote", "add", "origin", str(origin), cwd=repo)
     run("git", "push", "origin", "dev", cwd=repo)
     run("git", "worktree", "add", "-b", "fix/finished", str(worktree), "HEAD", cwd=repo)
-    run("git", "push", "origin", "fix/finished", cwd=repo)
+    (worktree / "finished.txt").write_text("finished\n")
+    run("git", "add", "finished.txt", cwd=worktree)
+    run("git", "commit", "-m", "fix: finished", cwd=worktree)
+    (repo / "moved.txt").write_text("dev moved\n")
+    run("git", "add", "moved.txt", cwd=repo)
+    run("git", "commit", "-m", "test: dev moved", cwd=repo)
+    run("git", "merge", "--squash", "fix/finished", cwd=repo)
+    run("git", "commit", "-m", "fix: finished (change 1)", cwd=repo)
+    run("git", "push", "origin", "dev", cwd=repo)
+    unmerged = repo / ".worktree/unmerged"
+    run("git", "worktree", "add", "-b", "fix/unmerged", str(unmerged), "HEAD", cwd=repo)
+    (unmerged / "unmerged.txt").write_text("unmerged\n")
+    run("git", "add", "unmerged.txt", cwd=unmerged)
+    run("git", "commit", "-m", "fix: unmerged", cwd=unmerged)
+    fresh = repo / ".worktree/fresh"
+    run("git", "worktree", "add", "-b", "fix/fresh", str(fresh), "HEAD", cwd=repo)
     target = worktree / "target"
     target.mkdir()
     cached = target / "live"
@@ -88,4 +103,8 @@ with tempfile.TemporaryDirectory() as temp:
 
     result = run("bash", str(SCRIPT), "--yes", cwd=repo, env=scan_env)
     assert not worktree.exists(), "released cache should be removable: " + result.stdout
-    print("PASS: borrowed target retained by descriptor/environment, then removed")
+    assert unmerged.exists(), "a commit dev lacks must keep its worktree: " + result.stdout
+    assert "no commit on dev with this patch" in result.stdout, result.stdout
+    assert fresh.exists(), "a worktree with no commit of its own must stay: " + result.stdout
+    assert "no commit of its own" in result.stdout, result.stdout
+    print("PASS: borrowed target retained by descriptor/environment, then the squash-merged worktree removed; unmerged and fresh ones kept")

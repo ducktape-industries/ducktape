@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reap worktrees whose work is fully merged into origin/dev.
 #
-# A worktree's life ends when its PR merges; what it leaves behind is ~20 GB of
+# A worktree's life ends when its change merges; what it leaves behind is ~20 GB of
 # Cargo target and nothing else. Twelve of them once ate 250 GB.
 #
 # Dry-run by default. It removes worktrees; that is not something to do on a
@@ -11,9 +11,10 @@
 #   ops/worktree-clean.sh --yes        # do it
 #   ops/worktree-clean.sh --yes --force  # also take worktrees that have live processes
 #
-# Refuses, always, to touch a worktree that is dirty or carries undelivered
-# work — a commit neither an ancestor of origin/dev nor the exact HEAD of a
-# squash-merged PR. Unmerged work is never this script's to throw away.
+# Refuses, always, to touch a worktree that is dirty, holds no commit of its
+# own, or carries undelivered work — commits neither ancestors of origin/dev nor
+# one squash commit on it with the same patch. Unmerged work is never this
+# script's to throw away.
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
@@ -112,18 +113,18 @@ PYTHON
 }
 
 # ── did this branch land as a squash merge? ──────────────────────────────────
-# A squash merge lands the PR as ONE new commit on dev; the branch's own
+# A squash merge lands the change as ONE new commit on dev; the branch's own
 # commits never become ancestors, so ancestry (`rev-list origin/dev..`) calls
-# every squash-merged worktree unmerged forever. GitHub is the authority here:
-# a MERGED PR whose head oid equals this worktree's HEAD proves the content
-# landed and nothing was committed after the merge. gh missing or offline =
-# not proven = refuse.
+# every squash-merged worktree unmerged forever. The patch is the proof here:
+# a commit on origin/dev since the fork whose patch-id equals that of the
+# worktree's whole diff from the fork to HEAD proves the content landed and
+# nothing was committed after the merge. No such commit = not proven = refuse.
 squash_merged() {
-  local wt="$1" branch="$2" head merged_heads
-  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return 1
-  merged_heads=$(gh pr list --state merged --head "$branch" \
-    --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || return 1
-  case "$merged_heads" in *"$head"*) return 0 ;; *) return 1 ;; esac
+  local wt="$1" fork patch
+  fork=$(git -C "$wt" merge-base origin/dev HEAD 2>/dev/null) || return 1
+  patch=$(git -C "$wt" diff "$fork" HEAD | git patch-id --stable | cut -d' ' -f1)
+  [ -n "$patch" ] || return 1
+  git -C "$wt" log -p "$fork..origin/dev" | git patch-id --stable | cut -d' ' -f1 | grep -qxF "$patch"
 }
 
 echo "Worktrees whose work is fully in origin/dev:"
@@ -144,16 +145,16 @@ while read -r wt; do
   live=$(wc -w <<< "$live_pids")
 
   # The refusals that make this safe to run without reading the code.
-  if [ "$ahead" != "0" ] && ! squash_merged "$wt" "$branch"; then
-    echo "- SKIP $branch — $ahead commit(s) not in dev, no merged PR at this HEAD"; continue
+  if [ "$ahead" != "0" ] && ! squash_merged "$wt"; then
+    echo "- SKIP $branch — $ahead commit(s) not in dev, no commit on dev with this patch"; continue
   fi
-  # A worktree parked exactly at dev HEAD with a branch that was NEVER PUSHED
-  # is indistinguishable from a merged one by ancestry — but "merged" here
-  # means a PR happened, and a PR means a push. No origin/<branch> = a
-  # freshly created worktree someone is about to work in; one was swept
-  # mid-setup exactly this way (2026-08-26). Not this script's to reap.
-  if [ "$ahead" = "0" ] && ! git -C "$wt" rev-parse --verify --quiet "origin/$branch" >/dev/null; then
-    echo "- SKIP $branch — never pushed; a just-created worktree looks merged"; continue
+  # A worktree parked at or behind dev HEAD holds no commit of its own and is
+  # indistinguishable from a merged one by ancestry — but every merge is a
+  # squash commit, so delivered work always leaves the worktree ahead of dev.
+  # One at dev is a freshly created worktree someone is about to work in; one
+  # was swept mid-setup exactly this way (2026-08-26). Not this script's to reap.
+  if [ "$ahead" = "0" ]; then
+    echo "- SKIP $branch — no commit of its own; a just-created worktree looks merged"; continue
   fi
   if [ "$dirty" != "0" ]; then
     echo "- SKIP $(basename "$wt") — $dirty uncommitted change(s)"; continue

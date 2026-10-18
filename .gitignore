@@ -6,7 +6,7 @@ __pycache__/
 .claude/worktrees/
 .codex/worktrees/
 node_modules
-# Brainstorm specs and implementation plans are per-PR working files, never a
+# Brainstorm specs and implementation plans are per-change working files, never a
 # record: they stay local and die with their worktree.
 docs/superpowers/
 

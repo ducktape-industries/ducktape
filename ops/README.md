@@ -124,26 +124,35 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## Forge and GitHub
 
-- dev and main of ducktape, programs and app live on duckpond's forge
-  (repositories `core`, `programs`, `app`) and on GitHub. Each repo's
-  `.github/workflows/forge-sync.yml` moves forge's branch to a GitHub push.
-- `k8s/forge-mirror/mirror.py` is forge-mirror, which carries the other
-  direction. It follows duckpond's forge writes over `/v1/changes/forge`. A
-  block that moves a followed forge branch starts one job for that branch, and
-  so does a start. A job fast-forwards GitHub's branch of the same name to
-  forge's head with a plain push, so it never drops a commit. When GitHub's
-  branch holds a commit forge lacks, the job pushes nothing to that branch
-  and logs the warning `mirror_diverged` with both heads: the branch is held
-  until a person makes GitHub's head one that forge's head contains. A push
-  that loses a race with another GitHub push runs again. A held branch, and a
-  job that fails otherwise, runs again at each later block that writes forge
-  or the clock program (`FORGE_MIRROR_CLOCK`, `scheduler`), and logs its first
-  attempt and every tenth with an `attempts` field.
-  `k8s/forge-mirror/mirror-test.py` covers it.
-- forge-mirror pushes over HTTPS as the GitHub App "ducktape forge-mirror",
-  with an installation token it mints from the App's key. The Secret
-  `forge-mirror/github-app` holds `app_id`, `installation_id` and
-  `private_key`, nothing else.
+- dev and main of ducktape, programs and app are held by duckpond's forge
+  (repositories `core`, `programs`, `app`). GitHub's
+  `ducktape-industries/ducktape`, `programs` and `app` are a read-only release
+  mirror of them: forge-mirror fast-forwards GitHub's dev and main to forge's,
+  GitHub Actions run CI and build releases from the mirrored commits, and the
+  ruleset `k8s/forge-mirror/protect` puts on dev and main lets only the App
+  write them.
+- `k8s/forge-mirror/mirror.py` is forge-mirror, running on fabrics-1 as
+  Deployment `forge-mirror`. It follows duckpond's forge writes over
+  `/v1/changes/forge`. A block that moves a followed forge branch starts one
+  job for that branch, and so does a start. A job fast-forwards GitHub's
+  branch of the same name to forge's head with a plain push, so it never drops
+  a commit. When GitHub's branch holds a commit forge lacks, the job pushes
+  nothing to that branch and logs the warning `mirror_diverged` with both
+  heads: the branch is held until a person makes GitHub's head one that
+  forge's head contains. A person carries what GitHub's branch holds that is
+  worth keeping onto forge through a forge change, then pushes forge's head to
+  GitHub as the App, with `--force-with-lease` on GitHub's head, from inside
+  the pod (`kubectl -n forge-mirror exec deploy/forge-mirror`), which holds
+  the App's key. A push that loses a race with another GitHub push runs
+  again. A held branch, and a job that fails otherwise, runs again at each
+  later block that writes forge or the clock program (`FORGE_MIRROR_CLOCK`,
+  `scheduler`), and logs its first attempt and every tenth with an `attempts`
+  field. `k8s/forge-mirror/mirror-test.py` covers it.
+- forge-mirror pushes over HTTPS as the GitHub App "ducktape forge-mirror"
+  (App ID 5370470), with an installation token it mints from the App's key
+  for the repositories `FORGE_MIRROR_REPOS` names, so the token writes only
+  ducktape, programs and app. The Secret `forge-mirror/github-app` holds
+  `app_id`, `installation_id` and `private_key`, nothing else.
 - `k8s/forge-mirror/deploy` builds the forge-mirror image around `mirror.py`
   and the pinned git-remote-duck, pushes it to the cluster node's registry, and
   applies `forge-mirror.yaml`: namespace `forge-mirror`, its state claim, a
@@ -157,7 +166,8 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## Worktrees
 
-- `worktree-clean.sh` — removes task worktrees whose branch is fully merged
-  into `origin/dev`; dry-run by default, `--yes` to act. It REFUSES a worktree
-  that is dirty, carries a commit not in `dev`, or has live processes under
-  it. `worktree-clean-test.py` covers those refusals.
+- `worktree-clean.sh` — removes task worktrees whose work is on
+  `origin/dev`, as ancestors or as one squash commit carrying the same patch;
+  dry-run by default, `--yes` to act. It REFUSES a worktree that is dirty,
+  carries work `dev` lacks, holds no commit of its own, or has live processes
+  under it. `worktree-clean-test.py` covers those refusals.
