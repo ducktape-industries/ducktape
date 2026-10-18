@@ -1,4 +1,5 @@
-"""Exercise the forge-sync follower against local git repositories standing in for forge and GitHub, a local websocket and HTTP node, and a recording ducktape; run by `python3 ops/k8s/forge-sync/follower-test.py`."""
+"""Exercise the forge-sync follower against local git repositories standing in for forge and GitHub, a local websocket and HTTP node, and a recording ducktape; run by `make test`."""
+import dataclasses
 import http.server
 import importlib.util
 import json
@@ -142,6 +143,18 @@ class Websocket(unittest.TestCase):
         server.join()
         listener.close()
 
+    def test_a_follow_the_peer_resets_ends_with_what_it_carried(self):
+        change = follower.Change(9, [(b"r/x", b"v")])
+
+        def reset():
+            yield change
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+        inbox = follower.queue.Queue()
+        follower.pump("forge", reset(), inbox)
+        self.assertEqual([inbox.get(), inbox.get()], [follower.Wrote("forge", change), follower.Ended("forge")])
+        self.assertTrue(inbox.empty())
+
 
 class NodeGet(unittest.TestCase):
     def test_get_posts_a_confirmed_get_and_reads_the_option(self):
@@ -167,29 +180,6 @@ class NodeGet(unittest.TestCase):
         server.shutdown()
         server.server_close()
         self.assertEqual(bodies[0], ("/v1/get", b"\x00" + follower.borsh_text("forge") + follower.borsh_bytes(b"key")))
-
-
-class App(unittest.TestCase):
-    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "the App's JWT needs python's cryptography")
-    def test_the_jwt_is_rs256_signed_by_the_app_key_and_names_the_app(self):
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding, rsa
-
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
-        token = follower.App(1234, pem).jwt()
-        header, claims, signature = token.split(".")
-        pad = lambda part: part + "=" * (-len(part) % 4)
-        decoded = json.loads(follower.base64.urlsafe_b64decode(pad(claims)))
-        self.assertEqual(json.loads(follower.base64.urlsafe_b64decode(pad(header))), {"alg": "RS256", "typ": "JWT"})
-        self.assertEqual(decoded["iss"], 1234)
-        self.assertEqual(decoded["exp"] - decoded["iat"], 600)
-        key.public_key().verify(follower.base64.urlsafe_b64decode(pad(signature)), f"{header}.{claims}".encode(), padding.PKCS1v15(), hashes.SHA256())
-
-    def test_git_auth_sends_the_token_as_basic_auth_to_github_only(self):
-        auth = follower.git_auth("tok")
-        self.assertEqual(auth["GIT_CONFIG_KEY_0"], "http.https://github.com/.extraheader")
-        self.assertEqual(auth["GIT_CONFIG_VALUE_0"], "AUTHORIZATION: basic " + follower.base64.b64encode(b"x-access-token:tok").decode())
 
 
 class Poster(unittest.TestCase):
@@ -226,14 +216,14 @@ class Poster(unittest.TestCase):
 class FakeNode:
     def __init__(self):
         self.values = {}
+        self.followed = []
 
     def get(self, program, key):
         return self.values.get((program, key))
 
-
-class NoAuth:
-    def env(self, repo):
-        return {}
+    def follow(self, program):
+        self.followed.append(program)
+        return iter([])
 
 
 class Recorder:
@@ -269,7 +259,7 @@ class Sync(unittest.TestCase):
         self.pair = self.config.pairs[0]
         self.node = FakeNode()
         self.poster = Recorder()
-        self.follower = follower.Follower(self.config, self.node, NoAuth(), self.poster)
+        self.follower = follower.Follower(self.config, self.node, self.poster)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -335,10 +325,10 @@ class Sync(unittest.TestCase):
         push = mirror.push
         moves = [raced]
 
-        def racing(branch, oid, auth, lease=None):
+        def racing(branch, oid, lease=None):
             if moves:
                 self.put(self.github, moves.pop())
-            return push(branch, oid, auth, lease)
+            return push(branch, oid, lease)
 
         mirror.push = racing
         outcomes = []
@@ -351,16 +341,46 @@ class Sync(unittest.TestCase):
         self.assertEqual(self.head(self.github), forge)
         self.assertIn(f"Dropped commits: {raced}.", self.poster.posts[0][2])
 
-    def test_a_refused_push_stops_the_follower(self):
-        forge = self.commit("forge-1", self.base)
-        self.on_forge(forge)
+    def refuse(self):
         hook = self.github / "hooks" / "pre-receive"
         hook.write_text("#!/bin/sh\necho protected >&2\nexit 1\n")
         hook.chmod(0o755)
-        with self.assertRaises(follower.Stopped) as stopped:
-            self.follower.sync(self.pair, forge, "test")
-        self.assertIn("protected", str(stopped.exception))
+        return hook
+
+    def test_a_refused_push_is_reported_once_and_tried_again_at_the_next_forge_push(self):
+        forge = self.commit("forge-1", self.base)
+        self.on_forge(forge)
+        hook = self.refuse()
+        self.assertEqual(self.follower.sync(self.pair, forge, "test"), "failed")
         self.assertEqual(self.head(self.github), self.base)
+        self.assertEqual(self.follower.pending, {self.pair})
+        [(channel, message_id, line)] = self.poster.posts
+        self.assertEqual(message_id, f"forge-sync-failed-core-dev-{forge[:12]}")
+        self.assertIn("protected", line)
+        hook.unlink()
+        other = follower.ref_key(follower.Pair("core", "x", "feature"))
+        self.follower.wake([self.change(follower.FORGE, 9, [(other, ref_value(self.base))])])
+        self.assertEqual(self.head(self.github), self.base)
+        self.follower.wake([self.change(follower.CHAT, 10, [(follower.channel_head_key("sync"), b"x")])])
+        self.assertEqual(self.head(self.github), forge)
+        self.assertEqual(self.follower.pending, set())
+
+    def test_a_pending_ref_is_tried_again_when_another_followed_ref_moves(self):
+        second = follower.Pair("core", "ducktape-industries/ducktape", "main")
+        self.config = dataclasses.replace(self.config, pairs=(self.pair, second))
+        self.follower = follower.Follower(self.config, self.node, self.poster)
+        for bare in (self.forge, self.github):
+            git("push", "--quiet", str(bare), f"{self.base}:refs/heads/main", cwd=self.work)
+        forge = self.commit("forge-1", self.base)
+        self.on_forge(forge)
+        hook = self.refuse()
+        self.follower.sync(self.pair, forge, "test")
+        hook.unlink()
+        main = self.commit("forge-main", self.base)
+        git("push", "--quiet", str(self.forge), f"{main}:refs/heads/main", cwd=self.work)
+        self.follower.wake([self.change(follower.FORGE, 11, [(follower.ref_key(second), ref_value(main))])])
+        self.assertEqual(self.head(self.github), forge)
+        self.assertEqual(git("--git-dir", str(self.github), "rev-parse", "refs/heads/main"), main)
 
     def test_a_held_report_of_a_reset_that_happened_is_posted(self):
         github = self.commit("github-1", self.base)
@@ -410,9 +430,25 @@ class Sync(unittest.TestCase):
         self.follower.wake([self.change(follower.CHAT, 10, [(follower.channel_head_key("sync"), b"x")])])
         self.assertEqual(self.head(self.github), ahead)
 
-    def test_an_ended_follow_stops_the_follower(self):
-        with self.assertRaises(follower.Stopped):
-            self.follower.wake([follower.Ended(follower.CHAT)])
+    def test_an_ended_forge_follow_follows_again_and_syncs_what_moved_meanwhile(self):
+        self.follower.sync(self.pair, self.base, "start")
+        self.follower.wake([follower.Ended(follower.FORGE)])
+        self.assertEqual(self.node.followed, ["forge"])
+        ahead = self.commit("forge-only", self.base)
+        self.on_forge(ahead)
+        self.follower.wake([follower.Ended(follower.FORGE)])
+        self.assertEqual(self.head(self.github), ahead)
+
+    def test_an_ended_chat_follow_follows_again_and_syncs_all_when_the_channel_moved_meanwhile(self):
+        ahead = self.commit("forge-only", self.base)
+        self.on_forge(ahead)
+        self.follower.seen[self.pair] = ahead
+        self.follower.wake([follower.Ended(follower.CHAT)])
+        self.assertEqual(self.head(self.github), self.base)
+        self.node.values[(follower.CHAT, follower.channel_head_key("sync"))] = b"seq 2"
+        self.follower.wake([follower.Ended(follower.CHAT)])
+        self.assertEqual(self.node.followed, ["chat", "chat"])
+        self.assertEqual(self.head(self.github), ahead)
 
 
 class ConfigFromEnv(unittest.TestCase):
@@ -437,7 +473,7 @@ class ConfigFromEnv(unittest.TestCase):
             ],
         )
         self.assertEqual(config.forge_url.format(forge="core"), "duck://duckpond-725bcad1/forge/core")
-        self.assertEqual(config.github_url.format(github="ducktape-industries/app"), "https://github.com/ducktape-industries/app.git")
+        self.assertEqual(config.github_url.format(github="ducktape-industries/app"), "git@github.com:ducktape-industries/app.git")
 
 
 if __name__ == "__main__":

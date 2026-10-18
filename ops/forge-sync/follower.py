@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # The forge-sync follower: brings GitHub's dev and main of ducktape, programs and app to duckpond forge's heads, forge winning a divergence, woken by each block that writes one of those forge refs or posts in #sync.
-# ops/k8s/forge-sync/forge-sync.yaml runs it on fabrics-1, follower-test.py tests it.
+# forge-sync.service runs it on orthorymain, pushing over SSH with orthory's key; follower-test.py tests it.
 import base64
 import json
 import os
@@ -11,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,8 +18,6 @@ from urllib.parse import urlsplit
 
 FORGE = "forge"
 CHAT = "chat"
-API = "https://api.github.com"
-GITHUB_HEADER = "http.https://github.com/.extraheader"
 
 
 class Stopped(Exception):
@@ -217,54 +214,6 @@ class Node:
         return Changes(self.url, program)
 
 
-def b64url(data):
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
-def git_auth(token):
-    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    return {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": GITHUB_HEADER, "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"}
-
-
-class App:
-    def __init__(self, app_id, key_pem, api=API):
-        from cryptography.hazmat.primitives import serialization
-
-        self.app_id = app_id
-        self.key = serialization.load_pem_private_key(key_pem, password=None)
-        self.api = api
-
-    def jwt(self):
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding
-
-        now = int(time.time())
-        header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
-        claims = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": self.app_id}).encode())
-        signing = f"{header}.{claims}".encode()
-        return f"{header}.{claims}.{b64url(self.key.sign(signing, padding.PKCS1v15(), hashes.SHA256()))}"
-
-    def call(self, method, path, body=None):
-        request = urllib.request.Request(
-            f"{self.api}{path}",
-            data=None if body is None else json.dumps(body).encode(),
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self.jwt()}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "forge-sync",
-            },
-        )
-        with urllib.request.urlopen(request) as answer:
-            return json.load(answer)
-
-    def env(self, repo):
-        installation = self.call("GET", f"/repos/{repo}/installation")["id"]
-        token = self.call("POST", f"/app/installations/{installation}/access_tokens", {"repositories": [repo.split("/", 1)[1]]})["token"]
-        return git_auth(token)
-
-
 class Poster:
     def __init__(self, ducktape, node, keys, home):
         self.ducktape = ducktape
@@ -358,18 +307,17 @@ class Mirror:
         if not self.path.exists():
             subprocess.run(["git", "init", "--quiet", "--bare", str(self.path)], check=True, capture_output=True)
 
-    def git(self, *args, auth=None):
-        command = ["git", "-C", str(self.path), "-c", self.chain_node, *args]
-        return subprocess.run(command, capture_output=True, text=True, env=dict(os.environ, **(auth or {})))
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.path), "-c", self.chain_node, *args], capture_output=True, text=True)
 
-    def must(self, *args, auth=None):
-        ran = self.git(*args, auth=auth)
+    def must(self, *args):
+        ran = self.git(*args)
         if ran.returncode != 0:
-            raise Stopped(f"git {' '.join(args[:2])} in {self.path.name}: {ran.stderr.strip()}")
+            raise Stopped(f"git {' '.join(args[:2])} in {self.path.name}: {' / '.join(ran.stderr.strip().splitlines())}")
         return ran.stdout
 
-    def github_head(self, branch, auth):
-        listed = self.must("ls-remote", self.github_url, f"refs/heads/{branch}", auth=auth).split()
+    def github_head(self, branch):
+        listed = self.must("ls-remote", self.github_url, f"refs/heads/{branch}").split()
         return listed[0] if listed else None
 
     def has(self, oid):
@@ -382,10 +330,10 @@ class Mirror:
         if not self.has(oid):
             raise Stopped(f"forge {self.path.stem} {branch} holds {oid}, which its fetch did not bring")
 
-    def fetch_github(self, branch, oid, auth):
+    def fetch_github(self, branch, oid):
         if self.has(oid):
             return True
-        self.must("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", self.github_url, f"+refs/heads/{branch}:refs/github/{branch}", auth=auth)
+        self.must("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", self.github_url, f"+refs/heads/{branch}:refs/github/{branch}")
         return self.has(oid)
 
     def contains(self, descendant, ancestor):
@@ -394,9 +342,9 @@ class Mirror:
     def only_in(self, tip, base):
         return self.must("rev-list", tip, f"^{base}").split()
 
-    def push(self, branch, oid, auth, lease=None):
+    def push(self, branch, oid, lease=None):
         guard = [] if lease is None else [f"--force-with-lease=refs/heads/{branch}:{lease}"]
-        return self.git("push", "--quiet", "--porcelain", *guard, self.github_url, f"{oid}:refs/heads/{branch}", auth=auth)
+        return self.git("push", "--quiet", "--porcelain", *guard, self.github_url, f"{oid}:refs/heads/{branch}")
 
 
 @dataclass(frozen=True)
@@ -421,7 +369,7 @@ class Config:
             state=Path(env["FORGE_SYNC_STATE"]),
             pairs=tuple(Pair(forge, github, branch) for forge, github in repos for branch in branches),
             forge_url=env.get("FORGE_SYNC_FORGE_URL", f"duck://{chain}/forge/{{forge}}"),
-            github_url=env.get("FORGE_SYNC_GITHUB_URL", "https://github.com/{github}.git"),
+            github_url=env.get("FORGE_SYNC_GITHUB_URL", "git@github.com:{github}.git"),
         )
 
 
@@ -440,20 +388,25 @@ def pump(program, changes, inbox):
     try:
         for change in changes:
             inbox.put(Wrote(program, change))
+    except OSError as error:
+        say("follow_broke", program=program, reason=str(error))
     finally:
         inbox.put(Ended(program))
 
 
 class Follower:
-    def __init__(self, config, node, github, poster):
+    def __init__(self, config, node, poster):
         self.config = config
         self.node = node
-        self.github = github
         self.poster = poster
         self.journal = Journal(config.state / "reports")
         self.mirrors = {}
         self.pair_of_key = {ref_key(pair): pair for pair in config.pairs}
         self.asked_key = channel_head_key(config.channel)
+        self.inbox = queue.Queue()
+        self.seen = {}
+        self.pending = set()
+        self.asked = None
 
     def mirror(self, pair):
         if pair.forge not in self.mirrors:
@@ -463,18 +416,21 @@ class Follower:
     def forge_head(self, pair):
         return oid_of(self.node.get(FORGE, ref_key(pair)))
 
+    def follow(self, program):
+        changes = self.node.follow(program)
+        threading.Thread(target=pump, args=(program, changes, self.inbox), daemon=True).start()
+
     def run(self):
-        inbox = queue.Queue()
         for program in (FORGE, CHAT):
-            changes = self.node.follow(program)
-            threading.Thread(target=pump, args=(program, changes, inbox), daemon=True).start()
+            self.follow(program)
         say("following", node=self.config.node, pairs=[f"{pair.forge}:{pair.branch}" for pair in self.config.pairs], channel=self.config.channel)
+        self.asked = self.node.get(CHAT, self.asked_key)
         self.settle_reports()
         self.sync_all("start")
         while True:
-            events = [inbox.get()]
-            while not inbox.empty():
-                events.append(inbox.get())
+            events = [self.inbox.get()]
+            while not self.inbox.empty():
+                events.append(self.inbox.get())
             self.wake(events)
 
     def wake(self, events):
@@ -483,42 +439,88 @@ class Follower:
         for event in events:
             match event:
                 case Ended(program):
-                    raise Stopped(f"the node ended the {program} follow")
+                    self.refollow(program, moved, asked)
                 case Wrote(program, change):
                     self.read(program, change, moved, asked)
-        if asked:
-            self.sync_all(f"asked at {asked[-1]}")
+        if not moved and not asked:
             return
-        for pair, (height, head) in moved.items():
-            self.sync(pair, head, f"forge wrote at {height}")
+        self.settle_reports()
+        if asked:
+            self.sync_all(asked[-1])
+            return
+        for pair, (cause, head) in moved.items():
+            self.sync(pair, head, cause)
+        for pair in sorted(self.pending - moved.keys(), key=self.config.pairs.index):
+            self.sync(pair, self.forge_head(pair), "retry")
 
     def read(self, program, change, moved, asked):
         for key, value in change.writes:
             if program == FORGE and key in self.pair_of_key:
-                moved[self.pair_of_key[key]] = (change.height, oid_of(value))
+                moved[self.pair_of_key[key]] = (f"forge wrote at {change.height}", oid_of(value))
             if program == CHAT and key == self.asked_key:
-                asked.append(change.height)
+                self.asked = value
+                asked.append(f"#{self.config.channel} posted at {change.height}")
+
+    def refollow(self, program, moved, asked):
+        self.follow(program)
+        say("refollowed", program=program)
+        match program:
+            case "forge":
+                self.missed_moves(moved)
+            case "chat":
+                self.missed_asks(asked)
+
+    def missed_moves(self, moved):
+        for pair in self.config.pairs:
+            head = self.forge_head(pair)
+            if head != self.seen.get(pair):
+                moved[pair] = ("forge moved while the follow was down", head)
+
+    def missed_asks(self, asked):
+        value = self.node.get(CHAT, self.asked_key)
+        if value != self.asked:
+            self.asked = value
+            asked.append(f"#{self.config.channel} posted while the follow was down")
 
     def sync_all(self, cause):
         for pair in self.config.pairs:
             self.sync(pair, self.forge_head(pair), cause)
 
     def sync(self, pair, forge, cause):
+        try:
+            outcome = self.settled(pair, forge, cause)
+        except Stopped as failed:
+            self.failed(pair, forge, cause, str(failed))
+            return "failed"
+        self.pending.discard(pair)
+        self.seen[pair] = forge
+        return outcome
+
+    def settled(self, pair, forge, cause):
         while True:
             outcome = self.attempt(pair, forge)
             say("synced", forge=pair.forge, github=pair.github, branch=pair.branch, head=forge, outcome=outcome, cause=cause)
             if outcome != "raced":
                 return outcome
 
+    def failed(self, pair, forge, cause, reason):
+        self.pending.add(pair)
+        say("failed", forge=pair.forge, github=pair.github, branch=pair.branch, head=forge, cause=cause, reason=reason)
+        message_id = f"forge-sync-failed-{pair.forge}-{pair.branch.replace('/', '-')}-{(forge or 'none')[:12]}"
+        line = f"forge-sync could not bring GitHub {pair.github} {pair.branch} to forge {pair.forge}'s {forge}: {reason}. It tries again at the next forge push or #{self.config.channel} post."
+        try:
+            say("reported", message_id=message_id, outcome=self.poster.post(self.config.channel, message_id, line))
+        except Stopped as unposted:
+            say("unreported", message_id=message_id, reason=str(unposted))
+
     def attempt(self, pair, forge):
         if forge is None:
             return "forge_absent"
         mirror = self.mirror(pair)
-        auth = self.github.env(pair.github)
-        github = mirror.github_head(pair.branch, auth)
+        github = mirror.github_head(pair.branch)
         if github == forge:
             return "equal"
-        fetched = github is None or mirror.fetch_github(pair.branch, github, auth)
+        fetched = github is None or mirror.fetch_github(pair.branch, github)
         if not fetched:
             return "raced"
         mirror.fetch_forge(pair.branch, forge)
@@ -527,32 +529,33 @@ class Follower:
             case "forge_absent" | "equal" | "ahead":
                 return step
             case "github_absent" | "behind":
-                return self.fast_forward(mirror, pair, forge, github, auth)
+                return self.fast_forward(mirror, pair, forge, github)
             case "diverged":
-                return self.reset(mirror, pair, forge, github, auth)
+                return self.reset(mirror, pair, forge, github)
 
-    def fast_forward(self, mirror, pair, forge, github, auth):
-        pushed = mirror.push(pair.branch, forge, auth)
+    def fast_forward(self, mirror, pair, forge, github):
+        pushed = mirror.push(pair.branch, forge)
         if pushed.returncode == 0:
             return "pushed"
-        return self.refused(mirror, pair, github, auth, pushed)
+        return self.refused(mirror, pair, github, pushed)
 
-    def reset(self, mirror, pair, forge, github, auth):
+    def reset(self, mirror, pair, forge, github):
         report = Report(report_id(pair, github, forge), pair, github, forge, mirror.only_in(github, forge))
         self.journal.write(report)
-        pushed = mirror.push(pair.branch, forge, auth, lease=github)
+        pushed = mirror.push(pair.branch, forge, lease=github)
         if pushed.returncode != 0:
             self.journal.drop(report)
-            return self.refused(mirror, pair, github, auth, pushed)
+            return self.refused(mirror, pair, github, pushed)
         say("reset", forge=pair.forge, github=pair.github, branch=pair.branch, old=github, new=forge, dropped=report.dropped)
         self.report(report)
         return "reset"
 
-    def refused(self, mirror, pair, github, auth, pushed):
-        now = mirror.github_head(pair.branch, auth)
+    def refused(self, mirror, pair, github, pushed):
+        now = mirror.github_head(pair.branch)
         if now != github:
             return "raced"
-        raise Stopped(f"GitHub refused {pair.github} {pair.branch}: {(pushed.stdout + pushed.stderr).strip()}")
+        said = " / ".join((pushed.stdout + pushed.stderr).strip().splitlines())
+        raise Stopped(f"GitHub refused the push: {said}")
 
     def report(self, report):
         outcome = self.poster.post(self.config.channel, report.message_id, report.line())
@@ -568,9 +571,8 @@ class Follower:
             self.journal.drop(report)
             return
         mirror = self.mirror(report.pair)
-        auth = self.github.env(report.pair.github)
-        github = mirror.github_head(report.pair.branch, auth)
-        fetched = github is not None and mirror.fetch_github(report.pair.branch, github, auth)
+        github = mirror.github_head(report.pair.branch)
+        fetched = github is not None and mirror.fetch_github(report.pair.branch, github)
         happened = fetched and mirror.contains(github, report.new) and not mirror.contains(github, report.old)
         if happened:
             self.report(report)
@@ -580,15 +582,12 @@ class Follower:
 
 def main():
     config = Config.from_env(os.environ)
-    keys = Path(os.environ["FORGE_SYNC_KEYS"])
-    app = Path(os.environ["FORGE_SYNC_APP"])
-    github = App(int((app / "app-id").read_text().strip()), (app / "private-key.pem").read_bytes())
     home = config.state / "ducktape"
     home.mkdir(parents=True, exist_ok=True)
     os.environ["DUCKTAPE_HOME"] = str(home)
-    poster = Poster(os.environ.get("FORGE_SYNC_DUCKTAPE", "ducktape"), config.node, keys, str(home))
+    poster = Poster(os.environ.get("FORGE_SYNC_DUCKTAPE", "ducktape"), config.node, config.state / "keys", str(home))
     try:
-        Follower(config, Node(config.node), github, poster).run()
+        Follower(config, Node(config.node), poster).run()
     except Stopped as stopped:
         say("stopped", reason=str(stopped))
         sys.exit(1)

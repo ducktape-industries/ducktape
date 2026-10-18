@@ -1,7 +1,7 @@
 # Each push to dev or main moves the same branch of duckpond's forge repository
 # `core` forward, signed by account 22's "forge-sync CI" key. When forge already holds
 # the push or has moved past it, the run changes nothing; when the two have diverged,
-# the run posts in duckpond's #sync, and forge-sync on fabrics-1 resets GitHub's branch to forge's.
+# the run posts in duckpond's #sync, and the forge-sync follower resets GitHub's branch to forge's.
 name: forge-sync
 
 on:
@@ -71,11 +71,11 @@ jobs:
             git fetch --quiet --no-tags "$FORGE" "+$branch:refs/forge/$GITHUB_REF_NAME"
           fi
           if [ -n "$held" ] && git merge-base --is-ancestor "$head" "$held"; then
-            echo "::notice::forge's $GITHUB_REF_NAME is at $held, past $head; forge-sync on fabrics-1 brings GitHub's $GITHUB_REF_NAME to it."
+            echo "::notice::forge's $GITHUB_REF_NAME is at $held, past $head; the forge-sync follower brings GitHub's $GITHUB_REF_NAME to it."
             exit 0
           fi
           if [ -n "$held" ] && ! git merge-base --is-ancestor "$held" "$head"; then
-            echo "::warning::GitHub's $GITHUB_REF_NAME at $head and forge's at $held have diverged. Forge wins: forge-sync on fabrics-1 resets GitHub's $GITHUB_REF_NAME to $held."
+            echo "::warning::GitHub's $GITHUB_REF_NAME at $head and forge's at $held have diverged. Forge wins: the forge-sync follower resets GitHub's $GITHUB_REF_NAME to $held."
             echo "forge=$held" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -84,7 +84,7 @@ jobs:
           fi
           now=$(git ls-remote "$FORGE" "$branch" | cut -f1)
           if [ "$now" != "$held" ]; then
-            echo "::notice::forge's $GITHUB_REF_NAME moved to $now during the push; forge-sync on fabrics-1 compares it with GitHub's."
+            echo "::notice::forge's $GITHUB_REF_NAME moved to $now during the push; the forge-sync follower compares it with GitHub's."
             exit 0
           fi
           echo "::error::forge did not take $GITHUB_REF_NAME at $head; forge's $GITHUB_REF_NAME is ${held:-absent}. Nothing was overwritten."
@@ -124,7 +124,7 @@ jobs:
 
           head, held, branch = os.environ["GITHUB_SHA"], os.environ["FORGE_HEAD"], os.environ["GITHUB_REF_NAME"]
           repo, forge = os.environ["GITHUB_REPOSITORY"], os.environ["FORGE_REPO"]
-          message_id = f"forge-sync-ci-{forge}-{branch}-{head[:12]}-{held[:12]}"
+          message_id = f"forge-sync-ci-{forge}-{branch.replace('/', '-')}-{head[:12]}-{held[:12]}"
           line = f"GitHub {repo} {branch} is at {head} and forge {forge}'s {branch} at {held}: they have diverged. Forge wins: forge-sync resets GitHub's {branch} to {held}."
           span = text(line) + struct.pack("<I", 0)
           paragraph = b"\x00" + struct.pack("<I", 1) + span

@@ -1,0 +1,23 @@
+# forge-sync on orthorymain: follows duckpond and brings GitHub's dev and main of ducktape, programs and app to forge's, pushing over SSH as orthory.
+# Installed by ops/forge-sync/install.sh; its state and #sync key live in ~/.local/state/forge-sync.
+[Unit]
+Description=forge-sync: GitHub's dev and main follow duckpond forge's
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.local/state/forge-sync
+ExecStart=/usr/bin/python3 %h/.local/share/forge-sync/follower.py
+Environment=PATH=%h/.local/share/forge-sync/bin:/usr/bin:/bin
+Environment=PYTHONDONTWRITEBYTECODE=1 NO_COLOR=1 DUCKTAPE_DEVICE_KEY_STORE=file
+Environment=FORGE_SYNC_NODE=https://duckpond.ducktape.industries
+Environment=FORGE_SYNC_CHAIN=duckpond-725bcad1
+Environment=FORGE_SYNC_CHANNEL=sync
+Environment=FORGE_SYNC_STATE=%h/.local/state/forge-sync
+Environment="FORGE_SYNC_REPOS=core=ducktape-industries/ducktape programs=ducktape-industries/programs app=ducktape-industries/app"
+Environment="FORGE_SYNC_BRANCHES=dev main"
+Nice=19
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
