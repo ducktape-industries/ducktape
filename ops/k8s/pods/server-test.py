@@ -44,6 +44,7 @@ GONE = bytes([3, 0])
 COMMIT = "c0ffee" + "0" * 34
 HAVE = "be" * 20
 UNSTARTED = 'error: unable to upgrade connection: container not found ("run")'
+UNPLACED = "error: unable to upgrade connection: pod duckpond-41 does not have a host assigned"
 FETCHING_STATE = {"waiting": {"reason": "PodInitializing"}}
 FAILED = {"terminated": {"exitCode": 128, "reason": "Error", "message": "clone failed"}}
 
@@ -413,6 +414,7 @@ class Create(Served):
         self.assertFalse(body["automountServiceAccountToken"])
         self.assertFalse(body["enableServiceLinks"])
         self.assertFalse(body["hostUsers"])
+        self.assertTrue(body["shareProcessNamespace"])
         self.assertEqual(body["restartPolicy"], "Never")
         self.assertNotIn("resources", body)
         self.assertNotIn("initContainers", body)
@@ -842,6 +844,31 @@ class Unstarted(Streamed):
         self.assertEqual(self.kube.verbs(), ["exec", "watch_pod", "exec"])
         self.assertEqual(self.signer.queries, [("egress", server.egress_request(41))] * 2)
         self.assertTrue(self.watch.killed)
+
+    def test_an_exec_before_the_pod_has_a_node_runs_once_its_default_container_runs(self):
+        self.kube.answer("exec", ran(code=1, err=UNPLACED), ran(b"built\n"))
+        heard = self.asked_egress()
+        self.watch.send("ADDED", pod_json())
+        answers = []
+        call = threading.Thread(target=lambda: answers.append(self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})))
+        call.start()
+        self.assertTrue(heard.wait(10))
+        self.assertEqual(self.kube.verbs(), ["exec", "watch_pod"])
+        self.watch.send("MODIFIED", pod_json(state=FETCHING_STATE, init=RUNNING))
+        self.watch.send("MODIFIED", pod_json(state=RUNNING, phase="Running", init=ENDED))
+        call.join(10)
+        self.assertEqual(answers, [(200, {"exit_code": 0, "stdout": "built\n", "stderr": ""})])
+        self.assertEqual(self.kube.verbs(), ["exec", "watch_pod", "exec"])
+        self.assertEqual(self.signer.queries, [("egress", server.egress_request(41))] * 3)
+
+    def test_an_exec_before_the_pod_has_a_node_watches_the_container_it_names(self):
+        self.kube.answer("exec", ran(code=1, err=UNPLACED), ran(b"read\n"))
+        self.watch.send("ADDED", pod_json())
+        self.watch.send("MODIFIED", pod_json(state=FETCHING_STATE, phase="Pending", init=ENDED))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["ls"], "container": "out"})
+        self.assertEqual((status, answer["stdout"]), (200, "read\n"))
+        self.assertEqual(self.kube.calls[-1][2], "out")
+        self.assertEqual(self.signer.queries, [("egress", server.egress_request(41))] * 2)
 
     def test_a_streamed_exec_is_alive_while_its_container_starts(self):
         self.watch.send("ADDED", pod_json(state=FETCHING_STATE, init=RUNNING))

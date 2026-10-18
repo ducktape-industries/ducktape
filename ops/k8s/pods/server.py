@@ -133,6 +133,7 @@ DROPPED = (
     "http2: client connection lost",
 )
 UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
+UNPLACED = "does not have a host assigned"
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
 RESOLVING = SAFE_GIT + 'cd "$1" && git rev-parse --verify --quiet "$2^{commit}"\n'
@@ -207,9 +208,26 @@ def failed(ran):
     return ran.err or ran.out.decode(errors="replace").strip() or f"exited {ran.code}"
 
 
-def unstarted(ran):
-    found = UNSTARTED.search(ran.err) if ran.code != 0 else None
-    return found.group(1) if found else None
+@dataclass
+class Unstarted:
+    container: str | None
+
+
+def unstarted(ran, container):
+    if ran.code == 0:
+        return None
+    found = UNSTARTED.search(ran.err)
+    if found:
+        return Unstarted(found.group(1))
+    if UNPLACED in ran.err:
+        return Unstarted(container)
+    return None
+
+
+def default_container(pod):
+    notes = pod.get("metadata", {}).get("annotations") or {}
+    containers = pod.get("spec", {}).get("containers") or [{}]
+    return notes.get(DEFAULT_CONTAINER) or containers[0].get("name")
 
 
 def start_of(event, container):
@@ -650,6 +668,7 @@ def pod_spec(asked, spec, fetching, namespace):
         "enableServiceLinks": False,
         "hostUsers": False,
         "priorityClassName": PRIORITY,
+        "shareProcessNamespace": True,
         "containers": [run_container, out_container],
     }
     if "resources" in spec:
@@ -1219,8 +1238,8 @@ class Service:
 
         while True:
             ran = self.retried(asked, attempt, failed) if again else attempt()
-            waited = unstarted(ran)
-            if waited is None or not self.started(asked, name, waited):
+            waited = unstarted(ran, container)
+            if waited is None or not self.started(asked, name, waited.container):
                 return ran
 
     def started(self, asked, name, container):
@@ -1241,11 +1260,12 @@ class Service:
                     if ran.code != 0:
                         continue
                     item = {"type": "MODIFIED", "object": json.loads(ran.out)}
-                start = start_of(item, container)
+                watched = container or default_container(item.get("object") or {})
+                start = start_of(item, watched)
                 if start == "ended":
                     return False
                 if not self.waiting(asked):
-                    raise Refused(502, f"container {container} of pod {name} had not started when request {asked['request']}, which asked for this, was gone, so nothing ran")
+                    raise Refused(502, f"container {watched} of pod {name} had not started when request {asked['request']}, which asked for this, was gone, so nothing ran")
                 if start == "running":
                     return True
         finally:

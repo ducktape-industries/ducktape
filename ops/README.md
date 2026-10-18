@@ -115,7 +115,9 @@ scripts back a `make` target; see the repository `Makefile`.
   foresee answers 500 with `{"error"}` rather than closing the connection.
 - An exec, `blob`, `file` or `push` that reaches a container which has not
   started yet (kubectl's `container not found ("run")`, while the `fetch`
-  init container still fetches the pod's inputs) watches the pod and runs
+  init container still fetches the pod's inputs, or `does not have a host
+  assigned`, while the pod waits for a node; then the container watched is
+  the one asked for, else the pod's default container) watches the pod and runs
   once that container runs, while the egress request that asked is open:
   each change the watch hears asks egress again, and once the request is
   gone it answers 502 and runs nothing. A container that ended, or a pod
@@ -129,6 +131,10 @@ scripts back a `make` target; see the repository `Makefile`.
   is a line in the fetch container's log (`pods/NAME/logs?container=fetch`)
   with the failure in the fetcher's words, and the pod stays in its init
   phase meanwhile.
+- A pod the service makes shares one process namespace among its
+  containers (`shareProcessNamespace`): the pod's pause process is PID 1, so
+  it reaps every orphaned process, and no container's own process is PID 1,
+  so a SIGTERM stops one that does not handle it.
 - A pod's inputs and `/out` are generic ephemeral volumes of storage class
   `local-path`, so they sit on the disk that holds the cluster's
   PersistentVolumes, not on the node's root filesystem. Kubernetes creates
