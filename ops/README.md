@@ -83,6 +83,49 @@ scripts back a `make` target; see the repository `Makefile`.
   agents build ducktape, programs and the app with, pushes it to the
   cluster node's registry and prints its reference.
 
+## Forge and GitHub in step
+
+- dev and main of ducktape, programs and app exist on GitHub and on
+  duckpond's forge (repositories `core`, `programs`, `app`). Each repo's
+  `.github/workflows/forge-sync.yml` moves forge's branch to a GitHub push;
+  `k8s/forge-sync/follower.py` moves GitHub's branch to a forge push.
+- `k8s/forge-sync/deploy COMMIT` builds `k8s/forge-sync/Containerfile` around
+  the Linux ducktape that release `bin-COMMIT` carries and git-remote-duck,
+  pushes it to the cluster node's registry, and applies
+  `k8s/forge-sync/forge-sync.yaml`: the Deployment `forge-sync` in namespace
+  `forge-sync`, its claim, a NetworkPolicy that admits no inbound traffic,
+  and the Service `forge-sync-node` in namespace `duckpond` onto the node's
+  HTTP port.
+- The follower follows the node's writes to forge and to chat
+  (`/v1/changes/forge`, `/v1/changes/chat`). A block that moves a followed
+  forge branch starts one job for that branch; a block that posts in chat
+  channel `sync` starts one for every branch, and so does a start. A job
+  reads GitHub's head: GitHub behind is pushed forge's head; GitHub equal
+  or ahead is left; diverged, forge wins: GitHub's branch is pushed forge's
+  head with a lease on the head just read, and the follower posts one line
+  in #sync naming the old head, the new one and every dropped commit. A job
+  whose push loses a race with a GitHub push runs again; any other failure
+  stops the follower, and Kubernetes starts it again.
+- `forge-sync.yml` changes nothing when forge already holds the push or has
+  moved past it; when the two have diverged it posts in #sync, which starts
+  the follower's jobs. A push by either side leaves the pair equal, so the
+  other side's run does nothing.
+- The follower pushes as a GitHub App whose ID and private key are the
+  Secret `github-app` (files `app-id` and `private-key.pem`), and posts as
+  account 22 with the key "forge-sync follower", the Secret `duckpond-key`
+  (files `key` and `password`):
+
+  ```sh
+  kubectl -n forge-sync create secret generic duckpond-key --from-file=key=KEY --from-file=password=PASSWORD
+  kubectl -n forge-sync create secret generic github-app --from-literal=app-id=APP_ID --from-file=private-key.pem=PEM
+  ```
+
+- `k8s/forge-sync/protect APP_ID` prints the repository rulesets that hold
+  the branch rules of dev in the three repos and of app's main, with the App
+  in their bypass lists, and the classic protection they replace;
+  `--apply` creates them and then deletes the classic protection.
+  `k8s/forge-sync/follower-test.py` covers the follower.
+
 ## Worktrees
 
 - `worktree-clean.sh` — removes task worktrees whose branch is fully merged
