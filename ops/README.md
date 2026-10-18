@@ -122,6 +122,17 @@ scripts back a `make` target; see the repository `Makefile`.
   each change the watch hears asks egress again, and once the request is
   gone it answers 502 and runs nothing. A container that ended, or a pod
   that failed, succeeded or was deleted, answers kubectl's failure at once.
+- An exec runs its command once per egress request (the `ducktape-chain`,
+  `ducktape-program` and `ducktape-request` headers). A node that restarted
+  calls each request still open again, and that call waits for the command
+  already running, or answers what it answered once it ended, its exit code
+  included, streamed or whole. The service keeps that answer while egress
+  says the request is open, asking again whenever an exec starts or ends,
+  and forgets it once the request is gone. A restart of the service itself
+  forgets every answer and ends each open stream with nothing more: the
+  command goes on in the pod, but its answer is lost.
+- The `run` and `out` containers both mount `/out` and every input at its
+  path, so `out` reads, packs and pushes from an input after `run` ended.
 - `server.py fetch` tries a step again when it lost its connection (the
   clone, which starts again from an empty directory, a files read, a blob
   get), with the pause doubling from a second and no last attempt, for as

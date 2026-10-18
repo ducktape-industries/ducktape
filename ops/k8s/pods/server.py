@@ -248,6 +248,32 @@ def outcome(attempt):
         return Refused(500, f"the pods service failed: {error!r}")
 
 
+def exec_key(asked):
+    return asked["chain"], asked["program"], asked["request"]
+
+
+class Execution:
+    def __init__(self, asked):
+        self.asked = asked
+        self.ended = threading.Event()
+        self.result = None
+
+    def end(self, result):
+        self.result = result
+        self.ended.set()
+
+    def get(self, timeout=None):
+        if not self.ended.wait(timeout):
+            raise queue.Empty
+        return self.result
+
+
+def answered(result):
+    if isinstance(result, Refused):
+        raise result
+    return result
+
+
 def text_or_hex(data, field):
     try:
         return {field: data.decode()}
@@ -658,7 +684,7 @@ def pod_spec(asked, spec, fetching, namespace):
         "name": OUT,
         "image": fetching.image,
         "command": ["sleep", "infinity"],
-        "volumeMounts": [{"name": OUT, "mountPath": OUT_PATH}],
+        "volumeMounts": mounts,
         "securityContext": confined(),
     }
     body = {
@@ -1195,6 +1221,9 @@ class Service:
         self.api = api
         self.notifier = Notifier(kube, signer)
         self.pause = time.sleep
+        self.execs = {}
+        self.lock = threading.Lock()
+        self.swept = threading.Event()
 
     def pod(self, name):
         ran = self.kube.get(name)
@@ -1231,6 +1260,43 @@ class Service:
                 raise Refused(502, f"{why}; request {asked['request']}, which asked for this, is gone, so it was not tried again")
             self.pause(pause)
             pause *= 2
+
+    def execution(self, asked, name, container, command):
+        key = exec_key(asked)
+        with self.lock:
+            known = self.execs.get(key)
+            if known is not None:
+                return known
+            running = self.execs[key] = Execution(asked)
+
+        def run():
+            running.end(outcome(lambda: self.executed(asked, name, container, command)))
+            self.swept.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        self.swept.set()
+        return running
+
+    def sweep(self):
+        with self.lock:
+            ended = [(key, run) for key, run in self.execs.items() if run.ended.is_set()]
+        for key, run in ended:
+            try:
+                waits = self.waiting(run.asked)
+            except Refused:
+                continue
+            if not waits:
+                with self.lock:
+                    self.execs.pop(key, None)
+
+    def sweeper(self):
+        while True:
+            self.swept.wait()
+            self.swept.clear()
+            try:
+                self.sweep()
+            except Exception as error:
+                say("pods_sweep_failed", detail=json.dumps(repr(error)))
 
     def executed(self, asked, name, container, command, again=False):
         def attempt():
@@ -1353,19 +1419,15 @@ class Service:
         command = strings(asked.get("command", []), "command")
         container = asked.get("container")
         if "every" not in asked:
-            return 200, exec_answer(name, self.executed(asked_by, name, container, command))
+            return 200, exec_answer(name, answered(self.execution(asked_by, name, container, command).get()))
         every = from_one(asked["every"], "every")
         self.pod(name)
         return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
 
     def exec_waited(self, asked, name, container, command, every):
-        done = queue.Queue()
-        threading.Thread(target=lambda: done.put(outcome(lambda: self.executed(asked, name, container, command))), daemon=True).start()
-        ran = yield from Beat(every).heard(done)
+        ran = yield from Beat(every).heard(self.execution(asked, name, container, command))
         try:
-            if isinstance(ran, Refused):
-                raise ran
-            answer = "ended", exec_answer(name, ran)
+            answer = "ended", exec_answer(name, answered(ran))
         except Refused as refusal:
             answer = "refused", {"status": refusal.status, "error": refusal.sentence}
         yield sse(*answer)
@@ -1803,6 +1865,7 @@ def main():
     signer = Signer(shlex.split(os.environ.get("PODS_DUCKTAPE", "ducktape")), Path(os.environ.get("PODS_KEYS", "/keys")))
     service = Service(kube, signer, fetching, Stats(), Api())
     threading.Thread(target=service.notifier.watch, daemon=True).start()
+    threading.Thread(target=service.sweeper, daemon=True).start()
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), handler(service))
     signal.signal(signal.SIGTERM, exit_on_signal)
