@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs, exec, logs, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, posts when work ends, and usage.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs, exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, posts when work ends, and usage.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import copy
 import json
 import os
+import queue
 import re
 import secrets
 import shlex
@@ -58,10 +59,11 @@ FORGE = {"repo": str, "commit": str}
 FILES = {"path": str, "snapshot": str}
 BLOB = {"path": str, "kind": str, "container": str}
 FILE = {"path": str, "to": str, "message": str, "container": str}
-EXEC = {"command": list, "container": str}
+EXEC = {"command": list, "container": str, "every": int}
 APPLY = {"manifests": list, "requester": int}
 DELETE = {"kind": str, "name": str}
 LOGS = {"tail", "since", "container"}
+WAIT = {"every"}
 ALIASES = {
     "secrets": "secret",
     "ingresses": "ingress",
@@ -133,6 +135,11 @@ class Answered:
     status: int
     kind: str
     body: bytes
+
+
+@dataclass
+class Stream:
+    events: object
 
 
 def run(argv, stdin=None, env=None):
@@ -332,6 +339,10 @@ class Kube:
 
     def watch(self):
         argv = self.argv("get", "pods", "--selector", "=".join(MANAGED), "--watch", "--output-watch-events", "--output", "json")
+        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def watch_pod(self, name):
+        argv = self.argv("get", "pod", name, "--watch", "--output-watch-events", "--output", "json")
         return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -799,6 +810,78 @@ def ended_line(pod):
     return None
 
 
+def ended_event(pod):
+    line = ended_line(pod)
+    if line is None:
+        return None
+    ran = state_of(pod.get("status", {}).get("containerStatuses", []), RUN)
+    run_ended = ran is not None and ran["state"] == "terminated"
+    return {"line": line, "exit_code": ran["exit_code"] if run_ended else None, "pod": view(pod)}
+
+
+def watch_ended(name, event):
+    pod = event.get("object") or {}
+    match event.get("type"):
+        case "DELETED":
+            return ended_event(pod) or {"line": f"pod {name} was deleted", "exit_code": None, "pod": view(pod)}
+        case "ADDED" | "MODIFIED":
+            return ended_event(pod)
+        case _:
+            return None
+
+
+def from_one(value, field):
+    if value < 1:
+        raise Refused(400, f"{field} is a whole number of seconds from 1")
+    return value
+
+
+def wait_every(query):
+    unknown = sorted(set(query) - WAIT)
+    if unknown:
+        raise Refused(400, f"a wait takes no {', '.join(unknown)}; it takes every")
+    if "every" not in query:
+        raise Refused(400, "a wait names every: the seconds between the alive events that keep the caller's request from expiring")
+    value = query["every"][-1]
+    if not value.isdigit():
+        raise Refused(400, "every is a whole number of seconds from 1")
+    return from_one(int(value), "every")
+
+
+def sse(event, data):
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+class Beat:
+    def __init__(self, every):
+        self.every = every
+        self.due = time.monotonic() + every
+
+    def heard(self, events):
+        while True:
+            try:
+                return events.get(timeout=max(self.due - time.monotonic(), 0))
+            except queue.Empty:
+                self.due += self.every
+                yield sse("alive", {})
+
+
+def relay(process, events):
+    with process.stdout:
+        for event in json_stream(process.stdout):
+            events.put(("event", event))
+    events.put(("closed", process.wait()))
+
+
+def exec_answer(name, ran):
+    reached = re.search(r"command terminated with exit code (\d+)", ran.err)
+    server_refused = ran.code != 0 and reached is None and "Error from server" in ran.err
+    if server_refused:
+        raise kube_refusal(ran, f"pod {name} was not reached")
+    stderr = re.sub(r"\n?command terminated with exit code \d+\s*$", "", ran.err)
+    return {"exit_code": ran.code, **text_or_hex(ran.out, "stdout"), **text_or_hex(stderr.encode(), "stderr")}
+
+
 def log_options(query):
     unknown = sorted(set(query) - LOGS)
     if unknown:
@@ -1020,6 +1103,42 @@ class Service:
             raise kube_refusal(ran, f"pod {name}'s logs were not read")
         return 200, ran.out
 
+    def wait(self, name, query):
+        every = wait_every(query)
+        return 200, Stream(self.waited(name, self.pod(name), every))
+
+    def waited(self, name, pod, every):
+        ended = ended_event(pod)
+        beat = Beat(every)
+        process = None
+        try:
+            while ended is None:
+                if process is None:
+                    process, events = self.kube.watch_pod(name), queue.Queue()
+                    threading.Thread(target=relay, args=(process, events), daemon=True).start()
+                kind, item = yield from beat.heard(events)
+                match kind:
+                    case "event":
+                        ended = watch_ended(name, item)
+                    case "closed":
+                        process = None
+                        ended = self.reread(name, item)
+        finally:
+            if process is not None:
+                process.kill()
+        yield sse("ended", ended)
+
+    def reread(self, name, code):
+        if code != 0:
+            time.sleep(WATCH_PAUSE)
+        ran = self.kube.get(name)
+        gone = ran.code != 0 and "(NotFound)" in ran.err
+        if gone:
+            return {"line": f"pod {name} is gone", "exit_code": None, "pod": None}
+        if ran.code != 0:
+            return None
+        return ended_event(json.loads(ran.out))
+
     def delete(self, name):
         ran = self.kube.delete(name)
         if ran.code != 0:
@@ -1029,13 +1148,22 @@ class Service:
     def exec(self, name, body):
         asked = checked(body, EXEC, "an exec")
         command = strings(asked.get("command", []), "command")
-        ran = self.kube.exec(name, asked.get("container"), command)
-        reached = re.search(r"command terminated with exit code (\d+)", ran.err)
-        server_refused = ran.code != 0 and reached is None and "Error from server" in ran.err
-        if server_refused:
-            raise kube_refusal(ran, f"pod {name} was not reached")
-        stderr = re.sub(r"\n?command terminated with exit code \d+\s*$", "", ran.err)
-        return 200, {"exit_code": ran.code, **text_or_hex(ran.out, "stdout"), **text_or_hex(stderr.encode(), "stderr")}
+        container = asked.get("container")
+        if "every" not in asked:
+            return 200, exec_answer(name, self.kube.exec(name, container, command))
+        every = from_one(asked["every"], "every")
+        self.pod(name)
+        return 200, Stream(self.exec_waited(name, container, command, every))
+
+    def exec_waited(self, name, container, command, every):
+        done = queue.Queue()
+        threading.Thread(target=lambda: done.put(self.kube.exec(name, container, command)), daemon=True).start()
+        ran = yield from Beat(every).heard(done)
+        try:
+            answer = "ended", exec_answer(name, ran)
+        except Refused as refusal:
+            answer = "refused", {"status": refusal.status, "error": refusal.sentence}
+        yield sse(*answer)
 
     def blob(self, name, body):
         asked = named(checked(body, BLOB, "a blob"), ["path", "kind"], "a blob")
@@ -1195,6 +1323,8 @@ class Service:
                 return self.status(name)
             case ("GET", "pods", name, "logs"):
                 return self.logs(name, query)
+            case ("GET", "pods", name, "wait"):
+                return self.wait(name, query)
             case ("POST", "pods", name, "exec"):
                 return self.exec(name, parsed(body))
             case ("POST", "pods", name, "blob"):
@@ -1238,6 +1368,9 @@ def handler(service):
                 status, answer = service.answer(method, self.path, headers, body)
             except Refused as refusal:
                 status, answer = refusal.status, {"error": refusal.sentence}
+            if isinstance(answer, Stream):
+                self.stream(status, answer.events)
+                return
             match answer:
                 case Answered(kind=kind, body=payload):
                     pass
@@ -1250,6 +1383,22 @@ def handler(service):
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def stream(self, status, events):
+            self.send_response(status)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("connection", "close")
+            self.end_headers()
+            try:
+                for event in events:
+                    self.wfile.write(event)
+                    self.wfile.flush()
+            except OSError:
+                say("pods_stream_unheard", reason="caller_gone")
+            finally:
+                events.close()
+                self.close_connection = True
 
         def do_GET(self):
             self.respond("GET")

@@ -78,7 +78,7 @@ scripts back a `make` target; see the repository `Makefile`.
 - `k8s/pods/server.py` is the service, and `server.py fetch` the init
   container that fetches a pod's inputs. Its routes, under `/v1`: `pods`
   (create, list), `pods/NAME` (status, delete), `pods/NAME/logs`,
-  `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `manifests` (apply,
+  `pods/NAME/wait`, `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `manifests` (apply,
   delete), `manifests/KIND[/NAME]`, `usage`, and `k8s/PATH`, which passes a
   Kubernetes API call through when PATH is inside namespace `agents`
   (`api/v1/namespaces/agents/...`, `apis/GROUP/VERSION/namespaces/agents/...`)
@@ -86,6 +86,16 @@ scripts back a `make` target; see the repository `Makefile`.
   replaces as `manifests` does, and sends a PATCH first as a dry run, checks
   the object it would store, and only then sends it. `server-test.py` covers
   them.
+- `pods/NAME/wait?every=SECONDS` and an exec that names `every` answer
+  `text/event-stream`, which a network hears event by event
+  (`Delivery::Events`): an `alive` event each `every` seconds, which moves
+  the caller's egress expiry on, then one `ended` event and the end of the
+  stream. A wait ends when the pod's run container ends, the pod fails or is
+  deleted, with `{line, exit_code, pod}`; an exec ends with its whole
+  answer, or `refused` with `{status, error}` when the cluster refused it.
+  So a build that outlives a request's `wait` still answers. `every` is the
+  caller's: only it knows its request's `wait` and the time an event takes
+  to reach its chain. A pod that is not there is refused before any stream.
 - A pod's inputs and `/out` are generic ephemeral volumes of storage class
   `local-path`, so they sit on the disk that holds the cluster's
   PersistentVolumes, not on the node's root filesystem. Kubernetes creates

@@ -4,6 +4,7 @@ import http.client
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import tempfile
 import threading
@@ -23,6 +24,7 @@ SNAPSHOT = "sha256:" + "ab" * 32
 CHUNKS = ["sha256:" + "01" * 32, "sha256:" + "02" * 32, "sha256:" + "03" * 32]
 NOTIFY = {"ducktape.industries/notify-channel": "builds"}
 ENDED = {"terminated": {"exitCode": 0, "reason": "Completed", "startedAt": "s", "finishedAt": "f"}}
+RUNNING = {"running": {"startedAt": "s"}}
 POSTED = bytes.fromhex(
     "04060000006275696c647316000000706f64732d6475636b706f6e642d34312d656e646564010000000002000000050000003c4031"
     "373e01000000030011000000000000002f00000020706f64206475636b706f6e642d343120656e6465643a206578697420636f6465"
@@ -67,6 +69,8 @@ class Kube:
     def __init__(self):
         self.calls = []
         self.answers = {}
+        self.watches = []
+        self.gate = None
 
     def answer(self, verb, *answers):
         self.answers[verb] = list(answers)
@@ -97,6 +101,8 @@ class Kube:
         return self.ran("delete", name)
 
     def exec(self, name, container, command):
+        if self.gate is not None:
+            self.gate.wait()
         return self.ran("exec", name, container, command)
 
     def annotate(self, name, key, value):
@@ -122,6 +128,33 @@ class Kube:
 
     def cluster_kinds(self):
         return self.ran("cluster_kinds")
+
+    def watch_pod(self, name):
+        self.calls.append(("watch_pod", name))
+        return self.watches.pop(0)
+
+
+class Watch:
+    def __init__(self, code=0):
+        read, self.end = os.pipe()
+        self.stdout = os.fdopen(read, "rb")
+        self.code = code
+        self.killed = False
+
+    def send(self, kind, pod):
+        os.write(self.end, json.dumps({"type": kind, "object": pod}).encode())
+
+    def close(self):
+        os.close(self.end)
+        self.end = None
+
+    def wait(self):
+        return self.code
+
+    def kill(self):
+        self.killed = True
+        if self.end is not None:
+            self.close()
 
 
 class Signer:
@@ -206,6 +239,125 @@ class Served(unittest.TestCase):
         for word in words:
             self.assertIn(word, answer["error"])
         return answer
+
+
+class Streamed(Served):
+    def stream(self, path, method="GET", body=None):
+        connection = http.client.HTTPConnection(*self.http.server_address)
+        self.addCleanup(connection.close)
+        connection.request(method, path, body=None if body is None else json.dumps(body).encode(), headers=ASKED)
+        return connection.getresponse()
+
+    def event(self, response):
+        lines = []
+        while (line := response.readline()) not in (b"\n", b""):
+            lines.append(line.decode().rstrip("\n"))
+        fields = dict(line.split(": ", 1) for line in lines)
+        return fields["event"], json.loads(fields["data"])
+
+    def past_alive(self, response):
+        while (heard := self.event(response))[0] == "alive":
+            pass
+        return heard
+
+
+class Wait(Streamed):
+    def test_a_wait_on_an_ended_pod_answers_ended_at_once(self):
+        self.kube.answer("get", ran(pod_json(state=ENDED, phase="Succeeded")))
+        response = self.stream("/v1/pods/duckpond-41/wait?every=30")
+        self.assertEqual((response.status, response.getheader("content-type")), (200, "text/event-stream"))
+        kind, data = self.event(response)
+        self.assertEqual((kind, data["exit_code"], data["line"]), ("ended", 0, "pod duckpond-41 ended: exit code 0 (Completed)"))
+        self.assertEqual(data["pod"]["name"], "duckpond-41")
+        self.assertEqual(response.read(), b"")
+        self.assertNotIn("watch_pod", self.kube.verbs())
+
+    def test_a_wait_names_every_in_whole_seconds_from_one(self):
+        for query, words in (("", "names every"), ("?every=0", "from 1"), ("?every=1.5", "whole number"), ("?every=5&tail=3", "no tail")):
+            self.refused("GET", f"/v1/pods/duckpond-41/wait{query}", None, 400, [words])
+        self.assertNotIn("get", self.kube.verbs())
+
+    def test_a_wait_on_no_pod_is_refused_before_any_stream(self):
+        self.kube.answer("get", ran(code=1, err=NOT_FOUND))
+        self.refused("GET", "/v1/pods/duckpond-9/wait?every=5", None, 404, ["duckpond-9"])
+
+    def test_a_running_pod_is_alive_each_every_until_its_run_container_ends(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        watch = Watch()
+        self.kube.watches.append(watch)
+        watch.send("ADDED", pod_json(state=RUNNING, phase="Running"))
+        response = self.stream("/v1/pods/duckpond-41/wait?every=1")
+        self.assertEqual(self.event(response), ("alive", {}))
+        watch.send("MODIFIED", pod_json(state=ENDED, phase="Succeeded"))
+        kind, data = self.past_alive(response)
+        self.assertEqual((kind, data["exit_code"]), ("ended", 0))
+        self.assertEqual(response.read(), b"")
+        self.assertTrue(watch.killed)
+
+    def test_a_deleted_pod_ends_the_wait_with_a_line_saying_so(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        watch = Watch()
+        self.kube.watches.append(watch)
+        watch.send("DELETED", pod_json(state=RUNNING, phase="Running"))
+        kind, data = self.event(self.stream("/v1/pods/duckpond-41/wait?every=30"))
+        self.assertEqual((kind, data["line"], data["exit_code"]), ("ended", "pod duckpond-41 was deleted", None))
+
+    def test_a_watch_that_ends_reads_the_pod_again_and_watches_on(self):
+        running = ran(pod_json(state=RUNNING, phase="Running"))
+        self.kube.answer("get", running, running, ran(pod_json(state=ENDED, phase="Succeeded")))
+        first, second = Watch(), Watch()
+        first.close()
+        second.close()
+        self.kube.watches += [first, second]
+        kind, data = self.event(self.stream("/v1/pods/duckpond-41/wait?every=30"))
+        self.assertEqual((kind, data["exit_code"]), ("ended", 0))
+        self.assertEqual(self.kube.verbs().count("watch_pod"), 2)
+
+    def test_a_pod_gone_between_watches_ends_the_wait(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")), ran(code=1, err=NOT_FOUND))
+        watch = Watch()
+        watch.close()
+        self.kube.watches.append(watch)
+        kind, data = self.event(self.stream("/v1/pods/duckpond-9/wait?every=30"))
+        self.assertEqual((kind, data["line"], data["pod"]), ("ended", "pod duckpond-9 is gone", None))
+
+
+class StreamedExec(Streamed):
+    def test_an_exec_with_every_is_alive_each_every_until_its_command_ends(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        self.kube.answer("exec", ran(b"built\n"))
+        self.kube.gate = threading.Event()
+        response = self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"], "every": 1})
+        self.assertEqual((response.status, response.getheader("content-type")), (200, "text/event-stream"))
+        self.assertEqual(self.event(response), ("alive", {}))
+        self.kube.gate.set()
+        self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
+        self.assertEqual(response.read(), b"")
+        self.assertEqual(self.kube.calls[-1], ("exec", "duckpond-41", None, ["make"]))
+
+    def test_an_exec_without_every_still_answers_whole(self):
+        self.kube.answer("exec", ran(b"built\n"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})
+        self.assertEqual((status, answer), (200, {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
+        self.assertNotIn("get", self.kube.verbs())
+
+    def test_a_streamed_exec_on_no_pod_is_refused_before_any_stream(self):
+        self.kube.answer("get", ran(code=1, err=NOT_FOUND))
+        self.refused("POST", "/v1/pods/duckpond-9/exec", {"command": ["make"], "every": 5}, 404, ["duckpond-9"])
+        self.assertNotIn("exec", self.kube.verbs())
+
+    def test_a_streamed_exec_names_every_in_whole_seconds_from_one(self):
+        for every, words in ((0, "from 1"), ("5", "JSON int"), (True, "JSON int")):
+            self.refused("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"], "every": every}, 400, [words])
+        self.assertNotIn("exec", self.kube.verbs())
+
+    def test_a_streamed_exec_the_cluster_refuses_ends_with_the_refusal(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        self.kube.answer("exec", ran(code=1, err='Error from server (BadRequest): container "nope" is not valid for pod "duckpond-41"'))
+        body = {"command": ["make"], "container": "nope", "every": 30}
+        kind, data = self.event(self.stream("/v1/pods/duckpond-41/exec", "POST", body))
+        self.assertEqual((kind, data["status"]), ("refused", 400))
+        self.assertIn("is not valid", data["error"])
 
 
 class Create(Served):
