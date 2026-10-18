@@ -92,13 +92,11 @@ under `ops/`.
   on `dev`, and high-confidence reviewed PRs merge into `dev`. `main` advances
   only by an explicit, user-requested release of `dev`.
 - `dev` and `main` live on GitHub and on duckpond's forge (this repo is
-  forge's `core`), and forge-sync keeps each pair the same (`ops/README.md`
-  § Forge and GitHub in step). Accepted work merges into `dev` on either
-  side: duckpond's agents merge on forge's `dev` (a fast-forward push or a
-  forge change's merge), and humans and operator workers may merge PRs on
-  GitHub. When both sides moved at once and diverged, forge wins: GitHub's
-  branch is reset to forge's, and the dropped commits are posted in
-  duckpond's #sync.
+  forge's `core`; `ops/README.md` § Forge and GitHub). Accepted work merges
+  into `dev` on GitHub, and `.github/workflows/forge-sync.yml` carries each
+  push to forge's `dev` without force. Never push forge's `dev` or `main`
+  directly: forge-sync.yml refuses a forge branch that holds a commit GitHub
+  lacks.
 - A program reaches a hosted network (duckpond) as a build of a commit on
   that network's forge, on the repo's `dev`, which holds only merged work.
   Two builders make it: the network's pods service, or eddy-claude (account

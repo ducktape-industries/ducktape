@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Builds the forge-mirror image around mirror.py and the pinned git-remote-duck, pushes it to the cluster node's registry, and applies forge-mirror.yaml.
+# Usage: ops/k8s/forge-mirror/deploy; the Secret forge-mirror/github-app (app_id, installation_id, private_key) is created apart from it.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+node=${DEPLOY_NODE:-fabrics@fabrics-1}
+context=${DEPLOY_CONTEXT:-fabrics-1}
+duck_release=git-remote-duck-7acf453
+duck_sha256=c03d7b0d02327af0a1d8eef2d80e778ec8a67850aa42dd2b43022f85269b5b75
+tunnel_port=35313
+
+stage=$(mktemp -d)
+socket="$stage.ssh"
+trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
+curl -fsSL -o "$stage/git-remote-duck" \
+  "https://github.com/ducktape-industries/ducktape/releases/download/$duck_release/git-remote-duck-x86_64-unknown-linux-gnu"
+echo "$duck_sha256  $stage/git-remote-duck" | sha256sum --check --quiet
+chmod +x "$stage/git-remote-duck"
+cp "$here/mirror.py" "$stage/mirror.py"
+tag=$(cat "$here/Containerfile" "$stage/mirror.py" <(echo "$duck_release") | sha256sum | cut -c1-12)
+podman build --file "$here/Containerfile" --tag "localhost:$tunnel_port/forge-mirror:$tag" "$stage"
+ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
+podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/forge-mirror:$tag"
+image="localhost:5000/forge-mirror:$tag@$(cat "$stage/digest")"
+sed -e "s#@IMAGE@#$image#g" "$here/forge-mirror.yaml" | kubectl --context "$context" apply -f -
+kubectl --context "$context" -n forge-mirror get pods
+echo "$image"

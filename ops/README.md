@@ -84,42 +84,36 @@ scripts back a `make` target; see the repository `Makefile`.
   agents build ducktape, programs and the app with, pushes it to the
   cluster node's registry and prints its reference.
 
-## Forge and GitHub in step
+## Forge and GitHub
 
-- dev and main of ducktape, programs and app exist on GitHub and on
-  duckpond's forge (repositories `core`, `programs`, `app`). Each repo's
-  `.github/workflows/forge-sync.yml` moves forge's branch to a GitHub push;
-  `forge-sync/follower.py` moves GitHub's branch to a forge push.
-- The follower runs on orthorymain as the systemd user unit
-  `forge-sync.service`, so the forge-to-GitHub half works only while
-  orthorymain is up. It pushes over SSH with orthory's own key, so its pushes
-  act with orthory's GitHub rights: as an admin it passes dev's required
-  `unit` check, and the branch rules of dev in the three repos and of app's
-  main let orthory alone force-push.
-- The follower follows duckpond's writes to forge and to chat
-  (`/v1/changes/forge`, `/v1/changes/chat` at
-  https://duckpond.ducktape.industries). A block that moves a followed forge
-  branch starts one job for that branch; a post in chat channel `sync` starts
-  one for every branch, and so does a start. When the tunnel closes an idle
-  follow, the follower follows again and syncs what moved meanwhile.
-- A job reads GitHub's head. GitHub behind is pushed forge's head; GitHub
-  equal or ahead is left; diverged, forge wins: GitHub's branch is pushed
-  forge's head with a lease on the head just read, and the follower posts one
-  line in #sync naming the old head, the new one and every dropped commit. A
-  job whose push loses a race with a GitHub push runs again. A job that fails
-  otherwise posts its reason in #sync once and runs again at the next forge
-  push or #sync post.
-- `forge-sync.yml` changes nothing when forge already holds the push or has
-  moved past it; when the two have diverged it posts in #sync, which starts
-  the follower's jobs. A push by either side leaves the pair equal, so the
-  other side's run does nothing.
-- `forge-sync/install.sh COMMIT` installs `follower.py`, the ducktape CLI
-  release `bin-COMMIT` carries and git-remote-duck under
-  `~/.local/share/forge-sync`, and the unit, and starts it. Its state is
-  `~/.local/state/forge-sync`: the git mirrors, the journal of resets not yet
-  posted, and `keys/key` and `keys/password`, account 22's sealed
-  "forge-sync follower" key that signs its #sync posts (mode 600).
-  `forge-sync/follower-test.py` covers the follower.
+- dev and main of ducktape, programs and app live on duckpond's forge
+  (repositories `core`, `programs`, `app`) and on GitHub. Each repo's
+  `.github/workflows/forge-sync.yml` moves forge's branch to a GitHub push.
+- `k8s/forge-mirror/mirror.py` is forge-mirror, which carries the other
+  direction. It follows duckpond's forge writes over `/v1/changes/forge`. A
+  block that moves a followed forge branch starts one job for that branch, and
+  so does a start. A job pushes forge's head to GitHub's branch of the same
+  name with `--force-with-lease` on the GitHub head it just read, so forge
+  always wins; a push that drops GitHub commits logs them as `reset`. A push
+  that loses a race with another GitHub push runs again. A job that fails
+  otherwise runs again at each later block that writes forge or the clock
+  program (`FORGE_MIRROR_CLOCK`, `scheduler`), and logs its first attempt and
+  every tenth with an `attempts` field. `k8s/forge-mirror/mirror-test.py`
+  covers it.
+- forge-mirror pushes over HTTPS as the GitHub App "ducktape forge-mirror",
+  with an installation token it mints from the App's key. The Secret
+  `forge-mirror/github-app` holds `app_id`, `installation_id` and
+  `private_key`, nothing else.
+- `k8s/forge-mirror/deploy` builds the forge-mirror image around `mirror.py`
+  and the pinned git-remote-duck, pushes it to the cluster node's registry, and
+  applies `forge-mirror.yaml`: namespace `forge-mirror`, its state claim, a
+  policy closing every inbound port, and Deployment `forge-mirror`. Create the
+  Secret apart from it:
+  `kubectl -n forge-mirror create secret generic github-app --from-literal=app_id=APP_ID --from-literal=installation_id=INSTALLATION_ID --from-file=private_key=APP.pem`.
+- `k8s/forge-mirror/protect APP_ID [--apply]` puts one ruleset on dev and
+  main of each repository that blocks update, force push and deletion for
+  everyone but the App, and deletes the classic protection it replaces.
+  Without `--apply` it prints both.
 
 ## Worktrees
 
