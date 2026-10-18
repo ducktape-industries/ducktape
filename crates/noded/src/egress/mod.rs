@@ -9,11 +9,11 @@ mod stream;
 use std::sync::Arc;
 
 use abi::role::egress::{Answer, Op, Query, Reply, RequestRow};
-use abi::{BlobId, Origin, ProgramId, reason, role};
+use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::Layer;
+use host::{Layer, Tip};
 use node::{Frame, Node, Preconfirm, Source, Taken};
 
 pub use config::{Config, Refused};
@@ -91,7 +91,11 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
                 let Bound::To(role) = &bound else {
                     continue;
                 };
-                if let Some(step) = desk.called(id, called) {
+                desk.called(id, called);
+                while let Ok((id, called)) = answered.try_recv() {
+                    desk.called(id, called);
+                }
+                for step in desk.launch() {
                     worker.execute(&mut desk, step, role).await;
                 }
             }
@@ -274,32 +278,46 @@ impl<E: Context> Worker<E> {
     }
 
     async fn send(&self, desk: &mut Desk, purpose: Purpose, role: &ProgramId) -> Option<Step> {
-        let frame = match desk.frame(&purpose) {
-            Some(frame) => frame.to_vec(),
-            None => {
-                let op = desk.op(&purpose)?;
-                match self.sign(&op, role).await {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: TARGET,
-                            event = "egress_unsigned",
-                            ?purpose,
-                            reason = "tip_unread",
-                            %error,
-                            "the egress worker could not anchor a frame; it tries again next block"
-                        );
-                        return None;
-                    }
-                }
-            }
+        let unsent = match desk.frame(&purpose) {
+            Some(frame) => Unsent::Signed(frame.to_vec()),
+            None => Unsent::Op(desk.op(&purpose)?),
         };
-        let sent = self.submit(frame).await;
+        let asked = self.daemon.context.current();
+        let mut node = self.daemon.node.lock().await;
+        let waited = self
+            .daemon
+            .context
+            .current()
+            .duration_since(asked)
+            .unwrap_or_default();
+        let frame = match unsent {
+            Unsent::Signed(frame) => frame,
+            Unsent::Op(op) => match node.tip() {
+                Ok(tip) => self.sign(tip, &op, role),
+                Err(error) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        event = "egress_unsigned",
+                        ?purpose,
+                        reason = "tip_unread",
+                        %error,
+                        "the egress worker could not anchor a frame; it tries again next block"
+                    );
+                    return None;
+                }
+            },
+        };
+        let taken = node
+            .submit(frame.clone(), Source::Client, Preconfirm::Off)
+            .await;
+        drop(node);
+        let sent = self.taken(taken, frame);
         tracing::trace!(
             target: TARGET,
             event = "egress_submitted",
             ?purpose,
             sent = sent.kind(),
+            waited_ms = waited.as_millis() as u64,
         );
         if let Sent::Refused(refusal) = &sent {
             tracing::warn!(
@@ -314,25 +332,23 @@ impl<E: Context> Worker<E> {
         desk.sent(&purpose, sent)
     }
 
-    async fn sign(&self, op: &Op, role: &ProgramId) -> Result<Vec<u8>> {
-        let tip = self.daemon.node.lock().await.tip()?;
-        let frame = Frame::sign(
+    fn sign(&self, anchor: Tip, op: &Op, role: &ProgramId) -> Vec<u8> {
+        Frame::sign(
             &self.daemon.key,
             &self.daemon.descriptor.id(),
-            tip,
+            anchor,
             None,
             role,
             abi::encode(op),
-        );
-        Ok(frame.encode())
+        )
+        .encode()
     }
 
-    async fn submit(&self, frame: Vec<u8>) -> Sent {
-        let mut node = self.daemon.node.lock().await;
-        let taken = node
-            .submit(frame.clone(), Source::Client, Preconfirm::Off)
-            .await;
-        drop(node);
+    fn taken(
+        &self,
+        taken: node::Result<std::result::Result<Taken, Refusal>>,
+        frame: Vec<u8>,
+    ) -> Sent {
         match taken {
             Ok(Ok(Taken::New(_))) => {
                 self.daemon.relay.send([frame.as_slice()]);
@@ -350,12 +366,17 @@ impl<E: Context> Worker<E> {
                     event = "egress_unsubmitted",
                     reason = "node_failed",
                     %error,
-                    "the node failed to take an egress frame; it is signed again next block"
+                    "the node failed to take an egress frame; it is sent again next block"
                 );
-                Sent::Stale
+                Sent::Untaken
             }
         }
     }
+}
+
+enum Unsent {
+    Signed(Vec<u8>),
+    Op(Op),
 }
 
 async fn body<E: Context>(

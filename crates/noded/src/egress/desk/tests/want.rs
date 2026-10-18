@@ -55,12 +55,7 @@ fn a_request_in_flight_keeps_its_call_across_a_new_wanted_set() {
     );
     desk.want(Vec::new());
     let answer = Answer::Output(b"pong".to_vec());
-    assert_eq!(
-        desk.called(1, Called::Whole(answer.clone())),
-        Some(Step::Send(Purpose::Request(1)))
-    );
-    assert_eq!(
-        desk.op(&Purpose::Request(1)),
-        Some(Op::Answer { id: 1, answer })
-    );
+    desk.called(1, Called::Whole(answer.clone()));
+    assert_eq!(desk.launch(), [Step::Send(flight(1, 0))]);
+    assert_eq!(desk.op(&flight(1, 0)), Some(Op::Answer { id: 1, answer }));
 }
