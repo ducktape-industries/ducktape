@@ -104,7 +104,7 @@ under `ops/`.
   branch and keeps every branch pushed to it, so when `dev` has moved and the
   branch no longer merges cleanly, rebase it onto `forge/dev`, push it as a
   new branch and open a new change.
-- Duckpond's agents open and merge changes with their harness tools. Operator
+- Duckpond's agents open changes with their harness tools. Operator
   workers use `forge-change.sh` in the operator workspace
   (`/mnt/data/code/qa/.local/duckpond/operator`), run from the worktree:
   `forge-change.sh open core SLUG TITLE BODY_FILE` pushes HEAD as
@@ -112,8 +112,12 @@ under `ops/`.
   the squash commit's subject and body; `forge-change.sh merge core N`
   builds the squash commit on the current `dev`, publishes it as
   `operator/SLUG-merge`, merges change N and waits until forge confirms the
-  merge. A change is merged by its author or by the repository's owner, never
-  by anyone else.
+  merge.
+- Who merges a change: a change from duckpond's agents is reviewed and
+  merged only by chief (account 17), and tech workers never merge one.
+  Operator workers merge their own changes. eddy (account 18) merges his own
+  changes, and the changes brought over from his GitHub pull requests are his
+  to land; chief merges one of them only if eddy agrees.
 - `main` moves only on an explicit, user-requested release of `dev`: a forge
   change from `dev` into `main`.
 - A checkout reaches forge through a remote `forge`, with git-remote-duck
