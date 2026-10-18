@@ -9,12 +9,12 @@ fn ms(millis: u64) -> Option<Duration> {
 #[test]
 fn the_defaults_are_multiples_of_the_block_time() {
     let cadence = Cadence::new(BLOCK, Timeouts::default()).unwrap();
-    assert_eq!(cadence.leader_timeout(), Duration::from_millis(5_000));
+    assert_eq!(cadence.leader_timeout(), Duration::from_millis(250));
     assert_eq!(
         cadence.certification_timeout(),
         Duration::from_millis(7_500)
     );
-    assert_eq!(cadence.timeout_retry(), Duration::from_millis(2_500));
+    assert_eq!(cadence.timeout_retry(), Duration::from_millis(500));
     assert_eq!(cadence.skip_timeout(), Duration::from_millis(7_750));
     assert_eq!(cadence.fetch_timeout(), BLOCK);
 }
@@ -40,16 +40,16 @@ fn skip_and_fetch_follow_the_configured_timeouts() {
 #[test]
 fn an_unset_timeout_keeps_its_default() {
     let timeouts = Timeouts {
-        leader: ms(1_000),
+        leader: ms(400),
         ..Timeouts::default()
     };
     let cadence = Cadence::new(BLOCK, timeouts).unwrap();
-    assert_eq!(cadence.leader_timeout(), Duration::from_millis(1_000));
+    assert_eq!(cadence.leader_timeout(), Duration::from_millis(400));
     assert_eq!(
         cadence.certification_timeout(),
         Duration::from_millis(7_500)
     );
-    assert_eq!(cadence.timeout_retry(), Duration::from_millis(2_500));
+    assert_eq!(cadence.timeout_retry(), Duration::from_millis(500));
 }
 
 #[test]

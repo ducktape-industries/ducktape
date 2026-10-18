@@ -374,9 +374,9 @@ live_lane_per_sender = 256    # --live-lane-per-sender
 live_linger_ms = 5000         # --live-linger-ms
 
 [consensus]
-leader_timeout_ms = 5000          # --leader-timeout-ms; default 20 block times
-certification_timeout_ms = 7500   # --certification-timeout-ms; default 30 block times
-timeout_retry_ms = 2500           # --timeout-retry-ms; default 10 block times
+leader_timeout_ms = 1000          # --leader-timeout-ms; default one block time
+certification_timeout_ms = 30000  # --certification-timeout-ms; default 30 block times
+timeout_retry_ms = 2000           # --timeout-retry-ms; default 2 block times
 ```
 
 The top level says where the node is reached and what it logs. `[load]`
@@ -395,13 +395,13 @@ fetch after one block time. `ducktape run` refuses to start unless the leader
 timeout is above zero, the certification timeout exceeds the leader timeout,
 and the retry interval is above zero and below the skip timeout.
 
-The leader timeout also bounds how long a silent peer link lives. A link
-that carries nothing for one leader timeout is dropped and dialed again, and
-the node pings each peer every quarter of its leader timeout so a healthy
-link is never silent that long. A peer reads one ping per eighth of its own
-leader timeout and waits out faster ones, so keep every node's leader timeout
-within a factor of two of the others'. The node's `node_started` log event
-carries the effective timeouts, the link timeout and the ping interval.
+A peer link is dropped and dialed again after twenty block times in which
+no bytes move on it. A message that is still arriving keeps its link alive
+however long it takes, so a large block on a slow link is never cut off. The
+node pings each peer every five block times, so a healthy idle link is never
+silent that long. Both follow the network's block time, not the consensus
+timeouts, so every node uses the same values. The node's `node_started` log
+event carries the effective timeouts, the link timeout and the ping interval.
 
 ## Reach a node
 

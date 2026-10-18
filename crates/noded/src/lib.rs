@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod egress;
 mod endpoint;
+mod link;
 pub mod live;
 mod logs;
 mod mesh;

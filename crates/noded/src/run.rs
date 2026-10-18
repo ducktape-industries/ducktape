@@ -14,7 +14,7 @@ use blob::contract::{BUNDLES, Bundle};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
-use commonware_p2p::authenticated::lookup::{Oracle, Receiver, Sender};
+use commonware_p2p::authenticated::lookup::{Oracle, Receiver};
 use commonware_runtime::Handle;
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
@@ -31,7 +31,7 @@ use tokio::sync::watch;
 
 use crate::endpoint::Endpoint;
 use crate::live;
-use crate::mesh::{Mesh, Tracker};
+use crate::mesh::{Mesh, Outbound, Tracker};
 use crate::relay::{self, Relay};
 use crate::transport;
 use crate::workspace::{Descriptor, Founding, Workspace};
@@ -39,8 +39,7 @@ use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Delivery = (Arc<Block>, Exact);
-type Seating<E> =
-    Membership<E, Sender<PublicKey, E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant>;
+type Seating<E> = Membership<E, Outbound<E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Listen {

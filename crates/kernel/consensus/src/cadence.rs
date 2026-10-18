@@ -38,9 +38,9 @@ impl Cadence {
     pub fn new(block_time: Duration, timeouts: Timeouts) -> Result<Cadence, CadenceError> {
         let cadence = Cadence {
             block_time,
-            leader_timeout: timeouts.leader.unwrap_or(block_time * 20),
+            leader_timeout: timeouts.leader.unwrap_or(block_time),
             certification_timeout: timeouts.certification.unwrap_or(block_time * 30),
-            timeout_retry: timeouts.retry.unwrap_or(block_time * 10),
+            timeout_retry: timeouts.retry.unwrap_or(block_time * 2),
         };
         cadence.validated()
     }

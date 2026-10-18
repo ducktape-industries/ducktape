@@ -17,6 +17,7 @@ commonware-runtime = { workspace = true }
 commonware-utils = { workspace = true }
 consensus = { workspace = true }
 futures = { workspace = true }
+governor = { workspace = true }
 halo = { workspace = true }
 hex = "0.4"
 keyscheme = { workspace = true }
