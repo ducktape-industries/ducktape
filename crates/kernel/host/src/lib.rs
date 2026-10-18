@@ -12,7 +12,7 @@ pub use abi::Roles;
 use abi::{
     BlobId, Cause, Env, HashKind, Invocation, ItemRef, Message, Origin, Outcome, Principal,
     ProgramCall, ProgramId, Receipt, Refusal, Root, Scan, hook, reason,
-    role::{self, access, identity, programs, validators},
+    role::{self, access, identity, ownership, programs, validators},
 };
 use blob::{Blobs, Layered, Stage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -1352,6 +1352,7 @@ where
             resumes,
             deferred,
             parked,
+            ..
         } = effects;
         let quiet = emitted.is_empty()
             && calls.is_empty()
@@ -1394,7 +1395,17 @@ where
             resumes,
             deferred,
             parked,
+            writes,
         } = effects;
+        let guarded = self
+            .guard(program, env, writes, overlay, stage, frame)
+            .await?;
+        if let Err(refusal) = guarded {
+            overlay.restore(checkpoint);
+            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+            receipt.outcome = Outcome::Rejected(refusal);
+            return Ok(Segment::finished(receipt));
+        }
         let refused = self
             .deliver(
                 program,
@@ -1432,6 +1443,57 @@ where
             deferred,
             parked,
         })
+    }
+
+    /// Asks the ownership role whether the run `program` just made stands,
+    /// given the owned keys it wrote: one call however many there are, made
+    /// once the run has returned and before anything it emitted is
+    /// delivered. The call says who acted and what each key was before and
+    /// after; the role decides, and its refusal undoes the run. A run that
+    /// wrote no owned key makes no call, and a network that binds no
+    /// ownership role guards nothing.
+    async fn guard(
+        &self,
+        program: &str,
+        env: &Env,
+        writes: Vec<ownership::Write>,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+        frame: &mut Frame,
+    ) -> Result<std::result::Result<(), Refusal>> {
+        if writes.is_empty() {
+            return Ok(Ok(()));
+        }
+        let Some(guardian) = self.roles.get(role::OWNERSHIP).cloned() else {
+            return Ok(Ok(()));
+        };
+        let guard = ownership::Op::Guard(ownership::Guard {
+            program: program.to_owned(),
+            origin: env.origin.clone(),
+            sender: env.sender.clone(),
+            writes,
+        });
+        let invocation = Invocation {
+            env: Env {
+                me: guardian.clone(),
+                origin: Origin::System,
+                sender: Some(Principal::System),
+                cause: Cause::Direct,
+                ..env.clone()
+            },
+            call: ProgramCall::Execute(abi::encode(&guard)),
+        };
+        let world = self.world(env.height, env.time);
+        let (receipt, effects) =
+            unit::execute(world, overlay, stage, frame, &guardian, None, invocation).await?;
+        match (receipt.outcome, effects.quiet()) {
+            (Outcome::Rejected(refusal), _) => Ok(Err(refusal)),
+            (Outcome::Applied { .. }, true) => Ok(Ok(())),
+            (Outcome::Applied { .. }, false) => Ok(Err(Refusal::new(
+                reason::UNSUPPORTED,
+                format!("{guardian} sends no message while it guards"),
+            ))),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1710,9 +1772,9 @@ where
                 }
             };
             roles.filled()?;
-            let unlisted = roles.iter().find(|(_, program)| {
-                !entries.iter().any(|entry| entry.program == **program)
-            });
+            let unlisted = roles
+                .iter()
+                .find(|(_, program)| !entries.iter().any(|entry| entry.program == **program));
             match unlisted {
                 Some((role, program)) => Err(Refusal::new(
                     reason::INVALID_INPUT,
@@ -1728,7 +1790,9 @@ where
         let running = programs_of(&view)?;
         let filled: Roles = roles
             .iter()
-            .filter(|(role, program)| role::REQUIRED.contains(role) || running.contains_key(*program))
+            .filter(|(role, program)| {
+                role::REQUIRED.contains(role) || running.contains_key(*program)
+            })
             .map(|(role, program)| (role, program.clone()))
             .collect();
         let recorded = roles_of(&view)?;

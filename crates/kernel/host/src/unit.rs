@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::role::identity::AccountNumber;
+use abi::role::ownership::{self, Table, Write};
 use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
     ProgramCall, ProgramId, Receipt, Refusal, Roles, reason, role,
@@ -45,6 +46,12 @@ impl Loaded {
             Slot::Running { module, .. } => Some(module),
             Slot::Awaiting { .. } => None,
         }
+    }
+
+    /// The tables `program`'s running code declares; none for a program
+    /// that does not run here.
+    pub fn tables(&self, program: &str) -> &[Table] {
+        self.module(program).map_or(&[], Code::tables)
     }
 
     pub fn code(&self, program: &str) -> Option<BlobId> {
@@ -423,7 +430,16 @@ where
     E: Context + Spawner,
 {
     let stack = vec![env.me.clone()];
-    read(world, layers, stage, stack, env, ProgramCall::Access(payload), fuel).await
+    read(
+        world,
+        layers,
+        stage,
+        stack,
+        env,
+        ProgramCall::Access(payload),
+        fuel,
+    )
+    .await
 }
 
 async fn read<'a, E>(
@@ -530,6 +546,35 @@ pub struct Effects {
     pub resumes: Vec<Resumed>,
     pub deferred: bool,
     pub parked: Option<Suspended>,
+    /// Each owned key a guarded run wrote, once, in key order.
+    pub writes: Vec<Write>,
+}
+
+impl Effects {
+    /// Whether the run sent nothing: no message, call, resume, deferral or
+    /// park.
+    pub fn quiet(&self) -> bool {
+        let sent = !self.emitted.is_empty() || !self.calls.is_empty() || !self.resumes.is_empty();
+        !sent && !self.deferred && self.parked.is_none()
+    }
+}
+
+/// Whether the ownership role guards what a run writes: an op, or an op
+/// resumed, unless the kernel runs it, the validators' vote sent it, or it
+/// is the ownership role's own. A network that binds no ownership role
+/// guards nothing, so its runs note no write.
+pub(crate) fn guarded(env: &Env, call: &ProgramCall) -> bool {
+    let runs_an_op = matches!(call, ProgramCall::Execute(_) | ProgramCall::Resume { .. });
+    let by_the_kernel = env.origin == Origin::System;
+    let voted = match &env.origin {
+        Origin::Program(program) => env.roles.get(role::VALIDATORS) == Some(program),
+        Origin::External(_) | Origin::System => false,
+    };
+    let Some(guardian) = env.roles.get(role::OWNERSHIP) else {
+        return false;
+    };
+    let guards = *guardian == env.me;
+    runs_an_op && !by_the_kernel && !voted && !guards
 }
 
 struct Execute<'a, E>
@@ -545,12 +590,29 @@ where
     effects: Effects,
     output: Vec<u8>,
     fault: Option<Error>,
+    guarded: bool,
+    tables: &'a [Table],
+    touched: BTreeMap<Vec<u8>, bool>,
 }
 
 impl<E> Execute<'_, E>
 where
     E: Context + Spawner,
 {
+    /// Notes, the first time a guarded run touches an owned key, whether a
+    /// value was there before the run.
+    fn note(&mut self, key: &[u8]) -> Result<()> {
+        let unwatched = !self.guarded || ownership::shared(self.tables, key);
+        let noted = self.touched.contains_key(key);
+        if unwatched || noted {
+            return Ok(());
+        }
+        let view = View::new(self.world.store.storage(), vec![&*self.overlay]);
+        let existed = view.get(&self.env.me, key)?.is_some();
+        self.touched.insert(key.to_vec(), existed);
+        Ok(())
+    }
+
     fn put(&mut self, hash: abi::HashKind, kind: &str, body: &[u8]) -> HostReply {
         match self.stage.put(hash, kind, body) {
             Ok(id) => {
@@ -638,14 +700,14 @@ where
     async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply {
         let me = self.env.me.clone();
         let result = match op {
-            HostOp::Set { key, value } => {
+            HostOp::Set { key, value } => self.note(&key).map(|()| {
                 self.overlay.set(&me, key, value);
-                Ok(HostReply::Done)
-            }
-            HostOp::Delete(key) => {
+                HostReply::Done
+            }),
+            HostOp::Delete(key) => self.note(&key).map(|()| {
                 self.overlay.delete(&me, key);
-                Ok(HostReply::Done)
-            }
+                HostReply::Done
+            }),
             HostOp::BlobPut { hash, kind, body } => Ok(self.put(hash, &kind, &body)),
             HostOp::Emit(message) => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
@@ -722,7 +784,9 @@ where
         invocation.call,
         ProgramCall::Execute(_) | ProgramCall::Resume { .. }
     );
-    let (verdict, events, mut effects, output, fault) = {
+    let guarded = guarded(&invocation.env, &invocation.call);
+    let tables = world.loaded.tables(program);
+    let (verdict, events, mut effects, output, fault, touched) = {
         let mut unit = Execute {
             world,
             env: invocation.env.clone(),
@@ -733,6 +797,9 @@ where
             effects: Effects::default(),
             output: Vec::new(),
             fault: None,
+            guarded,
+            tables,
+            touched: BTreeMap::new(),
         };
         let runtime = world.loaded.runtime();
         let verdict = match (suspended, may_park) {
@@ -751,7 +818,14 @@ where
                 .await
                 .map(Ran::Done),
         };
-        (verdict, unit.events, unit.effects, unit.output, unit.fault)
+        (
+            verdict,
+            unit.events,
+            unit.effects,
+            unit.output,
+            unit.fault,
+            unit.touched,
+        )
     };
     frame.fuel = fuel;
     if let Some(fault) = fault {
@@ -767,7 +841,10 @@ where
         Err(fault) => Outcome::Rejected(refusal_of(fault)),
     };
     let effects = match &outcome {
-        Outcome::Applied { .. } => effects,
+        Outcome::Applied { .. } => Effects {
+            writes: written(world.store.storage(), overlay, program, tables, touched)?,
+            ..effects
+        },
         Outcome::Rejected(_) => {
             overlay.restore(checkpoint);
             discard_unrostered(world.store.storage(), overlay, stage)?;
@@ -781,6 +858,35 @@ where
         nested: Vec::new(),
     };
     Ok((receipt, effects))
+}
+
+/// The owned keys a run touched, as they stand once it returns: whether each
+/// held a value before it and holds one after. A key that held none either
+/// side changed nothing, and is left out.
+fn written(
+    storage: &Storage,
+    overlay: &Overlay,
+    program: &str,
+    tables: &[Table],
+    touched: BTreeMap<Vec<u8>, bool>,
+) -> Result<Vec<Write>> {
+    let view = View::new(storage, vec![overlay]);
+    let mut writes = Vec::new();
+    for (key, existed) in touched {
+        let kept = view.get(program, &key)?.is_some();
+        let changed = existed || kept;
+        if !changed {
+            continue;
+        }
+        let kind = ownership::kind_of(tables, &key);
+        writes.push(Write {
+            key,
+            kind,
+            existed,
+            kept,
+        });
+    }
+    Ok(writes)
 }
 
 pub(crate) fn discard_unrostered(

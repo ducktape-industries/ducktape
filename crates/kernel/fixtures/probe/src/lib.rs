@@ -17,6 +17,13 @@ pub enum Reply {
 }
 
 pub const HOOK: &[u8] = b"#hook";
+
+// The probe's tables, borsh `Vec<Table>`: `s/` shared, and `o/` owned of the
+// kind `probe.item`; every other key is owned with no kind.
+pub const TABLES: [u8; 32] = [
+    2, 0, 0, 0, 2, 0, 0, 0, 115, 47, 0, 2, 0, 0, 0, 111, 47, 1, 10, 0, 0, 0, 112, 114, 111, 98,
+    101, 46, 105, 116, 101, 109,
+];
 pub const NEEDS: &[u8] = b"#needs";
 
 pub fn resource_key(key: &str) -> Vec<u8> {
@@ -41,6 +48,10 @@ mod program {
     use crate::{HOOK, NEEDS, Reply, Step, resource_key, seen};
 
     struct Probe;
+
+    #[used]
+    #[unsafe(link_section = "ducktape.tables")]
+    static TABLES: [u8; crate::TABLES.len()] = crate::TABLES;
 
     impl Program for Probe {
         fn init(ctx: &mut Execute, env: &Env, params: &[u8]) -> Result<(), Refusal> {

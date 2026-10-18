@@ -15,6 +15,7 @@ fixtures! {
     HALO => "fixture_halo",
     IDENTITY => "fixture_identity",
     ORACLE => "fixture_oracle",
+    OWNERSHIP => "fixture_ownership",
     PROBE => "fixture_probe",
     PROGRAMS => "fixture_programs",
     RELAY => "fixture_relay",

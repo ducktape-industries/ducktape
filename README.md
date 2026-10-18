@@ -100,6 +100,11 @@ code = "access.wasm"
 roles = ["access"]
 
 [[programs]]
+id = "ownership"
+code = "ownership.wasm"
+roles = ["ownership"]
+
+[[programs]]
 id = "ping"
 code = "ping.wasm"
 params = "ping.params"        # optional: the bytes the program's init receives
@@ -133,7 +138,28 @@ the owner of a key and the list that holds until one is set are the target
 program's to say (`ProgramCall::Resource`), which the access program asks
 through `HostOp::Resource`. A key shaped like a path answers to the nearest
 list on it or above it, and no list anywhere means anyone may act. A query is
-never checked. As the kernel admits a
+never checked.
+
+Every key a program writes is owned unless the program declares the table it
+falls in shared: a module's `ducktape.tables` custom section, borsh
+`Vec<role::ownership::Table>`, each a key prefix that is `Shared` or
+`Owned(kind)`, the longest prefix deciding. A module with no such section
+declares nothing, so every key it writes is owned; one whose section does not
+decode, or that carries it twice, does not load. While an op runs, or a
+parked op resumes, the host notes the first time it touches each owned key
+and whether the key held a value before. Once the run returns, and before
+anything it emitted is delivered, the host makes one call to the program
+filling the ownership role, `role::ownership::Op::Guard`, from the `System`
+origin: the program written, the frame's origin and sender, and each owned
+key with its table's kind, whether it existed before the run and whether it
+holds a value after it (a key that held none on either side is left out). The
+ownership program decides; its refusal undoes the run, and a guard that
+sends, calls, defers or parks is refused. A run that wrote no owned key makes
+no call, and the kernel's own runs (`System` origin), a message the program
+filling the validators role sent, and the ownership program's own runs are
+not guarded. The ownership role is an optional row: on a network that binds
+no program to it the host notes nothing and makes no call, and every frame
+runs as it would without the guard. As the kernel admits a
 program, at founding or later off the programs role, it gives the program an
 account: the identity role's
 `RegisterProgram`, executed with the `System` origin. Once per frame the host
@@ -145,7 +171,7 @@ runs as no one (`None`). A program may send a message as another account
 `Runs { program, account }` and runs the message as that account only when
 the role answers with it, so a program account whose script calls a program
 acts through that program with no key held anywhere. The interfaces are `abi::role::{programs,
-validators, identity, awaits, egress, scheduler, halo, access}`; the programs repository's `docs/roles.md` walks through them.
+validators, identity, awaits, egress, scheduler, halo, access, ownership}`; the programs repository's `docs/roles.md` walks through them.
 
 A program can wait for another program's answer. Its `execute` is an async
 Rust function (the program SDK's `awaiting_program!`), and each

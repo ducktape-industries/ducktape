@@ -24,6 +24,7 @@ fixture-access = { path = "../fixtures/access" }
 fixture-awaiter = { path = "../fixtures/awaiter" }
 fixture-identity = { path = "../fixtures/identity" }
 fixture-oracle = { path = "../fixtures/oracle" }
+fixture-ownership = { path = "../fixtures/ownership" }
 fixture-programs = { path = "../fixtures/programs" }
 fixture-probe = { path = "../fixtures/probe" }
 fixture-relay = { path = "../fixtures/relay" }

@@ -1927,6 +1927,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-ownership"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
+]
+
+[[package]]
 name = "fixture-probe"
 version = "0.1.0"
 dependencies = [
@@ -2356,6 +2365,7 @@ dependencies = [
  "fixture-awaiter",
  "fixture-identity",
  "fixture-oracle",
+ "fixture-ownership",
  "fixture-probe",
  "fixture-programs",
  "fixture-relay",
@@ -4084,6 +4094,7 @@ dependencies = [
  "futures",
  "sha2 0.10.9",
  "tokio",
+ "wasmparser 0.251.0",
  "wasmtime",
  "wat",
 ]

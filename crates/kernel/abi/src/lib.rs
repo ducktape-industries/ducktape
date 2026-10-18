@@ -87,7 +87,7 @@ pub fn hex(bytes: &[u8]) -> String {
         })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Origin {
     External(Vec<u8>),
     Program(ProgramId),
@@ -97,7 +97,18 @@ pub enum Origin {
 /// Who a frame acts as, resolved by the host once per frame through the
 /// identity role: an account (the one a signer's key holds, or the account
 /// of the program that sent a message), or the chain itself.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub enum Principal {
     Account(role::identity::AccountNumber),
     System,
@@ -487,6 +498,7 @@ pub mod role {
     pub const SCHEDULER: &str = "scheduler";
     pub const HALO: &str = "halo";
     pub const ACCESS: &str = "access";
+    pub const OWNERSHIP: &str = "ownership";
     pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO, ACCESS];
 
     /// Which code runs at a height.
@@ -1282,6 +1294,64 @@ pub mod role {
         }
     }
 
+    pub mod ownership {
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, Origin, Principal, ProgramId};
+
+        pub const TABLES_SECTION: &str = "ducktape.tables";
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum TableKind {
+            Shared,
+            Owned(String),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Table {
+            pub prefix: Vec<u8>,
+            pub kind: TableKind,
+        }
+
+        pub fn table_of<'t>(tables: &'t [Table], key: &[u8]) -> Option<&'t Table> {
+            tables
+                .iter()
+                .filter(|table| key.starts_with(&table.prefix))
+                .max_by_key(|table| table.prefix.len())
+        }
+
+        pub fn shared(tables: &[Table], key: &[u8]) -> bool {
+            let table = table_of(tables, key);
+            matches!(table.map(|table| &table.kind), Some(TableKind::Shared))
+        }
+
+        pub fn kind_of(tables: &[Table], key: &[u8]) -> Option<String> {
+            match &table_of(tables, key)?.kind {
+                TableKind::Owned(kind) => Some(kind.clone()),
+                TableKind::Shared => None,
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Write {
+            pub key: Vec<u8>,
+            pub kind: Option<String>,
+            pub existed: bool,
+            pub kept: bool,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Guard {
+            pub program: ProgramId,
+            pub origin: Origin,
+            pub sender: Option<Principal>,
+            pub writes: Vec<Write>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum Op {
+            Guard(Guard),
+        }
+    }
+
     pub mod access {
         use crate::role::identity::AccountNumber;
         use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
@@ -1914,6 +1984,39 @@ mod tests {
             Writers::Anyone,
             "no list anywhere is anyone"
         );
+    }
+
+    #[test]
+    fn an_owned_key_answers_to_the_longest_table_it_falls_under() {
+        use role::ownership::{Guard, Op, Table, TableKind, Write, kind_of, shared, table_of};
+        let tables = vec![
+            Table {
+                prefix: b"m/".to_vec(),
+                kind: TableKind::Owned("chat.message".into()),
+            },
+            Table {
+                prefix: b"m/h/".to_vec(),
+                kind: TableKind::Shared,
+            },
+        ];
+        assert_eq!(table_of(&tables, b"m/h/7"), Some(&tables[1]));
+        assert!(shared(&tables, b"m/h/7"));
+        assert_eq!(kind_of(&tables, b"m/7").as_deref(), Some("chat.message"));
+        assert!(!shared(&tables, b"x") && kind_of(&tables, b"x").is_none());
+        assert_eq!(decode::<Vec<Table>>(&encode(&tables)).unwrap(), tables);
+        let guard = Op::Guard(Guard {
+            program: "chat".into(),
+            origin: Origin::Program("harness".into()),
+            sender: Some(Principal::Account(17)),
+            writes: vec![Write {
+                key: b"m/7".to_vec(),
+                kind: Some("chat.message".into()),
+                existed: false,
+                kept: true,
+            }],
+        });
+        assert_eq!(encode(&guard)[0], 0);
+        assert_eq!(decode::<Op>(&encode(&guard)).unwrap(), guard);
     }
 
     #[test]
