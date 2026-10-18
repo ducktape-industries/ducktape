@@ -113,6 +113,15 @@ scripts back a `make` target; see the repository `Makefile`.
   `ducktape-request` header). Once it is gone the step is not tried again.
   Any other failure answers at once, and a failure the service did not
   foresee answers 500 with `{"error"}` rather than closing the connection.
+- `server.py fetch` tries a step again when it lost its connection (the
+  clone, which starts again from an empty directory, a files read, a blob
+  get), with the pause doubling from a second and no last attempt, for as
+  long as the pod lives: the request that made the pod was answered when the
+  pod was created, so no request bounds it, and deleting the pod ends it. An
+  HTTP answer, or any other failure, ends the fetch at once. Each try again
+  is a line in the fetch container's log (`pods/NAME/logs?container=fetch`)
+  with the failure in the fetcher's words, and the pod stays in its init
+  phase meanwhile.
 - A pod's inputs and `/out` are generic ephemeral volumes of storage class
   `local-path`, so they sit on the disk that holds the cluster's
   PersistentVolumes, not on the node's root filesystem. Kubernetes creates

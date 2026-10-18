@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs, exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends, and usage.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends, and usage.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import copy
 import json
@@ -8,6 +8,7 @@ import queue
 import re
 import secrets
 import shlex
+import shutil
 import ssl
 import subprocess
 import sys
@@ -1592,6 +1593,7 @@ class Fetcher:
         self.home = home
         self.runner = runner
         self.password = secrets.token_hex(16)
+        self.pause = time.sleep
 
     def env(self):
         return dict(os.environ, DUCKTAPE_PASSWORD=self.password, NO_COLOR="1", DUCKTAPE_DEVICE_KEY_STORE="file")
@@ -1599,7 +1601,19 @@ class Fetcher:
     def cli(self, *args, stdin=None):
         return self.runner([*self.ducktape, "--workspace", str(self.home), "--node", self.node, *args], stdin=stdin, env=self.env())
 
-    def must(self, ran, doing):
+    def tried(self, attempt, doing):
+        pause = RETRY_PAUSE
+        while True:
+            ran = attempt()
+            why = failed(ran)
+            if why is None or not dropped(why):
+                return ran
+            print(f"{doing}, it lost its connection, so it is tried again in {pause} s: {why}", flush=True)
+            self.pause(pause)
+            pause *= 2
+
+    def must(self, attempt, doing):
+        ran = self.tried(attempt, doing)
         if ran.code != 0:
             raise Refused(502, f"{doing}: {ran.err or ran.out.decode(errors='replace')}")
         return ran.out
@@ -1608,14 +1622,20 @@ class Fetcher:
         keys = self.home / "keys"
         minted = keys.exists() and any(keys.iterdir())
         if not minted:
-            self.must(self.cli("wallet", "new", "fetch"), "a reading key was not minted")
+            self.must(lambda: self.cli("wallet", "new", "fetch"), "a reading key was not minted")
 
     def forge_input(self, forge, target):
         chain = urlsplit(self.forge).netloc
         remote = f"{self.forge.rstrip('/')}/{forge['repo']}"
         git = ["git", "-c", f"duck.{chain}.node={self.node}"]
-        self.must(self.runner([*git, "clone", "--no-checkout", remote, str(target)], env=self.env()), f"{remote} was not cloned")
-        checkout = self.runner([*git, "-C", str(target), "checkout", "--detach", forge["commit"]], env=self.env())
+
+        def clone():
+            if target.exists():
+                shutil.rmtree(target)
+            return self.runner([*git, "clone", "--no-checkout", remote, str(target)], env=self.env())
+
+        self.must(clone, f"{remote} was not cloned")
+        checkout = lambda: self.runner([*git, "-C", str(target), "checkout", "--detach", forge["commit"]], env=self.env())
         self.must(checkout, f"{forge['repo']} has no commit {forge['commit']}")
         print(f"cloned {remote} at {forge['commit']}", flush=True)
 
@@ -1625,7 +1645,7 @@ class Fetcher:
         offset, data, size = 0, b"", 0
         while True:
             request = files_read(files["path"], snapshot, offset, CHUNK_SIZE)
-            reply = self.must(self.cli("query", FILES_PROGRAM, stdin=request), f"files did not read {files['path']}")
+            reply = self.must(lambda: self.cli("query", FILES_PROGRAM, stdin=request), f"files did not read {files['path']}")
             read_at, size, _, piece, eof = contents_of(reply)
             snapshot = snapshot or read_at
             data += piece
@@ -1636,7 +1656,7 @@ class Fetcher:
         print(f"read {files['path']} at snapshot {snapshot}, {len(data)} of {size} bytes", flush=True)
 
     def blob_input(self, blob, target):
-        framed = self.must(self.cli("blob", "get", blob), f"blob {blob} was not fetched")
+        framed = self.must(lambda: self.cli("blob", "get", blob), f"blob {blob} was not fetched")
         header, nul, body = framed.partition(b"\0")
         if not nul:
             raise Refused(502, f"blob {blob} came back without its header")

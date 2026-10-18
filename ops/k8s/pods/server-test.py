@@ -35,6 +35,7 @@ FETCHING = server.Fetching(image="localhost:5000/pods@sha256:00", node="https://
 
 
 DROPPED = "error: unable to upgrade connection: read tcp: connection reset by peer"
+LOST = "fatal: no node of duckpond answered: error sending request for url (https://node.example/v1/query)"
 OPEN = bytes([3, 1]) + b"the request's row"
 GONE = bytes([3, 0])
 COMMIT = "c0ffee" + "0" * 34
@@ -1231,12 +1232,14 @@ class Fetch(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.log = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.root = pathlib.Path(temp.name) / "in"
         self.home = pathlib.Path(temp.name) / "home"
         self.calls = []
         self.answers = []
         self.fetcher = server.Fetcher(["ducktape"], "https://node.example", "duck://duckpond/forge", self.home, runner=self.recorded)
+        self.paused = []
+        self.fetcher.pause = self.paused.append
 
     def recorded(self, argv, stdin=None, env=None):
         self.calls.append((argv, stdin, env))
@@ -1290,6 +1293,41 @@ class Fetch(unittest.TestCase):
         with self.assertRaises(server.Refused) as caught:
             self.fetcher.fetch([{"path": "/w", "forge": {"repo": "nope", "commit": "1"}}], self.root)
         self.assertIn("duck://duckpond/forge/nope was not cloned: fatal: repository not found", caught.exception.sentence)
+        self.assertEqual(self.paused, [])
+
+    def test_a_clone_that_loses_its_connection_is_cloned_again_with_doubling_pauses_and_the_pod_runs(self):
+        self.slot(0)
+        self.answers = [ran(code=128, err=LOST), ran(code=128, err=LOST), ran(b""), ran(b"")]
+        self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": "83b18766"}}], self.root)
+        verbs = [call[0][3] for call in self.calls]
+        self.assertEqual((verbs, self.paused), (["clone", "clone", "clone", "-C"], [1, 2]))
+        self.assertEqual((self.root / "0" / "data" / "build.sh").read_text(), "make")
+        lines = self.log.getvalue().splitlines()
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("duck://duckpond/forge/programs was not cloned, it lost its connection, so it is tried again in 2 s", lines[1])
+        self.assertIn("error sending request", lines[1])
+        self.assertEqual(lines[2], "cloned duck://duckpond/forge/programs at 83b18766")
+
+    def test_an_http_answer_is_not_tried_again(self):
+        self.slot(0)
+        self.answers = [ran(code=128, err="fatal: no node of duckpond answered: HTTP status server error (502 Bad Gateway)")]
+        with self.assertRaises(server.Refused) as caught:
+            self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": "83b18766"}}], self.root)
+        self.assertIn("502 Bad Gateway", caught.exception.sentence)
+        self.assertEqual((len(self.calls), self.paused), (1, []))
+
+    def test_a_files_read_and_a_blob_get_that_lose_their_connection_are_tried_again(self):
+        self.slot(0)
+        self.slot(1)
+        whole = b"\x05\x00" + b"\xab" * 32 + (3).to_bytes(8, "little") + (0).to_bytes(8, "little") + b"\x03\x00\x00\x00abc" + b"\x01"
+        lost = ran(code=1, err=LOST)
+        self.answers = [ran(b"minted"), lost, ran(whole), lost, lost, ran(b"program 4\x00\x00asm")]
+        inputs = [{"path": "/w/spec.md", "files": {"path": "/docs/spec.md"}}, {"path": "/w/a.wasm", "blob": CHUNKS[0]}]
+        self.fetcher.fetch(inputs, self.root)
+        self.assertEqual((len(self.calls), self.paused), (6, [1, 1, 2]))
+        self.assertEqual(self.calls[1][1], self.calls[2][1])
+        self.assertEqual((self.root / "0" / "data").read_bytes(), b"abc")
+        self.assertEqual((self.root / "1" / "data").read_bytes(), b"\x00asm")
 
 
 class Keys(unittest.TestCase):
