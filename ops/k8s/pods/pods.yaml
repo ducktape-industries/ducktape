@@ -186,6 +186,9 @@ spec:
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(volume, !has(volume.projected) || !has(volume.projected.sources) || volume.projected.sources.all(source, !has(source.serviceAccountToken)))"
       reason: Forbidden
       message: a pod in namespace agents projects no service account token
+    - expression: "([dyn(object.spec)] + object.spec.containers.map(container, dyn(container)) + (has(object.spec.initContainers) ? object.spec.initContainers.map(container, dyn(container)) : [])).all(holder, !has(holder.resources) || !has(holder.resources.limits) || !('cpu' in holder.resources.limits) || !quantity(holder.resources.limits.cpu).isGreaterThan(quantity('50')))"
+      reason: Forbidden
+      message: a pod in namespace agents uses at most 50 CPUs, so neither its pod-level cpu limit nor any container's may exceed 50; a pod that states no pod-level cpu limit gets 50
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -194,6 +197,38 @@ metadata:
 spec:
   policyName: agents-pods
   validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: agents-pods-cpu
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: agents}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+  matchConditions:
+    - name: no-pod-cpu-limit
+      expression: "!has(object.spec.resources) || !has(dyn(object.spec.resources).limits) || !('cpu' in dyn(object.spec.resources).limits)"
+    - name: no-container-cpu-limit-above-50
+      expression: "(object.spec.containers.map(container, dyn(container)) + (has(object.spec.initContainers) ? object.spec.initContainers.map(container, dyn(container)) : [])).all(holder, !has(holder.resources) || !has(holder.resources.limits) || !('cpu' in holder.resources.limits) || !quantity(holder.resources.limits.cpu).isGreaterThan(quantity('50')))"
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: 'Object{spec: Object.spec{resources: Object.spec.resources{limits: {"cpu": "50"}}}}'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: agents-pods-cpu
+spec:
+  policyName: agents-pods-cpu
 ---
 # hardcap caps what agents' pods are guaranteed, not what they burst to: AGENTS_CPU and AGENTS_MEMORY are the node's
 # allocatable cpu and memory minus the requests of the duckpond node, ccs and tunnel pods (kubectl describe node).
@@ -208,8 +243,8 @@ spec:
     requests.memory: "@AGENTS_MEMORY@"
     requests.storage: 500Gi
 ---
-# A container that states no cpu or memory requests none, so hardcap admits it, and has no limit, so it may use the
-# whole node. No default limit: Kubernetes refuses a container limit above the pod-level limit a pod states.
+# A container that states no cpu or memory requests none, so hardcap admits it. No default limit: Kubernetes refuses a
+# container limit above the pod-level limit a pod states.
 apiVersion: v1
 kind: LimitRange
 metadata:

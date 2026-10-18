@@ -156,11 +156,23 @@ scripts back a `make` target; see the repository `Makefile`.
   priority class other than `agents` or mounts or projects a service
   account token. A container that states no cpu or memory gets the
   LimitRange `defaults`: a request of 0 and no limit, so `hardcap` admits
-  it and it contends for the whole machine. `defaults` sets no default
-  limit, since Kubernetes refuses a container limit above the pod-level
-  limit a pod states. The PriorityClass `agents` ranks its pods below every
-  other pod on the cluster. Its NetworkPolicy `isolated` admits traffic only
-  from inside the namespace and lets pods out to public addresses and DNS.
+  it. `defaults` sets no default limit, since Kubernetes refuses a
+  container limit above the pod-level limit a pod states. The PriorityClass
+  `agents` ranks its pods below every other pod on the cluster. Its
+  NetworkPolicy `isolated` admits traffic only from inside the namespace and
+  lets pods out to public addresses and DNS.
+- A pod in `agents` uses at most 50 CPUs; nothing sets it a memory limit.
+  When a pod states no pod-level cpu limit, the MutatingAdmissionPolicy
+  `agents-pods-cpu` sets its `spec.resources.limits.cpu` to 50 as
+  Kubernetes creates it, and Kubernetes then sets its pod-level cpu request
+  to what its containers request together: 0 when they state none, so
+  `hardcap` admits it as before. The kubelet holds the whole pod to 50 CPUs.
+  `agents-pods` refuses a pod whose pod-level cpu limit, or any container's,
+  is above 50. A pod that states its own pod-level cpu limit keeps it, and
+  Kubernetes sets its pod-level cpu request to that limit when neither the
+  pod nor its containers state one. Both policies act on every pod created
+  in `agents`, whether the service, a manifest or a controller creates it;
+  a pod already running keeps the spec it started with.
 - The service signs blob puts, files commits and chat posts as the program
   account `pods`, whose key and password are the Secret `blob-key` (files
   `key` and `password`) in namespace `pods`:
