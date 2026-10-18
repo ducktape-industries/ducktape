@@ -113,6 +113,13 @@ scripts back a `make` target; see the repository `Makefile`.
   `ducktape-request` header). Once it is gone the step is not tried again.
   Any other failure answers at once, and a failure the service did not
   foresee answers 500 with `{"error"}` rather than closing the connection.
+- An exec, `blob`, `file` or `push` that reaches a container which has not
+  started yet (kubectl's `container not found ("run")`, while the `fetch`
+  init container still fetches the pod's inputs) watches the pod and runs
+  once that container runs, while the egress request that asked is open:
+  each change the watch hears asks egress again, and once the request is
+  gone it answers 502 and runs nothing. A container that ended, or a pod
+  that failed, succeeded or was deleted, answers kubectl's failure at once.
 - `server.py fetch` tries a step again when it lost its connection (the
   clone, which starts again from an empty directory, a files read, a blob
   get), with the pause doubling from a second and no last attempt, for as

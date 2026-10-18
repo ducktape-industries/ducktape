@@ -131,6 +131,7 @@ DROPPED = (
     "use of closed network connection",
     "http2: client connection lost",
 )
+UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
 RESOLVING = SAFE_GIT + 'cd "$1" && git rev-parse --verify --quiet "$2^{commit}"\n'
@@ -203,6 +204,29 @@ def failed(ran):
     if ran.code == 0:
         return None
     return ran.err or ran.out.decode(errors="replace").strip() or f"exited {ran.code}"
+
+
+def unstarted(ran):
+    found = UNSTARTED.search(ran.err) if ran.code != 0 else None
+    return found.group(1) if found else None
+
+
+def start_of(event, container):
+    status = (event.get("object") or {}).get("status", {})
+    state = state_of(status.get("containerStatuses", []), container)
+    ended = event.get("type") == "DELETED" or status.get("phase") in ("Succeeded", "Failed")
+    if ended or (state is not None and state["state"] == "terminated"):
+        return "ended"
+    return "running" if state is not None and state["state"] == "running" else "waiting"
+
+
+def outcome(attempt):
+    try:
+        return attempt()
+    except Refused as refusal:
+        return refusal
+    except Exception as error:
+        return Refused(500, f"the pods service failed: {error!r}")
 
 
 def text_or_hex(data, field):
@@ -1188,12 +1212,51 @@ class Service:
             self.pause(pause)
             pause *= 2
 
+    def executed(self, asked, name, container, command, again=False):
+        def attempt():
+            return self.kube.exec(name, container, command)
+
+        while True:
+            ran = self.retried(asked, attempt, failed) if again else attempt()
+            waited = unstarted(ran)
+            if waited is None or not self.started(asked, name, waited):
+                return ran
+
+    def started(self, asked, name, container):
+        process = None
+        try:
+            while True:
+                if process is None:
+                    process, events = self.kube.watch_pod(name), queue.Queue()
+                    threading.Thread(target=relay, args=(process, events), daemon=True).start()
+                kind, item = events.get()
+                if kind == "closed":
+                    process = None
+                    if item != 0:
+                        self.pause(WATCH_PAUSE)
+                    ran = self.kube.get(name)
+                    if ran.code != 0 and "(NotFound)" in ran.err:
+                        return False
+                    if ran.code != 0:
+                        continue
+                    item = {"type": "MODIFIED", "object": json.loads(ran.out)}
+                start = start_of(item, container)
+                if start == "ended":
+                    return False
+                if not self.waiting(asked):
+                    raise Refused(502, f"container {container} of pod {name} had not started when request {asked['request']}, which asked for this, was gone, so nothing ran")
+                if start == "running":
+                    return True
+        finally:
+            if process is not None:
+                process.kill()
+
     def output(self, name, asked_by, asked):
         pod = self.pod(name)
         names = [container["name"] for container in pod["spec"]["containers"]]
         container = asked.get("container") or (OUT if OUT in names else None)
         command = ["cat", "--", absolute(asked["path"], "path")]
-        ran = self.retried(asked_by, lambda: self.kube.exec(name, container, command), failed)
+        ran = self.executed(asked_by, name, container, command, again=True)
         if ran.code != 0:
             raise kube_refusal(ran, f"{asked['path']} was not read from pod {name}")
         return ran.out
@@ -1264,21 +1327,23 @@ class Service:
             raise kube_refusal(ran, f"pod {name} was not deleted")
         return 200, {"deleted": name}
 
-    def exec(self, name, body):
+    def exec(self, name, asked_by, body):
         asked = checked(body, EXEC, "an exec")
         command = strings(asked.get("command", []), "command")
         container = asked.get("container")
         if "every" not in asked:
-            return 200, exec_answer(name, self.kube.exec(name, container, command))
+            return 200, exec_answer(name, self.executed(asked_by, name, container, command))
         every = from_one(asked["every"], "every")
         self.pod(name)
-        return 200, Stream(self.exec_waited(name, container, command, every))
+        return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
 
-    def exec_waited(self, name, container, command, every):
+    def exec_waited(self, asked, name, container, command, every):
         done = queue.Queue()
-        threading.Thread(target=lambda: done.put(self.kube.exec(name, container, command)), daemon=True).start()
+        threading.Thread(target=lambda: done.put(outcome(lambda: self.executed(asked, name, container, command))), daemon=True).start()
         ran = yield from Beat(every).heard(done)
         try:
+            if isinstance(ran, Refused):
+                raise ran
             answer = "ended", exec_answer(name, ran)
         except Refused as refusal:
             answer = "refused", {"status": refusal.status, "error": refusal.sentence}
@@ -1346,10 +1411,10 @@ class Service:
         self.keyed("put the pack")
         container = asked.get("container")
         resolve = ["sh", "-c", RESOLVING, "resolve", path, rev]
-        resolved = self.retried(asked_by, lambda: self.kube.exec(name, container, resolve), failed)
+        resolved = self.executed(asked_by, name, container, resolve, again=True)
         commit = git_output(name, resolved, f"{rev} names no commit in {path}").decode().strip()
         packing = ["sh", "-c", PACKING, "pack", path, commit, *have]
-        packed = self.retried(asked_by, lambda: self.kube.exec(name, container, packing), failed)
+        packed = self.executed(asked_by, name, container, packing, again=True)
         pack = git_output(name, packed, f"{commit} was not packed in {path}")
         objects = objects_of(pack)
         answer = {"commit": commit, "objects": objects, "size": len(pack), "kind": PACK}
@@ -1483,7 +1548,7 @@ class Service:
             case ("GET", "pods", name, "wait"):
                 return self.wait(name, query)
             case ("POST", "pods", name, "exec"):
-                return self.exec(name, parsed(body))
+                return self.exec(name, asked, parsed(body))
             case ("POST", "pods", name, "blob"):
                 return self.blob(name, asked, parsed(body))
             case ("POST", "pods", name, "file"):

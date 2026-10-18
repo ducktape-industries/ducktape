@@ -40,6 +40,9 @@ OPEN = bytes([3, 1]) + b"the request's row"
 GONE = bytes([3, 0])
 COMMIT = "c0ffee" + "0" * 34
 HAVE = "be" * 20
+UNSTARTED = 'error: unable to upgrade connection: container not found ("run")'
+FETCHING_STATE = {"waiting": {"reason": "PodInitializing"}}
+FAILED = {"terminated": {"exitCode": 128, "reason": "Error", "message": "clone failed"}}
 
 
 def taken(holder, field):
@@ -802,6 +805,90 @@ class Retried(Served):
         self.assertEqual(status, 500)
         self.assertIn("the pods service failed", answer["error"])
 
+
+class Unstarted(Streamed):
+    def setUp(self):
+        super().setUp()
+        self.watch = Watch()
+        self.kube.watches.append(self.watch)
+        self.kube.answer("exec", ran(code=1, err=UNSTARTED), ran(b"built\n"))
+        self.addCleanup(self.watch.stdout.close)
+
+    def asked_egress(self):
+        heard = threading.Event()
+        query = self.signer.query
+
+        def told(program, request):
+            heard.set()
+            return query(program, request)
+
+        self.signer.query = told
+        return heard
+
+    def test_an_exec_before_its_container_starts_runs_once_the_container_runs(self):
+        heard = self.asked_egress()
+        self.watch.send("ADDED", pod_json(state=FETCHING_STATE, init=RUNNING))
+        answers = []
+        call = threading.Thread(target=lambda: answers.append(self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})))
+        call.start()
+        self.assertTrue(heard.wait(10))
+        self.assertEqual(self.kube.verbs(), ["exec", "watch_pod"])
+        self.watch.send("MODIFIED", pod_json(state=RUNNING, phase="Running", init=ENDED))
+        call.join(10)
+        self.assertEqual(answers, [(200, {"exit_code": 0, "stdout": "built\n", "stderr": ""})])
+        self.assertEqual(self.kube.verbs(), ["exec", "watch_pod", "exec"])
+        self.assertEqual(self.signer.queries, [("egress", server.egress_request(41))] * 2)
+        self.assertTrue(self.watch.killed)
+
+    def test_a_streamed_exec_is_alive_while_its_container_starts(self):
+        self.watch.send("ADDED", pod_json(state=FETCHING_STATE, init=RUNNING))
+        self.kube.answer("get", ran(pod_json(state=FETCHING_STATE, init=RUNNING)))
+        response = self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"], "every": 1})
+        self.assertEqual(self.event(response), ("alive", {}))
+        self.watch.send("MODIFIED", pod_json(state=RUNNING, phase="Running", init=ENDED))
+        self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
+        self.assertEqual(self.kube.verbs().count("exec"), 2)
+
+    def test_a_blob_or_a_push_waits_for_its_container_too(self):
+        self.kube.answer("get", ran(pod_json()))
+        self.kube.answer("exec", ran(code=1, err='error: unable to upgrade connection: container not found ("out")'), ran(b"\x00asm"))
+        self.watch.send("ADDED", pod_json(state=RUNNING, phase="Running"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"})
+        self.assertEqual((status, answer["size"]), (200, 4), answer)
+        self.assertEqual(self.kube.verbs(), ["get", "exec", "watch_pod", "exec"])
+
+    def test_a_container_that_ended_or_a_pod_that_failed_answers_the_failure_at_once(self):
+        for event, pod in (("MODIFIED", pod_json(state=ENDED, phase="Succeeded")), ("MODIFIED", pod_json(phase="Failed", init=FAILED)), ("DELETED", pod_json())):
+            with self.subTest(event=event, phase=pod["status"]["phase"]):
+                self.kube.calls.clear()
+                self.kube.answer("exec", ran(code=1, err=UNSTARTED))
+                watch = Watch()
+                self.kube.watches = [watch]
+                watch.send(event, pod)
+                status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})
+                self.assertEqual((status, answer["exit_code"], answer["stderr"]), (200, 1, UNSTARTED))
+                self.assertEqual(self.kube.verbs(), ["exec", "watch_pod"])
+        self.assertEqual(self.signer.queries, [])
+
+    def test_nothing_runs_once_the_request_that_asked_is_gone(self):
+        self.signer.request = ran(GONE)
+        self.watch.send("ADDED", pod_json(state=RUNNING, phase="Running"))
+        self.refused("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]}, 502, ["container run", "had not started", "request 41", "nothing ran"])
+        self.assertEqual(self.kube.verbs(), ["exec", "watch_pod"])
+
+    def test_a_watch_that_ends_reads_the_pod_again(self):
+        self.watch.close()
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})
+        self.assertEqual((status, answer["stdout"]), (200, "built\n"))
+        self.assertEqual(self.kube.verbs(), ["exec", "watch_pod", "get", "exec"])
+
+    def test_a_pod_gone_between_watches_answers_the_failure(self):
+        self.watch.close()
+        self.kube.answer("get", ran(code=1, err=NOT_FOUND))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})
+        self.assertEqual((status, answer["stderr"]), (200, UNSTARTED))
+        self.assertEqual(self.kube.verbs(), ["exec", "watch_pod", "get"])
 
 class Keyless(Served):
     def setUp(self):
