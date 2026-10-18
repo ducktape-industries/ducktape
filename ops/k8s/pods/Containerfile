@@ -1,0 +1,12 @@
+# The pods service image: Python, kubectl, git with git-remote-duck and a released ducktape CLI, running server.py as uid 1000.
+# Built by ops/k8s/pods/deploy from a staged context holding kubectl, ducktape, git-remote-duck and server.py.
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --user-group --create-home --home-dir /home/pods pods
+COPY kubectl ducktape git-remote-duck /usr/local/bin/
+COPY server.py /usr/local/lib/pods/server.py
+ENV NO_COLOR=1 PYTHONDONTWRITEBYTECODE=1 DUCKTAPE_DEVICE_KEY_STORE=file
+USER 1000:1000
+WORKDIR /home/pods
+ENTRYPOINT ["python3", "/usr/local/lib/pods/server.py"]
