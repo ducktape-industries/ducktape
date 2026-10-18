@@ -1,0 +1,59 @@
+# Each push to dev or main moves the same branch of duckpond's forge repository
+# `core` forward, signed by account 22's "forge-sync CI" key. When forge's branch
+# holds a commit the push lacks, the run fails and forge's branch stays as it is.
+name: forge-sync
+
+on:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORGE: duck://duckpond-725bcad1/forge/core
+  CHAIN: duckpond-725bcad1
+  NODE: https://duckpond.ducktape.industries
+  GIT_REMOTE_DUCK: https://github.com/ducktape-industries/ducktape/releases/download/git-remote-duck-7acf453/git-remote-duck-x86_64-unknown-linux-gnu
+  GIT_REMOTE_DUCK_SHA256: c03d7b0d02327af0a1d8eef2d80e778ec8a67850aa42dd2b43022f85269b5b75
+  DUCKTAPE_DEVICE_KEY_STORE: file
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: git-remote-duck
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          curl -fsSL -o "$bin/git-remote-duck" "$GIT_REMOTE_DUCK"
+          echo "$GIT_REMOTE_DUCK_SHA256  $bin/git-remote-duck" | sha256sum -c -
+          chmod +x "$bin/git-remote-duck"
+          echo "$bin" >> "$GITHUB_PATH"
+      - name: key
+        env:
+          KEY: ${{ secrets.DUCKPOND_FORGE_KEY }}
+        run: |
+          home="$RUNNER_TEMP/ducktape"
+          mkdir -p "$home/git"
+          (umask 077 && printf '%s' "$KEY" | base64 -d > "$home/git/$CHAIN.key")
+          echo "DUCKTAPE_HOME=$home" >> "$GITHUB_ENV"
+          git config --global "duck.$CHAIN.node" "$NODE"
+      - name: push
+        run: |
+          branch="refs/heads/$GITHUB_REF_NAME"
+          if git push "$FORGE" "HEAD:$branch"; then
+            exit 0
+          fi
+          held=$(git ls-remote "$FORGE" "$branch" | cut -f1)
+          echo "::error::forge did not take $GITHUB_REF_NAME at $(git rev-parse HEAD); forge's $GITHUB_REF_NAME is ${held:-absent}. Nothing was overwritten."
+          exit 1
