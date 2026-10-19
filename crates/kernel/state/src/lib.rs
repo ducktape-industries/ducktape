@@ -239,6 +239,10 @@ where
         &self.storage
     }
 
+    pub fn clock(&self) -> &E {
+        &self.context
+    }
+
     pub fn programs(&self) -> impl Iterator<Item = &ProgramId> {
         self.commitments.keys()
     }

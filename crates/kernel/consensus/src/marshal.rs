@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 
@@ -19,8 +20,8 @@ use commonware_cryptography::certificate::Verifier as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Sequential;
-use commonware_runtime::Handle;
 use commonware_runtime::buffer::paged::CacheRef;
+use commonware_runtime::{Clock, Handle};
 use commonware_storage::archive::{self, Archive as _, Identifier, immutable};
 use commonware_storage::metadata::{self, Metadata};
 use commonware_utils::vec::NonEmptyVec;
@@ -286,12 +287,15 @@ impl<E: Context> Clone for Summaries<E> {
 impl<E: Context> Summaries<E> {
     pub async fn keep(
         &self,
+        clock: &impl Clock,
         height: u64,
         id: Digest,
         summary: Vec<u8>,
         txs: &[[u8; 32]],
-    ) -> Result<(), SummariesError> {
+    ) -> Result<Duration, SummariesError> {
+        let asked = clock.current();
         let mut slot = self.kept.write().await;
+        let waited = clock.current().duration_since(asked).unwrap_or_default();
         let Kept {
             blocks,
             txs: mut places,
@@ -322,7 +326,7 @@ impl<E: Context> Summaries<E> {
             blocks,
             txs: places,
         });
-        Ok(())
+        Ok(waited)
     }
 
     pub async fn get(&self, height: u64) -> Result<Option<Vec<u8>>, SummariesError> {

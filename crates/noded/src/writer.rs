@@ -2,6 +2,7 @@
 // ask of it, in order. RPC handlers reach it through `Writer` and await its answer; nothing else
 // holds the node.
 
+use commonware_runtime::telemetry::metrics::Gauge;
 use futures::channel::{mpsc, oneshot};
 
 use crate::{Error, Result};
@@ -31,16 +32,23 @@ impl Held {
 }
 
 #[derive(Clone)]
-pub(crate) struct Writer(mpsc::UnboundedSender<Command>);
+pub(crate) struct Writer {
+    commands: mpsc::UnboundedSender<Command>,
+    queued: Gauge,
+}
 
 impl Writer {
-    pub(crate) fn new() -> (Writer, mpsc::UnboundedReceiver<Command>) {
+    pub(crate) fn new(queued: Gauge) -> (Writer, mpsc::UnboundedReceiver<Command>) {
         let (commands, inbox) = mpsc::unbounded();
-        (Writer(commands), inbox)
+        (Writer { commands, queued }, inbox)
     }
 
     async fn ask<T>(&self, command: Command, answer: oneshot::Receiver<T>) -> Result<T> {
-        self.0.unbounded_send(command).map_err(|_| Error::Stopped)?;
+        self.queued.inc();
+        if self.commands.unbounded_send(command).is_err() {
+            self.queued.dec();
+            return Err(Error::Stopped);
+        }
         answer.await.map_err(|_| Error::Stopped)
     }
 

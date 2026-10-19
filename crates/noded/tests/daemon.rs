@@ -1106,15 +1106,40 @@ fn a_sync_whose_caller_has_gone_is_dropped_unserved_and_the_next_is_answered() {
         held.release();
         let answered = daemon.sync(statesync::Request::Head).await.unwrap();
         assert!(matches!(answered, statesync::Response::Head(_)));
-        let text = client.metrics().await.unwrap();
-        let counted = |name: &str| -> u64 {
-            let line = text
-                .lines()
-                .find(|line| !line.starts_with('#') && line.contains(name))
-                .unwrap();
-            line.rsplit(' ').next().unwrap().parse().unwrap()
-        };
-        assert_eq!((counted("sync_abandoned"), counted("sync_served")), (1, 1));
+        let abandoned = metric(&client, "sync_abandoned").await;
+        let served = metric(&client, "sync_served").await;
+        assert_eq!((abandoned, served), (1, 1));
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn the_writer_counts_the_commands_waiting_for_it() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        reach(&client, 2).await;
+        let held = daemon.hold().await.unwrap();
+        assert_eq!(metric(&client, "queued_commands").await, 0);
+        let mut first = Box::pin(daemon.sync(statesync::Request::Head));
+        let mut second = Box::pin(daemon.sync(statesync::Request::Head));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(metric(&client, "queued_commands").await, 2);
+        held.release();
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(metric(&client, "queued_commands").await, 0);
     });
     drop(daemon);
 
@@ -2198,6 +2223,15 @@ fn parked_bytes(seat: &Seat) -> u64 {
         })
         .map(|path| bytes_under(&path))
         .sum()
+}
+
+async fn metric(client: &Client, name: &str) -> u64 {
+    let text = client.metrics().await.unwrap();
+    let line = text
+        .lines()
+        .find(|line| !line.starts_with('#') && line.contains(name))
+        .unwrap();
+    line.rsplit(' ').next().unwrap().parse().unwrap()
 }
 
 async fn parked_gauge(client: &Client, name: &str) -> u64 {

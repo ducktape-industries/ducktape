@@ -9,6 +9,7 @@ mod unit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use abi::Roles;
 use abi::{
@@ -165,6 +166,12 @@ pub struct Applied {
     pub root: Root,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spent {
+    pub executing: Duration,
+    pub committing: Duration,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Layer {
     Confirmed,
@@ -183,6 +190,7 @@ where
     hook_streaks: BTreeMap<ProgramId, u64>,
     scheduler_streak: u64,
     roster_streak: u64,
+    spent: Spent,
 }
 
 #[derive(Clone, Default)]
@@ -413,6 +421,7 @@ where
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
+            spent: Spent::default(),
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -508,6 +517,7 @@ where
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
+            spent: Spent::default(),
         };
         host.sync_code()?;
         Ok(host)
@@ -543,6 +553,10 @@ where
             roles: &self.roles,
             preconfirmed: None,
         }
+    }
+
+    pub fn spent(&self) -> Spent {
+        self.spent
     }
 
     pub fn snapshot(&self) -> Result<Snapshot<E>> {
@@ -737,6 +751,7 @@ where
     }
 
     pub async fn apply(&mut self, block: Block) -> Result<Applied> {
+        let started = self.store.clock().current();
         let expected = self.next_height()?;
         let in_sequence = block.height == expected;
         if !in_sequence {
@@ -800,17 +815,25 @@ where
             self.record_epoch(next_epoch, block.height, block.time, &mut overlay, &stage)
                 .await?;
         }
-        self.commit(
-            Tip {
-                height: block.height,
-                id: block.id,
-            },
-            overlay,
-            stage,
-            admissions,
-            submissions,
-        )
-        .await
+        let executed = self.store.clock().current();
+        let applied = self
+            .commit(
+                Tip {
+                    height: block.height,
+                    id: block.id,
+                },
+                overlay,
+                stage,
+                admissions,
+                submissions,
+            )
+            .await;
+        let committed = self.store.clock().current();
+        self.spent = Spent {
+            executing: executed.duration_since(started).unwrap_or_default(),
+            committing: committed.duration_since(executed).unwrap_or_default(),
+        };
+        applied
     }
 }
 

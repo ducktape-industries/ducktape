@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use abi::Outcome;
 use abi::Scan;
@@ -15,8 +15,10 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver};
+use commonware_runtime::Clock;
 use commonware_runtime::Handle;
-use commonware_runtime::telemetry::metrics::{Counter, raw};
+use commonware_runtime::telemetry::metrics::histogram::Buckets;
+use commonware_runtime::telemetry::metrics::{Counter, Gauge, Histogram, MetricsExt as _, raw};
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
@@ -40,7 +42,7 @@ use crate::transport;
 use crate::view::{Current, Facts, View, Views};
 use crate::workspace::{Descriptor, Founding, Workspace};
 use crate::writer::{Command, Hold, Sync, Writer};
-use crate::{Client, Context, Daemon, Error, Logs, Result};
+use crate::{Client, Context, Daemon, Error, Logs, Result, millis};
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Delivery = (Arc<Block>, Exact);
@@ -555,7 +557,9 @@ async fn start<E: Context>(
         "the node is up"
     );
 
-    let (writer, commands) = Writer::new();
+    let writing = context.child("writer");
+    let tally = Tally::registered(&writing);
+    let (writer, commands) = Writer::new(tally.queued.clone());
     let (changes, fanout) = Changes::new(network.clone(), tip.height);
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
@@ -596,7 +600,7 @@ async fn start<E: Context>(
             commands,
             membership,
             tracker,
-            syncs: Syncs::registered(&context.child("writer")),
+            tally,
         };
         move |_| write(writing, deliveries)
     });
@@ -837,17 +841,21 @@ struct Writing<E: Context> {
     commands: mpsc::UnboundedReceiver<Command>,
     membership: Seating<E>,
     tracker: Tracker,
-    syncs: Syncs,
+    tally: Tally,
 }
 
-struct Syncs {
+struct Tally {
     served: Counter,
     abandoned: Counter,
+    queued: Gauge,
+    applying: Histogram,
+    commands: u64,
+    commanding: Duration,
 }
 
-impl Syncs {
-    fn registered<E: Context>(context: &E) -> Syncs {
-        Syncs {
+impl Tally {
+    fn registered<E: Context>(context: &E) -> Tally {
+        Tally {
             served: context.register(
                 "sync_served",
                 "state sync requests the writer answered",
@@ -858,8 +866,99 @@ impl Syncs {
                 "state sync requests the writer dropped unserved because their caller had gone",
                 raw::Counter::default(),
             ),
+            queued: context.register(
+                "queued_commands",
+                "commands sent to the writer and not yet taken",
+                raw::Gauge::default(),
+            ),
+            applying: context.histogram(
+                "block_apply_seconds",
+                "time from the writer taking a block to finishing with it",
+                Buckets::NETWORK,
+            ),
+            commands: 0,
+            commanding: Duration::ZERO,
         }
     }
+}
+
+struct Lap<'a, C> {
+    clock: &'a C,
+    at: SystemTime,
+}
+
+impl<'a, C: Clock> Lap<'a, C> {
+    fn start(clock: &'a C) -> Lap<'a, C> {
+        Lap {
+            clock,
+            at: clock.current(),
+        }
+    }
+
+    fn lap(&mut self) -> Duration {
+        let now = self.clock.current();
+        let spent = now.duration_since(self.at).unwrap_or_default();
+        self.at = now;
+        spent
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Phases {
+    total: Duration,
+    behind: Duration,
+    applying: Duration,
+    executing: Duration,
+    committing: Duration,
+    publishing: Duration,
+    recording: Duration,
+    waiting: Duration,
+    receipting: Duration,
+    seating: Duration,
+}
+
+impl Phases {
+    fn slow(&self, block_time_ms: u64) -> bool {
+        self.total > Duration::from_millis(block_time_ms)
+    }
+
+    fn verifying(&self) -> Duration {
+        self.applying
+            .saturating_sub(self.executing)
+            .saturating_sub(self.committing)
+    }
+}
+
+fn ms(spent: Duration) -> u64 {
+    spent.as_millis() as u64
+}
+
+fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
+    tally.applying.observe(phases.total.as_secs_f64());
+    if !phases.slow(block_time_ms) {
+        return;
+    }
+    tracing::warn!(
+        target: "ducktape::node",
+        event = "apply_slow",
+        height,
+        total_ms = ms(phases.total),
+        block_time_ms,
+        behind_ms = ms(phases.behind),
+        queued = tally.queued.get(),
+        commands = tally.commands,
+        commands_ms = ms(tally.commanding),
+        executing_ms = ms(phases.executing),
+        committing_ms = ms(phases.committing),
+        verifying_ms = ms(phases.verifying()),
+        publishing_ms = ms(phases.publishing),
+        recording_ms = ms(phases.recording),
+        summary_wait_ms = ms(phases.waiting),
+        receipting_ms = ms(phases.receipting),
+        seating_ms = ms(phases.seating),
+        reason = "block_time_exceeded",
+        "the writer took longer than a block time to apply a block"
+    );
 }
 
 enum Event<D = Delivery, C = Command> {
@@ -889,7 +988,7 @@ async fn write<E: Context>(mut writing: Writing<E>, deliveries: mpsc::UnboundedR
         let flow = match event {
             Event::Delivered(delivery) => delivered(&mut writing, &mut deliveries, delivery).await,
             Event::Unfed => unfed(&mut deliveries),
-            Event::Asked(command) => asked(&mut writing.node, &writing.syncs, command).await,
+            Event::Asked(command) => commanded(&mut writing, command).await,
         };
         match flow {
             Flow::Writing => {}
@@ -923,9 +1022,20 @@ async fn delivered<E: Context>(
     deliveries: &mut Option<mpsc::UnboundedReceiver<Delivery>>,
     (block, ack): Delivery,
 ) -> Flow {
-    match applied(writing, &block).await {
+    let daemon = writing.daemon.clone();
+    let mut whole = Lap::start(&daemon.context);
+    let mut phases = Phases {
+        behind: Duration::from_millis(millis(&daemon.context).saturating_sub(block.time)),
+        ..Phases::default()
+    };
+    match applied(writing, &block, &mut phases).await {
         Ok(Flow::Writing) => {
             ack.acknowledge();
+            phases.total = whole.lap();
+            let block_time_ms = daemon.network.cadence.block_time_ms();
+            reported(&phases, &writing.tally, block.height, block_time_ms);
+            writing.tally.commands = 0;
+            writing.tally.commanding = Duration::ZERO;
             Flow::Writing
         }
         Ok(Flow::Closing(closer)) => Flow::Closing(closer),
@@ -945,24 +1055,45 @@ async fn delivered<E: Context>(
     }
 }
 
-async fn asked<E: Context>(node: &mut Node<E>, syncs: &Syncs, command: Option<Command>) -> Flow {
+async fn commanded<E: Context>(writing: &mut Writing<E>, command: Option<Command>) -> Flow {
+    let clock = writing.daemon.clone();
+    asked(
+        &mut writing.node,
+        &mut writing.tally,
+        &clock.context,
+        command,
+    )
+    .await
+}
+
+async fn asked<E: Context>(
+    node: &mut Node<E>,
+    tally: &mut Tally,
+    clock: &E,
+    command: Option<Command>,
+) -> Flow {
     let Some(command) = command else {
         return Flow::Unasked;
     };
-    match command {
-        Command::Sync(sync) => synced(node, syncs, sync).await,
+    tally.queued.dec();
+    let mut lap = Lap::start(clock);
+    let flow = match command {
+        Command::Sync(sync) => synced(node, tally, sync).await,
         Command::Hold(hold) => held(hold).await,
         Command::Close(closer) => Flow::Closing(closer),
-    }
+    };
+    tally.commands += 1;
+    tally.commanding += lap.lap();
+    flow
 }
 
-async fn synced<E: Context>(node: &mut Node<E>, syncs: &Syncs, sync: Sync) -> Flow {
+async fn synced<E: Context>(node: &mut Node<E>, tally: &Tally, sync: Sync) -> Flow {
     if sync.reply.is_canceled() {
-        syncs.abandoned.inc();
+        tally.abandoned.inc();
         return Flow::Writing;
     }
     let served = statesync::serve(node, sync.request).await;
-    syncs.served.inc();
+    tally.served.inc();
     let _ = sync.reply.send(served);
     Flow::Writing
 }
@@ -1026,14 +1157,22 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
             reason = "blob_missing",
             "the block reads a blob this node lacks; the node fetches it and applies again"
         );
-        let fetched = writing.daemon.blobs.fetch(id, halo::Class::Critical);
+        let daemon = writing.daemon.clone();
+        let fetched = daemon.blobs.fetch(id, halo::Class::Critical);
         futures::pin_mut!(fetched);
         loop {
             let command = tokio::select! {
                 () = &mut fetched => break,
                 command = writing.commands.next() => command,
             };
-            match asked(&mut writing.node, &writing.syncs, command).await {
+            match asked(
+                &mut writing.node,
+                &mut writing.tally,
+                &daemon.context,
+                command,
+            )
+            .await
+            {
                 Flow::Writing => {}
                 Flow::Closing(closer) => return Ok(Held::Closing(closer)),
                 Flow::Unasked => return Ok(Held::Unasked),
@@ -1130,12 +1269,19 @@ async fn receipts_for<E: Context>(
     Ok(taken)
 }
 
-async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<Flow> {
+async fn applied<E: Context>(
+    writing: &mut Writing<E>,
+    block: &Block,
+    phases: &mut Phases,
+) -> Result<Flow> {
+    let clock = writing.daemon.clone();
+    let mut lap = Lap::start(&clock.context);
     let sequenced = match holding(writing, block).await? {
         Held::Sequenced(sequenced) => sequenced,
         Held::Closing(closer) => return Ok(Flow::Closing(closer)),
         Held::Unasked => return Ok(Flow::Unasked),
     };
+    phases.applying = lap.lap();
     let Writing {
         daemon,
         node,
@@ -1147,6 +1293,7 @@ async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
     published(node, daemon);
     daemon.votes.applied(block.digest(), block.height);
     daemon.tips.send_replace(block.height);
+    phases.publishing = lap.lap();
     let closes = daemon.network.closes_an_epoch(block.height);
     let replayed = matches!(sequenced, Sequenced::Replayed);
     let opens_an_epoch = !replayed && closes;
@@ -1157,7 +1304,11 @@ async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
         } => {
             let ran = crate::blocks::ran(block, &carried)?;
             let receipts = std::mem::take(&mut applied.submissions);
-            daemon.record(node, block, ran, Some(receipts)).await?;
+            let spent = node.host().spent();
+            phases.executing = spent.executing;
+            phases.committing = spent.committing;
+            phases.waiting = daemon.record(node, block, ran, Some(receipts)).await?;
+            phases.recording = lap.lap();
             daemon.publish(&applied);
             let validators = node.host().role(role::VALIDATORS)?;
             let members_written = applied
@@ -1177,10 +1328,12 @@ async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
                 .applied(block.height, &writes.unwrap_or_default());
             let reseated = members_written || closes;
             let receipted = receipts_for(daemon, node, block.height, due, reseated).await?;
+            phases.receipting = lap.lap();
             (receipted, members_written)
         }
         Sequenced::Replayed => {
             daemon.record_unrecorded(node, block).await?;
+            phases.recording = lap.lap();
             (Vec::new(), false)
         }
     };
@@ -1191,6 +1344,7 @@ async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
     if !opens_an_epoch {
         daemon.pool.offer(Offer::Due);
         daemon.relay.send(receipted.iter().map(Vec::as_slice));
+        phases.seating = lap.lap();
         return Ok(Flow::Writing);
     }
     let epoch = daemon.network.epoch_after(block.height);
@@ -1211,16 +1365,18 @@ async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
     tracker.track(epoch, &members);
     daemon.relay.send(receipted.iter().map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
+    phases.seating = lap.lap();
     Ok(Flow::Writing)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use futures::channel::mpsc;
 
-    use super::{Event, listing, next, rewrites};
+    use super::{Event, Phases, listing, next, rewrites};
 
     #[test]
     fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
@@ -1253,6 +1409,26 @@ mod tests {
         }
         let event = next(&mut deliveries, &mut asked).await;
         assert!(matches!(event, Event::Asked(Some(0))));
+    }
+
+    #[test]
+    fn a_block_is_slow_past_one_block_time_and_its_verifying_is_what_the_host_did_not_spend() {
+        let phases = Phases {
+            total: Duration::from_millis(1001),
+            applying: Duration::from_millis(900),
+            executing: Duration::from_millis(200),
+            committing: Duration::from_millis(300),
+            ..Phases::default()
+        };
+        assert!(phases.slow(1000));
+        assert!(!phases.slow(1001));
+        assert_eq!(phases.verifying(), Duration::from_millis(400));
+        let replayed = Phases {
+            applying: Duration::from_millis(5),
+            executing: Duration::from_millis(9),
+            ..Phases::default()
+        };
+        assert_eq!(replayed.verifying(), Duration::ZERO);
     }
 
     #[test]

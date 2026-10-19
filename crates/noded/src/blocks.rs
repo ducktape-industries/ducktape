@@ -3,6 +3,7 @@
 //! for a payload its caller asks for.
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use abi::Receipt;
 use arc_swap::ArcSwap;
@@ -237,16 +238,17 @@ impl<E: Context> Daemon<E> {
         block: &Block,
         ran: Ran,
         receipts: Option<Vec<Receipt>>,
-    ) -> Result<()> {
+    ) -> Result<Duration> {
         let proposer = self.proposer(node, block.height).await?;
         let kept = summarize(block, self.network.epoch_length, proposer, ran, receipts)?;
         let bytes = abi::encode(&kept);
         let hashes: Vec<[u8; 32]> = kept.block.txs.iter().map(|tx| tx.hash).collect();
-        self.summaries
-            .keep(block.height, block.digest(), bytes, &hashes)
+        let waited = self
+            .summaries
+            .keep(&self.context, block.height, block.digest(), bytes, &hashes)
             .await?;
         self.recent.keep(Arc::new(kept));
-        Ok(())
+        Ok(waited)
     }
 
     pub(crate) async fn record_unrecorded(&self, node: &Node<E>, block: &Block) -> Result<()> {
@@ -257,7 +259,8 @@ impl<E: Context> Daemon<E> {
         let ran = node::carried(block, &network)
             .map(|(frame, submission)| (frame, submission.id(), submission))
             .collect();
-        self.record(node, block, ran, None).await
+        self.record(node, block, ran, None).await?;
+        Ok(())
     }
 
     async fn proposer(&self, node: &Node<E>, height: u64) -> Result<Option<Vec<u8>>> {
