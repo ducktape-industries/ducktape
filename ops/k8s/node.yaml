@@ -1,5 +1,5 @@
 # The network's node: ducktape on its home, and the Service node-http that carries its HTTP port inside the cluster.
-# Applied by ops/k8s/deploy, which substitutes NETWORK and IMAGE.
+# Applied by ops/k8s/deploy, which substitutes NETWORK and IMAGE, and with HOST set binds both ports on that host address.
 apiVersion: v1
 kind: Service
 metadata:
@@ -38,10 +38,16 @@ spec:
       containers:
         - name: node
           image: IMAGE
+          ports:
+            - {name: http, containerPort: 8844}
+            - {name: halo, containerPort: 9100, protocol: UDP}
+          envFrom:
+            - secretRef: {name: egress, optional: true}
           resources:
             requests: {cpu: "8", memory: 2Gi}
           volumeMounts:
             - {name: home, mountPath: /data}
+            - {name: egress, mountPath: /secrets/egress, readOnly: true}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
@@ -50,3 +56,5 @@ spec:
         - name: home
           persistentVolumeClaim:
             claimName: home
+        - name: egress
+          secret: {secretName: egress, optional: true}

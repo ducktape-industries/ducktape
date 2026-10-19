@@ -19,7 +19,11 @@ scripts back a `make` target; see the repository `Makefile`.
   the registry on the cluster node (`DEPLOY_NODE`, default
   `fabrics@fabrics-1`, at its `127.0.0.1:5000`), and applies
   `k8s/network.yaml`: the namespace `NETWORK` and the claim `home`, whose
-  volume is kept when the claim is deleted.
+  volume is kept when the claim is deleted. It runs `kubectl` on the current
+  context, and `network.yaml` also holds the StorageClass
+  `local-path-retain` every network's claim uses.
+  [`../docs/found-a-network.md`](../docs/found-a-network.md) walks a
+  founding through these steps.
 - With `--found` it then applies `k8s/found.yaml`, a pod `found` that holds
   `home` at `/data` and runs nothing. Found the network into it, then
   delete it:
@@ -28,12 +32,25 @@ scripts back a `make` target; see the repository `Makefile`.
   kubectl -n NETWORK exec found -- ducktape identity
   kubectl cp founding NETWORK/found:/data/founding
   kubectl -n NETWORK exec found -- ducktape init /data/founding/founding.toml --halo node.example.org:9100
+  kubectl -n NETWORK exec -i found -- sh -c 'cat > /data/egress.toml' < egress.toml
   kubectl -n NETWORK delete pod found
   ```
 
-- Without it, it applies `k8s/tunnel.yaml` and `k8s/node.yaml`.
+- Without it, it applies `k8s/node.yaml`, and `k8s/tunnel.yaml` when the
+  namespace holds the Secret `tunnel`.
   `node.yaml` is the deployment `node`, one pod running the node on `home`,
-  and the Service `node-http` on the node's HTTP port, `8844`. `tunnel.yaml`
+  and the Service `node-http` on the node's HTTP port, `8844`. The node gets
+  each key of the Secret `egress`, when there is one, as an environment
+  variable and as a file under `/secrets/egress/`, for `egress.toml`'s
+  secrets. Its pod resolves names only through public resolvers
+  (`dnsPolicy: None`), so `egress.toml` names a cluster Service by its
+  ClusterIP, never by its DNS name.
+- With `HOST=IP`, `deploy` binds the node's HTTP port at `IP:HTTP_PORT`
+  (TCP) and its halo port at `IP:HALO_PORT` (UDP) on the machine that runs
+  the pod, 8844 and 9100 unless set: a network reached only on a host
+  address, such as a Tailscale IP, needs no tunnel. duckpond deploys with
+  `HOST=100.65.253.102`.
+- `tunnel.yaml`
   is the deployment `tunnel`: cloudflared, which carries `node-http`, and the
   WebSocket on it that peers dial, through a Cloudflare tunnel. The founding
   file's `address` is `wss://` and the tunnel's hostname. The node binds halo

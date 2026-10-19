@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Builds the node image from the source of a ducktape commit, pushes it to the cluster node's registry, and applies a network's node and tunnel.
-# Usage: ops/k8s/deploy NETWORK COMMIT [--found]
+# Usage: [HOST=IP [HTTP_PORT=8844] [HALO_PORT=9100]] ops/k8s/deploy NETWORK COMMIT [--found]
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-network=${1:?usage: ops/k8s/deploy NETWORK COMMIT [--found]}
-commit=$(git -C "$here" rev-parse --verify "${2:?usage: ops/k8s/deploy NETWORK COMMIT [--found]}^{commit}")
+usage="usage: [HOST=IP [HTTP_PORT=8844] [HALO_PORT=9100]] ops/k8s/deploy NETWORK COMMIT [--found]"
+network=${1:?$usage}
+commit=$(git -C "$here" rev-parse --verify "${2:?$usage}^{commit}")
 mode=${3:-}
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 tunnel_port=35311
 tag=${commit:0:12}
+host=${HOST:-}
+http_port=${HTTP_PORT:-8844}
+halo_port=${HALO_PORT:-9100}
 
 stage=$(mktemp -d)
 socket="$stage.ssh"
@@ -24,6 +28,13 @@ image="localhost:5000/ducktape:$tag@$(cat "$stage/digest")"
 render() {
   sed -e "s#NETWORK#$network#g" -e "s#image: IMAGE\$#image: $image#" "$here/$1"
 }
+bind() {
+  case $host in
+    "") cat ;;
+    *) sed -e "s#containerPort: 8844}#containerPort: 8844, hostIP: $host, hostPort: $http_port}#" \
+         -e "s#containerPort: 9100, protocol: UDP}#containerPort: 9100, protocol: UDP, hostIP: $host, hostPort: $halo_port}#" ;;
+  esac
+}
 render network.yaml | kubectl apply -f -
 case $mode in
   --found)
@@ -31,9 +42,10 @@ case $mode in
     kubectl -n "$network" wait pod/found --for=condition=Ready --timeout=5m
     ;;
   "")
-    render tunnel.yaml | kubectl apply -f -
-    render node.yaml | kubectl apply -f -
-    kubectl -n "$network" rollout status deployment/tunnel --timeout=5m
+    tunnel=$(kubectl -n "$network" get secret tunnel --ignore-not-found -o name)
+    if [ -n "$tunnel" ]; then render tunnel.yaml | kubectl apply -f -; fi
+    render node.yaml | bind | kubectl apply -f -
+    if [ -n "$tunnel" ]; then kubectl -n "$network" rollout status deployment/tunnel --timeout=5m; fi
     kubectl -n "$network" rollout status deployment/node --timeout=5m
     ;;
   *)

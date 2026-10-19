@@ -44,11 +44,16 @@ macOS on arm64: the prerelease `bin-<commit>` carries
 
 A founding file names the network, its cadence, its validators and the
 programs it starts with. Every path is relative to the file.
-[programs](https://github.com/ducktape-industries/programs) publishes a
-founding for each commit on its `main`: the release `wasm-<commit>` carries
-`founding.tar.gz`, which holds every program it builds, packed with its
-view, and a `founding.toml` with only its network, time, key, address and
-halo address left to fill. The fields:
+programs' `make wasm-founding` packs a founding: `founding.tar.gz` holds
+every program it builds, packed with its view, and a `founding.toml` with
+only its network, time, key, address and halo address left to fill. A local
+network founds from the one
+[programs](https://github.com/ducktape-industries/programs) publishes for
+each commit on its `main`, in the GitHub release `wasm-<commit>`. A hosted
+network never does: it founds from `make wasm-founding` run at a commit on
+forge `programs` `dev` (`AGENTS.md` § Branching and Delivery), and
+[`docs/found-a-network.md`](docs/found-a-network.md) walks it through every
+step, from the founding to agents that answer. The fields:
 
 ```toml
 network = "mynet"
@@ -226,6 +231,8 @@ through the programs role like any other change.
 
 ```sh
 curl -fsSL https://github.com/ducktape-industries/programs/releases/download/wasm-<commit>/founding.tar.gz | tar xz
+# a hosted network instead: make -C programs wasm-founding at a forge dev commit, then
+# tar xzf programs/target/wasm32-unknown-unknown/release/founding.tar.gz
 ducktape identity                                   # mint this workspace's node key
 $EDITOR founding/founding.toml                      # network, time (`date +%s000`), that key, this node's address
 ducktape init founding/founding.toml --halo a.example.org:9100   # found the network in $DUCKTAPE_HOME
@@ -326,8 +333,8 @@ relay = true                  # answer `relay` requests
 http = true                   # answer `http` requests, to the public internet
 private = false               # optional: let `http` reach loopback, private and link-local addresses
 
-[services.ccs]                # a registered service this node fronts
-base = "http://127.0.0.1:4141"
+[services.anthropic]          # a registered service this node fronts; an agent's model record names it
+base = "http://127.0.0.1:4141"   # a model gateway, such as ccs
 secrets = { x-api-key = "CCS_KEY" }   # header = the environment variable holding its value
 
 [services.pods]
