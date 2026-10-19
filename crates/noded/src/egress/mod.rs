@@ -16,8 +16,8 @@ use futures::channel::mpsc;
 use host::{Layer, Tip};
 use node::{Frame, Preconfirm, Source, Taken};
 
-pub use config::{Config, Refused};
-pub use station::Station;
+pub use config::{Config, Refused, Withheld, withheld};
+pub use station::{Planned, Station, Tally};
 
 use crate::egress::call::Caller;
 use crate::egress::desk::{Called, Desk, Purpose, Reading, Sent, Step};

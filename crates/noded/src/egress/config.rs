@@ -74,6 +74,8 @@ pub enum Refused {
     Unfit { service: String },
     #[error("the HTTP client does not build: {0}")]
     Client(#[source] reqwest::Error),
+    #[error("egress.toml was not written: {0}")]
+    Unwritten(#[source] std::io::Error),
 }
 
 impl Refused {
@@ -86,9 +88,41 @@ impl Refused {
             | Refused::Reserved { .. }
             | Refused::Base { .. }
             | Refused::Unfit { .. } => reason::INVALID_INPUT,
-            Refused::Client(_) => reason::UNSUPPORTED,
+            Refused::Client(_) | Refused::Unwritten(_) => reason::UNSUPPORTED,
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Withheld {
+    #[error(
+        "{service} carries secrets, which a set never names: a secret stays with a proxy in the cluster that holds it"
+    )]
+    Secrets { service: String },
+    #[error(
+        "private = true lets http reach private addresses, which only the node's own key may set"
+    )]
+    Private,
+}
+
+impl Withheld {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Withheld::Secrets { .. } => reason::INVALID_INPUT,
+            Withheld::Private => reason::UNAUTHORIZED,
+        }
+    }
+}
+
+pub fn withheld(text: &str) -> Result<Vec<Withheld>, Refused> {
+    let file: File = toml::from_str(text)?;
+    let private = file.private.then_some(Withheld::Private);
+    let secreted = file
+        .services
+        .into_iter()
+        .filter(|(_, settings)| !settings.secrets.is_empty())
+        .map(|(service, _)| Withheld::Secrets { service });
+    Ok(private.into_iter().chain(secreted).collect())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

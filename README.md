@@ -281,7 +281,7 @@ leave. Each prints the block that carried it.
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
 from, the address its HTTP surface bound, the runtime's storage and, when the
-operator writes them, `node.toml` and `egress.toml`. Under `schemas/` the
+operator writes them, `node.toml`, `egress.toml` and `egress-grants`. Under `schemas/` the
 CLI keeps the schema section of each program code it has spoken to in JSON,
 named by the code's id, so `ducktape query` and `ducktape op` fetch a code
 from the node once, not on every call; an id names its bytes, so a kept
@@ -374,6 +374,26 @@ differs from the new list. A request already being called finishes against the
 service it started with. If the file does not load (it does not parse, a
 variable is not set, a secret file does not read), the node refuses the reload
 with the reason and the problem, and it keeps serving what it served before.
+
+`ducktape egress set FILE` sends the running node a whole `egress.toml`
+instead, over `/v1/egress/set`. The node loads it as a reload loads the file.
+With `--dry` it changes nothing; otherwise it writes the text as its
+`egress.toml` (a new file renamed over the old) and serves it from the next
+request on. It answers how many services it then serves and how many are
+added, removed and changed, and for each service whether its base answers a
+plain `GET` from this node (with any status) or fails, and why. A text that
+does not load is refused as a reload is, and the node keeps its file and what
+it serves. The CLI signs with the active wallet key, or with the node's own
+key under `--node-key`. The node takes the set from its own key or from a key
+the workspace's `egress-grants` file lists (one public key in hex per line),
+which it reads again at each set, so a grant takes effect without a restart.
+It refuses every other signer as `unauthorized`. A set carries no secrets:
+one whose services name any `secrets` entry, a variable or a file, is
+refused as `invalid_input` whoever signs it, naming the service. A secret
+reaches `egress.toml` only when the operator writes it there; a service
+that needs one sits behind a proxy in the cluster that holds it. Only the
+node's own key may set `private = true`; from a granted key the set is
+refused as `unauthorized`, naming `private`.
 
 A service request goes to `base` joined with its path; a path that would leave
 `base` fails. The node adds the service's secrets, and it adds

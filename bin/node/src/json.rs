@@ -8,7 +8,7 @@ use borsh_json::Interface;
 use commonware_cryptography::{Signer as _, ed25519};
 use host::Layer;
 use node::{Frame, Preconfirm};
-use noded::wire::{Status, Submitted};
+use noded::wire::{EgressPlan, Reached, Status, Submitted};
 use noded::{Client, Workspace};
 use programs_sdk::abi::Scheme;
 use serde_json::{Map, Value, json};
@@ -131,6 +131,30 @@ pub fn reply(interface: &Interface, program: &str, answer: &[u8]) -> Result<Valu
             hex::encode(answer)
         )
     })
+}
+
+pub fn egress(plan: &EgressPlan) -> Value {
+    let reach: Map<String, Value> = plan
+        .reach
+        .iter()
+        .map(|(name, reached)| (name.clone(), json!(reached_text(reached))))
+        .collect();
+    json!({
+        "tally": {
+            "served": plan.served,
+            "added": plan.added,
+            "removed": plan.removed,
+            "changed": plan.changed,
+        },
+        "reach": reach,
+    })
+}
+
+fn reached_text(reached: &Reached) -> String {
+    match reached {
+        Reached::Answered(status) => format!("answered {status}"),
+        Reached::Failed(why) => format!("failed: {why}"),
+    }
 }
 
 pub struct Sent<'a> {

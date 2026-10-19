@@ -6,6 +6,7 @@ use node::Preconfirm;
 
 pub const NODE_CONTRACT: u32 = 9;
 pub const ADMIN: &str = "$admin";
+pub const EGRESS: &str = "$egress";
 
 pub mod route {
     pub const STATUS: &str = "/v1/status";
@@ -29,6 +30,7 @@ pub mod route {
     pub const ACTIVITY: &str = "/v1/activity";
     pub const LOGS: &str = "/v1/logs";
     pub const ADMIN: &str = "/v1/admin";
+    pub const EGRESS_SET: &str = "/v1/egress/set";
     pub const SYNC: &str = "/v1/sync";
     pub const NETWORK: &str = "/v1/network";
     pub const P2P: &str = "/v1/p2p";
@@ -99,6 +101,27 @@ pub enum Admin {
     Shutdown,
     LogFilter(String),
     EgressReload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct EgressSet {
+    pub text: String,
+    pub dry: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct EgressPlan {
+    pub served: u64,
+    pub added: u64,
+    pub removed: u64,
+    pub changed: u64,
+    pub reach: Vec<(String, Reached)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Reached {
+    Answered(u16),
+    Failed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

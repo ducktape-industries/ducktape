@@ -14,7 +14,7 @@ use commonware_runtime::tokio::{Config, Runner};
 use futures::StreamExt as _;
 use host::{Layer, RECENT};
 use node::{Frame, Preconfirm};
-use noded::wire::{Admin, Submitted};
+use noded::wire::{Admin, EgressSet, Submitted};
 use noded::{
     Client, ConsensusSettings, CpuList, Endpoint, HaloConfig, LoadConfig, LoadSettings, Logs,
     NodeConfig, Settings, Upload, Workspace,
@@ -460,6 +460,18 @@ enum EgressVerb {
                  an invalid file leaves what it serves unchanged"
     )]
     Reload,
+    #[command(
+        about = "send the running node a whole egress.toml to serve, signed by the active wallet \
+                 key or, with --node-key, the node's own; prints what it changes and whether each \
+                 service's base answers from the node. With --dry nothing changes"
+    )]
+    Set {
+        file: PathBuf,
+        #[arg(long)]
+        dry: bool,
+        #[arg(long)]
+        node_key: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -892,6 +904,29 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         Verb::Egress(EgressVerb::Reload) => {
             let frame = admin(workspace, client, Admin::EgressReload).await?;
             client.admin(frame).await.sentence()
+        }
+        Verb::Egress(EgressVerb::Set {
+            file,
+            dry,
+            node_key,
+        }) => {
+            let text = std::fs::read_to_string(&file).sentence()?;
+            let key = match node_key {
+                true => workspace.identity().sentence()?,
+                false => signer(workspace)?,
+            };
+            let status = client.status().await.sentence()?;
+            let frame = Frame::sign(
+                &key,
+                status.network.as_bytes(),
+                status.anchor(),
+                None,
+                noded::wire::EGRESS,
+                abi::encode(&EgressSet { text, dry }),
+            );
+            let plan = client.egress_set(frame.encode()).await.sentence()?;
+            json::print(&json::egress(&plan));
+            Ok(())
         }
         Verb::Metrics => {
             print!("{}", client.metrics().await.sentence()?);

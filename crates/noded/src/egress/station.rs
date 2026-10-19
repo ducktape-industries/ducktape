@@ -1,5 +1,5 @@
 //! What this node serves through egress and the HTTP clients that reach it, loaded from
-//! `egress.toml` when the node starts and again on each `ducktape egress reload`.
+//! `egress.toml` when the node starts, on each `ducktape egress reload` and from each `egress set`.
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -9,6 +9,7 @@ use crate::Workspace;
 use crate::egress::TARGET;
 use crate::egress::call::Clients;
 use crate::egress::config::{Config, Refused};
+use crate::wire::Reached;
 
 pub struct Serving {
     pub config: Config,
@@ -20,6 +21,27 @@ impl Serving {
         let config = workspace.egress()?;
         let clients = Clients::new(config.reach)?;
         Ok(Serving { config, clients })
+    }
+}
+
+pub struct Planned {
+    serving: Serving,
+    text: String,
+    pub tally: Tally,
+}
+
+impl Planned {
+    pub async fn reach(&self) -> Vec<(String, Reached)> {
+        let clients = &self.serving.clients;
+        let calls =
+            self.serving
+                .config
+                .services
+                .iter()
+                .map(|(name, upstream)| async move {
+                    (name.clone(), clients.reach(&upstream.base).await)
+                });
+        futures::future::join_all(calls).await
     }
 }
 
@@ -61,6 +83,39 @@ impl Station {
             "the node re-read egress.toml"
         );
         Ok(())
+    }
+
+    pub fn grants(&self) -> std::io::Result<Vec<Vec<u8>>> {
+        self.workspace.egress_grants()
+    }
+
+    pub fn plan(&self, text: String) -> Result<Planned, Refused> {
+        let config = self.workspace.egress_from(&text)?;
+        let clients = Clients::new(config.reach)?;
+        let tally = Tally::between(&self.current().config, &config);
+        Ok(Planned {
+            serving: Serving { config, clients },
+            text,
+            tally,
+        })
+    }
+
+    pub fn put(&self, planned: Planned) -> Result<Tally, Refused> {
+        self.workspace
+            .write_egress(&planned.text)
+            .map_err(Refused::Unwritten)?;
+        self.serving.send_replace(Arc::new(planned.serving));
+        let tally = planned.tally;
+        tracing::info!(
+            target: TARGET,
+            event = "egress_set",
+            served = tally.served,
+            added = tally.added,
+            removed = tally.removed,
+            changed = tally.changed,
+            "the node serves the egress.toml it was sent"
+        );
+        Ok(tally)
     }
 
     pub fn current(&self) -> Arc<Serving> {

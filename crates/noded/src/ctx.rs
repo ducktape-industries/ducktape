@@ -23,6 +23,12 @@ pub(crate) struct Ctx<E: Context> {
 
 pub(crate) struct Stopped(Error);
 
+pub(crate) enum EgressSigner {
+    Node,
+    Granted,
+    Stranger,
+}
+
 impl IntoResponse for Stopped {
     fn into_response(self) -> Response {
         (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
@@ -133,6 +139,32 @@ impl<E: Context> Ctx<E> {
 
     pub(crate) fn reload_egress(&self) -> std::result::Result<(), crate::egress::Refused> {
         self.daemon.egress.reload()
+    }
+
+    pub(crate) fn egress_signer(&self, signer: &[u8]) -> std::io::Result<EgressSigner> {
+        let own = signer == self.daemon.identity.as_slice();
+        if own {
+            return Ok(EgressSigner::Node);
+        }
+        let grants = self.daemon.egress.grants()?;
+        match grants.iter().any(|key| key.as_slice() == signer) {
+            true => Ok(EgressSigner::Granted),
+            false => Ok(EgressSigner::Stranger),
+        }
+    }
+
+    pub(crate) fn plan_egress(
+        &self,
+        text: String,
+    ) -> std::result::Result<crate::egress::Planned, crate::egress::Refused> {
+        self.daemon.egress.plan(text)
+    }
+
+    pub(crate) fn put_egress(
+        &self,
+        planned: crate::egress::Planned,
+    ) -> std::result::Result<crate::egress::Tally, crate::egress::Refused> {
+        self.daemon.egress.put(planned)
     }
 
     pub(crate) async fn metrics(self) -> Result<String> {

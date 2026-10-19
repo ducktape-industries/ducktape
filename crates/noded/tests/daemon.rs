@@ -20,7 +20,10 @@ use futures::channel::oneshot;
 use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
-use noded::wire::{Admin, BlockAsk, BlockRef, Blocks, Change, Submitted, TxAsk, TxRef};
+use noded::wire::{
+    Admin, BlockAsk, BlockRef, Blocks, Change, EgressPlan, EgressSet, Reached, Submitted, TxAsk,
+    TxRef,
+};
 use noded::{
     Client, Endpoint, HaloConfig, Listen, Listeners, LoadConfig, Logs, Running, Upload, Workspace,
 };
@@ -2183,6 +2186,143 @@ fn a_running_node_serves_what_each_egress_reload_reads_and_keeps_its_services_on
             matches!(&gone, Outcome::Rejected(refusal) if refusal.reason == reason::NOT_FOUND),
             "{gone:?}"
         );
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+const GRANTEE_SEED: u64 = 31;
+
+async fn set_egress(
+    client: &Client,
+    key: &ed25519::PrivateKey,
+    text: &str,
+    dry: bool,
+) -> noded::Result<EgressPlan> {
+    let anchor = client.status().await.unwrap().anchor();
+    let asked = EgressSet {
+        text: text.to_owned(),
+        dry,
+    };
+    let frame = Frame::sign(
+        key,
+        NETWORK.as_bytes(),
+        anchor,
+        None,
+        noded::wire::EGRESS,
+        abi::encode(&asked),
+    );
+    client.egress_set(frame.encode()).await
+}
+
+fn served_file(seat: &Seat) -> Option<String> {
+    std::fs::read_to_string(seat.workspace.dir().join("egress.toml")).ok()
+}
+
+#[test]
+fn an_egress_set_from_a_granted_key_serves_its_text_after_a_dry_run_that_says_whether_each_base_answers()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let grantee = ed25519::PrivateKey::from_seed(GRANTEE_SEED);
+
+    client_runtime().block_on(async {
+        let echo = upstream().await;
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut changes = client.changes("egress").await.unwrap();
+        let both = format!(
+            "[services.echo]\nbase = \"http://{echo}\"\n[services.gone]\nbase = \"http://{closed}\"\n"
+        );
+        let Err(noded::Error::Refused(refusal)) = set_egress(&client, &grantee, &both, true).await
+        else {
+            panic!("a key egress-grants does not list is refused");
+        };
+        assert_eq!(refusal.reason, reason::UNAUTHORIZED);
+        std::fs::write(
+            seat.workspace.dir().join("egress-grants"),
+            format!("{}\n", hex::encode(grantee.public_key().as_ref())),
+        )
+        .unwrap();
+
+        let dry = set_egress(&client, &grantee, &both, true).await.unwrap();
+        assert_eq!((dry.served, dry.added, dry.removed, dry.changed), (2, 2, 0, 0));
+        assert_eq!(dry.reach[0], ("echo".to_owned(), Reached::Answered(404)));
+        assert!(
+            matches!(&dry.reach[1], (name, Reached::Failed(_)) if name == "gone"),
+            "{:?}",
+            dry.reach
+        );
+        assert_eq!(served_file(&seat), None);
+        let unserved = request(&client, "echo").await;
+        assert!(
+            matches!(&unserved, Outcome::Rejected(refusal) if refusal.reason == reason::NOT_FOUND),
+            "{unserved:?}"
+        );
+
+        let stranger = ed25519::PrivateKey::from_seed(PUTTER_SEED);
+        let Err(noded::Error::Refused(refusal)) = set_egress(&client, &stranger, &both, false).await
+        else {
+            panic!("a key egress-grants does not list is refused");
+        };
+        assert_eq!(refusal.reason, reason::UNAUTHORIZED);
+
+        let seed = format!(
+            "[services.echo]\nbase = \"http://{echo}\"\nsecrets = {{ x-seed = {{ file = \"identity.key\" }} }}\n"
+        );
+        let variable = format!(
+            "[services.echo]\nbase = \"http://{echo}\"\nsecrets = {{ x-api-key = \"PATH\" }}\n"
+        );
+        let private = "http = true\nprivate = true\n";
+        let refusals = [
+            (&grantee, seed.as_str(), reason::INVALID_INPUT, "echo carries secrets"),
+            (&seat.identity, seed.as_str(), reason::INVALID_INPUT, "echo carries secrets"),
+            (&grantee, variable.as_str(), reason::INVALID_INPUT, "echo carries secrets"),
+            (&seat.identity, variable.as_str(), reason::INVALID_INPUT, "echo carries secrets"),
+            (&grantee, private, reason::UNAUTHORIZED, "private"),
+        ];
+        for (key, text, refused, named) in refusals {
+            let Err(noded::Error::Refused(refusal)) = set_egress(&client, key, text, true).await
+            else {
+                panic!("a set naming {named} is refused");
+            };
+            assert_eq!(refusal.reason, refused);
+            assert!(refusal.sentence.contains(named), "{}", refusal.sentence);
+        }
+        let own = set_egress(&client, &seat.identity, private, true).await.unwrap();
+        assert_eq!(own.served, 1);
+
+        let echo_only = format!("[services.echo]\nbase = \"http://{echo}\"\n");
+        let set = set_egress(&client, &grantee, &echo_only, false).await.unwrap();
+        assert_eq!((set.served, set.added), (1, 1));
+        recorded(&client, &mut changes, &seat.key(), &["echo"]).await;
+        pinged(&client, &mut changes, "echo").await;
+        assert_eq!(served_file(&seat), Some(echo_only.clone()));
+
+        let Err(noded::Error::Refused(refusal)) =
+            set_egress(&client, &grantee, "relya = true\n", false).await
+        else {
+            panic!("a file that does not parse is refused");
+        };
+        assert_eq!(refusal.reason, reason::INVALID_INPUT);
+        pinged(&client, &mut changes, "echo").await;
+        assert_eq!(served_file(&seat), Some(echo_only.clone()));
+
+        std::fs::write(seat.workspace.dir().join("egress-grants"), "zz\n").unwrap();
+        let Err(noded::Error::Refused(refusal)) =
+            set_egress(&client, &grantee, &echo_only, true).await
+        else {
+            panic!("a grants file that does not read refuses a granted key");
+        };
+        assert_eq!(refusal.reason, reason::CORRUPT);
+        let own = set_egress(&client, &seat.identity, &echo_only, true).await.unwrap();
+        assert_eq!(own.served, 1);
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();

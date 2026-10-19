@@ -37,6 +37,36 @@ fn a_config_names_what_it_serves_and_reads_each_services_secrets_from_the_enviro
 }
 
 #[test]
+fn a_set_names_its_secrets_and_private_reach() {
+    let plain = "relay = true\n[services.pods]\nbase = \"http://127.0.0.1:1\"\n";
+    assert_eq!(withheld(plain).unwrap(), []);
+    assert_eq!(
+        withheld(TEXT).unwrap(),
+        [Withheld::Secrets {
+            service: "ccs".into()
+        }]
+    );
+    let filed = "private = true\n[services.ccs]\nbase = \"https://elsewhere.example\"\n\
+                 secrets = { x-seed = { file = \"identity.key\" } }\n";
+    let found = withheld(filed).unwrap();
+    assert_eq!(
+        found,
+        [
+            Withheld::Private,
+            Withheld::Secrets {
+                service: "ccs".into(),
+            },
+        ]
+    );
+    assert_eq!(found[0].reason(), reason::UNAUTHORIZED);
+    assert_eq!(found[1].reason(), reason::INVALID_INPUT);
+    assert!(matches!(
+        withheld("relya = true"),
+        Err(Refused::Unparsed(_))
+    ));
+}
+
+#[test]
 fn an_unset_variable_a_reserved_name_or_a_base_that_is_not_a_plain_url_is_refused() {
     let unset = Config::parse(TEXT, |_| None, unread).unwrap_err();
     let Refused::Unset { variable, .. } = &unset else {

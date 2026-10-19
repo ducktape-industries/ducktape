@@ -203,6 +203,10 @@ impl Client {
         self.post_raw(route::ADMIN, frame).await
     }
 
+    pub async fn egress_set(&self, frame: Vec<u8>) -> Result<crate::wire::EgressPlan> {
+        self.post_raw(route::EGRESS_SET, frame).await
+    }
+
     pub async fn metrics(&self) -> Result<String> {
         let response = self.http.get(self.url(route::METRICS)).send().await?;
         Ok(response.error_for_status()?.text().await?)

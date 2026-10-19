@@ -20,10 +20,10 @@ use node::{BLOCK_BYTES, Preconfirm, Taken};
 use statesync::Request as SyncRequest;
 
 use crate::changes::{self, Fanout, Published, Subscription};
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, EgressSigner};
 use crate::wire::{
-    Admin, BlockAsk, Blocks, Finalized, Get, Located, Network, Page, Query, Range, Submit,
-    Submitted, TxAsk, route,
+    Admin, BlockAsk, Blocks, EgressPlan, EgressSet, Finalized, Get, Located, Network, Page, Query,
+    Range, Submit, Submitted, TxAsk, route,
 };
 use crate::{Context, Daemon, cores, offload};
 
@@ -133,6 +133,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::ACTIVITY, post(activity::<E>))
         .route(route::LOGS, get(logs::<E>))
         .route(route::ADMIN, post(admin::<E>))
+        .route(route::EGRESS_SET, post(egress_set::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::METRICS, get(metrics::<E>))
         .route(live_wire::PORT_ROUTE, get(live_port::<E>))
@@ -662,6 +663,89 @@ async fn admin<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<()> {
             Ok(()) => Reply::Answered(()),
             Err(refused) => Reply::Refused(Refusal::new(refused.reason(), refused.to_string())),
         },
+    }
+}
+
+async fn egress_set<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<EgressPlan> {
+    let submission = match node::verify(&body, &ctx.network_id()) {
+        Ok(submission) => submission,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    let addressed_to_egress = submission.target == crate::wire::EGRESS;
+    if !addressed_to_egress {
+        return Reply::Refused(Refusal::new(
+            reason::INVALID_INPUT,
+            "an egress set is addressed to $egress",
+        ));
+    }
+    let signer = match ctx.egress_signer(&submission.signer) {
+        Ok(signer) => signer,
+        Err(error) => {
+            return Reply::Refused(Refusal::new(
+                reason::CORRUPT,
+                format!("the workspace's egress-grants does not read: {error}"),
+            ));
+        }
+    };
+    if let EgressSigner::Stranger = signer {
+        return Reply::Refused(Refusal::new(
+            reason::UNAUTHORIZED,
+            "an egress set is signed by the node's own key or a key the workspace's egress-grants lists",
+        ));
+    }
+    let fresh = match ctx.view().source().fresh(&submission) {
+        Ok(fresh) => fresh,
+        Err(error) => return failed(error),
+    };
+    if let Err(refusal) = fresh {
+        return Reply::Refused(refusal);
+    }
+    let asked: EgressSet = match abi::decode(&submission.payload) {
+        Ok(asked) => asked,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    if let Some(refusal) = withheld_from(&signer, &asked.text) {
+        return Reply::Refused(refusal);
+    }
+    let planned = match ctx.plan_egress(asked.text) {
+        Ok(planned) => planned,
+        Err(refused) => return Reply::Refused(Refusal::new(refused.reason(), refused.to_string())),
+    };
+    let reach = planned.reach().await;
+    let tally = match asked.dry {
+        true => planned.tally,
+        false => match ctx.put_egress(planned) {
+            Ok(tally) => tally,
+            Err(refused) => {
+                return Reply::Refused(Refusal::new(refused.reason(), refused.to_string()));
+            }
+        },
+    };
+    Reply::Answered(EgressPlan {
+        served: tally.served as u64,
+        added: tally.added as u64,
+        removed: tally.removed as u64,
+        changed: tally.changed as u64,
+        reach,
+    })
+}
+
+fn withheld_from(signer: &EgressSigner, text: &str) -> Option<Refusal> {
+    let found = match crate::egress::withheld(text) {
+        Ok(found) => found,
+        Err(refused) => return Some(Refusal::new(refused.reason(), refused.to_string())),
+    };
+    found
+        .into_iter()
+        .find(|withheld| refused_for(signer, withheld))
+        .map(|withheld| Refusal::new(withheld.reason(), withheld.to_string()))
+}
+
+fn refused_for(signer: &EgressSigner, withheld: &crate::egress::Withheld) -> bool {
+    match (withheld, signer) {
+        (crate::egress::Withheld::Secrets { .. }, _) => true,
+        (crate::egress::Withheld::Private, EgressSigner::Granted) => true,
+        (crate::egress::Withheld::Private, EgressSigner::Node | EgressSigner::Stranger) => false,
     }
 }
 

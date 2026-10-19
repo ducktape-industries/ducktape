@@ -23,6 +23,8 @@ const ANCHOR: &str = "anchor";
 const HTTP: &str = "http";
 const RUNTIME: &str = "runtime";
 const EGRESS: &str = "egress.toml";
+const EGRESS_FRESH: &str = "egress.toml.fresh";
+const EGRESS_GRANTS: &str = "egress-grants";
 const NODE: &str = "node.toml";
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -118,11 +120,41 @@ impl Workspace {
             }
             Err(error) => return Err(EgressRefused::Unread(error)),
         };
+        self.egress_from(&text)
+    }
+
+    pub(crate) fn egress_from(
+        &self,
+        text: &str,
+    ) -> std::result::Result<EgressConfig, EgressRefused> {
         EgressConfig::parse(
-            &text,
+            text,
             |variable| std::env::var(variable).ok(),
             |file| std::fs::read_to_string(self.dir.join(file)),
         )
+    }
+
+    pub(crate) fn write_egress(&self, text: &str) -> std::io::Result<()> {
+        let fresh = self.dir.join(EGRESS_FRESH);
+        std::fs::write(&fresh, text)?;
+        std::fs::rename(fresh, self.dir.join(EGRESS))
+    }
+
+    pub(crate) fn egress_grants(&self) -> std::io::Result<Vec<Vec<u8>>> {
+        let text = match std::fs::read_to_string(self.dir.join(EGRESS_GRANTS)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                hex::decode(line).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{line}: {error}"))
+                })
+            })
+            .collect()
     }
 
     pub fn settings_file(&self) -> PathBuf {

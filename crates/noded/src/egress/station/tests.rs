@@ -68,6 +68,51 @@ fn a_file_that_does_not_load_leaves_the_services_served_before() {
 }
 
 #[test]
+fn a_plan_serves_nothing_and_a_put_writes_the_file_and_serves_it() {
+    let (_dir, workspace) = workspace();
+    write(&workspace, "relay = true\n");
+    let station = Station::open(workspace.clone()).unwrap();
+    let text = "http = true\n[services.pods]\nbase = \"http://127.0.0.1:1\"\n";
+    let planned = station.plan(text.to_owned()).unwrap();
+    assert_eq!(
+        planned.tally,
+        Tally {
+            served: 2,
+            added: 2,
+            removed: 1,
+            changed: 0,
+        }
+    );
+    assert_eq!(served(&station), ["relay"]);
+    let mut sets = station.subscribe();
+    sets.borrow_and_update();
+    station.put(planned).unwrap();
+    assert!(sets.has_changed().unwrap());
+    assert_eq!(served(&station), ["http", "pods"]);
+    let written = std::fs::read_to_string(workspace.dir().join("egress.toml")).unwrap();
+    assert_eq!(written, text);
+    let unparsed = station.plan("relya = true\n".to_owned());
+    assert!(
+        matches!(unparsed, Err(Refused::Unparsed(_))),
+        "{:?}",
+        unparsed.err()
+    );
+}
+
+#[test]
+fn the_grants_are_read_from_the_workspace_at_each_ask() {
+    let (_dir, workspace) = workspace();
+    let station = Station::open(workspace.clone()).unwrap();
+    assert!(station.grants().unwrap().is_empty());
+    let grants = workspace.dir().join("egress-grants");
+    std::fs::write(&grants, "0a0b\n\n  0c  \n").unwrap();
+    assert_eq!(station.grants().unwrap(), [vec![0x0a, 0x0b], vec![0x0c]]);
+    std::fs::write(&grants, "zz\n").unwrap();
+    let unread = station.grants().unwrap_err();
+    assert_eq!(unread.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn a_tally_counts_names_added_removed_and_services_whose_upstream_changed() {
     let parse = |text: &str| Config::parse(text, |_| None, |_| Ok(String::new())).unwrap();
     let was = parse(

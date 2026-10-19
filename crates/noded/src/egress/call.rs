@@ -13,6 +13,7 @@ use url::Url;
 use crate::egress::config::{Config, Reach, Refused, Upstream};
 use crate::egress::desk::Called;
 use crate::egress::stream::Splitter;
+use crate::wire::Reached;
 
 const EVENT_STREAM: &str = "text/event-stream";
 
@@ -32,6 +33,13 @@ impl Clients {
             internet: built(internet)?,
             services: built(builder())?,
         })
+    }
+
+    pub async fn reach(&self, base: &Url) -> Reached {
+        match self.services.get(base.clone()).send().await {
+            Ok(response) => Reached::Answered(response.status().as_u16()),
+            Err(error) => Reached::Failed(unreached(base, error)),
+        }
     }
 }
 
