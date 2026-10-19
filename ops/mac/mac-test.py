@@ -174,16 +174,20 @@ class Door(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.headers.get("authorization") != "Bearer t0k":
             return self.reply(401, {"error": "the door's token is required"})
-        self.reply(200, {"nodes": [{"id": "phone:chat/attach", "role": "Button", "name": "Attach"}]})
+        if self.path != "/inspect/tree":
+            return self.reply(404, {"error": f"{self.path} is not a route"})
+        self.reply(200, [{"id": "phone:chat/attach", "role": "button", "label": "Attach"}])
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
-        if self.path == "/wait" and body.get("name") == "hold":
+        if self.path == "/inspect/wait" and body.get("label") == "hold":
             open(pathlib.Path(os.environ["FAKE_SIM"]) / "hold").close()
-            return self.reply(200, {"node": {"id": "phone:hold", "name": "hold"}})
-        if self.path == "/wait" and body.get("name") == "missing":
-            return self.reply(408, {"error": f"nothing matched within {body['deadline_ms']} ms", "tree": [{"id": "phone:chat/attach", "name": "Attach"}]})
-        if self.path == "/wait":
-            return self.reply(200, {"node": {"id": "phone:chat/" + body["name"].lower(), "role": body.get("role"), "name": body["name"]}})
+            return self.reply(200, {"node": {"id": "phone:hold", "label": "hold"}})
+        if self.path == "/inspect/wait" and body.get("label") == "missing":
+            return self.reply(408, {"error": f"nothing matched within {body['deadline_ms']} ms", "tree": [{"id": "phone:chat/attach", "label": "Attach"}]})
+        if self.path == "/inspect/wait":
+            return self.reply(200, {"node": {"id": "phone:chat/" + body["label"].lower(), "role": body.get("role"), "label": body["label"]}})
+        if self.path not in ("/inspect/press", "/inspect/type", "/inspect/scroll"):
+            return self.reply(404, {"error": f"{self.path} is not a route"})
         self.reply(200, {"did": self.path, "with": body})
     def log_message(self, form, *args):
         pass
@@ -351,8 +355,10 @@ class Mac(unittest.TestCase):
         script = [
             {"launch": {}},
             {"system": {"tap": "Allow", "app": "com.apple.springboard", "deadline_ms": 5000}},
-            {"wait": {"role": "Button", "name": "Attach", "deadline_ms": 5000}},
-            {"act": {"find": {"role": "Button", "name": "Attach", "deadline_ms": 5000}, "action": "click"}},
+            {"wait": {"role": "button", "label": "Attach", "deadline_ms": 5000}},
+            {"press": {"find": {"role": "button", "label": "Attach", "deadline_ms": 5000}}},
+            {"type": {"id": "phone:chat/draft/editor", "text": "a duck"}},
+            {"scroll": {"id": "phone:chat/rooms", "to": "end", "deadline_ms": 5000}},
             {"media": {"files": {"path": "/shared/cat.png"}}},
             {"system": {"tap": "Photo", "deadline_ms": 5000}},
             {"tree": "chat"},
@@ -362,7 +368,7 @@ class Mac(unittest.TestCase):
         name = self.ask(self.build(vars={"FEATURES": "ax-door"}, script={"steps": script}))
         run = self.ended(name)
         self.assertEqual((run["state"], run["reason"]), ("succeeded", None))
-        expected = ["07-chat.json", "08-chat.png", "build.log", "device.log", "driver.log", "script.log", "run.json"]
+        expected = ["09-chat.json", "10-chat.png", "build.log", "device.log", "driver.log", "script.log", "run.json"]
         self.assertEqual(self.outputs(run), expected)
         makes = [call for call in self.calls() if call[0] == "make"]
         target = f"CARGO_TARGET_DIR={self.root}/mac/target/app"
@@ -372,11 +378,13 @@ class Mac(unittest.TestCase):
         self.assertEqual(self.sim_state()["media"], ["cat.png:cat"])
         log = self.put(b"01 launch: launched")[0].decode()
         self.assertIn("02 system tap Allow: tapped Allow", log)
-        self.assertIn('03 wait Button Attach: {"node": {"id": "phone:chat/attach"', log)
-        self.assertIn('04 act click Attach: found phone:chat/attach; {"did": "/act", "with": {"action": "click", "id": "phone:chat/attach"}}', log)
-        self.assertIn("08 screenshot chat: saved 08-chat.png", log)
+        self.assertIn('03 wait button Attach: {"node": {"id": "phone:chat/attach"', log)
+        self.assertIn('04 press Attach: found phone:chat/attach; {"did": "/inspect/press", "with": {"id": "phone:chat/attach"}}', log)
+        self.assertIn('05 type phone:chat/draft/editor: {"did": "/inspect/type", "with": {"id": "phone:chat/draft/editor", "text": "a duck"}}', log)
+        self.assertIn('06 scroll phone:chat/rooms: {"did": "/inspect/scroll"', log)
+        self.assertIn("10 screenshot chat: saved 10-chat.png", log)
         self.assertEqual(self.put(b"fake screenshot"), [b"\x89PNG fake screenshot of KEPT-1"])
-        self.assertIn(b"phone:chat/attach", self.put(b"nodes")[0])
+        self.assertIn(b'[{"id": "phone:chat/attach", "role": "button", "label": "Attach"}]', self.put(b'[{"id": "phone:chat/attach"'))
         self.assertIn(b'--predicate process == "Ducktape"', self.put(b"fake log")[0])
 
         again = self.ask({"from": name, "to": TO, "script": {"steps": [{"launch": {}}, {"screenshot": "again"}]}})
@@ -386,13 +394,13 @@ class Mac(unittest.TestCase):
 
     def test_a_failing_step_stops_the_script_and_shows_the_screen(self):
         self.start()
-        script = [{"launch": {}}, {"wait": {"name": "missing", "deadline_ms": 10}}, {"screenshot": "never"}]
+        script = [{"launch": {}}, {"wait": {"label": "missing", "deadline_ms": 10}}, {"screenshot": "never"}]
         run = self.ended(self.ask(self.build(script={"steps": script})))
         self.assertEqual(run["state"], "failed")
         self.assertEqual(run["reason"], "step 2 (wait missing): the door answered 408: nothing matched within 10 ms")
         self.assertIn("02-failed.png", self.outputs(run))
         self.assertIn("02-failed.json", self.outputs(run))
-        self.assertEqual(self.put(b'"phone:chat/attach", "name"'), [b'[{"id": "phone:chat/attach", "name": "Attach"}]'])
+        self.assertEqual(self.put(b'"phone:chat/attach", "label"'), [b'[{"id": "phone:chat/attach", "label": "Attach"}]'])
         self.assertNotIn("03-never.png", self.outputs(run))
 
     def test_a_crash_at_launch_fails_the_run_with_its_crash_report(self):
@@ -467,7 +475,7 @@ class Mac(unittest.TestCase):
         hold = self.sim / "hold"
         os.mkfifo(hold)
         self.start()
-        steps = [{"launch": {}}, {"wait": {"name": "hold", "deadline_ms": 1}}, {"screenshot": "first"}]
+        steps = [{"launch": {}}, {"wait": {"label": "hold", "deadline_ms": 1}}, {"screenshot": "first"}]
         first = self.ask(self.build(script={"steps": steps}))
         self.until(lambda: self.service.runs[first]["step"] == "step 2/3: wait hold")
         second = self.ask(self.build(script={"steps": [{"launch": {}}, {"screenshot": "second"}]}))

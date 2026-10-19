@@ -425,8 +425,10 @@ scripts back a `make` target; see the repository `Makefile`.
 - A run's script runs against the simulator device `MAC_DEVICE`, which the
   operator makes once and signs the app in on, or a fresh device of the
   same type and runtime (`ducktape-run-<run>`), deleted when the run ends.
-  Steps reach the app through its AX door (the `ax-door` build, whose token
-  the Mac reads from the app's container), the device through
+  Steps reach the app through its inspector (`/inspect/*` on the `ax-door`
+  build's door, whose token the Mac reads from the app's container): find,
+  wait, press, type and scroll by the view's own ids, a press or typing
+  wheeling a clipped node into view first; the device through
   `xcrun simctl`, and system UI (the photo picker, permission alerts)
   through the app's XCUITest driver (`make -C phone ios-driver`). Runs on
   the kept device take it in turn: a run waits, saying which run holds it,

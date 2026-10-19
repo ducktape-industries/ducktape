@@ -30,7 +30,6 @@ DOOR_FILE = Path("Library/Caches/ducktape/ax-door.json")
 CRASHES = Path.home() / "Library/Logs/DiagnosticReports"
 FRESH = "ducktape-run-"
 DRIVER = "TEST_RUNNER_DUCKTAPE_DRIVER"
-DOOR_STEPS = ("wait", "act", "key", "drag")
 RELAY_DOWN_PAUSE = 5
 KEEPALIVE = (10, 5, 3)
 
@@ -82,11 +81,12 @@ def loaded(folder):
 
 def described(name, value):
     match name:
-        case "act":
-            target = value.get("id") or (value.get("find") or {}).get("name", "")
-            return f"act {value.get('action', '')} {target}".rstrip()
+        case "press" | "type" | "scroll":
+            find = value.get("find") or {}
+            target = value.get("id") or find.get("label") or find.get("text") or find.get("id", "")
+            return f"{name} {target}".rstrip()
         case "wait":
-            return "wait " + " ".join(str(value[field]) for field in ("role", "name", "state", "in") if field in value)
+            return "wait " + " ".join(str(value[field]) for field in ("id", "role", "label", "text", "in") if field in value)
         case "system":
             return f"system tap {value.get('tap', '')}"
         case "media":
@@ -402,13 +402,13 @@ class Simulator:
                 self.simctl("terminate", self.udid, self.bundle)
                 self.door = None
                 return "terminated"
-            case "wait" | "key" | "drag":
-                return self.door_call("POST", f"/{name}", value).decode(errors="replace")
-            case "act":
-                return self.act(value)
+            case "wait":
+                return self.door_call("POST", "/inspect/wait", value).decode(errors="replace")
+            case "press" | "type" | "scroll":
+                return self.aimed(name, value)
             case "tree":
                 target = out / f"{number:02d}-{value}.json"
-                written(target, self.door_call("GET", "/tree?compact=1"))
+                written(target, self.door_call("GET", "/inspect/tree"))
                 return f"saved {target.name}"
             case "screenshot":
                 return self.screenshot(out / f"{number:02d}-{value}.png")
@@ -438,15 +438,15 @@ class Simulator:
         self.door = door
         return f"launched, pid {pid}, AX door on port {door['port']}"
 
-    def act(self, value):
+    def aimed(self, name, value):
         if "find" not in value:
-            return self.door_call("POST", "/act", value).decode(errors="replace")
-        found = json.loads(self.door_call("POST", "/wait", value["find"]))
+            return self.door_call("POST", f"/inspect/{name}", value).decode(errors="replace")
+        found = json.loads(self.door_call("POST", "/inspect/wait", value["find"]))
         node = found.get("node") if isinstance(found, dict) else None
         if not isinstance(node, dict) or "id" not in node:
-            raise Failed(f"the door's wait for {json.dumps(value['find'])} answered no node with an id: {json.dumps(found)}")
-        acted = {**{field: given for field, given in value.items() if field != "find"}, "id": node["id"]}
-        said = self.door_call("POST", "/act", acted).decode(errors="replace")
+            raise Failed(f"the inspector's wait for {json.dumps(value['find'])} answered no node with an id: {json.dumps(found)}")
+        asked = {**{field: given for field, given in value.items() if field != "find"}, "id": node["id"]}
+        said = self.door_call("POST", f"/inspect/{name}", asked).decode(errors="replace")
         return f"found {node['id']}; {said}"
 
     def door_call(self, method, path, body=None):
