@@ -64,7 +64,7 @@ SCRATCH_SHAPE = {"medium": str, "size": str}
 SCRATCH_MEDIUM = "Memory"
 FORGE = {"repo": str, "commit": str}
 FILES = {"path": str, "snapshot": str}
-BLOB = {"path": str, "kind": str, "container": str}
+BLOB = {"path": str, "paths": list, "kind": str, "container": str}
 FILE = {"path": str, "to": str, "message": str, "container": str}
 EXEC = {"command": list, "container": str, "every": int}
 PUSH = {"path": str, "ref": str, "have": list, "container": str}
@@ -1729,18 +1729,26 @@ class Service:
         yield sse(*answer)
 
     def blob(self, name, asked_by, body):
-        asked = named(checked(body, BLOB, "a blob"), ["path", "kind"], "a blob")
+        asked = checked(body, BLOB, "a blob")
+        if ("path" in asked) == ("paths" in asked):
+            raise Refused(400, "a blob names its path, or its paths to put several in one bundle")
+        named(asked, ["kind"], "a blob")
+        paths = [asked["path"]] if "path" in asked else strings(asked["paths"], "paths")
         self.keyed("put blobs")
-        data = self.output(name, asked_by, asked)
+        datas = [self.output(name, asked_by, {**asked, "path": path}) for path in paths]
         with tempfile.TemporaryDirectory() as temp:
-            file = Path(temp) / "blob"
-            file.write_bytes(data)
-            put = self.retried(asked_by, lambda: self.signer.put([file], asked["kind"]), failed)
+            files = [Path(temp) / f"blob-{index}" for index in range(len(datas))]
+            for file, data in zip(files, datas):
+                file.write_bytes(data)
+            put = self.retried(asked_by, lambda: self.signer.put(files, asked["kind"]), failed)
         if put.code != 0:
             raise Refused(502, f"the blob was not put: {put.err or put.out.decode(errors='replace')}")
-        held = put_answer(put.out.decode(), 1)
-        blob = held.pop("blobs")[0]
-        return 200, {"blob": blob, "size": len(data), "kind": asked["kind"], **held}
+        held = put_answer(put.out.decode(), len(files))
+        blobs = held.pop("blobs")
+        if "path" in asked:
+            return 200, {"blob": blobs[0], "size": len(datas[0]), "kind": asked["kind"], **held}
+        listed = [{"path": path, "blob": blob, "size": len(data)} for path, blob, data in zip(paths, blobs, datas)]
+        return 200, {"blobs": listed, "kind": asked["kind"], **held}
 
     def file(self, name, asked_by, body):
         asked = named(checked(body, FILE, "a file"), ["path", "to"], "a file")

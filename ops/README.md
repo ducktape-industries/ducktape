@@ -109,6 +109,11 @@ scripts back a `make` target; see the repository `Makefile`.
   `size` and `objects`. The service pushes nothing: the caller sends forge's
   `Push` with the pack as its own account, so forge's write list decides as
   for any push.
+- `pods/NAME/blob` `{path | paths, kind, container}` puts a file the pod
+  wrote as a blob of `kind` and answers its `blob` id and `size`; with
+  `paths` it puts every one of them in one bundle and answers `blobs`, a
+  `{path, blob, size}` for each in the order asked, so a round of programs
+  is one call. Both answer the bundle (`bundle`, `put_at`, `held_since`).
 - `pods/NAME/blob`, `pods/NAME/file` and `pods/NAME/push` try a step again
   when it lost its connection (kubectl's exec, a blob put, files' head or
   the files commit, which is made again onto files' head as read then): the

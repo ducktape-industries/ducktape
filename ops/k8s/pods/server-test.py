@@ -846,6 +846,27 @@ class Blob(Served):
         self.signer.put_ran = ran(code=1, err="blob kind program refused: too large")
         self.refused("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/a", "kind": "program"}, 502, ["too large"])
 
+    def test_several_files_are_put_in_one_bundle_and_answered_in_the_order_asked(self):
+        self.kube.answer("exec", ran(b"\x00asm"), ran(b"\x00asm\x01"))
+        self.signer.put_ran = ran(b"sha256:aa\nsha256:bb\nbundle 7 put at block 900\nbundle 7 held since block 901\n")
+        asked = {"paths": ["/out/a.wasm", "/out/b.wasm"], "kind": "program", "container": "run"}
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/blob", asked)
+        self.assertEqual(status, 200)
+        listed = [{"path": "/out/a.wasm", "blob": "sha256:aa", "size": 4}, {"path": "/out/b.wasm", "blob": "sha256:bb", "size": 5}]
+        self.assertEqual(answer, {"blobs": listed, "kind": "program", "bundle": 7, "put_at": 900, "held_since": 901})
+        cats = [call for call in self.kube.calls if call[0] == "exec"]
+        self.assertEqual(cats, [("exec", "duckpond-41", "run", ["cat", "--", path]) for path in asked["paths"]])
+        self.assertEqual(self.signer.puts, [([b"\x00asm", b"\x00asm\x01"], "program")])
+
+    def test_a_blob_names_one_path_or_several_paths_and_every_one_is_absolute(self):
+        both = {"path": "/out/a", "paths": ["/out/b"], "kind": "program"}
+        self.refused("POST", "/v1/pods/duckpond-41/blob", both, 400, ["its path, or its paths"])
+        self.refused("POST", "/v1/pods/duckpond-41/blob", {"kind": "program"}, 400, ["its path, or its paths"])
+        self.refused("POST", "/v1/pods/duckpond-41/blob", {"paths": [], "kind": "program"}, 400, ["paths holds strings"])
+        self.refused("POST", "/v1/pods/duckpond-41/blob", {"paths": ["/out/a", 7], "kind": "program"}, 400, ["paths holds strings"])
+        self.refused("POST", "/v1/pods/duckpond-41/blob", {"paths": ["/out/a", "out/b"], "kind": "program"}, 400, ["absolute path"])
+        self.assertEqual(self.signer.puts, [])
+
     def test_a_blob_from_a_missing_pod_is_not_found(self):
         self.kube.answer("get", ran(code=1, err=NOT_FOUND))
         self.assertEqual(self.call("POST", "/v1/pods/duckpond-9/blob", {"path": "/out/a", "kind": "program"})[0], 404)
