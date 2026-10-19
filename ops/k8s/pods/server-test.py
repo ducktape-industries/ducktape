@@ -593,7 +593,7 @@ class Create(Served):
 
     def test_a_scratch_size_is_its_empty_directorys_size_limit(self):
         self.kube.answer("create", ran(pod_json()))
-        sizes = ["48Gi", "512M", "1e9", "1.5Gi", "+64Mi", ".5Ti"]
+        sizes = ["48Gi", "512M", "1e9", "1.5Gi", "+64Mi", ".5Ti", "1000000000000000000n", "1000000000000u", " 48Gi"]
         inputs = [{"path": f"/scratch/{index}", "scratch": {"medium": "Memory", "size": size}} for index, size in enumerate(sizes)]
         status, _ = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs})
         self.assertEqual(status, 201)
@@ -667,6 +667,30 @@ class Create(Served):
             status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, "resources": {"limits": {"memory": "96Gi"}}})
             self.assertEqual(status, 201)
             self.assertEqual(answer["warnings"], warnings)
+
+    def test_a_limit_in_any_form_the_api_server_takes_is_read_after_the_pod_is_made(self):
+        self.kube.answer("create", ran(pod_json()))
+        starved = "the kubelet sizes a memory scratch to the {} limit at most, and a full one leaves the pod's processes no memory, so they are OOM-killed."
+        cases = (
+            ("96000000000000000000n", "100Gi", True),
+            (" 96Gi", "90Gi", False),
+            ("96000000000000000u", "100Gi", True),
+            ("96Gi ", "96Gi", True),
+        )
+        for limit, size, warns in cases:
+            inputs = [{"path": "/var/tmp", "scratch": {"medium": "Memory", "size": size}}]
+            status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, "resources": {"limits": {"memory": limit}}})
+            self.assertEqual(status, 201, answer)
+            warned = [f"scratch /var/tmp {size} is not below the {limit} memory limit; {starved.format(limit)}"]
+            self.assertEqual(answer.get("warnings"), warned if warns else None)
+
+    def test_scratches_that_add_up_exactly_to_the_limit_warn(self):
+        self.kube.answer("create", ran(pod_json()))
+        inputs = [{"path": "/a", "scratch": {"medium": "Memory", "size": "0.1G"}}, {"path": "/b", "scratch": {"medium": "Memory", "size": "33.1G"}}]
+        status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, "resources": {"limits": {"memory": "33.2G"}}})
+        self.assertEqual(status, 201)
+        self.assertEqual(len(answer["warnings"]), 1)
+        self.assertIn("/a 0.1G + /b 33.1G is not below the 33.2G memory limit", answer["warnings"][0])
 
     def test_scratches_below_the_memory_limit_and_within_the_request_answer_no_warnings(self):
         self.kube.answer("create", ran(pod_json()))
@@ -1682,6 +1706,10 @@ class Usage(Served):
         self.assertEqual(server.quantity("2Gi"), 2 * 2**30)
         self.assertEqual(server.quantity("3k"), 3000)
         self.assertEqual(server.quantity("1e3"), 1000)
+        self.assertEqual(server.quantity(" 96000000000000000000n "), 96 * 10**9)
+        self.assertEqual(server.quantity("96000000000000000u"), 96 * 10**9)
+        self.assertEqual(server.quantity("0.1G") + server.quantity("33.1G"), server.quantity("33.2G"))
+        self.assertEqual(server.quantity("-1.5k"), -1500)
         with self.assertRaises(server.Refused):
             server.quantity("2Qi")
 
@@ -2136,7 +2164,7 @@ class Stopped(unittest.TestCase):
                         link.request("GET", "/")
                         link.getresponse().read()
                         link.close()
-                    except OSError:
+                    except (OSError, http.client.HTTPException):
                         return
 
             clients = [threading.Thread(target=asking) for _ in range(os.cpu_count())]

@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -100,13 +101,15 @@ STATUS = {
 }
 SCALE = {
     "": 1,
-    "m": 1e-3,
-    "k": 1e3,
-    "M": 1e6,
-    "G": 1e9,
-    "T": 1e12,
-    "P": 1e15,
-    "E": 1e18,
+    "n": Fraction(1, 10**9),
+    "u": Fraction(1, 10**6),
+    "m": Fraction(1, 10**3),
+    "k": 10**3,
+    "M": 10**6,
+    "G": 10**9,
+    "T": 10**12,
+    "P": 10**15,
+    "E": 10**18,
     "Ki": 2**10,
     "Mi": 2**20,
     "Gi": 2**30,
@@ -151,7 +154,7 @@ CUT = ("websocket: close 1006", "abnormal closure")
 UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
 UNPLACED = "does not have a host assigned"
 REQUEST_NUMBER = re.compile(r"[0-9]+")
-KUBERNETES_QUANTITY = re.compile(r"([+-]?)([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+|Ki|Mi|Gi|Ti|Pi|Ei|m|k|M|G|T|P|E)?")
+KUBERNETES_QUANTITY = re.compile(r"([+-]?)([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE]([+-]?[0-9]+)|(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E))?")
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
 HAVING = """having() {
@@ -752,7 +755,7 @@ def input_of(given, index):
 
 
 def scratch_size(text, what):
-    found = KUBERNETES_QUANTITY.fullmatch(text)
+    found = KUBERNETES_QUANTITY.fullmatch(text.strip())
     if found is None:
         raise Refused(400, f"{what} {text!r} is not a Kubernetes quantity such as 48Gi")
     sign, digits = found.group(1), found.group(2)
@@ -1275,10 +1278,12 @@ def put_answer(text, count):
 
 
 def quantity(text):
-    found = re.fullmatch(r"([+-]?[0-9.]+)(?:[eE]([+-]?\d+))?([a-zA-Z]*)", str(text))
-    if found is None or found.group(3) not in SCALE:
+    found = KUBERNETES_QUANTITY.fullmatch(str(text).strip())
+    if found is None:
         raise Refused(502, f"{text} is not a Kubernetes quantity")
-    return float(found.group(1)) * 10 ** int(found.group(2) or 0) * SCALE[found.group(3)]
+    sign, digits, exponent, suffix = found.groups()
+    amount = Fraction(digits) * Fraction(10) ** int(exponent or 0) * SCALE[suffix or ""]
+    return -amount if sign == "-" else amount
 
 
 def pod_limit(spec, resource):
@@ -1331,7 +1336,7 @@ def usage_of(pods, claims, summaries, quotas, namespace):
                 "pod": name,
                 "requester": requester_of(pod["metadata"].get("labels") or {}),
                 "phase": pod.get("status", {}).get("phase"),
-                "cpu_limit": pod_limit(pod.get("spec", {}), "cpu") if live else 0,
+                "cpu_limit": float(pod_limit(pod.get("spec", {}), "cpu")) if live else 0,
                 "memory_limit_bytes": int(pod_limit(pod.get("spec", {}), "memory")) if live else 0,
                 "cpu_nanocores": (entry.get("cpu") or {}).get("usageNanoCores") or 0,
                 "memory_bytes": (entry.get("memory") or {}).get("workingSetBytes") or 0,
