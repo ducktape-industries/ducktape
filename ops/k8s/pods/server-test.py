@@ -596,7 +596,7 @@ class Create(Served):
 
     def test_a_scratch_size_is_its_empty_directorys_size_limit(self):
         self.kube.answer("create", ran(pod_json()))
-        sizes = ["48Gi", "512M", "1e9", "1.5Gi", "+64Mi", ".5Ti", "1000000000000000000n", "1000000000000u", " 48Gi"]
+        sizes = ["48Gi", "512M", "1e9", "1.5Gi", "+64Mi", ".5Ti", "1000000000000000000n", "1000000000000u", " 48Gi", "1e-10000000", "1e2147483647"]
         inputs = [{"path": f"/scratch/{index}", "scratch": {"medium": "Memory", "size": size}} for index, size in enumerate(sizes)]
         status, _ = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs})
         self.assertEqual(status, 201)
@@ -612,6 +612,8 @@ class Create(Served):
         malformed = ("", "48GB", "48gi", "Gi", "1.2.3Gi", "48 Gi", "1e", "1e3Gi", "0x10", "forty")
         for size in malformed:
             self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": size}}]}, 400, ["is not a Kubernetes quantity"])
+        for size in ("1e2147483648", "1e-2147483649", "1e9223372036854775808", "1e" + "9" * 100000):
+            self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": size}}]}, 400, ["outside -2^31..2^31-1"])
         for size in ("0", "0Gi", "0.0", "-1Gi", "-0.5"):
             self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": size}}]}, 400, ["is not above 0"])
         self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": 48}}]}, 400, ["size is a JSON str"])
@@ -1715,6 +1717,27 @@ class Usage(Served):
         self.assertEqual(server.quantity("-1.5k"), -1500)
         with self.assertRaises(server.Refused):
             server.quantity("2Qi")
+
+    def test_a_quantity_past_what_kubernetes_holds_reads_as_kubernetes_holds_it(self):
+        nano = server.Fraction(1, 10**9)
+        self.assertEqual(server.quantity("1e-10000000"), nano)
+        self.assertEqual(server.quantity("1e-2147483648"), nano)
+        self.assertEqual(server.quantity("-1e-2147483648"), -nano)
+        self.assertEqual(server.quantity("0.0000000001"), nano)
+        self.assertEqual(server.quantity("1.0000000001"), 1 + nano)
+        self.assertEqual(server.quantity("0.5n"), nano)
+        self.assertEqual(server.quantity("0e-2147483648"), 0)
+        self.assertEqual(server.quantity("1e2147483647"), 2**63 - 1)
+        self.assertEqual(server.quantity("-1e2147483647"), -(2**63 - 1))
+        self.assertEqual(server.quantity("8Ei"), 2**63 - 1)
+        self.assertEqual(server.quantity("7Ei"), 7 * 2**60)
+        self.assertEqual(server.quantity("1e4294967296"), 1)
+        self.assertEqual(server.quantity("1e" + "0" * 100000 + "3"), 1000)
+        self.assertEqual(server.quantity("0." + "0" * 100000 + "1Ei"), nano)
+        self.assertEqual(server.quantity("1" + "0" * 100000), 2**63 - 1)
+        for past in ("1e9223372036854775808", "1e-9223372036854775809", "1e" + "9" * 100000):
+            with self.assertRaises(server.Refused):
+                server.quantity(past)
 
 
 class Posts(unittest.TestCase):

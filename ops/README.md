@@ -272,8 +272,10 @@ one up for another network.
   is an empty directory in the pod's memory (an `emptyDir` of medium
   `Memory`): nothing is fetched into it, and what is written there never
   reaches the node's disk. Its optional `size` is a Kubernetes quantity
-  above 0, such as `48Gi`, and becomes the `emptyDir`'s `sizeLimit`; the
-  service refuses any other `size` with a 400. The kubelet mounts the
+  above 0, such as `48Gi`, whose exponent fits the int32 Kubernetes reads it
+  into, and becomes the `emptyDir`'s `sizeLimit`; the service refuses any
+  other `size` with a 400. The service reads a quantity as Kubernetes holds
+  it: rounded up to a whole nano, and at most 2^63-1. The kubelet mounts the
   directory as a tmpfs of the smallest of that size, the pod's memory limit
   and the node's allocatable memory. A write past it fails with "No space
   left on device", and the pod keeps running. A scratch without a `size` in

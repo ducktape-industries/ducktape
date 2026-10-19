@@ -2,6 +2,7 @@
 # The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends or a notified pod prints a `ducktape-notify` line, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import copy
+import decimal
 import hashlib
 import itertools
 import json
@@ -22,6 +23,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from decimal import Decimal
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -103,23 +105,27 @@ STATUS = {
     "Forbidden": 403,
 }
 SCALE = {
-    "": 1,
-    "n": Fraction(1, 10**9),
-    "u": Fraction(1, 10**6),
-    "m": Fraction(1, 10**3),
-    "k": 10**3,
-    "M": 10**6,
-    "G": 10**9,
-    "T": 10**12,
-    "P": 10**15,
-    "E": 10**18,
-    "Ki": 2**10,
-    "Mi": 2**20,
-    "Gi": 2**30,
-    "Ti": 2**40,
-    "Pi": 2**50,
-    "Ei": 2**60,
+    "": Decimal(1),
+    "n": Decimal("1e-9"),
+    "u": Decimal("1e-6"),
+    "m": Decimal("1e-3"),
+    "k": Decimal("1e3"),
+    "M": Decimal("1e6"),
+    "G": Decimal("1e9"),
+    "T": Decimal("1e12"),
+    "P": Decimal("1e15"),
+    "E": Decimal("1e18"),
+    "Ki": Decimal(2**10),
+    "Mi": Decimal(2**20),
+    "Gi": Decimal(2**30),
+    "Ti": Decimal(2**40),
+    "Pi": Decimal(2**50),
+    "Ei": Decimal(2**60),
 }
+NANO = SCALE["n"]
+MOST = Decimal(2**63 - 1)
+INT32 = 2**31
+INT64 = 2**63
 ENDED = ("Succeeded", "Failed")
 REJECTED = {"unauthorized": 403, "not_found": 404, "already_exists": 409, "wrong_state": 409}
 UNLANDED = "no block carried the frame before its anchor aged out"
@@ -945,6 +951,10 @@ def scratch_size(text, what):
     found = KUBERNETES_QUANTITY.fullmatch(text.strip())
     if found is None:
         raise Refused(400, f"{what} {text!r} is not a Kubernetes quantity such as 48Gi")
+    exponent = found.group(3)
+    power = None if exponent is None else parsed_exponent(exponent)
+    if exponent is not None and (power is None or not -INT32 <= power < INT32):
+        raise Refused(400, f"{what} {text!r} has an exponent outside -2^31..2^31-1, the int32 Kubernetes reads it into")
     sign, digits = found.group(1), found.group(2)
     above_zero = sign != "-" and digits.strip("0.") != ""
     if not above_zero:
@@ -1483,13 +1493,35 @@ def put_answer(text, count):
     return answer
 
 
+def parsed_exponent(text):
+    digits = text.lstrip("+-").lstrip("0") or "0"
+    if len(digits) > len(str(INT64)):
+        return None
+    value = -int(digits) if text.startswith("-") else int(digits)
+    return value if -INT64 <= value < INT64 else None
+
+
 def quantity(text):
     found = KUBERNETES_QUANTITY.fullmatch(str(text).strip())
     if found is None:
         raise Refused(502, f"{text} is not a Kubernetes quantity")
     sign, digits, exponent, suffix = found.groups()
-    amount = Fraction(digits) * Fraction(10) ** int(exponent or 0) * SCALE[suffix or ""]
-    return -amount if sign == "-" else amount
+    power = parsed_exponent(exponent or "0")
+    if power is None:
+        raise Refused(502, f"{text} is not a Kubernetes quantity: its exponent is past int64")
+    power = (power + INT32) % (2 * INT32) - INT32
+    amount = Decimal(f"{digits}e{power}")
+    scale = SCALE[suffix or ""]
+    if amount.is_zero():
+        return Fraction(0)
+    if amount.adjusted() + min(SCALE.values()).adjusted() > MOST.adjusted():
+        value = MOST
+    elif amount.adjusted() + max(SCALE.values()).adjusted() + 2 <= NANO.adjusted():
+        value = NANO
+    else:
+        exact = decimal.Context(prec=decimal.MAX_PREC, Emax=decimal.MAX_EMAX, Emin=decimal.MIN_EMIN, rounding=decimal.ROUND_UP)
+        value = min(exact.multiply(amount, scale).quantize(NANO, context=exact), MOST)
+    return Fraction(-value if sign == "-" else value)
 
 
 def pod_limit(spec, resource):
