@@ -70,3 +70,20 @@ fn the_widest_backfill_reply_fits_one_mesh_message() {
     let reply = (finalization_signed_by_every_member(), block);
     assert!(RESOLVER_FRAMING + reply.encode_size() <= MESSAGE_BYTES as usize);
 }
+
+#[test]
+fn a_block_follows_its_parent_only_from_the_parents_time_and_within_a_block() {
+    let parent = Block::genesis(b"network", 1_000);
+    let at = |time: u64| Block::next(parent.tip(), time, Vec::new());
+    assert!(at(1_000).follows(&parent));
+    assert!(at(2_000).follows(&parent));
+    assert!(!at(999).follows(&parent));
+
+    let bytes = vec![0u8; BLOCK_BYTES];
+    let largest = bytes[..largest_carried(&bytes)].to_vec();
+    let full = Block::packed(parent.tip(), 2_000, [&largest]);
+    assert_eq!(full.frames.len(), 1);
+    assert!(full.follows(&parent));
+    let oversize = Block::next(parent.tip(), 2_000, vec![bytes]);
+    assert!(!oversize.follows(&parent));
+}

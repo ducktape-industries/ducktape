@@ -81,6 +81,12 @@ impl Block {
     pub fn links_to(&self, tip: Tip) -> bool {
         self.height == tip.height + 1 && self.parent.0 == tip.id
     }
+
+    pub fn follows(&self, parent: &Block) -> bool {
+        let not_backdated = self.time >= parent.time;
+        let carried = self.encode_size() <= BLOCK_BYTES;
+        not_backdated && carried
+    }
 }
 
 impl Write for Block {

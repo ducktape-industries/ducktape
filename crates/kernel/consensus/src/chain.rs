@@ -101,12 +101,18 @@ where
         if wait > 0 {
             context.sleep(Duration::from_millis(wait)).await;
         }
-        let time = now(&context);
+        let time = now(&context).max(parent.time);
         self.chain.propose(parent, ancestry, time).await
     }
 
-    async fn verify(&mut self, _: (E, Self::Context), _: impl Ancestry<Block>) -> bool {
-        true
+    async fn verify(&mut self, _: (E, Self::Context), mut ancestry: impl Ancestry<Block>) -> bool {
+        let Some(block) = ancestry.next().await else {
+            return false;
+        };
+        let Some(parent) = ancestry.next().await else {
+            return false;
+        };
+        block.follows(&parent)
     }
 }
 

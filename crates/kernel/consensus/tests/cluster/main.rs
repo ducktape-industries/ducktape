@@ -22,7 +22,9 @@ use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use host::{Founding, Genesis, Layer, Limits, Tip};
-use node::{Block, Frame, Mempool, Node, Preconfirm, Sequenced, Source};
+use node::{
+    BLOCK_BYTES, Block, Frame, MESSAGE_BYTES, Mempool, Node, Preconfirm, Sequenced, Source,
+};
 
 mod epochs;
 
@@ -38,6 +40,7 @@ type Pool = Arc<futures::lock::Mutex<Mempool<Ctx>>>;
 type Roots = Arc<Mutex<BTreeMap<u64, Root>>>;
 type Carried = Arc<Mutex<BTreeMap<u64, Vec<Vec<u8>>>>>;
 type Stalls = Arc<Mutex<Option<Stall>>>;
+type Tampering = Arc<Mutex<Option<Tamper>>>;
 type Delivery = (Arc<Block>, Exact);
 type Seating = Membership<
     Ctx,
@@ -198,11 +201,20 @@ async fn mesh_over(
     keys: &[ed25519::PrivateKey],
     link: Link,
 ) -> Oracle<ed25519::PublicKey, Ctx> {
+    mesh_carrying(context, keys, link, 1 << 20).await
+}
+
+async fn mesh_carrying(
+    context: &Ctx,
+    keys: &[ed25519::PrivateKey],
+    link: Link,
+    max_size: u32,
+) -> Oracle<ed25519::PublicKey, Ctx> {
     let peers: Vec<ed25519::PublicKey> = keys.iter().map(|k| k.public_key()).collect();
     let (network, oracle) = simulated::Network::new_with_peers(
         context.child("network"),
         simulated::Config {
-            max_size: 1 << 20,
+            max_size,
             disconnect_on_block: true,
             max_peers_per_set: NZUsize!(16),
             tracked_peer_sets: NZUsize!(1),
@@ -269,6 +281,8 @@ struct Participant {
     pool: Pool,
     inbox: mpsc::UnboundedSender<Delivery>,
     proposed: mpsc::UnboundedSender<u64>,
+    tamper: Tampering,
+    tampered: mpsc::UnboundedSender<u64>,
 }
 
 impl Chain for Participant {
@@ -280,17 +294,40 @@ impl Chain for Participant {
     ) -> Option<Block> {
         let applied = self.pool.lock().await.applied().height;
         let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
-        let block =
+        let mut block =
             self.pool
                 .lock()
                 .await
                 .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
+        let tamper = *self.tamper.lock().unwrap();
+        if let Some(tamper) = tamper
+            && tamper.apply(&mut block, &parent)
+        {
+            let _ = self.tampered.unbounded_send(block.height);
+        }
         let _ = self.proposed.unbounded_send(block.height);
         Some(block)
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
         let _ = self.inbox.unbounded_send((block, ack));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Tamper {
+    Backdate,
+    Oversize,
+}
+
+impl Tamper {
+    fn apply(self, block: &mut Block, parent: &Block) -> bool {
+        match self {
+            Tamper::Backdate if parent.time > 0 => block.time = parent.time - 1,
+            Tamper::Backdate => return false,
+            Tamper::Oversize => block.frames.push(vec![0; BLOCK_BYTES]),
+        }
+        true
     }
 }
 
@@ -316,6 +353,8 @@ struct Peer {
     heights: mpsc::UnboundedReceiver<u64>,
     proposed: mpsc::UnboundedReceiver<u64>,
     stalls: Stalls,
+    tamper: Tampering,
+    tampered: mpsc::UnboundedReceiver<u64>,
     roots: Roots,
     carried: Carried,
     _dir: tempfile::TempDir,
@@ -357,13 +396,17 @@ impl Peer {
         let (inbox, deliveries) = mpsc::unbounded();
         let (applied, heights) = mpsc::unbounded();
         let (proposals, proposed) = mpsc::unbounded();
+        let (tampering, tampered) = mpsc::unbounded();
         let stalls: Stalls = Arc::default();
+        let tamper: Tampering = Arc::default();
         let roots: Roots = Arc::default();
         let carried: Carried = Arc::default();
         let chain = Participant {
             pool: pool.clone(),
             inbox,
             proposed: proposals,
+            tamper: tamper.clone(),
+            tampered: tampering,
         };
         let (marshal, _receipts) = Marshal::start(
             context.child("marshal"),
@@ -418,6 +461,8 @@ impl Peer {
             heights,
             proposed,
             stalls,
+            tamper,
+            tampered,
             roots,
             carried,
             _dir: dir,
@@ -447,6 +492,14 @@ impl Peer {
 
     fn me(&self) -> ed25519::PublicKey {
         self.key.public_key()
+    }
+
+    fn tamper(&self, tamper: Tamper) {
+        *self.tamper.lock().unwrap() = Some(tamper);
+    }
+
+    async fn tampered(&mut self) -> u64 {
+        self.tampered.next().await.expect("consensus lives")
     }
 
     async fn reached(&mut self, target: u64) -> u64 {
@@ -596,6 +649,18 @@ async fn validators(
     peers
 }
 
+async fn every_block_follows_its_parent(peer: &Peer, tip: u64) {
+    let mut parent = Block::genesis(NETWORK, TIME);
+    for height in 1..=tip {
+        let block = peer.marshal.block(height).await.unwrap();
+        assert!(
+            block.follows(&parent),
+            "block {height} breaks from its parent"
+        );
+        parent = block;
+    }
+}
+
 #[test]
 fn three_validators_agree_on_a_chain_of_frames() {
     runner().start(|context| async move {
@@ -736,5 +801,37 @@ fn a_partitioned_validator_catches_up_when_the_link_heals() {
             peers[3].confirmed("probe", b"during").await,
             Some(b"partition".to_vec())
         );
+    });
+}
+
+#[test]
+fn validators_refuse_a_block_dated_before_its_parent() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=4).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh(&context, &keys).await;
+        let network = network(1_000);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+        peers[3].tamper(Tamper::Backdate);
+
+        let tampered = peers[3].tampered().await;
+        let tip = peers[0].reached(tampered + 1).await;
+        every_block_follows_its_parent(&peers[0], tip).await;
+    });
+}
+
+#[test]
+fn validators_refuse_a_block_larger_than_a_block_carries() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=4).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh_carrying(&context, &keys, link(), MESSAGE_BYTES).await;
+        let network = network(1_000);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+        peers[3].tamper(Tamper::Oversize);
+
+        let tampered = peers[3].tampered().await;
+        let tip = peers[0].reached(tampered + 1).await;
+        every_block_follows_its_parent(&peers[0], tip).await;
     });
 }
