@@ -56,6 +56,9 @@ another machine, reached by ssh.
    and `kubectl -n pods rollout restart deployment/pods`.
 3. Bind it in egress: `Register` and `Assign` as above, then the node's `egress.toml`
    entry and `ducktape egress reload`.
-4. Check it from an agent: `network_call` egress `Request` with `GET /v1/usage` answers
+4. On duckpond a new image after that rolls through forge repo `infra`: a merge
+   of its `pods.toml` makes reconcile patch the Deployment's image and prove it
+   (`../../README.md`, section "duckpond's desired infrastructure").
+5. Check it from an agent: `network_call` egress `Request` with `GET /v1/usage` answers
    200, and a pod made with `POST /v1/pods` runs and posts its end line in its `notify`
    channel.

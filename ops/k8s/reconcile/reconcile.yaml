@@ -1,4 +1,4 @@
-# reconcile on fabrics-1: its namespace and service account, which holds no Kubernetes right, its state claim, a policy closing every inbound port, and its Deployment.
+# reconcile on fabrics-1: its namespace and service account, the Role it holds in pods (the pods Deployment and a list of its pods), its state claim, a policy closing every inbound port, and its Deployment.
 # Applied by ops/k8s/reconcile/deploy, which substitutes @IMAGE@ and @MODE@; it signs with the key in the Secret `key`, which the node's workspace file egress-grants lists.
 apiVersion: v1
 kind: Namespace
@@ -10,7 +10,34 @@ kind: ServiceAccount
 metadata:
   name: reconcile
   namespace: reconcile
-automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reconcile
+  namespace: pods
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [pods]
+    verbs: [get, watch, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: reconcile
+  namespace: pods
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: reconcile
+subjects:
+  - kind: ServiceAccount
+    name: reconcile
+    namespace: reconcile
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -51,7 +78,6 @@ spec:
         app: reconcile
     spec:
       serviceAccountName: reconcile
-      automountServiceAccountToken: false
       securityContext:
         runAsUser: 1000
         runAsGroup: 1000
@@ -66,6 +92,7 @@ spec:
             - {name: RECONCILE_NODE, value: http://node-http.duckpond.svc:8844}
             - {name: RECONCILE_NODE_NAME, value: fabrics-1}
             - {name: RECONCILE_CHANNEL, value: infra}
+            - {name: RECONCILE_PROBER, value: "17"}
             - {name: RECONCILE_STATE, value: /state}
             - {name: RECONCILE_KEYS, value: /keys}
             - {name: RECONCILE_WORKSPACE, value: /tmp/ducktape}

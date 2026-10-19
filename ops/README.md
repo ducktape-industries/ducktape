@@ -538,8 +538,8 @@ one up for another network.
 - Forge repo `infra` holds what fabrics-1 should run, one file per duty; a
   merge into its `main` (protected, so only merges move it) is the
   decision. `k8s/reconcile/reconcile.py` is reconcile, a daemon off the
-  chain that applies it. Its one duty today is `egress/fabrics-1.toml`, the
-  node's own `egress.toml`.
+  chain that applies it. Its duties are `egress/fabrics-1.toml`, the
+  node's own `egress.toml`, and `pods.toml`, the pods service's image.
 - Each block time it reads `infra`'s `main` through forge. For every open
   change into `main` whose head changes that file, it posts a commit status
   `reconcile/egress` and a review comment, once per head: refused when the
@@ -560,16 +560,43 @@ one up for another network.
   dry: it posts what it would apply and leaves the node as it is. Its state
   is the claim `state`, saved before it posts; each post is read back by
   its id before it is sent. A post that cannot be posted logs
-  `report_unposted`, and a tick that cannot read forge or the node logs
-  `unread`, each at its first attempt and every tenth; a good read logs
-  `read` once.
+  `report_unposted`, and a tick that cannot read forge, the node or
+  Kubernetes logs `unread`, each at its first attempt and every tenth; a
+  good read logs `read` once.
+- `pods.toml` holds one line, `image = "localhost:5000/pods:<tag>@sha256:<digest>"`,
+  a digest already pushed (`k8s/pods/deploy` builds and pushes it). An open
+  change to it gets status `reconcile/pods`: refused when the image is not
+  that shape, when infra's egress file serves no `pods` (the proof below
+  could not run), or when a server-side dry-run patch changes more than the
+  `pods` container's image and its `PODS_OUT_IMAGE`. A new `main` that
+  changes the image is patched once (strategic merge, with the
+  Deployment's `resourceVersion`); reconcile then follows the rollout on
+  the Deployment's watch stream. It is proven when the rollout completes,
+  the node's dry `egress set` says `pods` answered from the node, and the
+  running pod's `imageID` is the declared digest; the post in `infra`
+  mentions `RECONCILE_PROBER` (17), who runs the functional probe (exec, a
+  tmpfs scratch, a notify post) with the pod tools, since nothing off the
+  chain reaches the pods service. A failed proof, or a rollout past
+  `progressDeadlineSeconds`, patches back the image it replaced. A digest
+  the registry lacks fails to pull while the old pod serves, so it costs
+  that deadline and rolls back by itself. A tick waits on the rollout, so
+  egress waits behind a roll. The proof's dry `egress set` is refused while
+  infra's egress file carries secrets, so a roll proves only once it
+  carries none.
+- reconcile writes no `PAUSED`: the infra merge is the only gate for when
+  to roll. It reads no node condition, which would need a ClusterRole. A
+  roll under MemoryPressure still keeps the service: `deploy/pods` is
+  RollingUpdate with one replica (25% / 25%: one surge pod, none
+  unavailable), so the surge pod waits Pending on the memory-pressure
+  NoSchedule taint while the old pod serves, and the Deployment's
+  `progressDeadlineSeconds` rolls it back.
 - `RECONCILE_MODE=report|act k8s/reconcile/deploy DUCKTAPE_COMMIT` checks
   that Secret `reconcile/key` exists, builds `k8s/reconcile/Containerfile`
   with the CLI from `git archive DUCKTAPE_COMMIT`, pushes it to the
   cluster node's registry and applies `k8s/reconcile/reconcile.yaml`:
-  namespace `reconcile`, service account `reconcile` with no Kubernetes
-  right and no token mounted, the claim, a policy closing every inbound
-  port, and Deployment `reconcile`. Its account must be on `infra`'s write
+  namespace `reconcile`, service account `reconcile` with a Role in
+  `pods` (get, watch and patch deployment `pods`; list pods), the
+  claim, a policy closing every inbound port, and Deployment `reconcile`. Its account must be on `infra`'s write
   list to post statuses. `k8s/reconcile/reconcile-test.py` covers it.
   Stop it with `kubectl -n reconcile scale deployment/reconcile
   --replicas=0`.
