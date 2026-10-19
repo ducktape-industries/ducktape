@@ -3394,3 +3394,131 @@ fn founding_refuses_a_hook_it_does_not_found() {
         );
     });
 }
+
+#[test]
+fn a_blob_is_released_once_no_program_that_put_it_holds_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let founded = genesis(vec![
+            founding("probe", PROBE, script(Vec::new())),
+            founding("other", PROBE, script(Vec::new())),
+        ]);
+        let mut host = found(context, "net", dir.path(), founded).await;
+        let run = |program: &str, steps: Vec<Step>, salt: u64| Submission {
+            salt: Some(salt),
+            ..submit(program, script(steps))
+        };
+        let row = |host: &Host<Ctx>, id: &BlobId| {
+            host.view(Layer::Confirmed)
+                .get(BLOBS, &abi::encode(id))
+                .unwrap()
+        };
+        let holders = |host: &Host<Ctx>, id: &BlobId| {
+            row(host, id).map(|value| {
+                let held: BTreeMap<String, abi::Retention> = abi::decode(&value).unwrap();
+                assert!(
+                    held.values()
+                        .all(|kept| *kept == abi::Retention::Referenced)
+                );
+                held.into_keys().collect::<Vec<_>>()
+            })
+        };
+        let id = blob_id("part", b"held twice");
+        let put = || put_blob("part", b"held twice");
+        let release = |id: BlobId| op(HostOp::BlobRelease(id));
+
+        host.apply(block(1, vec![run("probe", vec![put()], 1)]))
+            .await
+            .unwrap();
+        assert_eq!(holders(&host, &id), Some(vec!["probe".to_owned()]));
+        assert!(host.blobs().has(&id));
+
+        let applied = host
+            .apply(block(2, vec![run("probe", vec![put()], 2)]))
+            .await
+            .unwrap();
+        assert!(!applied.writes.programs.contains_key(BLOBS));
+
+        host.apply(block(3, vec![run("other", vec![put()], 3)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            holders(&host, &id),
+            Some(vec!["other".to_owned(), "probe".to_owned()])
+        );
+
+        host.apply(block(4, vec![run("probe", vec![release(id)], 4)]))
+            .await
+            .unwrap();
+        assert_eq!(holders(&host, &id), Some(vec!["other".to_owned()]));
+        assert!(host.blobs().has(&id));
+
+        host.apply(block(5, vec![run("other", vec![release(id)], 5)]))
+            .await
+            .unwrap();
+        assert_eq!(row(&host, &id), None);
+        assert!(!host.blobs().has(&id));
+        assert_eq!(host.blob(&id, TIME).await.unwrap(), None);
+        assert_eq!(
+            ask(&host, Layer::Confirmed, "probe", read_blob(id)).await,
+            vec![Reply::Host(HostReply::Blob(None))]
+        );
+
+        let code = host.programs().unwrap()["probe"];
+        host.apply(block(6, vec![run("probe", vec![release(code)], 6)]))
+            .await
+            .unwrap();
+        assert_eq!(row(&host, &code), Some(Vec::new()));
+        assert!(host.blobs().has(&code));
+
+        let fleeting = blob_id("part", b"fleeting");
+        host.apply(block(
+            7,
+            vec![run(
+                "probe",
+                vec![put_blob("part", b"fleeting"), release(fleeting)],
+                7,
+            )],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(row(&host, &fleeting), None);
+        assert!(!host.blobs().has(&fleeting));
+
+        assert_eq!(
+            ask(&host, Layer::Confirmed, "probe", vec![release(code)]).await,
+            vec![Reply::Host(HostReply::Refused(Refusal::new(
+                reason::UNSUPPORTED,
+                "a query does not write"
+            )))]
+        );
+
+        let framed = blob::frame("part", b"also bundled").unwrap();
+        let entry = blobs::Entry::of(&framed).unwrap();
+        let bundled = entry.id;
+        let bundle = Submission {
+            salt: Some(8),
+            ..submit("blobs", abi::encode(&blobs::Op::Put { blobs: vec![entry] }))
+        };
+        let receipt = Submission {
+            signer: b"v1".to_vec(),
+            ..submit("blobs", abi::encode(&blobs::Op::Receipt { bundle: 0 }))
+        };
+        host.apply(block(
+            8,
+            vec![
+                run("probe", vec![put_blob("part", b"also bundled")], 8),
+                bundle,
+            ],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(9, vec![receipt])).await.unwrap();
+        host.apply(block(10, vec![run("probe", vec![release(bundled)], 10)]))
+            .await
+            .unwrap();
+        assert_eq!(row(&host, &bundled), None);
+        assert!(host.blobs().has(&bundled));
+        assert!(host.readable(&bundled, TIME).await.unwrap());
+    });
+}
