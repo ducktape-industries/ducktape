@@ -138,7 +138,24 @@ pub struct Daemon<E: Context> {
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
-    subscribers: Mutex<Vec<(ProgramId, mpsc::UnboundedSender<Change>)>>,
+    subscribers: Mutex<Vec<Subscriber>>,
+}
+
+/// One `/v1/changes` socket's end: the program it follows, whether it
+/// asked for the keys alone, and where each block's word for it goes.
+struct Subscriber {
+    program: ProgramId,
+    keys: bool,
+    sender: mpsc::UnboundedSender<Published>,
+}
+
+/// What a `/v1/changes` socket hears of each block the node applies: what
+/// the block wrote to its program, or that it wrote nothing there
+/// (`Quiet`: the socket sends a ping, so a quiet program's socket is never
+/// idle long enough for a proxy to cut it).
+pub(crate) enum Published {
+    Change(Change),
+    Quiet,
 }
 
 impl<E: Context> Daemon<E> {
@@ -161,12 +178,22 @@ impl<E: Context> Daemon<E> {
         })
     }
 
-    pub fn subscribe(&self, program: ProgramId) -> mpsc::UnboundedReceiver<Change> {
+    /// Each block's word for `program` (`keys`: its changes' keys alone,
+    /// every value left out as `None`).
+    pub(crate) fn subscribe(
+        &self,
+        program: ProgramId,
+        keys: bool,
+    ) -> mpsc::UnboundedReceiver<Published> {
         let (sender, receiver) = mpsc::unbounded();
         self.subscribers
             .lock()
             .expect("the subscriber lock is never poisoned")
-            .push((program, sender));
+            .push(Subscriber {
+                program,
+                keys,
+                sender,
+            });
         receiver
     }
 
@@ -176,19 +203,26 @@ impl<E: Context> Daemon<E> {
             .subscribers
             .lock()
             .expect("the subscriber lock is never poisoned");
-        subscribers.retain(|(program, sender)| {
-            let Some(writes) = applied.writes.programs.get(program) else {
-                return !sender.is_closed();
+        subscribers.retain(|subscriber| {
+            let Some(writes) = applied.writes.programs.get(&subscriber.program) else {
+                return subscriber.sender.unbounded_send(Published::Quiet).is_ok();
+            };
+            let value = |value: &Option<Vec<u8>>| match subscriber.keys {
+                true => None,
+                false => value.clone(),
             };
             let change = Change {
                 height: applied.height,
                 root: applied.root,
                 writes: writes
                     .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .map(|(key, written)| (key.clone(), value(written)))
                     .collect(),
             };
-            sender.unbounded_send(change).is_ok()
+            subscriber
+                .sender
+                .unbounded_send(Published::Change(change))
+                .is_ok()
         });
     }
 }

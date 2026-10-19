@@ -859,10 +859,57 @@ fn a_changes_subscriber_that_closes_is_answered() {
         while let Some(frame) = socket.next().await {
             answered.push(frame.unwrap());
         }
+        // a block applied meanwhile is a ping
+        answered.retain(|frame| !matches!(frame, Message::Ping(_)));
         assert!(
             matches!(answered.as_slice(), [Message::Close(_)]),
             "{answered:?}"
         );
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_changes_socket_asked_for_keys_carries_none_of_the_values_and_a_quiet_one_is_pinged() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        let base = format!("ws://{}{}", seat.http, noded::wire::route::CHANGES);
+        // the first change a socket carries, past its pings
+        async fn change(url: String) -> Change {
+            let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            loop {
+                if let Message::Binary(bytes) = socket.next().await.unwrap().unwrap() {
+                    return abi::decode(&bytes).unwrap();
+                }
+            }
+        }
+        // every block writes the kernel's table of recent blocks
+        let whole = change(format!("{base}/{}", host::RECENT)).await;
+        assert!(
+            whole.writes.iter().any(|(_, value)| value.is_some()),
+            "{whole:?}"
+        );
+        let keys = change(format!("{base}/{}?keys", host::RECENT)).await;
+        assert!(!keys.writes.is_empty());
+        assert!(
+            keys.writes.iter().all(|(_, value)| value.is_none()),
+            "{keys:?}"
+        );
+        // nothing writes to `probe`: each block is a ping
+        let (mut quiet, _) = tokio_tungstenite::connect_async(format!("{base}/probe"))
+            .await
+            .unwrap();
+        let first = quiet.next().await.unwrap().unwrap();
+        assert!(matches!(first, Message::Ping(_)), "{first:?}");
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();

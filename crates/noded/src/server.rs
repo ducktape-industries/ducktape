@@ -5,7 +5,7 @@ use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequest, Path, Request, State};
+use axum::extract::{FromRequest, Path, RawQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -19,10 +19,10 @@ use statesync::Request as SyncRequest;
 use tokio::sync::Semaphore;
 
 use crate::wire::{
-    Admin, BlockAsk, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range, Submit,
+    Admin, BlockAsk, Blocks, Finalized, Get, Located, Network, Page, Query, Range, Submit,
     Submitted, TxAsk, route,
 };
-use crate::{Context, Daemon, LoadConfig};
+use crate::{Context, Daemon, LoadConfig, Published};
 
 const SUBMIT_BYTES: usize = BLOCK_BYTES;
 const SUBMIT_BODY_BYTES: usize = SUBMIT_BYTES + size_of::<u32>() + size_of::<bool>();
@@ -409,42 +409,49 @@ async fn programs<E: Context>(
     }
 }
 
+/// `/v1/changes/<program>`: each block that writes to `program`, as a
+/// `Change`; `?keys` asks for the keys alone, every value `None` (a client
+/// that re-reads what moved, as the app does, never reads the values). A
+/// block that writes nothing there is a ping.
 async fn changes<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
     Path(program): Path<ProgramId>,
+    RawQuery(query): RawQuery,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let subscription = daemon.subscribe(program);
+    let keys = query
+        .as_deref()
+        .is_some_and(|query| query.split('&').any(|asked| asked == "keys"));
+    let subscription = daemon.subscribe(program, keys);
     upgrade.on_upgrade(move |socket| stream(socket, subscription))
 }
 
 enum Next {
-    Change(Change),
+    Published(Published),
     Frame,
     Ended,
 }
 
-async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Change>) {
+async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Published>) {
     let (mut client, mut frames) = socket.split();
     loop {
         let next = tokio::select! {
-            change = changes.next() => change.map_or(Next::Ended, Next::Change),
+            published = changes.next() => published.map_or(Next::Ended, Next::Published),
             frame = frames.next() => match frame {
                 Some(Ok(_)) => Next::Frame,
                 Some(Err(_)) | None => Next::Ended,
             },
         };
-        match next {
-            Next::Change(change) => {
-                let sent = client
-                    .send(Message::Binary(abi::encode(&change).into()))
-                    .await;
-                if sent.is_err() {
-                    return;
-                }
+        let message = match next {
+            Next::Published(Published::Change(change)) => {
+                Message::Binary(abi::encode(&change).into())
             }
-            Next::Frame => {}
+            Next::Published(Published::Quiet) => Message::Ping(Bytes::new()),
+            Next::Frame => continue,
             Next::Ended => return,
+        };
+        if client.send(message).await.is_err() {
+            return;
         }
     }
 }
