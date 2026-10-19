@@ -93,6 +93,10 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## Agents' computing on Kubernetes
 
+`k8s/pods/README.md` says what the pods service needs (its namespaces and
+ServiceAccount, its own chain account, the egress binding) and how to stand
+one up for another network.
+
 - `k8s/pods/deploy NODE_URL FORGE COMMIT` builds `k8s/pods/Containerfile` around
   the ducktape CLI built from `git archive COMMIT` the same way, kubectl and
   git-remote-duck, pushes it to the cluster node's registry, and applies
@@ -116,6 +120,40 @@ scripts back a `make` target; see the repository `Makefile`.
   replaces as `manifests` does, and sends a PATCH first as a dry run, checks
   the object it would store, and only then sends it. `server-test.py` covers
   them.
+- The reserved pod `desktop` is orthory's desktop build runner, a rootless
+  podman container that runs the warm pod's `build.sh`. The service
+  reaches it by ssh with the Secret `desktop-runner` in namespace `pods`
+  (files `id_ed25519`, `known_hosts`, `hosts`, `user`; `hosts` lists the
+  addresses to try in order, and the one that last answered is tried first),
+  whose key may only run the desktop's `gate` command. `pods/desktop` answers
+  the runner's `ping` as a pod that runs (503 while it is down or
+  unreachable); `pods/desktop/exec` runs only `build.sh`: the command
+  `["sh", "/var/tmp/warm/build.sh", ...]`, or a script of plain words that
+  calls it (KEY=VALUE words first, no expansion, operator or comment outside
+  quotes), and refuses anything else with 400. An exec is sent to the next
+  host only when ssh never connected; a session that broke once it ran
+  answers 502 and is not run again, while reads try the next host. `blob` and `file` read through
+  `gate get` (paths under `/out/` and `/var/tmp/warm/`), `push` through
+  `gate resolve` and `gate pack` (which run `RESOLVING` and `PACKING`
+  verbatim: changing those scripts means telling the operator, who keeps the
+  gate's copy), `logs` through `gate logs`, and `wait` follows the runner's
+  log from then on and ends when that stream does. A streamed exec and a wait keep the ssh
+  connection alive at their own `every` (`ServerAliveInterval`). It is never
+  deleted. With no Secret mounted every call to it answers 503. An exec whose
+  words name `NOTIFY=<channel>` starts one follower of the runner's log (kept
+  for good, and joined again a second after it breaks, from the time the
+  last stream that delivered a line began, or at once when the next such exec
+  comes; a join that delivers no line keeps that window and doubles the
+  pause): each `ducktape-notify`
+  line is posted as `desktop · <line>` in its channel, as `pods` with no
+  mention, where the channel exists, is not archived and is open to anyone
+  (a desktop run has no requester to vouch for a members-only room).
+
+  ```sh
+  kubectl -n pods create secret generic desktop-runner --from-file=id_ed25519=KEY \
+    --from-file=id_ed25519.pub=KEY.pub --from-file=known_hosts=KNOWN_HOSTS --from-file=hosts=HOSTS --from-file=user=USER
+  ```
+
 - `pods/NAME/wait?every=SECONDS` and an exec that names `every` answer
   `text/event-stream`, which a network hears event by event
   (`Delivery::Events`): an `alive` event each `every` seconds, which moves

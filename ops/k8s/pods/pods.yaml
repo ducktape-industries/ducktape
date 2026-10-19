@@ -1,5 +1,5 @@
 # The pods service and the agents namespace it manages: priority, RBAC, the admission policies on the operator's quota hardcap and on every pod, hardcap itself and the LimitRange defaults, isolation, its Deployment and its fixed-address Service.
-# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@ and @AGENTS_MEMORY@; the key it signs with is the Secret `blob-key`.
+# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@ and @AGENTS_MEMORY@; the key it signs with is the Secret `blob-key`, and the desktop runner's ssh key the Secret `desktop-runner`.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -315,6 +315,8 @@ spec:
         app: pods
     spec:
       serviceAccountName: pods
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: pods
           image: "@IMAGE@"
@@ -325,10 +327,12 @@ spec:
             - {name: PODS_FORGE, value: "@FORGE@"}
             - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node @NODE_URL@"}
             - {name: PODS_KEYS, value: /keys}
+            - {name: PODS_DESKTOP, value: /desktop}
           ports:
             - {name: http, containerPort: 8080}
           volumeMounts:
             - {name: keys, mountPath: /keys, readOnly: true}
+            - {name: desktop, mountPath: /desktop, readOnly: true}
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
@@ -339,6 +343,11 @@ spec:
           secret:
             secretName: blob-key
             optional: true
+        - name: desktop
+          secret:
+            secretName: desktop-runner
+            optional: true
+            defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service

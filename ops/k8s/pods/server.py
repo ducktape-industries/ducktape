@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends or a notified pod prints a `ducktape-notify` line, and usage.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends or a notified pod prints a `ducktape-notify` line, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import copy
 import hashlib
+import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -188,6 +190,15 @@ having "$new" "$@" | git pack-objects --revs --stdout -q
 )
 WATCH_PAUSE = 1
 SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+DESKTOP = "desktop"
+DESKTOP_KEYS = "/desktop"
+DESKTOP_FILES = ("id_ed25519", "known_hosts", "hosts", "user")
+BUILD_SH = "/var/tmp/warm/build.sh"
+SETTING = re.compile(r"[A-Z_][A-Za-z0-9_]*=.*", re.S)
+UNPLAIN = frozenset("$`;|&<>()*?[~#\n")
+RUNNER_DOWN = 69
+SSH_FAILED = 255
+UNCONNECTED = "ssh: connect to host "
 
 
 class Refused(Exception):
@@ -620,6 +631,169 @@ class Signer:
 
     def query(self, program, request):
         return run([*self.ducktape, "query", program, "--raw"], stdin=request, env=self.env())
+
+
+def plain_words(script):
+    quote = None
+    for char in script:
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif quote == '"' and char in '$`\\':
+                return None
+        elif char in "'\"":
+            quote = char
+        elif char in UNPLAIN:
+            return None
+    try:
+        return shlex.split(script)
+    except ValueError:
+        return None
+
+
+def desktop_words(command):
+    words = plain_words(command[2]) if len(command) == 3 and command[:2] == ["sh", "-c"] else command
+    settings = list(itertools.takewhile(SETTING.fullmatch, words or []))
+    called = (words or [])[len(settings) :]
+    if called[:2] != ["sh", BUILD_SH]:
+        raise Refused(
+            400,
+            f'pod {DESKTOP} runs build.sh alone: the command ["sh", "{BUILD_SH}", ...], or a script of plain words that calls it (KEY=VALUE words first; no expansion, operator or comment outside quotes), not {shlex.join(command)}',
+        )
+    return settings + called[2:]
+
+
+def desktop_view(said):
+    running = {"state": "running", "reason": None, "message": None, "exit_code": None, "started": said.get("started"), "finished": None}
+    container = {"name": RUN, "image": None, "command": ["sh", BUILD_SH], "args": [], "workdir": None, "resources": {}, "status": running}
+    return {
+        "name": DESKTOP,
+        "created": said.get("started"),
+        "phase": "Running",
+        "reason": None,
+        "message": None,
+        "unscheduled": None,
+        "resources": {},
+        "containers": [container],
+        "init": [],
+        "inputs": [],
+        "asked": {name: None for name in ASKED},
+        "requester": None,
+        "notify": None,
+        "runner": said,
+    }
+
+
+def gate_run(argv):
+    done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True)
+    return Ran(done.returncode, done.stdout, done.stderr.decode(errors="replace").strip())
+
+
+def gate_spawn(argv):
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+class Desktop:
+    def __init__(self, keys, home=None, runner=gate_run, spawn=gate_spawn):
+        self.keys = keys
+        self.home = home
+        self.runner = runner
+        self.spawn = spawn
+        self.lock = threading.Lock()
+        self.reached = None
+        self.key = None
+
+    def held(self):
+        return all((self.keys / name).is_file() for name in DESKTOP_FILES)
+
+    def hosts(self):
+        listed = [line.strip() for line in (self.keys / "hosts").read_text().splitlines() if line.strip()]
+        with self.lock:
+            first = self.reached
+        return sorted(listed, key=lambda host: host != first)
+
+    def identity(self):
+        with self.lock:
+            if self.key is None:
+                home = self.home or Path(tempfile.mkdtemp(prefix="desktop-"))
+                home.mkdir(parents=True, exist_ok=True)
+                key = home / "id_ed25519"
+                with os.fdopen(os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
+                    file.write((self.keys / "id_ed25519").read_bytes())
+                self.key = key
+            return self.key
+
+    def argv(self, host, words, alive):
+        user = (self.keys / "user").read_text().strip()
+        options = ["IdentitiesOnly=yes", "BatchMode=yes", "StrictHostKeyChecking=yes", f"UserKnownHostsFile={self.keys / 'known_hosts'}"]
+        if alive is not None:
+            options.append(f"ServerAliveInterval={alive}")
+        flags = [part for option in options for part in ("-o", option)]
+        return ["ssh", "-T", "-F", "/dev/null", *flags, "-i", str(self.identity()), f"{user}@{host}", json.dumps(words)]
+
+    def call(self, words, alive=None, again=True):
+        if not self.held():
+            raise Refused(503, f"this service holds no key for pod {DESKTOP}, so the desktop runner is not reachable")
+        failures = []
+        for host in self.hosts():
+            ran = self.runner(self.argv(host, words, alive))
+            if ran.code == SSH_FAILED and not again and not ran.err.startswith(UNCONNECTED):
+                raise Refused(502, f"the exec's connection to pod {DESKTOP} at {host} was cut while it ran ({ran.err or 'ssh exited 255'}); its command may still be running there, so it was not run again")
+            if ran.code == SSH_FAILED:
+                failures.append(f"{host}: {ran.err or 'ssh exited 255'}")
+                continue
+            with self.lock:
+                self.reached = host
+            if ran.code == RUNNER_DOWN:
+                raise Refused(503, f"the desktop's runner is down: {ran.err}")
+            return ran
+        raise Refused(503, f"the desktop is unreachable: {'; '.join(failures) or 'its hosts file names no host'}")
+
+    def ran(self, command, alive=None):
+        match command:
+            case ["cat", "--", path]:
+                return self.call(["get", path])
+            case ["sh", "-c", script, "resolve", *words] if script == RESOLVING:
+                return self.call(["resolve", *words])
+            case ["sh", "-c", script, "pack", *words] if script == PACKING:
+                return self.call(["pack", *words])
+            case _:
+                return self.call(["exec", *desktop_words(command)], alive, again=False)
+
+    def state(self):
+        ran = self.call(["ping"])
+        try:
+            said = json.loads(ran.out)
+        except json.JSONDecodeError as error:
+            raise Refused(502, f"the desktop's ping answered {ran.out.decode(errors='replace').strip()!r}, not JSON") from error
+        if ran.code != 0 or not said.get("up"):
+            raise Refused(503, f"the desktop's runner is not up: {said.get('state') or ran.err or f'ping exited {ran.code}'}")
+        return said
+
+    def logs(self, options):
+        kept = [option for option in options if option.startswith(("--tail=", "--since="))]
+        ran = self.call(["logs", *kept])
+        if ran.code != 0:
+            raise Refused(502, f"the desktop's logs were not read: {ran.err or f'gate exited {ran.code}'}")
+        return ran.out
+
+    def follow(self, alive):
+        self.state()
+        with self.lock:
+            host = self.reached
+        return self.spawn(self.argv(host, ["logs", "--tail=0", "--follow"], alive))
+
+    def tail(self, since):
+        self.state()
+        with self.lock:
+            host = self.reached
+        return self.spawn(self.argv(host, ["logs", f"--since={since}s", "--follow"], None))
+
+
+def heard_in(stream, heard):
+    for raw in stream:
+        heard[:] = [raw]
+        yield raw
 
 
 class Stats:
@@ -1391,14 +1565,14 @@ class Notifier:
         self.lock = threading.Lock()
         self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
 
-    def post(self, notes, requester, message_id, line):
+    def post(self, notes, requester, message_id, line, unvouched=False):
         notify = notify_of(notes)
         if notify is None:
             return False
         if not self.signer.held():
             say("pods_unposted", message=message_id, reason="no_key")
             return False
-        refused = self.refusal(notify["channel"], requester)
+        refused = self.refusal(notify["channel"], requester, unvouched)
         if refused is not None:
             reason, detail = refused
             fields = {} if detail is None else {"detail": json.dumps(detail)}
@@ -1419,8 +1593,8 @@ class Notifier:
             raise Refused(502, ran.err or ran.out.decode(errors="replace") or f"ducktape exited {ran.code}")
         return ran.out
 
-    def refusal(self, channel, requester):
-        if requester is None:
+    def refusal(self, channel, requester, unvouched=False):
+        if requester is None and not unvouched:
             return "no_requester", None
         try:
             room = room_of(self.asked(chat_channel(channel)))
@@ -1428,8 +1602,10 @@ class Notifier:
                 return "no_channel", None
             if room["archived"]:
                 return "archived", None
-            if not room["members_only"] or room["owner"] == requester:
+            if not room["members_only"] or (requester is not None and room["owner"] == requester):
                 return None
+            if requester is None:
+                return "members_only", None
             after = None
             while True:
                 accounts, after = members_of(self.asked(chat_members(channel, after)))
@@ -1440,16 +1616,16 @@ class Notifier:
         except Refused as refused:
             return "chat_unasked", refused.sentence
 
-    def lines(self, name, requester, stream):
-        self.each(name, requester, notify_lines(name, stream))
+    def lines(self, name, requester, stream, unvouched=False):
+        self.each(name, requester, notify_lines(name, stream), unvouched)
 
-    def each(self, name, requester, said):
+    def each(self, name, requester, said, unvouched=False):
         for channel, line in said:
             message_id = notify_id(name, channel, line)
             with self.lock:
                 if message_id in self.posted.get(name, ()):
                     continue
-            if self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line):
+            if self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line, unvouched):
                 with self.lock:
                     self.posted.setdefault(name, set()).add(message_id)
 
@@ -1540,8 +1716,13 @@ def json_stream(stream):
 
 
 class Service:
-    def __init__(self, kube, signer, fetching, stats, api):
+    def __init__(self, kube, signer, fetching, stats, api, desktop=None):
         self.kube = kube
+        self.desktop = desktop or Desktop(Path(DESKTOP_KEYS))
+        self.desktop_wanted = threading.Event()
+        self.desktop_follower = None
+        self.rest = self.desktop_wanted.wait
+        self.clock = time.monotonic
         self.signer = signer
         self.fetching = fetching
         self.stats = stats
@@ -1588,7 +1769,7 @@ class Service:
             self.pause(pause)
             pause *= 2
 
-    def execution(self, asked, name, container, command):
+    def execution(self, asked, name, container, command, alive=None):
         key = exec_key(asked)
         with self.lock:
             known = self.execs.get(key)
@@ -1597,7 +1778,7 @@ class Service:
             running = self.execs[key] = Execution(asked)
 
         def run():
-            running.end(outcome(lambda: self.executed(asked, name, container, command)))
+            running.end(outcome(lambda: self.executed(asked, name, container, command, alive=alive)))
             self.swept.set()
 
         threading.Thread(target=run, daemon=True).start()
@@ -1631,7 +1812,10 @@ class Service:
             except Exception as error:
                 say("pods_sweep_failed", detail=json.dumps(repr(error)))
 
-    def executed(self, asked, name, container, command, again=False):
+    def executed(self, asked, name, container, command, again=False, alive=None):
+        if name == DESKTOP:
+            return self.desktop.ran(command, alive)
+
         def attempt():
             return self.kube.exec(name, container, command)
 
@@ -1689,9 +1873,11 @@ class Service:
                 process.kill()
 
     def output(self, name, asked_by, asked):
-        pod = self.pod(name)
-        names = [container["name"] for container in pod["spec"]["containers"]]
-        container = asked.get("container") or (OUT if OUT in names else None)
+        container = asked.get("container")
+        if name != DESKTOP:
+            pod = self.pod(name)
+            names = [held["name"] for held in pod["spec"]["containers"]]
+            container = container or (OUT if OUT in names else None)
         command = ["cat", "--", absolute(asked["path"], "path")]
         ran = self.executed(asked_by, name, container, command, again=True)
         if ran.code != 0:
@@ -1714,9 +1900,13 @@ class Service:
         return 200, {"pods": [view(pod) for pod in self.items(self.kube.list(), "the pods were not listed")]}
 
     def status(self, name):
+        if name == DESKTOP:
+            return 200, {"pod": desktop_view(self.desktop.state())}
         return 200, {"pod": view(self.pod(name))}
 
     def logs(self, name, query):
+        if name == DESKTOP:
+            return 200, self.desktop.logs(log_options(query))
         ran = self.kube.logs(name, log_options(query))
         if ran.code != 0:
             raise kube_refusal(ran, f"pod {name}'s logs were not read")
@@ -1724,7 +1914,55 @@ class Service:
 
     def wait(self, name, query):
         every = wait_every(query)
+        if name == DESKTOP:
+            return 200, Stream(self.desktop_waited(self.desktop.follow(every), every))
         return 200, Stream(self.waited(name, self.pod(name), every))
+
+    def follow_desktop(self):
+        with self.lock:
+            if self.desktop_follower is None:
+                self.desktop_follower = threading.Thread(target=self.followed_desktop, args=(self.clock(),), daemon=True)
+                self.desktop_follower.start()
+        self.desktop_wanted.set()
+
+    def followed_desktop(self, begun):
+        since = begun
+        pause = RETRY_PAUSE
+        while True:
+            asked = self.clock()
+            heard = []
+            try:
+                process = self.desktop.tail(math.ceil(asked - since))
+            except Refused as refused:
+                say("pods_unfollowed", pod=DESKTOP, detail=json.dumps(refused.sentence))
+            else:
+                with process.stdout:
+                    self.notifier.lines(DESKTOP, None, heard_in(process.stdout, heard), unvouched=True)
+                say("pods_unfollowed", pod=DESKTOP, code=process.wait())
+            if heard:
+                since, pause = asked, RETRY_PAUSE
+            self.rest(pause)
+            if not heard:
+                pause *= 2
+            self.desktop_wanted.clear()
+
+    def desktop_waited(self, process, every):
+        ended = queue.Queue()
+
+        def drained():
+            with process.stdout:
+                for _ in process.stdout:
+                    pass
+            ended.put((process.wait(), process.stderr.read().decode(errors="replace").strip()))
+
+        threading.Thread(target=drained, daemon=True).start()
+        try:
+            code, why = yield from Beat(every).heard(ended)
+        finally:
+            if process.poll() is None:
+                process.kill()
+        line = f"pod {DESKTOP}'s log stream ended (ssh exit {code}): {why or 'it said nothing'}"
+        yield sse("ended", {"line": line, "exit_code": None, "pod": None})
 
     def waited(self, name, pod, every):
         ended = ended_event(pod)
@@ -1759,6 +1997,8 @@ class Service:
         return ended_event(json.loads(ran.out))
 
     def delete(self, name):
+        if name == DESKTOP:
+            raise Refused(403, f"pod {DESKTOP} is orthory's desktop build runner, a machine and not a pod, so nothing deletes it")
         ran = self.kube.delete(name)
         if ran.code != 0:
             raise kube_refusal(ran, f"pod {name} was not deleted")
@@ -1768,14 +2008,17 @@ class Service:
         asked = checked(body, EXEC, "an exec")
         command = strings(asked.get("command", []), "command")
         container = asked.get("container")
+        if name == DESKTOP and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in desktop_words(command)):
+            self.follow_desktop()
         if "every" not in asked:
             return 200, exec_answer(name, answered(self.execution(asked_by, name, container, command).get()))
         every = from_one(asked["every"], "every")
-        self.pod(name)
+        if name != DESKTOP:
+            self.pod(name)
         return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
 
     def exec_waited(self, asked, name, container, command, every):
-        ran = yield from Beat(every).heard(self.execution(asked, name, container, command))
+        ran = yield from Beat(every).heard(self.execution(asked, name, container, command, alive=every))
         try:
             answer = "ended", exec_answer(name, answered(ran))
         except Refused as refusal:
@@ -2259,7 +2502,8 @@ def main():
         sys.exit(f"{', '.join(unset)} must be set: the image of each pod's fetch and out containers, the node they read inputs from, and its forge")
     kube = Kube(shlex.split(os.environ.get("PODS_KUBECTL", "kubectl")), os.environ.get("PODS_NAMESPACE", "agents"))
     signer = Signer(shlex.split(os.environ.get("PODS_DUCKTAPE", "ducktape")), Path(os.environ.get("PODS_KEYS", "/keys")))
-    service = Service(kube, signer, fetching, Stats(), Api())
+    desktop = Desktop(Path(os.environ.get("PODS_DESKTOP", DESKTOP_KEYS)))
+    service = Service(kube, signer, fetching, Stats(), Api(), desktop)
     threading.Thread(target=service.notifier.watch, daemon=True).start()
     threading.Thread(target=service.sweeper, daemon=True).start()
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)

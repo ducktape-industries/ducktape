@@ -4,6 +4,7 @@ import http.client
 import socket
 import importlib.util
 import io
+import itertools
 import json
 import os
 import pathlib
@@ -275,13 +276,13 @@ class Api:
 
 
 class Served(unittest.TestCase):
-    def serve(self, signer=None):
+    def serve(self, signer=None, desktop=None):
         self.kube = Kube()
         self.kube.answer("cluster_kinds", ran(KINDS))
         self.signer = signer or Signer()
         self.stats = Stats()
         self.api = Api()
-        service = self.service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api)
+        service = self.service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api, desktop)
         self.paused = []
         service.pause = self.paused.append
         quiet = type("Quiet", (server.handler(service),), {"log_message": lambda *_: None})
@@ -1301,8 +1302,8 @@ class Repeated(Streamed):
         arrived = queue.Queue()
         execution = self.service.execution
 
-        def told(*args):
-            running = execution(*args)
+        def told(*args, **named):
+            running = execution(*args, **named)
             arrived.put(running)
             return running
 
@@ -2154,6 +2155,247 @@ class ForgeRefs(unittest.TestCase):
     def test_a_branch_commit_is_checked_out_from_the_clone_alone(self):
         self.assertEqual(self.fetched(self.dev), (self.dev, ["base", "dev"]))
         self.assertEqual(self.log.getvalue().splitlines(), [f"cloned duck://duckpond/forge/programs at {self.dev}"])
+
+
+UP = {"runner": "desktop", "up": True, "state": "running", "started": "2026-10-19T16:00:00Z", "busy": [], "busy_exit": 0, "heavy_runs": 1}
+BUILD = server.BUILD_SH
+
+
+class Gate:
+    def __init__(self):
+        self.calls = []
+        self.answers = {"ping": ran(UP)}
+        self.down = set()
+        self.cut = set()
+        self.said = {}
+        self.processes = []
+        self.followers = queue.Queue()
+        self.spawned = queue.Queue()
+
+    def run(self, argv):
+        host = argv[-2].split("@", 1)[1]
+        words = json.loads(argv[-1])
+        self.calls.append((host, words, argv))
+        if host in self.down:
+            return ran(code=255, err=f"ssh: connect to host {host} port 22: No route to host")
+        if host in self.cut:
+            return ran(code=255, err=f"Connection to {host} closed by remote host.")
+        if host in self.said:
+            return ran(code=255, err=self.said[host])
+        return self.answers.get(words[0], ran(b""))
+
+    def spawn(self, argv):
+        words = json.loads(argv[-1])
+        self.calls.append((argv[-2].split("@", 1)[1], words, argv))
+        if any(word.startswith("--since=") for word in words):
+            self.spawned.put(words)
+            return self.followers.get()
+        return self.processes.pop(0)
+
+    def words(self):
+        return [words for _, words, _ in self.calls]
+
+
+class Followed:
+    def __init__(self, code, said, out=b"[run] a line\n"):
+        self.stdout = io.BytesIO(out)
+        self.stderr = io.BytesIO(said)
+        self.code = code
+        self.killed = False
+
+    def wait(self):
+        return self.code
+
+    def poll(self):
+        return self.code
+
+    def kill(self):
+        self.killed = True
+
+
+class DesktopRunner(Streamed):
+    def setUp(self):
+        held = tempfile.TemporaryDirectory()
+        self.addCleanup(held.cleanup)
+        self.keys = pathlib.Path(held.name) / "keys"
+        self.keys.mkdir()
+        for name, text in {"id_ed25519": "private", "known_hosts": "desk ssh-ed25519 AAAA", "hosts": "lan\ntail\nwifi\n", "user": "orthory\n"}.items():
+            (self.keys / name).write_text(text)
+        self.gate = Gate()
+        desktop = server.Desktop(self.keys, pathlib.Path(held.name) / "home", runner=self.gate.run, spawn=self.gate.spawn)
+        self.serve(desktop=desktop)
+        self.service.rest = self.paused.append
+
+    def notified(self, line):
+        self.gate.answers["exec"] = ran(b"run r1\n")
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "JOB=j-1", "NOTIFY=j-1", "programs", "dev", "gates"]})
+        words = self.gate.spawned.get(timeout=10)
+        self.assertEqual(words[0], "logs")
+        self.assertTrue(words[1].startswith("--since=") and words[1].endswith("s"))
+        self.gate.followers.put(Followed(255, b""))
+        self.gate.followers.put(Followed(0, b"", line))
+        self.gate.spawned.get(timeout=10)
+        self.gate.spawned.get(timeout=10)
+
+    def test_a_notify_run_s_end_line_is_posted_with_no_mention(self):
+        self.notified(b"[r1] GATES ok\nducktape-notify j-1 r1 ended: exit 0, GATES ok\n")
+        line = "desktop · r1 ended: exit 0, GATES ok"
+        posted = server.post_message("j-1", server.notify_id("desktop", "j-1", line), None, line, None)
+        self.assertEqual(self.signer.submits, [("chat", posted)])
+        self.assertEqual(self.paused, [1, 1])
+
+    def joins(self, clock, streams):
+        self.service.clock = clock
+        self.gate.answers["exec"] = ran(b"run r1\n")
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "NOTIFY=j-1", "programs", "dev", "gates"]})
+        asked = [self.gate.spawned.get(timeout=10)]
+        for out in streams:
+            self.gate.followers.put(Followed(255, b"", out))
+            asked.append(self.gate.spawned.get(timeout=10))
+        return [words[1] for words in asked]
+
+    def test_a_join_that_delivers_nothing_keeps_the_window_of_the_last_stream_that_did(self):
+        windows = self.joins(iter([0, 10, 400, 420]).__next__, [b"[r1] a line\n", b""])
+        self.assertEqual(windows, ["--since=10s", "--since=390s", "--since=410s"])
+        self.assertEqual(self.paused, [1, 1])
+
+    def test_joins_that_deliver_nothing_back_off(self):
+        self.joins(itertools.count().__next__, [b""] * 5)
+        self.assertEqual(self.paused, [1, 2, 4, 8, 16])
+
+    def test_a_notify_line_for_a_members_only_room_is_not_posted(self):
+        self.signer.rooms[server.chat_channel("j-1")] = room(members_only=True)
+        self.notified(b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\n")
+        self.assertEqual(self.signer.submits, [])
+
+    def test_its_status_is_its_runners_ping_over_the_gate_key(self):
+        status, answer = self.call("GET", "/v1/pods/desktop")
+        self.assertEqual((status, answer["pod"]["name"], answer["pod"]["phase"]), (200, "desktop", "Running"))
+        self.assertEqual(answer["pod"]["runner"], UP)
+        ((host, words, argv),) = self.gate.calls
+        self.assertEqual((host, words, argv[-2]), ("lan", ["ping"], "orthory@lan"))
+        for option in ("IdentitiesOnly=yes", "BatchMode=yes", "StrictHostKeyChecking=yes", f"UserKnownHostsFile={self.keys / 'known_hosts'}"):
+            self.assertIn(option, argv)
+        key = pathlib.Path(argv[argv.index("-i") + 1])
+        self.assertEqual((key.read_text(), key.stat().st_mode & 0o777), ("private", 0o600))
+        self.assertNotIn("get", self.kube.verbs())
+
+    def test_a_runner_that_is_not_up_or_is_down_answers_503(self):
+        self.gate.answers["ping"] = ran({"up": False, "state": "stopped"})
+        self.refused("GET", "/v1/pods/desktop", None, 503, ["not up", "stopped"])
+        self.gate.answers["ping"] = ran(code=69, err="gate: runner_down")
+        self.refused("GET", "/v1/pods/desktop", None, 503, ["down", "runner_down"])
+
+    def test_each_host_is_tried_in_order_and_the_one_that_answered_goes_first_after(self):
+        self.gate.down = {"lan"}
+        self.assertEqual(self.call("GET", "/v1/pods/desktop")[0], 200)
+        self.assertEqual([host for host, _, _ in self.gate.calls], ["lan", "tail"])
+        self.call("GET", "/v1/pods/desktop")
+        self.assertEqual([host for host, _, _ in self.gate.calls][2:], ["tail"])
+
+    def test_an_exec_goes_to_the_next_host_only_when_ssh_never_connected(self):
+        self.gate.down = {"lan"}
+        self.gate.answers["exec"] = ran(b"run r1\n")
+        status, _ = self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "busy"]})
+        self.assertEqual((status, [host for host, _, _ in self.gate.calls]), (200, ["lan", "tail"]))
+
+    def test_an_exec_whose_session_broke_is_never_run_again(self):
+        self.gate.cut = {"lan"}
+        self.refused("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "busy"]}, 502, ["may still be running", "closed by remote host"])
+        self.assertEqual([host for host, _, _ in self.gate.calls], ["lan"])
+
+    def test_an_exec_whose_own_output_names_a_failed_connect_is_not_run_again(self):
+        self.gate.said = {"lan": "ssh: connect to host forge port 22: Connection refused\nConnection to lan closed by remote host."}
+        self.gate.said["lan"] = "build.sh: " + self.gate.said["lan"]
+        self.refused("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "busy"]}, 502, ["may still be running"])
+        self.assertEqual([host for host, _, _ in self.gate.calls], ["lan"])
+
+    def test_a_read_whose_session_broke_tries_the_next_host(self):
+        self.gate.cut = {"lan"}
+        self.assertEqual(self.call("GET", "/v1/pods/desktop")[0], 200)
+        self.assertEqual([host for host, _, _ in self.gate.calls], ["lan", "tail"])
+
+    def test_no_host_answering_is_503_naming_each(self):
+        self.gate.down = {"lan", "tail", "wifi"}
+        self.refused("GET", "/v1/pods/desktop", None, 503, ["unreachable", "lan:", "tail:", "wifi:", "No route to host"])
+
+    def test_no_key_mounted_is_503(self):
+        (self.keys / "id_ed25519").unlink()
+        self.refused("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "busy"]}, 503, ["no key"])
+        self.assertEqual(self.gate.calls, [])
+
+    def test_an_exec_of_build_sh_goes_to_the_gates_exec_with_its_words(self):
+        self.gate.answers["exec"] = ran(b"run 20261019-1\n")
+        command = ["sh", BUILD, "JOB=j-1", "programs", "dev", "gates"]
+        status, answer = self.call("POST", "/v1/pods/desktop/exec", {"command": command})
+        self.assertEqual((status, answer), (200, {"exit_code": 0, "stdout": "run 20261019-1\n", "stderr": ""}))
+        self.assertEqual(self.gate.words(), [["exec", "JOB=j-1", "programs", "dev", "gates"]])
+
+    def test_a_script_of_plain_words_reads_as_build_shs_words(self):
+        script = "JOB=j-1 LIGHT=1 sh /var/tmp/warm/build.sh programs dev sh 'cargo test; echo $X # light'"
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", "-c", script]})
+        self.assertEqual(self.gate.words(), [["exec", "JOB=j-1", "LIGHT=1", "programs", "dev", "sh", "cargo test; echo $X # light"]])
+
+    def test_any_other_command_is_refused_before_ssh(self):
+        for command in (
+            ["make"],
+            ["cat", "--", "/out/x"],
+            ["sh", "-c", "sh /var/tmp/warm/build.sh busy; rm -rf /"],
+            ["sh", "-c", "sh /var/tmp/warm/build.sh $(id)"],
+            ["sh", "-c", 'sh /var/tmp/warm/build.sh "$HOME"'],
+            ["sh", "-c", "sh /var/tmp/warm/build.sh busy # x"],
+        ):
+            self.refused("POST", "/v1/pods/desktop/exec", {"command": command}, 400, ["runs build.sh alone"])
+        self.assertEqual(self.gate.calls, [])
+
+    def test_a_streamed_exec_keeps_ssh_alive_at_its_own_every(self):
+        self.gate.answers["exec"] = ran(b"ended\n", code=1)
+        response = self.stream("/v1/pods/desktop/exec", "POST", {"command": ["sh", BUILD, "wait", "r1"], "every": 7})
+        kind, data = self.past_alive(response)
+        self.assertEqual((kind, data["exit_code"], data["stdout"]), ("ended", 1, "ended\n"))
+        ((_, words, argv),) = self.gate.calls
+        self.assertEqual(words, ["exec", "wait", "r1"])
+        self.assertIn("ServerAliveInterval=7", argv)
+
+    def test_a_blob_is_read_through_the_gates_get(self):
+        self.gate.answers["get"] = ran(b"\0asm")
+        status, answer = self.call("POST", "/v1/pods/desktop/blob", {"path": "/out/a.wasm", "kind": "program"})
+        self.assertEqual((status, answer["size"]), (200, 4))
+        self.assertEqual(self.gate.words(), [["get", "/out/a.wasm"]])
+        self.assertEqual(self.signer.puts, [([b"\0asm"], "program")])
+        self.assertNotIn("get", self.kube.verbs())
+
+    def test_a_push_resolves_and_packs_through_the_gate(self):
+        self.gate.answers["resolve"] = ran(f"{COMMIT} {HAVE}\n1\n".encode())
+        self.gate.answers["pack"] = ran(pack_of(3))
+        tree = "/var/tmp/warm/programs/git"
+        status, answer = self.call("POST", "/v1/pods/desktop/push", {"path": tree, "have": [HAVE]})
+        self.assertEqual((status, answer["commit"], answer["objects"]), (200, COMMIT, 3))
+        self.assertEqual(self.gate.words(), [["resolve", tree, "HEAD", HAVE], ["pack", tree, COMMIT, HAVE]])
+
+    def test_logs_are_the_runners_with_tail_and_since(self):
+        self.gate.answers["logs"] = ran(b"[r1] GATES ok\n")
+        status, answer = self.call("GET", "/v1/pods/desktop/logs?tail=5&since=60&container=run")
+        self.assertEqual((status, answer), (200, b"[r1] GATES ok\n"))
+        self.assertEqual(self.gate.words(), [["logs", "--tail=5", "--since=60s"]])
+
+    def test_a_wait_ends_when_the_runners_log_stream_does(self):
+        self.gate.processes.append(Followed(255, b"Timeout, server lan not responding.\n"))
+        kind, data = self.past_alive(self.stream("/v1/pods/desktop/wait?every=9"))
+        self.assertEqual(kind, "ended")
+        self.assertEqual((data["exit_code"], data["pod"]), (None, None))
+        self.assertIn("ssh exit 255", data["line"])
+        self.assertIn("not responding", data["line"])
+        self.assertEqual(self.gate.words(), [["ping"], ["logs", "--tail=0", "--follow"]])
+        self.assertIn("ServerAliveInterval=9", self.gate.calls[1][2])
+
+    def test_a_wait_on_a_runner_that_is_not_up_is_refused_before_any_stream(self):
+        self.gate.answers["ping"] = ran({"up": False, "state": "stopped"})
+        self.refused("GET", "/v1/pods/desktop/wait?every=9", None, 503, ["not up"])
+
+    def test_it_is_never_deleted(self):
+        self.refused("DELETE", "/v1/pods/desktop", None, 403, ["not a pod"])
+        self.assertEqual(self.gate.calls, [])
 
 
 class Stopped(unittest.TestCase):
