@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use abi::reason;
 use abi::role::egress::{HTTP, RELAY, RESERVED};
+use abi::role::identity::AccountNumber;
 use serde::Deserialize;
 use url::Url;
 
@@ -24,9 +25,21 @@ struct File {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Service {
-    base: String,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    lent: Option<String>,
     #[serde(default)]
     secrets: BTreeMap<String, Secret>,
+    #[serde(default)]
+    lend: BTreeMap<String, Lend>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Lend {
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +87,14 @@ pub enum Refused {
     Unfit { service: String },
     #[error("the HTTP client does not build: {0}")]
     Client(#[source] reqwest::Error),
+    #[error("{service} names a base it fronts or a node it borrows it from (lent), one of them")]
+    Upstream { service: String },
+    #[error(
+        "{service} is borrowed: the lending node adds its own secrets and loans, so it names neither"
+    )]
+    Borrowed { service: String },
+    #[error("{service} lends to {account}, which is not an account number")]
+    Borrower { service: String, account: String },
     #[error("egress.toml was not written: {0}")]
     Unwritten(#[source] std::io::Error),
 }
@@ -87,7 +108,10 @@ impl Refused {
             Refused::Unparsed(_)
             | Refused::Reserved { .. }
             | Refused::Base { .. }
-            | Refused::Unfit { .. } => reason::INVALID_INPUT,
+            | Refused::Unfit { .. }
+            | Refused::Upstream { .. }
+            | Refused::Borrowed { .. }
+            | Refused::Borrower { .. } => reason::INVALID_INPUT,
             Refused::Client(_) | Refused::Unwritten(_) => reason::UNSUPPORTED,
         }
     }
@@ -136,6 +160,7 @@ pub enum Reach {
 pub struct Upstream {
     pub base: Url,
     pub secrets: Vec<(String, String)>,
+    pub lend: BTreeMap<AccountNumber, Vec<(String, String)>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -144,6 +169,7 @@ pub struct Config {
     pub http: bool,
     pub reach: Reach,
     pub services: BTreeMap<String, Upstream>,
+    pub lent: BTreeMap<String, Url>,
 }
 
 impl Config {
@@ -154,23 +180,40 @@ impl Config {
     ) -> Result<Config, Refused> {
         let file: File = toml::from_str(text)?;
         let mut services = BTreeMap::new();
+        let mut lent = BTreeMap::new();
         for (name, service) in file.services {
             if RESERVED.contains(&name.as_str()) {
                 return Err(Refused::Reserved { service: name });
             }
-            let secrets = service
-                .secrets
-                .into_iter()
-                .map(|(header, secret)| {
-                    let value = reveal(&name, &header, secret, &env, &read)?;
-                    Ok((header.to_ascii_lowercase(), value))
-                })
-                .collect::<Result<_, Refused>>()?;
-            let upstream = Upstream {
-                base: base(&name, &service.base)?,
-                secrets,
-            };
-            services.insert(name, upstream);
+            match (service.base, service.lent) {
+                (Some(fronted), None) => {
+                    let secrets = service
+                        .secrets
+                        .into_iter()
+                        .map(|(header, secret)| {
+                            let value = reveal(&name, &header, secret, &env, &read)?;
+                            Ok((header.to_ascii_lowercase(), value))
+                        })
+                        .collect::<Result<_, Refused>>()?;
+                    let upstream = Upstream {
+                        base: base(&name, &fronted)?,
+                        secrets,
+                        lend: loans(&name, service.lend)?,
+                    };
+                    services.insert(name, upstream);
+                }
+                (None, Some(lender)) => {
+                    let plain = service.secrets.is_empty() && service.lend.is_empty();
+                    if !plain {
+                        return Err(Refused::Borrowed { service: name });
+                    }
+                    let lender = base(&name, &lender)?;
+                    lent.insert(name, lender);
+                }
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(Refused::Upstream { service: name });
+                }
+            }
         }
         let reach = match file.private {
             true => Reach::Private,
@@ -181,6 +224,7 @@ impl Config {
             http: file.http,
             reach,
             services,
+            lent,
         })
     }
 
@@ -191,10 +235,30 @@ impl Config {
             .filter(|(on, _)| *on)
             .map(|(_, name)| name.to_owned())
             .chain(self.services.keys().cloned())
+            .chain(self.lent.keys().cloned())
             .collect();
         served.sort();
         served
     }
+}
+
+fn loans(
+    service: &str,
+    lend: BTreeMap<String, Lend>,
+) -> Result<BTreeMap<AccountNumber, Vec<(String, String)>>, Refused> {
+    lend.into_iter()
+        .map(|(account, Lend { headers })| {
+            let number = account.parse().map_err(|_| Refused::Borrower {
+                service: service.to_owned(),
+                account: account.clone(),
+            })?;
+            let headers = headers
+                .into_iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value))
+                .collect();
+            Ok((number, headers))
+        })
+        .collect()
 }
 
 fn reveal(

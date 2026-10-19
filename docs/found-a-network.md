@@ -138,6 +138,20 @@ base = "http://10.43.41.41:4141"
 secrets = { x-api-key = { file = "/secrets/egress/CCS_KEY" } }
 ```
 
+Instead of either kubectl step, a network can borrow the service from a
+network that fronts it, and nothing of the lender's is copied (README § Answer
+calls outside the chain, lending). Your node's key makes an account on the
+lending network, the service's owner there names that account in the access
+list on egress `lend/<service>`, and your node's `egress.toml` names the
+lending node:
+
+```toml
+relay = true
+
+[services.anthropic]
+lent = "https://duckpond.ducktape.industries"
+```
+
 ## 6. Found the network into its claim
 
 ```sh

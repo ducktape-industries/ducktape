@@ -399,6 +399,49 @@ that needs one sits behind a proxy in the cluster that holds it. Only the
 node's own key may set `private = true`; from a granted key the set is
 refused as `unauthorized`, naming `private`.
 
+A node lends a service it fronts to another network's node, so that network
+uses it without any of this node's secrets. The other network's node holds an
+account on this network under its own node key (identity `Create { name,
+scheme: Ed25519 }`, signed with that key). The service's owner lends the
+service by naming that account in the access list on egress key
+`lend/<service>` (access `Set { program: "egress", key: "lend/<service>", list
+}`; egress answers that key's owner as the service's owner), and clearing the
+list ends the loan. The borrowing node's `egress.toml` names the lending node
+instead of a base:
+
+```toml
+[services.anthropic]
+lent = "https://duckpond.ducktape.industries"   # a node of the lending network
+```
+
+A borrowed service names no `secrets` and no `lend`, and a service names
+`base` or `lent`, never both. The borrowing node serves it on its own network
+like any other. When its chain elects it for a request, it calls the lending
+node over one websocket, `/v1/egress/lend`, which it opens on its first
+request and opens again after it ends. The lending node opens with a
+challenge (its network, its tip and a nonce), and the borrowing node answers
+with a frame its node key signs to `$lend` carrying the nonce. The lending
+node reads the key's account from its identity role and then relays each
+request on the session. Before each one it asks its access role `Writers` for
+`lend/<service>` on the egress program, so a request after the list stops
+naming the account is refused (`<service> is not lent to account <n>`). It
+calls the service at its own base with its own secrets, adds
+`ducktape-borrower: <account>` and the headers its `lend` table names for that
+account (each replacing a header of the same name the borrower sent), and
+sends the answer back whole or event by event as it arrives. A session that
+ends cuts the requests on it on both nodes: the lending node stops calling
+the service for them. The lending node's `egress.toml` sets headers per
+borrowing account, such as a model gateway's account pin:
+
+```toml
+[services.anthropic.lend.42]   # account 42 on this network
+headers = { x-ccs-account = "max-2" }
+```
+
+Its `/metrics` counts `egress_lent_requests` and `egress_lent_bytes` (answer
+bytes) by account and service. An `egress set` dry run reports, for a
+borrowed service, whether the lending node answers.
+
 A service request goes to `base` joined with its path; a path that would leave
 `base` fails. The node adds the service's secrets, and it adds
 `ducktape-chain`, `ducktape-program` (the program that asked) and

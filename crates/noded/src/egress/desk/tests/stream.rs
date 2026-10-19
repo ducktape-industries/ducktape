@@ -77,12 +77,14 @@ fn call(row: &RequestRow) -> mpsc::UnboundedReceiver<Called> {
             http: true,
             reach: Reach::Private,
             services: BTreeMap::new(),
+            lent: BTreeMap::new(),
         };
         let clients = Clients::new(config.reach).unwrap();
         let caller = Caller {
             chain: "dognet-b5b6ea90",
             program: "harness",
             id: row.id,
+            lent: &[],
         };
         let event = |data| called.unbounded_send(Called::Event(data)).unwrap();
         let (request, delivery) = (&row.request, &row.delivery);

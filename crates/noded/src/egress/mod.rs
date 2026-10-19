@@ -3,6 +3,7 @@
 mod call;
 mod config;
 mod desk;
+mod lend;
 mod station;
 mod stream;
 
@@ -17,6 +18,7 @@ use host::{Layer, Tip};
 use node::{Frame, Preconfirm, Source, Taken};
 
 pub use config::{Config, Refused, Withheld, withheld};
+pub use lend::{Lending, lend_to};
 pub use station::{Planned, Station, Tally};
 
 use crate::egress::call::Caller;
@@ -271,11 +273,25 @@ impl<E: Context> Worker<E> {
                             chain: &daemon.descriptor.network,
                             program: &row.requester,
                             id,
+                            lent: &[],
                         };
                         let Serving { config, clients } = serving.as_ref();
                         let request = &row.request;
                         let delivery = &row.delivery;
-                        call::answer(clients, config, &caller, request, delivery, body, event).await
+                        match config.lent.get(request.service()) {
+                            Some(lender) => {
+                                let lending = &daemon.lending;
+                                lending
+                                    .borrow(lender, &caller, request, delivery, body, event)
+                                    .await
+                            }
+                            None => {
+                                call::answer(
+                                    clients, config, &caller, request, delivery, body, event,
+                                )
+                                .await
+                            }
+                        }
                     }
                     Err(reason) => Called::Whole(Answer::Failed(reason)),
                 };

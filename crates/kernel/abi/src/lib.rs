@@ -1530,6 +1530,20 @@ pub mod role {
                 needs: Vec<Need>,
             },
         }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum Query {
+            List { program: ProgramId, key: String },
+            Resource { program: ProgramId, key: String },
+            Writers { program: ProgramId, key: String },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum Reply {
+            List(Option<Ownership>),
+            Resource(Resource),
+            Writers(Writers),
+        }
     }
 }
 

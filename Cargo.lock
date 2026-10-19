@@ -3079,6 +3079,7 @@ dependencies = [
  "commonware-runtime",
  "commonware-utils",
  "consensus",
+ "fixture-access",
  "fixture-awaiter",
  "fixture-egress",
  "fixture-oracle",

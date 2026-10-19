@@ -1,6 +1,10 @@
 //! An egress program for the node's tests: a key's `Serve` records what it serves, a request goes to
-//! the first node serving its service, and that node's `Answer` is kept under `answer_key`.
+//! the first node serving it, whose `Answer` is kept under `answer_key` (a stream's events and end
+//! under `event_key` and `end_key`); `Register` makes its sender the owner of `lend/<service>`.
 pub const NODE: &[u8] = b"node/";
+pub const OWNER: &[u8] = b"owner/";
+pub const EVENT: &[u8] = b"event/";
+pub const END: &[u8] = b"end/";
 pub const REQUEST: &[u8] = b"request/";
 pub const ANSWER: &[u8] = b"answer/";
 pub const NEXT: &[u8] = b"next";
@@ -17,16 +21,34 @@ pub fn answer_key(id: u64) -> Vec<u8> {
     [ANSWER, &id.to_be_bytes()].concat()
 }
 
+pub fn owner_key(service: &str) -> Vec<u8> {
+    [OWNER, service.as_bytes()].concat()
+}
+
+pub fn events_of(id: u64) -> Vec<u8> {
+    [EVENT, &id.to_be_bytes()].concat()
+}
+
+pub fn event_key(id: u64, seq: u64) -> Vec<u8> {
+    [events_of(id).as_slice(), &seq.to_be_bytes()].concat()
+}
+
+pub fn end_key(id: u64) -> Vec<u8> {
+    [END, &id.to_be_bytes()].concat()
+}
+
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::role::access::{Need, Resource};
+    use abi::role::access::{Need, Ownership, Party, Resource};
     use abi::role::egress::{
-        Answer, Delivery, NodeRow, Op, Query as Ask, Reply, Request, RequestRow,
+        Answer, Delivery, Event, NodeRow, Op, Query as Ask, Reply, Request, RequestRow, StreamEnd,
     };
-    use abi::{Env, Origin, Refusal, Scan, reason};
+    use abi::{Env, Origin, Principal, Refusal, Scan, reason};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{NEXT, NODE, REQUEST, answer_key, node_key, request_key};
+    use crate::{
+        NEXT, NODE, REQUEST, answer_key, end_key, event_key, node_key, owner_key, request_key,
+    };
 
     struct Egress;
 
@@ -37,6 +59,45 @@ mod program {
                 Err(Refusal::new(reason::UNAUTHORIZED, "a node signs this op"))
             }
         }
+    }
+
+    fn register(ctx: &mut Execute, env: &Env, service: String) -> Result<(), Refusal> {
+        let Some(Principal::Account(owner)) = env.sender else {
+            return Err(Refusal::new(
+                reason::UNAUTHORIZED,
+                "an account registers a service",
+            ));
+        };
+        ctx.put(owner_key(&service), &owner);
+        Ok(())
+    }
+
+    fn elected(ctx: &mut Execute, env: &Env, id: u64) -> Result<(), Refusal> {
+        let Some(row) = ctx.record::<RequestRow>(request_key(id))? else {
+            return Err(Refusal::new(reason::NOT_FOUND, format!("no request {id}")));
+        };
+        if signer(env)? != row.node.as_slice() {
+            return Err(Refusal::new(
+                reason::UNAUTHORIZED,
+                format!("request {id} is another node's"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn events(ctx: &mut Execute, env: &Env, events: Vec<Event>) -> Result<(), Refusal> {
+        for event in events {
+            elected(ctx, env, event.id)?;
+            ctx.put(event_key(event.id, event.seq), &event.data);
+        }
+        Ok(())
+    }
+
+    fn end_stream(ctx: &mut Execute, env: &Env, id: u64, end: StreamEnd) -> Result<(), Refusal> {
+        elected(ctx, env, id)?;
+        ctx.delete(request_key(id));
+        ctx.put(end_key(id), &end);
+        Ok(())
     }
 
     fn serve(ctx: &mut Execute, env: &Env, services: Vec<String>) -> Result<(), Refusal> {
@@ -112,13 +173,12 @@ mod program {
                     ..
                 } => request(ctx, env, asked, delivery),
                 Op::Answer { id, answer: given } => answer(ctx, env, id, given),
-                Op::Register { .. }
-                | Op::Assign { .. }
-                | Op::Events(_)
-                | Op::EndStream { .. }
-                | Op::Expire { .. } => Err(Refusal::new(
+                Op::Register { service } => register(ctx, env, service),
+                Op::Events(given) => events(ctx, env, given),
+                Op::EndStream { id, end, .. } => end_stream(ctx, env, id, end),
+                Op::Assign { .. } | Op::Expire { .. } => Err(Refusal::new(
                     reason::UNSUPPORTED,
-                    "this fixture serves, requests and answers",
+                    "this fixture neither assigns nor expires",
                 )),
             }
         }
@@ -127,8 +187,15 @@ mod program {
             Ok(Vec::new())
         }
 
-        fn resource(_ctx: &mut Query, _env: &Env, _key: &str) -> Result<Resource, Refusal> {
-            Ok(Resource::default())
+        fn resource(ctx: &mut Query, _env: &Env, key: &str) -> Result<Resource, Refusal> {
+            let Some(service) = key.strip_prefix("lend/") else {
+                return Ok(Resource::default());
+            };
+            let owner: Option<u64> = ctx.record(owner_key(service))?;
+            Ok(Resource {
+                owner: owner.map(Party::Account),
+                default: Some(Ownership::Owner),
+            })
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {

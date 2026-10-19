@@ -64,12 +64,14 @@ fn config(base: &str, reach: Reach) -> Config {
     let upstream = Upstream {
         base: Url::parse(base).unwrap(),
         secrets: vec![("x-api-key".to_owned(), "gateway-key".to_owned())],
+        lend: BTreeMap::new(),
     };
     Config {
         relay: true,
         http: true,
         reach,
         services: BTreeMap::from([("ccs".to_owned(), upstream)]),
+        lent: BTreeMap::new(),
     }
 }
 
@@ -77,6 +79,7 @@ const CALLER: Caller<'static> = Caller {
     chain: "dognet-b5b6ea90",
     program: "harness",
     id: 7,
+    lent: &[],
 };
 
 fn post(service: &str, target: &str, headers: Vec<(&str, &str)>) -> Request {

@@ -7,6 +7,7 @@ use node::Preconfirm;
 pub const NODE_CONTRACT: u32 = 9;
 pub const ADMIN: &str = "$admin";
 pub const EGRESS: &str = "$egress";
+pub const LEND: &str = "$lend";
 
 pub mod route {
     pub const STATUS: &str = "/v1/status";
@@ -31,6 +32,7 @@ pub mod route {
     pub const LOGS: &str = "/v1/logs";
     pub const ADMIN: &str = "/v1/admin";
     pub const EGRESS_SET: &str = "/v1/egress/set";
+    pub const EGRESS_LEND: &str = "/v1/egress/lend";
     pub const SYNC: &str = "/v1/sync";
     pub const NETWORK: &str = "/v1/network";
     pub const P2P: &str = "/v1/p2p";
@@ -293,5 +295,57 @@ pub mod activity {
         Used(PageResponse<Used>),
         Indexed(Indexed),
         Refusal(Option<Refusal>),
+    }
+}
+
+pub mod lend {
+    use abi::Refusal;
+    use abi::role::egress::http::Head;
+    use abi::role::egress::{Answer, Delivery, StreamEnd};
+    use borsh::{BorshDeserialize, BorshSerialize};
+    use host::Tip;
+
+    #[derive(Debug, BorshSerialize, BorshDeserialize)]
+    pub struct Ask {
+        pub id: u64,
+        pub chain: String,
+        pub program: String,
+        pub service: String,
+        pub head: Head,
+        pub delivery: Delivery,
+        pub body: Vec<u8>,
+    }
+
+    #[derive(Debug, BorshSerialize, BorshDeserialize)]
+    pub enum Up {
+        Proof(Vec<u8>),
+        Ask(Ask),
+    }
+
+    #[derive(Debug, BorshSerialize, BorshDeserialize)]
+    pub enum Answered {
+        Whole(Answer),
+        End(StreamEnd),
+    }
+
+    #[derive(Debug, BorshSerialize, BorshDeserialize)]
+    pub enum Down {
+        Challenge {
+            network: Vec<u8>,
+            anchor: Tip,
+            nonce: [u8; 32],
+        },
+        Welcome {
+            account: u64,
+        },
+        Refused(Refusal),
+        Event {
+            id: u64,
+            data: Vec<u8>,
+        },
+        Answered {
+            id: u64,
+            answered: Answered,
+        },
     }
 }

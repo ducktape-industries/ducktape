@@ -32,6 +32,7 @@ fn a_config_names_what_it_serves_and_reads_each_services_secrets_from_the_enviro
         Upstream {
             base: Url::parse("http://127.0.0.1:4141").unwrap(),
             secrets: vec![("x-api-key".into(), "gateway-key".into())],
+            lend: BTreeMap::new(),
         }
     );
 }
@@ -98,4 +99,50 @@ fn an_unset_variable_a_reserved_name_or_a_base_that_is_not_a_plain_url_is_refuse
     let quiet = Config::parse("private = true", env, unread).unwrap();
     assert!(quiet.served().is_empty());
     assert_eq!(quiet.reach, Reach::Private);
+}
+
+#[test]
+fn a_service_fronts_a_base_and_lends_with_headers_per_account_or_is_borrowed_from_a_lending_node() {
+    let text = "[services.models]\nbase = \"http://127.0.0.1:4141\"\n\
+                [services.models.lend.42]\nheaders = { X-Ccs-Account = \"max-2\" }\n\
+                [services.borrowed]\nlent = \"https://lender.example\"\n";
+    let config = Config::parse(text, env, unread).unwrap();
+    assert_eq!(config.served(), ["borrowed", "models"]);
+    assert_eq!(
+        config.services["models"].lend[&42],
+        [("x-ccs-account".to_owned(), "max-2".to_owned())]
+    );
+    assert_eq!(
+        config.lent["borrowed"],
+        Url::parse("https://lender.example").unwrap()
+    );
+}
+
+#[test]
+fn a_service_names_one_upstream_a_borrowed_one_names_no_secrets_or_loans_and_a_loan_names_an_account()
+ {
+    let both = "[services.s]\nbase = \"http://a.example\"\nlent = \"http://b.example\"\n";
+    assert!(matches!(
+        Config::parse(both, env, unread),
+        Err(Refused::Upstream { .. })
+    ));
+    assert!(matches!(
+        Config::parse("[services.s]\n", env, unread),
+        Err(Refused::Upstream { .. })
+    ));
+    let secreted = "[services.s]\nlent = \"http://b.example\"\nsecrets = { k = \"CCS_KEY\" }\n";
+    assert!(matches!(
+        Config::parse(secreted, env, unread),
+        Err(Refused::Borrowed { .. })
+    ));
+    let relent = "[services.s]\nlent = \"http://b.example\"\n[services.s.lend.7]\n";
+    assert!(matches!(
+        Config::parse(relent, env, unread),
+        Err(Refused::Borrowed { .. })
+    ));
+    let unnamed = "[services.s]\nbase = \"http://b.example\"\n[services.s.lend.someone]\n";
+    assert!(matches!(
+        Config::parse(unnamed, env, unread),
+        Err(Refused::Borrower { .. })
+    ));
 }

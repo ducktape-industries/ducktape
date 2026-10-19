@@ -1,5 +1,6 @@
 //! An access program for the kernel's tests: the lists owners set, checked by the role's
-//! rules against the owners and defaults each program answers for its own keys.
+//! rules against the owners and defaults each program answers for its own keys, and the role's
+//! queries answered from them.
 use abi::ProgramId;
 use abi::role::access::{Need, Ownership, Party};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -24,7 +25,9 @@ pub fn list_key(program: &str, key: &str) -> Vec<u8> {
 
 #[cfg(target_arch = "wasm32")]
 mod program {
-    use abi::role::access::{Action, Need, Ownership, Party, Resource, writers};
+    use abi::role::access::{
+        Action, Need, Ownership, Party, Query as Ask, Reply, Resource, writers,
+    };
     use abi::{Env, Origin, Principal, Refusal, Scan, reason};
     use program::{Execute, Program, Query, Reads};
 
@@ -120,9 +123,16 @@ mod program {
         }
 
         fn query(ctx: &mut Query, _env: &Env, request: &[u8]) -> Result<(), Refusal> {
-            let (program, key): (String, String) = abi::decode(request)?;
-            let list = ctx.record::<Ownership>(list_key(&program, &key))?;
-            ctx.reply(&list);
+            let reply = match abi::decode(request)? {
+                Ask::List { program, key } => Reply::List(ctx.record(list_key(&program, &key))?),
+                Ask::Resource { program, key } => Reply::Resource(ctx.resource(&program, &key)?),
+                Ask::Writers { program, key } => Reply::Writers(writers(
+                    &key,
+                    |at| ctx.record::<Ownership>(list_key(&program, at)),
+                    |at| ctx.resource(&program, at),
+                )?),
+            };
+            ctx.reply(&reply);
             Ok(())
         }
     }

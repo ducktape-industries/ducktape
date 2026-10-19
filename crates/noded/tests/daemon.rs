@@ -2191,6 +2191,218 @@ fn a_running_node_serves_what_each_egress_reload_reads_and_keeps_its_services_on
     live.thread.join().unwrap();
 }
 
+const BORROWER_ACCOUNT: u64 = 77;
+const LENT: &str = "models";
+const LENDER_SECRET: &str = "lender-secret";
+
+type Seen = ::tokio::sync::mpsc::UnboundedReceiver<String>;
+
+async fn lent_upstream() -> (SocketAddr, Seen) {
+    let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let at = listener.local_addr().unwrap();
+    let (saw, seen) = ::tokio::sync::mpsc::unbounded_channel();
+    let heard = move |headers: &axum::http::HeaderMap| {
+        let header = |name: &str| {
+            let value = headers.get(name).and_then(|value| value.to_str().ok());
+            value.unwrap_or("-").to_owned()
+        };
+        let names = ["ducktape-borrower", "x-pin", "x-api-key"];
+        saw.send(names.map(header).join(" ")).unwrap();
+    };
+    let pinged = heard.clone();
+    let ping = move |headers: axum::http::HeaderMap| {
+        pinged(&headers);
+        async { PONG }
+    };
+    let stream = move |headers: axum::http::HeaderMap| {
+        heard(&headers);
+        let kind = [(axum::http::header::CONTENT_TYPE, "text/event-stream")];
+        async move { (kind, "data: one\n\ndata: two\n\n") }
+    };
+    let router = axum::Router::new()
+        .route("/ping", axum::routing::get(ping))
+        .route("/stream", axum::routing::get(stream));
+    ::tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (at, seen)
+}
+
+fn holds(bytes: &[u8], text: &str) -> bool {
+    bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+}
+
+async fn ended(
+    client: &Client,
+    changes: &mut (impl futures::Stream<Item = noded::Result<Change>> + Unpin),
+    id: u64,
+) -> egress::StreamEnd {
+    let key = fixture_egress::end_key(id);
+    loop {
+        let end = client.get(Layer::Confirmed, "egress", &key).await.unwrap();
+        if let Some(bytes) = end {
+            return abi::decode(&bytes).unwrap();
+        }
+        changes.next().await.unwrap().unwrap();
+    }
+}
+
+async fn streamed_events(client: &Client, id: u64) -> Vec<Vec<u8>> {
+    let scan = Scan::prefix(fixture_egress::events_of(id));
+    let entries = client.scan(Layer::Confirmed, "egress", scan).await.unwrap();
+    entries
+        .into_iter()
+        .map(|entry| abi::decode(&entry.value).unwrap())
+        .collect()
+}
+
+async fn applied(client: &Client, target: &str, payload: Vec<u8>) {
+    let anchor = client.status().await.unwrap().anchor();
+    let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
+    let frame = Frame::sign(&putter, NETWORK.as_bytes(), anchor, None, target, payload);
+    let (_, receipt) = client.land(&frame).await.unwrap();
+    assert!(
+        matches!(receipt.outcome, Outcome::Applied { .. }),
+        "{receipt:?}"
+    );
+}
+
+async fn lend(client: &Client, list: Option<abi::role::access::Ownership>) {
+    let set = fixture_access::Op::SetList {
+        program: "egress".to_owned(),
+        key: format!("lend/{LENT}"),
+        list,
+    };
+    applied(client, "access", abi::encode(&set)).await;
+}
+
+async fn borrow(client: &Client, target: &str, delivery: egress::Delivery) -> u64 {
+    let ask = egress::Op::Request {
+        request: egress::Request::Http {
+            service: LENT.to_owned(),
+            head: egress::http::Head {
+                method: egress::http::Method::Get,
+                target: target.to_owned(),
+                headers: vec![("x-pin".to_owned(), "the-borrowers".to_owned())],
+            },
+            body: Vec::new(),
+        },
+        delivery,
+        wait: None,
+    };
+    let anchor = client.status().await.unwrap().anchor();
+    let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
+    let frame = Frame::sign(
+        &putter,
+        NETWORK.as_bytes(),
+        anchor,
+        None,
+        "egress",
+        abi::encode(&ask),
+    );
+    let Outcome::Applied { output } = client.land(&frame).await.unwrap().1.outcome else {
+        panic!("the borrowing network did not take the request");
+    };
+    abi::decode(&output).unwrap()
+}
+
+#[test]
+fn a_borrowing_node_reaches_a_lent_service_only_while_the_lenders_list_names_its_account() {
+    let lending = tempfile::tempdir().unwrap();
+    let borrowing = tempfile::tempdir().unwrap();
+    let lender = Seat::new(lending.path(), "lender");
+    let borrower = Seat::new(borrowing.path(), "borrower");
+    lender.init(&founding(lending.path(), &[&lender], EPOCH_LENGTH));
+    borrower.init(&founding(borrowing.path(), &[&borrower], EPOCH_LENGTH));
+    let runtime = client_runtime();
+    let (up, mut seen) = runtime.block_on(lent_upstream());
+    std::fs::write(lender.workspace.dir().join("lender.key"), LENDER_SECRET).unwrap();
+    write_egress(
+        &lender,
+        &format!(
+            "[services.{LENT}]\nbase = \"http://{up}\"\n\
+             secrets = {{ x-api-key = {{ file = \"lender.key\" }} }}\n\
+             [services.{LENT}.lend.{BORROWER_ACCOUNT}]\nheaders = {{ x-pin = \"lent-pin\" }}\n"
+        ),
+    );
+    write_egress(
+        &borrower,
+        &format!(
+            "[services.{LENT}]\nlent = \"http://localhost:{}\"\n",
+            lender.http.port()
+        ),
+    );
+    let lent = lender.start();
+    let borrowed_from = borrower.start();
+    let (lends, borrows) = (lent.client.clone(), borrowed_from.client.clone());
+
+    runtime.block_on(async {
+        let held = abi::encode(&(borrower.key(), BORROWER_ACCOUNT));
+        applied(&lends, "identity", held).await;
+        let register = egress::Op::Register {
+            service: LENT.to_owned(),
+        };
+        applied(&lends, "egress", abi::encode(&register)).await;
+        let mut changes = borrows.changes("egress").await.unwrap();
+        recorded(&borrows, &mut changes, &borrower.key(), &[LENT]).await;
+
+        let whole = egress::Delivery::Whole;
+        let id = borrow(&borrows, "/ping", whole.clone()).await;
+        let unlisted = answered(&borrows, &mut changes, id).await;
+        let not_lent = format!("{LENT} is not lent to account {BORROWER_ACCOUNT}");
+        assert!(
+            matches!(&unlisted, egress::Answer::Failed(reason) if reason.contains(&not_lent)),
+            "{unlisted:?}"
+        );
+
+        let named = vec![abi::role::access::Party::Account(BORROWER_ACCOUNT)];
+        lend(&lends, Some(abi::role::access::Ownership::Listed(named))).await;
+        let id = borrow(&borrows, "/ping", whole.clone()).await;
+        let egress::Answer::Output(bytes) = answered(&borrows, &mut changes, id).await else {
+            panic!("a listed account's node is answered");
+        };
+        let lent_here = format!("{BORROWER_ACCOUNT} lent-pin {LENDER_SECRET}");
+        assert_eq!(seen.recv().await.unwrap(), lent_here);
+        assert!(
+            !holds(&bytes, LENDER_SECRET),
+            "the borrower's chain holds the lender's secret"
+        );
+        let response: egress::http::Response = abi::decode(&bytes).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, PONG.as_bytes());
+
+        let events = egress::Delivery::Events {
+            deliver: Vec::new(),
+        };
+        let id = borrow(&borrows, "/stream", events).await;
+        let end = ended(&borrows, &mut changes, id).await;
+        assert!(
+            matches!(&end, egress::StreamEnd::Complete { status: 200, .. }),
+            "{end:?}"
+        );
+        assert_eq!(seen.recv().await.unwrap(), lent_here);
+        let heard = streamed_events(&borrows, id).await;
+        assert_eq!(heard, [b"data: one\n".to_vec(), b"data: two\n".to_vec()]);
+        assert!(heard.iter().all(|event| !holds(event, LENDER_SECRET)));
+        let metrics = lends.metrics().await.unwrap();
+        assert!(metrics.contains("egress_lent_requests"), "{metrics}");
+
+        lend(&lends, None).await;
+        let id = borrow(&borrows, "/ping", whole).await;
+        let revoked = answered(&borrows, &mut changes, id).await;
+        assert!(
+            matches!(&revoked, egress::Answer::Failed(reason) if reason.contains(&not_lent)),
+            "{revoked:?}"
+        );
+        lender.admin(&lends, Admin::Shutdown).await;
+        borrower.admin(&borrows, Admin::Shutdown).await;
+    });
+    lent.thread.join().unwrap();
+    borrowed_from.thread.join().unwrap();
+}
+
 const GRANTEE_SEED: u64 = 31;
 
 async fn set_egress(

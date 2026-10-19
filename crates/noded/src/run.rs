@@ -600,6 +600,7 @@ async fn start<E: Context>(
         halo,
         live,
         egress,
+        lending: crate::egress::Lending::new(&context, identity.clone()),
         key: identity.clone(),
         mesh: transport::loopback(p2p),
     });
