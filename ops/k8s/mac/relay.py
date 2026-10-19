@@ -45,6 +45,7 @@ SCRIPT = {"steps": list, "files": dict}
 FILES = {"path": str, "snapshot": str}
 MEDIA = {"files": dict}
 SYSTEM = {"tap": str, "app": str, "deadline_ms": int}
+CHANGED = {"name": str, "deadline_ms": int}
 STEPS = {
     "launch": dict,
     "terminate": dict,
@@ -54,6 +55,7 @@ STEPS = {
     "scroll": dict,
     "tree": str,
     "screenshot": str,
+    "changed": dict,
     "media": dict,
     "system": dict,
 }
@@ -399,6 +401,11 @@ def step_of(step, number):
         case "tree" | "screenshot":
             if not NAME.fullmatch(value):
                 raise Refused(400, f"{what}'s {name} names its output with letters, digits, '.', '_' and '-'")
+        case "changed":
+            named(checked(value, CHANGED, f"{what}'s changed"), ["name", "deadline_ms"], f"{what}'s changed")
+            from_zero(value["deadline_ms"], f"{what}'s deadline_ms")
+            if not NAME.fullmatch(value["name"]):
+                raise Refused(400, f"{what}'s changed names its output with letters, digits, '.', '_' and '-'")
         case "system":
             named(checked(value, SYSTEM, f"{what}'s system"), ["tap", "deadline_ms"], f"{what}'s system")
             from_zero(value["deadline_ms"], f"{what}'s deadline_ms")

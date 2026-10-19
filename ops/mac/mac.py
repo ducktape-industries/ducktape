@@ -93,6 +93,8 @@ def described(name, value):
             return f"media {value.get('name', '')}"
         case "tree" | "screenshot":
             return f"{name} {value}"
+        case "changed":
+            return f"changed {value.get('name', '')}"
         case _:
             return name
 
@@ -366,6 +368,7 @@ class Simulator:
         self.door = None
         self.driver = None
         self.held = False
+        self.frame = None
 
     def simctl(self, *args):
         ran = self.job.xcrun("simctl", *args)
@@ -411,7 +414,11 @@ class Simulator:
                 written(target, self.door_call("GET", "/inspect/tree"))
                 return f"saved {target.name}"
             case "screenshot":
-                return self.screenshot(out / f"{number:02d}-{value}.png")
+                said = self.screenshot(out / f"{number:02d}-{value}.png")
+                self.frame = self.framed()
+                return said
+            case "changed":
+                return self.changed(out / f"{number:02d}-{value['name']}.png", value["deadline_ms"])
             case "media":
                 return self.media(value)
             case "system":
@@ -421,6 +428,31 @@ class Simulator:
         target.parent.mkdir(parents=True, exist_ok=True)
         self.simctl("io", self.udid, "screenshot", str(target))
         return f"saved {target.name}"
+
+    def framed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            frame = Path(temp) / "frame.bmp"
+            self.simctl("io", self.udid, "screenshot", "--type=bmp", str(frame))
+            return frame.read_bytes()
+
+    def changed(self, target, deadline_ms):
+        if self.frame is None:
+            raise Failed("there is no screen to compare with: a screenshot step comes first")
+        until = time.monotonic() + deadline_ms / 1000
+        seen, frames = self.frame, 0
+        while True:
+            frame = self.framed()
+            frames += 1
+            moved = frame != self.frame
+            still = frame == seen
+            if moved and still:
+                self.frame = frame
+                self.screenshot(target)
+                return f"the screen changed and held still after {frames} frames; saved {target.name}"
+            if time.monotonic() >= until:
+                state = "kept changing" if moved else "did not change"
+                raise Failed(f"the screen {state} within {deadline_ms} ms ({frames} frames)")
+            seen = frame
 
     def launch(self):
         door_file = self.container / DOOR_FILE

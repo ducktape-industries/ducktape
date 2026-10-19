@@ -92,6 +92,12 @@ match sys.argv[2:]:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+    case ["io", udid, "screenshot", "--type=bmp", path]:
+        screen = state.setdefault("screen", ["home"])
+        pathlib.Path(path).write_bytes(b"BM " + screen[0].encode())
+        if len(screen) > 1:
+            screen.pop(0)
+        save()
     case ["io", udid, "screenshot", path]:
         pathlib.Path(path).write_bytes(b"\x89PNG fake screenshot of " + udid.encode())
     case ["addmedia", udid, *files]:
@@ -391,6 +397,29 @@ class Mac(unittest.TestCase):
         run = self.ended(again)
         self.assertEqual(run["state"], "succeeded")
         self.assertEqual(len([call for call in self.calls() if call[0] == "make"]), 2)
+
+    def test_changed_ends_on_the_first_changed_frame_that_holds_still(self):
+        state = self.sim_state()
+        state["screen"] = ["room", "room", "zooming", "sheet", "sheet", "later"]
+        self.state(state)
+        self.start()
+        steps = [{"launch": {}}, {"screenshot": "room"}, {"changed": {"name": "sheet", "deadline_ms": 60000}}]
+        run = self.ended(self.ask(self.build(script={"steps": steps})))
+        self.assertEqual(run["state"], "succeeded")
+        self.assertIn("03-sheet.png", self.outputs(run))
+        log = self.put(b"01 launch")[0].decode()
+        self.assertIn("03 changed sheet: the screen changed and held still after 4 frames; saved 03-sheet.png", log)
+        self.assertEqual(self.sim_state()["screen"], ["later"])
+
+    def test_changed_fails_at_its_ceiling_and_needs_a_screen_to_compare_with(self):
+        self.start()
+        steps = [{"launch": {}}, {"screenshot": "room"}, {"changed": {"name": "sheet", "deadline_ms": 0}}]
+        run = self.ended(self.ask(self.build(script={"steps": steps})))
+        self.assertEqual(run["reason"], "step 3 (changed sheet): the screen did not change within 0 ms (1 frames)")
+        self.assertIn("03-failed.png", self.outputs(run))
+        steps = [{"launch": {}}, {"changed": {"name": "sheet", "deadline_ms": 0}}]
+        run = self.ended(self.ask({"from": run["id"], "to": TO, "script": {"steps": steps}}))
+        self.assertEqual(run["reason"], "step 2 (changed sheet): there is no screen to compare with: a screenshot step comes first")
 
     def test_a_failing_step_stops_the_script_and_shows_the_screen(self):
         self.start()

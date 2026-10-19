@@ -157,6 +157,8 @@ class Relay(unittest.TestCase):
             ({**BUILD, "script": {"steps": [{"tap": {}}]}}, "step 1 is tap, not a step"),
             ({**BUILD, "script": {"steps": [{"screenshot": "../x"}]}}, "names its output"),
             ({**BUILD, "script": {"steps": [{"system": {"tap": "Photo"}}]}}, "names its deadline_ms"),
+            ({**BUILD, "script": {"steps": [{"changed": {"name": "sheet"}}]}}, "names its deadline_ms"),
+            ({**BUILD, "script": {"steps": [{"changed": {"name": "../x", "deadline_ms": 1}}]}}, "names its output"),
             ({**BUILD, "script": {"steps": [], "files": {"path": "/s.json"}}}, "one of them"),
             ({"from": "duckpond-9", "to": TO}, "there is no run duckpond-9"),
         ]

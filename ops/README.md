@@ -440,7 +440,10 @@ scripts back a `make` target; see the repository `Makefile`.
   Steps reach the app through its inspector (`/inspect/*` on the `ax-door`
   build's door, whose token the Mac reads from the app's container): find,
   wait, press, type and scroll by the view's own ids, a press or typing
-  wheeling a clipped node into view first; the device through
+  wheeling a clipped node into view first; the screen itself through
+  `changed`, which compares the simulator's frames with the last
+  screenshot until one differs and the next frame repeats it, or its
+  `deadline_ms` passes; the device through
   `xcrun simctl`, and system UI (the photo picker, permission alerts)
   through the app's XCUITest driver (`make -C phone ios-driver`). Runs on
   the kept device take it in turn: a run waits, saying which run holds it,
