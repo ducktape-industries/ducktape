@@ -349,8 +349,10 @@ scripts back a `make` target; see the repository `Makefile`.
   `mac-key` (files `key` and `password`). Its state (`runs.json`, each
   run's inputs and outputs until written, mirrors of the repositories the
   Mac builds) is on the claim `state`. `relay-test.py` covers it.
-- The Mac dials out to the relay's port 8081, which the operator routes to
-  it (the tailnet, a tunnel hostname). Every call there carries the token in
+- The Mac dials out to the relay's port 8081 at `http://100.65.253.102:8081`:
+  the pod's `hostPort` on fabrics-1's tailnet address, as the node's 8844
+  is, so the Mac's connection reaches the relay as one TCP connection end to
+  end, and keepalive on it reads the far end. Every call there carries the token in
   the Secret `mac-token` (file `token`):
   `kubectl -n mac create secret generic mac-token --from-file=token=TOKEN`.
   `POST /v1/mac/work` is the Mac's event stream: it lists the runs the Mac
