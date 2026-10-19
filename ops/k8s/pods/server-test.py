@@ -2315,6 +2315,12 @@ class DesktopRunner(Streamed):
         self.assertEqual(self.call("GET", "/v1/pods/desktop")[0], 200)
         self.assertEqual([host for host, _, _ in self.gate.calls], ["lan", "tail"])
 
+    def test_hosts_on_one_line_are_tried_in_order(self):
+        (self.keys / "hosts").write_text("lan tail\twifi\n")
+        self.gate.down = {"lan", "tail"}
+        self.assertEqual(self.call("GET", "/v1/pods/desktop")[0], 200)
+        self.assertEqual([host for host, _, _ in self.gate.calls], ["lan", "tail", "wifi"])
+
     def test_no_host_answering_is_503_naming_each(self):
         self.gate.down = {"lan", "tail", "wifi"}
         self.refused("GET", "/v1/pods/desktop", None, 503, ["unreachable", "lan:", "tail:", "wifi:", "No route to host"])

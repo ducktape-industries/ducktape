@@ -707,7 +707,7 @@ class Desktop:
         return all((self.keys / name).is_file() for name in DESKTOP_FILES)
 
     def hosts(self):
-        listed = [line.strip() for line in (self.keys / "hosts").read_text().splitlines() if line.strip()]
+        listed = (self.keys / "hosts").read_text().split()
         with self.lock:
             first = self.reached
         return sorted(listed, key=lambda host: host != first)

@@ -123,7 +123,7 @@ one up for another network.
 - The reserved pod `desktop` is orthory's desktop build runner, a rootless
   podman container that runs the warm pod's `build.sh`. The service
   reaches it by ssh with the Secret `desktop-runner` in namespace `pods`
-  (files `id_ed25519`, `known_hosts`, `hosts`, `user`; `hosts` lists the
+  (files `id_ed25519`, `known_hosts`, `hosts`, `user`; `hosts` lists, split by any whitespace, the
   addresses to try in order, and the one that last answered is tried first),
   whose key may only run the desktop's `gate` command. `pods/desktop` answers
   the runner's `ping` as a pod that runs (503 while it is down or
