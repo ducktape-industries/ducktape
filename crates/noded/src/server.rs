@@ -45,7 +45,6 @@ impl Rpc {
         let cpus = Arc::new(split.rpc);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(threads)
-            .max_blocking_threads(threads)
             .thread_name("rpc")
             .on_thread_start(move || yielding(&cpus))
             .enable_all()
