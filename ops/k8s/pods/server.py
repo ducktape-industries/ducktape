@@ -129,7 +129,6 @@ CHUNK = "chunk"
 CHUNK_SIZE = 1 << 20
 EGRESS = "egress"
 PACK = "pack"
-RETRY_PAUSE = 1
 DROPPED = (
     "connection closed before message completed",
     "connection reset",
@@ -796,6 +795,19 @@ def heard_in(stream, heard):
         yield raw
 
 
+def block_ms_of(data):
+    reader = Reader(data)
+    reader.bytes()
+    reader.u64()
+    return reader.u64()
+
+
+def node_block_ms(node):
+    asked = urllib.request.Request(f"{node.rstrip('/')}/v1/status", headers={"User-Agent": "pods"})
+    with urllib.request.urlopen(asked) as answer:
+        return block_ms_of(answer.read())
+
+
 class Stats:
     def __init__(self, mount=SERVICE_ACCOUNT):
         self.mount = mount
@@ -987,6 +999,7 @@ class Fetching:
     image: str
     node: str
     forge: str
+    block_ms: int
 
 
 def resources_of(given):
@@ -1085,6 +1098,7 @@ def fetch_container(inputs, fetching):
             {"name": "PODS_INPUTS", "value": json.dumps(inputs)},
             {"name": "PODS_NODE", "value": fetching.node},
             {"name": "PODS_FORGE", "value": fetching.forge},
+            {"name": "PODS_BLOCK_MS", "value": str(fetching.block_ms)},
         ],
         "volumeMounts": [{"name": f"in-{index}", "mountPath": f"{IN_ROOT}/{index}"} for index, given in enumerate(inputs) if SCRATCH not in given],
         "terminationMessagePolicy": "FallbackToLogsOnError",
@@ -1722,6 +1736,7 @@ class Service:
         self.desktop_wanted = threading.Event()
         self.desktop_follower = None
         self.rest = self.desktop_wanted.wait
+        self.retry_pause = fetching.block_ms / 1000
         self.clock = time.monotonic
         self.signer = signer
         self.fetching = fetching
@@ -1754,7 +1769,7 @@ class Service:
         raise Refused(502, f"egress was not asked whether request {request} still waits: {why}")
 
     def retried(self, asked, attempt, failure):
-        pause = RETRY_PAUSE
+        pause = self.retry_pause
         attempts = 0
         while True:
             answer = attempt()
@@ -1826,7 +1841,7 @@ class Service:
                 return ran
 
     def through_apiserver(self, asked, name, attempt):
-        pause = RETRY_PAUSE
+        pause = self.retry_pause
         attempts = 0
         while True:
             ran = attempt()
@@ -1927,7 +1942,7 @@ class Service:
 
     def followed_desktop(self, begun):
         since = begun
-        pause = RETRY_PAUSE
+        pause = self.retry_pause
         while True:
             asked = self.clock()
             heard = []
@@ -1940,7 +1955,7 @@ class Service:
                     self.notifier.lines(DESKTOP, None, heard_in(process.stdout, heard), unvouched=True)
                 say("pods_unfollowed", pod=DESKTOP, code=process.wait())
             if heard:
-                since, pause = asked, RETRY_PAUSE
+                since, pause = asked, self.retry_pause
             self.rest(pause)
             if not heard:
                 pause *= 2
@@ -2086,7 +2101,7 @@ class Service:
             return base, receipt(self.signer.submit(FILES_PROGRAM, commit(base)))
 
         unsent = lambda tried: tried[1][2] if tried[1][0] == "failed" else None
-        pause = RETRY_PAUSE
+        pause = self.retry_pause
         while True:
             tried = self.retried(asked_by, attempt, unsent)
             outcome, reason, sentence, _ = tried[1]
@@ -2361,7 +2376,8 @@ def handler(service):
 
 
 class Fetcher:
-    def __init__(self, ducktape, node, forge, home, runner=run):
+    def __init__(self, ducktape, node, forge, home, runner=run, block_ms=None):
+        self.retry_pause = (node_block_ms(node) if block_ms is None else block_ms) / 1000
         self.ducktape = ducktape
         self.node = node
         self.forge = forge
@@ -2377,13 +2393,13 @@ class Fetcher:
         return self.runner([*self.ducktape, "--workspace", str(self.home), "--node", self.node, *args], stdin=stdin, env=self.env())
 
     def tried(self, attempt, doing):
-        pause = RETRY_PAUSE
+        pause = self.retry_pause
         while True:
             ran = attempt()
             why = failed(ran)
             if why is None or not dropped(why):
                 return ran
-            print(f"{doing}, it lost its connection, so it is tried again in {pause} s: {why}", flush=True)
+            print(f"{doing}, it lost its connection, so it is tried again in {pause:g} s: {why}", flush=True)
             self.pause(pause)
             pause *= 2
 
@@ -2473,7 +2489,7 @@ def shared(target):
 
 def fetch_main():
     ducktape = shlex.split(os.environ.get("PODS_DUCKTAPE_CLI", "ducktape"))
-    fetcher = Fetcher(ducktape, os.environ["PODS_NODE"], os.environ["PODS_FORGE"], Path(tempfile.mkdtemp()))
+    fetcher = Fetcher(ducktape, os.environ["PODS_NODE"], os.environ["PODS_FORGE"], Path(tempfile.mkdtemp()), block_ms=int(os.environ["PODS_BLOCK_MS"]))
     try:
         fetcher.fetch(json.loads(os.environ["PODS_INPUTS"]), Path(IN_ROOT))
     except Refused as refusal:
@@ -2491,15 +2507,15 @@ def exit_on_signal(number, frame):
 
 
 def main():
-    fetching = Fetching(
-        image=os.environ.get("PODS_OUT_IMAGE", ""),
-        node=os.environ.get("PODS_NODE", ""),
-        forge=os.environ.get("PODS_FORGE", ""),
-    )
-    named = {"PODS_OUT_IMAGE": fetching.image, "PODS_NODE": fetching.node, "PODS_FORGE": fetching.forge}
+    named = {name: os.environ.get(name, "") for name in ("PODS_OUT_IMAGE", "PODS_NODE", "PODS_FORGE")}
     unset = [name for name, value in named.items() if not value]
     if unset:
         sys.exit(f"{', '.join(unset)} must be set: the image of each pod's fetch and out containers, the node they read inputs from, and its forge")
+    try:
+        block_ms = node_block_ms(named["PODS_NODE"])
+    except (OSError, Refused) as error:
+        sys.exit(f"the network's block time was not read from {named['PODS_NODE']}/v1/status, and every retry pauses from it: {error}")
+    fetching = Fetching(image=named["PODS_OUT_IMAGE"], node=named["PODS_NODE"], forge=named["PODS_FORGE"], block_ms=block_ms)
     kube = Kube(shlex.split(os.environ.get("PODS_KUBECTL", "kubectl")), os.environ.get("PODS_NAMESPACE", "agents"))
     signer = Signer(shlex.split(os.environ.get("PODS_DUCKTAPE", "ducktape")), Path(os.environ.get("PODS_KEYS", "/keys")))
     desktop = Desktop(Path(os.environ.get("PODS_DESKTOP", DESKTOP_KEYS)))

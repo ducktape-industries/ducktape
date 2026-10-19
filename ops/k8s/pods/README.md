@@ -37,6 +37,9 @@ another machine, reached by ssh.
   2. Each of those nodes names it in its `egress.toml`, as
      `[services.pods] base = "http://<the Service's address>:8080"`, then runs
      `ducktape egress reload`. The node then sends `Serve` by itself.
+- **Its node's status.** It reads the network's block time from `NODE_URL`'s `/v1/status` as
+  it starts, and every retry pause starts there; it stops, saying why, when that node
+  doesn't answer.
 - **Optional: the desktop runner.** The Secret `desktop-runner` in namespace `pods` (files
   `id_ed25519`, `id_ed25519.pub`, `known_hosts`, `hosts`, `user`), mounted at `/desktop`.
   Without it, pod `desktop` answers 503.

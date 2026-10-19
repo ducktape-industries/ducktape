@@ -141,7 +141,7 @@ one up for another network.
   connection alive at their own `every` (`ServerAliveInterval`). It is never
   deleted. With no Secret mounted every call to it answers 503. An exec whose
   words name `NOTIFY=<channel>` starts one follower of the runner's log (kept
-  for good, and joined again a second after it breaks, from the time the
+  for good, and joined again a block's time after it breaks, from the time the
   last stream that delivered a line began, or at once when the next such exec
   comes; a join that delivers no line keeps that window and doubles the
   pause): each `ducktape-notify`
@@ -183,10 +183,15 @@ one up for another network.
   `paths` it puts every one of them in one bundle and answers `blobs`, a
   `{path, blob, size}` for each in the order asked, so a round of programs
   is one call. Both answer the bundle (`bundle`, `put_at`, `held_since`).
+- Every retry pause starts at the network's block time, `block_time_ms` of
+  `/v1/status` on the node at `NODE_URL`, which the service reads once as it
+  starts (it stops, saying why, when that read fails) and hands each fetch
+  container as `PODS_BLOCK_MS`. A `Fetcher` made with no `block_ms` (the
+  tools repo's warm scripts call it so) reads it from its own node.
 - `pods/NAME/blob`, `pods/NAME/file` and `pods/NAME/push` try a step again
   when it lost its connection (kubectl's exec, a blob put, files' head or
   the files commit, which is made again onto files' head as read then): the
-  pause doubles from a second, with no last attempt, while the egress
+  pause doubles from the network's block time, with no last attempt, while the egress
   request that asked is open (`egress` `Request { id }`, the
   `ducktape-request` header). Once it is gone the step is not tried again.
   Any other failure answers at once, and a failure the service did not
@@ -215,7 +220,7 @@ one up for another network.
 - An exec kubectl could not take to the API server (`apiserver not ready`,
   `the server is currently unable to handle the request`, `ServiceUnavailable`,
   a refused connection to it) never reached its container, so it is sent again,
-  the pause doubling from a second, while the egress request that asked is
+  the pause doubling from the network's block time, while the egress request that asked is
   open; once it is gone the answer is 503 `apiserver unavailable: …` and
   nothing ran. An exec whose own stream was cut while its command ran
   (`websocket: close 1006`) is never run again: it answers 502 `apiserver
@@ -239,7 +244,7 @@ one up for another network.
   for a change, is fetched by its id between the two.
 - `server.py fetch` tries a step again when it lost its connection (the
   clone, which starts again from an empty directory, the fetch of a commit
-  by its id, a files read, a blob get), with the pause doubling from a second and no last attempt, for as
+  by its id, a files read, a blob get), with the pause doubling from the network's block time and no last attempt, for as
   long as the pod lives: the request that made the pod was answered when the
   pod was created, so no request bounds it, and deleting the pod ends it. An
   HTTP answer, or any other failure, ends the fetch at once. Each try again

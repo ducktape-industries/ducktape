@@ -16,6 +16,7 @@ import tempfile
 import threading
 import unittest
 import unittest.mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("server", HERE / "server.py")
@@ -38,7 +39,7 @@ POSTED = bytes.fromhex(
     "20302028436f6d706c65746564290000000000"
 )
 KINDS = b"namespaces  ns  v1  false  Namespace\nclusterroles    rbac.authorization.k8s.io/v1  false  ClusterRole\n"
-FETCHING = server.Fetching(image="localhost:5000/pods@sha256:00", node="https://node.example", forge="duck://duckpond/forge")
+FETCHING = server.Fetching(image="localhost:5000/pods@sha256:00", node="https://node.example", forge="duck://duckpond/forge", block_ms=1000)
 
 
 DROPPED = "error: unable to upgrade connection: read tcp: connection reset by peer"
@@ -553,6 +554,7 @@ class Create(Served):
         self.assertEqual(json.loads(env["PODS_INPUTS"]), inputs)
         self.assertEqual(env["PODS_NODE"], "https://node.example")
         self.assertEqual(env["PODS_FORGE"], "duck://duckpond/forge")
+        self.assertEqual(env["PODS_BLOCK_MS"], "1000")
         self.assertEqual(
             [(mount["name"], mount["mountPath"]) for mount in fetch["volumeMounts"]],
             [("in-0", "/in/0"), ("in-1", "/in/1"), ("in-2", "/in/2")],
@@ -1972,7 +1974,7 @@ class Fetch(unittest.TestCase):
         self.home = pathlib.Path(temp.name) / "home"
         self.calls = []
         self.answers = []
-        self.fetcher = server.Fetcher(["ducktape"], "https://node.example", "duck://duckpond/forge", self.home, runner=self.recorded)
+        self.fetcher = server.Fetcher(["ducktape"], "https://node.example", "duck://duckpond/forge", self.home, runner=self.recorded, block_ms=1000)
         self.paused = []
         self.fetcher.pause = self.paused.append
 
@@ -2118,7 +2120,7 @@ class ForgeRefs(unittest.TestCase):
         }
         self.enterContext(unittest.mock.patch.dict(os.environ, isolated))
         self.dev, self.merge = self.forge_with_a_change(forge / "programs")
-        self.fetcher = server.Fetcher(["ducktape"], "https://node.example", "duck://duckpond/forge", self.base / "home")
+        self.fetcher = server.Fetcher(["ducktape"], "https://node.example", "duck://duckpond/forge", self.base / "home", block_ms=1000)
 
     def git(self, *argv, cwd):
         return subprocess.run(["git", *argv], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
@@ -2404,10 +2406,73 @@ class DesktopRunner(Streamed):
         self.assertEqual(self.gate.calls, [])
 
 
+def status(network, block_ms):
+    return server.borsh_text(network) + server.u64(1) + server.u64(block_ms) + server.u64(10) + server.u64(500) + b"the rest of the status"
+
+
+class Node(BaseHTTPRequestHandler):
+    def do_GET(self):
+        named = self.headers.get("User-Agent") == "pods"
+        body = status("duckpond", 1000) if self.path == "/v1/status" and named else b""
+        self.send_response(200 if body else 404)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+
+class Paced(unittest.TestCase):
+    def test_the_block_time_is_read_from_a_status(self):
+        self.assertEqual(server.block_ms_of(status("sealpond", 2500)), 2500)
+
+    def test_a_fetcher_given_no_block_time_reads_its_nodes(self):
+        served = ThreadingHTTPServer(("127.0.0.1", 0), Node)
+        threading.Thread(target=served.serve_forever, daemon=True).start()
+        self.addCleanup(served.server_close)
+        self.addCleanup(served.shutdown)
+        node = f"http://127.0.0.1:{served.server_address[1]}"
+        with tempfile.TemporaryDirectory() as home:
+            fetcher = server.Fetcher(["ducktape"], node, "duck://duckpond/forge", pathlib.Path(home))
+        self.assertEqual(fetcher.retry_pause, 1.0)
+
+    def test_a_status_cut_short_is_refused(self):
+        with self.assertRaises(server.Refused):
+            server.block_ms_of(server.borsh_text("duckpond") + server.u64(1))
+
+    def test_every_retry_pauses_from_the_networks_block_time(self):
+        fetching = server.Fetching(image="pods", node="https://node.example", forge="duck://duckpond/forge", block_ms=2500)
+        service = server.Service(Kube(), Signer(), fetching, Stats(), Api())
+        paused = []
+        service.pause = paused.append
+        answers = iter([ran(code=1, err=DROPPED), ran(code=1, err=DROPPED), ran(b"ok")])
+        self.assertEqual(service.retried(ASKED_BY, lambda: next(answers), server.failed).out, b"ok")
+        self.assertEqual(paused, [2.5, 5.0])
+
+
+ASKED_BY = {"chain": "duckpond", "program": "harness", "request": "41"}
+
+
 class Stopped(unittest.TestCase):
+    def node(self):
+        served = ThreadingHTTPServer(("127.0.0.1", 0), Node)
+        threading.Thread(target=served.serve_forever, daemon=True).start()
+        self.addCleanup(served.server_close)
+        self.addCleanup(served.shutdown)
+        return f"http://127.0.0.1:{served.server_address[1]}"
+
+    def test_a_node_whose_block_time_is_not_read_stops_the_service_at_start(self):
+        with tempfile.TemporaryDirectory() as keys:
+            unread = self.node() + "/nothing"
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=unread, PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
+            done = subprocess.run([sys.executable, str(HERE / "server.py")], env=env, capture_output=True, text=True)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn("block time was not read", done.stderr)
+
     def test_a_sigterm_ends_the_service_at_once(self):
         with tempfile.TemporaryDirectory() as keys:
-            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE="https://node", PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=self.node(), PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
             process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
             self.addCleanup(process.kill)
             serving = next(line for line in iter(process.stderr.readline, "") if "event=pods_serving" in line)
@@ -2420,7 +2485,7 @@ class Stopped(unittest.TestCase):
 
     def test_a_sigterm_with_requests_in_flight_ends_the_service_at_once(self):
         with tempfile.TemporaryDirectory() as keys:
-            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE="https://node", PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=self.node(), PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
             process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
             self.addCleanup(process.kill)
             lines = iter(process.stderr.readline, "")
