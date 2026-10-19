@@ -206,6 +206,14 @@ SSH_FAILED = 255
 UNCONNECTED = "ssh: connect to host "
 
 
+class Unanswered(Exception):
+    pass
+
+
+def unanswered(why):
+    return dropped(why) or re.search(r"\(5\d\d\)", why) is not None
+
+
 class Refused(Exception):
     def __init__(self, status, sentence):
         super().__init__(sentence)
@@ -1603,13 +1611,15 @@ def usage_of(pods, claims, summaries, quotas, namespace):
 
 
 class Notifier:
-    def __init__(self, kube, signer):
+    def __init__(self, kube, signer, retry_pause):
         self.kube = kube
         self.signer = signer
         self.following = set()
         self.posted = {}
         self.lock = threading.Lock()
         self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
+        self.pause = time.sleep
+        self.retry_pause = retry_pause
 
     def post(self, notes, requester, message_id, line, unvouched=False):
         notify = notify_of(notes)
@@ -1618,6 +1628,19 @@ class Notifier:
         if not self.signer.held():
             say("pods_unposted", message=message_id, reason="no_key")
             return False
+        pause = self.retry_pause
+        attempts = 0
+        while True:
+            try:
+                return self.post_once(notify, requester, message_id, line, unvouched)
+            except Unanswered as why:
+                attempts += 1
+                if attempts & (attempts - 1) == 0:
+                    say("pods_retried", attempts=attempts, reason="node_unanswered", message=message_id, detail=json.dumps(str(why)))
+                self.pause(pause)
+                pause *= 2
+
+    def post_once(self, notify, requester, message_id, line, unvouched):
         refused = self.refusal(notify["channel"], requester, unvouched)
         if refused is not None:
             reason, detail = refused
@@ -1630,13 +1653,18 @@ class Notifier:
         if posted:
             say("pods_posted", message=message_id)
             return True
+        if outcome in ("unknown", "unlanded") or (outcome == "failed" and unanswered(sentence)):
+            raise Unanswered(sentence)
         say("pods_unposted", message=message_id, reason=reason or outcome, detail=json.dumps(sentence))
         return False
 
     def asked(self, request):
         ran = self.signer.query(CHAT, request)
         if ran.code != 0:
-            raise Refused(502, ran.err or ran.out.decode(errors="replace") or f"ducktape exited {ran.code}")
+            why = ran.err or ran.out.decode(errors="replace") or f"ducktape exited {ran.code}"
+            if unanswered(why):
+                raise Unanswered(why)
+            raise Refused(502, why)
         return ran.out
 
     def refusal(self, channel, requester, unvouched=False):
@@ -1774,7 +1802,7 @@ class Service:
         self.fetching = fetching
         self.stats = stats
         self.api = api
-        self.notifier = Notifier(kube, signer)
+        self.notifier = Notifier(kube, signer, self.retry_pause)
         self.pause = time.sleep
         self.execs = {}
         self.lock = threading.Lock()

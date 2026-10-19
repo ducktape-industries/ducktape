@@ -308,7 +308,14 @@ one up for another network.
   end post too, goes only where its requester may post, as chat decides
   (the channel is not archived, and is open, or the requester owns it or
   is a member; asked of chat before each post): a pod with no requester
-  posts nothing. A pod without a `notify` gets none of either. Nothing else posts: `pods/NAME/blob` and
+  posts nothing. A pod without a `notify` gets none of either. A post the
+  node doesn't answer (its room query or its submit fails with a 5xx or a
+  dropped connection, or the frame's landing isn't known) is made again,
+  the pause doubling from the network's block time with no last attempt
+  (`pods_retried` on the first try and each power of two), until the node
+  answers; the message id makes a repeat a no-op. A definite answer
+  (no channel, archived, members only, not a member, rejected) ends it at
+  once. Nothing else posts: `pods/NAME/blob` and
   `pods/NAME/file` answer with their result, so they post nothing.
 - Namespace `agents` holds the ResourceQuota `hardcap`, the operator's
   ceiling: `requests.storage` 500Gi, and `requests.cpu` and

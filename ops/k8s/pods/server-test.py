@@ -1740,11 +1740,57 @@ class Usage(Served):
                 server.quantity(past)
 
 
+UNANSWERED = "ducktape: the node failed (524): error code: 524"
+
+
+class Unanswering(Signer):
+    def __init__(self, misses, why=UNANSWERED):
+        super().__init__()
+        self.misses = misses
+        self.why = why
+
+    def query(self, program, request):
+        if program == "chat" and self.misses:
+            self.misses -= 1
+            self.asked.append(request)
+            return ran(code=1, err=self.why)
+        return super().query(program, request)
+
+
 class Posts(unittest.TestCase):
     def setUp(self):
         self.kube = Kube()
         self.signer = Signer()
-        self.notifier = server.Notifier(self.kube, self.signer)
+        self.notifier = server.Notifier(self.kube, self.signer, 1)
+        self.paused = []
+        self.notifier.pause = self.paused.append
+
+    def test_a_room_query_the_node_does_not_answer_is_asked_again_until_it_answers(self):
+        self.signer = Unanswering(3)
+        self.notifier = server.Notifier(self.kube, self.signer, 1)
+        self.notifier.pause = self.paused.append
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [("chat", POSTED)])
+        self.assertEqual(self.paused, [1, 2, 4])
+        retried = [call.kwargs["attempts"] for call in said.call_args_list if call.args == ("pods_retried",)]
+        self.assertEqual(retried, [1, 2])
+        self.assertNotIn("pods_unposted", [call.args[0] for call in said.call_args_list])
+        self.assertIn("annotate", self.kube.verbs())
+
+    def test_a_submit_the_node_does_not_answer_is_sent_again_and_a_repeat_counts_as_posted(self):
+        self.signer.submitted = [ran(code=1, err="ducktape: the node failed (502): bad gateway"), ran(POOLED + b"landed 961 rejected already_exists: message pods-duckpond-41-ended is posted\n")]
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [("chat", POSTED)] * 2)
+        self.assertEqual(self.paused, [1])
+        self.assertIn("annotate", self.kube.verbs())
+
+    def test_a_room_query_chat_answers_with_a_failure_is_not_asked_again(self):
+        self.signer = Unanswering(1, why="ducktape: chat could not read its query")
+        self.notifier = server.Notifier(self.kube, self.signer, 1)
+        self.notifier.pause = self.paused.append
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual((self.signer.submits, self.paused), ([], []))
 
     def test_the_post_is_chats_post_message_with_a_mention_of_the_requester(self):
         line = "pod duckpond-41 ended: exit code 0 (Completed)"
@@ -1909,10 +1955,10 @@ class Posts(unittest.TestCase):
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         self.assertEqual(self.kube.verbs(), ["logs", "logs", "annotate"])
 
-    def test_a_post_no_block_carried_is_not_marked(self):
-        self.signer.submitted = ran(POOLED + b"unlanded\n")
+    def test_a_post_no_block_carried_is_made_again_until_one_does(self):
+        self.signer.submitted = [ran(POOLED + b"unlanded\n"), ran(POOLED + b"landed 960 applied 00ff\n")]
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
-        self.assertEqual(self.kube.verbs(), ["logs"])
+        self.assertEqual((self.kube.verbs(), self.paused), (["logs", "annotate"], [1]))
 
     def test_a_post_that_was_not_sent_is_not_marked(self):
         self.signer.submitted = ran(code=1, err="node unreachable")
