@@ -4222,6 +4222,8 @@ dependencies = [
  "wasmtime",
  "wat",
  "zstd",
+ "zstd-safe",
+ "zstd-sys",
 ]
 
 [[package]]

@@ -294,6 +294,15 @@ fn a_deferred_call_parks_the_frame_until_the_called_program_answers() {
         output(&applied.submissions[0]);
         assert_eq!(frames(&host), 1);
         assert!(stored(&host, "oracle", &owed_key(0)).is_some());
+        let images = host
+            .view(Layer::Confirmed)
+            .scan(PARKED, &Scan::prefix(b"image/"))
+            .unwrap();
+        assert_eq!(
+            images.len(),
+            1,
+            "a parked frame is kept as one packed image"
+        );
         let row = ticket(&host, 0).await.expect("the call holds a ticket");
         assert_eq!(
             (row.caller.as_str(), row.target.as_str(), row.opened),
@@ -312,11 +321,13 @@ fn a_deferred_call_parks_the_frame_until_the_called_program_answers() {
         assert_eq!(finished.height, 3);
         assert_eq!(frames(&host), 0);
         assert_eq!(ticket(&host, 1).await, None);
-        let parked = host
-            .view(Layer::Confirmed)
-            .scan(PARKED, &Scan::prefix(b"page/"))
-            .unwrap();
-        assert!(parked.is_empty());
+        for prefix in [b"page/".as_slice(), b"image/".as_slice()] {
+            let parked = host
+                .view(Layer::Confirmed)
+                .scan(PARKED, &Scan::prefix(prefix))
+                .unwrap();
+            assert!(parked.is_empty());
+        }
     });
 }
 

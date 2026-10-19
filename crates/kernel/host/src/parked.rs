@@ -1,5 +1,5 @@
 //! The kernel's record of parked frames, in `$parked`: what each frame runs as and for whom, who
-//! waits on it, the pages of its memory image, and the counters that number frames and tickets.
+//! waits on it, its memory image packed in one row, and the counters that number frames and tickets.
 use abi::role::awaits::{FrameId, Ticket};
 use abi::{BlobId, Cause, ItemRef, Origin, Principal, ProgramId, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -125,14 +125,10 @@ pub fn save(
     image: Image,
 ) -> Result<()> {
     drop_image(storage, overlay, id)?;
-    let shape = Shape {
-        length: image.length,
-        pages: image.pages.iter().map(|page| page.index).collect(),
-    };
-    for page in image.pages {
-        overlay.set(PARKED, page_key(id, page.index), page.bytes);
-    }
-    overlay.set(PARKED, shape_key(id), abi::encode(&shape));
+    let packed = image
+        .pack()
+        .map_err(|error| crate::Error::Corrupt(format!("frame {id}'s image: {error}")))?;
+    overlay.set(PARKED, image_key(id), abi::encode(&packed));
     overlay.set(PARKED, of_key(&parked.program, id), Vec::new());
     overlay.set(PARKED, frame_key(id), abi::encode(&parked));
     Ok(())
@@ -201,15 +197,17 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_kept_as_one_packed_image_loads_and_is_removed_whole() {
+    fn a_frame_is_saved_as_one_packed_image_loads_and_is_removed_whole() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         let mut overlay = Overlay::default();
         let record = parked();
-        overlay.set(PARKED, frame_key(7), abi::encode(&record));
-        overlay.set(PARKED, of_key(&record.program, 7), Vec::new());
-        overlay.set(PARKED, image_key(7), abi::encode(&image().pack().unwrap()));
+        save(&storage, &mut overlay, 7, record.clone(), image()).unwrap();
         let view = View::new(&storage, vec![&overlay]);
+        let packed = abi::encode(&image().pack().unwrap());
+        assert_eq!(view.get(PARKED, &image_key(7)).unwrap(), Some(packed));
+        assert_eq!(view.get(PARKED, &shape_key(7)).unwrap(), None);
+        assert_eq!(view.get(PARKED, &page_key(7, 2)).unwrap(), None);
         assert_eq!(load(&view, 7).unwrap(), Some((record.clone(), image())));
         remove(&storage, &mut overlay, 7, &record.program).unwrap();
         let view = View::new(&storage, vec![&overlay]);
@@ -217,19 +215,39 @@ mod tests {
         assert_eq!(load(&view, 7).unwrap(), None);
     }
 
+    fn keep_page_by_page(overlay: &mut Overlay, id: FrameId, record: &Parked, image: Image) {
+        let shape = Shape {
+            length: image.length,
+            pages: image.pages.iter().map(|page| page.index).collect(),
+        };
+        for page in image.pages {
+            overlay.set(PARKED, page_key(id, page.index), page.bytes);
+        }
+        overlay.set(PARKED, shape_key(id), abi::encode(&shape));
+        overlay.set(PARKED, of_key(&record.program, id), Vec::new());
+        overlay.set(PARKED, frame_key(id), abi::encode(record));
+    }
+
     #[test]
-    fn a_frame_kept_page_by_page_still_loads_and_is_removed() {
+    fn a_frame_kept_page_by_page_still_loads_and_its_next_save_packs_it() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         let mut overlay = Overlay::default();
         let record = parked();
-        save(&storage, &mut overlay, 7, record.clone(), image()).unwrap();
+        keep_page_by_page(&mut overlay, 7, &record, image());
         let view = View::new(&storage, vec![&overlay]);
         assert_eq!(view.get(PARKED, &image_key(7)).unwrap(), None);
         assert_eq!(load(&view, 7).unwrap(), Some((record.clone(), image())));
-        remove(&storage, &mut overlay, 7, &record.program).unwrap();
+        save(&storage, &mut overlay, 7, record.clone(), image()).unwrap();
         let view = View::new(&storage, vec![&overlay]);
         assert_eq!(view.get(PARKED, &page_key(7, 2)).unwrap(), None);
-        assert_eq!(load(&view, 7).unwrap(), None);
+        assert_eq!(view.get(PARKED, &shape_key(7)).unwrap(), None);
+        assert!(view.get(PARKED, &image_key(7)).unwrap().is_some());
+        assert_eq!(load(&view, 7).unwrap(), Some((record.clone(), image())));
+        keep_page_by_page(&mut overlay, 8, &record, image());
+        remove(&storage, &mut overlay, 8, &record.program).unwrap();
+        let view = View::new(&storage, vec![&overlay]);
+        assert_eq!(view.get(PARKED, &page_key(8, 2)).unwrap(), None);
+        assert_eq!(load(&view, 8).unwrap(), None);
     }
 }

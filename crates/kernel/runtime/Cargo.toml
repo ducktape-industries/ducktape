@@ -11,6 +11,8 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 wasmtime = { workspace = true }
 zstd = { workspace = true }
+zstd-safe = { workspace = true }
+zstd-sys = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
