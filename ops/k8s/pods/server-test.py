@@ -644,13 +644,38 @@ class Create(Served):
         self.assertEqual(status, 201)
         self.assertEqual(list(answer), ["pod"])
 
-    def test_a_scratch_in_a_pod_without_a_memory_request_answers_no_warnings(self):
+    def test_a_scratch_in_a_pod_without_a_memory_request_or_limit_answers_no_warnings(self):
         self.kube.answer("create", ran(pod_json()))
         inputs = [{"path": "/work", "scratch": {"medium": "Memory", "size": "80Gi"}}, {"path": "/unsized", "scratch": {"medium": "Memory"}}]
-        for resources in ({}, {"resources": {"limits": {"memory": "8Gi"}, "requests": {"cpu": "2"}}}):
+        for resources in ({}, {"resources": {"limits": {"cpu": "8"}, "requests": {"cpu": "2"}}}):
             status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, **resources})
             self.assertEqual(status, 201)
             self.assertEqual(list(answer), ["pod"])
+
+    def test_scratches_not_below_the_memory_limit_are_made_with_a_warning(self):
+        self.kube.answer("create", ran(pod_json()))
+        starved = "the kubelet sizes a memory scratch to the 96Gi limit at most, and a full one leaves the pod's processes no memory, so they are OOM-killed."
+        cases = (
+            ([{"path": "/var/tmp", "scratch": {"medium": "Memory", "size": "96Gi"}}], [f"scratch /var/tmp 96Gi is not below the 96Gi memory limit; {starved}"]),
+            (
+                [{"path": "/a", "scratch": {"medium": "Memory", "size": "50Gi"}}, {"path": "/b", "scratch": {"medium": "Memory", "size": "46Gi"}}],
+                [f"scratch /a 50Gi + /b 46Gi is not below the 96Gi memory limit; {starved}"],
+            ),
+            ([{"path": "/var/tmp", "scratch": {"medium": "Memory"}}], [f"scratch /var/tmp has no size, so it can fill the 96Gi memory limit; {starved}"]),
+        )
+        for inputs, warnings in cases:
+            status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, "resources": {"limits": {"memory": "96Gi"}}})
+            self.assertEqual(status, 201)
+            self.assertEqual(answer["warnings"], warnings)
+
+    def test_scratches_below_the_memory_limit_and_within_the_request_answer_no_warnings(self):
+        self.kube.answer("create", ran(pod_json()))
+        inputs = [{"path": "/var/tmp", "scratch": {"medium": "Memory", "size": "56Gi"}}, {"path": "/small", "scratch": {"medium": "Memory", "size": "8Gi"}}]
+        resources = {"requests": {"memory": "72Gi"}, "limits": {"memory": "96Gi"}}
+        status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, "resources": resources})
+        self.assertEqual(status, 201)
+        self.assertEqual(list(answer), ["pod"])
+        self.assertEqual(self.created()["spec"]["resources"], resources)
 
     def test_a_disk_scratch_is_refused_before_any_warning(self):
         inputs = [{"path": "/work", "scratch": {"medium": "Disk", "size": "80Gi"}}]

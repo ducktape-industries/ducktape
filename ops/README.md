@@ -243,7 +243,14 @@ scripts back a `make` target; see the repository `Makefile`.
   scratch's `size`, and its reply (201, or 200 for the same request again)
   then carries `"warnings"`: one sentence per such scratch, saying the pod
   can be evicted. A scratch without a `size` in a pod with a memory request
-  gets one too. A reply with nothing to warn of has no `warnings` field.
+  gets one too. A pod-level `resources.limits.memory` bounds the pod's
+  memory, scratch included, so a full scratch then fails one write or gets
+  one process OOM-killed instead of the pod evicted. Because the kubelet
+  sizes each memory scratch to that limit at most, a scratch without a
+  `size`, or scratches whose sizes add up to the limit or more, leave the
+  pod's processes no memory once full; the reply warns of each, saying the
+  processes are OOM-killed. A reply with nothing to warn of has no
+  `warnings` field.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. While

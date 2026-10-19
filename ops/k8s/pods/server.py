@@ -772,11 +772,24 @@ def scratch_warning(given, requested):
     return None
 
 
+def limit_warnings(scratches, limited):
+    starved = f"the kubelet sizes a memory scratch to the {limited} limit at most, and a full one leaves the pod's processes no memory, so they are OOM-killed."
+    unsized = [f"scratch {given['path']} has no size, so it can fill the {limited} memory limit; {starved}" for given in scratches if "size" not in given[SCRATCH]]
+    sized = [given for given in scratches if "size" in given[SCRATCH]]
+    total = sum(quantity(given[SCRATCH]["size"]) for given in sized)
+    if not sized or total < quantity(limited):
+        return unsized
+    held = " + ".join(f"{given['path']} {given[SCRATCH]['size']}" for given in sized)
+    return unsized + [f"scratch {held} is not below the {limited} memory limit; {starved}"]
+
+
 def scratch_warnings(spec):
-    requested = ((spec.get("resources") or {}).get("requests") or {}).get("memory")
-    if requested is None:
-        return []
-    warnings = [scratch_warning(given, requested) for given in spec.get("inputs", []) if SCRATCH in given]
+    resources = spec.get("resources") or {}
+    requested = (resources.get("requests") or {}).get("memory")
+    limited = (resources.get("limits") or {}).get("memory")
+    scratches = [given for given in spec.get("inputs", []) if SCRATCH in given]
+    warnings = [scratch_warning(given, requested) for given in scratches] if requested is not None else []
+    warnings += limit_warnings(scratches, limited) if limited is not None else []
     return [warning for warning in warnings if warning is not None]
 
 
