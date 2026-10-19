@@ -6,10 +6,10 @@ use store::Map;
 
 use super::*;
 
-const PROGRAM_FRAMES: Map<(u64, u32), Frame> = Map::new("f/").shared();
-const PROGRAM_SIGNED: Map<(Vec<u8>, u64, u32), Frame> = Map::new("k/").shared();
-const PROGRAM_ACTED: Map<(AccountNumber, u64, u32), Frame> = Map::new("a/").shared();
-const PROGRAM_USED: Map<(AccountNumber, String), u64> = Map::new("u/").shared();
+const PROGRAM_FRAMES: Map<(u64, u32), Frame> = Map::new("f/");
+const PROGRAM_SIGNED: Map<(Vec<u8>, u64, u32), Frame> = Map::new("k/");
+const PROGRAM_ACTED: Map<(AccountNumber, u64, u32), Frame> = Map::new("a/");
+const PROGRAM_USED: Map<(AccountNumber, String), u64> = Map::new("u/");
 
 fn keep(ctx: &ExecCtx, record: Record) {
     let frame = Frame {

@@ -183,11 +183,16 @@ under `ops/`.
 - **Merged means gone.** Remove the worktree and delete its local branch as
   soon as the change merges. Then `git grep` your symbol on `forge/dev`: a
   sibling's merge can revert it.
-- **`abi` lives in two repositories.** The programs a network founds with
-  live in forge's `programs`. Its `crates/sdk/abi` is a copy of
-  `crates/kernel/abi` here: a change to either copy is carried to the other
-  in the same change. `crates/kernel/program` here is the small program SDK
-  the kernel fixtures build against; that repository's `crates/sdk/program`
+- **`abi` lives here alone.** The programs a network founds with live in
+  forge's `programs`, which takes `crates/kernel/abi` from this repository
+  by git at the rev it pins its host to; nothing copies it. This workspace
+  links programs crates too, and its `[patch]` folds their `abi` and `blob`
+  back onto these paths, so a build holds one of each (tools' `one-abi`
+  gate fails a lock that lists either twice). Through that `[patch]` this
+  workspace compiles programs' crates against `crates/kernel/abi`, so an
+  abi change must keep them compiling at the programs pin.
+  `crates/kernel/program` here is the small program SDK the kernel
+  fixtures build against; that repository's `crates/sdk/program`
   is the full SDK its programs build against. They are two crates, not
   copies.
 - **Hold only what is really uncertain.** A change stays open only when the

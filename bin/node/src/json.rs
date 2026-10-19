@@ -3,14 +3,13 @@
 //! by code id, and an AddKey consent signed over identity's own admission.
 use std::path::{Path, PathBuf};
 
-use abi::{BlobId, Outcome, Receipt, role};
+use abi::{BlobId, Outcome, Receipt, Scheme, role};
 use borsh_json::Interface;
 use commonware_cryptography::{Signer as _, ed25519};
 use host::Layer;
 use node::{Frame, Preconfirm};
 use noded::wire::{EgressPlan, Reached, Status, Submitted};
 use noded::{Client, Workspace};
-use programs_sdk::abi::Scheme;
 use serde_json::{Map, Value, json};
 
 use crate::{Sentence as _, blob_text};
@@ -284,10 +283,9 @@ pub fn signed(signer: &ed25519::PrivateKey, admission: &identity::Admission) -> 
 
 #[cfg(test)]
 mod tests {
-    use abi::{Outcome, Receipt};
+    use abi::{Outcome, Receipt, Scheme};
     use borsh_json::Interface;
     use commonware_cryptography::{Signer as _, ed25519};
-    use programs_sdk::abi::Scheme;
     use serde_json::json;
 
     use super::{Sent, keep, kept, schemas, section, signed};

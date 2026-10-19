@@ -23,7 +23,6 @@ identity = { workspace = true }
 keystore = { workspace = true }
 node = { workspace = true }
 noded = { workspace = true }
-programs-sdk = { workspace = true }
 rand = { version = "0.10", features = ["sys_rng"] }
 rand_core = { workspace = true }
 serde_json = { workspace = true }

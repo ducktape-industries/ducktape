@@ -6,7 +6,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use abi::role::validators::{Grant, Invite, Motion, Op, Voted};
-use abi::{BlobId, HashKind, Outcome, Scan, role};
+use abi::{BlobId, HashKind, Outcome, Scan, Scheme, role};
 use clap::{Args, Parser, Subcommand};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::Runner as _;
@@ -19,7 +19,6 @@ use noded::{
     Client, ConsensusSettings, CpuList, Endpoint, HaloConfig, LoadConfig, LoadSettings, Logs,
     NodeConfig, Settings, Upload, Workspace,
 };
-use programs_sdk::abi::Scheme;
 
 #[derive(Parser)]
 #[command(name = "ducktape", about = "a ducktape node and its client", version)]
