@@ -583,6 +583,50 @@ class Create(Served):
         self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": 48}}]}, 400, ["size is a JSON str"])
         self.assertNotIn("create", self.kube.verbs())
 
+    def test_a_scratch_larger_than_the_memory_request_is_made_with_a_warning(self):
+        self.kube.answer("create", ran(pod_json()))
+        inputs = [
+            {"path": "/work", "scratch": {"medium": "Memory", "size": "80Gi"}},
+            {"path": "/small", "scratch": {"medium": "Memory", "size": "8Gi"}},
+            {"path": "/just-over", "scratch": {"medium": "Memory", "size": "73729Mi"}},
+            {"path": "/unsized", "scratch": {"medium": "Memory"}},
+        ]
+        spec = {"image": "toolchain", "inputs": inputs, "resources": {"requests": {"memory": "72Gi"}}}
+        status, answer = self.call("POST", "/v1/pods", spec)
+        self.assertEqual(status, 201)
+        self.assertEqual(self.kube.verbs(), ["create"])
+        self.assertEqual(answer["pod"]["name"], "duckpond-41")
+        self.assertEqual(
+            answer["warnings"],
+            [
+                "scratch /work is 80Gi on a 72Gi memory request; memory scratch counts as pod memory, so the pod can be evicted.",
+                "scratch /just-over is 73729Mi on a 72Gi memory request; memory scratch counts as pod memory, so the pod can be evicted.",
+                "scratch /unsized has no size, so it can grow past the 72Gi memory request; memory scratch counts as pod memory, so the pod can be evicted.",
+            ],
+        )
+
+    def test_a_scratch_no_larger_than_the_memory_request_answers_no_warnings(self):
+        self.kube.answer("create", ran(pod_json()))
+        sizes = ["72Gi", "73728Mi", "77309411328", "64Gi", "1e9"]
+        inputs = [{"path": f"/scratch/{index}", "scratch": {"medium": "Memory", "size": size}} for index, size in enumerate(sizes)]
+        status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, "resources": {"requests": {"memory": "72Gi"}}})
+        self.assertEqual(status, 201)
+        self.assertEqual(list(answer), ["pod"])
+
+    def test_a_scratch_in_a_pod_without_a_memory_request_answers_no_warnings(self):
+        self.kube.answer("create", ran(pod_json()))
+        inputs = [{"path": "/work", "scratch": {"medium": "Memory", "size": "80Gi"}}, {"path": "/unsized", "scratch": {"medium": "Memory"}}]
+        for resources in ({}, {"resources": {"limits": {"memory": "8Gi"}, "requests": {"cpu": "2"}}}):
+            status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, **resources})
+            self.assertEqual(status, 201)
+            self.assertEqual(list(answer), ["pod"])
+
+    def test_a_disk_scratch_is_refused_before_any_warning(self):
+        inputs = [{"path": "/work", "scratch": {"medium": "Disk", "size": "80Gi"}}]
+        answer = self.refused("POST", "/v1/pods", {"image": "t", "inputs": inputs, "resources": {"requests": {"memory": "72Gi"}}}, 400, ["medium is Memory"])
+        self.assertNotIn("warnings", answer)
+        self.assertNotIn("create", self.kube.verbs())
+
     def test_an_input_names_one_source_an_absolute_path_and_well_formed_ids(self):
         two = {"path": "/a", "blob": CHUNKS[0], "files": {"path": "/b"}}
         self.refused("POST", "/v1/pods", {"image": "t", "inputs": [two]}, 400, ["input 0 names one source"])
@@ -598,6 +642,16 @@ class Create(Served):
         status, answer = self.call("POST", "/v1/pods", {"image": "toolchain"})
         self.assertEqual(status, 200)
         self.assertEqual(answer["pod"]["phase"], "Running")
+        self.assertEqual(list(answer), ["pod"])
+
+    def test_the_same_request_again_warns_as_the_first_did(self):
+        self.kube.answer("create", ran(code=1, err='Error from server (AlreadyExists): pods "duckpond-41" already exists'))
+        self.kube.answer("get", ran(pod_json(state={"running": {"startedAt": "s"}}, phase="Running")))
+        inputs = [{"path": "/work", "scratch": {"medium": "Memory", "size": "80Gi"}}]
+        status, answer = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs, "resources": {"requests": {"memory": "72Gi"}}})
+        self.assertEqual(status, 200)
+        self.assertEqual(answer["pod"]["phase"], "Running")
+        self.assertEqual(answer["warnings"], ["scratch /work is 80Gi on a 72Gi memory request; memory scratch counts as pod memory, so the pod can be evicted."])
 
     def test_a_spec_the_service_cannot_read_is_refused(self):
         self.refused("POST", "/v1/pods", {"image": "t", "gpu": 1}, 400, ["no field gpu"])

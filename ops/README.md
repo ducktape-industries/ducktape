@@ -202,7 +202,12 @@ scripts back a `make` target; see the repository `Makefile`.
   allocatable memory, so filling it can starve the node and get the pod
   evicted. What a pod writes there counts as the pod's memory, but
   `hardcap` counts only requests, so a pod that builds into a scratch
-  states a memory request at least its scratch's size.
+  states a memory request at least its scratch's size. The service still
+  creates a pod whose `resources.requests.memory` is smaller than a
+  scratch's `size`, and its reply (201, or 200 for the same request again)
+  then carries `"warnings"`: one sentence per such scratch, saying the pod
+  can be evicted. A scratch without a `size` in a pod with a memory request
+  gets one too. A reply with nothing to warn of has no `warnings` field.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. A pod

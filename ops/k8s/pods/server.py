@@ -704,6 +704,31 @@ def scratch_size(text, what):
     return text
 
 
+def scratch_warning(given, requested):
+    risk = "memory scratch counts as pod memory, so the pod can be evicted."
+    scratch = given[SCRATCH]
+    if "size" not in scratch:
+        return f"scratch {given['path']} has no size, so it can grow past the {requested} memory request; {risk}"
+    if quantity(scratch["size"]) > quantity(requested):
+        return f"scratch {given['path']} is {scratch['size']} on a {requested} memory request; {risk}"
+    return None
+
+
+def scratch_warnings(spec):
+    requested = ((spec.get("resources") or {}).get("requests") or {}).get("memory")
+    if requested is None:
+        return []
+    warnings = [scratch_warning(given, requested) for given in spec.get("inputs", []) if SCRATCH in given]
+    return [warning for warning in warnings if warning is not None]
+
+
+def warned(answer, spec):
+    warnings = scratch_warnings(spec)
+    if not warnings:
+        return answer
+    return {**answer, "warnings": warnings}
+
+
 def confined():
     return {"allowPrivilegeEscalation": False, "seccompProfile": {"type": "RuntimeDefault"}}
 
@@ -1477,12 +1502,12 @@ class Service:
         pod = pod_spec(asked, spec, self.fetching, self.kube.namespace)
         ran = self.kube.create(pod)
         if ran.code == 0:
-            return 201, {"pod": view(json.loads(ran.out))}
+            return 201, warned({"pod": view(json.loads(ran.out))}, spec)
         refusal = kube_refusal(ran, "the pod was not created")
         repeated = refusal.status == 409 and "AlreadyExists" in ran.err
         if not repeated:
             raise refusal
-        return 200, {"pod": view(self.pod(pod["metadata"]["name"]))}
+        return 200, warned({"pod": view(self.pod(pod["metadata"]["name"]))}, spec)
 
     def list(self):
         return 200, {"pods": [view(pod) for pod in self.items(self.kube.list(), "the pods were not listed")]}
