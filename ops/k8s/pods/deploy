@@ -1,16 +1,44 @@
 #!/usr/bin/env bash
-# Builds the pods service image around the ducktape CLI built from the source of DUCKTAPE_COMMIT and git-remote-duck, pushes it to the cluster node's registry, and applies pods.yaml.
-# Usage: AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY ops/k8s/pods/deploy NODE_URL FORGE DUCKTAPE_COMMIT
+# Builds the pods service image around the ducktape CLI built from the source of DUCKTAPE_COMMIT and git-remote-duck, pushes it to the cluster node's registry, and applies pods.yaml with hardcap computed from the live cluster.
+# Usage: ops/k8s/pods/deploy NODE_URL FORGE DUCKTAPE_COMMIT
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-usage="usage: AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY ops/k8s/pods/deploy NODE_URL FORGE DUCKTAPE_COMMIT"
+usage="usage: ops/k8s/pods/deploy NODE_URL FORGE DUCKTAPE_COMMIT"
 node_url=${1:?$usage}
 forge=${2:?$usage}
 commit=$(git -C "$here" rev-parse --verify "${3:?$usage}^{commit}")
-agents_cpu=${AGENTS_CPU:?AGENTS_CPU is the requests.cpu of hardcap: the allocatable cpu of the node minus the requests of the duckpond node, ccs and tunnel pods (kubectl describe node)}
-agents_memory=${AGENTS_MEMORY:?AGENTS_MEMORY is the requests.memory of hardcap: the allocatable memory of the node minus the requests of those pods}
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 context=${DEPLOY_CONTEXT:-fabrics-1}
+
+hardcap() {
+  {
+    kubectl --context "$context" get nodes \
+      -o jsonpath='{range .items[*]}+ 1 {.status.allocatable.cpu}/{.status.allocatable.memory}{"\n"}{end}' &&
+      kubectl --context "$context" -n duckpond get deployment node ccs tunnel \
+        -o jsonpath='{range .items[*]}- {.spec.replicas}{range .spec.template.spec.containers[*]} {.resources.requests.cpu}/{.resources.requests.memory}{end}{"\n"}{end}'
+  } | awk '
+    BEGIN {
+      scale[""] = 1
+      split("Ki Mi Gi Ti Pi", binary, " ")
+      split("k M G T P", decimal, " ")
+      for (i = 1; i <= 5; i++) { scale[binary[i]] = 1024 ^ i; scale[decimal[i]] = 1000 ^ i }
+    }
+    function millicores(q) { return q ~ /m$/ ? substr(q, 1, length(q) - 1) : q * 1000 }
+    function bytes(q) { return match(q, /^[0-9.]+/) ? substr(q, 1, RLENGTH) * scale[substr(q, RLENGTH + 1)] : 0 }
+    {
+      sign = $1 == "+" ? 1 : -1
+      for (i = 3; i <= NF; i++) {
+        split($i, request, "/")
+        cpu += sign * $2 * millicores(request[1])
+        memory += sign * $2 * bytes(request[2])
+      }
+    }
+    END { printf "%dm %dKi\n", cpu, memory / 1024 }
+  '
+}
+limits=$(hardcap)
+read -r agents_cpu agents_memory <<<"$limits"
+echo "hardcap: requests.cpu $agents_cpu, requests.memory $agents_memory"
 kubectl_version=v1.36.5
 duck_release=git-remote-duck-628d7c1
 duck_sha256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7

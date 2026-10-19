@@ -230,8 +230,8 @@ metadata:
 spec:
   policyName: agents-pods-cpu
 ---
-# hardcap caps what agents' pods are guaranteed, not what they burst to: AGENTS_CPU and AGENTS_MEMORY are the node's
-# allocatable cpu and memory minus the requests of the duckpond node, ccs and tunnel pods (kubectl describe node).
+# hardcap caps what agents' pods are guaranteed, not what they burst to: AGENTS_CPU and AGENTS_MEMORY are the nodes'
+# allocatable cpu and memory minus the requests of the duckpond node, ccs and tunnel Deployments.
 apiVersion: v1
 kind: ResourceQuota
 metadata:

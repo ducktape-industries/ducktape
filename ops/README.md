@@ -64,7 +64,7 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## Agents' computing on Kubernetes
 
-- `AGENTS_CPU=CPU AGENTS_MEMORY=MEMORY k8s/pods/deploy NODE_URL FORGE COMMIT` builds `k8s/pods/Containerfile` around
+- `k8s/pods/deploy NODE_URL FORGE COMMIT` builds `k8s/pods/Containerfile` around
   the ducktape CLI built from `git archive COMMIT` the same way, kubectl and
   git-remote-duck, pushes it to the cluster node's registry, and applies
   `k8s/pods/pods.yaml`: the service `pods` in namespace `pods` at
@@ -189,8 +189,10 @@ scripts back a `make` target; see the repository `Makefile`.
   `pods/NAME/file` answer with their result, so they post nothing.
 - Namespace `agents` holds the ResourceQuota `hardcap`, the operator's
   ceiling: `requests.storage` 500Gi, and `requests.cpu` and
-  `requests.memory` at `AGENTS_CPU` and `AGENTS_MEMORY`, the node's
-  allocatable minus the duckpond node, ccs and tunnel pods' requests. It
+  `requests.memory` at the allocatable cpu and memory of the cluster's
+  nodes minus what the duckpond node, ccs and tunnel Deployments request,
+  summed over their containers and replicas. `k8s/pods/deploy` reads these
+  from the cluster and prints the two values before it applies. It
   caps what pods are guaranteed, not what they burst to. Kubernetes enforces every quota in a
   namespace, so agents add their own quotas and LimitRanges beside it and
   none exceeds it. The service's
