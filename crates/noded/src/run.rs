@@ -361,6 +361,7 @@ async fn adopt<E: Context>(
         &descriptor.network,
         workspace.dir(),
         descriptor.id(),
+        Duration::from_millis(descriptor.block_time_ms),
         source,
     )
     .await?;

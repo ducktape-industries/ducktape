@@ -3,7 +3,9 @@ mod serve;
 mod wire;
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::path::Path;
+use std::time::Duration;
 
 use abi::{BlobId, ProgramId, Refusal, reason};
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
@@ -21,6 +23,8 @@ pub use wire::{Head, Request, Response};
 
 pub type SyncRequest = sync::Request<state::Family>;
 pub type SyncResponse = sync::Response<state::Family, state::Op, Digest>;
+
+const ATTEMPTS_PER_LINE: u64 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -54,8 +58,24 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    Transient(&'static str),
+    Definite,
+}
+
+pub trait Fault: std::error::Error + Send + Sync + 'static {
+    fn failure(&self) -> Failure;
+}
+
+impl Fault for Infallible {
+    fn failure(&self) -> Failure {
+        match *self {}
+    }
+}
+
 pub trait Exchange: Clone + Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: Fault;
 
     fn exchange(
         &self,
@@ -73,9 +93,15 @@ pub async fn join<E: Context, X: Exchange>(
     name: &str,
     dir: &Path,
     network: Vec<u8>,
+    pause: Duration,
     exchange: X,
 ) -> Result<Joined<E>> {
-    let (head, commitments) = adopted_head(&context, name, &exchange).await?;
+    let asking = Asking {
+        context: context.child("ask"),
+        exchange,
+        pause,
+    };
+    let (head, commitments) = adopted_head(&context, name, &asking).await?;
     let synced = Synced {
         height: head.tip.height,
         commitments,
@@ -93,7 +119,7 @@ pub async fn join<E: Context, X: Exchange>(
         verified(&mut context, &network, &node, certificate)?;
     }
     for id in node.host().missing_blobs()? {
-        let framed = blob(&exchange, id).await?;
+        let framed = blob(&asking, id).await?;
         node.install(id, &framed)?;
     }
     Ok(Joined {
@@ -105,16 +131,16 @@ pub async fn join<E: Context, X: Exchange>(
 async fn adopted_head<E: Context, X: Exchange>(
     context: &E,
     name: &str,
-    exchange: &X,
+    asking: &Asking<E, X>,
 ) -> Result<(Head, BTreeMap<ProgramId, Commitment<E>>)> {
     let mut retargets: u64 = 0;
     loop {
-        let head = head(exchange).await?;
+        let head = head(asking).await?;
         let anchor_names_the_tip = head.anchor.names(head.tip);
         if !anchor_names_the_tip {
             return Err(Error::Head);
         }
-        let error = match synced_to(context, name, exchange, &head.targets).await {
+        let error = match synced_to(context, name, asking, &head.targets).await {
             Ok(commitments) => return Ok((head, commitments)),
             Err(error) => error,
         };
@@ -136,13 +162,13 @@ async fn adopted_head<E: Context, X: Exchange>(
 async fn synced_to<E: Context, X: Exchange>(
     context: &E,
     name: &str,
-    exchange: &X,
+    asking: &Asking<E, X>,
     targets: &BTreeMap<ProgramId, SyncTarget>,
 ) -> Result<BTreeMap<ProgramId, Commitment<E>>> {
     let mut commitments = BTreeMap::new();
     for (program, target) in targets {
         let source = Remote {
-            exchange: exchange.clone(),
+            asking: asking.clone(),
             program: program.clone(),
         };
         let commitment = Commitment::sync_from(
@@ -186,16 +212,16 @@ fn verified<E: Context>(
     Ok(())
 }
 
-async fn head<X: Exchange>(exchange: &X) -> Result<Head> {
-    match ask(exchange, Request::Head).await? {
+async fn head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<Head> {
+    match asking.ask(Request::Head).await? {
         Response::Head(head) => Ok(head),
         Response::Refused(refusal) => Err(Error::Refused(refusal)),
         other => Err(Error::Answer(Box::new(other))),
     }
 }
 
-async fn blob<X: Exchange>(exchange: &X, id: BlobId) -> Result<Vec<u8>> {
-    match ask(exchange, Request::Blob(id)).await? {
+async fn blob<E: Context, X: Exchange>(asking: &Asking<E, X>, id: BlobId) -> Result<Vec<u8>> {
+    match asking.ask(Request::Blob(id)).await? {
         Response::Blob(Some(framed)) => Ok(framed),
         Response::Blob(None) => Err(Error::Blob(id)),
         Response::Refused(refusal) => Err(Error::Refused(refusal)),
@@ -203,9 +229,45 @@ async fn blob<X: Exchange>(exchange: &X, id: BlobId) -> Result<Vec<u8>> {
     }
 }
 
-async fn ask<X: Exchange>(exchange: &X, request: Request) -> Result<Response> {
-    exchange
-        .exchange(request)
-        .await
-        .map_err(|error| Error::Exchange(Box::new(error)))
+struct Asking<E, X> {
+    context: E,
+    exchange: X,
+    pause: Duration,
+}
+
+impl<E: Context, X: Exchange> Clone for Asking<E, X> {
+    fn clone(&self) -> Self {
+        Asking {
+            context: self.context.child("ask"),
+            exchange: self.exchange.clone(),
+            pause: self.pause,
+        }
+    }
+}
+
+impl<E: Context, X: Exchange> Asking<E, X> {
+    async fn ask(&self, request: Request) -> Result<Response> {
+        let mut attempts: u64 = 0;
+        loop {
+            let error = match self.exchange.exchange(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            let Failure::Transient(reason) = error.failure() else {
+                return Err(Error::Exchange(Box::new(error)));
+            };
+            attempts += 1;
+            let worth_a_line = attempts == 1 || attempts.is_multiple_of(ATTEMPTS_PER_LINE);
+            if worth_a_line {
+                tracing::warn!(
+                    target: "ducktape::sync",
+                    event = "join_unanswered",
+                    reason,
+                    attempts,
+                    "the source did not answer the join; it asks again"
+                );
+            }
+            self.context.sleep(self.pause).await;
+        }
+    }
 }

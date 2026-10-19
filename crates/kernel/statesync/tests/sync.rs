@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use abi::{
     HostOp, role,
@@ -19,10 +20,14 @@ use commonware_utils::iter::NonEmpty;
 use consensus::{Certificate, validators_of};
 use fixture_probe::Step;
 use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET};
+use futures::StreamExt as _;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use host::{Founding, Genesis, Layer, Limits, Tip};
 use node::{Block, Frame, Node, Sequenced};
 use state::{Storage, Store};
-use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, anchored, join, serve};
+use statesync::{
+    Anchor, Anchors, Error, Exchange, Failure, Fault, Request, Response, anchored, join, serve,
+};
 
 const NETWORK: &[u8] = b"sync";
 const TIME: u64 = 1_700_000_000;
@@ -332,7 +337,14 @@ fn identity_sync(request: &Request) -> bool {
 /// `exchange` never answers, as a crash or a Ctrl-C does: nothing after the
 /// cut runs.
 async fn cut_off<X: Exchange>(context: &Ctx, name: &'static str, dir: &Path, exchange: X) {
-    let joining = join(context.child(name), name, dir, NETWORK.to_vec(), exchange);
+    let joining = join(
+        context.child(name),
+        name,
+        dir,
+        NETWORK.to_vec(),
+        PAUSE,
+        exchange,
+    );
     let waited = context.sleep(std::time::Duration::from_secs(5));
     futures::pin_mut!(joining, waited);
     let cut = futures::future::select(joining, waited).await;
@@ -448,6 +460,7 @@ fn a_joiner_adopts_the_state_at_a_finalized_tip() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -501,6 +514,7 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -547,6 +561,7 @@ fn a_joiner_at_genesis_starts_from_the_genesis_block() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -581,6 +596,7 @@ fn a_certificate_from_strangers_is_rejected() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -626,6 +642,7 @@ fn a_tip_certificate_verifies_against_the_validators_not_the_members() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -659,6 +676,7 @@ fn a_certificate_naming_an_unrecorded_epoch_is_rejected() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -677,6 +695,7 @@ fn a_refusal_ends_the_join() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             Refusing,
         )
         .await
@@ -714,6 +733,7 @@ fn a_retry_after_a_cut_off_join_reads_what_the_source_reads() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -751,6 +771,7 @@ fn a_retried_join_resumes_the_programs_it_synced() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.withholding(identity_sync, true),
         )
         .await
@@ -790,6 +811,7 @@ fn a_join_resyncs_what_another_chain_left_under_its_name() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -815,6 +837,7 @@ fn a_join_reads_nothing_another_chains_failed_join_adopted() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             other.withholding(blobs, true),
         )
         .await
@@ -832,6 +855,7 @@ fn a_join_reads_nothing_another_chains_failed_join_adopted() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.exchange(),
         )
         .await
@@ -904,6 +928,7 @@ fn a_founding_over_a_joined_dir_is_refused() {
                 "joiner",
                 dir.path(),
                 NETWORK.to_vec(),
+                PAUSE,
                 network.exchange(),
             )
             .await
@@ -957,6 +982,7 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
             "whole",
             elsewhere.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.counting(&whole, usize::MAX),
         )
         .await
@@ -971,6 +997,7 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.counting(&refused, serves),
         )
         .await
@@ -987,6 +1014,7 @@ fn a_join_a_source_refused_mid_sync_resumes_when_retried() {
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             network.counting(&retried, usize::MAX),
         )
         .await
@@ -1136,6 +1164,7 @@ fn a_join_the_source_prunes_past_reads_the_head_again_and_adopts_the_later_root(
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
+            PAUSE,
             pruning.clone(),
         )
         .await
@@ -1164,5 +1193,177 @@ fn a_join_the_source_prunes_past_reads_the_head_again_and_adopts_the_later_root(
                 .get("probe", b"churn-7-63")
                 .unwrap()
         );
+    });
+}
+
+const PAUSE: Duration = Duration::from_secs(1);
+
+const ASKED_WHILE_DOWN: usize = 3;
+
+#[derive(Debug, thiserror::Error)]
+#[error("the source is down")]
+struct Outage(Failure);
+
+impl Fault for Outage {
+    fn failure(&self) -> Failure {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Serving,
+    Down,
+    Restored,
+}
+
+#[derive(Clone)]
+struct Cut {
+    source: Loopback,
+    cuts: fn(&Request) -> bool,
+    failure: Failure,
+    phase: Arc<Mutex<Phase>>,
+    failed: UnboundedSender<()>,
+    heads: Arc<AtomicUsize>,
+    served: Arc<AtomicUsize>,
+}
+
+impl Cut {
+    fn restore(&self) {
+        *self.phase.lock().unwrap() = Phase::Restored;
+    }
+}
+
+impl Exchange for Cut {
+    type Error = Outage;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Outage> {
+        let down = {
+            let mut phase = self.phase.lock().unwrap();
+            let cut_here = *phase == Phase::Serving && (self.cuts)(&request);
+            if cut_here {
+                *phase = Phase::Down;
+            }
+            *phase == Phase::Down
+        };
+        if down {
+            self.failed.unbounded_send(()).unwrap();
+            return Err(Outage(self.failure));
+        }
+        if matches!(request, Request::Head) {
+            self.heads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.served.fetch_add(1, Ordering::SeqCst);
+        let Ok(response) = self.source.exchange(request).await;
+        Ok(response)
+    }
+}
+
+fn cut(
+    network: &Network,
+    cuts: fn(&Request) -> bool,
+    failure: Failure,
+) -> (Cut, UnboundedReceiver<()>) {
+    let (failed, told) = unbounded();
+    let cut = Cut {
+        source: network.exchange(),
+        cuts,
+        failure,
+        phase: Arc::new(Mutex::new(Phase::Serving)),
+        failed,
+        heads: Arc::new(AtomicUsize::new(0)),
+        served: Arc::new(AtomicUsize::new(0)),
+    };
+    (cut, told)
+}
+
+fn never(_: &Request) -> bool {
+    false
+}
+
+async fn join_through(
+    context: &Ctx,
+    name: &'static str,
+    dir: &Path,
+    cut: &Cut,
+    mut told: UnboundedReceiver<()>,
+    asks: usize,
+) -> statesync::Result<statesync::Joined<Ctx>> {
+    let joining = join(
+        context.child(name),
+        name,
+        dir,
+        NETWORK.to_vec(),
+        PAUSE,
+        cut.clone(),
+    );
+    let restoring = async {
+        for _ in 0..asks {
+            told.next().await.unwrap();
+        }
+        cut.restore();
+    };
+    let (joined, ()) = futures::join!(joining, restoring);
+    joined
+}
+
+fn goes_on_after_an_outage(cuts: fn(&Request) -> bool) {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let tip = network
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
+            .await;
+        let transient = Failure::Transient("source_down");
+        let (unbroken, told) = cut(&network, never, transient);
+        let elsewhere = tempfile::tempdir().unwrap();
+        join_through(&context, "unbroken", elsewhere.path(), &unbroken, told, 0)
+            .await
+            .unwrap();
+
+        let (broken, told) = cut(&network, cuts, transient);
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join_through(
+            &context,
+            "joiner",
+            dir.path(),
+            &broken,
+            told,
+            ASKED_WHILE_DOWN,
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+        assert!(joined.node.host().missing_blobs().unwrap().is_empty());
+        assert_eq!(broken.heads.load(Ordering::SeqCst), 1);
+        let served = broken.served.load(Ordering::SeqCst);
+        assert_eq!(served, unbroken.served.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+fn a_join_whose_source_drops_mid_sync_asks_again_and_goes_on() {
+    goes_on_after_an_outage(probe_sync);
+}
+
+#[test]
+fn a_join_whose_source_drops_while_it_fetches_blobs_asks_again_and_goes_on() {
+    goes_on_after_an_outage(blobs);
+}
+
+#[test]
+fn a_definite_failure_ends_the_join_at_once() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        network
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
+            .await;
+        let (broken, told) = cut(&network, probe_sync, Failure::Definite);
+        let dir = tempfile::tempdir().unwrap();
+        let error = join_through(&context, "joiner", dir.path(), &broken, told, 1)
+            .await
+            .err()
+            .expect("a definite failure ends the join");
+        assert!(matches!(error, Error::Exchange(_)), "{error}");
     });
 }

@@ -2346,6 +2346,7 @@ fn join_held(seat: &Seat, source: Client, gate: Arc<Gate>) -> JoinHandle<()> {
                 &descriptor.network,
                 workspace.dir(),
                 descriptor.id(),
+                std::time::Duration::from_millis(descriptor.block_time_ms),
                 held,
             )
             .await

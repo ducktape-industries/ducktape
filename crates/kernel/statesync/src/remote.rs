@@ -4,14 +4,14 @@ use commonware_storage::qmdb::sync::{FeedbackTx, Source};
 use node::Digest;
 
 use crate::wire::{Request, Response};
-use crate::{Error, Exchange, SyncRequest, SyncResponse, ask};
+use crate::{Asking, Context, Error, Exchange, SyncRequest, SyncResponse};
 
-pub struct Remote<X> {
-    pub exchange: X,
-    pub program: ProgramId,
+pub struct Remote<E, X> {
+    pub(crate) asking: Asking<E, X>,
+    pub(crate) program: ProgramId,
 }
 
-impl<X: Exchange> Source for Remote<X> {
+impl<E: Context, X: Exchange> Source for Remote<E, X> {
     type Family = state::Family;
     type Digest = Digest;
     type Op = state::Op;
@@ -23,7 +23,7 @@ impl<X: Exchange> Source for Remote<X> {
             program: self.program.clone(),
             request: request.encode().to_vec(),
         };
-        let bytes = match ask(&self.exchange, request).await? {
+        let bytes = match self.asking.ask(request).await? {
             Response::Sync(bytes) => bytes,
             Response::Refused(refusal) => return Err(Error::Refused(refusal)),
             other => return Err(Error::Answer(Box::new(other))),

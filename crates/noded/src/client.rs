@@ -7,7 +7,7 @@ use futures::{Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
 use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
-use statesync::{Exchange, Request, Response};
+use statesync::{Exchange, Failure, Fault, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -288,4 +288,82 @@ impl Exchange for Client {
     async fn exchange(&self, request: Request) -> Result<Response> {
         self.post(route::SYNC, &request).await
     }
+}
+
+impl Fault for Error {
+    fn failure(&self) -> Failure {
+        match self {
+            Error::Http(error) => http_failure(error),
+            Error::Failed { status, .. } => status_failure(*status),
+            Error::Io(_)
+            | Error::Founding(_)
+            | Error::Settings { .. }
+            | Error::NoListen
+            | Error::NoHalo
+            | Error::Cadence(_)
+            | Error::PastPermits { .. }
+            | Error::Hex(_)
+            | Error::Address(_)
+            | Error::Tls(_)
+            | Error::Corrupt(_)
+            | Error::Node(_)
+            | Error::Host(_)
+            | Error::Blob(_)
+            | Error::Sync(_)
+            | Error::Summaries(_)
+            | Error::Marshal(_)
+            | Error::Lane(_)
+            | Error::Membership(_)
+            | Error::Ws(_)
+            | Error::Decode(_)
+            | Error::Refused(_)
+            | Error::Closed
+            | Error::Unlanded
+            | Error::Stopped
+            | Error::Offloaded(_)
+            | Error::Egress(_) => Failure::Definite,
+        }
+    }
+}
+
+fn http_failure(error: &reqwest::Error) -> Failure {
+    let untrusted = causes(error).any(|cause| cause.is::<rustls::Error>());
+    if untrusted {
+        return Failure::Definite;
+    }
+    if error.is_connect() {
+        return Failure::Transient("source_unreachable");
+    }
+    let dropped = error.is_request() || error.is_body() || error.is_decode();
+    if dropped {
+        return Failure::Transient("source_dropped");
+    }
+    Failure::Definite
+}
+
+fn causes<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |&error| {
+        let wrapped = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref);
+        match wrapped {
+            Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+            None => error.source(),
+        }
+    })
+}
+
+fn status_failure(status: u16) -> Failure {
+    let Ok(status) = StatusCode::from_u16(status) else {
+        return Failure::Definite;
+    };
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Failure::Transient("source_busy");
+    }
+    if status.is_server_error() {
+        return Failure::Transient("source_failed");
+    }
+    Failure::Definite
 }
