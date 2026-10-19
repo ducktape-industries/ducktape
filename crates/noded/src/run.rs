@@ -460,8 +460,12 @@ async fn start<E: Context>(
         None => crate::cores::usable()?,
     };
     let indexed = workspace.dir().join(crate::activity::DIR);
+    let lag = crate::activity::Lag {
+        from: tip.height,
+        epoch: network.epoch_length,
+    };
     let activity = crate::cores::beside_blocks(rpc_cpus, move || {
-        crate::activity::Index::open(&indexed, move || seed_of(&seeding))
+        crate::activity::Index::open(&indexed, lag, move || seed_of(&seeding))
     })??;
 
     // the live door opens on its socket here, beside halo's, before consensus does any work

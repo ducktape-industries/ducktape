@@ -237,7 +237,8 @@ acted as, each account's count of frames per program, and the refusal of
 each frame that did not apply. The host returns a
 block's records with its receipts (`host::Applied`'s `records`), and a thread
 of the node's own writes them after the block, so the index may lag the chain
-but never holds a block up. `POST /v1/activity` reads it: a borsh
+but never holds a block up, and logs `activity_lag` when it falls more than
+an epoch behind, once until it has caught up again. `POST /v1/activity` reads it: a borsh
 `noded::wire::activity::Query` (`Acted`, `Signed`, `Used` and `Frames`, each a
 page resumed by its `next`, and `Indexed`, the first height whose frames it
 holds and the newest it has indexed, and `Refusal`, why the frame at a height

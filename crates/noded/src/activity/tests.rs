@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 use programs_sdk::{Env, ExecCtx, MockHost};
@@ -92,6 +93,15 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+const LAG: Lag = Lag { from: 0, epoch: 2 };
+
+fn opened<S>(dir: &Path, seed: S) -> Result<Index>
+where
+    S: FnOnce() -> Result<Seed> + Send + 'static,
+{
+    Index::open(dir, LAG, seed)
+}
+
 fn empty() -> Result<Seed> {
     Ok(Seed {
         height: 0,
@@ -107,7 +117,7 @@ fn indexed_to(index: &Index, height: u64) -> Indexed {
 }
 
 fn fed(dir: &Path, blocks: Vec<Block>) -> Index {
-    let index = Index::open(dir, empty).unwrap();
+    let index = opened(dir, empty).unwrap();
     let top = blocks.last().map_or(0, |block| block.height);
     for block in blocks {
         index.offer(block);
@@ -322,7 +332,7 @@ fn a_seeded_index_answers_as_the_one_it_was_seeded_from_and_goes_on_alike() {
             Entry { key, value }
         })
         .collect();
-    let seeded_one = Index::open(&root.path().join("seeded"), move || {
+    let seeded_one = opened(&root.path().join("seeded"), move || {
         Ok(Seed { height: 4, rows })
     })
     .unwrap();
@@ -358,7 +368,7 @@ fn a_seeded_index_answers_as_the_one_it_was_seeded_from_and_goes_on_alike() {
 #[test]
 fn an_index_seeded_with_no_rows_holds_history_from_the_next_block() {
     let dir = tempfile::tempdir().unwrap();
-    let index = Index::open(dir.path(), || {
+    let index = opened(dir.path(), || {
         Ok(Seed {
             height: 9,
             rows: Vec::new(),
@@ -402,7 +412,7 @@ fn a_block_indexed_already_is_skipped_and_a_missed_one_moves_the_history_on() {
 fn a_stalled_index_takes_every_block_without_holding_its_feeder() {
     let dir = tempfile::tempdir().unwrap();
     let (release, stalled) = mpsc::channel::<()>();
-    let index = Index::open(dir.path(), move || {
+    let index = opened(dir.path(), move || {
         stalled.recv().unwrap();
         empty()
     })
@@ -411,12 +421,41 @@ fn a_stalled_index_takes_every_block_without_holding_its_feeder() {
         index.offer(block);
     }
     assert_eq!(*index.indexed().borrow(), None);
+    assert!(
+        index.lagging.load(Ordering::Relaxed),
+        "four blocks behind is past an epoch of two"
+    );
     assert_eq!(
         asked(&index, Query::Indexed).unwrap_err().reason,
         reason::NOT_YET
     );
     release.send(()).unwrap();
     assert_eq!(indexed_to(&index, 4), Indexed { from: 1, height: 4 });
+    index.offer(block(5, Vec::new()));
+    assert!(
+        !index.lagging.load(Ordering::Relaxed),
+        "an index that caught up is no longer behind"
+    );
+}
+
+#[test]
+fn an_index_pacing_an_epoch_behind_logs_its_lag_once_until_it_catches_up() {
+    let epoch = 2;
+    let lags = [1, 3, 2, 3, 2, 3, 2, 1, 2, 3, 0, 3];
+    let mut behind = false;
+    let mut logged = Vec::new();
+    for (at, lag) in lags.into_iter().enumerate() {
+        let step = lagged(behind, lag, epoch);
+        behind = step.behind;
+        if step.logs {
+            logged.push(at);
+        }
+    }
+    assert_eq!(
+        logged,
+        [1, 9, 11],
+        "once each time it falls behind, never while pacing an epoch back"
+    );
 }
 
 #[test]
@@ -425,7 +464,7 @@ fn a_closed_index_reopens_where_it_stopped() {
     let index = fed(dir.path(), chain());
     runtime().block_on(index.close());
     drop(index);
-    let reopened = Index::open(dir.path(), || {
+    let reopened = opened(dir.path(), || {
         panic!("an index that holds a height is not seeded")
     })
     .unwrap();

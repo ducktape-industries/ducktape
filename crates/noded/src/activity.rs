@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use abi::hook::Record;
@@ -34,6 +35,12 @@ pub(crate) struct Block {
     pub(crate) time: u64,
     pub(crate) records: Vec<Record>,
     pub(crate) refused: Vec<(u32, Refusal)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Lag {
+    pub(crate) from: u64,
+    pub(crate) epoch: u64,
 }
 
 pub(crate) struct Seed {
@@ -70,6 +77,8 @@ pub(crate) struct Index {
     reads: Reads,
     feed: mpsc::Sender<Event>,
     indexed: watch::Receiver<Option<Indexed>>,
+    lag: Lag,
+    lagging: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -94,7 +103,7 @@ struct Rows {
 }
 
 impl Index {
-    pub(crate) fn open<S>(dir: &Path, seed: S) -> Result<Index>
+    pub(crate) fn open<S>(dir: &Path, lag: Lag, seed: S) -> Result<Index>
     where
         S: FnOnce() -> Result<Seed> + Send + 'static,
     {
@@ -119,10 +128,31 @@ impl Index {
             reads: Reads { db },
             feed,
             indexed,
+            lag,
+            lagging: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn offer(&self, block: Block) {
+        let indexed = self
+            .indexed
+            .borrow()
+            .map_or(self.lag.from, |span| span.height);
+        let lag = block.height.saturating_sub(indexed);
+        let was = self.lagging.load(Ordering::Relaxed);
+        let Lagged { behind, logs } = lagged(was, lag, self.lag.epoch);
+        self.lagging.store(behind, Ordering::Relaxed);
+        if logs {
+            tracing::info!(
+                target: "ducktape::activity",
+                event = "activity_lag",
+                lag,
+                height = block.height,
+                indexed,
+                reason = "index_behind",
+                "the activity index is more than an epoch behind the chain"
+            );
+        }
         let _ = self.feed.send(Event::Block(block));
     }
 
@@ -231,6 +261,30 @@ pub(crate) fn refused(records: &[Record], receipts: &[Receipt]) -> Vec<(u32, Ref
             Some((record.position, refusal.clone()))
         })
         .collect()
+}
+
+struct Lagged {
+    behind: bool,
+    logs: bool,
+}
+
+fn lagged(was_behind: bool, lag: u64, epoch: u64) -> Lagged {
+    let past_an_epoch = lag > epoch;
+    let caught_up = lag <= 1;
+    match (was_behind, past_an_epoch, caught_up) {
+        (false, true, _) => Lagged {
+            behind: true,
+            logs: true,
+        },
+        (true, _, true) => Lagged {
+            behind: false,
+            logs: false,
+        },
+        (behind, _, _) => Lagged {
+            behind,
+            logs: false,
+        },
+    }
 }
 
 fn place(span: Indexed, height: u64) -> Place {
