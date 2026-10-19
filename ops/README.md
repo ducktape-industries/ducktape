@@ -592,6 +592,33 @@ one up for another network.
   `mac-key` (files `key` and `password`). Its state (`runs.json`, each
   run's inputs and outputs until written, mirrors of the repositories the
   Mac builds) is on the claim `state`. `relay-test.py` covers it.
+- With `MAC_LABELS` (mac.yaml: `mac macos-aarch64`), the relay is also an
+  actions runner for the Mac, as account `mac`: it registers those labels,
+  follows `ducktape changes actions`, and while the Mac is connected and
+  holds no run claims the oldest queued check whose `runs-on` they cover.
+  The check becomes a run `check-<id>`: the Mac runs the job's steps with
+  `sh -c` in a worktree of its commit, with `OUT` (what it keeps) and
+  `NEEDS` (what the jobs it needs produced, at `NEEDS/<job>/<path>`, read
+  from actions `Query::Needs` and `Query::Outputs` and handed as inputs).
+  When it ends, `log` goes into files at
+  `/shared/actions/<repo>/<commit>/<workflow>/<job>-<attempt>/log`, every
+  other output is put as a blob of kind `output` in one bundle and recorded
+  with actions `Outputs`, and the check is reported: passed, failed when a
+  step exited non-zero, errored otherwise. A check that ends elsewhere
+  (superseded) is forgotten on the Mac; deleting its run errs it. The Mac
+  holds no key and the relay signs nothing but what `mac` already did, so
+  any commit builds; signing is the separate signer's (J-074). The relay
+  reads actions once per height `ducktape changes` prints (its first
+  word), and follows again at once when the follow ends after hearing
+  something, else after `FOLLOW_PAUSE` (5 s, as the Mac's
+  `RELAY_DOWN_PAUSE`, chief's ruling; `mac-test.py` holds the two equal),
+  saying why it ended. A check whose report did not
+  send keeps its run `writing`, holds the Mac, and is reported again by the
+  next pull; deleting an unended check's run reports it errored first,
+  whatever the Mac had said of it, and a delete lets the Mac take the next
+  check. A
+  run's view carries `check`, and the Mac's run event `job`, only for a
+  check's run.
 - The Mac dials out to the relay's port 8081 at `http://100.65.253.102:8081`:
   the pod's `hostPort` on fabrics-1's tailnet address, as the node's 8844
   is, so the Mac's connection reaches the relay as one TCP connection end to

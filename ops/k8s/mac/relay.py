@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # The mac service's relay, the egress service `mac`: agents' runs (a phone build of a forge commit, then a UI script in the iOS simulator) held on the cluster for a Mac that dials out to it, pulls them and sends back their states and outputs.
-# A run's script and media are read from files when it is asked for, its source is bundled from forge for the Mac, its outputs go into files in one commit, and one post says it ended. ops/k8s/mac/mac.yaml runs it, relay-test.py tests it, and ops/mac/mac.py is the Mac's side.
+# A run's script and media are read from files when it is asked for, its source is bundled from forge for the Mac, its outputs go into files in one commit, and one post says it ended. With MAC_LABELS it is also an actions runner for the Mac: it claims the checks those labels cover while the Mac is idle and reports them.
+# ops/k8s/mac/mac.yaml runs it, relay-test.py tests it, and ops/mac/mac.py is the Mac's side.
 import hmac
 import json
 import os
@@ -59,7 +60,7 @@ STEPS = {
     "media": dict,
     "system": dict,
 }
-STATE = {"state": str, "step": str, "reason": str}
+STATE = {"state": str, "step": str, "reason": str, "exit": int}
 WORK = {"facts": dict, "runs": list}
 SOURCE = {"repo": str, "commit": str, "have": list}
 WAIT = {"every"}
@@ -94,6 +95,11 @@ CHUNK = "chunk"
 CHUNK_SIZE = 1 << 20
 KEEPALIVE = (10, 5, 3)
 HASHES = {"sha256": (0, 32), "sha1": (1, 20)}
+ACTIONS = "actions"
+OUTPUT = "output"
+LOG = "log"
+FOLLOW_PAUSE = 5
+CHECK_STATES = ("queued", "running", "passed", "failed", "errored", "superseded", "waiting", "skipped")
 
 
 class Refused(Exception):
@@ -197,6 +203,61 @@ def blob_id(text):
     return u8(known[0]) + bytes.fromhex(digest)
 
 
+def u32(value):
+    return value.to_bytes(4, "little")
+
+
+def actions_register(labels):
+    return u8(2) + borsh_vec([borsh_text(label) for label in labels]) + borsh_bytes(b"")
+
+
+def actions_claim(check):
+    return u8(3) + u64(check)
+
+
+def actions_report(check, state, summary, log):
+    return u8(4) + u64(check) + u8(CHECK_STATES.index(state)) + borsh_text(summary) + borsh_option(log, borsh_text)
+
+
+def actions_outputs(check, files):
+    return u8(7) + u64(check) + borsh_vec([borsh_text(path) + blob_id(blob) + u64(size) for path, blob, size in files])
+
+
+def actions_check(check):
+    return u8(0) + u64(check)
+
+
+def actions_queued(after):
+    return u8(2) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+
+
+def actions_needs(check):
+    return u8(6) + u64(check)
+
+
+def actions_outputs_of(check):
+    return u8(7) + u64(check)
+
+
+def unframed(framed):
+    header, nul, body = framed.partition(b"\0")
+    if not nul:
+        raise Refused(502, "a blob came back with no frame")
+    return body
+
+
+def placed(job, path):
+    parts = [job, *path.split("/")]
+    if any(part in ("", ".", "..") for part in parts) or "/" in job:
+        raise Refused(422, f"check output {path!r} of `{job}` would land outside its needs folder")
+    return "/".join(parts)
+
+
+def check_dir(check):
+    workflow = check["workflow"].removesuffix(".toml")
+    return f"/shared/actions/{check['repo']}/{check['commit']}/{workflow}/{check['job']['id']}-{check['attempt']}"
+
+
 class Reader:
     def __init__(self, data):
         self.data = data
@@ -224,6 +285,32 @@ class Reader:
             if index == tag:
                 return f"{name}:{self.take(size).hex()}"
         raise Refused(502, f"a reply names hash kind {tag}")
+
+    def u32(self):
+        return int.from_bytes(self.take(4), "little")
+
+    def text(self):
+        return self.bytes().decode()
+
+    def option(self, read):
+        return read() if self.u8() else None
+
+    def vec(self, read):
+        return [read() for _ in range(self.u32())]
+
+    def check(self):
+        row = {"id": self.u64(), "run": self.u64(), "repo": self.text(), "commit": self.text(), "workflow": self.text(), "attempt": self.u32()}
+        job = {"id": self.text(), "runs_on": self.vec(self.text), "image": self.text(), "steps": self.vec(self.text)}
+        job["env"] = dict(self.vec(lambda: (self.text(), self.text())))
+        self.vec(lambda: (self.text(), self.text()))
+        state = self.u8()
+        row.update(job=job, state=CHECK_STATES[state] if state < len(CHECK_STATES) else f"state {state}")
+        self.option(self.u64), self.option(self.u64), self.u64(), self.option(self.u64), self.option(self.u64), self.text(), self.option(self.text)
+        return row
+
+    def page(self, read):
+        self.u64()
+        return self.vec(read), self.option(self.bytes)
 
 
 def mention(account):
@@ -427,7 +514,10 @@ def steps_of(data, path):
 
 
 def view(record):
-    return {field: record.get(field) for field in VIEWED}
+    viewed = {field: record.get(field) for field in VIEWED}
+    if record.get("check") is not None:
+        viewed["check"] = record["check"]
+    return viewed
 
 
 def ended_line(record):
@@ -473,6 +563,27 @@ class Signer:
 
     def query(self, program, request):
         return run([*self.ducktape, "query", program, "--raw"], stdin=request, env=self.env())
+
+    def blob(self, blob):
+        return run([*self.ducktape, "blob", "get", blob], env=self.env())
+
+    def follow(self, program):
+        return Following([*self.ducktape, "changes", program], self.env())
+
+
+class Following:
+    def __init__(self, argv, env):
+        self.argv = argv
+        self.env = env
+        self.why = None
+
+    def __iter__(self):
+        process = subprocess.Popen(self.argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        with process.stdout:
+            yield from process.stdout
+        said = process.stderr.read().decode(errors="replace").strip()
+        process.stderr.close()
+        self.why = said or f"exited {process.wait()}"
 
 
 class Forge:
@@ -579,8 +690,12 @@ class Work:
 
 
 class Service:
-    def __init__(self, signer, store, token, forge, clock=now):
+    def __init__(self, signer, store, token, forge, clock=now, labels=()):
         self.signer = signer
+        self.labels = tuple(labels)
+        self.pause = time.sleep
+        self.following = False
+        self.pulling = False
         self.store = store
         self.forge = forge
         self.token = token
@@ -597,6 +712,178 @@ class Service:
         unwritten = [name for name, record in self.runs.items() if "ending" in record]
         for name in unwritten:
             self.spawn(lambda name=name: self.finish(name))
+        if self.labels:
+            outcome, reason, sentence = receipt(self.signer.submit(ACTIONS, actions_register(self.labels)))
+            say("mac_registered", labels=",".join(self.labels), outcome=outcome, detail=json.dumps(f"{reason}: {sentence}"))
+            self.follow()
+
+    def follow(self):
+        with self.changed:
+            if not self.labels or self.following:
+                return
+            self.following = True
+        self.spawn(self.followed)
+
+    def followed(self):
+        try:
+            while True:
+                following = self.signer.follow(ACTIONS)
+                heard, height = False, None
+                for line in following:
+                    heard = True
+                    at = line.split(b"\t", 1)[0]
+                    if at != height:
+                        height = at
+                        self.settle_checks()
+                        self.pull()
+                say("mac_unfollowed", heard=heard, detail=json.dumps(following.why))
+                if not heard:
+                    self.pause(FOLLOW_PAUSE)
+        finally:
+            with self.changed:
+                self.following = False
+
+    def asked_actions(self, request, what):
+        ran = self.signer.query(ACTIONS, request)
+        if ran.code != 0:
+            raise Refused(502, f"actions did not answer {what}: {failed(ran)}")
+        return Reader(ran.out)
+
+    def queued(self):
+        checks, after = [], None
+        while True:
+            reader = self.asked_actions(actions_queued(after), "Queued")
+            reader.u8()
+            items, after = reader.page(reader.check)
+            checks.extend(items)
+            if after is None:
+                return checks
+
+    def check_of(self, check):
+        reader = self.asked_actions(actions_check(check), "Check")
+        reader.u8()
+        return reader.option(reader.check)
+
+    def needed(self, check):
+        reader = self.asked_actions(actions_needs(check), "Needs")
+        reader.u8()
+        needs = reader.vec(lambda: (reader.text(), reader.option(reader.u64)))
+        inputs = []
+        for job, met in needs:
+            if met is None:
+                raise Refused(422, f"needs `{job}`, which no passed check met")
+            reader = self.asked_actions(actions_outputs_of(met), "Outputs")
+            reader.u8()
+            row = reader.option(lambda: (reader.u64(), reader.vec(lambda: (reader.text(), reader.blob(), reader.u64()))))
+            for path, blob, _ in row[1] if row else []:
+                name = placed(job, path)
+                got = self.signer.blob(blob)
+                if got.code != 0:
+                    raise Refused(502, f"blob {blob} was not fetched: {failed(got)}")
+                inputs.append((name, unframed(got.out)))
+        return inputs
+
+    def idle(self):
+        return self.mac["connected"] and all(record["state"] in ENDED for record in self.runs.values())
+
+    def pull(self):
+        with self.changed:
+            unreported = [name for name, record in self.runs.items() if record.get("check") and "ending" in record]
+        self.again(unreported)
+        with self.changed:
+            if not self.labels or self.pulling or not self.idle():
+                return
+            self.pulling = True
+        try:
+            covered = [check for check in self.queued() if set(check["job"]["runs_on"]) <= set(self.labels)]
+            for check in sorted(covered, key=lambda check: check["id"]):
+                outcome, reason, sentence = receipt(self.signer.submit(ACTIONS, actions_claim(check["id"])))
+                if outcome == "applied":
+                    self.checked(check)
+                    return
+                say("mac_unclaimed", check=check["id"], reason=reason or outcome, detail=json.dumps(sentence))
+                if reason != "wrong_state":
+                    return
+        except Refused as refusal:
+            say("mac_unpulled", detail=json.dumps(refusal.sentence))
+        finally:
+            with self.changed:
+                self.pulling = False
+
+    def checked(self, check):
+        name = f"check-{check['id']}"
+        try:
+            inputs = self.needed(check["id"])
+        except Refused as refusal:
+            inputs, unstarted = [], refusal.sentence
+        else:
+            unstarted = None
+        with self.changed:
+            folder = self.store.run_dir(name) / "inputs"
+            folder.mkdir(parents=True, exist_ok=True)
+            for index, (_, data) in enumerate(inputs):
+                (folder / str(index)).write_bytes(data)
+            record = {
+                "from": None,
+                "repo": check["repo"],
+                "commit": check["commit"],
+                "build": None,
+                "to": check_dir(check),
+                "vars": {},
+                "device": {},
+                "requester": None,
+                "notify": None,
+                "id": name,
+                "created": self.clock(),
+                "state": QUEUED,
+                "step": None,
+                "reason": None,
+                "steps": None,
+                "asked": None,
+                "started": None,
+                "finished": None,
+                "outputs": [],
+                "script": None,
+                "inputs": [input_name for input_name, _ in inputs],
+                "check": check["id"],
+                "job": {"steps": check["job"]["steps"], "env": check["job"]["env"]},
+            }
+            if unstarted is not None:
+                record.update(state="writing", step="reporting the check", ending={"state": "failed", "reason": unstarted})
+            self.runs[name] = record
+            if unstarted is None:
+                self.offer(record)
+            self.saved()
+        if unstarted is not None:
+            self.finish(name)
+
+    def settle_checks(self):
+        with self.changed:
+            open_checks = [(name, record["check"]) for name, record in self.runs.items() if record.get("check") and record["state"] not in ENDED and "ending" not in record]
+        for name, check in open_checks:
+            try:
+                row = self.check_of(check)
+            except Refused as refusal:
+                say("mac_unsettled", check=check, detail=json.dumps(refusal.sentence))
+                continue
+            if row is not None and row["state"] in ("queued", "running"):
+                continue
+            with self.changed:
+                if self.runs.pop(name, None) is None:
+                    continue
+                if self.work is not None:
+                    self.work.send(sse("forget", {"id": name}))
+                self.saved()
+            shutil.rmtree(self.store.run_dir(name), ignore_errors=True)
+            say("mac_dropped", check=check, state=row["state"] if row else "gone")
+
+    def reported_now(self, check, state, summary, log):
+        outcome, reason, sentence = receipt(self.signer.submit(ACTIONS, actions_report(check, state, summary, log)))
+        if outcome == "failed":
+            return sentence
+        if outcome == "rejected":
+            say("mac_unreported", check=check, reason=reason, detail=json.dumps(sentence))
+        return None
 
     def presence(self):
         mac = dict(self.mac)
@@ -661,7 +948,10 @@ class Service:
         return script, inputs
 
     def handed(self, record):
-        return sse("run", {"run": view(record), "script": record["script"], "inputs": record["inputs"]})
+        handed = {"run": view(record), "script": record["script"], "inputs": record["inputs"]}
+        if record.get("job") is not None:
+            handed["job"] = record["job"]
+        return sse("run", handed)
 
     def offer(self, record):
         if self.work is None:
@@ -748,12 +1038,26 @@ class Service:
 
     def delete(self, name):
         with self.changed:
-            self.known(name)
+            record = self.known(name)
+            if record.get("check") and record["state"] not in ENDED:
+                return self.dropped(name, record)
             self.runs.pop(name)
             if self.work is not None:
                 self.work.send(sse("forget", {"id": name}))
             self.saved()
         shutil.rmtree(self.store.run_dir(name), ignore_errors=True)
+        self.spawn(self.pull)
+        return 200, {"deleted": name, "mac": self.presence()}
+
+    def dropped(self, name, record):
+        record["deleted"] = True
+        record["ending"] = {"state": "failed", "reason": "its run was deleted on the mac relay"}
+        record["state"], record["step"] = "writing", "reporting the check"
+        if self.work is not None:
+            self.work.send(sse("forget", {"id": name}))
+        self.saved()
+        shutil.rmtree(self.store.run_dir(name) / "outputs", ignore_errors=True)
+        self.spawn(lambda: self.finish(name))
         return 200, {"deleted": name, "mac": self.presence()}
 
     def connect(self, body):
@@ -778,6 +1082,8 @@ class Service:
                     record["ending"] = {"state": "interrupted", "reason": "the Mac no longer held this run when it connected again"}
             self.saved()
         self.again(list(self.runs))
+        self.follow()
+        self.spawn(self.pull)
         return 200, Stream(lambda connection: self.worked(work, connection))
 
     def worked(self, work, connection):
@@ -828,6 +1134,8 @@ class Service:
             if state in ENDED:
                 record["state"], record["step"] = "writing", "writing the outputs into files"
                 record["ending"] = {"state": state, "reason": body.get("reason")}
+                if "exit" in body:
+                    record["ending"]["exit"] = body["exit"]
             else:
                 record["state"], record["step"] = state, body.get("step")
                 record["reason"] = body.get("reason", record["reason"])
@@ -877,6 +1185,8 @@ class Service:
                 self.finishing.discard(name)
 
     def finished(self, name, final):
+        if final.get("check"):
+            return self.checked_out(name, final)
         base = f"{final['to'].rstrip('/')}/{name}"
         root = self.store.run_dir(name) / "outputs"
         found = sorted(path for path in root.rglob("*") if path.is_file()) if root.is_dir() else []
@@ -903,6 +1213,59 @@ class Service:
             self.runs[name] = final
             self.saved()
         self.post(final)
+        self.pull()
+
+    def unsent(self, name, sentence):
+        with self.changed:
+            record = self.runs.get(name)
+            if record is not None and "ending" in record:
+                record["step"] = f"its check is not reported yet ({sentence}); the next call about this run reports it again"
+                self.saved()
+
+    def checked_out(self, name, final):
+        root = self.store.run_dir(name) / "outputs"
+        found = sorted(path for path in root.rglob("*") if path.is_file()) if root.is_dir() else []
+        log_file = root / LOG
+        others = [path for path in found if path != log_file]
+        log, notes = None, []
+        if log_file in found:
+            target = f"{final['to']}/{LOG}"
+            match self.written(name, [(target, log_file.read_bytes())]):
+                case None:
+                    log = target
+                case ("refused", sentence):
+                    notes.append(f"its log was not written: {sentence}")
+                case ("unsent", sentence):
+                    return self.unsent(name, sentence)
+        if others:
+            put = self.signer.put(others, OUTPUT)
+            if put.code != 0:
+                return self.unsent(name, f"the outputs were not put: {failed(put)}")
+            blobs = put_answer(put.out.decode(), len(others))
+            files = [(path.relative_to(root).as_posix(), blob, path.stat().st_size) for path, blob in zip(others, blobs)]
+            outcome, reason, sentence = receipt(self.signer.submit(ACTIONS, actions_outputs(final["check"], files)))
+            if outcome == "failed":
+                return self.unsent(name, sentence)
+            if outcome == "rejected":
+                notes.append(f"its outputs were not recorded: {reason}: {sentence}")
+        state = {"succeeded": "passed", "failed": "failed" if final.get("exit") is not None else "errored"}.get(final["state"], "errored")
+        summary = "; ".join(part for part in (final.get("reason") or "every step passed", *notes) if part)
+        unreported = self.reported_now(final["check"], state, summary, log)
+        if unreported is not None:
+            return self.unsent(name, unreported)
+        final["outputs"] = [path.relative_to(root).as_posix() for path in found]
+        with self.changed:
+            if name not in self.runs:
+                return
+            final.pop("ending")
+            if final.get("deleted"):
+                self.runs.pop(name)
+            else:
+                self.runs[name] = final
+            self.saved()
+        if final.get("deleted"):
+            shutil.rmtree(self.store.run_dir(name), ignore_errors=True)
+        self.pull()
 
     def written(self, name, files):
         try:
@@ -1101,7 +1464,8 @@ def main():
     signer = Signer(shlex.split(os.environ.get("MAC_DUCKTAPE", "ducktape")), Path(os.environ.get("MAC_KEYS", "/keys")))
     root = Path(os.environ.get("MAC_STATE", "/state"))
     forge = Forge(root / "repos", os.environ["MAC_FORGE"], os.environ["MAC_NODE"])
-    service = Service(signer, Store(root), Path(os.environ.get("MAC_TOKEN", "/token/token")), forge)
+    labels = os.environ.get("MAC_LABELS", "").split()
+    service = Service(signer, Store(root), Path(os.environ.get("MAC_TOKEN", "/token/token")), forge, labels=labels)
     service.resume()
     agents = listening(os.environ.get("MAC_AGENTS_LISTEN", "0.0.0.0:8080"), service.agents)
     mac = listening(os.environ.get("MAC_MAC_LISTEN", "0.0.0.0:8081"), service.macs)

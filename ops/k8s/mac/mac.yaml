@@ -67,6 +67,7 @@ spec:
             - {name: MAC_KEYS, value: /keys}
             - {name: MAC_TOKEN, value: /token/token}
             - {name: MAC_STATE, value: /state}
+            - {name: MAC_LABELS, value: "mac macos-aarch64"}
           ports:
             - {name: agents, containerPort: 8080}
             - {name: mac, containerPort: 8081, hostIP: 100.65.253.102, hostPort: 8081}

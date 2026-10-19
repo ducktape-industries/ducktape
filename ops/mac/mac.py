@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The mac service's Mac side: dials out to the relay (ops/k8s/mac/relay.py), pulls agents' runs, builds each forge commit with the app's phone/Makefile, runs its UI script in the iOS simulator (the app's AX door, simctl and the XCUITest driver) and sends back states and outputs.
+# The mac service's Mac side: dials out to the relay (ops/k8s/mac/relay.py), pulls agents' runs and actions checks, builds each forge commit with the app's phone/Makefile or runs a check's steps in it, runs a UI script in the iOS simulator (the app's AX door, simctl and the XCUITest driver) and sends back states and outputs.
 # A LaunchAgent (com.ducktape.mac.plist) keeps it running; power.swift tells it when macOS sleeps, wakes and changes network. mac-test.py tests it on Linux against the real relay, git, and a fake xcrun, make and xcodebuild.
 import http.client
 import json
@@ -40,6 +40,12 @@ class Failed(Exception):
         super().__init__(sentence)
         self.sentence = sentence
         self.seen = seen
+
+
+class StepFailed(Failed):
+    def __init__(self, sentence, exit):
+        super().__init__(sentence)
+        self.exit = exit
 
 
 class Stopped(Exception):
@@ -673,6 +679,32 @@ class Job:
         if self.needs_driver() and not self.record.get("driver"):
             self.save(driver=self.make("ios-driver", log))
 
+    def steps(self):
+        run, job = self.record["run"], self.record["job"]
+        log = self.out / "log"
+        src = self.folder / "src"
+        self.report("building", f"fetching {run['repo']} at {run['commit']}")
+        self.mac.sources.worktree(self, run["repo"], run["commit"], src, log)
+        self.save(src=str(src), repo=run["repo"])
+        needs = self.folder / "needs"
+        for index, name in enumerate(self.record.get("inputs") or []):
+            parts = name.split("/")
+            if any(part in ("", ".", "..") for part in parts):
+                raise Failed(f"input {name!r} would land outside the needs folder")
+            status, data = self.mac.relay.call("GET", f"/v1/mac/runs/{self.name}/inputs/{index}")
+            if status != 200:
+                raise Failed(f"the relay did not give input {index}: {status} {data.decode(errors='replace')}")
+            target = needs.joinpath(*parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            written(target, data)
+        env = dict(os.environ, **(job.get("env") or {}), OUT=str(self.out), NEEDS=str(needs))
+        steps = job.get("steps") or []
+        for number, step in enumerate(steps, 1):
+            self.report("building", f"step {number}/{len(steps)}: {step}")
+            code, last = self.command(["sh", "-c", step], log, cwd=src, env=env)
+            if code != 0:
+                raise StepFailed(f"step {number} ({step}) exited {code}: {last}", code)
+
     def test(self):
         script = self.record["script"]
         app = Path(self.record["product"])
@@ -721,8 +753,12 @@ class Job:
 
     def work(self):
         ending = None
+        exit_code = None
         try:
-            self.build()
+            if self.record.get("job"):
+                self.steps()
+            else:
+                self.build()
             if self.record.get("script"):
                 self.test()
             ending = ("succeeded", None)
@@ -730,6 +766,7 @@ class Job:
             ending = None
         except Failed as failure:
             ending = ("failed", failure.sentence)
+            exit_code = getattr(failure, "exit", None)
         except Exception as error:
             say("mac_failed", run=self.name, detail=json.dumps(repr(error)))
             ending = ("failed", f"the Mac's side failed: {error!r}")
@@ -738,7 +775,7 @@ class Job:
         if ending is None or self.stopped:
             self.mac.remove(self.name)
             return
-        self.save(state=ending[0], reason=ending[1], step=None, reported=False)
+        self.save(state=ending[0], reason=ending[1], exit=exit_code, step=None, reported=False)
         self.mac.deliver(self.folder)
 
 
@@ -845,7 +882,7 @@ class Mac:
             if known.get("state") in WORKING:
                 self.tell(name, {"state": known["state"], "step": known.get("step")})
             return
-        record = {"run": data["run"], "script": data.get("script"), "inputs": data.get("inputs", []), "state": "accepted", "reported": False}
+        record = {"run": data["run"], "script": data.get("script"), "inputs": data.get("inputs", []), "job": data.get("job"), "state": "accepted", "reported": False}
         job = Job(self, folder, record)
         job.save()
         with self.lock:
@@ -891,7 +928,7 @@ class Mac:
                 status, _ = self.relay.call("PUT", f"/v1/mac/runs/{name}/outputs/{target}", path.read_bytes())
                 if status != 200:
                     return self.delivered(folder, status)
-            ending = {field: record[field] for field in ("state", "reason") if record.get(field) is not None}
+            ending = {field: record[field] for field in ("state", "reason", "exit") if record.get(field) is not None}
             status, _ = self.relay.call("POST", f"/v1/mac/runs/{name}/state", ending)
         except Unreached as error:
             say("mac_undelivered", run=name, detail=json.dumps(str(error)))

@@ -376,6 +376,21 @@ class Relay(unittest.TestCase):
         self.assertEqual((body["run"]["state"], body["run"]["reason"]), ("failed", "relay died"))
         self.assertFalse(body["mac"]["connected"])
 
+    def test_a_relay_with_no_labels_reads_no_actions_and_keeps_the_runs_shapes(self):
+        self.agent("POST", "/v1/runs", BUILD)
+        connection, answer = self.work()
+        kind, handed = self.event(answer)
+        self.assertEqual(sorted(handed), ["inputs", "run", "script"])
+        self.assertEqual(sorted(handed["run"]), sorted(relay.VIEWED))
+        self.mac("PUT", "/v1/mac/runs/duckpond-41/outputs/build.log", b"made")
+        status, body = self.mac("POST", "/v1/mac/runs/duckpond-41/state", {"state": "succeeded"})
+        self.assertEqual(sorted(body["run"]), sorted(relay.VIEWED))
+        self.assertNotIn("exit", self.store.load()["duckpond-41"])
+        written = [piece for kind, pieces in self.signer.puts for piece in pieces if b'"state": "succeeded"' in piece]
+        self.assertEqual(sorted(json.loads(written[0])), sorted(relay.VIEWED))
+        self.assertEqual([program for program, _ in self.signer.queries + self.signer.submits if program == relay.ACTIONS], [])
+        connection.close()
+
     def test_the_mac_is_sent_a_commit_as_a_bundle_of_what_it_lacks(self):
         root = pathlib.Path(self.temp.name)
         work = root / "work"
@@ -403,6 +418,223 @@ class Relay(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIn("forge's app has no commit", body["error"])
 
+
+def text(value):
+    return relay.borsh_text(value)
+
+
+def check_row(check, runs_on=("mac",), steps=("make app",), state="queued"):
+    job = text("macos") + relay.borsh_vec([text(label) for label in runs_on]) + text("") + relay.borsh_vec([text(step) for step in steps])
+    job += relay.borsh_vec([text("MODE") + text("dist")]) + relay.borsh_vec([])
+    row = relay.u64(check) + relay.u64(1) + text("app") + text(COMMIT) + text("release.toml") + relay.u32(1) + job
+    row += relay.u8(relay.CHECK_STATES.index(state)) + b"\x00\x00" + relay.u64(1) + b"\x00\x00" + text("") + b"\x00"
+    return row
+
+
+class ActionsSigner(Signer):
+    def __init__(self):
+        super().__init__()
+        self.queue = []
+        self.states = {}
+        self.taken = set()
+        self.needs = {}
+        self.outputs = {}
+        self.blobs = {}
+        self.follows = []
+
+    def query(self, program, request):
+        if program != relay.ACTIONS:
+            return super().query(program, request)
+        self.queries.append((program, request))
+        tag, check = request[0], int.from_bytes(request[1:9], "little")
+        match tag:
+            case 2:
+                rows = [check_row(id, **fields) for id, fields in self.queue if id not in self.taken]
+                return ran(relay.u8(2) + relay.u64(1) + relay.borsh_vec(rows) + b"\x00")
+            case 0:
+                state = self.states.get(check, "running")
+                return ran(relay.u8(0) + b"\x01" + check_row(check, state=state))
+            case 6:
+                needs = [text(job) + relay.borsh_option(met, relay.u64) for job, met in self.needs.get(check, [])]
+                return ran(relay.u8(6) + relay.borsh_vec(needs))
+            case 7:
+                files = self.outputs.get(check)
+                if files is None:
+                    return ran(relay.u8(7) + b"\x00")
+                listed = [text(path) + relay.blob_id(blob) + relay.u64(size) for path, blob, size in files]
+                return ran(relay.u8(7) + b"\x01" + relay.u64(1) + relay.borsh_vec(listed))
+        raise AssertionError(f"an actions query this fake does not answer: {request.hex()}")
+
+    def submit(self, program, payload):
+        if program == relay.ACTIONS and payload[0] == 3:
+            check = int.from_bytes(payload[1:9], "little")
+            self.submits.append((program, payload))
+            if check in self.taken:
+                return ran(b"preconfirmed rejected wrong_state: check is running, not queued")
+            self.taken.add(check)
+            return ran(b"preconfirmed applied 0a")
+        return super().submit(program, payload)
+
+    def blob(self, blob):
+        return ran(b"blob 3\0" + self.blobs[blob])
+
+    def follow(self, program):
+        return Followed(self.follows.pop(0) if self.follows else [])
+
+
+class Followed:
+    def __init__(self, lines):
+        self.lines = lines
+        self.why = "ducktape: IO error: the node is not reachable"
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+class Stopped(Exception):
+    pass
+
+
+class Checks(unittest.TestCase):
+    serve = Relay.serve
+    tearDown = Relay.tearDown
+    call = Relay.call
+    mac = Relay.mac
+    agent = Relay.agent
+    work = Relay.work
+    event = Relay.event
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self.temp.name)
+        (root / "token").write_text(TOKEN + "\n")
+        self.signer = ActionsSigner()
+        self.store = relay.Store(root / "state")
+        forge = relay.Forge(root / "state" / "repos", f"file://{root}/forge", "https://node.example")
+        clock = lambda: "2026-10-19T12:00:00Z"
+        self.service = self.serve(relay.Service(self.signer, self.store, root / "token", forge, clock=clock, labels=("mac", "macos-aarch64")))
+        self.service.follow = lambda: None
+
+    def actions(self, tag):
+        return [payload for program, payload in self.signer.submits if program == relay.ACTIONS and payload[0] == tag]
+
+    def test_an_idle_mac_claims_the_oldest_check_it_covers_and_its_end_is_reported_with_its_outputs(self):
+        self.signer.queue = [(5, {"runs_on": ("linux",)}), (3, {}), (4, {})]
+        self.service.pull()
+        self.assertEqual(self.signer.submits, [], "nothing is claimed while the Mac is away")
+        connection, answer = self.work()
+        kind, handed = self.event(answer)
+        self.assertEqual((kind, handed["run"]["id"], handed["run"]["check"]), ("run", "check-3", 3))
+        self.assertEqual(handed["job"], {"steps": ["make app"], "env": {"MODE": "dist"}})
+        self.assertEqual(self.mac("PUT", "/v1/mac/runs/check-3/outputs/log", b"$ make app\n")[0], 200)
+        self.assertEqual(self.mac("PUT", "/v1/mac/runs/check-3/outputs/dist/app.tar.gz", b"tar")[0], 200)
+        self.mac("POST", "/v1/mac/runs/check-3/state", {"state": "succeeded"})
+        log = f"/shared/actions/app/{COMMIT}/release/macos-1/log"
+        files = [payload for program, payload in self.signer.submits if program == "files"]
+        self.assertEqual(len(files), 1)
+        self.assertIn(log.encode(), files[0])
+        self.assertIn(("output", [b"tar"]), self.signer.puts)
+        [outputs] = self.actions(7)
+        self.assertEqual(outputs, relay.actions_outputs(3, [("dist/app.tar.gz", f"sha256:{0:064x}", 3)]))
+        [report] = self.actions(4)
+        self.assertEqual(report, relay.actions_report(3, "passed", "every step passed", log))
+        kind, handed = self.event(answer)
+        self.assertEqual((kind, handed["run"]["id"]), ("run", "check-4"), "the next check once the Mac is idle")
+        self.assertEqual([int.from_bytes(claim[1:9], "little") for claim in self.actions(3)], [3, 4])
+        connection.close()
+
+    def test_a_step_that_fails_fails_the_check_and_a_broken_run_errs_it(self):
+        self.signer.queue = [(3, {}), (4, {})]
+        connection, answer = self.work()
+        self.event(answer)
+        self.mac("POST", "/v1/mac/runs/check-3/state", {"state": "failed", "reason": "step 1 (make app) exited 2: no rule", "exit": 2})
+        self.assertEqual(self.actions(4)[0], relay.actions_report(3, "failed", "step 1 (make app) exited 2: no rule", None))
+        self.event(answer)
+        self.mac("POST", "/v1/mac/runs/check-4/state", {"state": "failed", "reason": "the Mac's side failed: OSError()"})
+        self.assertEqual(self.actions(4)[1], relay.actions_report(4, "errored", "the Mac's side failed: OSError()", None))
+        connection.close()
+
+    def test_what_a_check_needs_is_handed_to_the_mac_and_a_path_out_of_its_folder_errs_it(self):
+        blob = "sha256:" + "ab" * 32
+        self.signer.queue = [(3, {}), (4, {})]
+        self.signer.needs = {3: [("build", 9)], 4: [("build", 10)]}
+        self.signer.outputs = {9: [("dist/app.tar.gz", blob, 3)], 10: [("../../etc/passwd", blob, 3)]}
+        self.signer.blobs = {blob: b"tar"}
+        connection, answer = self.work()
+        kind, handed = self.event(answer)
+        self.assertEqual(handed["inputs"], ["build/dist/app.tar.gz"])
+        status, data = self.mac("GET", "/v1/mac/runs/check-3/inputs/0")
+        self.assertEqual((status, data), (200, b"tar"))
+        self.mac("POST", "/v1/mac/runs/check-3/state", {"state": "succeeded"})
+        errored = relay.actions_report(4, "errored", "check output '../../etc/passwd' of `build` would land outside its needs folder", None)
+        self.assertIn(errored, self.actions(4))
+        self.assertEqual(self.service.runs["check-4"]["state"], "failed", "a check that errs before it starts never reaches the Mac")
+        connection.close()
+
+    def test_a_check_that_ended_elsewhere_is_forgotten_on_the_mac_and_deleting_one_errs_it(self):
+        self.signer.queue = [(3, {}), (4, {})]
+        connection, answer = self.work()
+        self.event(answer)
+        self.signer.states[3] = "superseded"
+        self.service.settle_checks()
+        self.assertEqual(self.event(answer), ("forget", {"id": "check-3"}))
+        self.assertNotIn("check-3", self.service.runs)
+        self.assertEqual(self.actions(4), [], "a superseded check is not reported")
+        self.service.pull()
+        self.assertEqual(self.event(answer)[1]["run"]["id"], "check-4")
+        self.mac("PUT", "/v1/mac/runs/check-4/outputs/log", b"$ make app\n")
+        self.signer.answers = [ran(code=1, err="the node was not reached")]
+        self.mac("POST", "/v1/mac/runs/check-4/state", {"state": "succeeded"})
+        self.assertEqual(self.service.runs["check-4"]["state"], "writing", "its log did not send")
+        self.agent("DELETE", "/v1/runs/check-4")
+        self.assertEqual(self.event(answer), ("forget", {"id": "check-4"}))
+        self.assertEqual(self.actions(4), [relay.actions_report(4, "errored", "its run was deleted on the mac relay", None)])
+        self.assertNotIn("check-4", self.service.runs)
+        connection.close()
+
+    def test_deleting_the_run_that_held_the_mac_takes_the_next_check(self):
+        self.signer.queue = [(3, {})]
+        self.agent("POST", "/v1/runs", BUILD)
+        connection, answer = self.work()
+        self.assertEqual(self.event(answer)[1]["run"]["id"], "duckpond-41")
+        self.assertEqual(self.actions(3), [], "the Mac holds an agent's run")
+        self.agent("DELETE", "/v1/runs/duckpond-41")
+        self.assertEqual(self.event(answer), ("forget", {"id": "duckpond-41"}))
+        self.assertEqual(self.event(answer)[1]["run"]["id"], "check-3")
+        connection.close()
+
+    def test_a_report_that_was_not_sent_is_sent_again_and_holds_the_mac_until_it_is(self):
+        blob = "sha256:" + "ab" * 32
+        self.signer.queue = [(3, {}), (4, {})]
+        self.signer.needs = {3: [("build", 10)]}
+        self.signer.outputs = {10: [("../x", blob, 1)]}
+        self.signer.answers = [ran(code=1, err="the node was not reached")]
+        connection, answer = self.work()
+        self.assertEqual(self.service.runs["check-3"]["state"], "writing")
+        self.assertEqual(len(self.actions(4)), 1)
+        self.assertEqual([int.from_bytes(claim[1:9], "little") for claim in self.actions(3)], [3], "a Mac with a report owed is not idle")
+        self.service.pull()
+        errored = relay.actions_report(3, "errored", "check output '../x' of `build` would land outside its needs folder", None)
+        self.assertEqual(self.actions(4), [errored, errored])
+        self.assertEqual(self.service.runs["check-3"]["state"], "failed")
+        self.assertEqual(self.event(answer)[1]["run"]["id"], "check-4")
+        connection.close()
+
+    def test_the_follower_reads_actions_once_a_height_and_follows_again_after_its_pause(self):
+        pulls, paused = [], []
+        self.service.pull = lambda: pulls.append(1)
+        self.service.settle_checks = lambda: None
+
+        def pause(seconds):
+            paused.append(seconds)
+            raise Stopped()
+
+        self.service.pause = pause
+        self.signer.follows = [[b"5\tk1\tv\n", b"5\tk2\tv\n", b"6\tk1\tv\n"]]
+        with self.assertRaises(Stopped):
+            self.service.followed()
+        self.assertEqual((len(pulls), paused), (2, [relay.FOLLOW_PAUSE]))
+        self.assertFalse(self.service.following)
 
 if __name__ == "__main__":
     unittest.main()

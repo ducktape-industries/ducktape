@@ -401,6 +401,36 @@ class Mac(unittest.TestCase):
         self.assertEqual(run["state"], "succeeded")
         self.assertEqual(len([call for call in self.calls() if call[0] == "make"]), 2)
 
+    def test_the_relay_follows_actions_again_at_the_macs_own_pause(self):
+        self.assertEqual(relay.FOLLOW_PAUSE, mac.RELAY_DOWN_PAUSE)
+
+    def a_check(self, steps):
+        return {"id": 7, "repo": "app", "commit": self.commit, "workflow": "release.toml", "attempt": 1, "job": {"id": "macos", "steps": steps, "env": {"MODE": "dist"}}}
+
+    def test_a_check_runs_its_steps_with_out_and_needs_and_is_reported_with_its_outputs(self):
+        self.service.needed = lambda check: [("build/app.txt", b"built")]
+        self.start()
+        steps = ['test "$(cat "$NEEDS/build/app.txt")" = built', 'test "$MODE" = dist', 'test -f README.md', 'echo made > "$OUT/app.tar.gz"']
+        self.service.checked(self.a_check(steps))
+        run = self.ended("check-7")
+        self.assertEqual((run["state"], run["reason"]), ("succeeded", None))
+        self.assertEqual(run["outputs"], ["app.tar.gz", "log"])
+        self.assertIn([b"made\n"], self.signer.puts)
+        actions = [payload for program, payload in self.signer.submits if program == relay.ACTIONS]
+        self.assertEqual([payload[0] for payload in actions], [7, 4])
+        self.assertEqual(actions[1][9], relay.CHECK_STATES.index("passed"))
+
+    def test_a_check_whose_step_fails_says_which_and_with_what_exit_code(self):
+        self.service.needed = lambda check: []
+        self.start()
+        self.service.checked(self.a_check(["true", "echo nope; exit 3", "echo never"]))
+        run = self.ended("check-7")
+        self.assertEqual((run["state"], run["reason"]), ("failed", "step 2 (echo nope; exit 3) exited 3: nope"))
+        report = [payload for program, payload in self.signer.submits if program == relay.ACTIONS][-1]
+        self.assertEqual((report[0], report[9]), (4, relay.CHECK_STATES.index("failed")))
+        log = [piece for pieces in self.signer.puts for piece in pieces if b"$ sh -c" in piece][0]
+        self.assertNotIn(b"never", log)
+
     def test_changed_ends_on_the_first_changed_frame_that_holds_still(self):
         state = self.sim_state()
         state["screen"] = ["room", "room", "zooming", "sheet", "sheet", "later"]
