@@ -2,7 +2,6 @@
 // than over the store a block applies to. The node's pool task drives it; consensus builds from it.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::UNIX_EPOCH;
 
 use abi::{Receipt, Refusal};
 use commonware_runtime::Spawner;
@@ -172,12 +171,7 @@ where
     }
 
     fn now(&self) -> u64 {
-        let since_epoch = self
-            .context
-            .current()
-            .duration_since(UNIX_EPOCH)
-            .expect("the clock reads after the unix epoch");
-        since_epoch.as_millis() as u64
+        crate::millis(&self.context)
     }
 }
 

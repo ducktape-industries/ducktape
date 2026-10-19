@@ -83,7 +83,7 @@ impl Marshal {
         anchor: Anchor,
         transport: Transport<S, R, P, B>,
         chain: C,
-    ) -> (Marshal, Summaries<E>)
+    ) -> Result<(Marshal, Summaries<E>), MarshalError>
     where
         E: Context,
         C: Chain,
@@ -171,9 +171,7 @@ impl Marshal {
             }
             futures::future::pending::<()>().await
         });
-        let resolver = resolving
-            .await
-            .expect("the backfill task hands back its resolver");
+        let resolver = resolving.await.map_err(|_| MarshalError::Backfill)?;
 
         let (actor, mailbox, _) = Actor::init(
             context.child("marshal"),
@@ -213,7 +211,7 @@ impl Marshal {
             kept: Arc::new(RwLock::new(Some(summaries))),
             span: Arc::new(ArcSwapOption::new(span)),
         };
-        (marshal, summaries)
+        Ok((marshal, summaries))
     }
 
     pub fn mailbox(&self) -> &MarshalMailbox {
@@ -246,6 +244,12 @@ impl Marshal {
     pub fn hint(&self, height: u64, peers: NonEmptyVec<PublicKey>) {
         self.mailbox.hint_finalized(Height::new(height), peers);
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MarshalError {
+    #[error("the backfill task ended before it handed back its resolver")]
+    Backfill,
 }
 
 #[derive(Debug, thiserror::Error)]

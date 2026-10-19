@@ -473,7 +473,7 @@ async fn start<E: Context>(
         door,
         load.live(),
         shutdown.subscribe(),
-    );
+    )?;
 
     let (mesh, mut tracker, marshal_lanes, engine_channels, (relay_sender, relay_receiver)) =
         Mesh::start(
@@ -526,7 +526,7 @@ async fn start<E: Context>(
         },
         chain.clone(),
     )
-    .await;
+    .await?;
     let mux = EngineMux::start(context.child("lanes"), engine_channels, mesh.oracle());
     let mut membership = Membership::new(
         context.child("membership"),

@@ -126,11 +126,11 @@ impl<E: crate::Context> Relay<E> {
         door: Option<quinn::Endpoint>,
         config: Config,
         shutdown: watch::Receiver<bool>,
-    ) -> Arc<Relay<E>> {
+    ) -> Result<Arc<Relay<E>>, halo::Taken> {
         let me = halo.me().clone();
         let metrics = metrics(&context);
         let rechecks = Arc::new(Notify::new());
-        let plane = lane::Plane::open(&halo, &config);
+        let plane = lane::Plane::open(&halo, &config)?;
         let (begin, begun) = oneshot::channel();
         let relay = Arc::new_cyclic(|weak: &Weak<Relay<E>>| {
             let (table, inbox) = mpsc::unbounded_channel();
@@ -167,7 +167,7 @@ impl<E: crate::Context> Relay<E> {
             }
         });
         let _ = begin.send(());
-        relay
+        Ok(relay)
     }
 
     fn send(&self, event: Event) {
@@ -191,14 +191,12 @@ impl<E: crate::Context> Relay<E> {
     async fn inspect<T: Send + 'static>(
         &self,
         look: impl FnOnce(&State) -> T + Send + 'static,
-    ) -> T {
+    ) -> Option<T> {
         let (reply, answer) = oneshot::channel();
         self.send(Event::Inspect(Box::new(move |state| {
             let _ = reply.send(look(state));
         })));
-        answer
-            .await
-            .expect("the table answers while the relay is up")
+        answer.await.ok()
     }
 
     /// The UDP port of the QUIC door, `None` when the node opened none.
@@ -215,8 +213,6 @@ impl<E: crate::Context> Relay<E> {
         serve(relay, Link::ws(socket, &config)).await;
     }
 
-    /// A block was applied: grants of a program whose `live/` table it wrote, and every
-    /// session's account when the identity program wrote, are re-read on the next turn.
     pub fn invalidate(&self, writes: &state::Writes) {
         let mut dirty = Dirty::default();
         for (program, keys) in &writes.programs {

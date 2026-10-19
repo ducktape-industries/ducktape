@@ -18,7 +18,9 @@ pub use chain::{App, Chain, unapplied};
 pub use commonware_consensus::marshal::ancestry::Ancestry;
 pub use engine::proposer;
 pub use lanes::{EngineChannels, EngineMux, MarshalLanes, channel};
-pub use marshal::{Certificate, Marshal, MarshalMailbox, Summaries, SummariesError, Transport};
+pub use marshal::{
+    Certificate, Marshal, MarshalError, MarshalMailbox, Summaries, SummariesError, Transport,
+};
 pub use membership::{Error as MembershipError, Membership, Standing};
 pub use roster::{Roster, validators_of};
 pub use votes::Votes;

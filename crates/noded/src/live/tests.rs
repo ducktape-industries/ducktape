@@ -201,7 +201,8 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         Some(super::door(&identity, std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap()),
         Config::default(),
         down,
-    );
+    )
+    .unwrap();
     Node {
         key,
         halo,
@@ -786,7 +787,8 @@ fn a_datagram_older_than_the_newest_held_is_dropped_and_counted() {
                     .as_ref()
                     .map(|cached| cached.first)
             })
-            .await;
+            .await
+            .unwrap();
         assert_eq!(first, Some(3));
     });
 }
@@ -1344,7 +1346,8 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
         let priority = second
             .relay
             .inspect(move |state| state.track(&held).expect("held remote").priority)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             priority, 3,
             "the track's priority crossed with its announce"
@@ -1648,7 +1651,8 @@ fn an_object_over_its_cap_is_refused_too_large_and_the_session_goes_on() {
         let open = node
             .relay
             .inspect(move |state| state.open_groups(&held))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(open, 0, "the oversized group left no open-group entry");
     });
 }

@@ -97,6 +97,10 @@ pub enum Error {
     #[error(transparent)]
     Summaries(#[from] consensus::SummariesError),
     #[error(transparent)]
+    Marshal(#[from] consensus::MarshalError),
+    #[error(transparent)]
+    Lane(#[from] halo::Taken),
+    #[error(transparent)]
     Membership(#[from] consensus::MembershipError),
     #[error(transparent)]
     Http(#[from] reqwest::Error),

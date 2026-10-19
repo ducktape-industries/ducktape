@@ -146,12 +146,10 @@ impl Grants {
         }
     }
 
-    /// The account the chain answers for `key`.
     pub async fn account(&self, key: &[u8]) -> Option<Account> {
         self.chain.account(key).await
     }
 
-    /// The grant `account` holds in `program`'s `room`, if the program wrote one.
     pub async fn grant(&self, program: &str, room: &str, account: Account) -> Option<Grant> {
         self.chain.grant(program, room, account).await
     }

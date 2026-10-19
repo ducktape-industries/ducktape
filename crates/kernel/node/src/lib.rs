@@ -58,6 +58,14 @@ pub fn carried<'a>(
         .filter_map(|(index, frame)| Some((index as u32, frame::verify(frame, network).ok()?)))
 }
 
+fn millis(clock: &impl commonware_runtime::Clock) -> u64 {
+    let since_epoch = clock
+        .current()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    since_epoch.as_millis() as u64
+}
+
 pub fn admissible(frame: &[u8], network: &[u8]) -> std::result::Result<Submission, Refusal> {
     if !Block::carries(frame) {
         let sentence = format!(
@@ -190,12 +198,7 @@ where
     }
 
     pub fn now(&self) -> u64 {
-        let since_epoch = self
-            .context
-            .current()
-            .duration_since(UNIX_EPOCH)
-            .expect("the clock reads after the unix epoch");
-        since_epoch.as_millis() as u64
+        millis(&self.context)
     }
 
     pub fn view(&self, layer: Layer) -> View<'_> {

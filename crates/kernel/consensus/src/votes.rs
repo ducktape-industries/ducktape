@@ -10,7 +10,7 @@
 //! orphaned notarization, a digest no block has) never counts.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arc_swap::ArcSwap;
 
@@ -38,8 +38,6 @@ const APPLIED: usize = 2 * VIEW_RETENTION as usize;
 /// this node hold.
 const PENDING: usize = 256;
 
-/// The book an engine's reporter fills and the node reads. Every height in
-/// it is one the caller of [`Votes::applied`] passed.
 #[derive(Clone, Default)]
 pub struct Votes {
     book: Arc<Mutex<Book>>,
@@ -164,9 +162,7 @@ impl Votes {
     }
 
     fn book(&self) -> MutexGuard<'_, Book> {
-        self.book
-            .lock()
-            .expect("the vote book lock is never poisoned")
+        self.book.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn publish(&self, book: &Book) {

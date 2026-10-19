@@ -130,19 +130,11 @@ pub struct Plane {
 }
 
 impl Plane {
-    pub fn open(halo: &Halo, config: &Config) -> Plane {
+    pub fn open(halo: &Halo, config: &Config) -> Result<Plane, halo::Taken> {
         let plane = halo.plane();
-        let streams = Arc::new(
-            plane
-                .streams(LANE, config.lane_backlog.get())
-                .expect("the live lane is the relay's alone"),
-        );
-        let datagrams = Arc::new(
-            plane
-                .datagrams(LANE, config.lane_per_sender.get())
-                .expect("the live lane is the relay's alone"),
-        );
-        Plane { streams, datagrams }
+        let streams = Arc::new(plane.streams(LANE, config.lane_backlog.get())?);
+        let datagrams = Arc::new(plane.datagrams(LANE, config.lane_per_sender.get())?);
+        Ok(Plane { streams, datagrams })
     }
 }
 

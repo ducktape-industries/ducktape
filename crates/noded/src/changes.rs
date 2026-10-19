@@ -13,12 +13,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::wire::Change;
 
-/// One `/v1/changes` socket's end: the program it follows, whether it
-/// asked for the keys alone, and where each block's word for it goes.
-/// `since` is the tip it was opened at and `read` the newest height a pong
-/// of its client echoed. `cut` reaches the socket's task even while a send
-/// waits on a client that stopped reading: dropped, it ends the task and
-/// its queue; sent, the node is stopping and the task says goodbye.
 pub(crate) struct Subscriber {
     program: ProgramId,
     keys: bool,
@@ -28,19 +22,12 @@ pub(crate) struct Subscriber {
     cut: cut::Sender<()>,
 }
 
-/// A `/v1/changes` socket's side of its [`Subscriber`].
 pub(crate) struct Subscription {
     pub(crate) changes: queue::UnboundedReceiver<Published>,
     pub(crate) read: Arc<AtomicU64>,
     pub(crate) cut: cut::Receiver<()>,
 }
 
-/// What a `/v1/changes` socket hears of each block the node applies: what
-/// the block wrote to its program, or a ping carrying the block's height
-/// (8 bytes, little-endian). A block that wrote nothing there is a ping, so
-/// a quiet program's socket is never idle long enough for a proxy to cut
-/// it; so is the block that closes each epoch, after its change, so every
-/// client is asked once an epoch to show that it still reads (its pong).
 pub(crate) enum Published {
     Change(Change),
     Ping(u64),
@@ -87,8 +74,6 @@ impl Changes {
         (Changes(inbox), fanout)
     }
 
-    /// Each block's word for `program` (`keys`: its changes' keys alone,
-    /// every value left out as `None`).
     pub(crate) fn subscribe(&self, program: ProgramId, keys: bool) -> Subscription {
         let (sender, changes) = queue::unbounded();
         let (cut, dropped) = cut::channel();
@@ -154,10 +139,6 @@ fn subscribed(fanout: &mut Fanout, mut subscriber: Subscriber) -> Flow {
     Flow::Fanning
 }
 
-/// Each socket's word for the block. At the block that closes an
-/// epoch, a socket that was open at the previous epoch's close but has
-/// answered no ping since hasn't read for a whole epoch: it is dropped,
-/// its queue with it, and its client reads again when it reconnects.
 fn written(fanout: &mut Fanout, wrote: Wrote) -> Flow {
     let height = wrote.height;
     fanout.tip = height;

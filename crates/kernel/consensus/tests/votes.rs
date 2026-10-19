@@ -91,7 +91,8 @@ impl Peer {
             },
             chain.clone(),
         )
-        .await;
+        .await
+        .unwrap();
         let mux = EngineMux::start(
             context.child("lanes"),
             mesh.engine_channels().await,

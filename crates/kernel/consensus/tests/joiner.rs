@@ -118,7 +118,8 @@ async fn join(
         },
         Held(inbox),
     )
-    .await;
+    .await
+    .unwrap();
     marshal.processed().await;
     (marshal, deliveries)
 }
