@@ -448,6 +448,49 @@ scripts back a `make` target; see the repository `Makefile`.
   nothing. `k8s/watch/watch-test.py` covers it. Stop it with
   `kubectl -n watch scale deployment/watch --replicas=0`.
 
+## The registry's garbage collection
+
+- `k8s/registry-gc/gc.sh` is one run of the CronJob `registry-gc` in
+  namespace `registry`, every 5 minutes, the kubelet's image-GC period. It
+  reads `rlm-home`'s usage with `statvfs` on the registry's claim, which
+  lives there, and counts it as the kubelet does. Under the kubelet's
+  `imageGCHighThresholdPercent` it stops. At or over it, it runs
+  `registry garbage-collect --dry-run`, and stops when no blob is eligible
+  for deletion. Otherwise it adds `REGISTRY_STORAGE_MAINTENANCE_READONLY`
+  (`{"enabled":true}`) to Deployment `registry` and waits for the rollout,
+  so a push is refused while it collects. Then it runs
+  `registry garbage-collect` and removes the variable again, which also
+  restarts the registry and drops its cached blob metadata. It never passes
+  `--delete-untagged`: it deletes only blobs that no manifest in the store
+  references, so every image the store still holds, tagged or not, stays
+  whole.
+- One run acts at a time: each run first takes an `flock` on the claim's
+  directory, and a run that finds it held logs `another_run` and stops, so
+  a run by hand never meets a scheduled one. Once read-only is on, any
+  failure or a stop still removes the variable, after a running collection
+  ends. A run that finds the variable still set removes it before anything
+  else. A failed run is not retried; the next period runs again.
+- Each step logs one `registry-gc: event=<name>` line: `another_run`,
+  `read_only_left_on`, `under_line`, `nothing_to_collect`, `collecting`
+  (with the dry run's blob count and bytes), `read_only_on`,
+  `read_only_off` and `collected` (with the blobs deleted and the bytes
+  the store shrank by while read-only). `line_unread` and `dry_run_unread`
+  end a run whose line or dry run does not read.
+  `k8s/registry-gc/gc-test.py` covers it.
+- `k8s/registry-gc/deploy` reads the registry pod's image digest, the
+  cluster's version and node architecture and `imageGCHighThresholdPercent`
+  from the kubelet's `configz`. It builds `k8s/registry-gc/Containerfile`,
+  the registry's own image with the matching kubectl and `gc.sh`, pushes it
+  to the cluster node's registry, and applies `k8s/registry-gc/registry-gc.yaml`
+  after a server-side dry run: service account `registry-gc`, a Role that
+  may get, list, watch and patch only Deployment `registry`, and the
+  CronJob, which mounts the claim `registry`. It changes neither the
+  Deployment nor the claim.
+- Run it once by hand, at the line it uses, with
+  `kubectl -n registry create job --from=cronjob/registry-gc registry-gc-by-hand`.
+  Stop it with
+  `kubectl -n registry patch cronjob registry-gc -p '{"spec":{"suspend":true}}'`.
+
 ## Phone builds and simulator runs on a Mac
 
 - `k8s/mac/relay.py` is the egress service `mac`, the relay: Deployment

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Builds the registry-gc image on the registry pod's own image with the kubectl matching the cluster, pushes it to the cluster node's registry, and applies registry-gc.yaml with the kubelet's imageGCHighThresholdPercent, after a server-side dry run.
+# Usage: ops/k8s/registry-gc/deploy; it acts in namespace registry beside Deployment registry and its claim registry, which it does not change.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+node=${DEPLOY_NODE:-fabrics@fabrics-1}
+context=${DEPLOY_CONTEXT:-fabrics-1}
+kube_node=${DEPLOY_KUBE_NODE:-fabrics-1}
+tunnel_port=35315
+
+fail() { echo "deploy: $*" >&2; exit 1; }
+k() { kubectl --context "$context" "$@"; }
+
+k -n registry get persistentvolumeclaim registry >/dev/null || fail "namespace registry has no claim registry"
+container=$(k -n registry get deployment registry -o jsonpath='{.spec.template.spec.containers[*].name}')
+[ "$container" = registry ] || fail "Deployment registry runs containers '$container', not the one container registry"
+registry_image=$(k -n registry get pods -l app=registry -o jsonpath='{.items[*].status.containerStatuses[*].imageID}')
+[[ $registry_image =~ ^[^\ ]+@sha256:[0-9a-f]{64}$ ]] || fail "the registry pod's image reads as '$registry_image', not one digest"
+image_gc=$(k get --raw "/api/v1/nodes/$kube_node/proxy/configz" | python3 -c 'import json, sys; print(json.load(sys.stdin)["kubeletconfig"]["imageGCHighThresholdPercent"])')
+[[ $image_gc =~ ^[0-9]+$ ]] || fail "the kubelet's imageGCHighThresholdPercent reads as $image_gc"
+server_version=$(k version -o json | python3 -c 'import json, sys; print(json.load(sys.stdin)["serverVersion"]["gitVersion"])')
+kubectl_version=${server_version%%+*}
+[[ $kubectl_version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "the cluster's version reads as $server_version"
+arch=$(k get node "$kube_node" -o jsonpath='{.status.nodeInfo.architecture}')
+[[ $arch =~ ^[a-z0-9]+$ ]] || fail "node $kube_node's architecture reads as '$arch'"
+
+stage=$(mktemp -d)
+socket="$stage.ssh"
+trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
+curl -fsSL -o "$stage/kubectl" "https://dl.k8s.io/release/$kubectl_version/bin/linux/$arch/kubectl"
+echo "$(curl -fsSL "https://dl.k8s.io/release/$kubectl_version/bin/linux/$arch/kubectl.sha256")  $stage/kubectl" | sha256sum --check --quiet
+chmod +x "$stage/kubectl"
+cp "$here/gc.sh" "$stage/gc.sh"
+tag=$(cat "$here/Containerfile" "$stage/gc.sh" <(echo "$registry_image $kubectl_version $arch") | sha256sum | cut -c1-12)
+nice -n 19 podman build --platform "linux/$arch" --file "$here/Containerfile" --build-arg REGISTRY_IMAGE="$registry_image" \
+  --tag "localhost:$tunnel_port/registry-gc:$tag" "$stage"
+ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
+podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/registry-gc:$tag"
+image="localhost:5000/registry-gc:$tag@$(cat "$stage/digest")"
+sed -e "s#@IMAGE@#$image#g" -e "s#@IMAGE_GC_PERCENT@#$image_gc#g" "$here/registry-gc.yaml" > "$stage/registry-gc.yaml"
+k apply --dry-run=server -f "$stage/registry-gc.yaml"
+k apply -f "$stage/registry-gc.yaml"
+echo "$image image_gc=$image_gc% registry=$registry_image kubectl=$kubectl_version arch=$arch"

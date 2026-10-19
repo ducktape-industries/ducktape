@@ -1,0 +1,7 @@
+# The registry-gc image: the image Deployment registry runs, with kubectl and gc.sh as its entrypoint.
+# Built by ops/k8s/registry-gc/deploy from a staged context holding kubectl and gc.sh, with REGISTRY_IMAGE the registry pod's image digest.
+ARG REGISTRY_IMAGE
+FROM ${REGISTRY_IMAGE}
+COPY kubectl /usr/local/bin/kubectl
+COPY gc.sh /usr/local/bin/registry-gc
+ENTRYPOINT ["/usr/local/bin/registry-gc"]

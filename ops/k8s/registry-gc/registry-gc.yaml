@@ -1,0 +1,70 @@
+# registry-gc on fabrics-1: its service account, a Role in namespace registry that may read and patch only Deployment registry, and the CronJob that runs gc.sh on the kubelet's image-GC period.
+# Applied by ops/k8s/registry-gc/deploy, which substitutes @IMAGE@ and @IMAGE_GC_PERCENT@.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: registry-gc
+  namespace: registry
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: registry-gc
+  namespace: registry
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [registry]
+    verbs: [get, list, watch, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: registry-gc
+  namespace: registry
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: registry-gc}
+subjects: [{kind: ServiceAccount, name: registry-gc, namespace: registry}]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: registry-gc
+  namespace: registry
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: registry-gc
+        spec:
+          serviceAccountName: registry-gc
+          restartPolicy: Never
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: registry-gc
+              image: "@IMAGE@"
+              env:
+                - {name: GC_USED_PERCENT, value: "@IMAGE_GC_PERCENT@"}
+                - {name: GC_STORE, value: /var/lib/registry}
+                - {name: REGISTRY_LOG_LEVEL, value: info}
+                - {name: HOME, value: /tmp}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - {name: data, mountPath: /var/lib/registry}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: registry
+            - name: tmp
+              emptyDir: {}
