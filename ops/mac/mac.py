@@ -36,9 +36,10 @@ KEEPALIVE = (10, 5, 3)
 
 
 class Failed(Exception):
-    def __init__(self, sentence):
+    def __init__(self, sentence, seen=None):
         super().__init__(sentence)
         self.sentence = sentence
+        self.seen = seen
 
 
 class Stopped(Exception):
@@ -460,10 +461,13 @@ class Simulator:
         except urllib.error.HTTPError as refusal:
             said = refusal.read().decode(errors="replace")
             try:
-                said = json.loads(said).get("error", said)
-            except (json.JSONDecodeError, AttributeError):
-                pass
-            raise Failed(f"the door answered {refusal.code}: {said}") from refusal
+                body = json.loads(said)
+            except json.JSONDecodeError:
+                body = None
+            told = body if isinstance(body, dict) else {}
+            seen = told.get("tree")
+            sentence = told.get("error", said)
+            raise Failed(f"the door answered {refusal.code}: {sentence}", None if seen is None else json.dumps(seen).encode()) from refusal
         except (urllib.error.URLError, OSError) as error:
             raise Failed(f"the AX door was not reached: {getattr(error, 'reason', error)}") from error
 
@@ -657,6 +661,8 @@ class Job:
                 except Failed as failure:
                     self.logged(log, f"{number:02d} {doing}: failed: {failure.sentence}")
                     self.shot(simulator, number)
+                    if failure.seen is not None:
+                        written(self.out / f"{number:02d}-failed.json", failure.seen)
                     raise Failed(f"step {number} ({doing}): {failure.sentence}") from failure
                 self.logged(log, f"{number:02d} {doing}: {said}")
         finally:

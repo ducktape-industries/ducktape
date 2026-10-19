@@ -181,7 +181,7 @@ class Door(BaseHTTPRequestHandler):
             open(pathlib.Path(os.environ["FAKE_SIM"]) / "hold").close()
             return self.reply(200, {"node": {"id": "phone:hold", "name": "hold"}})
         if self.path == "/wait" and body.get("name") == "missing":
-            return self.reply(408, {"error": f"nothing matched within {body['deadline_ms']} ms"})
+            return self.reply(408, {"error": f"nothing matched within {body['deadline_ms']} ms", "tree": [{"id": "phone:chat/attach", "name": "Attach"}]})
         if self.path == "/wait":
             return self.reply(200, {"node": {"id": "phone:chat/" + body["name"].lower(), "role": body.get("role"), "name": body["name"]}})
         self.reply(200, {"did": self.path, "with": body})
@@ -391,6 +391,8 @@ class Mac(unittest.TestCase):
         self.assertEqual(run["state"], "failed")
         self.assertEqual(run["reason"], "step 2 (wait missing): the door answered 408: nothing matched within 10 ms")
         self.assertIn("02-failed.png", self.outputs(run))
+        self.assertIn("02-failed.json", self.outputs(run))
+        self.assertEqual(self.put(b'"phone:chat/attach", "name"'), [b'[{"id": "phone:chat/attach", "name": "Attach"}]'])
         self.assertNotIn("03-never.png", self.outputs(run))
 
     def test_a_crash_at_launch_fails_the_run_with_its_crash_report(self):
