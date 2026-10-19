@@ -553,8 +553,31 @@ class Create(Served):
         self.assertEqual(body["volumes"][:2], [claimed("out", labels), claimed("in-0", labels)])
 
     def test_a_scratch_input_lives_in_memory_only(self):
-        for scratch, words in (({}, "names its medium"), ({"medium": "Disk"}, "medium is Memory"), ({"medium": "Memory", "size": "1Gi"}, "no field size")):
+        for scratch, words in (({}, "names its medium"), ({"medium": "Disk"}, "medium is Memory"), ({"medium": "Memory", "bytes": "1Gi"}, "no field bytes")):
             self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": scratch}]}, 400, [words])
+        self.assertNotIn("create", self.kube.verbs())
+
+    def test_a_scratch_size_is_its_empty_directorys_size_limit(self):
+        self.kube.answer("create", ran(pod_json()))
+        sizes = ["48Gi", "512M", "1e9", "1.5Gi", "+64Mi", ".5Ti"]
+        inputs = [{"path": f"/scratch/{index}", "scratch": {"medium": "Memory", "size": size}} for index, size in enumerate(sizes)]
+        status, _ = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs})
+        self.assertEqual(status, 201)
+        volumes = self.created()["spec"]["volumes"][1:]
+        self.assertEqual(volumes, [{"name": f"in-{index}", "emptyDir": {"medium": "Memory", "sizeLimit": size}} for index, size in enumerate(sizes)])
+
+    def test_a_scratch_without_a_size_has_no_size_limit(self):
+        self.kube.answer("create", ran(pod_json()))
+        self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": [{"path": "/var/tmp/target", "scratch": {"medium": "Memory"}}]})
+        self.assertNotIn("sizeLimit", self.created()["spec"]["volumes"][1]["emptyDir"])
+
+    def test_a_scratch_size_is_a_kubernetes_quantity_above_zero(self):
+        malformed = ("", "48GB", "48gi", "Gi", "1.2.3Gi", "48 Gi", "1e", "1e3Gi", "0x10", "forty")
+        for size in malformed:
+            self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": size}}]}, 400, ["is not a Kubernetes quantity"])
+        for size in ("0", "0Gi", "0.0", "-1Gi", "-0.5"):
+            self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": size}}]}, 400, ["is not above 0"])
+        self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": 48}}]}, 400, ["size is a JSON str"])
         self.assertNotIn("create", self.kube.verbs())
 
     def test_an_input_names_one_source_an_absolute_path_and_well_formed_ids(self):

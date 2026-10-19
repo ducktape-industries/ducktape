@@ -58,7 +58,7 @@ NOTIFY = {"channel": str, "thread": int}
 INPUT = {"path": str, "forge": dict, "files": dict, "blob": str, "scratch": dict}
 SOURCES = ("forge", "files", "blob", "scratch")
 SCRATCH = "scratch"
-SCRATCH_SHAPE = {"medium": str}
+SCRATCH_SHAPE = {"medium": str, "size": str}
 SCRATCH_MEDIUM = "Memory"
 FORGE = {"repo": str, "commit": str}
 FILES = {"path": str, "snapshot": str}
@@ -148,6 +148,7 @@ CUT = ("websocket: close 1006", "abnormal closure")
 UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
 UNPLACED = "does not have a host assigned"
 REQUEST_NUMBER = re.compile(r"[0-9]+")
+KUBERNETES_QUANTITY = re.compile(r"([+-]?)([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+|Ki|Mi|Gi|Ti|Pi|Ei|m|k|M|G|T|P|E)?")
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
 RESOLVING = SAFE_GIT + 'cd "$1" && git rev-parse --verify --quiet "$2^{commit}"\n'
@@ -678,7 +679,20 @@ def input_of(given, index):
             scratch = named(checked(given["scratch"], SCRATCH_SHAPE, f"{what}'s scratch"), ["medium"], f"{what}'s scratch")
             if scratch["medium"] != SCRATCH_MEDIUM:
                 raise Refused(400, f"{what}'s scratch medium is {SCRATCH_MEDIUM}: a scratch input lives in the pod's memory, never on the node's disk")
+            if "size" in scratch:
+                scratch_size(scratch["size"], f"{what}'s scratch size")
     return given
+
+
+def scratch_size(text, what):
+    found = KUBERNETES_QUANTITY.fullmatch(text)
+    if found is None:
+        raise Refused(400, f"{what} {text!r} is not a Kubernetes quantity such as 48Gi")
+    sign, digits = found.group(1), found.group(2)
+    above_zero = sign != "-" and digits.strip("0.") != ""
+    if not above_zero:
+        raise Refused(400, f"{what} {text!r} is not above 0: Kubernetes refuses a negative sizeLimit and bounds nothing by one of 0")
+    return text
 
 
 def confined():
@@ -717,7 +731,9 @@ def input_mount(index, given):
 
 def input_volume(index, given, labels):
     if SCRATCH in given:
-        return {"name": f"in-{index}", "emptyDir": {"medium": given[SCRATCH]["medium"]}}
+        scratch = given[SCRATCH]
+        sized = {"sizeLimit": scratch["size"]} if "size" in scratch else {}
+        return {"name": f"in-{index}", "emptyDir": {"medium": scratch["medium"], **sized}}
     return claimed(f"in-{index}", labels)
 
 

@@ -180,11 +180,20 @@ scripts back a `make` target; see the repository `Makefile`.
   the pod's inputs and `/out`. `volume_disks` holds, once per node, the used and
   capacity bytes of the disk under the pods' inputs and `/out`. `claims`
   lists only the claims no pod owns.
-- A `scratch` input (`{"path", "scratch": {"medium": "Memory"}}`) is an
-  empty directory in the pod's memory (an `emptyDir` of medium `Memory`):
-  nothing is fetched into it, and what is written there never reaches the
-  node's disk. It counts against the pod's memory, so a pod that builds into
-  it states a memory request sized to what it writes.
+- A `scratch` input (`{"path", "scratch": {"medium": "Memory", "size"}}`)
+  is an empty directory in the pod's memory (an `emptyDir` of medium
+  `Memory`): nothing is fetched into it, and what is written there never
+  reaches the node's disk. Its optional `size` is a Kubernetes quantity
+  above 0, such as `48Gi`, and becomes the `emptyDir`'s `sizeLimit`; the
+  service refuses any other `size` with a 400. The kubelet mounts the
+  directory as a tmpfs of the smallest of that size, the pod's memory limit
+  and the node's allocatable memory. A write past it fails with "No space
+  left on device", and the pod keeps running. A scratch without a `size` in
+  a pod without a memory limit is a tmpfs as large as the node's
+  allocatable memory, so filling it can starve the node and get the pod
+  evicted. What a pod writes there counts as the pod's memory, but
+  `hardcap` counts only requests, so a pod that builds into a scratch
+  states a memory request at least its scratch's size.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. A pod
