@@ -273,3 +273,15 @@ fn only_a_routable_unicast_address_is_public() {
         assert!(!public(address.parse().unwrap()), "{address}");
     }
 }
+
+#[tokio::test]
+async fn a_base_that_takes_the_connection_and_never_answers_fails_its_reach_at_the_wait() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = Url::parse(&format!("http://{}", silent.local_addr().unwrap())).unwrap();
+    let clients = Clients::new(Reach::Public).unwrap();
+    let reached = clients.reach(&base, Duration::from_millis(1)).await;
+    let Reached::Failed(why) = reached else {
+        panic!("{reached:?}");
+    };
+    assert!(why.contains("did not answer within 1 ms"), "{why}");
+}

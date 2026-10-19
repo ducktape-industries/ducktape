@@ -383,7 +383,9 @@ With `--dry` it changes nothing; otherwise it writes the text as its
 `egress.toml` (a new file renamed over the old) and serves it from the next
 request on. It answers how many services it then serves and how many are
 added, removed and changed, and for each service whether its base answers a
-plain `GET` from this node (with any status) or fails, and why. A text that
+plain `GET` from this node (with any status) or fails, and why; a base that
+has not answered within `DEFAULT_WAIT` block times, the wait a request gets,
+fails. Sets are written one at a time. A text that
 does not load is refused as a reload is, and the node keeps its file and what
 it serves. The CLI signs with the active wallet key, or with the node's own
 key under `--node-key`. The node takes the set from its own key or from a key

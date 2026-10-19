@@ -726,7 +726,7 @@ async fn egress_set<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Egress
         Ok(planned) => planned,
         Err(refused) => return Reply::Refused(Refusal::new(refused.reason(), refused.to_string())),
     };
-    let reach = planned.reach().await;
+    let reach = planned.reach(ctx.egress_wait()).await;
     let tally = match asked.dry {
         true => planned.tally,
         false => match ctx.put_egress(planned) {

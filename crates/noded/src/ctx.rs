@@ -162,6 +162,11 @@ impl<E: Context> Ctx<E> {
         }
     }
 
+    pub(crate) fn egress_wait(&self) -> std::time::Duration {
+        let block = self.daemon.network.cadence.block_time_ms();
+        std::time::Duration::from_millis(abi::role::egress::DEFAULT_WAIT * block)
+    }
+
     pub(crate) fn plan_egress(
         &self,
         text: String,

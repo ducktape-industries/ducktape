@@ -1,7 +1,8 @@
 //! What this node serves through egress and the HTTP clients that reach it, loaded from
 //! `egress.toml` when the node starts, on each `ducktape egress reload` and from each `egress set`.
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -31,16 +32,16 @@ pub struct Planned {
 }
 
 impl Planned {
-    pub async fn reach(&self) -> Vec<(String, Reached)> {
+    pub async fn reach(&self, wait: Duration) -> Vec<(String, Reached)> {
         let clients = &self.serving.clients;
-        let calls =
-            self.serving
-                .config
-                .services
-                .iter()
-                .map(|(name, upstream)| async move {
-                    (name.clone(), clients.reach(&upstream.base).await)
-                });
+        let calls = self
+            .serving
+            .config
+            .services
+            .iter()
+            .map(|(name, upstream)| async move {
+                (name.clone(), clients.reach(&upstream.base, wait).await)
+            });
         futures::future::join_all(calls).await
     }
 }
@@ -48,16 +49,25 @@ impl Planned {
 pub struct Station {
     workspace: Workspace,
     serving: watch::Sender<Arc<Serving>>,
+    writing: Mutex<()>,
 }
 
 impl Station {
     pub fn open(workspace: Workspace) -> Result<Station, Refused> {
         let serving = Serving::load(&workspace)?;
         let (serving, _) = watch::channel(Arc::new(serving));
-        Ok(Station { workspace, serving })
+        Ok(Station {
+            workspace,
+            serving,
+            writing: Mutex::new(()),
+        })
     }
 
     pub fn reload(&self) -> Result<(), Refused> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let serving = match Serving::load(&self.workspace) {
             Ok(serving) => serving,
             Err(refused) => {
@@ -101,6 +111,10 @@ impl Station {
     }
 
     pub fn put(&self, planned: Planned) -> Result<Tally, Refused> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.workspace
             .write_egress(&planned.text)
             .map_err(Refused::Unwritten)?;

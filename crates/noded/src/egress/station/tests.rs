@@ -100,6 +100,47 @@ fn a_plan_serves_nothing_and_a_put_writes_the_file_and_serves_it() {
 }
 
 #[test]
+fn sets_put_at_once_each_land_and_the_file_is_what_the_node_serves() {
+    let (_dir, workspace) = workspace();
+    let station = Station::open(workspace.clone()).unwrap();
+    let texts: Vec<String> = (1..=16)
+        .map(|port| format!("[services.s{port}]\nbase = \"http://127.0.0.1:{port}\"\n"))
+        .collect();
+    std::thread::scope(|scope| {
+        let puts: Vec<_> = texts
+            .iter()
+            .map(|text| scope.spawn(|| station.put(station.plan(text.clone()).unwrap())))
+            .collect();
+        for put in puts {
+            put.join().unwrap().unwrap();
+        }
+    });
+    let written = std::fs::read_to_string(workspace.dir().join("egress.toml")).unwrap();
+    assert!(texts.contains(&written));
+    assert_eq!(workspace.egress().unwrap().served(), served(&station));
+}
+
+#[test]
+fn reloads_and_sets_at_once_leave_the_file_as_what_the_node_serves() {
+    let (_dir, workspace) = workspace();
+    let station = Station::open(workspace.clone()).unwrap();
+    let texts: Vec<String> = (1..=8)
+        .map(|port| format!("[services.s{port}]\nbase = \"http://127.0.0.1:{port}\"\n"))
+        .collect();
+    std::thread::scope(|scope| {
+        let mut done = Vec::new();
+        for text in &texts {
+            done.push(scope.spawn(|| station.put(station.plan(text.clone()).unwrap()).map(|_| ())));
+            done.push(scope.spawn(|| station.reload()));
+        }
+        for one in done {
+            one.join().unwrap().unwrap();
+        }
+    });
+    assert_eq!(workspace.egress().unwrap().served(), served(&station));
+}
+
+#[test]
 fn the_grants_are_read_from_the_workspace_at_each_ask() {
     let (_dir, workspace) = workspace();
     let station = Station::open(workspace.clone()).unwrap();

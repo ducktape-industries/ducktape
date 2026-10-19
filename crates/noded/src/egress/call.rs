@@ -3,6 +3,7 @@
 //! egress worker in `mod.rs`.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use abi::role::egress::http::{Head, Response};
 use abi::role::egress::{Answer, Delivery, HTTP, Request, StreamEnd};
@@ -35,11 +36,19 @@ impl Clients {
         })
     }
 
-    pub async fn reach(&self, base: &Url) -> Reached {
-        match self.services.get(base.clone()).send().await {
-            Ok(response) => Reached::Answered(response.status().as_u16()),
-            Err(error) => Reached::Failed(unreached(base, error)),
-        }
+    pub async fn reach(&self, base: &Url, wait: Duration) -> Reached {
+        let error = match self.services.get(base.clone()).timeout(wait).send().await {
+            Ok(response) => return Reached::Answered(response.status().as_u16()),
+            Err(error) => error,
+        };
+        let failed = match error.is_timeout() {
+            true => format!(
+                "{base} did not answer within {} ms, the wait egress gives a request",
+                wait.as_millis()
+            ),
+            false => unreached(base, error),
+        };
+        Reached::Failed(failed)
     }
 }
 
