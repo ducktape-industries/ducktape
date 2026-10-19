@@ -70,8 +70,9 @@ class FakeCli:
         self.failing = False
         self.landing_unseen = False
         self.dying = False
+        self.stalled = False
 
-    def query(self, program, query):
+    def query(self, program, query, confirmed=False):
         if program == "harness":
             if isinstance(self.budget, Exception):
                 raise self.budget
@@ -90,8 +91,10 @@ class FakeCli:
             raise watch.Unread("the answer was lost")
         if self.failing:
             raise watch.Unread("unlanded")
+        if self.stalled:
+            return {"pooled": posted["message_id"]}
         self.posted[posted["message_id"]] = posted["blocks"][0]["Paragraph"][0]["text"]
-        return {"landed": 1}
+        return {"pooled": posted["message_id"]}
 
 
 def ready_kube(**more):
@@ -279,16 +282,56 @@ class FakePager:
         return Ran(self.codes.pop(0) if self.codes else 0)
 
 
+class Blocking(unittest.TestCase):
+    def test_a_cli_call_that_does_not_end_within_a_sample_is_unread_and_posts_wait_on_no_block(self):
+        seen = []
+
+        def blocks(argv, capture_output, env, timeout):
+            seen.append((argv, timeout))
+            raise watch.subprocess.TimeoutExpired(argv, timeout)
+
+        with tempfile.TemporaryDirectory() as temp:
+            keys = pathlib.Path(temp)
+            (keys / "password").write_text("p")
+            cli = watch.Cli(["ducktape"], NODE, keys, keys, blocks)
+            with self.assertRaises(watch.Unread):
+                cli.op("chat", {"PostMessage": {}})
+            with self.assertRaises(watch.Unread):
+                cli.query("chat", {"MessageById": {"message_id": "x"}}, confirmed=True)
+        self.assertEqual([timeout for _, timeout in seen], [watch.SAMPLE_S, watch.SAMPLE_S])
+        self.assertNotIn("--land", seen[0][0])
+        self.assertIn("--confirmed", seen[1][0])
+
+
 class Flush(unittest.TestCase):
     def item(self):
         return {"id": "watch-rate-bad-2", "text": "t", "tried": 0}
 
-    def test_a_landed_post_leaves_the_outbox_and_pages_nobody(self):
+    def test_a_post_leaves_the_outbox_once_a_block_carries_it_and_pages_nobody(self):
         cli = FakeCli()
         runner = FakePager()
-        self.assertEqual(watch.flush(cli, "alerts", [self.item()], watch.Pager(["page"], runner)), [])
+        pager = watch.Pager(["page"], runner)
+        left = watch.flush(cli, "alerts", [self.item()], pager)
+        self.assertTrue(left[0]["sent"])
+        self.assertEqual(watch.flush(cli, "alerts", left, pager), [])
         self.assertEqual(cli.ops[0]["PostMessage"]["channel_id"], "alerts")
+        self.assertEqual(len(cli.ops), 1)
         self.assertEqual(runner.pages, [])
+
+    def test_a_chain_that_stalls_pages_at_the_next_sample_and_never_blocks_the_flush(self):
+        cli = FakeCli()
+        cli.stalled = True
+        runner = FakePager()
+        pager = watch.Pager(["page", "orthory"], runner)
+        left = watch.flush(cli, "alerts", [self.item()], pager)
+        self.assertEqual(runner.pages, [])
+        left = watch.flush(cli, "alerts", left, pager)
+        left = watch.flush(cli, "alerts", left, pager)
+        self.assertEqual(runner.pages, [(["page", "orthory"], "t")])
+        self.assertEqual(len(cli.ops), 3)
+        cli.stalled = False
+        left = watch.flush(cli, "alerts", left, pager)
+        self.assertEqual(watch.flush(cli, "alerts", left, pager), [])
 
     def test_a_post_that_landed_unseen_is_read_back_not_resent(self):
         cli = FakeCli()
@@ -304,6 +347,7 @@ class Flush(unittest.TestCase):
         cli.failing = True
         left = watch.flush(cli, "alerts", [self.item()], watch.Pager([]))
         cli.failing = False
+        left = watch.flush(cli, "alerts", left, watch.Pager([]))
         self.assertEqual(watch.flush(cli, "alerts", left, watch.Pager([])), [])
         self.assertEqual(len(cli.ops), 2)
 
@@ -318,7 +362,7 @@ class Flush(unittest.TestCase):
 
     def test_a_chat_that_stays_down_logs_at_attempts_1_10_and_20(self):
         class Down(FakeCli):
-            def query(self, program, query):
+            def query(self, program, query, confirmed=False):
                 raise watch.Unread("connection refused")
 
         cli = Down()

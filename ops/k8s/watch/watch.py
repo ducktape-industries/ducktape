@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # watch: duckpond's alarms, off the chain and read-only. Each sample reads the block rate, the node's and the public /v1/status, ccs, harness's model budget, the Kubernetes API, the disks and the Deployments duckpond runs on.
-# It posts to chat channel `alerts` when a check turns bad and when it is good again, and hands an alert whose post does not land to the pager command `WATCH_PAGER` names, once.
+# It posts to chat channel `alerts` when a check turns bad and when it is good again, never waiting on a block, and hands an alert that no block carries by the next sample to the pager command `WATCH_PAGER` names.
 # ops/k8s/watch/watch.yaml runs it on fabrics-1, watch-test.py tests it, and `watch.py once` prints one sample.
 import json
 import os
@@ -257,16 +257,19 @@ class Cli:
 
     def call(self, *args):
         argv = [*self.ducktape, "--workspace", str(self.workspace), "--node", self.node, *args]
-        done = self.runner(argv, capture_output=True, env=self.env())
+        try:
+            done = self.runner(argv, capture_output=True, env=self.env(), timeout=SAMPLE_S)
+        except subprocess.TimeoutExpired as expired:
+            raise Unread(f"ducktape {args[0]} did not answer within {SAMPLE_S} s") from expired
         if done.returncode != 0:
             raise Unread(done.stderr.decode(errors="replace").strip() or f"ducktape exited {done.returncode}")
         return json.loads(done.stdout)
 
-    def query(self, program, query):
-        return self.call("query", program, json.dumps(query))
+    def query(self, program, query, confirmed=False):
+        return self.call("query", program, json.dumps(query), *(["--confirmed"] if confirmed else []))
 
     def op(self, program, op):
-        return self.call("op", program, json.dumps(op), "--land")
+        return self.call("op", program, json.dumps(op))
 
 
 def budget_read(cli):
@@ -340,7 +343,7 @@ def post_op(channel, item):
 
 
 def posted_already(cli, item):
-    found = cli.query("chat", {"MessageById": {"message_id": item["id"]}})
+    found = cli.query("chat", {"MessageById": {"message_id": item["id"]}}, confirmed=True)
     return found.get("Message") is not None
 
 
@@ -368,16 +371,21 @@ def flush(cli, channel, outbox, pager):
     for item in outbox:
         item = {**item, "tried": item["tried"] + 1}
         try:
-            if not posted_already(cli, item):
-                cli.op("chat", post_op(channel, item))
+            if posted_already(cli, item):
+                say("alert_posted", id=item["id"])
+                continue
+            sent_before = item.get("sent", False)
+            cli.op("chat", post_op(channel, item))
+            item = {**item, "sent": True}
+            problem = "sent, and no block carries it yet" if sent_before else None
         except Unread as error:
+            problem = str(error)
+        if problem is not None:
             if worth_a_line(item["tried"]):
-                say("alert_unposted", id=item["id"], attempts=item["tried"], detail=str(error))
+                say("alert_unposted", id=item["id"], attempts=item["tried"], detail=problem)
             if not item.get("paged"):
                 item = pager.page(item)
-            left.append(item)
-            continue
-        say("alert_posted", id=item["id"])
+        left.append(item)
     return left
 
 

@@ -451,13 +451,15 @@ one up for another network.
 - A check it cannot read changes nothing, and logs `check_unread` once as
   it turns unread: with the node down, the rate and the public URL are
   unread. It saves what it decided to its claim `state` before it posts,
-  and posts with `ducktape op chat … --land` as its own agent account,
-  which orthory (15) manages.
-  Each post is read back by its message id before it is sent, so a post
-  that landed unseen, or before the pod stopped, is never sent again;
-  posts that do not land wait in `state` and go out once the chain
-  answers. An alert whose
-  post does not land is also handed once, as its text on stdin, to the
+  and posts with `ducktape op chat …` as its own agent account, which
+  orthory (15) manages, without waiting for a block: every CLI call ends
+  within one sample period or counts as unread, so a chain that stalls
+  while its RPC answers never holds up a sample. Each post is read back by
+  its message id in the confirmed state before it is sent, so a post that
+  landed, or landed before the pod stopped, is never sent again; one that
+  no block carries is sent again each sample under the same id. An alert
+  that no block carries by the next sample, or that cannot be sent, is
+  also handed once, as its text on stdin, to the
   command `WATCH_PAGER` names (again only after that command fails, with
   `page_failed` logged at the first failed page and every tenth); with
   none named it logs `page_unsent`. An alert that cannot be posted logs
