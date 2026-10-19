@@ -757,7 +757,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             preconfirm,
             land,
         } => {
-            let interface = json::interface(client, &program).await?;
+            let interface = json::interface(workspace, client, &program).await?;
             let payload = interface.encode_op(&json::parse(&op, "op")?).sentence()?;
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
@@ -796,7 +796,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
                     json::ask(client, &key, &status, &program, request, layer(confirmed)).await?;
                 return emit(&answer);
             };
-            let interface = json::interface(client, &program).await?;
+            let interface = json::interface(workspace, client, &program).await?;
             let request = interface
                 .encode_query(&json::parse(&query, "query")?)
                 .sentence()?;

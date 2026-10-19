@@ -281,7 +281,11 @@ leave. Each prints the block that carried it.
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
 from, the address its HTTP surface bound, the runtime's storage and, when the
-operator writes them, `node.toml` and `egress.toml`.
+operator writes them, `node.toml` and `egress.toml`. Under `schemas/` the
+CLI keeps the schema section of each program code it has spoken to in JSON,
+named by the code's id, so `ducktape query` and `ducktape op` fetch a code
+from the node once, not on every call; an id names its bytes, so a kept
+schema never goes stale.
 
 ## Answer calls outside the chain
 

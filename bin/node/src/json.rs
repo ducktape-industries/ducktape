@@ -1,41 +1,82 @@
 //! A program spoken to in JSON: the interface its live code's `ducktape.schema` section carries,
-//! read through programs' borsh-json as harness's network tools read it, and an AddKey consent
-//! signed over identity's own admission.
+//! read through programs' borsh-json as harness's network tools read it and kept in the workspace
+//! by code id, and an AddKey consent signed over identity's own admission.
+use std::path::{Path, PathBuf};
+
 use abi::{BlobId, Outcome, Receipt, role};
 use borsh_json::Interface;
 use commonware_cryptography::{Signer as _, ed25519};
 use host::Layer;
 use node::{Frame, Preconfirm};
-use noded::Client;
 use noded::wire::{Status, Submitted};
+use noded::{Client, Workspace};
 use programs_sdk::abi::Scheme;
 use serde_json::{Map, Value, json};
 
 use crate::{Sentence as _, blob_text};
 
-pub async fn interface(client: &Client, program: &str) -> Result<Interface, String> {
+const SCHEMAS: &str = "schemas";
+
+pub async fn interface(
+    workspace: &Workspace,
+    client: &Client,
+    program: &str,
+) -> Result<Interface, String> {
     let programs = client.programs().await.sentence()?;
     let code = programs
         .get(program)
         .ok_or_else(|| format!("no program named {program} runs on this network"))?;
+    let folder = schemas(workspace.dir());
+    let section = match kept(&folder, code) {
+        Some(section) => section,
+        None => {
+            let section = fetched(client, program, code).await?;
+            let _ = keep(&folder, code, &section);
+            section
+        }
+    };
+    Interface::read(&section).map_err(|unreadable| {
+        format!(
+            "program {program}'s {} section {unreadable}",
+            borsh_json::SECTION
+        )
+    })
+}
+
+async fn fetched(client: &Client, program: &str, code: &BlobId) -> Result<Vec<u8>, String> {
     let framed = client
         .blob(*code)
         .await
         .sentence()?
         .ok_or_else(|| absent(program, code))?;
     let (_, module) = blob::parse(&framed).ok_or_else(|| absent(program, code))?;
-    let Some(section) = section(module).sentence()? else {
-        return Err(format!(
+    match section(module).sentence()? {
+        Some(section) => Ok(section.to_vec()),
+        None => Err(format!(
             "program {program}'s code carries no {} section, so it has no schema",
             borsh_json::SECTION
-        ));
-    };
-    Interface::read(section).map_err(|unreadable| {
-        format!(
-            "program {program}'s {} section {unreadable}",
-            borsh_json::SECTION
-        )
-    })
+        )),
+    }
+}
+
+fn schemas(dir: &Path) -> PathBuf {
+    dir.join(SCHEMAS)
+}
+
+fn schema_name(code: &BlobId) -> String {
+    blob_text(code).replace(':', "-")
+}
+
+fn kept(folder: &Path, code: &BlobId) -> Option<Vec<u8>> {
+    std::fs::read(folder.join(schema_name(code))).ok()
+}
+
+fn keep(folder: &Path, code: &BlobId, section: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    let name = schema_name(code);
+    let fresh = folder.join(format!("{name}.{}", std::process::id()));
+    std::fs::write(&fresh, section)?;
+    std::fs::rename(fresh, folder.join(name))
 }
 
 fn absent(program: &str, code: &BlobId) -> String {
@@ -227,7 +268,7 @@ mod tests {
     use programs_sdk::abi::Scheme;
     use serde_json::json;
 
-    use super::{Sent, section, signed};
+    use super::{Sent, keep, kept, schemas, section, signed};
 
     fn module(customs: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = b"\0asm\x01\0\0\0".to_vec();
@@ -267,6 +308,19 @@ mod tests {
     #[allow(dead_code, non_snake_case)]
     struct Returns {
         Count: u64,
+    }
+
+    #[test]
+    fn a_kept_schema_reads_back_under_its_own_code_id_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = schemas(dir.path());
+        let code = abi::BlobId::Sha256([1; 32]);
+        let other = abi::BlobId::Sha256([2; 32]);
+        assert_eq!(kept(&folder, &code), None);
+        keep(&folder, &code, b"schema").unwrap();
+        assert_eq!(kept(&folder, &code), Some(b"schema".to_vec()));
+        assert_eq!(kept(&folder, &other), None);
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1);
     }
 
     #[test]
