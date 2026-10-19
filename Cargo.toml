@@ -116,6 +116,7 @@ borsh = { version = "1", default-features = false, features = ["derive", "std", 
 # changing it is a binary upgrade, never a live program swap.
 wasmtime = "=46.0.3"
 wasmparser = "0.251"
+zstd = "=0.13.3"
 
 # internal — kernel crates (the platform). `keyscheme` is the key schemes a
 # frame's signer may use, the one verification path the node and the host

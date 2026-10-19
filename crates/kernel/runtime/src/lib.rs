@@ -49,7 +49,7 @@ pub trait Host {
     async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply;
 }
 
-pub use image::{Image, PAGE_BYTES, Page};
+pub use image::{Codec, Image, PACK_LEVEL, PAGE_BYTES, Packed, Page};
 
 #[derive(Clone)]
 pub struct Code {

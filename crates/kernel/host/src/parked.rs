@@ -3,7 +3,7 @@
 use abi::role::awaits::{FrameId, Ticket};
 use abi::{BlobId, Cause, ItemRef, Origin, Principal, ProgramId, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
-use runtime::{Image, Page};
+use runtime::{Image, Packed, Page};
 use state::{Overlay, Reads, View};
 
 use crate::namespace::PARKED;
@@ -41,6 +41,10 @@ fn frame_key(id: FrameId) -> Vec<u8> {
 
 fn shape_key(id: FrameId) -> Vec<u8> {
     [b"shape/".as_slice(), &id.to_be_bytes()].concat()
+}
+
+fn image_key(id: FrameId) -> Vec<u8> {
+    [b"image/".as_slice(), &id.to_be_bytes()].concat()
 }
 
 fn page_key(id: FrameId, index: u32) -> Vec<u8> {
@@ -88,6 +92,13 @@ pub fn load(view: &View<'_>, id: FrameId) -> Result<Option<(Parked, Image)>> {
     let Some(parked) = record(view, id)? else {
         return Ok(None);
     };
+    if let Some(bytes) = view.get(PARKED, &image_key(id))? {
+        let packed: Packed = abi::decode(&bytes).map_err(corrupt)?;
+        let image = packed
+            .unpack()
+            .map_err(|error| crate::Error::Corrupt(format!("frame {id}'s image: {error}")))?;
+        return Ok(Some((parked, image)));
+    }
     let shape = view
         .get(PARKED, &shape_key(id))?
         .ok_or_else(|| crate::Error::Corrupt(format!("frame {id} has no image")))?;
@@ -146,6 +157,10 @@ pub fn of(view: &View<'_>, program: &str) -> Result<Vec<FrameId>> {
 
 fn drop_image(storage: &Reads, overlay: &mut Overlay, id: FrameId) -> Result<()> {
     let view = View::new(storage, vec![&*overlay]);
+    if view.get(PARKED, &image_key(id))?.is_some() {
+        overlay.delete(PARKED, image_key(id));
+    }
+    let view = View::new(storage, vec![&*overlay]);
     let Some(shape) = view.get(PARKED, &shape_key(id))? else {
         return Ok(());
     };
@@ -155,4 +170,66 @@ fn drop_image(storage: &Reads, overlay: &mut Overlay, id: FrameId) -> Result<()>
     }
     overlay.delete(PARKED, shape_key(id));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use runtime::PAGE_BYTES;
+    use state::Storage;
+
+    use super::*;
+
+    fn parked() -> Parked {
+        Parked {
+            program: "awaiter".into(),
+            code: BlobId::Sha256([1; 32]),
+            origin: Origin::System,
+            sender: None,
+            cause: Cause::Direct,
+            waiter: Waiter::Nobody,
+        }
+    }
+
+    fn image() -> Image {
+        Image {
+            length: 4 * PAGE_BYTES as u64,
+            pages: vec![Page {
+                index: 2,
+                bytes: vec![7; PAGE_BYTES],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_frame_kept_as_one_packed_image_loads_and_is_removed_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut overlay = Overlay::default();
+        let record = parked();
+        overlay.set(PARKED, frame_key(7), abi::encode(&record));
+        overlay.set(PARKED, of_key(&record.program, 7), Vec::new());
+        overlay.set(PARKED, image_key(7), abi::encode(&image().pack().unwrap()));
+        let view = View::new(&storage, vec![&overlay]);
+        assert_eq!(load(&view, 7).unwrap(), Some((record.clone(), image())));
+        remove(&storage, &mut overlay, 7, &record.program).unwrap();
+        let view = View::new(&storage, vec![&overlay]);
+        assert_eq!(view.get(PARKED, &image_key(7)).unwrap(), None);
+        assert_eq!(load(&view, 7).unwrap(), None);
+    }
+
+    #[test]
+    fn a_frame_kept_page_by_page_still_loads_and_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut overlay = Overlay::default();
+        let record = parked();
+        save(&storage, &mut overlay, 7, record.clone(), image()).unwrap();
+        let view = View::new(&storage, vec![&overlay]);
+        assert_eq!(view.get(PARKED, &image_key(7)).unwrap(), None);
+        assert_eq!(load(&view, 7).unwrap(), Some((record.clone(), image())));
+        remove(&storage, &mut overlay, 7, &record.program).unwrap();
+        let view = View::new(&storage, vec![&overlay]);
+        assert_eq!(view.get(PARKED, &page_key(7, 2)).unwrap(), None);
+        assert_eq!(load(&view, 7).unwrap(), None);
+    }
 }
