@@ -120,7 +120,7 @@ impl HaloConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadConfig {
     pub blob_backlog: NonZeroUsize,
     pub blob_serves_in_flight: NonZeroUsize,
@@ -132,6 +132,7 @@ pub struct LoadConfig {
     pub live_lane_backlog: NonZeroUsize,
     pub live_lane_per_sender: NonZeroUsize,
     pub live_linger: Duration,
+    pub rpc_cpus: Option<Vec<usize>>,
 }
 
 impl Default for LoadConfig {
@@ -149,6 +150,7 @@ impl Default for LoadConfig {
             live_lane_backlog: live.lane_backlog,
             live_lane_per_sender: live.lane_per_sender,
             live_linger: live.linger,
+            rpc_cpus: None,
         }
     }
 }
@@ -453,10 +455,14 @@ async fn start<E: Context>(
     let current = Arc::new(Current::new());
     current.views.store(Some(base.clone()));
     let seeding = base.clone();
-    let activity =
-        crate::activity::Index::open(&workspace.dir().join(crate::activity::DIR), move || {
-            seed_of(&seeding)
-        })?;
+    let rpc_cpus = match &load.rpc_cpus {
+        Some(cpus) => cpus.clone(),
+        None => crate::cores::usable()?,
+    };
+    let indexed = workspace.dir().join(crate::activity::DIR);
+    let activity = crate::cores::beside_blocks(rpc_cpus, move || {
+        crate::activity::Index::open(&indexed, move || seed_of(&seeding))
+    })??;
 
     // the live door opens on its socket here, beside halo's, before consensus does any work
     let (shutdown, _) = watch::channel(false);
@@ -620,7 +626,7 @@ async fn start<E: Context>(
         Some(socket) => Some((transport::served(socket)?, transport::acceptor()?)),
         None => None,
     };
-    let rpc = crate::server::Rpc::start(daemon.clone(), listeners.http, fanout)?;
+    let rpc = crate::server::Rpc::start(daemon.clone(), listeners.http, fanout, load.rpc_cpus)?;
     let egressing = crate::egress::spawn(daemon.clone());
     let mut tasks = vec![pump, relayed, egressing];
     if let Some((listener, acceptor)) = tls {

@@ -403,6 +403,7 @@ tls = "127.0.0.1:9443"        # --tls; default none
 halo = "0.0.0.0:9100"         # --halo; no default
 live = "0.0.0.0:9200"         # --live; default none: desktop clients take the websocket on the http port
 log = "info"                  # --log; default info
+block_cpus = "0-5"            # --block-cpus; default none: block and rpc threads share every CPU
 
 [load]
 halo_egress = 10000000        # --halo-egress; default unlimited
@@ -425,7 +426,14 @@ certification_timeout_ms = 30000  # --certification-timeout-ms; default 30 block
 timeout_retry_ms = 2000           # --timeout-retry-ms; default 2 block times
 ```
 
-The top level says where the node is reached and what it logs. `[load]`
+The top level says where the node is reached, what it logs and which CPUs
+its block threads run on. With `block_cpus` set (a Linux CPU list such as
+`0-5` or `0-3,8`), `ducktape run` pins its first thread to those CPUs before
+the block runtime starts, so every thread that orders, applies and stores
+blocks inherits them, and the RPC runtime takes every other CPU the process
+may use. Fence the same CPUs off from everything else on the host (a cpuset,
+or the static CPU manager for a Guaranteed pod), or other work still lands
+on them. A CPU the process may not use stops the node. `[load]`
 says how much work the node takes on at once and how fast it sends over
 halo; "Reach a node" describes each of its keys, and `ducktape run --help`
 shows each default. A count in `[load]` is above zero, and every count but

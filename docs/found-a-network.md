@@ -88,10 +88,11 @@ the host's sockets (`ss -lntu`) and the ports pods hold
 duckpond holds `100.65.253.102:8844`; sealpond took `8845` and UDP `9101`.
 
 Two nodes on one machine share its CPUs with no isolation between them. Each
-node keeps the fastest of the CPUs it may use free of its own RPC threads
-and runs those at nice 19 (`crates/noded/src/cores.rs`). That reservation is
-per process, so the two nodes' block threads compete on the same CPUs like
-any other processes.
+node runs its RPC threads at nice 19, and with `block_cpus` set in its
+`node.toml` it pins its block threads to those CPUs and its RPC threads to the
+rest (`crates/noded/src/cores.rs`). Give each node its own `block_cpus`, and
+fence them off from the other node and from every other pod, or the block
+threads compete for the same CPUs like any other processes.
 
 ## 5. Reach a model gateway
 

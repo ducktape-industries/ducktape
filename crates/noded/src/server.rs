@@ -37,12 +37,16 @@ impl Rpc {
         daemon: Arc<Daemon<E>>,
         listener: std::net::TcpListener,
         fanout: Fanout,
+        rpc_cpus: Option<Vec<usize>>,
     ) -> crate::Result<Rpc> {
-        let block_workers = tokio::runtime::Handle::current().metrics().num_workers();
-        let split = cores::split(block_workers)?;
-        let threads = split.rpc.len();
-        tracing::info!(target: "ducktape::http", event = "rpc_cores", rpc = threads, reserved = split.reserved, "the rpc runtime runs beside the block threads");
-        let cpus = Arc::new(split.rpc);
+        let pinned = rpc_cpus.is_some();
+        let cpus = match rpc_cpus {
+            Some(cpus) => cpus,
+            None => cores::usable()?,
+        };
+        let threads = cpus.len();
+        tracing::info!(target: "ducktape::http", event = "rpc_cores", rpc = threads, pinned, "the rpc runtime runs beside the block threads");
+        let cpus = Arc::new(cpus);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(threads)
             .thread_name("rpc")

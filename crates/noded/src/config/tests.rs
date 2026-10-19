@@ -33,6 +33,7 @@ const EVERY_KEY: &str = "listen = \"127.0.0.1:9000\"\n\
                          halo = \"127.0.0.1:9200\"\n\
                          live = \"127.0.0.1:9300\"\n\
                          log = \"debug\"\n\
+                         block_cpus = \"0-5\"\n\
                          [load]\n\
                          halo_egress = 1000000\n\
                          halo_inbound_streams = 32\n\
@@ -60,6 +61,7 @@ fn every_key() -> Settings {
         halo: Some(socket(9200)),
         live: Some(socket(9300)),
         log: Some("debug".into()),
+        block_cpus: Some(CpuList::parse("0-5").unwrap()),
         load: LoadSettings {
             halo_egress: Some(1_000_000),
             halo_inbound_streams: Some(count(32)),
@@ -185,14 +187,23 @@ fn file_only_settings_reach_the_config() {
             live_lane_backlog: count(4),
             live_lane_per_sender: count(16),
             live_linger: Duration::from_millis(700),
+            rpc_cpus: None,
         }
     );
+    assert_eq!(config.block_cpus.unwrap().cpus(), &[0, 1, 2, 3, 4, 5]);
     assert_eq!(config.cadence.leader_timeout(), Duration::from_millis(4000));
     assert_eq!(
         config.cadence.certification_timeout(),
         Duration::from_millis(6000)
     );
     assert_eq!(config.cadence.timeout_retry(), Duration::from_millis(2000));
+}
+
+#[test]
+fn block_cpus_the_file_cannot_read_is_refused_at_its_line() {
+    let refusal = Settings::parse("log = \"info\"\nblock_cpus = \"5-0\"\n").unwrap_err();
+    assert!(refusal.starts_with("line 2"), "{refusal}");
+    assert!(Settings::parse("block_cpus = 5\n").is_err());
 }
 
 #[test]

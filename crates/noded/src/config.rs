@@ -8,6 +8,7 @@ use std::time::Duration;
 use consensus::{Cadence, Timeouts};
 use serde::{Deserialize, Deserializer};
 
+use crate::cores::CpuList;
 use crate::mesh;
 use crate::run::{HaloConfig, Listen, LoadConfig};
 use crate::workspace::{Descriptor, Workspace};
@@ -25,6 +26,8 @@ pub struct Settings {
     pub halo: Option<SocketAddr>,
     pub live: Option<SocketAddr>,
     pub log: Option<String>,
+    #[serde(default, deserialize_with = "cpu_list")]
+    pub block_cpus: Option<CpuList>,
     #[serde(default)]
     pub load: LoadSettings,
     #[serde(default)]
@@ -74,6 +77,7 @@ pub struct NodeConfig {
     pub halo: HaloConfig,
     pub load: LoadConfig,
     pub cadence: Cadence,
+    pub block_cpus: Option<CpuList>,
 }
 
 pub fn permits(count: NonZeroUsize) -> Result<NonZeroUsize> {
@@ -92,6 +96,15 @@ fn held_permits<'de, D: Deserializer<'de>>(
     permits(count).map(Some).map_err(serde::de::Error::custom)
 }
 
+fn cpu_list<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<CpuList>, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    CpuList::parse(&text)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 impl Settings {
     pub fn parse(text: &str) -> std::result::Result<Settings, String> {
         toml::from_str(text).map_err(|error| refusal(text, &error))
@@ -105,6 +118,7 @@ impl Settings {
             halo: self.halo.or(under.halo),
             live: self.live.or(under.live),
             log: self.log.or(under.log),
+            block_cpus: self.block_cpus.or(under.block_cpus),
             load: self.load.over(under.load),
             consensus: self.consensus.over(under.consensus),
         }
@@ -126,6 +140,7 @@ impl Settings {
             halo: self.load.halo(),
             load: self.load.load(),
             cadence,
+            block_cpus: self.block_cpus,
         })
     }
 }
@@ -181,6 +196,7 @@ impl LoadSettings {
             live_linger: self
                 .live_linger_ms
                 .map_or(default.live_linger, |ms| Duration::from_millis(ms.get())),
+            rpc_cpus: None,
         }
     }
 }

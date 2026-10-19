@@ -16,8 +16,8 @@ use host::{Layer, RECENT};
 use node::{Frame, Preconfirm};
 use noded::wire::{Admin, Submitted};
 use noded::{
-    Client, ConsensusSettings, Endpoint, HaloConfig, LoadConfig, LoadSettings, Logs, NodeConfig,
-    Settings, Upload, Workspace,
+    Client, ConsensusSettings, CpuList, Endpoint, HaloConfig, LoadConfig, LoadSettings, Logs,
+    NodeConfig, Settings, Upload, Workspace,
 };
 use programs_sdk::abi::Scheme;
 
@@ -220,6 +220,16 @@ struct RunArgs {
     log: Option<String>,
     #[arg(
         long,
+        value_parser = CpuList::parse,
+        help = setting(
+            "the CPUs, such as 0-5, that the threads ordering, applying and storing blocks run on; \
+             the rpc runtime takes every other CPU. Unset, both run on every CPU",
+            "block_cpus"
+        )
+    )]
+    block_cpus: Option<CpuList>,
+    #[arg(
+        long,
         help = setting(
             "the bytes per second this node sends to other members over halo; unlimited when \
              absent",
@@ -390,6 +400,7 @@ impl RunArgs {
             halo: self.halo,
             live: self.live,
             log: self.log,
+            block_cpus: self.block_cpus,
             load: LoadSettings {
                 halo_egress: self.halo_egress,
                 halo_inbound_streams: self.halo_inbound_streams,
@@ -580,7 +591,10 @@ fn execute(cli: Cli) -> Result<(), String> {
             })
         }
         Verb::Run(args) => {
-            let config = NodeConfig::load(&workspace, args.settings()).sentence()?;
+            let mut config = NodeConfig::load(&workspace, args.settings()).sentence()?;
+            if let Some(block) = &config.block_cpus {
+                config.load.rpc_cpus = Some(noded::pin_block_threads(block).sentence()?);
+            }
             let runtime = runtime_config(&workspace).with_read_write_timeout(config.link_timeout());
             Runner::new(runtime).start(|context| async move {
                 let logs = Logs::install(&config.log)?;
@@ -1237,7 +1251,9 @@ mod tests {
 
     use std::num::NonZeroU64;
 
-    use super::{Cli, ConsensusSettings, LoadSettings, Scheme, Settings, Verb, WalletVerb};
+    use super::{
+        Cli, ConsensusSettings, CpuList, LoadSettings, Scheme, Settings, Verb, WalletVerb,
+    };
 
     #[test]
     fn a_registered_halo_address_refuses_a_bind_only_host_and_run_binds_one() {
@@ -1427,6 +1443,8 @@ mod tests {
             "6000",
             "--timeout-retry-ms",
             "2000",
+            "--block-cpus",
+            "0-5",
         ]);
         assert_eq!(
             settings,
@@ -1437,6 +1455,7 @@ mod tests {
                 halo: Some("0.0.0.0:9100".parse().unwrap()),
                 live: Some("0.0.0.0:9200".parse().unwrap()),
                 log: Some("debug".into()),
+                block_cpus: Some(CpuList::parse("0-5").unwrap()),
                 load: LoadSettings {
                     halo_egress: Some(1_000_000),
                     halo_inbound_streams: Some(count(32)),
