@@ -602,7 +602,7 @@ class Signer:
             return run([*self.ducktape, "submit", program, str(file), "--land"], env=self.env())
 
     def query(self, program, request):
-        return run([*self.ducktape, "query", program], stdin=request, env=self.env())
+        return run([*self.ducktape, "query", program, "--raw"], stdin=request, env=self.env())
 
 
 class Stats:
@@ -2128,7 +2128,7 @@ class Fetcher:
         offset, data, size = 0, b"", 0
         while True:
             request = files_read(files["path"], snapshot, offset, CHUNK_SIZE)
-            reply = self.must(lambda: self.cli("query", FILES_PROGRAM, stdin=request), f"files did not read {files['path']}")
+            reply = self.must(lambda: self.cli("query", FILES_PROGRAM, "--raw", stdin=request), f"files did not read {files['path']}")
             read_at, size, _, piece, eof = contents_of(reply)
             snapshot = snapshot or read_at
             data += piece

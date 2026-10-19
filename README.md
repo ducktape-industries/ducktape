@@ -518,12 +518,15 @@ ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100  
 ```sh
 ducktape status                         # height, tip, root, epoch, identity, role bindings
 ducktape wallet new alice               # a user key; DUCKTAPE_PASSWORD or a prompt
+ducktape op identity '{"CreateAgent": {"name": "chief"}}' --land  # an op as the JSON its program's schema reads; prints the block and what it returned
 ducktape submit ping request.bin        # sign a frame with the active wallet and pool it; --preconfirm prints its predicted receipt; --land waits for its block's receipt
 ducktape get ping 6b6579                # a key in hex, from the preconfirmed layer
 ducktape get ping 6b6579 --confirmed    # the committed layer
 ducktape scan ping --lo 6b               # a key range
 ducktape changes ping                   # follow a program's confirmed writes
-ducktape query ping request.bin         # a signed read-only call
+ducktape query files '"Head"'           # a signed read-only call, written and answered as JSON
+ducktape query ping --raw request.bin   # the same with borsh bytes, from a file or stdin
+ducktape wallet consent --account 18    # the active key's consent to a key joining account 18, as AddKey's JSON
 ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ducktape blob put code.wasm --kind program --wait  # put a bundle, print its ids, wait until it is held

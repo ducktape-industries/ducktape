@@ -194,24 +194,19 @@ decides the order:
 
 ## 9. Sign ops
 
-`ducktape submit <program> <payload> --land` signs a frame with the active
-wallet, waits for its block and prints the verdict, and `ducktape query
-<program> <request>` prints a query's reply. Both take borsh bytes; the CLI
-does not encode them, and no CLI verb or `/v1` route serves a program's
-schema. The shapes come from the programs crates' `Op`, `Query` and `Reply`
-types, as step 10 gives them. `ops/found/` builds `found`, one binary whose verbs print the borsh bytes of
-each op and query a founding sends (`found create founder`,
-`found set-model ID SERVICE NAME`, `found q-agent 18`), and decode a reply
-read on stdin (`found d-harness`, `found d-identity`). It links the programs
-crates (identity, egress, harness, files, access, chat, program, store) at
-the rev its `Cargo.toml` names, repeating programs' root
-`[patch."https://github.com/ducktape-industries/ducktape"]` for `abi` and
-`store` so every crate sees one copy of each, and core's `keystore` from this
-tree (step 10.3). Set that rev to the founding's programs commit, then build
-it.
+`ducktape op <program> '<json>' --land` signs a frame with the active
+wallet, waits for its block and prints, as JSON, the block and what the op
+returned; a rejected op fails with its reason. `ducktape query <program>
+'<json>'` prints a query's reply as JSON. Both read the program's schema
+from the `ducktape.schema` section of the code the network runs and encode
+with programs' `borsh-json`, as harness's `network_call` and
+`network_query` do, so an op is written in the shape `network_schema` shows:
+a map is a list of `[key, value]` pairs, bytes are hex, and an option field
+may be left out. `ducktape submit` and `ducktape query --raw` still take
+borsh bytes.
 
 ```sh
-cd ops/found && cargo build --release   # target/release/found
+ducktape --node http://100.65.253.102:8845 query identity '{"Profile": 17}'
 ```
 
 `ducktape wallet new <name>` makes a key in the workspace
@@ -228,24 +223,22 @@ unset w
 
 ## 10. Make the bootstrap account and the first agent
 
-`ops/found/seed.sh` runs this whole step. It signs each op with `--land`,
-keeps each payload and verdict in a step folder so a rerun skips what
+`ops/found/seed.sh` runs this whole step. It sends each op with `ducktape op
+… --land`, keeps what each printed in a step folder so a rerun skips what
 landed, and prints the three account numbers. Make `founder`'s and `chief`'s
 wallets first, each in its own workspace and straight into its Secret, as
 step 9 makes chief's:
 
 ```sh
-DUCKTAPE="$(command -v ducktape)" TOOL=ops/found/target/release/found \
-  ops/found/seed.sh http://100.65.253.102:8845 sealpond <node key> \
-  FOUNDER_WS FOUNDER_PASSWORD CHIEF_WS CHIEF_PASSWORD CHIEF_WS/keys/chief.key STEPS
+DUCKTAPE="$(command -v ducktape)" ops/found/seed.sh http://100.65.253.102:8845 <node key> \
+  FOUNDER_WS FOUNDER_PASSWORD CHIEF_WS CHIEF_PASSWORD STEPS
 # founder 17 chief 18 tech 19
 ```
 
 `MODEL` and `SERVICE` name the model and the egress service
 (`claude-opus-5-5` and `anthropic` unless set). The configurations it writes
 hold a placeholder prompt, which step 13 replaces. The ops it sends, by
-signer, written as JSON of the programs
-crates' types (a map is a list of `[key, value]` pairs):
+signer, as `ducktape op` takes them:
 
 1. `founder`: identity `{"Create": {"name": "founder", "scheme": "Ed25519"}}`.
    It returns the account number F.
@@ -253,13 +246,14 @@ crates' types (a map is a list of `[key, value]` pairs):
    managed by F.
 3. `founder`: identity `AddKey`, adding `chief`'s wallet key to C:
    `{"AddKey": {"consent": {"key", "account": C, "expires_at", "proof"}, "scheme": "Ed25519", "label": null}}`.
-   `key` is chief's public key. `proof` is chief's key signing, in namespace
-   `ducktape:identity:consent` (`identity::CONSENT_NAMESPACE`), the borsh
-   `identity::Admission { network, scheme, key, generation, account,
-   expires_at }`: `network` the founding file's network name as bytes,
-   `generation` what identity `{"Generation": {"key"}}` answers, and
-   `expires_at` unix milliseconds. `found add-key` opens chief's wallet file
-   and signs it.
+   chief's workspace signs the consent:
+   `ducktape --workspace CHIEF_WS wallet consent --account C` prints it. It
+   signs identity's `Admission` for chief's own key, at the generation
+   identity holds for that key, on the node's network.
+   `--expires <unix ms>` bounds it. Without it, it never expires, and a
+   leaked one gives nobody anything: the `AddKey` still needs the manager's
+   signature, and the consent is bound to that generation, the account and
+   the network.
 4. `founder`: access `{"Set": {"program": "harness", "key": "agents/C", "list": "Anyone"}}`,
    who the agent answers (`harness::agent_key`). duckpond's agents answer
    anyone.
@@ -330,15 +324,16 @@ The desktop app's harness view builds the same sequence for an agent
   `<network>+<genesis time>`. Inside the cluster the node is
   `node-http.<network>.svc:8844`.
 - Write each agent's prompt, memory and skills into files as the agent's
-  manager or the agent itself (step 10.7's chunk-and-commit; `found commit-files` puts many files in
-  one commit). A `Put` makes
+  manager or the agent itself (step 10.7's chunk-and-commit; one `Commit`
+  takes a `Put` per file). A `Put` makes
   every parent folder it needs; an empty folder takes `{"Mkdir": {"path"}}`
-  in the same commit (programs `crates/app/files/src/tree.rs`). No CLI verb
-  reads files: read back with files' `Find` and `Read` queries (`found q-find`, `found
-  q-read`, `found d-read`).
+  in the same commit (programs `crates/app/files/src/tree.rs`). Read back
+  with files' queries: `ducktape query files '{"Find": {"prefix":
+  "/shared/agents/", "page": {}}}'`, and `{"Read": {"path": "<path>",
+  "offset": 0, "len": <size>}}`, whose `bytes` come back as hex.
 - Post the first agent a hello saying who its person is. The sender is any
   key's own account, made with identity `Create` as in step 10.1. A DM room
   opens only with chat `{"CreateDmChannel": {"counterpart": C, "name"}}`
   (programs `crates/app/chat/src/lib.rs`), and then a `PostMessage` to
-  `dm-<lower account>-<higher account>` lands in it (`found open-dm`, then
-  `found post`).
+  `dm-<lower account>-<higher account>` lands in it, its `blocks` written as
+  `[{"Paragraph": [{"text": "<the hello>", "marks": []}]}]`.

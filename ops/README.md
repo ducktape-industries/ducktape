@@ -81,20 +81,15 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## A network's first accounts
 
-- `found/` is the crate `found`, its own workspace: one binary whose verbs
-  print the borsh bytes of the identity, egress, harness, files, access and
-  chat ops and queries a founding sends, for `ducktape submit` and
-  `ducktape query`, and decode their replies (`d-*`, read on stdin). It
-  links the programs crates at the rev `found/Cargo.toml` names, which must
-  be the founding's programs commit, and core's `keystore` from this tree,
-  which `add-key` opens a wallet file with to sign a key's consent.
 - `found/seed.sh` turns a freshly founded network into one with two agents:
   the account `founder` creates the agent `chief`, adds chief's own key to
   it and lists who chief answers; chief's key then registers and assigns
   the egress service, sets the model, writes chief's configuration, sets
-  its script, and creates `tech` the same way, chief managing it. Each
-  step's frame and receipt stay in the step folder, and a rerun skips the
-  steps that landed. `../docs/found-a-network.md` step 10 gives the call.
+  its script, and creates `tech` the same way, chief managing it. It sends
+  each op as JSON with `ducktape op … --land` and has chief's workspace sign
+  chief's consent with `ducktape wallet consent`. What each step printed
+  stays in the step folder, and a rerun skips the steps that landed.
+  `../docs/found-a-network.md` step 10 gives the call.
 
 ## Agents' computing on Kubernetes
 

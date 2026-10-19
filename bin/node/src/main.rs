@@ -1,3 +1,5 @@
+mod json;
+
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -17,6 +19,7 @@ use noded::{
     Client, ConsensusSettings, Endpoint, HaloConfig, LoadConfig, LoadSettings, Logs, NodeConfig,
     Settings, Upload, Workspace,
 };
+use programs_sdk::abi::Scheme;
 
 #[derive(Parser)]
 #[command(name = "ducktape", about = "a ducktape node and its client", version)]
@@ -95,10 +98,31 @@ enum Verb {
         #[arg(long)]
         land: bool,
     },
-    #[command(about = "query a program; the request is a file or stdin, the answer is stdout")]
+    #[command(
+        about = "send a program an op written as the JSON its schema reads (harness's network_schema \
+                 shape), signed by the active wallet key. Prints JSON: the pooled frame; with \
+                 --preconfirm the predicted outcome and what the op returned; with --land the block \
+                 that carried it and what the op returned. A rejected or unlanded op fails"
+    )]
+    Op {
+        program: String,
+        op: String,
+        #[arg(long, conflicts_with = "land")]
+        preconfirm: bool,
+        #[arg(long)]
+        land: bool,
+    },
+    #[command(
+        about = "ask a program a query written as the JSON its schema reads, and print its reply as \
+                 JSON; with --raw the query is borsh bytes from a file or stdin and the answer is its \
+                 raw bytes on stdout"
+    )]
     Query {
         program: String,
-        request: Option<PathBuf>,
+        #[arg(required_unless_present = "raw", conflicts_with = "raw")]
+        query: Option<String>,
+        #[arg(long, value_name = "FILE", num_args = 0..=1)]
+        raw: Option<Option<PathBuf>>,
         #[arg(long)]
         confirmed: bool,
     },
@@ -455,6 +479,48 @@ enum WalletVerb {
     List,
     #[command(about = "make a key the one that signs")]
     Use { name: String },
+    #[command(
+        about = "sign with the active key a consent to a key joining an account, and print it as the \
+                 JSON identity's AddKey op takes as its consent"
+    )]
+    Consent {
+        #[arg(long, help = "the account the key joins")]
+        account: u64,
+        #[arg(long, help = "the joining key in hex [default: the active key]")]
+        key: Option<String>,
+        #[arg(long, value_enum, default_value_t = KeyScheme::Ed25519, help = "the joining key's scheme")]
+        scheme: KeyScheme,
+        #[arg(
+            long,
+            help = "the network it is for; refused unless the node runs it [default: the node's]"
+        )]
+        network: Option<String>,
+        #[arg(long, help = EXPIRES)]
+        expires: Option<u64>,
+    },
+}
+
+const EXPIRES: &str = "the unix time in milliseconds past which identity refuses the consent; \
+                       without it the consent never expires, which gives a leaked one to nobody: \
+                       the AddKey that uses it still needs the signature of the account's manager \
+                       (or of the joining key, on a user's account), and the consent is bound to \
+                       the joining key's generation, the account and the network";
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KeyScheme {
+    Ed25519,
+    Secp256k1,
+    Secp256r1,
+}
+
+impl From<KeyScheme> for Scheme {
+    fn from(scheme: KeyScheme) -> Scheme {
+        match scheme {
+            KeyScheme::Ed25519 => Scheme::Ed25519,
+            KeyScheme::Secp256k1 => Scheme::Secp256k1,
+            KeyScheme::Secp256r1 => Scheme::Secp256r1,
+        }
+    }
 }
 
 fn main() {
@@ -539,7 +605,9 @@ fn execute(cli: Cli) -> Result<(), String> {
                 running.stopped(signalled).await.sentence()
             })
         }
-        Verb::Wallet(verb) => wallet(&workspace, verb),
+        Verb::Wallet(verb) if !matches!(verb, WalletVerb::Consent { .. }) => {
+            wallet(&workspace, verb)
+        }
         verb => {
             let client = client(&workspace, cli.node)?;
             client_runtime()?.block_on(talk(&workspace, &client, verb))
@@ -669,26 +737,61 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             }
             Ok(())
         }
-        Verb::Query {
+        Verb::Op {
             program,
-            request,
-            confirmed,
+            op,
+            preconfirm,
+            land,
         } => {
+            let interface = json::interface(client, &program).await?;
+            let payload = interface.encode_op(&json::parse(&op, "op")?).sentence()?;
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
             let frame = Frame::sign(
                 &key,
                 status.network.as_bytes(),
                 status.anchor(),
-                None,
+                Some(salt()),
                 &program,
-                bytes(request)?,
+                payload.clone(),
             );
-            let answer = client
-                .query(layer(confirmed), frame.encode())
-                .await
+            let sent = json::Sent {
+                interface: &interface,
+                program: &program,
+                payload: &payload,
+            };
+            let told = match (land, preconfirm) {
+                (true, _) => sent.land(client, &frame).await?,
+                (false, true) => sent.submit(client, &frame, Preconfirm::On).await?,
+                (false, false) => sent.submit(client, &frame, Preconfirm::Off).await?,
+            };
+            json::print(&told);
+            Ok(())
+        }
+        Verb::Query {
+            program,
+            query,
+            raw,
+            confirmed,
+        } => {
+            let Some(query) = query else {
+                let request = bytes(raw.flatten())?;
+                let status = client.status().await.sentence()?;
+                let key = signer(workspace)?;
+                let answer =
+                    json::ask(client, &key, &status, &program, request, layer(confirmed)).await?;
+                return emit(&answer);
+            };
+            let interface = json::interface(client, &program).await?;
+            let request = interface
+                .encode_query(&json::parse(&query, "query")?)
                 .sentence()?;
-            emit(&answer)
+            let status = client.status().await.sentence()?;
+            let key = signer(workspace)?;
+            let answer =
+                json::ask(client, &key, &status, &program, request, layer(confirmed)).await?;
+            json::print(&json::reply(&interface, &program, &answer)?);
+            Ok(())
         }
         Verb::Get {
             program,
@@ -813,6 +916,25 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         Verb::Halo { halo } => {
             let (height, _) = membership(workspace, client, Op::SetHalo { halo }).await?;
             println!("halo address registered at block {height}");
+            Ok(())
+        }
+        Verb::Wallet(WalletVerb::Consent {
+            account,
+            key,
+            scheme,
+            network,
+            expires,
+        }) => {
+            let key = key.map(hex::decode).transpose().sentence()?;
+            let signer = signer(workspace)?;
+            let asked = json::Consenting {
+                account,
+                key,
+                scheme: scheme.into(),
+                network,
+                expires,
+            };
+            json::print(&json::consent(client, &signer, asked).await?);
             Ok(())
         }
         Verb::Version
@@ -1027,6 +1149,7 @@ fn wallet(workspace: &Workspace, verb: WalletVerb) -> Result<(), String> {
             Ok(())
         }
         WalletVerb::Use { name } => keystore::wallet::activate(workspace.dir(), &name),
+        WalletVerb::Consent { .. } => unreachable!("a consent asks the node, so talk signs it"),
     }
 }
 
@@ -1114,7 +1237,7 @@ mod tests {
 
     use std::num::NonZeroU64;
 
-    use super::{Cli, ConsensusSettings, LoadSettings, Settings, Verb};
+    use super::{Cli, ConsensusSettings, LoadSettings, Scheme, Settings, Verb, WalletVerb};
 
     #[test]
     fn a_registered_halo_address_refuses_a_bind_only_host_and_run_binds_one() {
@@ -1159,6 +1282,56 @@ mod tests {
             panic!("run parses");
         };
         assert_eq!(args.halo, Some("0.0.0.0:9100".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_query_is_json_unless_it_says_raw_and_then_its_bytes_come_from_a_file_or_stdin() {
+        let query = |args: &[&str]| {
+            let all = ["ducktape", "query", "files"].into_iter();
+            let parsed = Cli::try_parse_from(all.chain(args.iter().copied()))?;
+            let Verb::Query { query, raw, .. } = parsed.verb else {
+                panic!("not a query");
+            };
+            Ok::<_, clap::Error>((query, raw))
+        };
+        assert_eq!(
+            query(&["\"Head\""]).unwrap(),
+            (Some("\"Head\"".into()), None)
+        );
+        assert_eq!(query(&["--raw"]).unwrap(), (None, Some(None)));
+        assert_eq!(
+            query(&["--raw", "q.bin"]).unwrap(),
+            (None, Some(Some("q.bin".into())))
+        );
+        assert!(query(&[]).is_err());
+        assert!(query(&["\"Head\"", "--raw"]).is_err());
+    }
+
+    #[test]
+    fn a_consent_never_expires_and_is_for_the_active_key_unless_told() {
+        let parsed = Cli::try_parse_from(["ducktape", "wallet", "consent", "--account", "18"]);
+        let Verb::Wallet(WalletVerb::Consent {
+            account,
+            key,
+            scheme,
+            network,
+            expires,
+        }) = parsed.unwrap().verb
+        else {
+            panic!("not a consent");
+        };
+        assert_eq!((account, key, network, expires), (18, None, None, None));
+        assert_eq!(Scheme::from(scheme), Scheme::Ed25519);
+        let passkey = [
+            "ducktape",
+            "wallet",
+            "consent",
+            "--account",
+            "18",
+            "--scheme",
+            "secp256r1",
+        ];
+        assert!(Cli::try_parse_from(passkey).is_ok());
     }
 
     fn run(args: &[&str]) -> Result<Cli, clap::Error> {

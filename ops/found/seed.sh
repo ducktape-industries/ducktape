@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 # Seeds a freshly founded network's first agents: founder creates chief and gives it its own key; chief's key does the rest and creates tech.
-# Usage: DUCKTAPE=<ducktape> TOOL=<found> seed.sh NODE_URL NETWORK NODE_KEY FOUNDER_WORKSPACE FOUNDER_PASSWORD_FILE CHIEF_WORKSPACE CHIEF_PASSWORD_FILE CHIEF_KEY_FILE STEP_DIR
+# Usage: DUCKTAPE=<ducktape> seed.sh NODE_URL NODE_KEY FOUNDER_WORKSPACE FOUNDER_PASSWORD_FILE CHIEF_WORKSPACE CHIEF_PASSWORD_FILE STEP_DIR
 set -euo pipefail
-[ $# -eq 9 ] || { sed -n 3p "$0" >&2; exit 2; }
-node=$1 network=$2 node_key=$3
-founder_workspace=$4 founder_password_file=$5
-chief_workspace=$6 chief_password_file=$7 chief_key_file=$8
-out=$9
+[ $# -eq 7 ] || { sed -n 3p "$0" >&2; exit 2; }
+node=$1 node_key=$2
+founder_workspace=$3 founder_password_file=$4
+chief_workspace=$5 chief_password_file=$6
+out=$7
 B=${DUCKTAPE:?the ducktape binary}
-T=${TOOL:?the found binary}
 model=${MODEL:-claude-opus-5-5}
 service=${SERVICE:-anthropic}
-consent_ttl_ms=900000
 mkdir -p "$out"
 cd "$out"
 
@@ -24,62 +22,61 @@ as() {
   esac
   DUCKTAPE_PASSWORD="$(cat "$password_file")" "$B" --workspace "$workspace" --node "$node" "$@"
 }
-ask() {
-  as founder query "$@"
-}
 land() {
-  local who=$1 name=$2 program=$3; shift 3
+  local who=$1 name=$2 program=$3 op=$4
   [ -e "$name.landed" ] && { cat "$name.landed"; return; }
-  "$T" "$@" > "$name.bin"
-  as "$who" submit "$program" "$name.bin" --land | tee "$name.landed"
-  grep -q '^landed [0-9]* applied' "$name.landed" || { echo "seed: $name did not apply" >&2; exit 1; }
+  as "$who" op "$program" "$op" --land > "$name.json"
+  mv "$name.json" "$name.landed"
+  cat "$name.landed"
 }
 returned() {
-  "$T" d-number "$(awk '/^landed/ {print $4}' "$1.landed")"
+  grep -oE '"returned":[0-9]+' "$1.landed" | cut -d: -f2
 }
 active_key() {
   as "$1" wallet list | awk '$1 == "*" {print $3}'
 }
 put_config() {
   local who=$1 name=$2 path=$3
-  "$T" config "$model" 65535 high web 5000 650000 "$name.prompt" > "$name.md"
-  [ -e "$name.blob" ] || as "$who" blob put "$name.md" --kind chunk --wait | tee "$name.blob"
-  local id; id=$(grep -oE '(sha256:)?[0-9a-f]{64}' "$name.blob" | head -1)
-  land "$who" "$name-commit" files commit-file "seed $path" "$path" "$(stat -c %s "$name.md")" "$id"
+  [ -e "$name.md" ] || {
+    printf '+++\nmodel = "%s"\nmax_tokens = 65535\nthinking = "high"\nserver_tools = ["web_search", "web_fetch"]\nsettle = "5s"\ncompact_at = 650000\n+++\n' "$model"
+    cat "$name.prompt"
+  } > "$name.md"
+  [ -e "$name.blob" ] || as "$who" blob put "$name.md" --kind chunk --wait > "$name.blob"
+  local id; id=$(grep -oE '^sha256:[0-9a-f]{64}' "$name.blob" | head -1 | cut -d: -f2)
+  local size; size=$(stat -c %s "$name.md")
+  land "$who" "$name-commit" files "{\"Commit\": {\"base\": null, \"message\": \"seed $path\", \"changes\": [{\"Put\": {\"path\": \"$path\", \"exec\": false, \"meta\": [], \"content\": {\"Chunks\": {\"size\": $size, \"chunks\": [{\"Sha256\": \"$id\"}]}}}}]}}"
 }
 
 for who in founder chief; do
   [ -n "$(active_key "$who")" ] || { echo "seed: $who's workspace holds no active wallet key; run ducktape wallet new $who there first" >&2; exit 1; }
 done
-chief_key=$(active_key chief)
 
-land founder create-founder identity create founder
+land founder create-founder identity '{"Create": {"name": "founder", "scheme": "Ed25519"}}'
 founder=$(returned create-founder)
-land founder create-chief identity create-agent chief
+land founder create-chief identity '{"CreateAgent": {"name": "chief"}}'
 chief=$(returned create-chief)
 
 if [ ! -e add-chief-key.landed ]; then
-  "$T" q-generation "$chief_key" > generation.q
-  generation=$(ask identity generation.q | "$T" d-identity | grep -oE '[0-9]+' | head -1)
-  expires=$(( $(date +%s000) + consent_ttl_ms ))
-  land founder add-chief-key identity add-key "$chief_key_file" "$chief_password_file" "$chief" "$network" "$generation" "$expires" chief
+  consent=$(as chief wallet consent --account "$chief")
+  land founder add-chief-key identity "{\"AddKey\": {\"scheme\": \"Ed25519\", \"label\": \"chief\", \"consent\": $consent}}"
 fi
-land founder chief-answers access set-list harness "$("$T" agent-key "$chief")" anyone
+land founder chief-answers access "{\"Set\": {\"program\": \"harness\", \"key\": \"agents/$chief\", \"list\": \"Anyone\"}}"
 
-land chief register-service egress register "$service"
-land chief assign-service egress assign "$service" "$node_key"
-land chief set-model harness set-model "$model" "$service" "$model"
+land chief register-service egress "{\"Register\": {\"service\": \"$service\"}}"
+land chief assign-service egress "{\"Assign\": {\"service\": \"$service\", \"nodes\": [\"$node_key\"]}}"
+land chief set-model harness "{\"SetModel\": {\"id\": \"$model\", \"wire\": \"AnthropicMessages\", \"service\": \"$service\", \"name\": \"$model\"}}"
 
+network=$(as chief status | awk '$1 == "network" {print $2}')
 [ -e chief.prompt ] || printf 'You are chief (account %s), the operator agent of the %s network. Your full prompt is still to be seeded.\n' "$chief" "$network" > chief.prompt
 put_config chief chief /shared/agents/chief/md
-land chief script-chief identity set-script "$chief" /shared/agents/chief/md
+land chief script-chief identity "{\"SetScript\": {\"account\": $chief, \"script\": {\"calls\": \"harness\", \"config\": \"/shared/agents/chief/md\"}}}"
 
-land chief create-tech identity create-agent tech
+land chief create-tech identity '{"CreateAgent": {"name": "tech"}}'
 tech=$(returned create-tech)
 [ -e tech.prompt ] || printf 'You are tech (account %s), the engineer agent of the %s network, managed by chief (account %s). Your full prompt is still to be seeded.\n' "$tech" "$network" "$chief" > tech.prompt
 put_config chief tech /shared/agents/tech/md
-land chief script-tech identity set-script "$tech" /shared/agents/tech/md
-land chief tech-answers access set-list harness "$("$T" agent-key "$tech")" anyone
-land chief tech-conversations access set-list harness "$("$T" conversation-key "$tech")" "listed:$chief"
+land chief script-tech identity "{\"SetScript\": {\"account\": $tech, \"script\": {\"calls\": \"harness\", \"config\": \"/shared/agents/tech/md\"}}}"
+land chief tech-answers access "{\"Set\": {\"program\": \"harness\", \"key\": \"agents/$tech\", \"list\": \"Anyone\"}}"
+land chief tech-conversations access "{\"Set\": {\"program\": \"harness\", \"key\": \"agents/$tech/conversation\", \"list\": {\"Listed\": [{\"Account\": $chief}]}}}"
 
 echo "founder $founder chief $chief tech $tech"

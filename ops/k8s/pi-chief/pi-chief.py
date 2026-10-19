@@ -896,7 +896,7 @@ class Cli:
         return [*self.ducktape, "--workspace", str(self.workspace), "--node", node, *args]
 
     def query(self, program, request):
-        ran = self.runner(self.argv(self.node, "query", program), stdin=request, env=self.env())
+        ran = self.runner(self.argv(self.node, "query", program, "--raw"), stdin=request, env=self.env())
         if ran.code != 0:
             raise Unreached(f"{program} query: {ran.err}")
         return ran.out

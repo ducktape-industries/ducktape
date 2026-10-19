@@ -465,7 +465,7 @@ class Signer:
             return run([*self.ducktape, "submit", program, str(file), "--preconfirm"], env=self.env())
 
     def query(self, program, request):
-        return run([*self.ducktape, "query", program], stdin=request, env=self.env())
+        return run([*self.ducktape, "query", program, "--raw"], stdin=request, env=self.env())
 
 
 class Forge:
