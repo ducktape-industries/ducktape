@@ -3,6 +3,7 @@
 # Each open change into `main` gets a dry-run verdict as a commit status and a review comment; each new `main` is applied once, proven, and rolled back when a base stops answering. reconcile-test.py tests it against a fake node.
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -19,11 +20,19 @@ CONTEXT = "reconcile/egress"
 RESERVED = ("http", "relay")
 ATTEMPTS_PER_LINE = 10
 MODES = ("report", "act")
+NOT_FOUND = "not_found"
 LEVELS = {"report_unposted": "warn", "unread": "warn"}
 
 
 class Unread(Exception):
-    pass
+    def __init__(self, detail, reason=None):
+        super().__init__(detail)
+        self.reason = reason
+
+
+def refusal_reason(said):
+    found = re.search(r"\brefused: ([a-z_]+):", said)
+    return found.group(1) if found else None
 
 
 class Refused(Exception):
@@ -70,7 +79,8 @@ class Cli:
     def call(self, *args):
         done = self.run(*args)
         if done.returncode != 0:
-            raise Unread(done.stderr.decode(errors="replace").strip() or f"ducktape exited {done.returncode}")
+            said = done.stderr.decode(errors="replace").strip() or f"ducktape exited {done.returncode}"
+            raise Unread(said, refusal_reason(said))
         return json.loads(done.stdout)
 
     def query(self, program, query):
@@ -102,7 +112,12 @@ class Forge:
         page = {"after": None, "limit": None}
         while True:
             query = {"Tree": {"repo": REPO, "at": commit, "path": hexed(folder), "page": page}}
-            listed = self.cli.query("forge", query)["Tree"]["page"]
+            try:
+                listed = self.cli.query("forge", query)["Tree"]["page"]
+            except Unread as unread:
+                if unread.reason == NOT_FOUND:
+                    return None
+                raise
             for item in listed["items"]:
                 if bytes.fromhex(item["name"]) == name.encode():
                     return item["oid"]

@@ -100,6 +100,50 @@ def world(main_text=LIVE, mode="act"):
     return node, cli, forge, reconcile, temp
 
 
+class Ran:
+    def __init__(self, code, stdout=b"", stderr=b""):
+        self.returncode = code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class RealForge(unittest.TestCase):
+    def forge(self, answer):
+        temp = tempfile.TemporaryDirectory()
+        keys = pathlib.Path(temp.name)
+        (keys / "password").write_text("p")
+        cli = rc.Cli(["ducktape"], "http://node", keys, keys, lambda argv, capture_output, env: answer)
+        return rc.Forge(cli), temp
+
+    def test_a_folder_forge_has_no_entry_for_reads_as_an_absent_file(self):
+        forge, temp = self.forge(Ran(1, stderr=b"refused: not_found: no entry at this path"))
+        with temp:
+            self.assertIsNone(forge.file("a" * 40, PATH))
+
+    def test_a_forge_that_does_not_answer_stays_unread(self):
+        forge, temp = self.forge(Ran(1, stderr=b"error sending request: connection refused"))
+        with temp:
+            with self.assertRaises(rc.Unread) as raised:
+                forge.file("a" * 40, PATH)
+            self.assertIsNone(raised.exception.reason)
+
+    def test_a_main_with_no_egress_folder_still_judges_the_change_that_adds_it(self):
+        node, cli, forge, reconcile, temp = world()
+        with temp:
+            real = forge.file
+
+            def foldered(commit, path):
+                if commit == forge.main:
+                    return None
+                return real(commit, path)
+
+            forge.file = foldered
+            forge.files["3" * 40] = {PATH: WITH_MAC}
+            forge.changes[9] = "3" * 40
+            reconcile.tick()
+            self.assertTrue(forge.verdicts[0][2])
+
+
 class Status(unittest.TestCase):
     def test_the_node_key_and_block_time_read_from_a_recorded_status(self):
         status = bytes.fromhex(STATUS)
