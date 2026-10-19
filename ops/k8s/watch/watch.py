@@ -368,8 +368,14 @@ class Pager:
 
 def flush(cli, channel, outbox, pager):
     left = []
+    chat_down = None
     for item in outbox:
         item = {**item, "tried": item["tried"] + 1}
+        if chat_down is not None:
+            if not item.get("paged"):
+                item = pager.page(item)
+            left.append(item)
+            continue
         try:
             if posted_already(cli, item):
                 say("alert_posted", id=item["id"])
@@ -380,6 +386,7 @@ def flush(cli, channel, outbox, pager):
             problem = "sent, and no block carries it yet" if sent_before else None
         except Unread as error:
             problem = str(error)
+            chat_down = problem
         if problem is not None:
             if worth_a_line(item["tried"]):
                 say("alert_unposted", id=item["id"], attempts=item["tried"], detail=problem)

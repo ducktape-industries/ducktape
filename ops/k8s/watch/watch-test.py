@@ -379,6 +379,22 @@ class Flush(unittest.TestCase):
         self.assertEqual(left[0]["tried"], 25)
         self.assertEqual(cli.ops, [])
 
+    def test_after_chat_fails_once_the_rest_of_the_flush_is_paged_without_calling_chat(self):
+        class Down(FakeCli):
+            calls = 0
+
+            def query(self, program, query, confirmed=False):
+                Down.calls += 1
+                raise watch.Unread("timed out")
+
+        cli = Down()
+        runner = FakePager()
+        items = [{"id": f"watch-{n}", "text": f"t{n}", "tried": 0} for n in range(5)]
+        left = watch.flush(cli, "alerts", items, watch.Pager(["page"], runner))
+        self.assertEqual(Down.calls, 1)
+        self.assertEqual([text for _, text in runner.pages], ["t0", "t1", "t2", "t3", "t4"])
+        self.assertEqual(len(left), 5)
+
     def test_a_pager_that_keeps_failing_logs_at_pages_1_10_and_20(self):
         cli = FakeCli()
         cli.failing = True

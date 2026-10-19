@@ -459,7 +459,9 @@ one up for another network.
   landed, or landed before the pod stopped, is never sent again; one that
   no block carries is sent again each sample under the same id. An alert
   that no block carries by the next sample, or that cannot be sent, is
-  also handed once, as its text on stdin, to the
+  also handed once, as its text on stdin (after the first chat call in a
+  flush fails, the rest of that flush is paged without calling chat), to
+  the
   command `WATCH_PAGER` names (again only after that command fails, with
   `page_failed` logged at the first failed page and every tenth); with
   none named it logs `page_unsent`. An alert that cannot be posted logs
