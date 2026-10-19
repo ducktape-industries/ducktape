@@ -21,7 +21,7 @@ use commonware_storage::{
         },
         sync::{self, EngineError, SourceFor, Target, engine::Config as SyncConfig},
     },
-    translator::TwoCap,
+    translator::EightCap,
 };
 use commonware_utils::range::NonEmptyRange;
 use sha2::Digest as _;
@@ -29,10 +29,10 @@ use sha2::Digest as _;
 use crate::{Error, Result, Slot, SyncFailure};
 
 pub type Family = merkle::mmr::Family;
-pub type Db<E> = Qmdb<Family, E, Digest, Vec<u8>, Sha256, TwoCap, Sequential>;
+pub type Db<E> = Qmdb<Family, E, Digest, Vec<u8>, Sha256, EightCap, Sequential>;
 pub type Op = Operation<Family, Digest, Vec<u8>>;
 pub type SyncTarget = Target<Family, Digest>;
-pub type Config = VariableConfig<TwoCap, ((), (RangeCfg<usize>, ())), Sequential>;
+pub type Config = VariableConfig<EightCap, ((), (RangeCfg<usize>, ())), Sequential>;
 
 pub struct Tuning {
     pub items_per_blob: NonZeroU64,
@@ -68,7 +68,7 @@ pub fn codec_config() -> ((), (RangeCfg<usize>, ())) {
     ((), (RangeCfg::from(..), ()))
 }
 
-pub fn config<E: Context>(context: &E, name: &str) -> Config {
+pub fn config<E: Context>(context: &E, name: &str, live_keys: usize) -> Config {
     let tuning = Tuning::default();
     let page_cache = CacheRef::from_pooler(context, tuning.page_size, tuning.page_cache_pages);
     VariableConfig {
@@ -90,8 +90,8 @@ pub fn config<E: Context>(context: &E, name: &str) -> Config {
             codec_config: codec_config(),
             page_cache,
         },
-        translator: TwoCap,
-        init_cache_size: None,
+        translator: EightCap,
+        init_cache_size: NonZeroUsize::new(live_keys),
         init_buffer: tuning.replay_buffer,
         init_concurrency: (),
     }
@@ -115,8 +115,8 @@ where
     E: Context + Spawner,
 {
     /// Reopens the commitment `name` as it was left.
-    pub async fn open(context: E, name: &str) -> Result<Commitment<E>> {
-        let config = config(&context, name);
+    pub async fn open(context: E, name: &str, live_keys: usize) -> Result<Commitment<E>> {
+        let config = config(&context, name, live_keys);
         let db = Db::<E>::init(context, config).await?;
         Ok(Commitment {
             name: name.to_owned(),
@@ -128,7 +128,7 @@ where
     /// holding: its op log and merkle open apart, because a log a sync left
     /// short of its target does not replay into a database.
     pub(crate) async fn destroy(context: E, name: &str) -> Result<()> {
-        let config = config(&context, name);
+        let config = config(&context, name, 0);
         let log = async {
             journal::contiguous::variable::Journal::<E, Op>::init(
                 context.child("log"),
@@ -334,7 +334,7 @@ where
     S: SourceFor<Db<E>>,
 {
     let tuning = Tuning::default();
-    let db_config = config(&context, name);
+    let db_config = config(&context, name, 0);
     sync::sync(SyncConfig {
         context,
         source,

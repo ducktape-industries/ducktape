@@ -3,11 +3,11 @@ mod overlay;
 mod storage;
 mod view;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use abi::{ProgramId, Root};
 use borsh::{BorshDeserialize, BorshSerialize};
-use commonware_runtime::Spawner;
+use commonware_runtime::{Clock, Spawner};
 use commonware_storage::Context;
 
 pub use commitment::{Commitment, Db, Family, Op, SyncTarget, Tuning, codec_config, digest};
@@ -25,6 +25,12 @@ pub enum Error {
     Sync(String),
     #[error("the commitment of {0} was lost to a failed apply")]
     Lost(String),
+    #[error("the task opening the commitment of {program} ended without opening it: {source}")]
+    Unopened {
+        program: ProgramId,
+        #[source]
+        source: commonware_runtime::Error,
+    },
     #[error("state is corrupt: {0}")]
     Corrupt(String),
 }
@@ -87,11 +93,53 @@ where
         // only a founding opens a store with no committed height, and
         // nothing under its name is its own: a failed founding's or join's
         let fresh = store.storage.height()?.is_none();
-        for program in programs {
-            store.open_program(&program, fresh).await?;
-        }
+        store.commitments = store
+            .open_commitments(programs.into_iter().collect(), fresh)
+            .await?;
         store.reconcile().await?;
         Ok(store)
+    }
+
+    async fn open_commitments(
+        &self,
+        programs: BTreeSet<ProgramId>,
+        fresh: bool,
+    ) -> Result<BTreeMap<ProgramId, Commitment<E>>> {
+        let scans = programs
+            .into_iter()
+            .map(|program| {
+                let keys = self.storage.iter(&program, b"", None, false)?;
+                Ok((program, keys))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let opening: Vec<_> = scans
+            .into_iter()
+            .map(|(program, keys)| {
+                let context = self.context(&program);
+                let name = commitment_name(&self.name, &program);
+                let id = program.clone();
+                let thread = self.context.child("opening").dedicated();
+                let task = thread.spawn(move |clock| async move {
+                    open_commitment(&clock, context, &id, &name, fresh, keys).await
+                });
+                (program, task)
+            })
+            .collect();
+        let mut outcomes = Vec::with_capacity(opening.len());
+        for (program, task) in opening {
+            let outcome = match task.await {
+                Ok(outcome) => outcome,
+                Err(source) => Err(Error::Unopened {
+                    program: program.clone(),
+                    source,
+                }),
+            };
+            outcomes.push((program, outcome));
+        }
+        outcomes
+            .into_iter()
+            .map(|(program, outcome)| outcome.map(|commitment| (program, commitment)))
+            .collect()
     }
 
     pub async fn adopt(
@@ -123,18 +171,19 @@ where
     /// Adds an admitted program's commitment, empty: what another chain, a
     /// failed join or a dropped program left under its id is none of its.
     pub async fn add_program(&mut self, program: &str) -> Result<()> {
-        self.open_program(program, true).await
-    }
-
-    async fn open_program(&mut self, program: &str, fresh: bool) -> Result<()> {
         if self.commitments.contains_key(program) {
             return Ok(());
         }
         let name = commitment_name(&self.name, program);
-        if fresh {
-            Commitment::destroy(self.context(program).child("fresh"), &name).await?;
-        }
-        let commitment = Commitment::open(self.context(program), &name).await?;
+        let commitment = open_commitment(
+            &self.context,
+            self.context(program),
+            program,
+            &name,
+            true,
+            std::iter::empty(),
+        )
+        .await?;
         self.commitments.insert(program.to_owned(), commitment);
         Ok(())
     }
@@ -246,4 +295,33 @@ where
         }
         Ok(())
     }
+}
+
+async fn open_commitment<E>(
+    clock: &impl Clock,
+    context: E,
+    program: &str,
+    name: &str,
+    fresh: bool,
+    keys: impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+) -> Result<Commitment<E>>
+where
+    E: Context + Spawner,
+{
+    let started = clock.current();
+    let live_keys = keys.map(|entry| entry.map(|_| 1)).sum::<Result<usize>>()?;
+    if fresh {
+        Commitment::destroy(context.child("fresh"), name).await?;
+    }
+    let commitment = Commitment::open(context, name, live_keys).await?;
+    let elapsed = clock.current().duration_since(started).unwrap_or_default();
+    tracing::info!(
+        target: "ducktape::state",
+        event = "commitment_opened",
+        program,
+        live_keys,
+        elapsed_ms = elapsed.as_millis(),
+        "the node opened a program's commitment"
+    );
+    Ok(commitment)
 }

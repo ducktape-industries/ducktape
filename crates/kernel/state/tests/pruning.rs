@@ -89,7 +89,7 @@ fn a_commit_prunes_the_log_to_its_floor_and_keeps_the_root_and_every_value() {
         let mut store = Store::open(context.child("store"), "s", storage(&dir), [APP.to_owned()])
             .await
             .unwrap();
-        let mut reference = Commitment::open(context.child("reference"), "reference")
+        let mut reference = Commitment::open(context.child("reference"), "reference", 0)
             .await
             .unwrap()
             .into_db()
@@ -162,7 +162,7 @@ fn crash_inside_a_prune(seed: u64) {
                 Store::open(context.child("store"), "s", storage(dir), [APP.to_owned()])
                     .await
                     .unwrap();
-            let mut reference = Commitment::open(context.child("reference"), "reference")
+            let mut reference = Commitment::open(context.child("reference"), "reference", 0)
                 .await
                 .unwrap()
                 .into_db()
