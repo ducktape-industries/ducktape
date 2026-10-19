@@ -31,10 +31,10 @@ use node::{Preconfirm, Source, Taken};
 use tokio::sync::watch;
 
 pub use client::{Client, Upload};
-pub use cores::{CpuList, pin_block_threads};
 pub use config::{
     ConsensusSettings, DEFAULT_HTTP, DEFAULT_LOG, LoadSettings, NodeConfig, Settings, permits,
 };
+pub use cores::{CpuList, pin_block_threads};
 pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
