@@ -285,7 +285,8 @@ operator writes them, `node.toml`, `egress.toml` and `egress-grants`. Under `sch
 CLI keeps the schema section of each program code it has spoken to in JSON,
 named by the code's id, so `ducktape query` and `ducktape op` fetch a code
 from the node once, not on every call; an id names its bytes, so a kept
-schema never goes stale.
+schema never goes stale, and one that no longer reads is fetched and kept
+again.
 
 ## Answer calls outside the chain
 

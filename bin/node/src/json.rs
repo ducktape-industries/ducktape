@@ -27,20 +27,18 @@ pub async fn interface(
         .get(program)
         .ok_or_else(|| format!("no program named {program} runs on this network"))?;
     let folder = schemas(workspace.dir());
-    let section = match kept(&folder, code) {
-        Some(section) => section,
-        None => {
-            let section = fetched(client, program, code).await?;
-            let _ = keep(&folder, code, &section);
-            section
-        }
-    };
-    Interface::read(&section).map_err(|unreadable| {
+    if let Some(interface) = kept(&folder, code).and_then(|kept| Interface::read(&kept).ok()) {
+        return Ok(interface);
+    }
+    let section = fetched(client, program, code).await?;
+    let interface = Interface::read(&section).map_err(|unreadable| {
         format!(
             "program {program}'s {} section {unreadable}",
             borsh_json::SECTION
         )
-    })
+    })?;
+    let _ = keep(&folder, code, &section);
+    Ok(interface)
 }
 
 async fn fetched(client: &Client, program: &str, code: &BlobId) -> Result<Vec<u8>, String> {
