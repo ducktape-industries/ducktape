@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("server", HERE / "server.py")
@@ -39,6 +40,7 @@ FETCHING = server.Fetching(image="localhost:5000/pods@sha256:00", node="https://
 
 
 DROPPED = "error: unable to upgrade connection: read tcp: connection reset by peer"
+MERGED = "0c46f11b649fcae450bf2f774eb766d5b33e107e"
 LOST = "fatal: no node of duckpond answered: error sending request for url (https://node.example/v1/query)"
 OPEN = bytes([3, 1]) + b"the request's row"
 GONE = bytes([3, 0])
@@ -1502,9 +1504,10 @@ class Fetch(unittest.TestCase):
     def test_a_forge_input_is_cloned_from_the_callers_forge_and_checked_out_at_its_commit(self):
         self.slot(0)
         self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": "83b18766"}}], self.root)
-        clone, checkout = [call[0] for call in self.calls]
+        clone, held, checkout = [call[0] for call in self.calls]
         git = ["git", "-c", "duck.duckpond.node=https://node.example"]
         self.assertEqual(clone, [*git, "clone", "--no-checkout", "duck://duckpond/forge/programs", str(self.root / "0" / "data")])
+        self.assertEqual(held, [*git, "-C", str(self.root / "0" / "data"), "cat-file", "-e", "83b18766^{commit}"])
         self.assertEqual(checkout, [*git, "-C", str(self.root / "0" / "data"), "checkout", "--detach", "83b18766"])
         self.assertEqual((self.root / "0" / "data" / "build.sh").stat().st_mode & 0o777, 0o777)
         self.assertEqual(self.calls[0][2]["DUCKTAPE_DEVICE_KEY_STORE"], "file")
@@ -1543,13 +1546,37 @@ class Fetch(unittest.TestCase):
         self.answers = [ran(code=128, err=LOST), ran(code=128, err=LOST), ran(b""), ran(b"")]
         self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": "83b18766"}}], self.root)
         verbs = [call[0][3] for call in self.calls]
-        self.assertEqual((verbs, self.paused), (["clone", "clone", "clone", "-C"], [1, 2]))
+        self.assertEqual((verbs, self.paused), (["clone", "clone", "clone", "-C", "-C"], [1, 2]))
         self.assertEqual((self.root / "0" / "data" / "build.sh").read_text(), "make")
         lines = self.log.getvalue().splitlines()
         self.assertEqual(len(lines), 3, lines)
         self.assertIn("duck://duckpond/forge/programs was not cloned, it lost its connection, so it is tried again in 2 s", lines[1])
         self.assertIn("error sending request", lines[1])
         self.assertEqual(lines[2], "cloned duck://duckpond/forge/programs at 83b18766")
+
+    def test_a_commit_the_clone_did_not_bring_is_fetched_by_its_id_then_checked_out(self):
+        self.slot(0)
+        self.answers = [ran(b""), ran(code=128, err=f"fatal: Not a valid object name {MERGED}^{{commit}}")]
+        self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": MERGED}}], self.root)
+        inside = ["git", "-c", "duck.duckpond.node=https://node.example", "-C", str(self.root / "0" / "data")]
+        self.assertEqual([call[0] for call in self.calls[2:]], [[*inside, "fetch", "origin", MERGED], [*inside, "checkout", "--detach", MERGED]])
+        self.assertEqual(self.log.getvalue().splitlines(), [f"{MERGED} is on no branch of duck://duckpond/forge/programs, so it was fetched by its id", f"cloned duck://duckpond/forge/programs at {MERGED}"])
+
+    def test_a_fetch_by_id_that_loses_its_connection_is_tried_again_with_doubling_pauses(self):
+        self.slot(0)
+        self.answers = [ran(b""), ran(code=128), ran(code=128, err=LOST), ran(code=128, err=LOST), ran(b""), ran(b"")]
+        self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": MERGED}}], self.root)
+        verbs = [call[0][5] for call in self.calls[1:]]
+        self.assertEqual((verbs, self.paused), (["cat-file", "fetch", "fetch", "fetch", "checkout"], [1, 2]))
+        self.assertIn(f"programs has no commit {MERGED} on any ref, it lost its connection, so it is tried again in 2 s", self.log.getvalue())
+
+    def test_a_commit_the_forge_does_not_hold_says_so_without_trying_again(self):
+        self.slot(0)
+        self.answers = [ran(b""), ran(code=128), ran(code=128, err=f"fatal: remote error: object {MERGED} not found")]
+        with self.assertRaises(server.Refused) as caught:
+            self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": MERGED}}], self.root)
+        self.assertIn(f"programs has no commit {MERGED} on any ref: fatal: remote error: object {MERGED} not found", caught.exception.sentence)
+        self.assertEqual((len(self.calls), self.paused), (3, []))
 
     def test_an_http_answer_is_not_tried_again(self):
         self.slot(0)
@@ -1571,6 +1598,68 @@ class Fetch(unittest.TestCase):
         self.assertEqual(self.calls[1][1], self.calls[2][1])
         self.assertEqual((self.root / "0" / "data").read_bytes(), b"abc")
         self.assertEqual((self.root / "1" / "data").read_bytes(), b"\x00asm")
+
+
+class ForgeRefs(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.log = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.base = pathlib.Path(temp.name)
+        self.root = self.base / "in"
+        (self.root / "0").mkdir(parents=True)
+        forge = self.base / "forge"
+        forge.mkdir()
+        isolated = {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{forge.as_uri()}/.insteadOf",
+            "GIT_CONFIG_VALUE_0": "duck://duckpond/forge/",
+            "GIT_AUTHOR_NAME": "tech",
+            "GIT_AUTHOR_EMAIL": "tech@example",
+            "GIT_COMMITTER_NAME": "tech",
+            "GIT_COMMITTER_EMAIL": "tech@example",
+        }
+        self.enterContext(unittest.mock.patch.dict(os.environ, isolated))
+        self.dev, self.merge = self.forge_with_a_change(forge / "programs")
+        self.fetcher = server.Fetcher(["ducktape"], "https://node.example", "duck://duckpond/forge", self.base / "home")
+
+    def git(self, *argv, cwd):
+        return subprocess.run(["git", *argv], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, work, name):
+        (work / name).write_text(name)
+        self.git("add", name, cwd=work)
+        self.git("commit", "-q", "-m", name, cwd=work)
+
+    def forge_with_a_change(self, bare):
+        work = self.base / "work"
+        self.git("init", "-q", "-b", "dev", str(work), cwd=self.base)
+        self.commit(work, "base")
+        self.git("switch", "-q", "-c", "topic", cwd=work)
+        self.commit(work, "topic")
+        self.git("switch", "-q", "dev", cwd=work)
+        self.commit(work, "dev")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "the change's preview", cwd=work)
+        merge = self.git("rev-parse", "HEAD", cwd=work)
+        self.git("reset", "-q", "--hard", "HEAD~1", cwd=work)
+        self.git("init", "-q", "--bare", str(bare), cwd=self.base)
+        self.git("push", "-q", str(bare), "dev", f"{merge}:refs/changes/7/merge", cwd=work)
+        return self.git("rev-parse", "dev", cwd=work), merge
+
+    def fetched(self, commit):
+        self.fetcher.fetch([{"path": "/w", "forge": {"repo": "programs", "commit": commit}}], self.root)
+        data = self.root / "0" / "data"
+        return self.git("rev-parse", "HEAD", cwd=data), sorted(path.name for path in data.iterdir() if path.name != ".git")
+
+    def test_a_commit_only_a_changes_merge_ref_holds_is_checked_out_with_the_merged_tree(self):
+        self.assertEqual(self.fetched(self.merge), (self.merge, ["base", "dev", "topic"]))
+        self.assertIn("is on no branch of duck://duckpond/forge/programs, so it was fetched by its id", self.log.getvalue())
+
+    def test_a_branch_commit_is_checked_out_from_the_clone_alone(self):
+        self.assertEqual(self.fetched(self.dev), (self.dev, ["base", "dev"]))
+        self.assertEqual(self.log.getvalue().splitlines(), [f"cloned duck://duckpond/forge/programs at {self.dev}"])
 
 
 class Stopped(unittest.TestCase):

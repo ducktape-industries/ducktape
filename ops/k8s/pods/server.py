@@ -1792,7 +1792,9 @@ class Fetcher:
     def forge_input(self, forge, target):
         chain = urlsplit(self.forge).netloc
         remote = f"{self.forge.rstrip('/')}/{forge['repo']}"
+        commit = forge["commit"]
         git = ["git", "-c", f"duck.{chain}.node={self.node}"]
+        inside = [*git, "-C", str(target)]
 
         def clone():
             if target.exists():
@@ -1800,9 +1802,14 @@ class Fetcher:
             return self.runner([*git, "clone", "--no-checkout", remote, str(target)], env=self.env())
 
         self.must(clone, f"{remote} was not cloned")
-        checkout = lambda: self.runner([*git, "-C", str(target), "checkout", "--detach", forge["commit"]], env=self.env())
-        self.must(checkout, f"{forge['repo']} has no commit {forge['commit']}")
-        print(f"cloned {remote} at {forge['commit']}", flush=True)
+        on_a_branch = self.runner([*inside, "cat-file", "-e", f"{commit}^{{commit}}"], env=self.env()).code == 0
+        if not on_a_branch:
+            fetched = lambda: self.runner([*inside, "fetch", "origin", commit], env=self.env())
+            self.must(fetched, f"{forge['repo']} has no commit {commit} on any ref")
+            print(f"{commit} is on no branch of {remote}, so it was fetched by its id", flush=True)
+        checkout = lambda: self.runner([*inside, "checkout", "--detach", commit], env=self.env())
+        self.must(checkout, f"{forge['repo']} has no commit {commit}")
+        print(f"cloned {remote} at {commit}", flush=True)
 
     def files_input(self, files, target):
         self.reader()

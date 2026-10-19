@@ -136,9 +136,12 @@ scripts back a `make` target; see the repository `Makefile`.
   command goes on in the pod, but its answer is lost.
 - The `run` and `out` containers both mount `/out` and every input at its
   path, so `out` reads, packs and pushes from an input after `run` ended.
+- A forge input is a clone of the repository's branches, then a checkout of
+  its commit. A commit no branch holds, such as the merge commit forge makes
+  for a change, is fetched by its id between the two.
 - `server.py fetch` tries a step again when it lost its connection (the
-  clone, which starts again from an empty directory, a files read, a blob
-  get), with the pause doubling from a second and no last attempt, for as
+  clone, which starts again from an empty directory, the fetch of a commit
+  by its id, a files read, a blob get), with the pause doubling from a second and no last attempt, for as
   long as the pod lives: the request that made the pod was answered when the
   pod was created, so no request bounds it, and deleting the pod ends it. An
   HTTP answer, or any other failure, ends the fetch at once. Each try again
