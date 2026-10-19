@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use abi::{BlobId, ProgramId, Refusal};
+use abi::{ProgramId, Refusal};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::{Decode, Encode, Read};
 use consensus::Anchor;
@@ -15,14 +15,12 @@ pub enum Request {
         program: ProgramId,
         request: Vec<u8>,
     },
-    Blob(BlobId),
 }
 
 #[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
 pub enum Response {
     Head(Head),
     Sync(Vec<u8>),
-    Blob(Option<Vec<u8>>),
     Refused(Refusal),
 }
 

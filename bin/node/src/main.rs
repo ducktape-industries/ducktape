@@ -589,7 +589,10 @@ fn execute(cli: Cli) -> Result<(), String> {
             invite,
         } => {
             let invite = invite.map(|hex| decode_invite(&hex)).transpose()?;
+            let log = workspace.settings().sentence()?.log;
+            let log = log.unwrap_or_else(|| noded::DEFAULT_LOG.to_string());
             Runner::new(runtime_config(&workspace)).start(|context| async move {
+                Logs::install(&log)?;
                 noded::join(
                     context,
                     &workspace,

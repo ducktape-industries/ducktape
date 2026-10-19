@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use abi::Receipt;
-use abi::{BlobId, Entry, ProgramId, Refusal, Scan};
+use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::{Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
@@ -279,14 +279,20 @@ async fn answered<T: BorshDeserialize>(response: reqwest::Response) -> Result<T>
     let body = response.bytes().await?;
     match status {
         StatusCode::OK => abi::decode(&body).map_err(Error::Decode),
-        StatusCode::BAD_REQUEST => {
-            let refusal: Refusal = abi::decode(&body).map_err(Error::Decode)?;
-            Err(Error::Refused(refusal))
-        }
-        status => Err(Error::Failed {
+        status => Err(unanswered(status, &body)),
+    }
+}
+
+fn unanswered(status: StatusCode, body: &[u8]) -> Error {
+    match status {
+        StatusCode::BAD_REQUEST => match abi::decode::<Refusal>(body) {
+            Ok(refusal) => Error::Refused(refusal),
+            Err(refusal) => Error::Decode(refusal),
+        },
+        status => Error::Failed {
             status: status.as_u16(),
-            sentence: String::from_utf8_lossy(&body).into_owned(),
-        }),
+            sentence: String::from_utf8_lossy(body).into_owned(),
+        },
     }
 }
 
@@ -296,6 +302,123 @@ impl Exchange for Client {
     async fn exchange(&self, request: Request) -> Result<Response> {
         self.post(route::SYNC, &request).await
     }
+
+    fn stream_blobs(&self, ids: Vec<BlobId>) -> impl Stream<Item = Result<Option<Vec<u8>>>> + Send {
+        futures::stream::once(blob_answers(self.clone(), ids)).flat_map(|opened| match opened {
+            Ok(answers) => answers.left_stream(),
+            Err(error) => futures::stream::once(futures::future::ready(Err(error))).right_stream(),
+        })
+    }
+}
+
+type Body = std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
+
+async fn blob_answers(
+    client: Client,
+    ids: Vec<BlobId>,
+) -> Result<impl Stream<Item = Result<Option<Vec<u8>>>> + Send> {
+    let response = client
+        .http
+        .post(client.url(route::BLOBS))
+        .body(abi::encode(&ids))
+        .send()
+        .await?;
+    let status = response.status();
+    let answered = status == StatusCode::OK;
+    if !answered {
+        let body = response.bytes().await?;
+        return Err(unanswered(status, &body));
+    }
+    let reading = Reading {
+        body: Box::pin(response.bytes_stream()),
+        answer: Answer::default(),
+    };
+    Ok(futures::stream::unfold(Some(reading), next_blob))
+}
+
+struct Reading {
+    body: Body,
+    answer: Answer,
+}
+
+async fn next_blob(reading: Option<Reading>) -> Option<(Result<Option<Vec<u8>>>, Option<Reading>)> {
+    let mut reading = reading?;
+    loop {
+        match reading.answer.take() {
+            Ok(Taken::Blob(framed)) => return Some((Ok(framed), Some(reading))),
+            Ok(Taken::Ended) => return None,
+            Ok(Taken::Wanting) => {}
+            Err(error) => return Some((Err(error), None)),
+        }
+        match reading.body.next().await {
+            Some(Ok(bytes)) => reading.answer.held.extend_from_slice(&bytes),
+            Some(Err(error)) => return Some((Err(error.into()), None)),
+            None => return Some((Err(Error::Short), None)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Answer {
+    held: Vec<u8>,
+    left: Option<u32>,
+}
+
+enum Taken {
+    Blob(Option<Vec<u8>>),
+    Wanting,
+    Ended,
+}
+
+impl Answer {
+    fn take(&mut self) -> Result<Taken> {
+        let Some(left) = self.left else {
+            return self.counted();
+        };
+        if left == 0 {
+            return Ok(Taken::Ended);
+        }
+        let Some((framed, used)) = item(&self.held)? else {
+            return Ok(Taken::Wanting);
+        };
+        self.held.drain(..used);
+        self.left = Some(left - 1);
+        Ok(Taken::Blob(framed))
+    }
+
+    fn counted(&mut self) -> Result<Taken> {
+        let Some(count) = self.held.first_chunk::<4>() else {
+            return Ok(Taken::Wanting);
+        };
+        self.left = Some(u32::from_le_bytes(*count));
+        self.held.drain(..4);
+        self.take()
+    }
+}
+
+type Item = (Option<Vec<u8>>, usize);
+
+fn item(held: &[u8]) -> Result<Option<Item>> {
+    let Some((&tag, rest)) = held.split_first() else {
+        return Ok(None);
+    };
+    match tag {
+        0 => Ok(Some((None, 1))),
+        1 => {
+            let Some(len) = rest.first_chunk::<4>() else {
+                return Ok(None);
+            };
+            let len = u32::from_le_bytes(*len) as usize;
+            let Some(framed) = rest[4..].get(..len) else {
+                return Ok(None);
+            };
+            Ok(Some((Some(framed.to_vec()), 5 + len)))
+        }
+        tag => Err(Error::Decode(Refusal::new(
+            reason::PROTOCOL,
+            format!("a blob answer's item opens with {tag}, not an option's tag"),
+        ))),
+    }
 }
 
 impl Fault for Error {
@@ -303,6 +426,7 @@ impl Fault for Error {
         match self {
             Error::Http(error) => http_failure(error),
             Error::Failed { status, .. } => status_failure(*status),
+            Error::Short => Failure::Transient("source_dropped"),
             Error::Io(_)
             | Error::Founding(_)
             | Error::Settings { .. }

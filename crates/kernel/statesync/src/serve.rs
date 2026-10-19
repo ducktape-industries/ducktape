@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use abi::{BlobId, ProgramId, Refusal, reason};
+use abi::{ProgramId, Refusal, reason};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::types::Height;
 use commonware_storage::qmdb::sync::Source as _;
@@ -41,7 +41,6 @@ pub async fn serve<E: Context>(node: &Node<E>, request: Request) -> Served {
         Request::Sync { program, request } => {
             Served::Answered(sync(node, &program, &request).await)
         }
-        Request::Blob(id) => Served::Answered(blob(node, &id).await),
     }
 }
 
@@ -125,13 +124,6 @@ async fn sync<E: Context>(node: &Node<E>, program: &str, request: &[u8]) -> Resp
     match db.serve(request).await {
         Ok((response, _)) => Response::Sync(response.encode().to_vec()),
         Err(error) => refused(reason::INVALID_INPUT, error),
-    }
-}
-
-async fn blob<E: Context>(node: &Node<E>, id: &BlobId) -> Response {
-    match node.host().blob(id, node.now()).await {
-        Ok(framed) => Response::Blob(framed),
-        Err(error) => refused(reason::NOT_FOUND, error),
     }
 }
 

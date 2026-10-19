@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use futures::StreamExt as _;
 use noded::Client;
 use statesync::{Exchange as _, Failure, Fault as _, Request};
 use tokio::net::TcpListener;
@@ -95,5 +96,58 @@ fn a_certificate_that_does_not_verify_is_definite() {
             }
         });
         assert_eq!(failure_of(base).await, Failure::Definite);
+    });
+}
+
+async fn streaming(chunks: Vec<Vec<u8>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = axum::Router::new().fallback(move || {
+        let chunks = chunks.clone();
+        async move {
+            let parts = chunks.into_iter().map(Ok::<_, std::io::Error>);
+            axum::body::Body::from_stream(futures::stream::iter(parts))
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    base
+}
+
+async fn streamed(base: String, asked: usize) -> Vec<Result<Option<Vec<u8>>, Failure>> {
+    let ids = vec![abi::BlobId::Sha1([0; 20]); asked];
+    Client::new(base)
+        .stream_blobs(ids)
+        .map(|read| read.map_err(|error| error.failure()))
+        .collect()
+        .await
+}
+
+#[test]
+fn a_blob_answer_read_in_pieces_gives_each_blob_whole() {
+    runtime().block_on(async {
+        let page = vec![
+            Some(b"first".to_vec()),
+            None,
+            Some(Vec::new()),
+            Some(vec![7; 300]),
+        ];
+        let bytes = abi::encode(&page);
+        let chunks = bytes.chunks(3).map(<[u8]>::to_vec).collect();
+        let read = streamed(streaming(chunks).await, page.len()).await;
+        let expected: Vec<_> = page.into_iter().map(Ok).collect();
+        assert_eq!(read, expected);
+    });
+}
+
+#[test]
+fn a_blob_answer_cut_short_is_asked_again() {
+    runtime().block_on(async {
+        let page = vec![Some(b"first".to_vec()), Some(b"second".to_vec())];
+        let mut bytes = abi::encode(&page);
+        bytes.truncate(bytes.len() - 3);
+        let read = streamed(streaming(vec![bytes]).await, page.len()).await;
+        let first = Ok(Some(b"first".to_vec()));
+        let cut = Err(Failure::Transient("source_dropped"));
+        assert_eq!(read, vec![first, cut]);
     });
 }

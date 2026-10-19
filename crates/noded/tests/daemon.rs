@@ -2529,11 +2529,16 @@ impl statesync::Exchange for Held {
             statesync::Response::Refused(refusal) if refusal.reason == reason::STALE => {
                 self.gate.stale.fetch_add(1, Ordering::SeqCst);
             }
-            statesync::Response::Sync(_)
-            | statesync::Response::Blob(_)
-            | statesync::Response::Refused(_) => {}
+            statesync::Response::Sync(_) | statesync::Response::Refused(_) => {}
         }
         Ok(response)
+    }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<abi::BlobId>,
+    ) -> impl futures::Stream<Item = noded::Result<Option<Vec<u8>>>> + Send {
+        statesync::Exchange::stream_blobs(&self.client, ids)
     }
 }
 

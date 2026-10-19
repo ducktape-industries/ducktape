@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use abi::{
-    HostOp, role,
+    BlobId, HostOp, role,
     role::{halo, validators},
 };
 use commonware_consensus::marshal::Start;
@@ -20,8 +20,8 @@ use commonware_utils::iter::NonEmpty;
 use consensus::{Certificate, validators_of};
 use fixture_probe::Step;
 use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET};
-use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::{Stream, StreamExt as _};
 use host::{Founding, Genesis, Layer, Limits, Tip};
 use node::{Block, Frame, Node, Sequenced};
 use state::{Storage, Store};
@@ -247,6 +247,20 @@ impl Exchange for Loopback {
         let response = anchored(served, &*self.0).await;
         Ok(abi::decode(&abi::encode(&response)).unwrap())
     }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        let source = self.0.clone();
+        futures::stream::iter(ids).then(move |id| {
+            let source = source.clone();
+            async move {
+                let node = source.node.lock().await;
+                Ok(node.host().blob(&id, node.now()).await.unwrap())
+            }
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -261,6 +275,13 @@ impl Exchange for Refusing {
             "nothing here",
         )))
     }
+
+    fn stream_blobs(
+        &self,
+        _: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        futures::stream::empty()
+    }
 }
 
 /// Serves from the source, except what `withheld` picks: that it refuses
@@ -268,7 +289,7 @@ impl Exchange for Refusing {
 #[derive(Clone)]
 struct Withholding {
     source: Loopback,
-    withheld: fn(&Request) -> bool,
+    withheld: fn(Asked<'_>) -> bool,
     refuses: bool,
 }
 
@@ -276,7 +297,7 @@ impl Exchange for Withholding {
     type Error = Infallible;
 
     async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
-        if !(self.withheld)(&request) {
+        if !(self.withheld)(Asked::Request(&request)) {
             return self.source.exchange(request).await;
         }
         if !self.refuses {
@@ -286,6 +307,20 @@ impl Exchange for Withholding {
             abi::reason::NOT_FOUND,
             "withheld",
         )))
+    }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        let withheld = (self.withheld)(Asked::Blob(0));
+        match (withheld, self.refuses) {
+            (false, _) => self.source.stream_blobs(ids).left_stream(),
+            (true, false) => futures::stream::pending().left_stream().right_stream(),
+            (true, true) => futures::stream::iter(ids.into_iter().map(|_| Ok(None)))
+                .right_stream()
+                .right_stream(),
+        }
     }
 }
 
@@ -302,8 +337,8 @@ impl Exchange for Counting {
     type Error = Infallible;
 
     async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
-        let refused =
-            probe_sync(&request) && self.asked.fetch_add(1, Ordering::SeqCst) >= self.serves;
+        let refused = probe_sync(Asked::Request(&request))
+            && self.asked.fetch_add(1, Ordering::SeqCst) >= self.serves;
         if refused {
             return Ok(Response::Refused(abi::Refusal::new(
                 abi::reason::NOT_FOUND,
@@ -312,25 +347,42 @@ impl Exchange for Counting {
         }
         self.source.exchange(request).await
     }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        self.source.stream_blobs(ids)
+    }
 }
 
 /// Every blob, which a joiner fetches once it has adopted the state.
-fn blobs(request: &Request) -> bool {
-    matches!(request, Request::Blob(_))
+fn blobs(asked: Asked<'_>) -> bool {
+    matches!(asked, Asked::Blob(_))
 }
 
 /// `program`'s sync; the head lists the reserved programs, then identity
 /// and ping, before probe.
-fn syncing(request: &Request, program: &str) -> bool {
-    matches!(request, Request::Sync { program: asked, .. } if asked == program)
+fn syncing(asked: Asked<'_>, program: &str) -> bool {
+    matches!(asked, Asked::Request(Request::Sync { program: syncing, .. }) if syncing == program)
 }
 
-fn probe_sync(request: &Request) -> bool {
-    syncing(request, "probe")
+fn probe_sync(asked: Asked<'_>) -> bool {
+    syncing(asked, "probe")
 }
 
-fn identity_sync(request: &Request) -> bool {
-    syncing(request, "identity")
+fn identity_sync(asked: Asked<'_>) -> bool {
+    syncing(asked, "identity")
+}
+
+#[derive(Clone, Copy)]
+enum Asked<'a> {
+    Request(&'a Request),
+    Blob(usize),
+}
+
+fn past_the_first_blob(asked: Asked<'_>) -> bool {
+    matches!(asked, Asked::Blob(nth) if nth > 0)
 }
 
 /// Joins `name` into `dir` and cuts the join off once it waits on what
@@ -420,7 +472,7 @@ impl Network {
         Loopback(self.source.clone())
     }
 
-    fn withholding(&self, withheld: fn(&Request) -> bool, refuses: bool) -> Withholding {
+    fn withholding(&self, withheld: fn(Asked<'_>) -> bool, refuses: bool) -> Withholding {
         Withholding {
             source: self.exchange(),
             withheld,
@@ -842,8 +894,8 @@ fn a_join_reads_nothing_another_chains_failed_join_adopted() {
         )
         .await
         .err()
-        .expect("a refused blob ends the join");
-        assert!(matches!(error, Error::Refused(_)), "{error}");
+        .expect("a blob the source does not serve ends the join");
+        assert!(matches!(error, Error::Blob(_)), "{error}");
         drop(other);
 
         let mut network = found_as(&context, "second").await;
@@ -1103,7 +1155,8 @@ impl Exchange for Pruning {
     type Error = Infallible;
 
     async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
-        let held = probe_sync(&request) && self.held.fetch_add(1, Ordering::SeqCst) == 0;
+        let held =
+            probe_sync(Asked::Request(&request)) && self.held.fetch_add(1, Ordering::SeqCst) == 0;
         if let (true, Some(start)) = (held, sync_start(&request)) {
             self.prune_past(start).await;
         }
@@ -1115,9 +1168,16 @@ impl Exchange for Pruning {
             Response::Refused(refusal) if refusal.reason == abi::reason::STALE => {
                 self.stale.fetch_add(1, Ordering::SeqCst);
             }
-            Response::Sync(_) | Response::Blob(_) | Response::Refused(_) => {}
+            Response::Sync(_) | Response::Refused(_) => {}
         }
         Ok(response)
+    }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        self.source.stream_blobs(ids)
     }
 }
 
@@ -1220,17 +1280,31 @@ enum Phase {
 #[derive(Clone)]
 struct Cut {
     source: Loopback,
-    cuts: fn(&Request) -> bool,
+    cuts: fn(Asked<'_>) -> bool,
     failure: Failure,
     phase: Arc<Mutex<Phase>>,
     failed: UnboundedSender<()>,
     heads: Arc<AtomicUsize>,
     served: Arc<AtomicUsize>,
+    streams: Arc<AtomicUsize>,
 }
 
 impl Cut {
     fn restore(&self) {
         *self.phase.lock().unwrap() = Phase::Restored;
+    }
+
+    fn down(&self, asked: Asked<'_>) -> bool {
+        let mut phase = self.phase.lock().unwrap();
+        let cut_here = *phase == Phase::Serving && (self.cuts)(asked);
+        if cut_here {
+            *phase = Phase::Down;
+        }
+        let down = *phase == Phase::Down;
+        if down {
+            self.failed.unbounded_send(()).unwrap();
+        }
+        down
     }
 }
 
@@ -1238,16 +1312,7 @@ impl Exchange for Cut {
     type Error = Outage;
 
     async fn exchange(&self, request: Request) -> Result<Response, Outage> {
-        let down = {
-            let mut phase = self.phase.lock().unwrap();
-            let cut_here = *phase == Phase::Serving && (self.cuts)(&request);
-            if cut_here {
-                *phase = Phase::Down;
-            }
-            *phase == Phase::Down
-        };
-        if down {
-            self.failed.unbounded_send(()).unwrap();
+        if self.down(Asked::Request(&request)) {
             return Err(Outage(self.failure));
         }
         if matches!(request, Request::Head) {
@@ -1257,11 +1322,30 @@ impl Exchange for Cut {
         let Ok(response) = self.source.exchange(request).await;
         Ok(response)
     }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Outage>> + Send {
+        self.streams.fetch_add(1, Ordering::SeqCst);
+        let cut = self.clone();
+        self.source
+            .stream_blobs(ids)
+            .enumerate()
+            .map(move |(nth, read)| {
+                let Ok(framed) = read;
+                if cut.down(Asked::Blob(nth)) {
+                    return Err(Outage(cut.failure));
+                }
+                cut.served.fetch_add(1, Ordering::SeqCst);
+                Ok(framed)
+            })
+    }
 }
 
 fn cut(
     network: &Network,
-    cuts: fn(&Request) -> bool,
+    cuts: fn(Asked<'_>) -> bool,
     failure: Failure,
 ) -> (Cut, UnboundedReceiver<()>) {
     let (failed, told) = unbounded();
@@ -1273,11 +1357,12 @@ fn cut(
         failed,
         heads: Arc::new(AtomicUsize::new(0)),
         served: Arc::new(AtomicUsize::new(0)),
+        streams: Arc::new(AtomicUsize::new(0)),
     };
     (cut, told)
 }
 
-fn never(_: &Request) -> bool {
+fn never(_: Asked<'_>) -> bool {
     false
 }
 
@@ -1307,7 +1392,7 @@ async fn join_through(
     joined
 }
 
-fn goes_on_after_an_outage(cuts: fn(&Request) -> bool) {
+fn goes_on_after_an_outage(cuts: fn(Asked<'_>) -> bool) {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         let tip = network
@@ -1319,6 +1404,7 @@ fn goes_on_after_an_outage(cuts: fn(&Request) -> bool) {
         join_through(&context, "unbroken", elsewhere.path(), &unbroken, told, 0)
             .await
             .unwrap();
+        assert_eq!(unbroken.streams.load(Ordering::SeqCst), 1);
 
         let (broken, told) = cut(&network, cuts, transient);
         let dir = tempfile::tempdir().unwrap();
@@ -1349,6 +1435,11 @@ fn a_join_whose_source_drops_mid_sync_asks_again_and_goes_on() {
 #[test]
 fn a_join_whose_source_drops_while_it_fetches_blobs_asks_again_and_goes_on() {
     goes_on_after_an_outage(blobs);
+}
+
+#[test]
+fn a_join_whose_blob_stream_is_cut_mid_way_asks_for_the_blobs_it_lacks_and_goes_on() {
+    goes_on_after_an_outage(past_the_first_blob);
 }
 
 #[test]

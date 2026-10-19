@@ -12,6 +12,7 @@ use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_parallel::Sequential;
 use commonware_storage::qmdb::sync;
 use consensus::{Certificate, validators_of};
+use futures::{Stream, StreamExt as _};
 use node::{Digest, Node, Synced};
 use state::{Commitment, SyncFailure, SyncTarget, commitment_name};
 
@@ -54,6 +55,8 @@ pub enum Error {
     Unrecorded { epoch: u64 },
     #[error("the state names blob {0:?} and the peer does not serve it")]
     Blob(BlobId),
+    #[error("the peer answered {answered} blobs of the {asked} asked")]
+    Blobs { asked: usize, answered: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -81,6 +84,11 @@ pub trait Exchange: Clone + Send + Sync + 'static {
         &self,
         request: Request,
     ) -> impl Future<Output = std::result::Result<Response, Self::Error>> + Send;
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = std::result::Result<Option<Vec<u8>>, Self::Error>> + Send;
 }
 
 pub struct Joined<E: Context> {
@@ -118,10 +126,7 @@ pub async fn join<E: Context, X: Exchange>(
     if let Anchor::Finalized(certificate) = &head.anchor {
         verified(&mut context, &network, &node, certificate)?;
     }
-    for id in node.host().missing_blobs()? {
-        let framed = blob(&asking, id).await?;
-        node.install(id, &framed)?;
-    }
+    installed(&asking, &mut node).await?;
     Ok(Joined {
         node,
         anchor: head.anchor,
@@ -166,7 +171,7 @@ async fn synced_to<E: Context, X: Exchange>(
     targets: &BTreeMap<ProgramId, SyncTarget>,
 ) -> Result<BTreeMap<ProgramId, Commitment<E>>> {
     let mut commitments = BTreeMap::new();
-    for (program, target) in targets {
+    for (synced, (program, target)) in targets.iter().enumerate() {
         let source = Remote {
             asking: asking.clone(),
             program: program.clone(),
@@ -185,6 +190,14 @@ async fn synced_to<E: Context, X: Exchange>(
             SyncFailure::State(error) => Error::State(error),
         })?;
         commitments.insert(program.clone(), commitment);
+        tracing::debug!(
+            target: "ducktape::sync",
+            event = "join_synced",
+            program = program.as_str(),
+            synced = synced + 1,
+            programs = targets.len(),
+            "the join synced a program's commitment"
+        );
     }
     Ok(commitments)
 }
@@ -220,13 +233,101 @@ async fn head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<Head> {
     }
 }
 
-async fn blob<E: Context, X: Exchange>(asking: &Asking<E, X>, id: BlobId) -> Result<Vec<u8>> {
-    match asking.ask(Request::Blob(id)).await? {
-        Response::Blob(Some(framed)) => Ok(framed),
-        Response::Blob(None) => Err(Error::Blob(id)),
-        Response::Refused(refusal) => Err(Error::Refused(refusal)),
-        other => Err(Error::Answer(Box::new(other))),
+async fn installed<E: Context, X: Exchange>(
+    asking: &Asking<E, X>,
+    node: &mut Node<E>,
+) -> Result<()> {
+    let mut missing = node.host().missing_blobs()?;
+    tracing::info!(
+        target: "ducktape::sync",
+        event = "join_fetching_blobs",
+        blobs = missing.len(),
+        "the join asks the source for every blob its state names, in one stream"
+    );
+    let mut attempts: u64 = 0;
+    let mut progress = Progress {
+        blobs: missing.len(),
+        installed: 0,
+    };
+    while !missing.is_empty() {
+        let streamed = streamed(&asking.exchange, node, &missing, &mut progress).await?;
+        missing.drain(..streamed.installed);
+        if let Some(error) = streamed.cut {
+            asking.again(error, &mut attempts).await?;
+        }
     }
+    Ok(())
+}
+
+struct Progress {
+    blobs: usize,
+    installed: usize,
+}
+
+impl Progress {
+    fn installed(&mut self) {
+        let percent = |installed: usize| installed * 100 / self.blobs;
+        let before = percent(self.installed);
+        self.installed += 1;
+        let crossed_a_percent = percent(self.installed) != before;
+        if !crossed_a_percent {
+            return;
+        }
+        tracing::debug!(
+            target: "ducktape::sync",
+            event = "join_blobs",
+            installed = self.installed,
+            blobs = self.blobs,
+            "the join installed another hundredth of the blobs its state names"
+        );
+    }
+}
+
+struct Streamed<F> {
+    installed: usize,
+    cut: Option<F>,
+}
+
+async fn streamed<E: Context, X: Exchange>(
+    exchange: &X,
+    node: &mut Node<E>,
+    missing: &[BlobId],
+    progress: &mut Progress,
+) -> Result<Streamed<X::Error>> {
+    let mut answers = std::pin::pin!(exchange.stream_blobs(missing.to_vec()));
+    let mut installed = 0;
+    while let Some(answer) = answers.next().await {
+        let framed = match answer {
+            Ok(framed) => framed,
+            Err(error) => {
+                return Ok(Streamed {
+                    installed,
+                    cut: Some(error),
+                });
+            }
+        };
+        let Some(&id) = missing.get(installed) else {
+            return Err(Error::Blobs {
+                asked: missing.len(),
+                answered: installed + 1,
+            });
+        };
+        let framed = framed.ok_or(Error::Blob(id))?;
+        node.install(id, &framed)?;
+        progress.installed();
+        installed += 1;
+    }
+    let answered_every_blob = installed == missing.len();
+    if !answered_every_blob {
+        return Err(Error::Blobs {
+            asked: missing.len(),
+            answered: installed,
+        });
+    }
+    Ok(Streamed {
+        installed,
+        cut: None,
+    })
 }
 
 struct Asking<E, X> {
@@ -253,21 +354,26 @@ impl<E: Context, X: Exchange> Asking<E, X> {
                 Ok(response) => return Ok(response),
                 Err(error) => error,
             };
-            let Failure::Transient(reason) = error.failure() else {
-                return Err(Error::Exchange(Box::new(error)));
-            };
-            attempts += 1;
-            let worth_a_line = attempts == 1 || attempts.is_multiple_of(ATTEMPTS_PER_LINE);
-            if worth_a_line {
-                tracing::warn!(
-                    target: "ducktape::sync",
-                    event = "join_unanswered",
-                    reason,
-                    attempts,
-                    "the source did not answer the join; it asks again"
-                );
-            }
-            self.context.sleep(self.pause).await;
+            self.again(error, &mut attempts).await?;
         }
+    }
+
+    async fn again(&self, error: X::Error, attempts: &mut u64) -> Result<()> {
+        let Failure::Transient(reason) = error.failure() else {
+            return Err(Error::Exchange(Box::new(error)));
+        };
+        *attempts += 1;
+        let worth_a_line = *attempts == 1 || attempts.is_multiple_of(ATTEMPTS_PER_LINE);
+        if worth_a_line {
+            tracing::warn!(
+                target: "ducktape::sync",
+                event = "join_unanswered",
+                reason,
+                attempts = *attempts,
+                "the source did not answer the join; it asks again"
+            );
+        }
+        self.context.sleep(self.pause).await;
+        Ok(())
     }
 }
