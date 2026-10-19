@@ -134,8 +134,10 @@ scripts back a `make` target; see the repository `Makefile`.
   out) resolved to its commit, and every object it reaches but the commits
   in `have` and the pod's `refs/remotes` reach, which forge already holds.
   The pack is put as a blob of kind `pack`, and the answer names the
-  `commit`, the `pack` blob (`null` when forge holds every object), its
-  `size` and `objects`. The service pushes nothing: the caller sends forge's
+  `commit`, its `parents`, `commits` (how many commits the pack carries:
+  the commit and every one under it that forge does not hold), the `pack`
+  blob (`null` when forge holds every object), its `size` and `objects`.
+  The service pushes nothing: the caller sends forge's
   `Push` with the pack as its own account, so forge's write list decides as
   for any push.
 - `pods/NAME/blob` `{path | paths, kind, container}` puts a file the pod

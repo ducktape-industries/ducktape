@@ -940,12 +940,14 @@ class Push(Served):
         return [call for call in self.kube.calls if call[0] == "exec"]
 
     def test_a_commit_is_resolved_packed_against_what_forge_has_and_put_as_a_pack_blob(self):
-        self.kube.answer("exec", ran(f"{COMMIT}\n".encode()), ran(pack_of(3)))
+        self.kube.answer("exec", ran(f"{COMMIT} {HAVE}\n1\n".encode()), ran(pack_of(3)))
         body = {"path": "/work/programs", "ref": "j-057/x", "have": [HAVE]}
         status, answer = self.call("POST", "/v1/pods/duckpond-41/push", body)
         self.assertEqual(status, 200, answer)
         expected = {
             "commit": COMMIT,
+            "parents": [HAVE],
+            "commits": 1,
             "objects": 3,
             "size": len(pack_of(3)),
             "kind": "pack",
@@ -956,22 +958,50 @@ class Push(Served):
         }
         self.assertEqual(answer, expected)
         resolve, pack = self.execs()
-        self.assertEqual(resolve, ("exec", "duckpond-41", None, ["sh", "-c", server.RESOLVING, "resolve", "/work/programs", "j-057/x"]))
+        self.assertEqual(resolve, ("exec", "duckpond-41", None, ["sh", "-c", server.RESOLVING, "resolve", "/work/programs", "j-057/x", HAVE]))
         self.assertEqual(pack, ("exec", "duckpond-41", None, ["sh", "-c", server.PACKING, "pack", "/work/programs", COMMIT, HAVE]))
         self.assertEqual(self.signer.puts, [([pack_of(3)], "pack")])
         self.assertEqual((self.signer.submits, self.paused), ([], []))
 
     def test_head_is_the_default_ref_and_the_container_asked_runs_git(self):
-        self.kube.answer("exec", ran(f"{COMMIT}\n".encode()), ran(pack_of(1)))
+        self.kube.answer("exec", ran(f"{COMMIT}\n1\n".encode()), ran(pack_of(1)))
         self.call("POST", "/v1/pods/duckpond-41/push", {"path": "/work/core", "container": "out"})
         resolve, pack = self.execs()
         self.assertEqual((resolve[2], resolve[3][-1], pack[3][4:]), ("out", "HEAD", ["/work/core", COMMIT]))
 
     def test_a_commit_forge_already_holds_answers_no_pack_and_puts_nothing(self):
-        self.kube.answer("exec", ran(f"{COMMIT}\n".encode()), ran(pack_of(0)))
+        self.kube.answer("exec", ran(f"{COMMIT} {HAVE}\n0\n".encode()), ran(pack_of(0)))
         status, answer = self.call("POST", "/v1/pods/duckpond-41/push", {"path": "/work/core", "have": [COMMIT]})
         self.assertEqual((status, answer["pack"], answer["objects"], answer["commit"]), (200, None, 0, COMMIT))
+        self.assertEqual((answer["parents"], answer["commits"]), ([HAVE], 0))
         self.assertEqual(self.signer.puts, [])
+
+    def test_resolving_names_the_parents_and_counts_the_commits_forge_does_not_hold(self):
+        with tempfile.TemporaryDirectory() as work:
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+            env.update(GIT_AUTHOR_NAME="pod", GIT_AUTHOR_EMAIL="pod@pods", GIT_COMMITTER_NAME="pod", GIT_COMMITTER_EMAIL="pod@pods")
+
+            def git(*args):
+                return subprocess.run(["git", "-C", work, *args], env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+            def resolve(*args):
+                ran = subprocess.run(["sh", "-c", server.RESOLVING, "resolve", work, *args], env=env, capture_output=True, text=True)
+                self.assertEqual(ran.returncode, 0, ran.stderr)
+                return ran.stdout.splitlines()
+
+            git("init", "-q")
+            made = []
+            for message in ("landed", "unlanded", "stacked"):
+                git("commit", "-q", "--allow-empty", "-m", message)
+                made.append(git("rev-parse", "HEAD"))
+            landed, unlanded, stacked = made
+            git("update-ref", "refs/remotes/origin/dev", landed)
+            self.assertEqual(resolve("HEAD"), [f"{stacked} {unlanded}", "2"])
+            self.assertEqual(resolve(unlanded), [f"{unlanded} {landed}", "1"])
+            self.assertEqual(resolve("HEAD", unlanded), [f"{stacked} {unlanded}", "1"])
+            self.assertEqual(resolve("HEAD", "ab" * 20), [f"{stacked} {unlanded}", "2"])
+            self.assertEqual(resolve(landed), [landed, "0"])
+            self.assertEqual(subprocess.run(["sh", "-c", server.RESOLVING, "resolve", work, "nowhere"], env=env).returncode, 1)
 
     def test_a_ref_that_names_no_commit_is_refused_in_gits_words(self):
         self.kube.answer("exec", ran(code=1, err="fatal: not a git repository\ncommand terminated with exit code 128"))

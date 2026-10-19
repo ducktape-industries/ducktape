@@ -154,19 +154,32 @@ REQUEST_NUMBER = re.compile(r"[0-9]+")
 KUBERNETES_QUANTITY = re.compile(r"([+-]?)([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+|Ki|Mi|Gi|Ti|Pi|Ei|m|k|M|G|T|P|E)?")
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
-RESOLVING = SAFE_GIT + 'cd "$1" && git rev-parse --verify --quiet "$2^{commit}"\n'
-PACKING = (
-    SAFE_GIT
-    + """cd "$1" || exit
-new=$2
-shift 2
-{
-  echo "$new"
+HAVING = """having() {
+  echo "$1"
+  shift
   for have in "$@"; do
     if git cat-file -e "$have^{commit}" 2>/dev/null; then echo "^$have"; fi
   done
   git for-each-ref --format='^%(objectname)' refs/remotes
-} | git pack-objects --revs --stdout -q
+}
+"""
+RESOLVING = (
+    SAFE_GIT
+    + HAVING
+    + """cd "$1" || exit
+commit=$(git rev-parse --verify --quiet "$2^{commit}") || exit
+shift 2
+git rev-list --parents -n 1 "$commit"
+having "$commit" "$@" | git rev-list --stdin --count
+"""
+)
+PACKING = (
+    SAFE_GIT
+    + HAVING
+    + """cd "$1" || exit
+new=$2
+shift 2
+having "$new" "$@" | git pack-objects --revs --stdout -q
 """
 )
 WATCH_PAUSE = 1
@@ -1816,14 +1829,16 @@ class Service:
             raise Refused(400, f"have holds commit ids, 40 or 64 lowercase hex digits, not {unnamed[0]!r}")
         self.keyed("put the pack")
         container = asked.get("container")
-        resolve = ["sh", "-c", RESOLVING, "resolve", path, rev]
+        resolve = ["sh", "-c", RESOLVING, "resolve", path, rev, *have]
         resolved = self.executed(asked_by, name, container, resolve, again=True)
-        commit = git_output(name, resolved, f"{rev} names no commit in {path}").decode().strip()
+        lines = git_output(name, resolved, f"{rev} names no commit in {path}").decode().splitlines()
+        commit, *parents = lines[0].split()
+        commits = int(lines[1])
         packing = ["sh", "-c", PACKING, "pack", path, commit, *have]
         packed = self.executed(asked_by, name, container, packing, again=True)
         pack = git_output(name, packed, f"{commit} was not packed in {path}")
         objects = objects_of(pack)
-        answer = {"commit": commit, "objects": objects, "size": len(pack), "kind": PACK}
+        answer = {"commit": commit, "parents": parents, "commits": commits, "objects": objects, "size": len(pack), "kind": PACK}
         if objects == 0:
             return 200, {**answer, "pack": None}
         with tempfile.TemporaryDirectory() as temp:
