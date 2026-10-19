@@ -40,10 +40,6 @@ pub struct LoadSettings {
     #[serde(default, deserialize_with = "held_permits")]
     pub halo_datagrams: Option<NonZeroUsize>,
     #[serde(default, deserialize_with = "held_permits")]
-    pub reads_in_flight: Option<NonZeroUsize>,
-    #[serde(default, deserialize_with = "held_permits")]
-    pub uploads_in_flight: Option<NonZeroUsize>,
-    #[serde(default, deserialize_with = "held_permits")]
     pub blob_serves_in_flight: Option<NonZeroUsize>,
     #[serde(default, deserialize_with = "held_permits")]
     pub blob_backlog: Option<NonZeroUsize>,
@@ -140,8 +136,6 @@ impl LoadSettings {
             halo_egress: self.halo_egress.or(under.halo_egress),
             halo_inbound_streams: self.halo_inbound_streams.or(under.halo_inbound_streams),
             halo_datagrams: self.halo_datagrams.or(under.halo_datagrams),
-            reads_in_flight: self.reads_in_flight.or(under.reads_in_flight),
-            uploads_in_flight: self.uploads_in_flight.or(under.uploads_in_flight),
             blob_serves_in_flight: self.blob_serves_in_flight.or(under.blob_serves_in_flight),
             blob_backlog: self.blob_backlog.or(under.blob_backlog),
             blob_gatherers: self.blob_gatherers.or(under.blob_gatherers),
@@ -167,8 +161,6 @@ impl LoadSettings {
     fn load(self) -> LoadConfig {
         let default = LoadConfig::default();
         LoadConfig {
-            reads_in_flight: self.reads_in_flight.unwrap_or(default.reads_in_flight),
-            uploads_in_flight: self.uploads_in_flight.unwrap_or(default.uploads_in_flight),
             blob_backlog: self.blob_backlog.unwrap_or(default.blob_backlog),
             blob_serves_in_flight: self
                 .blob_serves_in_flight

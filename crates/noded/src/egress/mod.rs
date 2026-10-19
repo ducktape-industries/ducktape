@@ -14,7 +14,7 @@ use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{Layer, Tip};
-use node::{Frame, Node, Preconfirm, Source, Taken};
+use node::{Frame, Preconfirm, Source, Taken};
 
 pub use config::{Config, Refused};
 pub use station::Station;
@@ -165,13 +165,25 @@ impl Bound {
 
 impl<E: Context> Worker<E> {
     /// The egress role at the node's tip, if the network binds one.
-    fn role(node: &Node<E>) -> Option<ProgramId> {
-        node.host().roles().get(role::EGRESS).cloned()
+    fn role(source: &host::Source<'_, E>) -> Option<ProgramId> {
+        source.roles().get(role::EGRESS).cloned()
     }
 
-    async fn ask(&self, node: &Node<E>, role: &ProgramId, query: &Query) -> Result<Reply> {
-        let answer = node
-            .query(Layer::Confirmed, Origin::System, role, abi::encode(query))
+    async fn ask(
+        &self,
+        source: &host::Source<'_, E>,
+        role: &ProgramId,
+        query: &Query,
+    ) -> Result<Reply> {
+        let now = self.daemon.now();
+        let answer = source
+            .query(
+                Layer::Confirmed,
+                now,
+                Origin::System,
+                role,
+                abi::encode(query),
+            )
             .await?
             .map_err(Error::Refused)?;
         abi::decode(&answer).map_err(Error::Decode)
@@ -179,11 +191,11 @@ impl<E: Context> Worker<E> {
 
     async fn requests(
         &self,
-        node: &Node<E>,
+        source: &host::Source<'_, E>,
         role: &ProgramId,
         query: &Query,
     ) -> Result<Vec<RequestRow>> {
-        match self.ask(node, role, query).await? {
+        match self.ask(source, role, query).await? {
             Reply::Requests(rows) => Ok(rows),
             Reply::Node(_) | Reply::Serving(_) => Err(Error::Corrupt(
                 "the egress program answered a request listing with something else".into(),
@@ -194,24 +206,25 @@ impl<E: Context> Worker<E> {
     /// The egress role and what it holds for this node at the tip; `None` when the network
     /// binds no egress role there.
     async fn read(&self) -> Result<Option<(ProgramId, Reading)>> {
-        let node = self.daemon.node.lock().await;
-        let Some(role) = Self::role(&node) else {
+        let view = self.daemon.view()?;
+        let source = view.source();
+        let Some(role) = Self::role(&source) else {
             return Ok(None);
         };
         let key = self.daemon.identity.clone();
         let assigned = self
-            .requests(&node, &role, &Query::Assigned { key: key.clone() })
+            .requests(&source, &role, &Query::Assigned { key: key.clone() })
             .await?;
         let Reply::Node(row) = self
-            .ask(&node, &role, &Query::Node { key: key.clone() })
+            .ask(&source, &role, &Query::Node { key: key.clone() })
             .await?
         else {
             return Err(Error::Corrupt(
                 "the egress program answered a node with something else".into(),
             ));
         };
-        let epoch = self.daemon.network.epoch_after(node.tip()?.height);
-        let member = node
+        let epoch = self.daemon.network.epoch_after(view.tip().height);
+        let member = source
             .epoch_members(epoch)?
             .is_some_and(|members| members.iter().any(|member| member.key == key));
         let mut serving = row.map(|row| row.services).unwrap_or_default();
@@ -282,35 +295,34 @@ impl<E: Context> Worker<E> {
             Some(frame) => Unsent::Signed(frame.to_vec()),
             None => Unsent::Op(desk.op(&purpose)?),
         };
+        let frame = match unsent {
+            Unsent::Signed(frame) => frame,
+            Unsent::Op(op) => match self.daemon.view() {
+                Ok(view) => self.sign(view.tip(), &op, role),
+                Err(error) => {
+                    tracing::debug!(
+                        target: TARGET,
+                        event = "egress_unsigned",
+                        ?purpose,
+                        reason = "node_stopped",
+                        %error,
+                        "the egress worker could not anchor a frame"
+                    );
+                    return None;
+                }
+            },
+        };
         let asked = self.daemon.context.current();
-        let mut node = self.daemon.node.lock().await;
+        let taken = self
+            .daemon
+            .submit(frame.clone(), Source::Client, Preconfirm::Off)
+            .await;
         let waited = self
             .daemon
             .context
             .current()
             .duration_since(asked)
             .unwrap_or_default();
-        let frame = match unsent {
-            Unsent::Signed(frame) => frame,
-            Unsent::Op(op) => match node.tip() {
-                Ok(tip) => self.sign(tip, &op, role),
-                Err(error) => {
-                    tracing::warn!(
-                        target: TARGET,
-                        event = "egress_unsigned",
-                        ?purpose,
-                        reason = "tip_unread",
-                        %error,
-                        "the egress worker could not anchor a frame; it tries again next block"
-                    );
-                    return None;
-                }
-            },
-        };
-        let taken = node
-            .submit(frame.clone(), Source::Client, Preconfirm::Off)
-            .await;
-        drop(node);
         let sent = self.taken(taken, frame);
         tracing::trace!(
             target: TARGET,
@@ -344,11 +356,7 @@ impl<E: Context> Worker<E> {
         .encode()
     }
 
-    fn taken(
-        &self,
-        taken: node::Result<std::result::Result<Taken, Refusal>>,
-        frame: Vec<u8>,
-    ) -> Sent {
+    fn taken(&self, taken: Result<std::result::Result<Taken, Refusal>>, frame: Vec<u8>) -> Sent {
         match taken {
             Ok(Ok(Taken::New(_))) => {
                 self.daemon.relay.send([frame.as_slice()]);

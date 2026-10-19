@@ -224,26 +224,6 @@ struct RunArgs {
         long,
         value_parser = permits,
         help = defaulted(
-            "the HTTP reads this node serves at once; the rest wait their turn",
-            "load.reads_in_flight",
-            LoadConfig::default().reads_in_flight
-        )
-    )]
-    reads_in_flight: Option<NonZeroUsize>,
-    #[arg(
-        long,
-        value_parser = permits,
-        help = defaulted(
-            "the uploads (submit, blob put) this node takes at once; the rest wait their turn",
-            "load.uploads_in_flight",
-            LoadConfig::default().uploads_in_flight
-        )
-    )]
-    uploads_in_flight: Option<NonZeroUsize>,
-    #[arg(
-        long,
-        value_parser = permits,
-        help = defaulted(
             "the blobs this node sends to members at once",
             "load.blob_serves_in_flight",
             LoadConfig::default().blob_serves_in_flight
@@ -385,8 +365,6 @@ impl RunArgs {
                 halo_egress: self.halo_egress,
                 halo_inbound_streams: self.halo_inbound_streams,
                 halo_datagrams: self.halo_datagrams,
-                reads_in_flight: self.reads_in_flight,
-                uploads_in_flight: self.uploads_in_flight,
                 blob_serves_in_flight: self.blob_serves_in_flight,
                 blob_backlog: self.blob_backlog,
                 blob_gatherers: self.blob_gatherers,
@@ -1167,8 +1145,6 @@ mod tests {
         for flag in [
             "--halo-inbound-streams",
             "--halo-datagrams",
-            "--reads-in-flight",
-            "--uploads-in-flight",
             "--blob-serves-in-flight",
             "--blob-backlog",
             "--live-session-inbound",
@@ -1215,10 +1191,6 @@ mod tests {
             "32",
             "--halo-datagrams",
             "128",
-            "--reads-in-flight",
-            "16",
-            "--uploads-in-flight",
-            "2",
             "--blob-serves-in-flight",
             "3",
             "--blob-backlog",
@@ -1259,8 +1231,6 @@ mod tests {
                     halo_egress: Some(1_000_000),
                     halo_inbound_streams: Some(count(32)),
                     halo_datagrams: Some(count(128)),
-                    reads_in_flight: Some(count(16)),
-                    uploads_in_flight: Some(count(2)),
                     blob_serves_in_flight: Some(count(3)),
                     blob_backlog: Some(count(40)),
                     blob_gatherers: Some(count(5)),

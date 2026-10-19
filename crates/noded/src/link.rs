@@ -4,7 +4,9 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use arc_swap::ArcSwapOption;
 use std::time::{Duration, SystemTime};
 
 use commonware_runtime::signal::Signal;
@@ -30,14 +32,11 @@ pub struct Linked<E> {
 /// The bound listener a node hands its mesh, until commonware binds it; every child of a
 /// `Linked` shares it.
 #[derive(Clone, Default)]
-struct Handed(Arc<Mutex<Option<std::net::TcpListener>>>);
+struct Handed(Arc<ArcSwapOption<std::net::TcpListener>>);
 
 impl Handed {
     fn take(&self) -> Option<std::net::TcpListener> {
-        self.0
-            .lock()
-            .expect("the handed listener's lock is never poisoned")
-            .take()
+        self.0.swap(None).and_then(Arc::into_inner)
     }
 }
 
@@ -89,7 +88,7 @@ impl<E> Linked<E> {
         Linked {
             context,
             idle,
-            handed: Handed(Arc::new(Mutex::new(Some(listener)))),
+            handed: Handed(Arc::new(ArcSwapOption::from_pointee(listener))),
         }
     }
 

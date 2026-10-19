@@ -52,6 +52,11 @@ impl Drop for Engine {
 }
 
 impl Engine {
+    pub(crate) async fn stop(mut self) {
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+    }
+
     pub(crate) fn start<E, C, S, R, B>(
         context: E,
         partition: &str,

@@ -11,15 +11,17 @@ use blob::{Blobs, Layered, Stage};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Ran, Runtime, Suspended};
-use state::{Overlay, Storage, Store, View};
+use state::{Committed, Overlay, Reads, View};
 
 use crate::{Error, Result, crypto, namespace, parked};
 
+#[derive(Clone)]
 pub struct Loaded {
     runtime: Runtime,
     programs: BTreeMap<ProgramId, Slot>,
 }
 
+#[derive(Clone)]
 enum Slot {
     Running { code: BlobId, module: Code },
     Awaiting { code: BlobId },
@@ -142,7 +144,7 @@ pub struct World<'a, E>
 where
     E: Context + Spawner,
 {
-    pub store: &'a Store<E>,
+    pub store: Committed<'a, E>,
     pub blobs: &'a Blobs,
     pub loaded: &'a Loaded,
     pub network: &'a [u8],
@@ -607,7 +609,7 @@ where
         if unwatched || noted {
             return Ok(());
         }
-        let view = View::new(self.world.store.storage(), vec![&*self.overlay]);
+        let view = View::new(self.world.store.reads(), vec![&*self.overlay]);
         let existed = view.get(&self.env.me, key)?.is_some();
         self.touched.insert(key.to_vec(), existed);
         Ok(())
@@ -641,7 +643,7 @@ where
         payload: Vec<u8>,
         acting: Option<AccountNumber>,
     ) -> Result<HostReply> {
-        let ticket = parked::take_ticket(self.world.store.storage(), self.overlay)?;
+        let ticket = parked::take_ticket(self.world.store.reads(), self.overlay)?;
         self.effects.calls.push(Called {
             ticket,
             target,
@@ -670,7 +672,7 @@ where
                 "only the awaits role resumes a frame",
             )));
         }
-        let view = View::new(self.world.store.storage(), vec![&*self.overlay]);
+        let view = View::new(self.world.store.reads(), vec![&*self.overlay]);
         let parked = parked::record(&view, frame)?.is_some();
         let resuming = self
             .effects
@@ -842,12 +844,12 @@ where
     };
     let effects = match &outcome {
         Outcome::Applied { .. } => Effects {
-            writes: written(world.store.storage(), overlay, program, tables, touched)?,
+            writes: written(world.store.reads(), overlay, program, tables, touched)?,
             ..effects
         },
         Outcome::Rejected(_) => {
             overlay.restore(checkpoint);
-            discard_unrostered(world.store.storage(), overlay, stage)?;
+            discard_unrostered(world.store.reads(), overlay, stage)?;
             Effects::default()
         }
     };
@@ -864,7 +866,7 @@ where
 /// held a value before it and holds one after. A key that held none either
 /// side changed nothing, and is left out.
 fn written(
-    storage: &Storage,
+    storage: &Reads,
     overlay: &Overlay,
     program: &str,
     tables: &[Table],
@@ -890,7 +892,7 @@ fn written(
 }
 
 pub(crate) fn discard_unrostered(
-    storage: &Storage,
+    storage: &Reads,
     overlay: &Overlay,
     stage: &mut Stage,
 ) -> Result<()> {

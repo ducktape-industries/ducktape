@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
+
 use abi::Refusal;
 
 use commonware_broadcast::buffered;
@@ -23,6 +25,7 @@ use commonware_storage::archive::{self, Archive as _, Identifier, immutable};
 use commonware_storage::metadata::{self, Metadata};
 use commonware_utils::vec::NonEmptyVec;
 use node::{Block, Digest};
+use tokio::sync::RwLock;
 
 use crate::anchor::Anchor;
 use crate::chain::{App, Chain};
@@ -53,10 +56,12 @@ pub struct Marshal {
     anchor: Anchor,
     actor: Handle<()>,
     broadcast: Handle<()>,
+    backfill: Handle<()>,
 }
 
 impl Drop for Marshal {
     fn drop(&mut self) {
+        self.backfill.abort();
         self.actor.abort();
         self.broadcast.abort();
     }
@@ -147,20 +152,28 @@ impl Marshal {
         );
         let broadcast = broadcast_engine.start(transport.lanes.broadcast);
 
-        let resolver = backfill::init(
-            context.child("backfill"),
-            backfill::Config {
-                public_key: transport.me,
-                peer_provider: transport.provider,
-                blocker: transport.blocker,
-                mailbox_size: MAILBOX,
-                timeout: cadence.fetch_timeout(),
-                fetch_retry_timeout: cadence.fetch_timeout(),
-                priority_requests: false,
-                priority_responses: false,
-            },
-            transport.lanes.backfill,
-        );
+        let config = backfill::Config {
+            public_key: transport.me,
+            peer_provider: transport.provider,
+            blocker: transport.blocker,
+            mailbox_size: MAILBOX,
+            timeout: cadence.fetch_timeout(),
+            fetch_retry_timeout: cadence.fetch_timeout(),
+            priority_requests: false,
+            priority_responses: false,
+        };
+        let lanes = transport.lanes.backfill;
+        let (resolved, resolving) = futures::channel::oneshot::channel();
+        let backfill = context.child("backfill").spawn(move |context| async move {
+            let resolver = backfill::init(context, config, lanes);
+            if resolved.send(resolver).is_err() {
+                return;
+            }
+            futures::future::pending::<()>().await
+        });
+        let resolver = resolving
+            .await
+            .expect("the backfill task hands back its resolver");
 
         let (actor, mailbox, _) = Actor::init(
             context.child("marshal"),
@@ -193,8 +206,13 @@ impl Marshal {
             anchor,
             actor,
             broadcast,
+            backfill,
         };
-        let summaries = Summaries(Arc::new(futures::lock::Mutex::new(Some(summaries))));
+        let span = span_of(&summaries.blocks).map(Arc::new);
+        let summaries = Summaries {
+            kept: Arc::new(RwLock::new(Some(summaries))),
+            span: Arc::new(ArcSwapOption::new(span)),
+        };
         (marshal, summaries)
     }
 
@@ -204,6 +222,13 @@ impl Marshal {
 
     pub fn anchor(&self) -> &Anchor {
         &self.anchor
+    }
+
+    pub async fn stop(mut self) {
+        self.backfill.abort();
+        let _ = (&mut self.backfill).await;
+        self.actor.abort();
+        self.broadcast.abort();
     }
 
     pub async fn processed(&self) -> Option<u64> {
@@ -240,11 +265,17 @@ struct Kept<E: Context> {
     txs: SummaryArchive<E>,
 }
 
-pub struct Summaries<E: Context>(Arc<futures::lock::Mutex<Option<Kept<E>>>>);
+pub struct Summaries<E: Context> {
+    kept: Arc<RwLock<Option<Kept<E>>>>,
+    span: Arc<ArcSwapOption<(u64, u64)>>,
+}
 
 impl<E: Context> Clone for Summaries<E> {
     fn clone(&self) -> Self {
-        Summaries(self.0.clone())
+        Summaries {
+            kept: self.kept.clone(),
+            span: self.span.clone(),
+        }
     }
 }
 
@@ -256,7 +287,7 @@ impl<E: Context> Summaries<E> {
         summary: Vec<u8>,
         txs: &[[u8; 32]],
     ) -> Result<(), SummariesError> {
-        let mut slot = self.0.lock().await;
+        let mut slot = self.kept.write().await;
         let Kept {
             blocks,
             txs: mut places,
@@ -282,6 +313,7 @@ impl<E: Context> Summaries<E> {
             places
         };
         let blocks = blocks.put_sync(height, id, summary).await?;
+        self.span.store(span_of(&blocks).map(Arc::new));
         *slot = Some(Kept {
             blocks,
             txs: places,
@@ -290,25 +322,25 @@ impl<E: Context> Summaries<E> {
     }
 
     pub async fn get(&self, height: u64) -> Result<Option<Vec<u8>>, SummariesError> {
-        let slot = self.0.lock().await;
+        let slot = self.kept.read().await;
         let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
         Ok(kept.blocks.get(Identifier::Index(height)).await?)
     }
 
     pub async fn get_by_id(&self, id: Digest) -> Result<Option<Vec<u8>>, SummariesError> {
-        let slot = self.0.lock().await;
+        let slot = self.kept.read().await;
         let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
         Ok(kept.blocks.get(Identifier::Key(&id)).await?)
     }
 
     pub async fn has(&self, height: u64) -> Result<bool, SummariesError> {
-        let slot = self.0.lock().await;
+        let slot = self.kept.read().await;
         let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
         Ok(kept.blocks.has(Identifier::Index(height)).await?)
     }
 
     pub async fn place(&self, tx: [u8; 32]) -> Result<Option<(u64, u32)>, SummariesError> {
-        let slot = self.0.lock().await;
+        let slot = self.kept.read().await;
         let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
         let Some(bytes) = kept.txs.get(Identifier::Key(&Digest::from(tx))).await? else {
             return Ok(None);
@@ -318,11 +350,13 @@ impl<E: Context> Summaries<E> {
             .map_err(SummariesError::Decode)
     }
 
-    pub async fn span(&self) -> Result<Option<(u64, u64)>, SummariesError> {
-        let slot = self.0.lock().await;
-        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
-        Ok(kept.blocks.first_index().zip(kept.blocks.last_index()))
+    pub fn span(&self) -> Option<(u64, u64)> {
+        self.span.load().as_deref().copied()
     }
+}
+
+fn span_of<E: Context>(blocks: &SummaryArchive<E>) -> Option<(u64, u64)> {
+    blocks.first_index().zip(blocks.last_index())
 }
 
 async fn seed_epoch_cache_floor<E: Context>(context: E, prefix: &str, anchor: &Anchor) {

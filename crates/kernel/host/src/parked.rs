@@ -4,7 +4,7 @@ use abi::role::awaits::{FrameId, Ticket};
 use abi::{BlobId, Cause, ItemRef, Origin, Principal, ProgramId, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use runtime::{Image, Page};
-use state::{Overlay, Storage, View};
+use state::{Overlay, Reads, View};
 
 use crate::namespace::PARKED;
 use crate::{Result, corrupt};
@@ -63,17 +63,17 @@ pub fn counter(view: &View<'_>, space: &str, key: &[u8]) -> Result<u64> {
         .unwrap_or(0))
 }
 
-fn take(storage: &Storage, overlay: &mut Overlay, key: &[u8]) -> Result<u64> {
+fn take(storage: &Reads, overlay: &mut Overlay, key: &[u8]) -> Result<u64> {
     let next = counter(&View::new(storage, vec![&*overlay]), PARKED, key)?;
     overlay.set(PARKED, key.to_vec(), (next + 1).to_be_bytes().to_vec());
     Ok(next)
 }
 
-pub fn take_ticket(storage: &Storage, overlay: &mut Overlay) -> Result<Ticket> {
+pub fn take_ticket(storage: &Reads, overlay: &mut Overlay) -> Result<Ticket> {
     take(storage, overlay, NEXT_TICKET)
 }
 
-pub fn take_frame(storage: &Storage, overlay: &mut Overlay) -> Result<FrameId> {
+pub fn take_frame(storage: &Reads, overlay: &mut Overlay) -> Result<FrameId> {
     take(storage, overlay, NEXT_FRAME)
 }
 
@@ -107,7 +107,7 @@ pub fn load(view: &View<'_>, id: FrameId) -> Result<Option<(Parked, Image)>> {
 }
 
 pub fn save(
-    storage: &Storage,
+    storage: &Reads,
     overlay: &mut Overlay,
     id: FrameId,
     parked: Parked,
@@ -127,7 +127,7 @@ pub fn save(
     Ok(())
 }
 
-pub fn remove(storage: &Storage, overlay: &mut Overlay, id: FrameId, program: &str) -> Result<()> {
+pub fn remove(storage: &Reads, overlay: &mut Overlay, id: FrameId, program: &str) -> Result<()> {
     drop_image(storage, overlay, id)?;
     overlay.delete(PARKED, of_key(program, id));
     overlay.delete(PARKED, frame_key(id));
@@ -144,7 +144,7 @@ pub fn of(view: &View<'_>, program: &str) -> Result<Vec<FrameId>> {
         .collect())
 }
 
-fn drop_image(storage: &Storage, overlay: &mut Overlay, id: FrameId) -> Result<()> {
+fn drop_image(storage: &Reads, overlay: &mut Overlay, id: FrameId) -> Result<()> {
     let view = View::new(storage, vec![&*overlay]);
     let Some(shape) = view.get(PARKED, &shape_key(id))? else {
         return Ok(());

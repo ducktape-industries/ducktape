@@ -1,6 +1,8 @@
-use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use arc_swap::ArcSwapOption;
 
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
@@ -13,29 +15,38 @@ const RING: usize = 4096;
 
 type Filter = reload::Handle<EnvFilter, Registry>;
 
-static LOGS: OnceLock<Logs> = OnceLock::new();
-/// Two nodes in one process (the daemon tests) could both find `LOGS` empty
-/// and race to set the global subscriber: installs take turns.
-static INSTALL: Mutex<()> = Mutex::new(());
+static LOGS: OnceLock<Result<Logs, String>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct Logs {
-    ring: Arc<Mutex<VecDeque<String>>>,
+    ring: Arc<Lines>,
     filter: Filter,
+}
+
+struct Lines {
+    slots: Box<[ArcSwapOption<Line>]>,
+    next: AtomicU64,
+}
+
+struct Line {
+    at: u64,
+    text: String,
 }
 
 impl Logs {
     pub fn install(directives: &str) -> Result<Logs, String> {
-        let _turn = INSTALL
-            .lock()
-            .expect("the log install lock is never poisoned");
-        if let Some(logs) = LOGS.get() {
-            logs.retune(directives)?;
-            return Ok(logs.clone());
-        }
+        let logs = LOGS.get_or_init(|| Logs::installed(directives)).clone()?;
+        logs.retune(directives)?;
+        Ok(logs)
+    }
+
+    fn installed(directives: &str) -> Result<Logs, String> {
         let filter = EnvFilter::try_new(directives).map_err(|error| error.to_string())?;
         let (filter, handle) = reload::Layer::new(filter);
-        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING)));
+        let ring = Arc::new(Lines {
+            slots: (0..RING).map(|_| ArcSwapOption::empty()).collect(),
+            next: AtomicU64::new(0),
+        });
         let logs = Logs {
             ring: ring.clone(),
             filter: handle,
@@ -46,16 +57,21 @@ impl Logs {
             .with(Ring { ring })
             .try_init()
             .map_err(|error| error.to_string())?;
-        Ok(LOGS.get_or_init(|| logs).clone())
+        Ok(logs)
     }
 
     pub fn lines(&self) -> Vec<String> {
-        self.ring
-            .lock()
-            .expect("the log ring lock is never poisoned")
+        let end = self.ring.next.load(Ordering::Acquire);
+        let start = end.saturating_sub(RING as u64);
+        let mut kept: Vec<Arc<Line>> = self
+            .ring
+            .slots
             .iter()
-            .cloned()
-            .collect()
+            .filter_map(ArcSwapOption::load_full)
+            .filter(|line| (start..end).contains(&line.at))
+            .collect();
+        kept.sort_unstable_by_key(|line| line.at);
+        kept.iter().map(|line| line.text.clone()).collect()
     }
 
     pub fn retune(&self, directives: &str) -> Result<(), String> {
@@ -67,7 +83,7 @@ impl Logs {
 }
 
 struct Ring {
-    ring: Arc<Mutex<VecDeque<String>>>,
+    ring: Arc<Lines>,
 }
 
 impl<S> Layer<S> for Ring
@@ -78,14 +94,9 @@ where
         let metadata = event.metadata();
         let mut line = format!("{} {}", metadata.level(), metadata.target());
         event.record(&mut Fields(&mut line));
-        let mut ring = self
-            .ring
-            .lock()
-            .expect("the log ring lock is never poisoned");
-        if ring.len() == RING {
-            ring.pop_front();
-        }
-        ring.push_back(line);
+        let at = self.ring.next.fetch_add(1, Ordering::AcqRel);
+        let slot = &self.ring.slots[(at % RING as u64) as usize];
+        slot.store(Some(Arc::new(Line { at, text: line })));
     }
 }
 

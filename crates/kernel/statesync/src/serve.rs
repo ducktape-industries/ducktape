@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use abi::{BlobId, Refusal, reason};
+use abi::{BlobId, ProgramId, Refusal, reason};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::types::Height;
 use commonware_storage::qmdb::sync::Source as _;
@@ -10,7 +10,7 @@ use node::Node;
 
 use crate::Anchor;
 use crate::wire::{Head, Request, Response};
-use crate::{Context, SyncRequest};
+use crate::{Context, SyncRequest, SyncTarget};
 
 pub trait Anchors: Send + Sync {
     fn anchor(&self, tip: Tip) -> impl Future<Output = Option<Anchor>> + Send;
@@ -27,26 +27,54 @@ impl Anchors for MarshalMailbox {
     }
 }
 
-pub async fn serve<E: Context, A: Anchors>(
-    node: &Node<E>,
-    anchors: &A,
-    request: Request,
-) -> Response {
+pub enum Served {
+    Answered(Response),
+    Unanchored {
+        tip: Tip,
+        targets: Result<BTreeMap<ProgramId, SyncTarget>, Refusal>,
+    },
+}
+
+pub async fn serve<E: Context>(node: &Node<E>, request: Request) -> Served {
     match request {
-        Request::Head => head(node, anchors).await,
-        Request::Sync { program, request } => sync(node, &program, &request).await,
-        Request::Blob(id) => blob(node, &id).await,
+        Request::Head => head(node),
+        Request::Sync { program, request } => {
+            Served::Answered(sync(node, &program, &request).await)
+        }
+        Request::Blob(id) => Served::Answered(blob(node, &id).await),
     }
 }
 
-async fn head<E: Context, A: Anchors>(node: &Node<E>, anchors: &A) -> Response {
-    let tip = match node.tip() {
-        Ok(tip) => tip,
-        Err(error) => return refused(reason::NOT_FOUND, error),
+pub async fn anchored<A: Anchors>(served: Served, anchors: &A) -> Response {
+    let (tip, targets) = match served {
+        Served::Answered(response) => return response,
+        Served::Unanchored { tip, targets } => (tip, targets),
     };
     let Some(anchor) = anchors.anchor(tip).await else {
         return refused(reason::NOT_FOUND, "the tip has no anchor to start from");
     };
+    match targets {
+        Ok(targets) => Response::Head(Head {
+            tip,
+            anchor,
+            targets,
+        }),
+        Err(refusal) => Response::Refused(refusal),
+    }
+}
+
+fn head<E: Context>(node: &Node<E>) -> Served {
+    let tip = match node.tip() {
+        Ok(tip) => tip,
+        Err(error) => return Served::Answered(refused(reason::NOT_FOUND, error)),
+    };
+    Served::Unanchored {
+        tip,
+        targets: targets(node),
+    }
+}
+
+fn targets<E: Context>(node: &Node<E>) -> Result<BTreeMap<ProgramId, SyncTarget>, Refusal> {
     let mut targets = BTreeMap::new();
     for (program, commitment) in node.host().store().commitments() {
         match commitment.target() {
@@ -54,16 +82,13 @@ async fn head<E: Context, A: Anchors>(node: &Node<E>, anchors: &A) -> Response {
                 targets.insert(program.clone(), target);
             }
             Ok(None) => {
-                return refused(reason::NOT_FOUND, format!("{program} has nothing to sync"));
+                let sentence = format!("{program} has nothing to sync");
+                return Err(Refusal::new(reason::NOT_FOUND, sentence));
             }
-            Err(error) => return refused(reason::NOT_FOUND, error),
+            Err(error) => return Err(Refusal::new(reason::NOT_FOUND, error.to_string())),
         }
     }
-    Response::Head(Head {
-        tip,
-        anchor,
-        targets,
-    })
+    Ok(targets)
 }
 
 async fn sync<E: Context>(node: &Node<E>, program: &str, request: &[u8]) -> Response {

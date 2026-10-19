@@ -127,6 +127,7 @@ where
         let asked = identity::Query::OfProgram(entry.scheduler.clone());
         let fuel = &mut self.loaded.limits().fuel;
         let sender = match self
+            .source()
             .account(asked, height, time, overlay, stage, fuel)
             .await?
         {
@@ -134,10 +135,15 @@ where
             Err(refusal) => return Ok(rejected(&entry.target, refusal)),
         };
         let cause = Cause::Scheduled { entry: entry.id };
-        let env = self.env(&entry.target, &entry.scheduler, sender, cause, height, time);
+        let env = self
+            .source()
+            .env(&entry.target, &entry.scheduler, sender, cause, height, time);
         let checkpoint = overlay.checkpoint();
         let call = ProgramCall::Execute(entry.payload.clone());
-        let receipt = self.run(&entry.target, call, env, overlay, stage).await?;
+        let receipt = self
+            .source()
+            .run(&entry.target, call, env, overlay, stage)
+            .await?;
         if let Outcome::Rejected(_) = receipt.outcome {
             overlay.restore(checkpoint);
             unit::discard_unrostered(self.store.storage(), overlay, stage)?;
@@ -165,7 +171,10 @@ where
             cause: Cause::Direct,
         };
         let call = ProgramCall::Execute(abi::encode(&op));
-        let told = self.run(scheduler, call, env, overlay, stage).await?;
+        let told = self
+            .source()
+            .run(scheduler, call, env, overlay, stage)
+            .await?;
         match told.outcome {
             Outcome::Applied { .. } => Ok(None),
             Outcome::Rejected(refusal) => Ok(Some(refusal)),

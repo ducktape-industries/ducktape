@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use abi::Outcome;
@@ -26,20 +26,25 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use halo::{Class, Halo, Lane, Seat};
 use host::Layer;
-use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source, Taken};
+use node::{Block, Frame, Node, Preconfirm, Sequenced, Source, Taken};
 use tokio::sync::watch;
 
+use crate::changes::Changes;
 use crate::endpoint::Endpoint;
 use crate::live;
 use crate::mesh::{Mesh, Outbound, Tracker};
+use crate::pool::{self, Offer, Pooling};
 use crate::relay::{self, Relay};
 use crate::transport;
+use crate::view::{Current, Facts, View, Views};
 use crate::workspace::{Descriptor, Founding, Workspace};
-use crate::{Client, Context, Daemon, Error, Logs, Result, Shared};
+use crate::writer::{Command, Hold, Sync, Writer};
+use crate::{Client, Context, Daemon, Error, Logs, Result};
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Delivery = (Arc<Block>, Exact);
-type Seating<E> = Membership<E, Outbound<E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant>;
+type Seating<E> =
+    Membership<E, Outbound<E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant<E>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Listen {
@@ -112,13 +117,8 @@ impl HaloConfig {
     }
 }
 
-const READS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero");
-const UPLOADS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadConfig {
-    pub reads_in_flight: NonZeroUsize,
-    pub uploads_in_flight: NonZeroUsize,
     pub blob_backlog: NonZeroUsize,
     pub blob_serves_in_flight: NonZeroUsize,
     pub blob_gatherers: NonZeroUsize,
@@ -136,8 +136,6 @@ impl Default for LoadConfig {
         let blobs = blob::service::Config::default();
         let live = live::Config::default();
         LoadConfig {
-            reads_in_flight: READS_IN_FLIGHT,
-            uploads_in_flight: UPLOADS_IN_FLIGHT,
             blob_backlog: blobs.backlog,
             blob_serves_in_flight: blobs.serving,
             blob_gatherers: blobs.gatherers,
@@ -161,7 +159,6 @@ impl LoadConfig {
         }
     }
 
-    /// The relay's share; its chain reads run under the node's `reads_in_flight`.
     fn live(&self) -> live::Config {
         live::Config {
             session_inbound: self.live_session_inbound,
@@ -170,7 +167,6 @@ impl LoadConfig {
             peer_queue: self.live_peer_queue,
             lane_backlog: self.live_lane_backlog,
             lane_per_sender: self.live_lane_per_sender,
-            reads_in_flight: self.reads_in_flight,
             linger: self.live_linger,
         }
     }
@@ -180,9 +176,10 @@ pub struct Running<E: Context> {
     pub http: SocketAddr,
     pub p2p: SocketAddr,
     pub daemon: Arc<Daemon<E>>,
-    _marshal: Marshal,
-    _mesh: Mesh<E>,
+    marshal: Marshal,
+    mesh: Mesh<E>,
     tasks: Vec<Handle<()>>,
+    rpc: crate::server::Rpc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,14 +208,24 @@ impl<E: Context> Running<E> {
     }
 
     async fn close(self, stop: Stop) -> Result<()> {
-        self.daemon.shutdown.send_replace(true);
-        let mut node = self.daemon.node.lock().await;
-        for task in &self.tasks {
+        let Running {
+            daemon,
+            marshal,
+            mesh,
+            tasks,
+            rpc,
+            ..
+        } = self;
+        daemon.shutdown.send_replace(true);
+        let closed = daemon.writer.close().await;
+        for task in &tasks {
             task.abort();
         }
-        self.daemon.hang_up();
-        node.sync().await?;
-        let height = node.tip()?.height;
+        daemon.hang_up().await;
+        drop(rpc);
+        marshal.stop().await;
+        drop(mesh);
+        let height = closed?;
         tracing::info!(
             target: "ducktape::node",
             event = "node_stopped",
@@ -429,8 +436,17 @@ async fn start<E: Context>(
     )?;
     let member_cap = node.member_cap()?;
     let identity_role = node.host().role(role::IDENTITY)?.clone();
-    let proposer = node.proposer();
-    let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
+    let identity_key = identity.public_key().as_ref().to_vec();
+    let (readers, _) = watch::channel(());
+    let facts = Facts {
+        descriptor: &descriptor,
+        network: &network,
+        identity: &identity_key,
+        readers: &readers,
+    };
+    let base = Arc::new(View::of(&node, &facts)?);
+    let current = Arc::new(Current::new());
+    current.views.store(Some(base.clone()));
 
     // the live door opens on its socket here, beside halo's, before consensus does any work
     let (shutdown, _) = watch::channel(false);
@@ -452,7 +468,7 @@ async fn start<E: Context>(
             genesis: descriptor.genesis_block().digest().0,
             identity: identity_role,
         },
-        Arc::new(node.clone()),
+        Arc::new(Views::new(current.clone(), context.child("views"))),
         halo.clone(),
         door,
         load.live(),
@@ -477,8 +493,25 @@ async fn start<E: Context>(
         roster.seat(*epoch, validators);
     }
 
+    let (tips, _) = watch::channel(tip.height);
+    let relay = Arc::new(Relay::new(
+        identity.public_key(),
+        relay_sender,
+        voters.as_ref(),
+    ));
+    let pooling = pool::start(
+        context.child("pool"),
+        node.network().to_vec(),
+        base,
+        current.clone(),
+        relay.clone(),
+        tips.subscribe(),
+    )?;
     let (inbox, deliveries) = mpsc::unbounded();
-    let chain = Participant { proposer, inbox };
+    let chain = Participant {
+        pool: pooling.clone(),
+        inbox,
+    };
     let (marshal, summaries) = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
@@ -520,66 +553,62 @@ async fn start<E: Context>(
         "the node is up"
     );
 
-    let (tips, _) = watch::channel(tip.height);
+    let (writer, commands) = Writer::new();
+    let (changes, fanout) = Changes::new(network.clone(), tip.height);
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
-        node,
+        current,
+        readers,
+        writer,
+        pool: pooling,
+        changes,
         descriptor: descriptor.clone(),
         network,
-        identity: identity.public_key().as_ref().to_vec(),
+        identity: identity_key,
         anchors: marshal.mailbox().clone(),
         summaries,
+        recent: crate::blocks::Recent::new(),
         logs,
         shutdown,
         tips,
         votes: membership.votes().clone(),
-        relay: Relay::new(identity.public_key(), relay_sender, voters.as_ref()),
+        relay,
         blobs,
         halo,
         live,
         egress,
         key: identity.clone(),
         mesh: transport::loopback(p2p),
-        subscribers: Mutex::new(Vec::new()),
     });
     let founding = tip.height == 0;
     if let Anchor::Genesis(genesis) = marshal.anchor()
         && founding
     {
-        let node = daemon.node.lock().await;
         daemon.record_unrecorded(&node, genesis).await?;
     }
 
     let pump = context.child("pump").spawn({
-        let daemon = daemon.clone();
-        move |_| pump(daemon, membership, tracker, deliveries)
+        let writing = Writing {
+            daemon: daemon.clone(),
+            node,
+            commands,
+            membership,
+            tracker,
+        };
+        move |_| write(writing, deliveries)
     });
     let relayed = context.child("relay").spawn({
         let daemon = daemon.clone();
         move |_| relay::serve(daemon, relay_receiver)
     });
-    let listener = transport::served(listeners.http)?;
-    let http = listener.local_addr()?;
+    let http = listeners.http.local_addr()?;
     let tls = match listeners.tls {
         Some(socket) => Some((transport::served(socket)?, transport::acceptor()?)),
         None => None,
     };
-    let server = context.child("http").spawn({
-        let router = crate::server::router(daemon.clone(), load);
-        let mut down = daemon.shutdown.subscribe();
-        move |_| async move {
-            let served = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = down.wait_for(|down| *down).await;
-                })
-                .await;
-            if let Err(error) = served {
-                tracing::error!(target: "ducktape::http", %error, "the http server stopped");
-            }
-        }
-    });
+    let rpc = crate::server::Rpc::start(daemon.clone(), listeners.http, fanout)?;
     let egressing = crate::egress::spawn(daemon.clone());
-    let mut tasks = vec![pump, server, relayed, egressing];
+    let mut tasks = vec![pump, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(p2p);
         tasks.push(
@@ -593,9 +622,10 @@ async fn start<E: Context>(
         http,
         p2p,
         daemon,
-        _marshal: marshal,
-        _mesh: mesh,
+        marshal,
+        mesh,
         tasks,
+        rpc,
     })
 }
 
@@ -767,25 +797,30 @@ fn recorded_epochs<E: Context>(
     Ok(seated)
 }
 
-#[derive(Clone)]
-pub struct Participant {
-    proposer: Proposer,
+pub struct Participant<E: Context> {
+    pool: Pooling<E>,
     inbox: mpsc::UnboundedSender<Delivery>,
 }
 
-impl Chain for Participant {
+impl<E: Context> Clone for Participant<E> {
+    fn clone(&self) -> Participant<E> {
+        Participant {
+            pool: self.pool.clone(),
+            inbox: self.inbox.clone(),
+        }
+    }
+}
+
+impl<E: Context> Chain for Participant<E> {
     async fn propose(
         &mut self,
         parent: Arc<Block>,
         ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> Option<Block> {
-        let applied = self.proposer.applied().height;
+        let applied = self.pool.applied();
         let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
-        let block = self
-            .proposer
-            .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
-        Some(block)
+        self.pool.build(parent.tip(), unapplied, time).await
     }
 
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
@@ -793,15 +828,82 @@ impl Chain for Participant {
     }
 }
 
-async fn pump<E: Context>(
+struct Writing<E: Context> {
     daemon: Arc<Daemon<E>>,
-    mut membership: Seating<E>,
-    mut tracker: Tracker,
-    mut deliveries: mpsc::UnboundedReceiver<Delivery>,
-) {
-    while let Some((block, ack)) = deliveries.next().await {
-        let outcome = applied(&daemon, &mut membership, &mut tracker, &block).await;
-        if let Err(error) = outcome {
+    node: Node<E>,
+    commands: mpsc::UnboundedReceiver<Command>,
+    membership: Seating<E>,
+    tracker: Tracker,
+}
+
+enum Event {
+    Delivered(Delivery),
+    Unfed,
+    Asked(Option<Command>),
+}
+
+type Closer = futures::channel::oneshot::Sender<Result<u64>>;
+
+enum Flow {
+    Writing,
+    Closing(Closer),
+    Unasked,
+}
+
+enum Held {
+    Sequenced(Sequenced),
+    Closing(Closer),
+    Unasked,
+}
+
+async fn write<E: Context>(mut writing: Writing<E>, deliveries: mpsc::UnboundedReceiver<Delivery>) {
+    let mut deliveries = Some(deliveries);
+    loop {
+        let event = next(&mut deliveries, &mut writing.commands).await;
+        let flow = match event {
+            Event::Delivered(delivery) => delivered(&mut writing, &mut deliveries, delivery).await,
+            Event::Unfed => unfed(&mut deliveries),
+            Event::Asked(command) => asked(&mut writing.node, command).await,
+        };
+        match flow {
+            Flow::Writing => {}
+            Flow::Closing(closer) => return closing(writing, closer).await,
+            Flow::Unasked => return,
+        }
+    }
+}
+
+async fn next(
+    deliveries: &mut Option<mpsc::UnboundedReceiver<Delivery>>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+) -> Event {
+    let Some(fed) = deliveries else {
+        return Event::Asked(commands.next().await);
+    };
+    tokio::select! {
+        delivery = fed.next() => delivery.map_or(Event::Unfed, Event::Delivered),
+        command = commands.next() => Event::Asked(command),
+    }
+}
+
+fn unfed(deliveries: &mut Option<mpsc::UnboundedReceiver<Delivery>>) -> Flow {
+    *deliveries = None;
+    Flow::Writing
+}
+
+async fn delivered<E: Context>(
+    writing: &mut Writing<E>,
+    deliveries: &mut Option<mpsc::UnboundedReceiver<Delivery>>,
+    (block, ack): Delivery,
+) -> Flow {
+    match applied(writing, &block).await {
+        Ok(Flow::Writing) => {
+            ack.acknowledge();
+            Flow::Writing
+        }
+        Ok(Flow::Closing(closer)) => Flow::Closing(closer),
+        Ok(Flow::Unasked) => Flow::Unasked,
+        Err(error) => {
             tracing::error!(
                 target: "ducktape::node",
                 event = "apply_failed",
@@ -809,24 +911,80 @@ async fn pump<E: Context>(
                 %error,
                 "the node cannot apply a finalized block and stops"
             );
-            daemon.shutdown.send_replace(true);
-            return;
+            writing.daemon.shutdown.send_replace(true);
+            *deliveries = None;
+            Flow::Writing
         }
-        ack.acknowledge();
     }
 }
 
-async fn holding<'a, E: Context>(
-    daemon: &'a Daemon<E>,
-    block: &Block,
-) -> Result<(futures::lock::MutexGuard<'a, Node<E>>, Sequenced)> {
+async fn asked<E: Context>(node: &mut Node<E>, command: Option<Command>) -> Flow {
+    let Some(command) = command else {
+        return Flow::Unasked;
+    };
+    match command {
+        Command::Sync(sync) => synced(node, sync).await,
+        Command::Hold(hold) => held(hold).await,
+        Command::Close(closer) => Flow::Closing(closer),
+    }
+}
+
+async fn synced<E: Context>(node: &mut Node<E>, sync: Sync) -> Flow {
+    let served = statesync::serve(node, sync.request).await;
+    let _ = sync.reply.send(served);
+    Flow::Writing
+}
+
+async fn held(hold: Hold) -> Flow {
+    let _ = hold.holding.send(());
+    let _ = hold.released.await;
+    Flow::Writing
+}
+
+async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
+    let Writing {
+        daemon,
+        mut node,
+        commands,
+        membership,
+        tracker,
+    } = writing;
+    daemon.hang_up().await;
+    daemon.current.withdraw();
+    daemon.pool.close().await;
+    drop(commands);
+    membership.stop().await;
+    drop(tracker);
+    let synced = node.sync().await;
+    let closed = synced
+        .map_err(Error::from)
+        .and_then(|()| Ok(node.tip()?.height));
+    daemon.readers.closed().await;
+    drop(node);
+    let _ = closer.send(closed);
+}
+
+fn published<E: Context>(node: &Node<E>, daemon: &Daemon<E>) {
+    match View::of(node, &daemon.facts()) {
+        Ok(view) => {
+            daemon.current.views.store(Some(Arc::new(view)));
+        }
+        Err(error) => tracing::warn!(
+            target: "ducktape::node",
+            event = "view_unpublished",
+            %error,
+            reason = "view_unread",
+            "the node could not pin a view of its state; reads see the last one"
+        ),
+    }
+}
+
+async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<Held> {
     loop {
-        let mut node = daemon.node.lock().await;
-        let applied = node.apply(block).await;
+        let applied = writing.node.apply(block).await;
         let Err(node::Error::Host(host::Error::BlobUnavailable(id))) = applied else {
-            return Ok((node, applied?));
+            return Ok(Held::Sequenced(applied?));
         };
-        drop(node);
         tracing::warn!(
             target: "ducktape::node",
             event = "blob_unavailable",
@@ -835,7 +993,19 @@ async fn holding<'a, E: Context>(
             reason = "blob_missing",
             "the block reads a blob this node lacks; the node fetches it and applies again"
         );
-        daemon.blobs.fetch(id, halo::Class::Critical).await;
+        let fetched = writing.daemon.blobs.fetch(id, halo::Class::Critical);
+        futures::pin_mut!(fetched);
+        loop {
+            let command = tokio::select! {
+                () = &mut fetched => break,
+                command = writing.commands.next() => command,
+            };
+            match asked(&mut writing.node, command).await {
+                Flow::Writing => {}
+                Flow::Closing(closer) => return Ok(Held::Closing(closer)),
+                Flow::Unasked => return Ok(Held::Unasked),
+            }
+        }
     }
 }
 
@@ -846,11 +1016,11 @@ enum Posted {
     Unheld,
 }
 
-async fn reposted<E: Context>(node: &mut Node<E>, posted: Option<Vec<u8>>) -> Result<Posted> {
+async fn reposted<E: Context>(daemon: &Daemon<E>, posted: Option<Vec<u8>>) -> Result<Posted> {
     let Some(receipt) = posted else {
         return Ok(Posted::Unheld);
     };
-    match node
+    match daemon
         .submit(receipt.clone(), Source::Client, Preconfirm::Off)
         .await?
     {
@@ -868,7 +1038,7 @@ async fn reposted<E: Context>(node: &mut Node<E>, posted: Option<Vec<u8>>) -> Re
 
 async fn receipt_for<E: Context>(
     daemon: &Daemon<E>,
-    node: &mut Node<E>,
+    node: &Node<E>,
     height: u64,
     bundle: u64,
 ) -> Result<Option<Vec<u8>>> {
@@ -883,7 +1053,7 @@ async fn receipt_for<E: Context>(
         abi::encode(&blob::contract::Op::Receipt { bundle }),
     )
     .encode();
-    match node
+    match daemon
         .submit(receipt.clone(), Source::Client, Preconfirm::Off)
         .await?
     {
@@ -906,14 +1076,14 @@ async fn receipt_for<E: Context>(
 
 async fn receipts_for<E: Context>(
     daemon: &Daemon<E>,
-    node: &mut Node<E>,
+    node: &Node<E>,
     height: u64,
     due: Vec<blob::service::Due>,
     reseated: bool,
 ) -> Result<Vec<Vec<u8>>> {
     let mut taken = Vec::new();
     for due in due {
-        match reposted(node, due.posted).await? {
+        match reposted(daemon, due.posted).await? {
             Posted::Pending => {}
             Posted::Retaken(receipt) => taken.push(receipt),
             Posted::Refused => {
@@ -927,15 +1097,21 @@ async fn receipts_for<E: Context>(
     Ok(taken)
 }
 
-async fn applied<E: Context>(
-    daemon: &Daemon<E>,
-    membership: &mut Seating<E>,
-    tracker: &mut Tracker,
-    block: &Block,
-) -> Result<()> {
-    let (mut node, sequenced) = holding(daemon, block).await?;
-    // under the node lock, which a /v1/network read holds across the tip
-    // and the book, so no height it serves passes its tip
+async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<Flow> {
+    let sequenced = match holding(writing, block).await? {
+        Held::Sequenced(sequenced) => sequenced,
+        Held::Closing(closer) => return Ok(Flow::Closing(closer)),
+        Held::Unasked => return Ok(Flow::Unasked),
+    };
+    let Writing {
+        daemon,
+        node,
+        membership,
+        tracker,
+        ..
+    } = writing;
+    let daemon: &Daemon<E> = daemon;
+    published(node, daemon);
     daemon.votes.applied(block.digest(), block.height);
     daemon.tips.send_replace(block.height);
     let closes = daemon.network.closes_an_epoch(block.height);
@@ -948,7 +1124,7 @@ async fn applied<E: Context>(
         } => {
             let ran = crate::blocks::ran(block, &carried)?;
             let receipts = std::mem::take(&mut applied.submissions);
-            daemon.record(&node, block, ran, Some(receipts)).await?;
+            daemon.record(node, block, ran, Some(receipts)).await?;
             daemon.publish(&applied);
             let validators = node.host().role(role::VALIDATORS)?;
             let members_written = applied
@@ -959,7 +1135,7 @@ async fn applied<E: Context>(
             let halo = node.host().role(role::HALO)?;
             let lanes_written = rewrites(&applied.writes, halo);
             if lanes_written {
-                retable_halo(daemon, &node, block.height).await;
+                retable_halo(daemon, node, block.height).await;
             }
             let blobs = node.host().role(role::BLOBS)?;
             let writes = applied.writes.programs.get(blobs).cloned();
@@ -967,25 +1143,22 @@ async fn applied<E: Context>(
                 .blobs
                 .applied(block.height, &writes.unwrap_or_default());
             let reseated = members_written || closes;
-            let receipted = receipts_for(daemon, &mut node, block.height, due, reseated).await?;
+            let receipted = receipts_for(daemon, node, block.height, due, reseated).await?;
             (receipted, members_written)
         }
         Sequenced::Replayed => {
-            daemon.record_unrecorded(&node, block).await?;
+            daemon.record_unrecorded(node, block).await?;
             (Vec::new(), false)
         }
     };
     let reseats = members_written || closes;
     if reseats {
-        reseat_halo(daemon, &node, block.height).await;
+        reseat_halo(daemon, node, block.height).await;
     }
     if !opens_an_epoch {
-        let due = node.reoffer();
-        drop(node);
-        daemon
-            .relay
-            .send(due.iter().chain(&receipted).map(Vec::as_slice));
-        return Ok(());
+        daemon.pool.offer(Offer::Due);
+        daemon.relay.send(receipted.iter().map(Vec::as_slice));
+        return Ok(Flow::Writing);
     }
     let epoch = daemon.network.epoch_after(block.height);
     let unrecorded = || Error::Corrupt(format!("the boundary block records no epoch {epoch}"));
@@ -995,20 +1168,17 @@ async fn applied<E: Context>(
         "epoch {epoch} seats an undecodable key"
     )))?;
     let reseated = daemon.relay.seat(seated.as_ref());
-    let due = if reseated {
-        node.reoffer_all()
-    } else {
-        node.reoffer()
+    let offer = match reseated {
+        true => Offer::Every,
+        false => Offer::Due,
     };
-    drop(node);
+    daemon.pool.offer(offer);
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
     tracker.track(epoch, &members);
-    daemon
-        .relay
-        .send(due.iter().chain(&receipted).map(Vec::as_slice));
+    daemon.relay.send(receipted.iter().map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
-    Ok(())
+    Ok(Flow::Writing)
 }
 
 #[cfg(test)]

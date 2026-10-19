@@ -144,6 +144,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1068,6 +1077,7 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "arc-swap",
  "borsh",
  "commonware-actor",
  "commonware-broadcast",
@@ -1091,6 +1101,7 @@ dependencies = [
  "rand_core 0.10.1",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing-subscriber",
 ]
 
@@ -1982,7 +1993,7 @@ dependencies = [
 [[package]]
 name = "fluent31"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/fluent31?rev=76ba1867bc0ba9c09bb8387149c07844f1d2395c#76ba1867bc0ba9c09bb8387149c07844f1d2395c"
+source = "git+https://github.com/ducktape-industries/fluent31?rev=823e0459a7f71ea96460e6754635c0c324980412#823e0459a7f71ea96460e6754635c0c324980412"
 dependencies = [
  "crc32fast",
  "crossbeam-skiplist",
@@ -2245,6 +2256,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2446,6 +2476,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2978,6 +3009,7 @@ name = "noded"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "arc-swap",
  "axum",
  "blob",
  "borsh",
@@ -2997,6 +3029,7 @@ dependencies = [
  "fixture-relay",
  "fixture-valset",
  "fixture-wasm",
+ "fluent31",
  "futures",
  "governor",
  "halo",
@@ -3010,6 +3043,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rcgen",
  "reqwest 0.12.28",
+ "rustix",
  "rustls",
  "serde",
  "state",

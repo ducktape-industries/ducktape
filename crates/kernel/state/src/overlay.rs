@@ -8,12 +8,13 @@ use crate::Writes;
 pub type Slot = Option<Vec<u8>>;
 pub type Slotted<'a> = (&'a [u8], Option<&'a [u8]>);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Overlay {
     programs: BTreeMap<ProgramId, BTreeMap<Vec<u8>, Slot>>,
     undo: Vec<Undo>,
 }
 
+#[derive(Clone)]
 struct Undo {
     program: ProgramId,
     key: Vec<u8>,

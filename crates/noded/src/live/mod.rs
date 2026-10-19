@@ -8,13 +8,13 @@ mod grants;
 mod groups;
 mod lane;
 mod session;
+mod table;
 #[cfg(test)]
 mod tests;
 mod tracks;
 
-use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use abi::ProgramId;
@@ -27,15 +27,16 @@ use live_wire::{
     ALPN, Account, Challenge, Code, Control, HANDSHAKE_WAIT, Hello, IDLE, IDLE_SESSION, KEEP_ALIVE,
     NAMESPACE, Proof, RequestId, proof_preimage,
 };
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 pub use grants::Chain;
 use grants::{Grants, place};
 pub use session::ws_upgrade;
-use session::{Inbound, Link, Out, Outlet, Sent};
-use tracks::{Ask, Effect, GoingAway, SessionId, State};
+use session::{Inbound, Link, Out};
+use table::{Dirty, Event, Table};
+use tracks::{Ask, GoingAway, SessionId, State};
 
 /// The relay's share of the node's load settings (`LoadConfig`, each a `run` flag): how much
 /// waits where before a client or a peer is held back, and the one clock no event ends.
@@ -57,9 +58,6 @@ pub struct Config {
     pub lane_backlog: NonZeroUsize,
     /// Lane datagrams waiting per peer; past it the oldest is dropped.
     pub lane_per_sender: NonZeroUsize,
-    /// The node's `reads_in_flight`: chain reads the relay runs at once over every session; a
-    /// session's control messages queue here rather than at the node lock.
-    pub reads_in_flight: NonZeroUsize,
     /// How long a closed session's last message (a refusal, a GoAway) gets to reach the client
     /// before the connection is closed under it. A clock, not an event: the writer waits for
     /// the client's acknowledgement, which a client whose receive window is full never sends,
@@ -77,7 +75,6 @@ impl Default for Config {
             peer_queue: permits(1024),
             lane_backlog: permits(64),
             lane_per_sender: permits(256),
-            reads_in_flight: permits(64),
             linger: Duration::from_secs(5),
         }
     }
@@ -103,13 +100,6 @@ impl Network {
     }
 }
 
-/// Which programs' grants and which sessions' accounts a block may have changed.
-#[derive(Default)]
-struct Dirty {
-    programs: BTreeSet<ProgramId>,
-    identity: bool,
-}
-
 pub struct Relay<E: crate::Context> {
     context: E,
     network: Network,
@@ -121,17 +111,9 @@ pub struct Relay<E: crate::Context> {
     door: Option<quinn::Endpoint>,
     /// This node's key, which a proof names.
     me: PublicKey,
-    metrics: tracks::Metrics,
-    state: Mutex<State>,
-    dirty: Mutex<Dirty>,
-    rechecks: Arc<Notify>,
-    /// The live lane's writers, one per peer, fed by the steps' effects: locked after the
-    /// state lock, never before it.
-    lanes: Mutex<lane::Lanes<E>>,
-    /// Every task the relay runs, the live lane's included (each peer writer's group writers
-    /// go with that writer): dropped with the relay, they are aborted, and what they hold of
-    /// halo goes with them.
-    tasks: Mutex<JoinSet<()>>,
+    plane: lane::Plane,
+    table: mpsc::UnboundedSender<Event>,
+    _tasks: JoinSet<()>,
 }
 
 impl<E: crate::Context> Relay<E> {
@@ -148,45 +130,75 @@ impl<E: crate::Context> Relay<E> {
         let me = halo.me().clone();
         let metrics = metrics(&context);
         let rechecks = Arc::new(Notify::new());
-        // The tasks and the lanes hold the relay weakly: it drops with its last owner, and
-        // they end with it.
-        let relay = Arc::new_cyclic(|weak: &Weak<Relay<E>>| Relay {
-            state: Mutex::new(State::new(network.id.clone(), metrics.clone())),
-            context,
-            network,
-            config,
-            grants: Grants::new(chain, config.reads_in_flight),
-            halo: halo.clone(),
-            door: door.clone(),
-            me: me.clone(),
-            dirty: Mutex::default(),
-            rechecks: rechecks.clone(),
-            lanes: Mutex::new(lane::Lanes::new(
+        let plane = lane::Plane::open(&halo, &config);
+        let (begin, begun) = oneshot::channel();
+        let relay = Arc::new_cyclic(|weak: &Weak<Relay<E>>| {
+            let (table, inbox) = mpsc::unbounded_channel();
+            let lanes = lane::Lanes::new(
                 weak.clone(),
-                halo,
-                me,
+                halo.clone(),
+                me.clone(),
+                plane.clone(),
                 metrics.dropped_behind.clone(),
                 config,
-            )),
-            metrics,
-            tasks: Mutex::default(),
+            );
+            let state = State::new(network.id.clone(), metrics.clone());
+            let dropped = metrics.dropped_behind.clone();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(Table::new(state, lanes, rechecks.clone(), dropped).run(inbox));
+            tasks.spawn(running(
+                weak.clone(),
+                begun,
+                rechecks,
+                shutdown,
+                door.clone(),
+            ));
+            Relay {
+                context,
+                network,
+                config,
+                grants: Grants::new(chain),
+                halo,
+                door,
+                me,
+                plane,
+                table,
+                _tasks: tasks,
+            }
         });
-        let weak = Arc::downgrade(&relay);
-        relay.spawn(rechecking(weak.clone(), rechecks));
-        relay.spawn(closing(weak.clone(), shutdown));
-        relay.spawn(lane::serving(weak.clone()));
-        if let Some(door) = door {
-            relay.spawn(accepting(weak, door));
-        }
+        let _ = begin.send(());
         relay
     }
 
-    /// A task aborted with the relay; the handle aborts it sooner. The tasks already over are
-    /// let go first, so the set holds only what runs.
-    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> tokio::task::AbortHandle {
-        let mut tasks = self.tasks.lock().expect("the tasks lock is never poisoned");
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(task)
+    fn send(&self, event: Event) {
+        let _ = self.table.send(event);
+    }
+
+    fn asking<T>(&self, event: impl FnOnce(oneshot::Sender<T>) -> Event) -> oneshot::Receiver<T> {
+        let (reply, answer) = oneshot::channel();
+        self.send(event(reply));
+        answer
+    }
+
+    async fn going_away(&self) -> Option<GoingAway> {
+        self.asking(|reply| Event::GoingAway { reply })
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(test)]
+    async fn inspect<T: Send + 'static>(
+        &self,
+        look: impl FnOnce(&State) -> T + Send + 'static,
+    ) -> T {
+        let (reply, answer) = oneshot::channel();
+        self.send(Event::Inspect(Box::new(move |state| {
+            let _ = reply.send(look(state));
+        })));
+        answer
+            .await
+            .expect("the table answers while the relay is up")
     }
 
     /// The UDP port of the QUIC door, `None` when the node opened none.
@@ -204,11 +216,9 @@ impl<E: crate::Context> Relay<E> {
     }
 
     /// A block was applied: grants of a program whose `live/` table it wrote, and every
-    /// session's account when the identity program wrote, are re-read on the next turn. Sync
-    /// and lock-free on the node, because the caller holds the node lock.
+    /// session's account when the identity program wrote, are re-read on the next turn.
     pub fn invalidate(&self, writes: &state::Writes) {
-        let mut dirty = self.dirty.lock().expect("the dirty lock is never poisoned");
-        let was = (dirty.identity, dirty.programs.len());
+        let mut dirty = Dirty::default();
         for (program, keys) in &writes.programs {
             let wrote_identity = *program == self.network.identity;
             if wrote_identity {
@@ -221,63 +231,9 @@ impl<E: crate::Context> Relay<E> {
                 self.grants.moved();
             }
         }
-        let moved = (dirty.identity, dirty.programs.len()) != was;
-        drop(dirty);
-        if moved {
-            self.rechecks.notify_one();
+        if !dirty.is_empty() {
+            self.send(Event::Moved(dirty));
         }
-    }
-
-    /// One step on the table, decided and delivered under the one lock: what steps send leaves
-    /// in the order they were decided, so no step's word to a session overtakes another's, as a
-    /// re-check's end would overtake the answer to the request it re-checks. Everything a step
-    /// decides is delivered here and nowhere else: a session's outlet takes what it is sent or
-    /// is closed as behind, and a peer's writer takes what it is handed or is dropped and
-    /// resynced; the lanes lock is the only lock taken here, after the state's. Outside the
-    /// table are only the handshake's refusal and go-away, to a session that was never in it,
-    /// and a session's own loop closing its outlet when it ends.
-    fn step(&self, decide: impl FnOnce(&mut State) -> Vec<Effect>) {
-        self.step_to(|state| ((), decide(state)));
-    }
-
-    /// A step whose decision the caller needs back, beside what it sends.
-    fn step_to<T>(&self, decide: impl FnOnce(&mut State) -> (T, Vec<Effect>)) -> T {
-        let mut state = self.state();
-        let (decision, effects) = decide(&mut state);
-        state.gauges();
-        for effect in effects {
-            match effect {
-                Effect::Send(outlet, out) => self.deliver(&outlet, out),
-                Effect::Lane(to, item) => self.lanes().hand(to, item),
-                Effect::Announce(forward) => self.lanes().announce(forward),
-                Effect::Nudge(outlet) => outlet.nudge(),
-                Effect::Close(outlet, reason) => outlet.close(reason),
-            }
-        }
-        decision
-    }
-
-    /// A step a session's loop took, for the loop to go on.
-    fn stepped(&self, decide: impl FnOnce(&mut State) -> Vec<Effect>) -> Step {
-        self.step(decide);
-        Step::Done
-    }
-
-    fn deliver(&self, outlet: &Outlet, out: Out) {
-        match outlet.send(out) {
-            Sent::Queued => {}
-            Sent::Superseded | Sent::Behind => {
-                self.metrics.dropped_behind.inc();
-            }
-        }
-    }
-
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().expect("the state lock is never poisoned")
-    }
-
-    fn lanes(&self) -> std::sync::MutexGuard<'_, lane::Lanes<E>> {
-        self.lanes.lock().expect("the lanes lock is never poisoned")
     }
 
     /// The grant read for one request, with the generation it was read at, so a block that
@@ -305,12 +261,10 @@ impl<E: crate::Context> Relay<E> {
         let Some(program) = decided.program.filter(|_| moved) else {
             return;
         };
-        self.dirty
-            .lock()
-            .expect("the dirty lock is never poisoned")
-            .programs
-            .insert(program);
-        self.rechecks.notify_one();
+        self.send(Event::Moved(Dirty {
+            programs: [program].into(),
+            identity: false,
+        }));
     }
 
     /// The session is registered: if the identity table moved while it proved, the re-check
@@ -320,11 +274,10 @@ impl<E: crate::Context> Relay<E> {
         if !moved {
             return;
         }
-        self.dirty
-            .lock()
-            .expect("the dirty lock is never poisoned")
-            .identity = true;
-        self.rechecks.notify_one();
+        self.send(Event::Moved(Dirty {
+            programs: Default::default(),
+            identity: true,
+        }));
     }
 
     /// One control message from a client, after the handshake.
@@ -343,7 +296,7 @@ impl<E: crate::Context> Relay<E> {
                 };
                 self.asked(id, account, request, ask).await
             }
-            Control::Unpublish { request } => self.stepped(|state| state.unpublish(id, request)),
+            Control::Unpublish { request } => self.stepped(Event::Unpublished { id, request }),
             Control::Subscribe {
                 request,
                 track,
@@ -352,14 +305,12 @@ impl<E: crate::Context> Relay<E> {
                 let ask = Ask::Subscribe { track, from };
                 self.asked(id, account, request, ask).await
             }
-            Control::Unsubscribe { request } => {
-                self.stepped(|state| state.unsubscribe(id, request))
-            }
+            Control::Unsubscribe { request } => self.stepped(Event::Unsubscribed { id, request }),
             Control::Watch { request, namespace } => {
                 let ask = Ask::Watch { namespace };
                 self.asked(id, account, request, ask).await
             }
-            Control::Unwatch { request } => self.stepped(|state| state.unwatch(id, request)),
+            Control::Unwatch { request } => self.stepped(Event::Unwatched { id, request }),
             Control::Hello(_)
             | Control::Challenge(_)
             | Control::Proof(_)
@@ -379,22 +330,47 @@ impl<E: crate::Context> Relay<E> {
     /// A publish, subscribe or watch from the client. The chain is read only for an ask the
     /// node would take: a name or namespace it refuses as malformed costs no read.
     async fn asked(&self, id: SessionId, account: Account, request: RequestId, ask: Ask) -> Step {
-        let admissible = self.state().admissible_ask(&ask);
+        let admissible = tracks::admissible_ask(&self.network.id, &ask);
         if !admissible {
-            return self.stepped(|state| state.ask(id, request, ask, None));
+            return self.stepped(Event::Asked {
+                id,
+                request,
+                ask,
+                grant: None,
+            });
         }
         let decided = self.decided(account, ask.namespace()).await;
-        let step = self.stepped(|state| state.ask(id, request, ask, decided.grant.as_ref()));
+        let step = self.stepped(Event::Asked {
+            id,
+            request,
+            ask,
+            grant: decided.grant.clone(),
+        });
         // Settled once the answer is out, so a re-check of the request comes after it.
         self.settled(decided);
         step
+    }
+
+    fn stepped(&self, event: Event) -> Step {
+        self.send(event);
+        Step::Moved
+    }
+
+    fn flowed(&self, event: Event) -> Step {
+        self.send(event);
+        Step::Done
     }
 
     /// A waiting ask asked again, on the grants a block wrote: answered as the client's own
     /// would be, unless the client withdrew it meanwhile.
     async fn asked_again(&self, id: SessionId, account: Account, request: RequestId, ask: Ask) {
         let decided = self.decided(account, ask.namespace()).await;
-        self.step(|state| state.admit(id, request, ask, decided.grant.as_ref()));
+        self.send(Event::Admitted {
+            id,
+            request,
+            ask,
+            grant: decided.grant.clone(),
+        });
         self.settled(decided);
     }
 }
@@ -473,12 +449,37 @@ pub fn door(
     )?)
 }
 
+async fn running<E: crate::Context>(
+    relay: Weak<Relay<E>>,
+    begun: oneshot::Receiver<()>,
+    rechecks: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
+    door: Option<quinn::Endpoint>,
+) {
+    if begun.await.is_err() {
+        return;
+    }
+    let door = async {
+        if let Some(door) = door {
+            accepting(relay.clone(), door).await;
+        }
+    };
+    tokio::join!(
+        rechecking(relay.clone(), rechecks),
+        closing(relay.clone(), shutdown),
+        lane::serving(relay.clone()),
+        door,
+    );
+}
+
 async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, door: quinn::Endpoint) {
+    let mut sessions = JoinSet::new();
     while let Some(incoming) = door.accept().await {
         let Some(strong) = relay.upgrade() else {
             return;
         };
-        strong.spawn(serve_quic(
+        while sessions.try_join_next().is_some() {}
+        sessions.spawn(serve_quic(
             relay.clone(),
             incoming,
             strong.halo.plane().pacer().clone(),
@@ -582,7 +583,7 @@ async fn handshake<E: crate::Context>(relay: &Weak<Relay<E>>, link: &mut Link) -
         if let Some(account) = strong.grants.account(&hello.key).await {
             return Handshake::Welcomed(account, hello.key, generation);
         }
-        if let Some(GoingAway { in_ms }) = strong.state().going_away() {
+        if let Some(GoingAway { in_ms }) = strong.going_away().await {
             return Handshake::GoingAway(in_ms);
         }
         drop(strong);
@@ -596,6 +597,7 @@ async fn handshake<E: crate::Context>(relay: &Weak<Relay<E>>, link: &mut Link) -
 /// What a session's loop does once a step is taken.
 enum Step {
     Done,
+    Moved,
     Close(&'static str),
 }
 
@@ -656,13 +658,21 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
     let Some(strong) = relay.upgrade() else {
         return link.outlet.close("relay_gone");
     };
-    // Joined and welcomed in the one step, under the lock `go_away` takes: a session hears its
-    // welcome before any GoAway.
-    let welcomed =
-        strong.step_to(|state| state.welcome(account, key, link.outlet.clone(), link.datagrams));
-    let id = match welcomed {
-        Ok(id) => id,
-        Err(GoingAway { in_ms }) => return going_away(&link, in_ms),
+    let welcomed = strong.asking(|reply| Event::Welcome {
+        account,
+        key,
+        outlet: link.outlet.clone(),
+        datagrams: link.datagrams,
+        reply,
+    });
+    drop(strong);
+    let id = match welcomed.await {
+        Ok(Ok(id)) => id,
+        Ok(Err(GoingAway { in_ms })) => return going_away(&link, in_ms),
+        Err(_) => return link.outlet.close("relay_gone"),
+    };
+    let Some(strong) = relay.upgrade() else {
+        return link.outlet.close("relay_gone");
     };
     // Now the session is registered, a block that moved the identity table while it proved is
     // re-checked: the re-check reads its account again and closes it if the key moved.
@@ -670,13 +680,8 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
     tracing::info!(target: "ducktape::live", event = "live_session_opened", account, path = link.path, "a live session opened");
     drop(strong);
     let mut idle_since: Option<Instant> = None;
+    let mut idle = holds_nothing(&relay, id).await;
     let reason = loop {
-        let idle = relay.upgrade().is_none_or(|relay| {
-            relay
-                .state()
-                .session(id)
-                .is_none_or(|session| session.idle())
-        });
         let idle_at = match idle {
             true => Some(*idle_since.get_or_insert_with(Instant::now) + IDLE_SESSION),
             false => {
@@ -692,47 +697,74 @@ async fn serve<E: crate::Context>(relay: Weak<Relay<E>>, mut link: Link) {
             // message, or nudges it when there is nothing to say, so the loop's top re-arms
             // `idle_at` from what the session holds now: one the relay emptied is closed after
             // `IDLE_SESSION` like one the client stopped using.
-            Awaited::Recheck => continue,
+            Awaited::Recheck => {
+                idle = holds_nothing(&relay, id).await;
+                continue;
+            }
             Awaited::Idle => break "idle",
         };
-        let Some(relay) = relay.upgrade() else {
+        let Some(strong) = relay.upgrade() else {
             break "relay_gone";
         };
         let step = match inbound {
-            Inbound::Control(control) => relay.control(id, account, control).await,
+            Inbound::Control(control) => strong.control(id, account, control).await,
             Inbound::Object {
                 header,
                 object,
                 body,
-            } => relay.stepped(|state| state.object(Some(id), header, object, body)),
+            } => strong.flowed(Event::Object {
+                from: Some(id),
+                header,
+                object,
+                body,
+            }),
             Inbound::GroupEnd {
                 alias,
                 group,
                 complete,
-            } => relay.stepped(|state| state.group_end(Some(id), alias, group, complete)),
+            } => strong.flowed(Event::GroupEnded {
+                from: Some(id),
+                alias,
+                group,
+                complete,
+            }),
             Inbound::Oversize { alias, group } => {
-                relay.stepped(|state| state.oversize(id, alias, group))
+                strong.flowed(Event::Oversize { id, alias, group })
             }
-            Inbound::Datagram { header, payload } => {
-                relay.stepped(|state| state.datagram(Some(id), header, payload))
-            }
+            Inbound::Datagram { header, payload } => strong.flowed(Event::Datagram {
+                from: Some(id),
+                header,
+                payload,
+            }),
             Inbound::Garbled => Step::Close("malformed_request"),
             Inbound::Closed => break "closed",
         };
         match step {
             Step::Done => {}
+            Step::Moved => idle = holds_nothing(&relay, id).await,
             Step::Close(reason) => {
                 tracing::debug!(target: "ducktape::live", event = "live_refused", reason, path = link.path, "a live session sent what is not the wire");
-                relay.step(|state| state.garbled(id, reason));
+                let refused = strong.asking(|reply| Event::Garbled { id, reason, reply });
+                drop(strong);
+                let _ = refused.await;
                 break reason;
             }
         }
     };
     link.outlet.close(reason);
     if let Some(relay) = relay.upgrade() {
-        relay.step(|state| state.closed(id));
+        relay.send(Event::Closed { id });
     }
     tracing::info!(target: "ducktape::live", event = "live_session_closed", account, path = link.path, reason, "a live session closed");
+}
+
+async fn holds_nothing<E: crate::Context>(relay: &Weak<Relay<E>>, id: SessionId) -> bool {
+    let Some(strong) = relay.upgrade() else {
+        return true;
+    };
+    let asked = strong.asking(|reply| Event::Idle { id, reply });
+    drop(strong);
+    asked.await.unwrap_or(true)
 }
 
 /// A block moved grants or identities: every request the change could cover is re-read, and
@@ -745,41 +777,50 @@ async fn rechecking<E: crate::Context>(relay: Weak<Relay<E>>, rechecks: Arc<Noti
         let Some(relay) = relay.upgrade() else {
             return;
         };
-        let dirty = std::mem::take(
-            &mut *relay
-                .dirty
-                .lock()
-                .expect("the dirty lock is never poisoned"),
-        );
+        let Ok(dirty) = relay.asking(|reply| Event::Due { reply }).await else {
+            return;
+        };
         for program in &dirty.programs {
-            let requests = relay.state().requests_in(program);
-            for (id, request, held) in requests {
-                let Some(account) = relay.state().session(id).map(|session| session.account) else {
-                    continue;
-                };
+            let asked = relay.asking(|reply| Event::RequestsIn {
+                program: program.clone(),
+                reply,
+            });
+            let Ok(requests) = asked.await else {
+                return;
+            };
+            for (id, request, held, account) in requests {
                 let decided = relay.decided(account, held.namespace()).await;
                 // The held thing may have changed under the id while the grant was read; the
                 // step re-reads it and acts only if it still names what the re-check saw.
-                relay.step(|state| state.rechecked(id, request, &held, decided.grant.as_ref()));
+                relay.send(Event::Rechecked {
+                    id,
+                    request,
+                    held,
+                    grant: decided.grant,
+                });
             }
-            let waiting = relay.state().waiting_in(program);
-            for (id, request, ask) in waiting {
-                let Some(account) = relay.state().session(id).map(|session| session.account) else {
-                    continue;
-                };
+            let asked = relay.asking(|reply| Event::WaitingIn {
+                program: program.clone(),
+                reply,
+            });
+            let Ok(waiting) = asked.await else {
+                return;
+            };
+            for (id, request, ask, account) in waiting {
                 relay.asked_again(id, account, request, ask).await;
             }
         }
         if dirty.identity {
-            let sessions: Vec<(SessionId, Vec<u8>, Account)> = relay
-                .state()
-                .sessions()
-                .map(|(id, session)| (id, session.key.clone(), session.account))
-                .collect();
+            let Ok(sessions) = relay.asking(|reply| Event::Sessions { reply }).await else {
+                return;
+            };
             for (id, key, account) in sessions {
                 let still = relay.grants.account(&key).await == Some(account);
                 if !still {
-                    relay.step(|state| state.close_session(id, "no_account"));
+                    relay.send(Event::CloseSession {
+                        id,
+                        reason: "no_account",
+                    });
                 }
             }
         }
@@ -794,6 +835,6 @@ async fn closing<E: crate::Context>(relay: Weak<Relay<E>>, mut shutdown: watch::
     let Some(relay) = relay.upgrade() else {
         return;
     };
-    relay.step(|state| state.go_away(GOAWAY_MS));
+    relay.send(Event::GoAway { in_ms: GOAWAY_MS });
     relay.grants.going_away();
 }

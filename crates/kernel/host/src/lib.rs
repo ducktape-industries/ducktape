@@ -3,10 +3,12 @@ mod namespace;
 mod parked;
 mod parking;
 mod scheduling;
+mod snapshot;
 mod unit;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 pub use abi::Roles;
 use abi::{
@@ -20,7 +22,10 @@ use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::{Fault, Suspended};
 use sha2::{Digest as _, Sha256};
-use state::{Checkpoint, Commitment, Overlay, Storage, Store, View, Writes, valid_program_id};
+use state::{
+    Checkpoint, Commitment, Committed, Overlay, Reads, Storage, Store, View, Writes,
+    valid_program_id,
+};
 
 use crate::parked::Waiter;
 use crate::parking::{Run, Segment, Start, Status};
@@ -29,6 +34,7 @@ use crate::unit::{Frame, Loaded, World, refusal_of};
 pub use namespace::{BLOBS, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT, spent};
 pub use parking::PAGE_FUEL;
 pub use runtime::Limits;
+pub use snapshot::{Snapshot, Source};
 
 const STATE_DIR: &str = "state";
 const BLOBS_DIR: &str = "blobs";
@@ -174,16 +180,15 @@ where
     network: Vec<u8>,
     roles: Roles,
     loaded: Loaded,
-    preconfirmed: Preconfirmed,
     hook_streaks: BTreeMap<ProgramId, u64>,
     scheduler_streak: u64,
     roster_streak: u64,
 }
 
-#[derive(Default)]
-struct Preconfirmed {
-    overlay: Overlay,
-    stage: Stage,
+#[derive(Clone, Default)]
+pub(crate) struct Preconfirmed {
+    pub(crate) overlay: Overlay,
+    pub(crate) stage: Stage,
 }
 
 struct Mark {
@@ -405,7 +410,6 @@ where
             network: genesis.network,
             roles: roles.clone(),
             loaded: Loaded::new(genesis.limits),
-            preconfirmed: Preconfirmed::default(),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
@@ -501,7 +505,6 @@ where
             network,
             roles,
             loaded: Loaded::new(limits),
-            preconfirmed: Preconfirmed::default(),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
@@ -511,22 +514,12 @@ where
     }
 
     fn sync_code(&mut self) -> Result<()> {
-        let view = self.store.view(Vec::new());
-        let limits = limits_of(&view)?;
-        let limits_changed = self.loaded.limits() != limits;
-        if limits_changed {
-            self.loaded = Loaded::new(limits);
-        }
-        let wanted = programs_of(&view)?;
-        self.loaded.sync(&wanted, &self.blobs)
+        sync_code(&mut self.loaded, &self.store.view(Vec::new()), &self.blobs)
     }
 
     fn ready(&mut self) -> Result<()> {
         self.sync_code()?;
-        match self.loaded.missing().first() {
-            Some((_, code)) => Err(Error::BlobUnavailable(*code)),
-            None => Ok(()),
-        }
+        runnable(&self.loaded)
     }
 
     pub fn store(&self) -> &Store<E> {
@@ -541,56 +534,59 @@ where
         &self.network
     }
 
+    pub fn source(&self) -> Source<'_, E> {
+        Source {
+            committed: Committed::Live(&self.store),
+            blobs: &self.blobs,
+            loaded: &self.loaded,
+            network: &self.network,
+            roles: &self.roles,
+            preconfirmed: None,
+        }
+    }
+
+    pub fn snapshot(&self) -> Result<Snapshot<E>> {
+        Ok(Snapshot {
+            pinned: self.store.pin()?,
+            blobs: self.blobs.clone(),
+            loaded: self.loaded.clone(),
+            network: self.network.clone(),
+            roles: self.roles.clone(),
+            preconfirmed: Arc::default(),
+            context: std::marker::PhantomData,
+        })
+    }
+
     pub fn height(&self) -> Result<u64> {
-        self.store.height()?.ok_or(Error::Unfounded)
+        self.source().height()
     }
 
     fn next_height(&self) -> Result<u64> {
-        Ok(self.store.height()?.map_or(0, |height| height + 1))
+        self.source().next_height()
     }
 
     pub fn tip(&self) -> Result<Tip> {
-        let height = self.height()?;
-        let bytes = self
-            .store
-            .view(Vec::new())
-            .get(RECENT, &namespace::height(height))?
-            .ok_or_else(|| Error::Corrupt("the network records no tip".into()))?;
-        let id = abi::decode(&bytes).map_err(corrupt)?;
-        Ok(Tip { height, id })
+        self.source().tip()
     }
 
     pub fn epoch_length(&self) -> Result<u64> {
-        let bytes = self
-            .store
-            .view(Vec::new())
-            .get(NETWORK, namespace::EPOCH_LENGTH)?
-            .ok_or_else(|| Error::Corrupt("the network records no epoch length".into()))?;
-        abi::decode(&bytes).map_err(corrupt)
+        self.source().epoch_length()
     }
 
     /// How many members the network ever holds at once, as founded.
     pub fn member_cap(&self) -> Result<u32> {
-        member_cap_of(&self.store.view(Vec::new()))
+        self.source().member_cap()
     }
 
     pub fn epoch_members(&self, epoch: u64) -> Result<Option<Vec<validators::Member>>> {
-        self.store
-            .view(Vec::new())
-            .get(NETWORK, &namespace::epoch(epoch))?
-            .map(|bytes| abi::decode(&bytes).map_err(corrupt))
-            .transpose()
+        self.source().epoch_members(epoch)
     }
 
     /// The keys that vote and propose in `epoch`: the validators program's
     /// `Validators` answer. [`Host::epoch_members`] is who the mesh admits,
     /// residents included; consensus seats only these.
     pub fn epoch_validators(&self, epoch: u64) -> Result<Option<Vec<Vec<u8>>>> {
-        self.store
-            .view(Vec::new())
-            .get(NETWORK, &namespace::epoch_validators(epoch))?
-            .map(|bytes| abi::decode(&bytes).map_err(corrupt))
-            .transpose()
+        self.source().epoch_validators(epoch)
     }
 
     pub fn roles(&self) -> &Roles {
@@ -602,48 +598,23 @@ where
     }
 
     pub fn root(&self) -> Result<Root> {
-        let roots = self.store.roots()?;
-        Ok(Root(Sha256::digest(abi::encode(&roots)).into()))
+        self.source().root()
     }
 
     pub fn view(&self, layer: Layer) -> View<'_> {
-        self.store.view(self.layers(layer))
+        self.source().view(layer)
     }
 
     pub fn fresh(&self, submission: &Submission) -> Result<std::result::Result<(), Refusal>> {
-        fresh(
-            &self.view(Layer::Confirmed),
-            submission,
-            self.next_height()?,
-        )
-    }
-
-    fn layers(&self, layer: Layer) -> Vec<&Overlay> {
-        match layer {
-            Layer::Confirmed => Vec::new(),
-            Layer::Preconfirmed => vec![&self.preconfirmed.overlay],
-        }
-    }
-
-    fn height_of(&self, layer: Layer) -> Result<u64> {
-        match layer {
-            Layer::Confirmed => self.height(),
-            Layer::Preconfirmed => self.next_height(),
-        }
+        self.source().fresh(submission)
     }
 
     pub fn programs(&self) -> Result<BTreeMap<ProgramId, BlobId>> {
-        programs_of(&self.store.view(Vec::new()))
+        self.source().programs()
     }
 
     pub fn missing_blobs(&self) -> Result<Vec<BlobId>> {
-        let view = self.store.view(Vec::new());
-        let mut named = BTreeSet::new();
-        for entry in view.scan(BLOBS, &Scan::prefix(b""))? {
-            named.insert(abi::decode::<BlobId>(&entry.key).map_err(corrupt)?);
-        }
-        named.extend(programs_of(&view)?.into_values());
-        Ok(named.into_iter().filter(|id| !self.blobs.has(id)).collect())
+        self.source().missing_blobs()
     }
 
     pub async fn sync(&mut self) -> Result<()> {
@@ -668,56 +639,15 @@ where
     }
 
     pub async fn readable(&self, id: &BlobId, time: u64) -> Result<bool> {
-        let height = self.height()?;
-        self.readable_in(id, height, time, &Overlay::default(), &Stage::default())
-            .await
-    }
-
-    async fn readable_in(
-        &self,
-        id: &BlobId,
-        height: u64,
-        time: u64,
-        overlay: &Overlay,
-        stage: &Stage,
-    ) -> Result<bool> {
-        let rostered = View::new(self.store.storage(), vec![overlay])
-            .get(BLOBS, &namespace::blob(id))?
-            .is_some();
-        if rostered {
-            return Ok(true);
-        }
-        unit::held(
-            self.world(height, time),
-            vec![overlay],
-            stage,
-            &[],
-            id,
-            &mut self.loaded.limits().fuel,
-        )
-        .await
+        self.source().readable(id, time).await
     }
 
     pub async fn blob(&self, id: &BlobId, time: u64) -> Result<Option<Vec<u8>>> {
-        if !self.readable(id, time).await? {
-            return Ok(None);
-        }
-        self.blobs
-            .framed(id)?
-            .map(Some)
-            .ok_or(Error::BlobUnavailable(*id))
+        self.source().blob(id, time).await
     }
 
     fn world(&self, height: u64, time: u64) -> World<'_, E> {
-        World {
-            store: &self.store,
-            blobs: &self.blobs,
-            loaded: &self.loaded,
-            network: &self.network,
-            roles: &self.roles,
-            height,
-            time,
-        }
+        self.source().world(height, time)
     }
 
     pub async fn query(
@@ -728,26 +658,9 @@ where
         program: &str,
         request: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, Refusal>> {
-        if let Some(code) = self.loaded.awaiting(program) {
-            return Err(Error::BlobUnavailable(code));
-        }
-        let height = self.height_of(layer)?;
-        let confirmed = Stage::default();
-        let stage = match layer {
-            Layer::Confirmed => &confirmed,
-            Layer::Preconfirmed => &self.preconfirmed.stage,
-        };
-        unit::query(
-            self.world(height, time),
-            self.layers(layer),
-            stage,
-            &[],
-            origin,
-            program.to_owned(),
-            request,
-            &mut self.loaded.limits().fuel,
-        )
-        .await
+        self.source()
+            .query(layer, time, origin, program, request)
+            .await
     }
 
     /// Records who `epoch` seats (`Validators`) and who its mesh admits
@@ -823,48 +736,6 @@ where
         abi::decode(&bytes).map_err(corrupt)
     }
 
-    pub async fn preconfirm(
-        &mut self,
-        time: u64,
-        submissions: Vec<Submission>,
-    ) -> Result<Vec<Receipt>> {
-        self.ready()?;
-        let height = self.next_height()?;
-        let mut preconfirmed = std::mem::take(&mut self.preconfirmed);
-        let mark = preconfirmed.mark();
-        let predicted = self
-            .predict(submissions, height, time, &mut preconfirmed)
-            .await;
-        if predicted.is_err() {
-            preconfirmed.rewind(mark);
-        }
-        self.preconfirmed = preconfirmed;
-        predicted
-    }
-
-    async fn predict(
-        &self,
-        submissions: Vec<Submission>,
-        height: u64,
-        time: u64,
-        preconfirmed: &mut Preconfirmed,
-    ) -> Result<Vec<Receipt>> {
-        let mut receipts = Vec::new();
-        for submission in submissions {
-            let submitted = self
-                .submit(
-                    submission,
-                    height,
-                    time,
-                    &mut preconfirmed.overlay,
-                    &mut preconfirmed.stage,
-                )
-                .await?;
-            receipts.push(submitted.receipt());
-        }
-        Ok(receipts)
-    }
-
     pub async fn apply(&mut self, block: Block) -> Result<Applied> {
         let expected = self.next_height()?;
         let in_sequence = block.height == expected;
@@ -881,6 +752,7 @@ where
             .refresh_programs(block.height, block.time, &mut overlay, &mut stage)
             .await?;
         let mut hooks = self
+            .source()
             .hooks(block.height, block.time, &overlay, &stage)
             .await?;
         let mut submissions = Vec::new();
@@ -888,6 +760,7 @@ where
             let signer = submission.signer.clone();
             let target = submission.target.clone();
             let submitted = self
+                .source()
                 .submit(
                     submission,
                     block.height,
@@ -907,7 +780,8 @@ where
                         target,
                         applied: matches!(receipt.outcome, Outcome::Applied { .. }),
                     };
-                    self.tell(&mut hooks, &record, block.time, &mut overlay, &mut stage)
+                    self.source()
+                        .tell(&mut hooks, &record, block.time, &mut overlay, &mut stage)
                         .await?;
                     receipt
                 }
@@ -938,7 +812,12 @@ where
         )
         .await
     }
+}
 
+impl<'a, E> Source<'a, E>
+where
+    E: Context + Spawner,
+{
     async fn submit(
         &self,
         submission: Submission,
@@ -947,7 +826,7 @@ where
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Submitted> {
-        let view = self.store.view(vec![&*overlay]);
+        let view = self.committed.view(vec![&*overlay]);
         if let Err(refusal) = fresh(&view, &submission, height)? {
             return Ok(Submitted::Stale(rejected(&submission.target, refusal)));
         }
@@ -968,7 +847,7 @@ where
         };
         let checkpoint = overlay.checkpoint();
         let env = Env {
-            network: self.network.clone(),
+            network: self.network.to_vec(),
             height,
             time,
             me: submission.target.clone(),
@@ -1073,7 +952,7 @@ where
     ) -> Result<Option<Refusal>> {
         let checkpoint = overlay.checkpoint();
         let env = Env {
-            network: self.network.clone(),
+            network: self.network.to_vec(),
             height: record.height,
             time,
             me: program.to_owned(),
@@ -1108,34 +987,11 @@ where
             (Outcome::Applied { .. }, false) => return Ok(None),
             (Outcome::Applied { .. }, true) => {
                 overlay.restore(checkpoint);
-                unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+                unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
                 Refusal::new(reason::UNSUPPORTED, "a hook sends no messages")
             }
         };
         Ok(Some(refusal))
-    }
-
-    fn log_hooks(&mut self, height: u64, hooks: Hooks) {
-        for (program, tally) in hooks.tallies {
-            let Some(reason) = tally.reason else {
-                self.hook_streaks.remove(&program);
-                continue;
-            };
-            let blocks = self.hook_streaks.entry(program.clone()).or_default();
-            *blocks += 1;
-            let due = *blocks == 1 || blocks.is_multiple_of(STREAK_LOG_EVERY);
-            if due {
-                tracing::warn!(
-                    target: "ducktape::hook",
-                    event = "hook_refused",
-                    hook = %program,
-                    height,
-                    frames = tally.refused,
-                    blocks = *blocks,
-                    reason = %reason,
-                );
-            }
-        }
     }
 
     /// The account the identity role says `program` runs as, for a frame
@@ -1291,7 +1147,7 @@ where
     }
 
     fn open_frame(&self, fuel: Option<u64>, overlay: &Overlay) -> Result<Frame> {
-        let view = self.store.view(vec![overlay]);
+        let view = self.committed.view(vec![overlay]);
         let next_item = parked::counter(&view, NETWORK, namespace::NEXT_ITEM)?;
         Ok(Frame {
             fuel,
@@ -1334,7 +1190,7 @@ where
                 .await?
         {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             return Ok(Run::finished(rejected(program, refusal)));
         }
         let segment = self
@@ -1343,7 +1199,7 @@ where
         let refused = matches!(segment.receipt.outcome, Outcome::Rejected(_));
         if refused {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
         }
         let start = Start {
             frame: None,
@@ -1457,7 +1313,7 @@ where
             .await?;
         if let Err(refusal) = guarded {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             receipt.outcome = Outcome::Rejected(refusal);
             return Ok(Segment::finished(receipt));
         }
@@ -1475,7 +1331,7 @@ where
             .await?;
         if let Some(outcome) = refused {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             receipt.outcome = outcome;
             return Ok(Segment::finished(receipt));
         }
@@ -1687,7 +1543,7 @@ where
         time: u64,
     ) -> Env {
         Env {
-            network: self.network.clone(),
+            network: self.network.to_vec(),
             height,
             time,
             me: me.to_owned(),
@@ -1695,6 +1551,34 @@ where
             sender,
             roles: self.roles.clone(),
             cause,
+        }
+    }
+}
+
+impl<E> Host<E>
+where
+    E: Context + Spawner,
+{
+    fn log_hooks(&mut self, height: u64, hooks: Hooks) {
+        for (program, tally) in hooks.tallies {
+            let Some(reason) = tally.reason else {
+                self.hook_streaks.remove(&program);
+                continue;
+            };
+            let blocks = self.hook_streaks.entry(program.clone()).or_default();
+            *blocks += 1;
+            let due = *blocks == 1 || blocks.is_multiple_of(STREAK_LOG_EVERY);
+            if due {
+                tracing::warn!(
+                    target: "ducktape::hook",
+                    event = "hook_refused",
+                    hook = %program,
+                    height,
+                    frames = tally.refused,
+                    blocks = *blocks,
+                    reason = %reason,
+                );
+            }
         }
     }
 
@@ -1743,6 +1627,7 @@ where
                 continue;
             }
             let readable = self
+                .source()
                 .readable_in(&entry.code, height, time, overlay, stage)
                 .await?;
             if !readable {
@@ -1790,6 +1675,7 @@ where
         self.fill_roles(roles, overlay)?;
         for program in changed {
             let cancelled = self
+                .source()
                 .cancel_parked(&program, height, time, overlay, stage)
                 .await?;
             receipts.extend(cancelled);
@@ -1897,6 +1783,7 @@ where
             cause: Cause::Direct,
         };
         let receipt = self
+            .source()
             .run(
                 &entry.program,
                 ProgramCall::Init(entry.params.clone()),
@@ -1943,14 +1830,15 @@ where
         let op = identity::Op::RegisterProgram {
             program: program.to_owned(),
         };
-        self.run(
-            identity,
-            ProgramCall::Execute(abi::encode(&op)),
-            env,
-            overlay,
-            stage,
-        )
-        .await
+        self.source()
+            .run(
+                identity,
+                ProgramCall::Execute(abi::encode(&op)),
+                env,
+                overlay,
+                stage,
+            )
+            .await
     }
 
     fn swap(
@@ -2021,7 +1909,6 @@ where
         for program in stale {
             self.store.remove_program(&program).await?;
         }
-        self.preconfirmed = Preconfirmed::default();
         Ok(Applied {
             height: tip.height,
             admissions,
@@ -2109,7 +1996,7 @@ pub(crate) fn rejected(program: &str, refusal: Refusal) -> Receipt {
     }
 }
 
-fn programs_in(storage: &Storage) -> Result<Vec<ProgramId>> {
+fn programs_in(storage: &Reads) -> Result<Vec<ProgramId>> {
     let mut programs: Vec<ProgramId> = RESERVED.map(str::to_owned).to_vec();
     for entry in storage.iter(PROGRAMS, b"", None, false)? {
         let (key, _) = entry?;
@@ -2119,7 +2006,7 @@ fn programs_in(storage: &Storage) -> Result<Vec<ProgramId>> {
 }
 
 /// The programs the last committed block dropped from the roster.
-fn dropped_in(storage: &Storage) -> Result<Vec<ProgramId>> {
+fn dropped_in(storage: &Reads) -> Result<Vec<ProgramId>> {
     let Some(pending) = storage.pending()? else {
         return Ok(Vec::new());
     };
@@ -2173,6 +2060,23 @@ fn fresh(
         )));
     }
     Ok(Ok(()))
+}
+
+pub(crate) fn sync_code(loaded: &mut Loaded, view: &View<'_>, blobs: &Blobs) -> Result<()> {
+    let limits = limits_of(view)?;
+    let limits_changed = loaded.limits() != limits;
+    if limits_changed {
+        *loaded = Loaded::new(limits);
+    }
+    let wanted = programs_of(view)?;
+    loaded.sync(&wanted, blobs)
+}
+
+pub(crate) fn runnable(loaded: &Loaded) -> Result<()> {
+    match loaded.missing().first() {
+        Some((_, code)) => Err(Error::BlobUnavailable(*code)),
+        None => Ok(()),
+    }
 }
 
 fn limits_of(view: &View<'_>) -> Result<Limits> {

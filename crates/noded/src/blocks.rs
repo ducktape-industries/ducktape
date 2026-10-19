@@ -1,12 +1,16 @@
 //! Block summaries this node records as it applies blocks, served by the
 //! block read routes; a route reads a block out of the marshal archive only
 //! for a payload its caller asks for.
+use std::collections::VecDeque;
+use std::sync::Arc;
+
 use abi::Receipt;
+use arc_swap::ArcSwap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_consensus::types::Height;
 use commonware_cryptography::{Digestible as _, sha256};
 use consensus::validators_of;
-use host::{Submission, SubmissionId};
+use host::{ANCHOR_WINDOW, Submission, SubmissionId};
 use node::{Block, Body, Carried, Frame, Node};
 
 use crate::wire::{BlockAsk, BlockRef, Blocks, Finalized, Located, Page, Tx, TxAsk, TxRef};
@@ -20,9 +24,63 @@ struct Kept {
 
 type Ran = Vec<(u32, SubmissionId, Submission)>;
 
+pub(crate) struct Recent {
+    window: ArcSwap<VecDeque<Arc<Kept>>>,
+}
+
+impl Recent {
+    pub(crate) fn new() -> Recent {
+        Recent {
+            window: ArcSwap::from_pointee(VecDeque::new()),
+        }
+    }
+
+    fn keep(&self, kept: Arc<Kept>) {
+        let mut window = VecDeque::clone(&self.window.load());
+        let follows = window
+            .back()
+            .is_some_and(|last| last.block.height + 1 == kept.block.height);
+        if !follows {
+            window.clear();
+        }
+        window.push_back(kept);
+        let spilled = window.len().saturating_sub(ANCHOR_WINDOW as usize);
+        window.drain(..spilled);
+        self.window.store(Arc::new(window));
+    }
+
+    fn at(&self, height: u64) -> Option<Arc<Kept>> {
+        let window = self.window.load();
+        let oldest = window.front()?.block.height;
+        let offset = usize::try_from(height.checked_sub(oldest)?).ok()?;
+        window.get(offset).cloned()
+    }
+
+    fn by_id(&self, id: [u8; 32]) -> Option<Arc<Kept>> {
+        let window = self.window.load();
+        window.iter().find(|kept| kept.block.id == id).cloned()
+    }
+
+    fn place(&self, hash: [u8; 32]) -> Option<(u64, u32)> {
+        let window = self.window.load();
+        let oldest = window.front()?.block.height;
+        let (height, position, anchor) = window.iter().find_map(|kept| {
+            let (position, tx) = kept
+                .block
+                .txs
+                .iter()
+                .enumerate()
+                .find(|(_, tx)| tx.hash == hash)?;
+            Some((kept.block.height, position as u32, tx.anchor.height))
+        })?;
+        let no_landing_precedes_the_window = anchor >= oldest;
+        no_landing_precedes_the_window.then_some((height, position))
+    }
+}
+
 impl<E: Context> Daemon<E> {
     pub async fn blocks(&self, page: Blocks) -> Result<Page> {
-        let Some((lowest, newest)) = self.summaries.span().await? else {
+        let Some((lowest, newest)) = self.summaries.span() else {
             return Ok(Page {
                 blocks: Vec::new(),
                 listed_from: None,
@@ -82,7 +140,7 @@ impl<E: Context> Daemon<E> {
     pub async fn tx(&self, ask: TxAsk) -> Result<Option<Located>> {
         let place = match ask.tx {
             TxRef::At { height, position } => Some((height, position)),
-            TxRef::Hash(hash) => self.summaries.place(hash).await?,
+            TxRef::Hash(hash) => self.placed(hash).await?,
         };
         let Some((height, position)) = place else {
             return Ok(None);
@@ -93,18 +151,31 @@ impl<E: Context> Daemon<E> {
         }
     }
 
-    async fn summary(&self, height: u64) -> Result<Option<Kept>> {
+    async fn placed(&self, hash: [u8; 32]) -> Result<Option<(u64, u32)>> {
+        if let Some(place) = self.recent.place(hash) {
+            return Ok(Some(place));
+        }
+        Ok(self.summaries.place(hash).await?)
+    }
+
+    async fn summary(&self, height: u64) -> Result<Option<Arc<Kept>>> {
+        if let Some(kept) = self.recent.at(height) {
+            return Ok(Some(kept));
+        }
         let Some(bytes) = self.summaries.get(height).await? else {
             return Ok(None);
         };
-        Ok(Some(decoded(&bytes)?))
+        Ok(Some(Arc::new(decoded(&bytes)?)))
     }
 
-    async fn summary_by_id(&self, id: [u8; 32]) -> Result<Option<Kept>> {
+    async fn summary_by_id(&self, id: [u8; 32]) -> Result<Option<Arc<Kept>>> {
+        if let Some(kept) = self.recent.by_id(id) {
+            return Ok(Some(kept));
+        }
         let Some(bytes) = self.summaries.get_by_id(sha256::Digest(id)).await? else {
             return Ok(None);
         };
-        Ok(Some(decoded(&bytes)?))
+        Ok(Some(Arc::new(decoded(&bytes)?)))
     }
 
     async fn recorded(&self, kept: &Kept, position: u32, most: u32) -> Result<Option<Located>> {
@@ -174,6 +245,7 @@ impl<E: Context> Daemon<E> {
         self.summaries
             .keep(block.height, block.digest(), bytes, &hashes)
             .await?;
+        self.recent.keep(Arc::new(kept));
         Ok(())
     }
 
@@ -318,3 +390,6 @@ fn decoded(bytes: &[u8]) -> Result<Kept> {
         ))
     })
 }
+
+#[cfg(test)]
+mod tests;

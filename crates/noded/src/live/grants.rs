@@ -5,19 +5,18 @@
 //! message is never stale.
 
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 use abi::live::{self, Grant};
 use abi::{Origin, role::identity};
 use host::Layer;
 use live_wire::Account;
 
-use crate::Shared;
+use crate::Views;
 
 pub type Answered<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -38,18 +37,24 @@ fn decoded(row: Option<Vec<u8>>) -> Option<Grant> {
     Some(abi::decode(&row).unwrap_or_default())
 }
 
-impl<E: crate::Context> Chain for Shared<E> {
+impl<E: crate::Context> Chain for Views<E> {
     fn account(&self, key: &[u8]) -> Answered<'_, Option<Account>> {
         let key = key.to_vec();
         Box::pin(async move {
-            let node = self.lock().await;
-            let Ok(identity) = node.host().role(abi::role::IDENTITY) else {
+            let view = self.now()?;
+            let source = view.source();
+            let Ok(identity) = source.role(abi::role::IDENTITY) else {
                 return None;
             };
-            let identity = identity.clone();
             let asked = abi::encode(&identity::Query::Account(key));
-            let answered = node
-                .query(Layer::Confirmed, Origin::System, &identity, asked)
+            let answered = source
+                .query(
+                    Layer::Confirmed,
+                    self.time(),
+                    Origin::System,
+                    identity,
+                    asked,
+                )
                 .await;
             let Ok(Ok(bytes)) = answered else {
                 return None;
@@ -66,8 +71,9 @@ impl<E: crate::Context> Chain for Shared<E> {
         let everyone = live::key(room, None);
         let program = program.to_owned();
         Box::pin(async move {
-            let node = self.lock().await;
-            let view = node.view(Layer::Confirmed);
+            let now = self.now()?;
+            let source = now.source();
+            let view = source.view(Layer::Confirmed);
             let own = decoded(view.get(&program, &own).ok().flatten());
             match own {
                 Some(grant) => Some(grant),
@@ -128,40 +134,25 @@ pub struct Grants {
     /// held for a key with no account yet reads it again, or hears the node is going. Its own
     /// handle, so a held handshake waits on it holding nothing of the relay.
     held: Arc<Notify>,
-    reads: Semaphore,
 }
 
 impl Grants {
-    /// `reads_in_flight` chain reads run at once over every session; the rest queue here rather
-    /// than at the node lock.
-    pub fn new(chain: Arc<dyn Chain>, reads_in_flight: NonZeroUsize) -> Grants {
+    pub fn new(chain: Arc<dyn Chain>) -> Grants {
         Grants {
             chain,
             generation: AtomicU64::new(0),
             identity: AtomicU64::new(0),
             held: Arc::new(Notify::new()),
-            reads: Semaphore::new(reads_in_flight.get()),
         }
     }
 
-    /// The account the chain answers for `key`, read under a permit.
+    /// The account the chain answers for `key`.
     pub async fn account(&self, key: &[u8]) -> Option<Account> {
-        let _read = self
-            .reads
-            .acquire()
-            .await
-            .expect("the reads semaphore is never closed");
         self.chain.account(key).await
     }
 
-    /// The grant `account` holds in `program`'s `room`, if the program wrote one, read under a
-    /// permit.
+    /// The grant `account` holds in `program`'s `room`, if the program wrote one.
     pub async fn grant(&self, program: &str, room: &str, account: Account) -> Option<Grant> {
-        let _read = self
-            .reads
-            .acquire()
-            .await
-            .expect("the reads semaphore is never closed");
         self.chain.grant(program, room, account).await
     }
 

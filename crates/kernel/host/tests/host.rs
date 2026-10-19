@@ -23,7 +23,7 @@ use fixture_wasm::{
 };
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
-    Limits, NETWORK, RECENT, Roles, SPENT, Submission, Tip,
+    Limits, NETWORK, RECENT, Roles, SPENT, Snapshot, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -317,6 +317,27 @@ async fn account_of(host: &Host<Ctx>, program: &str) -> Option<u64> {
         identity::Reply::Account(account) => account,
         other => panic!("{other:?}"),
     }
+}
+
+async fn ask_over(
+    snapshot: &Snapshot<Ctx>,
+    layer: Layer,
+    program: &str,
+    steps: Vec<Step>,
+) -> Vec<Reply> {
+    let answer = snapshot
+        .source()
+        .query(
+            layer,
+            TIME,
+            Origin::External(SIGNER.to_vec()),
+            program,
+            script(steps),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    answers(&answer)
 }
 
 async fn ask(host: &Host<Ctx>, layer: Layer, program: &str, steps: Vec<Step>) -> Vec<Reply> {
@@ -2216,7 +2237,8 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
         ))
         .await
         .unwrap();
-        let receipts = host
+        let mut speculative = host.snapshot().unwrap();
+        let receipts = speculative
             .preconfirm(
                 TIME,
                 vec![submit(
@@ -2268,7 +2290,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
             ]
         );
         assert_eq!(
-            ask(&host, Layer::Preconfirmed, "probe", steps()).await,
+            ask_over(&speculative, Layer::Preconfirmed, "probe", steps()).await,
             vec![
                 Reply::Host(HostReply::Value(Some(b"2".to_vec()))),
                 Reply::Host(HostReply::Value(Some(b"3".to_vec()))),
@@ -2290,14 +2312,18 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
             ]
         );
         assert_eq!(
-            host.view(Layer::Preconfirmed).get("probe", b"b").unwrap(),
+            speculative
+                .source()
+                .view(Layer::Preconfirmed)
+                .get("probe", b"b")
+                .unwrap(),
             Some(b"3".to_vec())
         );
 
         host.apply(block(2, Vec::new())).await.unwrap();
         assert_eq!(
-            ask(
-                &host,
+            ask_over(
+                &host.snapshot().unwrap(),
                 Layer::Preconfirmed,
                 "probe",
                 vec![get(b"a"), get(b"b")]
@@ -2346,13 +2372,17 @@ fn a_preconfirmed_blob_reads_in_the_preconfirmed_layer_before_its_block_commits(
         let id = blob_id("page", b"body");
         let put = submit("probe", script(vec![put_blob("page", b"body")]));
 
-        let predicted = host.preconfirm(TIME, vec![put.clone()]).await.unwrap();
+        let mut speculative = host.snapshot().unwrap();
+        let predicted = speculative
+            .preconfirm(TIME, vec![put.clone()])
+            .await
+            .unwrap();
         assert_eq!(
             replies(&predicted[0]),
             vec![Reply::Host(HostReply::BlobId(id))]
         );
         assert_eq!(
-            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            ask_over(&speculative, Layer::Preconfirmed, "probe", read_blob(id)).await,
             blob_reply("page", b"body")
         );
         assert_eq!(
@@ -2362,13 +2392,17 @@ fn a_preconfirmed_blob_reads_in_the_preconfirmed_layer_before_its_block_commits(
         assert_eq!(host.blob(&id, TIME).await.unwrap(), None);
 
         host.apply(block(1, Vec::new())).await.unwrap();
+        let mut speculative = host.snapshot().unwrap();
         assert_eq!(
-            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            ask_over(&speculative, Layer::Preconfirmed, "probe", read_blob(id)).await,
             no_blob_reply()
         );
-        host.preconfirm(TIME, vec![put.clone()]).await.unwrap();
+        speculative
+            .preconfirm(TIME, vec![put.clone()])
+            .await
+            .unwrap();
         assert_eq!(
-            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            ask_over(&speculative, Layer::Preconfirmed, "probe", read_blob(id)).await,
             blob_reply("page", b"body")
         );
 
@@ -2378,7 +2412,13 @@ fn a_preconfirmed_blob_reads_in_the_preconfirmed_layer_before_its_block_commits(
             blob_reply("page", b"body")
         );
         assert_eq!(
-            ask(&host, Layer::Preconfirmed, "probe", read_blob(id)).await,
+            ask_over(
+                &host.snapshot().unwrap(),
+                Layer::Preconfirmed,
+                "probe",
+                read_blob(id)
+            )
+            .await,
             blob_reply("page", b"body")
         );
         assert_eq!(
@@ -2417,7 +2457,8 @@ fn a_failed_preconfirm_keeps_what_was_preconfirmed_before_it_and_nothing_of_its_
             "probe",
             script(vec![set(b"k", b"v"), put_blob("page", b"body")]),
         );
-        host.preconfirm(TIME, vec![earlier]).await.unwrap();
+        let mut speculative = host.snapshot().unwrap();
+        speculative.preconfirm(TIME, vec![earlier]).await.unwrap();
 
         let beside = submit("probe", script(vec![set(b"m", b"y")]));
         let failing = submit(
@@ -2428,7 +2469,7 @@ fn a_failed_preconfirm_keeps_what_was_preconfirmed_before_it_and_nothing_of_its_
                 op(HostOp::BlobGet(lacked)),
             ]),
         );
-        let failed = host
+        let failed = speculative
             .preconfirm(TIME, vec![beside.clone(), failing.clone()])
             .await;
         assert!(
@@ -2436,7 +2477,8 @@ fn a_failed_preconfirm_keeps_what_was_preconfirmed_before_it_and_nothing_of_its_
             "{failed:?}"
         );
 
-        let preconfirmed = host.view(Layer::Preconfirmed);
+        let source = speculative.source();
+        let preconfirmed = source.view(Layer::Preconfirmed);
         assert_eq!(
             preconfirmed.get("probe", b"k").unwrap(),
             Some(b"v".to_vec())
@@ -2444,8 +2486,8 @@ fn a_failed_preconfirm_keeps_what_was_preconfirmed_before_it_and_nothing_of_its_
         assert_eq!(preconfirmed.get("probe", b"j").unwrap(), None);
         assert_eq!(preconfirmed.get("probe", b"m").unwrap(), None);
         assert_eq!(
-            ask(
-                &host,
+            ask_over(
+                &speculative,
                 Layer::Preconfirmed,
                 "probe",
                 read_blob(blob_id("page", b"body"))
@@ -2454,8 +2496,8 @@ fn a_failed_preconfirm_keeps_what_was_preconfirmed_before_it_and_nothing_of_its_
             blob_reply("page", b"body")
         );
         assert_eq!(
-            ask(
-                &host,
+            ask_over(
+                &speculative,
                 Layer::Preconfirmed,
                 "probe",
                 read_blob(blob_id("note", b"lost"))
@@ -2464,12 +2506,12 @@ fn a_failed_preconfirm_keeps_what_was_preconfirmed_before_it_and_nothing_of_its_
             no_blob_reply()
         );
 
-        let again = host.preconfirm(TIME, vec![failing]).await;
+        let again = speculative.preconfirm(TIME, vec![failing]).await;
         assert!(
             matches!(again, Err(Error::BlobUnavailable(missing)) if missing == lacked),
             "{again:?}"
         );
-        let predicted = host.preconfirm(TIME, vec![beside]).await.unwrap();
+        let predicted = speculative.preconfirm(TIME, vec![beside]).await.unwrap();
         assert_eq!(replies(&predicted[0]), vec![Reply::Host(HostReply::Done)]);
     });
 }
@@ -2880,6 +2922,8 @@ fn a_block_runs_a_frame_once_and_a_rejected_run_spends_it() {
 
         let fresh = || anchored(2, fails());
         let receipts = host
+            .snapshot()
+            .unwrap()
             .preconfirm(
                 TIME,
                 vec![
@@ -3187,11 +3231,14 @@ fn a_hook_is_told_of_every_carried_frame_after_it_runs_and_changes_none() {
             hooked(standard(), &["probe"]),
         )
         .await;
-        host.preconfirm(TIME, frames()).await.unwrap();
-        let preconfirmed = host
+        let mut speculative = host.snapshot().unwrap();
+        speculative.preconfirm(TIME, frames()).await.unwrap();
+        let preconfirmed = speculative
+            .source()
             .view(Layer::Preconfirmed)
             .get("probe", &fixture_probe::seen(1, 0))
             .unwrap();
+        drop(speculative);
         assert_eq!(preconfirmed, None, "a preconfirmed frame is told nothing");
         let applied = host.apply(block(1, frames())).await.unwrap();
         assert_eq!(applied.submissions, unhooked.submissions);

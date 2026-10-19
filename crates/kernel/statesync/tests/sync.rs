@@ -22,7 +22,7 @@ use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY
 use host::{Founding, Genesis, Layer, Limits, Tip};
 use node::{Block, Frame, Node, Sequenced};
 use state::{Storage, Store};
-use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, join, serve};
+use statesync::{Anchor, Anchors, Error, Exchange, Request, Response, anchored, join, serve};
 
 const NETWORK: &[u8] = b"sync";
 const TIME: u64 = 1_700_000_000;
@@ -145,11 +145,32 @@ fn frame(key: &ed25519::PrivateKey, steps: Vec<Step>) -> Vec<u8> {
     Frame::sign(key, NETWORK, origin(), None, "probe", abi::encode(&steps)).encode()
 }
 
-async fn seal(node: &mut Node<Ctx>) -> Block {
+async fn seal(
+    context: &Ctx,
+    node: &mut Node<Ctx>,
+    frames: Vec<Vec<u8>>,
+    preconfirm: node::Preconfirm,
+) -> Block {
+    let mut pool = node::Mempool::new(
+        context.child("pool"),
+        node.network().to_vec(),
+        node.snapshot().unwrap(),
+    )
+    .unwrap();
+    for frame in frames {
+        let taken = pool
+            .submit(frame, node::Source::Client, preconfirm)
+            .await
+            .unwrap()
+            .unwrap();
+        let predicted_applied = taken
+            .prediction()
+            .is_none_or(|receipt| matches!(receipt.outcome, abi::Outcome::Applied { .. }));
+        assert!(predicted_applied, "{taken:?}");
+    }
     let tip = node.tip().unwrap();
-    let block = node
-        .proposer()
-        .build(tip, std::iter::empty(), TIME + tip.height + 1);
+    let block = pool.build(tip, std::iter::empty(), TIME + tip.height + 1);
+    drop(pool);
     let Sequenced::Applied { .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
@@ -188,6 +209,7 @@ fn certify(
 
 struct Source {
     node: Shared,
+    context: Ctx,
     genesis: Block,
     certificates: Mutex<BTreeMap<u64, Certificate>>,
 }
@@ -215,7 +237,9 @@ impl Exchange for Loopback {
     async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
         let request: Request = abi::decode(&abi::encode(&request)).unwrap();
         let node = self.0.node.lock().await;
-        let response = serve(&node, &*self.0, request).await;
+        let served = serve(&node, request).await;
+        drop(node);
+        let response = anchored(served, &*self.0).await;
         Ok(abi::decode(&abi::encode(&response)).unwrap())
     }
 }
@@ -325,18 +349,9 @@ async fn advance(
     frames: Vec<Vec<u8>>,
 ) -> Tip {
     let mut node = source.node.lock().await;
-    for frame in frames {
-        let taken = node
-            .submit(frame, node::Source::Client, node::Preconfirm::On)
-            .await
-            .unwrap()
-            .unwrap();
-        let prediction = taken
-            .prediction()
-            .expect("a preconfirmed frame is predicted");
-        assert!(matches!(prediction.outcome, abi::Outcome::Applied { .. }));
-    }
-    let tip = seal(&mut node).await.tip();
+    let tip = seal(&source.context, &mut node, frames, node::Preconfirm::On)
+        .await
+        .tip();
     drop(node);
     let certificate = certify(keys, members, tip);
     source
@@ -376,6 +391,7 @@ async fn found_as(context: &Ctx, name: &'static str) -> Network {
         members,
         source: Arc::new(Source {
             node: Arc::new(futures::lock::Mutex::new(node)),
+            context: context.child("pool"),
             genesis,
             certificates: Mutex::new(BTreeMap::new()),
         }),
@@ -491,16 +507,13 @@ fn a_joined_node_applies_the_next_block_like_the_source() {
         .unwrap();
 
         let mut source = network.source.node.lock().await;
-        source
-            .submit(
-                frame(&alice, vec![set(b"c", b"3")]),
-                node::Source::Client,
-                node::Preconfirm::Off,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let block = seal(&mut source).await;
+        let block = seal(
+            &network.source.context,
+            &mut source,
+            vec![frame(&alice, vec![set(b"c", b"3")])],
+            node::Preconfirm::Off,
+        )
+        .await;
         let Sequenced::Applied { applied, .. } = joined.node.apply(&block).await.unwrap() else {
             panic!("the joiner had not seen block {}", block.height);
         };

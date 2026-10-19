@@ -108,6 +108,14 @@ where
         &self.votes
     }
 
+    pub async fn stop(mut self) {
+        self.catch_up.abort();
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        engine.stop().await;
+    }
+
     /// Seats the epoch after `tip` with its `validators`' keys; a node whose
     /// key is not among them follows.
     pub async fn seat(&mut self, tip: Tip, validators: &[Vec<u8>]) -> Result<Standing, Error> {

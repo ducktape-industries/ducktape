@@ -10,9 +10,10 @@ use commonware_storage::Context;
 use runtime::{Image, OUT_OF_FUEL, Suspended};
 use state::{Checkpoint, Overlay};
 
+use crate::Source;
 use crate::parked::{self, Parked, Waiter};
 use crate::unit::{self, Called, Frame, Resumed, refusal_of};
-use crate::{Host, MAX_DEPTH, Result, rejected};
+use crate::{MAX_DEPTH, Result, rejected};
 
 pub const PAGE_FUEL: u64 = 4_096;
 
@@ -86,7 +87,7 @@ fn charge(frame: &mut Frame, image: &Image) -> std::result::Result<(), Refusal> 
     }
 }
 
-impl<E> Host<E>
+impl<'a, E> Source<'a, E>
 where
     E: Context + Spawner,
 {
@@ -166,7 +167,7 @@ where
             let refused = matches!(receipt.outcome, Outcome::Rejected(_));
             if refused {
                 overlay.restore(start.checkpoint);
-                unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+                unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             }
         }
     }
@@ -276,7 +277,7 @@ where
         }
         let id = match start.frame {
             Some(id) => id,
-            None => parked::take_frame(self.store.storage(), overlay)?,
+            None => parked::take_frame(self.committed.reads(), overlay)?,
         };
         let park = awaits::Op::Park {
             frame: id,
@@ -311,7 +312,7 @@ where
             cause: env.cause.clone(),
             waiter: start.waiter,
         };
-        parked::save(self.store.storage(), overlay, id, record, image)?;
+        parked::save(self.committed.reads(), overlay, id, record, image)?;
         Ok(Run {
             receipt,
             status: Status::Parked,
@@ -332,7 +333,7 @@ where
         depth: u32,
     ) -> Result<Run> {
         overlay.restore(start.checkpoint);
-        unit::discard_unrostered(self.store.storage(), overlay, stage)?;
+        unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
         receipt.outcome = Outcome::Rejected(refusal);
         self.finish(
             program, env, start, receipt, false, overlay, stage, frame, depth,
@@ -360,7 +361,7 @@ where
             };
             return Ok(Run { receipt, status });
         };
-        parked::remove(self.store.storage(), overlay, id, program)?;
+        parked::remove(self.committed.reads(), overlay, id, program)?;
         let close = awaits::Op::Close { frame: id };
         let closed = self
             .tell_awaits(Origin::System, close, env, overlay, stage, frame, depth + 1)
@@ -450,7 +451,7 @@ where
             Err(refusal) => return Ok(rejected(&role, refusal)),
         };
         let env = Env {
-            network: self.network.clone(),
+            network: self.network.to_vec(),
             height: env.height,
             time: env.time,
             me: role.clone(),
@@ -490,14 +491,14 @@ where
             ticket,
             answer,
         } = resumed;
-        let view = self.store.view(vec![&*overlay]);
+        let view = self.committed.view(vec![&*overlay]);
         let Some((record, image)) = parked::load(&view, id)? else {
             let gone = Refusal::new(reason::NOT_FOUND, format!("frame {id} is not parked"));
             return Ok(rejected(self.role(role::AWAITS)?, gone));
         };
         let program = record.program.clone();
         let env = Env {
-            network: self.network.clone(),
+            network: self.network.to_vec(),
             height,
             time,
             me: program.clone(),
@@ -594,14 +595,14 @@ where
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Vec<Receipt>> {
-        let frames = parked::of(&self.store.view(vec![&*overlay]), program)?;
+        let frames = parked::of(&self.committed.view(vec![&*overlay]), program)?;
         let mut receipts = Vec::new();
         for id in frames {
-            let Some(record) = parked::record(&self.store.view(vec![&*overlay]), id)? else {
+            let Some(record) = parked::record(&self.committed.view(vec![&*overlay]), id)? else {
                 continue;
             };
             let env = Env {
-                network: self.network.clone(),
+                network: self.network.to_vec(),
                 height,
                 time,
                 me: program.to_owned(),

@@ -37,8 +37,6 @@ const EVERY_KEY: &str = "listen = \"127.0.0.1:9000\"\n\
                          halo_egress = 1000000\n\
                          halo_inbound_streams = 32\n\
                          halo_datagrams = 128\n\
-                         reads_in_flight = 16\n\
-                         uploads_in_flight = 2\n\
                          blob_serves_in_flight = 3\n\
                          blob_backlog = 40\n\
                          blob_gatherers = 5\n\
@@ -66,8 +64,6 @@ fn every_key() -> Settings {
             halo_egress: Some(1_000_000),
             halo_inbound_streams: Some(count(32)),
             halo_datagrams: Some(count(128)),
-            reads_in_flight: Some(count(16)),
-            uploads_in_flight: Some(count(2)),
             blob_serves_in_flight: Some(count(3)),
             blob_backlog: Some(count(40)),
             blob_gatherers: Some(count(5)),
@@ -126,8 +122,6 @@ fn a_count_the_file_names_must_be_nonzero_and_fit_a_tokio_semaphore() {
     for key in [
         "halo_inbound_streams",
         "halo_datagrams",
-        "reads_in_flight",
-        "uploads_in_flight",
         "blob_serves_in_flight",
         "blob_backlog",
     ] {
@@ -181,8 +175,6 @@ fn file_only_settings_reach_the_config() {
     assert_eq!(
         config.load,
         LoadConfig {
-            reads_in_flight: count(16),
-            uploads_in_flight: count(2),
             blob_backlog: count(40),
             blob_serves_in_flight: count(3),
             blob_gatherers: count(5),
@@ -212,8 +204,8 @@ fn a_flag_beats_the_file_and_the_file_beats_the_default() {
         log: Some("debug".into()),
         load: LoadSettings {
             halo_datagrams: Some(count(128)),
-            reads_in_flight: Some(count(16)),
-            uploads_in_flight: Some(count(2)),
+            blob_backlog: Some(count(16)),
+            blob_serves_in_flight: Some(count(2)),
             ..LoadSettings::default()
         },
         consensus: ConsensusSettings {
@@ -228,7 +220,7 @@ fn a_flag_beats_the_file_and_the_file_beats_the_default() {
         halo: Some(socket(9200)),
         load: LoadSettings {
             halo_datagrams: Some(count(64)),
-            reads_in_flight: Some(count(8)),
+            blob_backlog: Some(count(8)),
             ..LoadSettings::default()
         },
         consensus: ConsensusSettings {
@@ -259,8 +251,8 @@ fn a_flag_beats_the_file_and_the_file_beats_the_default() {
     assert_eq!(
         config.load,
         LoadConfig {
-            reads_in_flight: count(8),
-            uploads_in_flight: count(2),
+            blob_backlog: count(8),
+            blob_serves_in_flight: count(2),
             ..LoadConfig::default()
         }
     );

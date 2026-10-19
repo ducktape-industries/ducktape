@@ -4,11 +4,11 @@ use std::iter::Peekable;
 use abi::{Entry, Scan};
 
 use crate::overlay::Overlay;
-use crate::storage::Storage;
+use crate::storage::Reads;
 use crate::{Error, Result};
 
 pub struct View<'a> {
-    storage: &'a Storage,
+    storage: &'a Reads,
     layers: Vec<&'a Overlay>,
 }
 
@@ -17,7 +17,7 @@ type Item = Result<Merged>;
 type Layer<'a> = Peekable<Box<dyn Iterator<Item = Item> + 'a>>;
 
 impl<'a> View<'a> {
-    pub fn new(storage: &'a Storage, layers: Vec<&'a Overlay>) -> View<'a> {
+    pub fn new(storage: &'a Reads, layers: Vec<&'a Overlay>) -> View<'a> {
         View { storage, layers }
     }
 

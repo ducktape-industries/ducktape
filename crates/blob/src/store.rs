@@ -20,7 +20,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Stage {
     framed: BTreeMap<BlobId, Vec<u8>>,
 }

@@ -386,8 +386,6 @@ log = "info"                  # --log; default info
 halo_egress = 10000000        # --halo-egress; default unlimited
 halo_inbound_streams = 512    # --halo-inbound-streams
 halo_datagrams = 2048         # --halo-datagrams
-reads_in_flight = 128         # --reads-in-flight
-uploads_in_flight = 16        # --uploads-in-flight
 blob_serves_in_flight = 32    # --blob-serves-in-flight
 blob_backlog = 128            # --blob-backlog
 blob_gatherers = 8            # --blob-gatherers
@@ -467,9 +465,7 @@ for it to take them; past it the node takes no more until one is taken.
 `--halo-datagrams` is how many datagrams from members wait for the node to
 read them; past it a datagram is dropped.
 
-Five more `run` flags set how much work a node takes on at once.
-`--reads-in-flight` and `--uploads-in-flight` are the HTTP reads and the
-uploads (submit, blob put) it serves together; the rest wait their turn.
+Three more `run` flags set how much blob work a node takes on at once.
 `--blob-serves-in-flight` and `--blob-gatherers` are the blobs it sends to
 members and gathers from members together. `--blob-backlog` is how many
 members' blob requests wait for a send; past it a request is refused.
@@ -479,8 +475,8 @@ loop and for its connection (a session that far behind is closed),
 `--live-group-queue` the objects waiting for one group stream's writer (past
 it the group is dropped short), `--live-peer-queue`, `--live-lane-backlog` and
 `--live-lane-per-sender` the lane items waiting for one peer's writer, the
-peers' streams waiting to be taken and the datagrams waiting per peer; its
-chain reads run under `--reads-in-flight`. `--live-linger-ms` is how long a
+peers' streams waiting to be taken and the datagrams waiting per peer.
+`--live-linger-ms` is how long a
 closed session's last message gets to reach the client before the connection
 is closed under it. `ducktape run --help` shows each default and its
 `node.toml` key.
@@ -564,6 +560,11 @@ decides its outcome. The node runs a frame before its block only when the
 submit asks with `--preconfirm`: the frame's writes then show in the
 preconfirmed layer, the node runs it again after each block until a block
 carries it, and the receipt `submit` prints is that prediction, not a verdict.
+The prediction runs over the newest block the node has finished applying and
+the frames it already holds, so it can be answered while the next block is
+still being applied, and that block can change the outcome. After each block
+the node checks every frame it holds again and drops the ones no block may
+carry any more; a dropped frame never shows in `/v1/tx`.
 A frame predicted to fail is still relayed and waits for a block. `blob put`,
 votes and `ducktape halo` never preconfirm. `ducktape logs`,
 `ducktape log-filter`, `ducktape egress reload`, `ducktape metrics` and

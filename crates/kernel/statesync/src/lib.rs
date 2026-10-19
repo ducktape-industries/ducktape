@@ -16,7 +16,7 @@ use state::{Commitment, SyncFailure, SyncTarget, commitment_name};
 pub use consensus::Anchor;
 pub use consensus::Context;
 pub use remote::Remote;
-pub use serve::{Anchors, serve};
+pub use serve::{Anchors, Served, anchored, serve};
 pub use wire::{Head, Request, Response};
 
 pub type SyncRequest = sync::Request<state::Family>;

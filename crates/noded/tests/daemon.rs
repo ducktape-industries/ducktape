@@ -1,8 +1,7 @@
+use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::thread::JoinHandle;
@@ -22,7 +21,9 @@ use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
 use noded::wire::{Admin, BlockAsk, BlockRef, Blocks, Change, Submitted, TxAsk, TxRef};
-use noded::{Client, Endpoint, HaloConfig, Listen, Listeners, LoadConfig, Logs, Upload, Workspace};
+use noded::{
+    Client, Endpoint, HaloConfig, Listen, Listeners, LoadConfig, Logs, Running, Upload, Workspace,
+};
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
@@ -174,6 +175,14 @@ impl Seat {
     }
 
     fn start_with(&self, load: LoadConfig) -> Live {
+        self.start_handing(load, |_| ()).0
+    }
+
+    fn start_handing<T: Send + 'static>(
+        &self,
+        load: LoadConfig,
+        hand: impl FnOnce(&Running<tokio::Context>) -> T + Send + 'static,
+    ) -> (Live, T) {
         let (ready, started) = mpsc::channel();
         let workspace = self.workspace.clone();
         let held = self.held.lock().unwrap().take();
@@ -197,15 +206,16 @@ impl Seat {
                 )
                 .await
                 .unwrap();
-                ready.send(running.http).unwrap();
+                ready.send((running.http, hand(&running))).unwrap();
                 running.stopped(std::future::pending()).await.unwrap();
             });
         });
-        let http = started.recv().unwrap();
-        Live {
+        let (http, handed) = started.recv().unwrap();
+        let live = Live {
             client: Client::new(format!("http://{http}")),
             thread,
-        }
+        };
+        (live, handed)
     }
 
     fn admin_frame(&self, anchor: Tip, verb: Admin) -> Vec<u8> {
@@ -277,7 +287,9 @@ fn founding_with(
     let mut programs = String::new();
     for (id, code) in extra {
         std::fs::write(root.join(format!("{id}.wasm")), code).unwrap();
-        programs.push_str(&format!("[[programs]]\nid = \"{id}\"\ncode = \"{id}.wasm\"\n"));
+        programs.push_str(&format!(
+            "[[programs]]\nid = \"{id}\"\ncode = \"{id}.wasm\"\n"
+        ));
     }
     let text = format!(
         "network = \"{NETWORK}\"\ntime = {TIME}\nepoch_length = {epoch_length}\n\
@@ -1039,6 +1051,171 @@ fn a_node_run_without_live_names_no_live_port() {
     live.thread.join().unwrap();
 }
 
+#[test]
+fn a_node_answers_reads_from_its_last_applied_block_while_its_writer_is_held() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        reach(&client, 2).await;
+        let held = daemon.hold().await.unwrap();
+        let view = daemon.view().unwrap();
+        let source = view.source();
+        let applied = (
+            source.tip().unwrap(),
+            source.root().unwrap(),
+            source.roles().clone(),
+        );
+        let status = client.status().await.unwrap();
+        assert_eq!((status.anchor(), status.root, status.roles), applied);
+        let programs = client.programs().await.unwrap();
+        assert_eq!(programs, source.programs().unwrap());
+        let network = client.network().await.unwrap();
+        assert_eq!(network.height, applied.0.height);
+        held.release();
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_preconfirmed_submit_is_answered_while_the_writer_is_held_and_lands_after() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        let alice = ed25519::PrivateKey::from_seed(31);
+        let given = frame(&client, &alice, vec![set(b"held", b"1")]).await;
+        let held = daemon.hold().await.unwrap();
+        let receipt = preconfirmed(&client, given.clone()).await;
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        held.release();
+        let (_, landed) = client.land(&Frame::decode(&given).unwrap()).await.unwrap();
+        assert!(
+            matches!(landed.outcome, Outcome::Applied { .. }),
+            "{landed:?}"
+        );
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn many_submits_are_answered_while_the_writer_is_held_and_the_next_blocks_take_them_from_the_pool()
+{
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        let mut given = Vec::new();
+        for seed in 40..72 {
+            let key = ed25519::PrivateKey::from_seed(seed);
+            let value = seed.to_le_bytes();
+            given.push(frame(&client, &key, vec![set(b"crowd", &value)]).await);
+        }
+        let held = daemon.hold().await.unwrap();
+        let receipts = futures::future::join_all(
+            given
+                .iter()
+                .map(|frame| preconfirmed(&client, frame.clone())),
+        )
+        .await;
+        for receipt in &receipts {
+            assert!(
+                matches!(receipt.outcome, Outcome::Applied { .. }),
+                "{receipt:?}"
+            );
+        }
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        held.release();
+        let mut waiting: Vec<[u8; 32]> = given
+            .iter()
+            .map(|frame| Frame::decode(frame).unwrap().body.submission().id())
+            .collect();
+        while !waiting.is_empty() {
+            blocks.next().await.unwrap().unwrap();
+            let mut still = Vec::new();
+            for id in waiting {
+                let ask = TxAsk {
+                    tx: TxRef::Hash(id),
+                    most: 0,
+                };
+                match client.tx(ask).await.unwrap() {
+                    Some(located) => {
+                        let receipt = located.tx.receipt.unwrap();
+                        assert!(
+                            matches!(receipt.outcome, Outcome::Applied { .. }),
+                            "{receipt:?}"
+                        );
+                    }
+                    None => still.push(id),
+                }
+            }
+            waiting = still;
+        }
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_changes_socket_keeps_no_view_of_a_block_it_was_opened_at() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        let opened = std::sync::Arc::downgrade(&daemon.view().unwrap());
+        let opened_at = opened.upgrade().unwrap().tip().height;
+        let mut changes = client.changes(host::RECENT).await.unwrap();
+        let _quiet = client.changes("probe").await.unwrap();
+        while changes.next().await.unwrap().unwrap().height < opened_at + 2 {}
+        assert!(
+            opened.upgrade().is_none(),
+            "a view of block {opened_at} outlives two blocks while sockets stay open"
+        );
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
 const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 fn upload_expecting_continue(http: SocketAddr) -> TcpStream {
@@ -1057,36 +1234,21 @@ fn continued(stream: &mut TcpStream) {
     assert_eq!(line, CONTINUE);
 }
 
-fn answered_yet(stream: &mut TcpStream) -> bool {
-    stream.set_nonblocking(true).unwrap();
-    let read = stream.read(&mut [0u8; 1]);
-    stream.set_nonblocking(false).unwrap();
-    !matches!(read, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-}
-
 #[test]
-fn a_node_run_with_one_upload_in_flight_reads_the_next_upload_only_when_the_first_ends() {
+fn a_second_upload_is_read_while_the_first_is_in_flight() {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
     seat.init(&founding);
-    let load = LoadConfig {
-        uploads_in_flight: NonZeroUsize::MIN,
-        ..LoadConfig::default()
-    };
-    let live = seat.start_with(load);
+    let live = seat.start();
     let client = live.client.clone();
 
     let mut first = upload_expecting_continue(seat.http);
     continued(&mut first);
     let mut second = upload_expecting_continue(seat.http);
-    client_runtime().block_on(async { client.status().await.unwrap() });
-    assert!(
-        !answered_yet(&mut second),
-        "the node reads a second upload while the first is in flight"
-    );
-    first.write_all(b"x").unwrap();
     continued(&mut second);
+    first.write_all(b"x").unwrap();
+    second.write_all(b"x").unwrap();
 
     client_runtime().block_on(seat.admin(&client, Admin::Shutdown));
     live.thread.join().unwrap();
@@ -2039,7 +2201,14 @@ async fn park_and_resume(client: &Client, key: &ed25519::PrivateKey, round: u64)
     let parks: Vec<Frame> = (0..PARKS)
         .map(|n| {
             let salt = Some(round * PARKS + n);
-            Frame::sign(key, NETWORK.as_bytes(), anchor, salt, "awaiter", wait_plan())
+            Frame::sign(
+                key,
+                NETWORK.as_bytes(),
+                anchor,
+                salt,
+                "awaiter",
+                wait_plan(),
+            )
         })
         .collect();
     applied_all(client, &parks).await;
@@ -2056,7 +2225,14 @@ async fn park_and_resume(client: &Client, key: &ed25519::PrivateKey, round: u64)
                 ticket,
                 answer: Ok(b"answered".to_vec()),
             };
-            Frame::sign(key, NETWORK.as_bytes(), anchor, None, "oracle", abi::encode(&op))
+            Frame::sign(
+                key,
+                NETWORK.as_bytes(),
+                anchor,
+                None,
+                "oracle",
+                abi::encode(&op),
+            )
         })
         .collect();
     applied_all(client, &answers).await;
@@ -2116,10 +2292,9 @@ fn sync_start(request: &statesync::Request) -> u64 {
     let statesync::Request::Sync { request, .. } = request else {
         panic!("only a sync request starts somewhere");
     };
-    let decoded = <statesync::SyncRequest as commonware_codec::DecodeExt<_>>::decode(
-        request.as_slice(),
-    )
-    .unwrap();
+    let decoded =
+        <statesync::SyncRequest as commonware_codec::DecodeExt<_>>::decode(request.as_slice())
+            .unwrap();
     *decoded.start()
 }
 

@@ -1,5 +1,5 @@
-// The mempool: every frame a node has taken that no applied block has carried and whose anchor
-// is still recent, in the order the node took them. `Node` writes it; its `Proposer` reads it.
+// The frames a node has taken that no applied block has carried and whose anchor is still recent,
+// in the order the node took them. `Mempool` holds it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -93,15 +93,11 @@ impl Pool {
         self.arrived.values().map(|id| &self.held[id])
     }
 
-    pub fn settle<'a>(&mut self, carried: impl IntoIterator<Item = &'a SubmissionId>, next: u64) {
-        let expired = self
-            .held
-            .values()
-            .filter(|held| !held.submission.anchor.anchors(next))
-            .map(|held| held.id);
-        let gone: Vec<SubmissionId> = carried.into_iter().copied().chain(expired).collect();
-        for id in gone {
-            self.remove(&id);
+    pub fn remove(&mut self, ids: &[SubmissionId]) {
+        for id in ids {
+            if let Some(held) = self.held.remove(id) {
+                self.arrived.remove(&held.arrival);
+            }
         }
     }
 
@@ -127,11 +123,5 @@ impl Pool {
             offered.push(held.frame.clone());
         }
         offered
-    }
-
-    fn remove(&mut self, id: &SubmissionId) {
-        if let Some(held) = self.held.remove(id) {
-            self.arrived.remove(&held.arrival);
-        }
     }
 }

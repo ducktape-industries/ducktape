@@ -2,7 +2,9 @@
 // mesh, and takes a frame another member relays into its own mempool, telling the blob service
 // which member sent a put. Used by run and server.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::authenticated::lookup::Receiver;
@@ -15,7 +17,7 @@ use crate::{Context, Daemon};
 pub struct Relay<E: Context> {
     me: PublicKey,
     sender: Outbound<E>,
-    validators: Mutex<Vec<PublicKey>>,
+    validators: ArcSwap<Vec<PublicKey>>,
 }
 
 impl<E: Context> Relay<E> {
@@ -23,7 +25,7 @@ impl<E: Context> Relay<E> {
         let relay = Relay {
             me,
             sender,
-            validators: Mutex::new(Vec::new()),
+            validators: ArcSwap::from_pointee(Vec::new()),
         };
         relay.seat(validators);
         relay
@@ -35,28 +37,20 @@ impl<E: Context> Relay<E> {
             .filter(|key| **key != self.me)
             .cloned()
             .collect();
-        let mut seated = self
-            .validators
-            .lock()
-            .expect("the validator lock is never poisoned");
-        let changed = *seated != others;
-        *seated = others;
+        let changed = **self.validators.load() != others;
+        self.validators.store(Arc::new(others));
         changed
     }
 
     pub fn send<'a>(&self, frames: impl IntoIterator<Item = &'a [u8]>) {
-        let validators = self
-            .validators
-            .lock()
-            .expect("the validator lock is never poisoned")
-            .clone();
+        let validators = self.validators.load_full();
         if validators.is_empty() {
             return;
         }
         let mut sender = self.sender.clone();
         for frame in frames {
             let attempted =
-                sender.send(Recipients::Some(validators.clone()), frame.to_vec(), false);
+                sender.send(Recipients::Some(validators.to_vec()), frame.to_vec(), false);
             tracing::debug!(
                 target: "ducktape::relay",
                 bytes = frame.len(),
@@ -71,14 +65,16 @@ impl<E: Context> Relay<E> {
 pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<PublicKey>) {
     while let Ok((peer, message)) = receiver.recv().await {
         let frame = message.as_ref().to_vec();
-        let (taken, role) = {
-            let mut node = daemon.node.lock().await;
-            let role = node.host().roles().get(abi::role::BLOBS).cloned();
-            let taken = node
-                .submit(frame.clone(), Source::Peer, Preconfirm::Off)
-                .await;
-            (taken, role)
+        let role = match daemon.view() {
+            Ok(view) => view.source().roles().get(abi::role::BLOBS).cloned(),
+            Err(error) => {
+                tracing::debug!(target: "ducktape::relay", %peer, %error, "dropped a relayed frame");
+                return;
+            }
         };
+        let taken = daemon
+            .submit(frame.clone(), Source::Peer, Preconfirm::Off)
+            .await;
         match taken {
             Ok(Ok(Taken::New(_))) => {
                 tracing::debug!(target: "ducktape::relay", %peer, "took a relayed frame");

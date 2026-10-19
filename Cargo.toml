@@ -70,7 +70,9 @@ async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+rustix = { version = "1", features = ["process", "thread"] }
+arc-swap = "1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
 commonware-storage = "2026.9.0"
@@ -102,7 +104,7 @@ chacha20poly1305 = "0.10"
 zeroize = "1"
 
 # fluent31 — the LSM engine under the state crate's storage.
-fluent31 = { git = "https://github.com/ducktape-industries/fluent31", rev = "76ba1867bc0ba9c09bb8387149c07844f1d2395c", default-features = false }
+fluent31 = { git = "https://github.com/ducktape-industries/fluent31", rev = "823e0459a7f71ea96460e6754635c0c324980412", default-features = false }
 # borsh — the record codec: the ABI, the wire records and the workspace files
 # share one byte layout with no map ordering games. Its schemas describe a
 # program's ops, queries and replies to a reader with no Rust type for them.

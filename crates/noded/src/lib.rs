@@ -1,6 +1,9 @@
 mod blocks;
+mod changes;
 mod client;
 mod config;
+mod cores;
+mod ctx;
 mod egress;
 mod endpoint;
 mod link;
@@ -8,22 +11,22 @@ pub mod live;
 mod logs;
 mod mesh;
 mod network;
+mod pool;
 mod relay;
 mod run;
 mod server;
 mod transport;
+mod view;
 pub mod wire;
 mod workspace;
+mod writer;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use abi::{ProgramId, Refusal};
-use commonware_cryptography::Digestible as _;
 use consensus::{MarshalMailbox, Network, Summaries, Votes};
-use futures::channel::{mpsc, oneshot};
 use host::Applied;
-use node::Node;
+use node::{Preconfirm, Source, Taken};
 use tokio::sync::watch;
 
 pub use client::{Client, Upload};
@@ -36,10 +39,12 @@ pub use mesh::Mesh;
 pub use run::{
     HaloConfig, Listen, Listeners, LoadConfig, Running, init, invite, join, run, run_on,
 };
+pub use view::{View, Views};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
+pub use writer::Held;
 
-use crate::wire::Change;
+use crate::changes::{Changes, Subscription, Wrote};
 
 pub trait Context:
     consensus::Context + commonware_runtime::Network + commonware_runtime::Resolver
@@ -50,8 +55,6 @@ impl<E> Context for E where
     E: consensus::Context + commonware_runtime::Network + commonware_runtime::Resolver
 {
 }
-
-pub type Shared<E> = Arc<futures::lock::Mutex<Node<E>>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -107,6 +110,10 @@ pub enum Error {
     Failed { status: u16, sentence: String },
     #[error("the node closed its change stream")]
     Closed,
+    #[error("the node stopped")]
+    Stopped,
+    #[error("the node's reader stopped: {0}")]
+    Offloaded(String),
     #[error("egress: {0}")]
     Egress(#[from] egress::Refused),
 }
@@ -121,16 +128,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct Daemon<E: Context> {
     pub context: E,
-    pub node: Shared<E>,
+    current: Arc<view::Current<E>>,
+    readers: watch::Sender<()>,
+    writer: writer::Writer,
+    pool: pool::Pooling<E>,
+    changes: Changes,
     pub descriptor: Descriptor,
     pub network: Network,
     pub identity: Vec<u8>,
     pub anchors: MarshalMailbox,
     pub summaries: Summaries<E>,
+    recent: blocks::Recent,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub tips: watch::Sender<u64>,
-    pub relay: relay::Relay<E>,
+    pub relay: Arc<relay::Relay<E>>,
     pub blobs: blob::service::Service,
     halo: Arc<halo::Halo>,
     pub live: Arc<live::Relay<E>>,
@@ -139,150 +151,86 @@ pub struct Daemon<E: Context> {
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
-    subscribers: Mutex<Vec<Subscriber>>,
-}
-
-/// One `/v1/changes` socket's end: the program it follows, whether it
-/// asked for the keys alone, and where each block's word for it goes.
-/// `since` is the tip it was opened at and `read` the newest height a pong
-/// of its client echoed. `cut` reaches the socket's task even while a send
-/// waits on a client that stopped reading: dropped, it ends the task and
-/// its queue; sent, the node is stopping and the task says goodbye.
-struct Subscriber {
-    program: ProgramId,
-    keys: bool,
-    sender: mpsc::UnboundedSender<Published>,
-    since: u64,
-    read: Arc<AtomicU64>,
-    cut: oneshot::Sender<()>,
-}
-
-/// A `/v1/changes` socket's side of its [`Subscriber`].
-pub(crate) struct Subscription {
-    pub(crate) changes: mpsc::UnboundedReceiver<Published>,
-    pub(crate) read: Arc<AtomicU64>,
-    pub(crate) cut: oneshot::Receiver<()>,
-}
-
-/// What a `/v1/changes` socket hears of each block the node applies: what
-/// the block wrote to its program, or a ping carrying the block's height
-/// (8 bytes, little-endian). A block that wrote nothing there is a ping, so
-/// a quiet program's socket is never idle long enough for a proxy to cut
-/// it; so is the block that closes each epoch, after its change, so every
-/// client is asked once an epoch to show that it still reads (its pong).
-pub(crate) enum Published {
-    Change(Change),
-    Ping(u64),
 }
 
 impl<E: Context> Daemon<E> {
-    pub async fn status(&self) -> Result<Status> {
-        let node = self.node.lock().await;
-        let tip = node.tip()?;
-        Ok(Status {
-            network: self.descriptor.network.clone(),
-            time: self.descriptor.time,
-            block_time_ms: self.descriptor.block_time_ms,
-            epoch_length: self.network.epoch_length,
-            height: tip.height,
-            tip: tip.id,
-            root: node.host().root()?,
-            epoch: self.network.epoch_after(tip.height),
-            identity: self.identity.clone(),
-            contract: NODE_CONTRACT,
-            genesis: self.descriptor.genesis_block().digest().0,
-            roles: node.host().roles().clone(),
+    pub fn view(&self) -> Result<Arc<View<E>>> {
+        self.current.view()
+    }
+
+    pub(crate) fn facts(&self) -> view::Facts<'_> {
+        view::Facts {
+            descriptor: &self.descriptor,
+            network: &self.network,
+            identity: &self.identity,
+            readers: &self.readers,
+        }
+    }
+
+    pub(crate) fn now(&self) -> u64 {
+        millis(&self.context)
+    }
+
+    pub async fn submit(
+        &self,
+        frame: Vec<u8>,
+        source: Source,
+        preconfirm: Preconfirm,
+    ) -> Result<std::result::Result<Taken, Refusal>> {
+        let network = self.descriptor.id();
+        let (frame, admitted) = offload(move || {
+            let admitted = node::admissible(&frame, &network);
+            (frame, admitted)
         })
-    }
-
-    /// Each block's word for `program` (`keys`: its changes' keys alone,
-    /// every value left out as `None`).
-    pub(crate) fn subscribe(&self, program: ProgramId, keys: bool) -> Subscription {
-        let (sender, changes) = mpsc::unbounded();
-        let (cut, dropped) = oneshot::channel();
-        let read = Arc::new(AtomicU64::new(0));
-        let subscription = Subscription {
-            changes,
-            read: read.clone(),
-            cut: dropped,
+        .await?;
+        let submission = match admitted {
+            Ok(submission) => submission,
+            Err(refusal) => return Ok(Err(refusal)),
         };
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .expect("the subscriber lock is never poisoned");
-        let stopping = *self.shutdown.borrow();
-        if stopping {
-            let _ = cut.send(());
-            return subscription;
-        }
-        subscribers.push(Subscriber {
-            program,
-            keys,
-            sender,
-            since: *self.tips.borrow(),
-            read,
-            cut,
-        });
-        subscription
+        self.pool
+            .submit(frame, submission, source, preconfirm)
+            .await
     }
 
-    pub(crate) fn hang_up(&self) {
-        let subscribers = std::mem::take(
-            &mut *self
-                .subscribers
-                .lock()
-                .expect("the subscriber lock is never poisoned"),
-        );
-        for subscriber in subscribers {
-            let _ = subscriber.cut.send(());
-        }
+    pub async fn hold(&self) -> Result<Held> {
+        self.writer.hold().await
     }
 
-    /// Each socket's word for the block. At the block that closes an
-    /// epoch, a socket that was open at the previous epoch's close but has
-    /// answered no ping since hasn't read for a whole epoch: it is dropped,
-    /// its queue with it, and its client reads again when it reconnects.
+    pub async fn sync(&self, request: statesync::Request) -> Result<statesync::Response> {
+        let served = self.writer.sync(request).await?;
+        Ok(statesync::anchored(served, &self.anchors).await)
+    }
+
+    pub(crate) fn subscribe(&self, program: ProgramId, keys: bool) -> Subscription {
+        self.changes.subscribe(program, keys)
+    }
+
+    pub(crate) async fn hang_up(&self) {
+        self.changes.hang_up().await;
+    }
+
     pub fn publish(&self, applied: &Applied) {
         self.live.invalidate(&applied.writes);
-        let height = applied.height;
-        let closes = self.network.closes_an_epoch(height);
-        let last = height.checked_sub(self.network.epoch_length);
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .expect("the subscriber lock is never poisoned");
-        subscribers.retain(|subscriber| {
-            if let Some(last) = last.filter(|_| closes)
-                && subscriber.since < last
-                && subscriber.read.load(Ordering::Relaxed) < last
-            {
-                return false;
-            }
-            let Some(writes) = applied.writes.programs.get(&subscriber.program) else {
-                return subscriber
-                    .sender
-                    .unbounded_send(Published::Ping(height))
-                    .is_ok();
-            };
-            let value = |value: &Option<Vec<u8>>| match subscriber.keys {
-                true => None,
-                false => value.clone(),
-            };
-            let change = Change {
-                height: applied.height,
-                root: applied.root,
-                writes: writes
-                    .iter()
-                    .map(|(key, written)| (key.clone(), value(written)))
-                    .collect(),
-            };
-            let sent = subscriber.sender.unbounded_send(Published::Change(change));
-            sent.is_ok()
-                && (!closes
-                    || subscriber
-                        .sender
-                        .unbounded_send(Published::Ping(height))
-                        .is_ok())
+        self.changes.wrote(Wrote {
+            height: applied.height,
+            root: applied.root,
+            writes: Arc::new(applied.writes.clone()),
         });
     }
+}
+
+pub(crate) async fn offload<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| Error::Offloaded(error.to_string()))
+}
+
+pub(crate) fn millis(clock: &impl commonware_runtime::Clock) -> u64 {
+    let since_epoch = clock
+        .current()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    since_epoch.as_millis() as u64
 }

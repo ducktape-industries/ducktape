@@ -776,16 +776,18 @@ fn a_datagram_older_than_the_newest_held_is_dropped_and_counted() {
         assert_eq!((header.group, header.object), (1, 3));
         assert_eq!(payload, b"newer");
         assert_eq!(metric(&context, "live_dropped_stale_total"), 1);
-        assert_eq!(
-            node.relay
-                .state()
-                .track(&cursor)
-                .unwrap()
-                .latest
-                .as_ref()
-                .map(|cached| cached.first),
-            Some(3)
-        );
+        let first = node
+            .relay
+            .inspect(move |state| {
+                state
+                    .track(&cursor)
+                    .unwrap()
+                    .latest
+                    .as_ref()
+                    .map(|cached| cached.first)
+            })
+            .await;
+        assert_eq!(first, Some(3));
     });
 }
 
@@ -1338,14 +1340,13 @@ fn a_track_published_on_one_node_reaches_a_subscriber_on_another_over_halo() {
 
         // The track's priority crossed the lane with its announce and is held on the second
         // node, where its egress streams are set to it.
+        let held = doc.clone();
+        let priority = second
+            .relay
+            .inspect(move |state| state.track(&held).expect("held remote").priority)
+            .await;
         assert_eq!(
-            second
-                .relay
-                .state()
-                .track(&doc)
-                .expect("held remote")
-                .priority,
-            3,
+            priority, 3,
             "the track's priority crossed with its announce"
         );
 
@@ -1643,11 +1644,12 @@ fn an_object_over_its_cap_is_refused_too_large_and_the_session_goes_on() {
         // The oversized group's entry was ended short, not left behind: both groups'
         // entries are gone once group 2 completed, which the ordered session loop reached after
         // the oversized group's own short end.
-        assert_eq!(
-            node.relay.state().open_groups(&doc),
-            0,
-            "the oversized group left no open-group entry"
-        );
+        let held = doc.clone();
+        let open = node
+            .relay
+            .inspect(move |state| state.open_groups(&held))
+            .await;
+        assert_eq!(open, 0, "the oversized group left no open-group entry");
     });
 }
 

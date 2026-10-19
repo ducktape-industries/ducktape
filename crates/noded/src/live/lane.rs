@@ -21,6 +21,7 @@ use tokio::task::{AbortHandle, JoinSet};
 
 use super::groups::{self, GroupOut, Groups, Handed};
 use super::session::{Latest, framed};
+use super::table::Event;
 use super::{Config, Relay};
 
 /// A retried thing logs its first attempt, then every tenth.
@@ -122,14 +123,36 @@ impl Writer {
     }
 }
 
-/// The relay's side of the lane: one writer per peer, fed without waiting, under the relay's
-/// lanes lock (taken after the state lock, never the other way).
+#[derive(Clone)]
+pub struct Plane {
+    streams: Arc<Streams>,
+    datagrams: Arc<Datagrams>,
+}
+
+impl Plane {
+    pub fn open(halo: &Halo, config: &Config) -> Plane {
+        let plane = halo.plane();
+        let streams = Arc::new(
+            plane
+                .streams(LANE, config.lane_backlog.get())
+                .expect("the live lane is the relay's alone"),
+        );
+        let datagrams = Arc::new(
+            plane
+                .datagrams(LANE, config.lane_per_sender.get())
+                .expect("the live lane is the relay's alone"),
+        );
+        Plane { streams, datagrams }
+    }
+}
+
 pub struct Lanes<E: crate::Context> {
     relay: Weak<Relay<E>>,
     halo: Arc<Halo>,
     me: PublicKey,
     streams: Arc<Streams>,
     datagrams: Arc<Datagrams>,
+    writers: JoinSet<()>,
     dropped: Counter,
     config: Config,
     peers: HashMap<PublicKey, Writer>,
@@ -144,26 +167,17 @@ impl<E: crate::Context> Lanes<E> {
         relay: Weak<Relay<E>>,
         halo: Arc<Halo>,
         me: PublicKey,
+        plane: Plane,
         dropped: Counter,
         config: Config,
     ) -> Self {
-        let plane = halo.plane();
-        let streams = Arc::new(
-            plane
-                .streams(LANE, config.lane_backlog.get())
-                .expect("the live lane is the relay's alone"),
-        );
-        let datagrams = Arc::new(
-            plane
-                .datagrams(LANE, config.lane_per_sender.get())
-                .expect("the live lane is the relay's alone"),
-        );
         Lanes {
             relay,
             halo,
             me,
-            streams,
-            datagrams,
+            streams: plane.streams,
+            datagrams: plane.datagrams,
+            writers: JoinSet::new(),
             dropped,
             config,
             peers: HashMap::new(),
@@ -224,7 +238,7 @@ impl<E: crate::Context> Lanes<E> {
     /// Served: the writers of members not seated any more go, and the members seated are what
     /// is left to resync. Unserved: every writer goes, and there is no member at all, so a
     /// paused or closed lane is silence, not a stall.
-    fn seated(&mut self) -> Option<Vec<PublicKey>> {
+    pub fn seated(&mut self) -> Option<Vec<PublicKey>> {
         if !self.streams.served() {
             self.peers.clear();
             self.resets.clear();
@@ -241,7 +255,6 @@ impl<E: crate::Context> Lanes<E> {
     /// fresh stream arms the other side again.
     fn writer(&mut self, to: PublicKey) -> Option<&mut Writer> {
         if !self.peers.contains_key(&to) {
-            let relay = self.relay.upgrade()?;
             let (control, queued) = mpsc::channel(self.config.peer_queue.get());
             let latest = Arc::new(Latest::default());
             let link = PeerLink {
@@ -253,7 +266,10 @@ impl<E: crate::Context> Lanes<E> {
                 link: Link::Closed,
                 attempts: 0,
             };
-            let aborting = relay.spawn(peer_writing(link, queued, latest.clone()));
+            while self.writers.try_join_next().is_some() {}
+            let aborting = self
+                .writers
+                .spawn(peer_writing(link, queued, latest.clone()));
             self.peers.insert(
                 to.clone(),
                 Writer {
@@ -266,6 +282,10 @@ impl<E: crate::Context> Lanes<E> {
             );
         }
         self.peers.get_mut(&to)
+    }
+
+    pub fn resync(&mut self, member: PublicKey) {
+        self.queue(member, Queued::Resync);
     }
 
     fn queue(&mut self, to: PublicKey, queued: Queued) {
@@ -317,57 +337,39 @@ impl<E: crate::Context> Lanes<E> {
     }
 }
 
-/// The lane's served state or the membership moved. Every member not seated any more is gone
-/// (its writer aborted, its tracks ended and its asks dropped), and every one seated is
-/// resynced, so one seated after we last opened to it hears our tracks without a retable or a
-/// reconnect. The state is stepped with no lanes lock held.
-fn reconcile<E: crate::Context>(relay: &Relay<E>) {
-    let seated = relay.lanes().seated();
-    let Some(seated) = seated else {
-        relay.step(|state| state.peers_gone(|_| false));
-        return;
-    };
-    relay.step(|state| state.peers_gone(|peer| seated.contains(peer)));
-    let mut lanes = relay.lanes();
-    for member in seated {
-        lanes.queue(member, Queued::Resync);
-    }
-}
-
 /// Reads the lane's streams and datagrams, and reconciles the writers whenever the membership
 /// or the lane's served state moves.
 pub async fn serving<E: crate::Context>(relay: Weak<Relay<E>>) {
     let Some(strong) = relay.upgrade() else {
         return;
     };
-    let (halo, streams, datagrams) = {
-        let lanes = strong.lanes();
-        (
-            lanes.halo.clone(),
-            lanes.streams.clone(),
-            lanes.datagrams.clone(),
-        )
-    };
-    strong.spawn(accepting(relay.clone(), streams.clone()));
-    strong.spawn(receiving(relay.clone(), datagrams));
+    let (halo, streams, datagrams) = (
+        strong.halo.clone(),
+        strong.plane.streams.clone(),
+        strong.plane.datagrams.clone(),
+    );
     drop(strong);
-    let mut membership = halo.membership_changed();
-    let mut served = streams.served_changed();
-    loop {
-        // A member seated, or the lane enabled, before this loop began to watch.
-        let Some(strong) = relay.upgrade() else {
-            return;
-        };
-        reconcile(&strong);
-        drop(strong);
-        // The `Ok(())` pattern disables a watch whose sender is gone, rather than firing it
-        // forever: a dropped sender means the halo or the plane is going.
-        tokio::select! {
-            Ok(()) = membership.changed() => {}
-            Ok(()) = served.changed() => {}
-            else => return,
+    let reconciling = async {
+        let mut membership = halo.membership_changed();
+        let mut served = streams.served_changed();
+        loop {
+            let Some(strong) = relay.upgrade() else {
+                return;
+            };
+            strong.send(Event::Reconcile);
+            drop(strong);
+            tokio::select! {
+                Ok(()) = membership.changed() => {}
+                Ok(()) = served.changed() => {}
+                else => return,
+            }
         }
-    }
+    };
+    tokio::join!(
+        accepting(relay.clone(), streams.clone()),
+        receiving(relay.clone(), datagrams),
+        reconciling,
+    );
 }
 
 /// One peer's writer task: the control stream to it.
@@ -546,8 +548,14 @@ impl<E: crate::Context> PeerLink<E> {
         let Some(relay) = self.relay.upgrade() else {
             return Ensured::Failed;
         };
-        let resync = relay.step_to(|state| (state.resync(&self.to), Vec::new()));
+        let asked = relay.asking(|reply| Event::Resync {
+            peer: self.to.clone(),
+            reply,
+        });
         drop(relay);
+        let Ok(resync) = asked.await else {
+            return Ensured::Failed;
+        };
         for forward in &resync {
             if !self.write(forward).await {
                 return Ensured::Failed;
@@ -616,18 +624,18 @@ fn cut_short(stream: Stream) {
 }
 
 async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, streams: Arc<Streams>) {
+    let mut readers = JoinSet::new();
     while let Some(inbound) = streams.accept().await {
         let Ok(meta) = abi::decode::<LaneMeta>(&inbound.meta) else {
             continue;
         };
-        let Some(strong) = relay.upgrade() else {
+        if relay.strong_count() == 0 {
             return;
-        };
-        // Through the relay's `JoinSet`, so a per-stream reader is aborted with the relay and
-        // does not keep a halo stream past it.
+        }
+        while readers.try_join_next().is_some() {}
         match meta {
-            LaneMeta::Control => strong.spawn(control_reading(relay.clone(), inbound)),
-            LaneMeta::Group => strong.spawn(group_reading(relay.clone(), inbound)),
+            LaneMeta::Control => readers.spawn(control_reading(relay.clone(), inbound)),
+            LaneMeta::Group => readers.spawn(group_reading(relay.clone(), inbound)),
         };
     }
 }
@@ -654,48 +662,16 @@ async fn control_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbo
     let Some(strong) = relay.upgrade() else {
         return;
     };
-    strong.step(|state| state.peer_fresh(from.clone()));
+    strong.send(Event::PeerFresh { from: from.clone() });
     drop(strong);
     while let Some(forward) = read_forward(&mut stream).await {
         let Some(relay) = relay.upgrade() else {
             return;
         };
-        heard(&relay, &from, forward);
-    }
-}
-
-/// One message from a peer, applied: each kind is one step, which decides and delivers under the
-/// one lock, the answer a node's `Subscribe` wants among the effects it returns.
-fn heard<E: crate::Context>(relay: &Relay<E>, from: &PublicKey, forward: Forward) {
-    match forward {
-        Forward::Announce {
-            track,
-            by,
-            mode,
-            priority,
-            up,
-        } => {
-            relay.step(|state| state.remote_announced(from.clone(), track, by, mode, priority, up))
-        }
-        Forward::Subscribe { request, track } => {
-            relay.step(|state| state.node_subscribed(from.clone(), request, &track))
-        }
-        Forward::Unsubscribe { request } => {
-            relay.step(|state| state.node_unsubscribed(from, request))
-        }
-        Forward::Forwarded { request, latest } => {
-            relay.step(|state| state.node_forwarded(from, request, latest))
-        }
-        Forward::Ended { request, reason } => {
-            relay.step(|state| state.node_ended(from, request, reason))
-        }
-        Forward::Refused { request, code } => {
-            relay.step(|state| state.node_refused(from, request, code))
-        }
-        Forward::Count { request, count } => {
-            relay.step(|state| state.node_counted(from, request, count))
-        }
-        Forward::Resynced => relay.step(|state| state.peer_resynced(from)),
+        relay.send(Event::Heard {
+            from: from.clone(),
+            forward,
+        });
     }
 }
 
@@ -714,13 +690,20 @@ async fn group_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inboun
     let Ok(theirs) = abi::decode::<GroupHeader>(&header) else {
         return;
     };
-    let Some(alias) = relay
-        .upgrade()
-        .and_then(|relay| relay.state().remote_alias(&from, theirs.alias))
-    else {
+    let Some(strong) = relay.upgrade() else {
         return;
     };
-    let header = GroupHeader { alias, ..theirs };
+    let asked = strong.asking(|reply| Event::RemoteGroup {
+        from: from.clone(),
+        alias: theirs.alias,
+        reply,
+    });
+    drop(strong);
+    let Ok(true) = asked.await else {
+        return;
+    };
+    let header = theirs;
+    let alias = header.alias;
     let mut object = 0u32;
     // The group completes only on `GROUP_COMPLETE`; a short read, a reset or an oversize object
     // ends it short, as the sibling QUIC reader reads its own end.
@@ -743,13 +726,23 @@ async fn group_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inboun
         let Some(relay) = relay.upgrade() else {
             return;
         };
-        relay.step(|state| state.object(None, header, object, body.into()));
+        relay.send(Event::Object {
+            from: None,
+            header,
+            object,
+            body: body.into(),
+        });
         object += 1;
     };
     let Some(relay) = relay.upgrade() else {
         return;
     };
-    relay.step(|state| state.group_end(None, alias, header.group, complete));
+    relay.send(Event::GroupEnded {
+        from: None,
+        alias,
+        group: header.group,
+        complete,
+    });
 }
 
 async fn receiving<E: crate::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Datagrams>) {
@@ -767,10 +760,10 @@ async fn receiving<E: crate::Context>(relay: Weak<Relay<E>>, datagrams: Arc<Data
         let Some(relay) = relay.upgrade() else {
             return;
         };
-        let Some(alias) = relay.state().remote_alias(&from, theirs.alias) else {
-            continue;
-        };
-        let header = DatagramHeader { alias, ..theirs };
-        relay.step(|state| state.datagram(None, header, bytes));
+        relay.send(Event::RemoteDatagram {
+            from,
+            header: theirs,
+            payload: bytes,
+        });
     }
 }

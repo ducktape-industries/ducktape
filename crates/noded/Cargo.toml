@@ -5,7 +5,8 @@ version.workspace = true
 
 [dependencies]
 abi = { workspace = true }
-axum = { version = "0.8", features = ["ws"] }
+arc-swap = { workspace = true }
+axum = { version = "0.8", features = ["http2", "ws"] }
 blob = { workspace = true, features = ["node"] }
 borsh = { workspace = true }
 bytes = "1"
@@ -43,6 +44,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 fixture-awaiter = { path = "../kernel/fixtures/awaiter" }
 fixture-egress = { path = "../kernel/fixtures/egress" }
@@ -52,5 +56,6 @@ fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }
 fixture-valset = { path = "../kernel/fixtures/valset" }
 fixture-wasm = { workspace = true }
+fluent31 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

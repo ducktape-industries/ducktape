@@ -12,6 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use arc_swap::ArcSwap;
+
 use commonware_actor::Feedback;
 use commonware_consensus::Reporter;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
@@ -37,10 +39,12 @@ const APPLIED: usize = 2 * VIEW_RETENTION as usize;
 const PENDING: usize = 256;
 
 /// The book an engine's reporter fills and the node reads. Every height in
-/// it is one the caller of [`Votes::applied`] passed, so a reader that
-/// takes the lock that caller holds never sees a height past its tip.
+/// it is one the caller of [`Votes::applied`] passed.
 #[derive(Clone, Default)]
-pub struct Votes(Arc<Mutex<Book>>);
+pub struct Votes {
+    book: Arc<Mutex<Book>>,
+    heights: Arc<ArcSwap<BTreeMap<Vec<u8>, u64>>>,
+}
 
 #[derive(Default)]
 struct Book {
@@ -80,17 +84,20 @@ impl Votes {
             }
             false
         });
+        self.publish(&book);
     }
 
     /// Each validator key's height: the newest block this node applied
     /// that the validator sent this node's engine a finalize vote for.
-    pub fn heights(&self) -> BTreeMap<Vec<u8>, u64> {
-        self.book().signed.clone()
+    pub fn heights(&self) -> Arc<BTreeMap<Vec<u8>, u64>> {
+        self.heights.load_full()
     }
 
     /// Forgets every vote and takes none until the next [`Votes::seat`].
     pub(crate) fn clear(&self) {
-        *self.book() = Book::default();
+        let mut book = self.book();
+        *book = Book::default();
+        self.publish(&book);
     }
 
     /// Seats the book for an engine seated with `validators`: it takes only
@@ -110,6 +117,7 @@ impl Votes {
             voters.retain(|key| seated.contains(key));
             !voters.is_empty()
         });
+        self.publish(&book);
     }
 
     /// The reporter for an engine seated with `validators`: it hands every
@@ -143,6 +151,7 @@ impl Votes {
         }
         if let Some(&(_, height)) = applied.iter().find(|(id, _)| *id == proposal.payload) {
             raise(signed, key, height);
+            self.publish(&book);
             return;
         }
         pending
@@ -155,7 +164,13 @@ impl Votes {
     }
 
     fn book(&self) -> MutexGuard<'_, Book> {
-        self.0.lock().expect("the vote book lock is never poisoned")
+        self.book
+            .lock()
+            .expect("the vote book lock is never poisoned")
+    }
+
+    fn publish(&self, book: &Book) {
+        self.heights.store(Arc::new(book.signed.clone()));
     }
 }
 

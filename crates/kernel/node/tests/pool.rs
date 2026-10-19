@@ -63,20 +63,18 @@ fn one_body_is_held_once_whatever_bytes_carry_it() {
 }
 
 #[test]
-fn settling_drops_what_a_block_carried_and_every_frame_whose_anchor_aged_out() {
+fn removing_drops_the_named_frames_and_keeps_the_rest_in_order() {
     let mut pool = Pool::default();
-    let carried = admit(&mut pool, b"alice", 5, b"carried");
-    let oldest = admit(&mut pool, b"alice", 0, b"oldest");
-    let aged = admit(&mut pool, b"bob", 0, b"aged");
-    let next_oldest = admit(&mut pool, b"carol", 1, b"next");
+    let first = admit(&mut pool, b"alice", 5, b"first");
+    let carried = admit(&mut pool, b"alice", 0, b"carried");
+    let last = admit(&mut pool, b"carol", 1, b"last");
 
-    pool.settle(&[carried.id()], ANCHOR_WINDOW + 1);
-    assert_eq!(ordered(&pool), vec![next_oldest]);
-    assert!(pool.get(&oldest.id()).is_none());
-    assert!(pool.get(&aged.id()).is_none());
+    pool.remove(&[carried.id()]);
+    assert_eq!(ordered(&pool), vec![first.clone(), last]);
+    assert!(pool.get(&carried.id()).is_none());
 
-    pool.settle(&[], ANCHOR_WINDOW + 2);
-    assert!(pool.is_empty());
+    pool.remove(&[first.id(), carried.id()]);
+    assert_eq!(pool.len(), 1);
 }
 
 #[test]
@@ -98,15 +96,11 @@ fn an_offered_frame_comes_due_after_a_wait_that_doubles_up_to_64_blocks() {
 }
 
 #[test]
-fn a_frame_whose_anchor_aged_out_is_offered_no_more() {
+fn a_removed_frame_is_offered_no_more() {
     let mut pool = Pool::default();
-    pool.admit(
-        b"a0".to_vec(),
-        submission(b"alice", 0, b"a0"),
-        Some(applied()),
-        Some(0),
-    );
+    let given = submission(b"alice", 0, b"a0");
+    pool.admit(b"a0".to_vec(), given.clone(), Some(applied()), Some(0));
 
-    pool.settle(&[], ANCHOR_WINDOW + 1);
+    pool.remove(&[given.id()]);
     assert!(pool.reoffer_all(ANCHOR_WINDOW + 1).is_empty());
 }

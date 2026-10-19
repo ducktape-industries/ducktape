@@ -1,7 +1,7 @@
 mod block;
 mod frame;
+mod mempool;
 pub mod pool;
-mod proposer;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,14 +13,12 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
-use host::{Applied, Genesis, Host, Layer, Submission, SubmissionId, Tip};
+use host::{Applied, Genesis, Host, Layer, Snapshot, Submission, SubmissionId, Tip};
 use state::{Commitment, View};
-
-use crate::proposer::Pending;
 
 pub use block::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES};
 pub use frame::{Body, Frame, NAMESPACE, verify};
-pub use proposer::Proposer;
+pub use mempool::Mempool;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -58,6 +56,17 @@ pub fn carried<'a>(
         .iter()
         .enumerate()
         .filter_map(|(index, frame)| Some((index as u32, frame::verify(frame, network).ok()?)))
+}
+
+pub fn admissible(frame: &[u8], network: &[u8]) -> std::result::Result<Submission, Refusal> {
+    if !Block::carries(frame) {
+        let sentence = format!(
+            "the frame is {} bytes and a block carries at most {BLOCK_BYTES}",
+            frame.len()
+        );
+        return Err(Refusal::new(reason::CAPACITY, sentence));
+    }
+    frame::verify(frame, network)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,7 +116,6 @@ where
     context: E,
     host: Host<E>,
     network: Vec<u8>,
-    proposer: Proposer,
 }
 
 impl<E> Node<E>
@@ -146,21 +154,11 @@ where
 
     fn over(context: E, host: Host<E>) -> Result<Node<E>> {
         let network = host.network().to_vec();
-        let proposer = Proposer::new(host.tip()?);
         Ok(Node {
             context,
             host,
             network,
-            proposer,
         })
-    }
-
-    fn locked(&self) -> std::sync::MutexGuard<'_, Pending> {
-        self.proposer.lock()
-    }
-
-    pub fn proposer(&self) -> Proposer {
-        self.proposer.clone()
     }
 
     pub fn host(&self) -> &Host<E> {
@@ -189,14 +187,6 @@ where
 
     pub fn epoch_validators(&self, epoch: u64) -> Result<Option<Vec<Vec<u8>>>> {
         Ok(self.host.epoch_validators(epoch)?)
-    }
-
-    pub fn pending(&self) -> usize {
-        self.locked().pool.len()
-    }
-
-    pub fn due(&self) -> bool {
-        !self.locked().pool.is_empty()
     }
 
     pub fn now(&self) -> u64 {
@@ -233,58 +223,8 @@ where
             .await?)
     }
 
-    pub async fn submit(
-        &mut self,
-        frame: Vec<u8>,
-        source: Source,
-        preconfirm: Preconfirm,
-    ) -> Result<std::result::Result<Taken, Refusal>> {
-        if !Block::carries(&frame) {
-            let sentence = format!(
-                "the frame is {} bytes and a block carries at most {BLOCK_BYTES}",
-                frame.len()
-            );
-            return Ok(Err(Refusal::new(reason::CAPACITY, sentence)));
-        }
-        let submission = match frame::verify(&frame, &self.network) {
-            Ok(submission) => submission,
-            Err(refusal) => return Ok(Err(refusal)),
-        };
-        let held = self
-            .locked()
-            .pool
-            .get(&submission.id())
-            .map(|held| held.prediction.clone());
-        if let Some(prediction) = held {
-            return Ok(Ok(Taken::Held(prediction)));
-        }
-        if let Err(refusal) = self.host.fresh(&submission)? {
-            return Ok(Err(refusal));
-        }
-        let prediction = match preconfirm {
-            Preconfirm::Off => None,
-            Preconfirm::On => Some(self.preconfirm(submission.clone()).await?),
-        };
-        let offered = match source {
-            Source::Client => Some(self.host.tip()?.height),
-            Source::Peer => None,
-        };
-        self.locked()
-            .pool
-            .admit(frame, submission, prediction.clone(), offered);
-        Ok(Ok(Taken::New(prediction)))
-    }
-
-    pub fn reoffer(&mut self) -> Vec<Vec<u8>> {
-        let mut pending = self.locked();
-        let height = pending.applied.height;
-        pending.pool.reoffer(height)
-    }
-
-    pub fn reoffer_all(&mut self) -> Vec<Vec<u8>> {
-        let mut pending = self.locked();
-        let height = pending.applied.height;
-        pending.pool.reoffer_all(height)
+    pub fn snapshot(&self) -> Result<Snapshot<E>> {
+        Ok(self.host.snapshot()?)
     }
 
     pub async fn apply(&mut self, block: &Block) -> Result<Sequenced> {
@@ -315,41 +255,6 @@ where
                 submissions,
             })
             .await?;
-        let ids: Vec<SubmissionId> = carried.iter().map(|carried| carried.id).collect();
-        self.settle(&ids, block.tip());
-        self.replay().await?;
         Ok(Sequenced::Applied { applied, carried })
-    }
-
-    async fn preconfirm(&mut self, submission: Submission) -> Result<Receipt> {
-        let time = self.now();
-        let mut predicted = self.host.preconfirm(time, vec![submission]).await?;
-        predicted.pop().ok_or(Error::Unpredicted)
-    }
-
-    fn settle(&mut self, carried: &[SubmissionId], applied: Tip) {
-        let mut pending = self.locked();
-        pending.pool.settle(carried, applied.height + 1);
-        pending.applied = applied;
-    }
-
-    async fn replay(&mut self) -> Result<()> {
-        let (ids, submissions): (Vec<SubmissionId>, Vec<Submission>) = self
-            .locked()
-            .pool
-            .order()
-            .filter(|held| held.preconfirmed())
-            .map(|held| (held.id, held.submission.clone()))
-            .unzip();
-        if submissions.is_empty() {
-            return Ok(());
-        }
-        let time = self.now();
-        let predicted = self.host.preconfirm(time, submissions).await?;
-        let mut pending = self.locked();
-        for (id, receipt) in ids.iter().zip(predicted) {
-            pending.pool.predict(id, receipt);
-        }
-        Ok(())
     }
 }

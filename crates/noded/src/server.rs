@@ -6,32 +6,116 @@ use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
-use axum::extract::{FromRequest, Path, RawQuery, Request, State};
+use axum::extract::{FromRequest, Path, RawQuery, Request};
 use axum::http::StatusCode;
-use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt as _;
 use borsh::BorshSerialize;
 use futures::pin_mut;
 use futures::stream::SplitSink;
 use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
-use node::{BLOCK_BYTES, Preconfirm, Source, Taken};
+use node::{BLOCK_BYTES, Preconfirm, Taken};
 use statesync::Request as SyncRequest;
-use tokio::sync::Semaphore;
 
+use crate::changes::{self, Fanout, Published, Subscription};
+use crate::ctx::Ctx;
 use crate::wire::{
     Admin, BlockAsk, Blocks, Finalized, Get, Located, Network, Page, Query, Range, Submit,
     Submitted, TxAsk, route,
 };
-use crate::{Context, Daemon, LoadConfig, Published, Subscription};
+use crate::{Context, Daemon, cores, offload};
 
 const SUBMIT_BYTES: usize = BLOCK_BYTES;
 const SUBMIT_BODY_BYTES: usize = SUBMIT_BYTES + size_of::<u32>() + size_of::<bool>();
 
-pub fn router<E: Context>(daemon: Arc<Daemon<E>>, load: LoadConfig) -> Router {
-    let read_permits = Arc::new(Semaphore::new(load.reads_in_flight.get()));
-    let reads = Router::new()
+pub(crate) struct Rpc(Option<tokio::runtime::Runtime>);
+
+impl Rpc {
+    pub(crate) fn start<E: Context>(
+        daemon: Arc<Daemon<E>>,
+        listener: std::net::TcpListener,
+        fanout: Fanout,
+    ) -> crate::Result<Rpc> {
+        let block_workers = tokio::runtime::Handle::current().metrics().num_workers();
+        let split = cores::split(block_workers)?;
+        let threads = split.rpc.len();
+        tracing::info!(target: "ducktape::http", event = "rpc_cores", rpc = threads, reserved = split.reserved, "the rpc runtime runs beside the block threads");
+        let cpus = Arc::new(split.rpc);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .max_blocking_threads(threads)
+            .thread_name("rpc")
+            .on_thread_start(move || yielding(&cpus))
+            .enable_all()
+            .build()?;
+        let router = router(daemon.clone());
+        runtime.spawn(changes::fan(fanout));
+        for _ in 0..threads {
+            let door = listener.try_clone()?;
+            runtime.spawn(accepting(door, router.clone(), daemon.shutdown.subscribe()));
+        }
+        Ok(Rpc(Some(runtime)))
+    }
+}
+
+async fn accepting(
+    door: std::net::TcpListener,
+    router: Router,
+    mut down: tokio::sync::watch::Receiver<bool>,
+) {
+    let listener = match crate::transport::served(door) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(target: "ducktape::http", %error, "the http server stopped");
+            return;
+        }
+    };
+    let listener = listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(target: "ducktape::http", %error, "a connection keeps nagle");
+        }
+    });
+    let served = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = down.wait_for(|down| *down).await;
+        })
+        .await;
+    if let Err(error) = served {
+        tracing::error!(target: "ducktape::http", %error, "the http server stopped");
+    }
+}
+
+fn yielding(cpus: &[usize]) {
+    lowest_priority();
+    if let Err(error) = cores::pin(cpus) {
+        tracing::debug!(target: "ducktape::http", %error, "an rpc thread runs on every cpu");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lowest_priority() {
+    const LOWEST: i32 = 19;
+    let thread = rustix::thread::gettid();
+    if let Err(error) = rustix::process::setpriority_process(Some(thread), LOWEST) {
+        tracing::debug!(target: "ducktape::http", %error, "an rpc thread keeps its priority");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lowest_priority() {}
+
+impl Drop for Rpc {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
+    Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
         .route(route::GET, post(get_value::<E>))
@@ -49,34 +133,15 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>, load: LoadConfig) -> Router {
         .route(route::METRICS, get(metrics::<E>))
         .route(live_wire::PORT_ROUTE, get(live_port::<E>))
         .route(route::QUERY, post(query::<E>))
-        .layer(middleware::from_fn_with_state(read_permits, bounded));
-    let uploads = Router::new()
         .route(route::SUBMIT, post(submit::<E>))
         .route(route::BLOB_PUT, post(blob_put::<E>))
-        .layer(middleware::from_fn_with_state(
-            Arc::new(Semaphore::new(load.uploads_in_flight.get())),
-            bounded,
-        ));
-    let streams = Router::new()
         .route(
             &format!("{}/{{program}}", route::CHANGES),
             get(changes::<E>),
         )
         .route(route::P2P, get(p2p::<E>))
-        .route(live_wire::ROUTE, get(live_socket::<E>));
-    reads.merge(uploads).merge(streams).with_state(daemon)
-}
-
-async fn bounded(
-    State(permits): State<Arc<Semaphore>>,
-    request: Request,
-    next: middleware::Next,
-) -> Response {
-    let Ok(_permit) = permits.acquire_owned().await else {
-        let sentence = "the node stopped taking requests";
-        return (StatusCode::SERVICE_UNAVAILABLE, sentence).into_response();
-    };
-    next.run(request).await
+        .route(live_wire::ROUTE, get(live_socket::<E>))
+        .with_state(daemon)
 }
 
 struct Whole(Bytes);
@@ -141,36 +206,47 @@ fn failed<T>(error: impl ToString) -> Reply<T> {
     Reply::Failed(error.to_string())
 }
 
-async fn status<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<crate::wire::Status> {
-    match daemon.status().await {
-        Ok(status) => Reply::Answered(status),
+fn answered<T, E: ToString>(read: crate::Result<Result<T, E>>) -> Reply<T> {
+    match read {
+        Ok(Ok(value)) => Reply::Answered(value),
+        Ok(Err(error)) => failed(error),
         Err(error) => failed(error),
     }
 }
 
-async fn network<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Network> {
-    match daemon.network().await {
+struct Encoded(Bytes);
+
+impl IntoResponse for Encoded {
+    fn into_response(self) -> Response {
+        (StatusCode::OK, self.0).into_response()
+    }
+}
+
+async fn status<E: Context>(ctx: Ctx<E>) -> Encoded {
+    Encoded(ctx.view().status())
+}
+
+async fn network<E: Context>(ctx: Ctx<E>) -> Reply<Network> {
+    match ctx.network().await {
         Ok(network) => Reply::Answered(network),
         Err(error) => failed(error),
     }
 }
 
 async fn submit<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
+    ctx: Ctx<E>,
     Capped(body): Capped<SUBMIT_BODY_BYTES>,
 ) -> Reply<Submitted> {
     let Submit { frame, preconfirm } = match abi::decode(&body) {
         Ok(submit) => submit,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let mut node = daemon.node.lock().await;
-    match node.submit(frame.clone(), Source::Client, preconfirm).await {
-        Ok(Ok(Taken::New(prediction))) => {
-            drop(node);
-            daemon.relay.send([frame.as_slice()]);
-            Reply::Answered(submitted(prediction))
-        }
-        Ok(Ok(Taken::Held(prediction))) => Reply::Answered(submitted(prediction)),
+    taken(ctx.submit(frame, preconfirm).await)
+}
+
+fn taken(taken: crate::Result<Result<Taken, Refusal>>) -> Reply<Submitted> {
+    match taken {
+        Ok(Ok(taken)) => Reply::Answered(submitted(taken.into_prediction())),
         Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }
@@ -183,106 +259,116 @@ fn submitted(prediction: Option<Receipt>) -> Submitted {
     }
 }
 
-async fn query<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Vec<u8>> {
+async fn query<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<u8>> {
     let query: Query = match abi::decode(&body) {
         Ok(query) => query,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let submission = match node::verify(&query.frame, &daemon.descriptor.id()) {
-        Ok(submission) => submission,
-        Err(refusal) => return Reply::Refused(refusal),
+    let reading = match ctx.reading(query.layer) {
+        Ok(reading) => reading,
+        Err(error) => return failed(error),
     };
-    let node = daemon.node.lock().await;
-    let answer = node
-        .query(
+    let network = ctx.network_id();
+    let time = ctx.now();
+    let asked = offload(move || {
+        let submission = match node::verify(&query.frame, &network) {
+            Ok(submission) => submission,
+            Err(refusal) => return Asked::Unverified(refusal),
+        };
+        let source = reading.source();
+        let answer = source.query(
             query.layer,
+            time,
             Origin::External(submission.signer),
             &submission.target,
             submission.payload,
-        )
-        .await;
-    match answer {
-        Ok(Ok(bytes)) => Reply::Answered(bytes),
-        Ok(Err(refusal)) => Reply::Refused(refusal),
+        );
+        Asked::Answered(tokio::runtime::Handle::current().block_on(answer))
+    })
+    .await;
+    match asked {
+        Ok(Asked::Unverified(refusal)) => Reply::Refused(refusal),
+        Ok(Asked::Answered(Ok(Ok(bytes)))) => Reply::Answered(bytes),
+        Ok(Asked::Answered(Ok(Err(refusal)))) => Reply::Refused(refusal),
+        Ok(Asked::Answered(Err(error))) => failed(error),
         Err(error) => failed(error),
     }
 }
 
-async fn get_value<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Option<Vec<u8>>> {
+enum Asked {
+    Unverified(Refusal),
+    Answered(host::Result<Result<Vec<u8>, Refusal>>),
+}
+
+async fn get_value<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Vec<u8>>> {
     let get: Get = match abi::decode(&body) {
         Ok(get) => get,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let node = daemon.node.lock().await;
-    match node.view(get.layer).get(&get.program, &get.key) {
-        Ok(value) => Reply::Answered(value),
-        Err(error) => failed(error),
-    }
+    let reading = match ctx.reading(get.layer) {
+        Ok(reading) => reading,
+        Err(error) => return failed(error),
+    };
+    answered(offload(move || reading.source().view(get.layer).get(&get.program, &get.key)).await)
 }
 
-async fn scan<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Vec<abi::Entry>> {
+async fn scan<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<abi::Entry>> {
     let range: Range = match abi::decode(&body) {
         Ok(range) => range,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let node = daemon.node.lock().await;
-    match node.view(range.layer).scan(&range.program, &range.scan) {
-        Ok(entries) => Reply::Answered(entries),
-        Err(error) => failed(error),
-    }
+    let reading = match ctx.reading(range.layer) {
+        Ok(reading) => reading,
+        Err(error) => return failed(error),
+    };
+    answered(
+        offload(move || {
+            reading
+                .source()
+                .view(range.layer)
+                .scan(&range.program, &range.scan)
+        })
+        .await,
+    )
 }
 
-async fn blob_get<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Option<Vec<u8>>> {
+async fn blob_get<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Vec<u8>>> {
     let id: BlobId = match abi::decode(&body) {
         Ok(id) => id,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match served(&daemon, &[id]).await {
+    match served(&ctx, &[id]).await {
         Ok(page) => Reply::Answered(page.into_iter().next().flatten()),
         Err(error) => failed(error),
     }
 }
 
-async fn blobs<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Vec<Option<Vec<u8>>>> {
+async fn blobs<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<Option<Vec<u8>>>> {
     let ids: Vec<BlobId> = match abi::decode(&body) {
         Ok(ids) => ids,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match served(&daemon, &ids).await {
+    match served(&ctx, &ids).await {
         Ok(page) => Reply::Answered(page),
         Err(error) => failed(error),
     }
 }
 
-async fn served<E: Context>(
-    daemon: &Daemon<E>,
-    ids: &[BlobId],
-) -> crate::Result<Vec<Option<Vec<u8>>>> {
-    let readable = {
-        let node = daemon.node.lock().await;
-        let now = node.now();
-        let mut readable = Vec::with_capacity(ids.len());
-        for id in ids {
-            readable.push(node.host().readable(id, now).await?);
+async fn served<E: Context>(ctx: &Ctx<E>, ids: &[BlobId]) -> crate::Result<Vec<Option<Vec<u8>>>> {
+    let view = ctx.view().clone();
+    let now = ctx.now();
+    let asked = ids.to_vec();
+    let readable = offload(move || {
+        let source = view.source();
+        let mut readable = Vec::with_capacity(asked.len());
+        for id in &asked {
+            let read = tokio::runtime::Handle::current().block_on(source.readable(id, now));
+            readable.push(read?);
         }
-        readable
-    };
-    let store = daemon.blobs.store();
+        Ok::<_, host::Error>(readable)
+    })
+    .await??;
+    let store = ctx.blobs().store();
     let mut page = Vec::with_capacity(ids.len());
     for (id, readable) in ids.iter().zip(readable) {
         if !readable {
@@ -290,17 +376,16 @@ async fn served<E: Context>(
             continue;
         }
         if !store.has(id) {
-            daemon.blobs.fetch(*id, halo::Class::Client).await;
+            ctx.fetch(*id).await;
         }
-        page.push(store.framed(id)?);
+        let read = store.clone();
+        let id = *id;
+        page.push(offload(move || read.framed(&id)).await??);
     }
     Ok(page)
 }
 
-async fn blob_put<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    request: Request,
-) -> Reply<Submitted> {
+async fn blob_put<E: Context>(ctx: Ctx<E>, request: Request) -> Reply<Submitted> {
     let stream = request
         .into_body()
         .into_data_stream()
@@ -310,18 +395,11 @@ async fn blob_put<E: Context>(
         Ok(frame) => frame,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let submission = match node::verify(&frame, &daemon.descriptor.id()) {
+    let submission = match node::verify(&frame, &ctx.network_id()) {
         Ok(submission) => submission,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let bound = daemon
-        .node
-        .lock()
-        .await
-        .host()
-        .roles()
-        .bound(role::BLOBS)
-        .cloned();
+    let bound = ctx.view().source().roles().bound(role::BLOBS).cloned();
     let role = match bound {
         Ok(role) => role,
         Err(refusal) => return Reply::Refused(refusal),
@@ -330,23 +408,10 @@ async fn blob_put<E: Context>(
         Ok(entries) => entries,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    if let Err(refusal) = daemon.blobs.stage(&entries, &mut body).await {
+    if let Err(refusal) = ctx.blobs().stage(&entries, &mut body).await {
         return Reply::Refused(refusal);
     }
-    let mut node = daemon.node.lock().await;
-    match node
-        .submit(frame.clone(), Source::Client, Preconfirm::Off)
-        .await
-    {
-        Ok(Ok(Taken::New(prediction))) => {
-            drop(node);
-            daemon.relay.send([frame.as_slice()]);
-            Reply::Answered(submitted(prediction))
-        }
-        Ok(Ok(Taken::Held(prediction))) => Reply::Answered(submitted(prediction)),
-        Ok(Err(refusal)) => Reply::Refused(refusal),
-        Err(error) => failed(error),
-    }
+    taken(ctx.submit(frame, Preconfirm::Off).await)
 }
 
 async fn framed_put(body: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<u8>, Refusal> {
@@ -393,21 +458,17 @@ fn put_entries(
     }
 }
 
-async fn blob_missing<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Vec<BlobId>> {
-    let node = daemon.node.lock().await;
-    match node.host().missing_blobs() {
-        Ok(missing) => Reply::Answered(missing),
-        Err(error) => failed(error),
-    }
+async fn blob_missing<E: Context>(ctx: Ctx<E>) -> Reply<Vec<BlobId>> {
+    let view = ctx.view().clone();
+    answered(offload(move || view.source().missing_blobs()).await)
 }
 
-async fn programs<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-) -> Reply<std::collections::BTreeMap<ProgramId, BlobId>> {
-    let node = daemon.node.lock().await;
-    match node.host().programs() {
-        Ok(programs) => Reply::Answered(programs),
-        Err(error) => failed(error),
+async fn programs<E: Context>(ctx: Ctx<E>) -> Response {
+    let view = ctx.view().clone();
+    match offload(move || view.programs()).await {
+        Ok(Ok(encoded)) => Encoded(encoded).into_response(),
+        Ok(Err(error)) => failed::<()>(error).into_response(),
+        Err(error) => failed::<()>(error).into_response(),
     }
 }
 
@@ -418,7 +479,7 @@ async fn programs<E: Context>(
 /// closes each epoch. Every ping carries its block's height; a client that
 /// answers none of them for a whole epoch is cut (`Daemon::publish`).
 async fn changes<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
+    ctx: Ctx<E>,
     Path(program): Path<ProgramId>,
     RawQuery(query): RawQuery,
     upgrade: WebSocketUpgrade,
@@ -426,7 +487,7 @@ async fn changes<E: Context>(
     let keys = query
         .as_deref()
         .is_some_and(|query| query.split('&').any(|asked| asked == "keys"));
-    let subscription = daemon.subscribe(program, keys);
+    let subscription = ctx.subscribe(program, keys);
     upgrade.on_upgrade(move |socket| stream(socket, subscription))
 }
 
@@ -508,58 +569,49 @@ async fn goodbye(mut client: SplitSink<WebSocket, Message>) {
     let _ = client.send(Message::Close(Some(stopped))).await;
 }
 
-async fn blocks<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Page> {
+async fn blocks<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Page> {
     let page: Blocks = match abi::decode(&body) {
         Ok(page) => page,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match daemon.blocks(page).await {
+    match ctx.blocks(page).await {
         Ok(page) => Reply::Answered(page),
         Err(error) => failed(error),
     }
 }
 
-async fn block<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Option<Finalized>> {
+async fn block<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Finalized>> {
     let ask: BlockAsk = match abi::decode(&body) {
         Ok(ask) => ask,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match daemon.block(ask).await {
+    match ctx.block(ask).await {
         Ok(block) => Reply::Answered(block),
         Err(error) => failed(error),
     }
 }
 
-async fn tx<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<Option<Located>> {
+async fn tx<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Located>> {
     let ask: TxAsk = match abi::decode(&body) {
         Ok(ask) => ask,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match daemon.tx(ask).await {
+    match ctx.tx(ask).await {
         Ok(tx) => Reply::Answered(tx),
         Err(error) => failed(error),
     }
 }
 
-async fn logs<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Vec<String>> {
-    Reply::Answered(daemon.logs.lines())
+async fn logs<E: Context>(ctx: Ctx<E>) -> Reply<Vec<String>> {
+    Reply::Answered(ctx.logs())
 }
 
-async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, Whole(body): Whole) -> Reply<()> {
-    let submission = match node::verify(&body, &daemon.descriptor.id()) {
+async fn admin<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<()> {
+    let submission = match node::verify(&body, &ctx.network_id()) {
         Ok(submission) => submission,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let signed_by_the_node = submission.signer == daemon.identity;
+    let signed_by_the_node = submission.signer == ctx.identity();
     let addressed_to_admin = submission.target == crate::wire::ADMIN;
     if !(signed_by_the_node && addressed_to_admin) {
         return Reply::Refused(Refusal::new(
@@ -567,7 +619,7 @@ async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, Whole(body): Wh
             "an admin verb is signed by the node's own key",
         ));
     }
-    let fresh = match daemon.node.lock().await.host().fresh(&submission) {
+    let fresh = match ctx.view().source().fresh(&submission) {
         Ok(fresh) => fresh,
         Err(error) => return failed(error),
     };
@@ -580,54 +632,50 @@ async fn admin<E: Context>(State(daemon): State<Arc<Daemon<E>>>, Whole(body): Wh
     };
     match verb {
         Admin::Shutdown => {
-            daemon.shutdown.send_replace(true);
+            ctx.shut_down();
             Reply::Answered(())
         }
-        Admin::LogFilter(directives) => match daemon.logs.retune(&directives) {
+        Admin::LogFilter(directives) => match ctx.retune(&directives) {
             Ok(()) => Reply::Answered(()),
             Err(error) => Reply::Refused(Refusal::new(reason::INVALID_INPUT, error)),
         },
-        Admin::EgressReload => match daemon.egress.reload() {
+        Admin::EgressReload => match ctx.reload_egress() {
             Ok(()) => Reply::Answered(()),
             Err(refused) => Reply::Refused(Refusal::new(refused.reason(), refused.to_string())),
         },
     }
 }
 
-async fn sync<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    Whole(body): Whole,
-) -> Reply<statesync::Response> {
+async fn sync<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<statesync::Response> {
     let request: SyncRequest = match abi::decode(&body) {
         Ok(request) => request,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let node = daemon.node.lock().await;
-    Reply::Answered(statesync::serve(&node, &daemon.anchors, request).await)
+    match ctx.sync(request).await {
+        Ok(response) => Reply::Answered(response),
+        Err(error) => failed(error),
+    }
 }
 
-async fn metrics<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> String {
-    daemon.context.encode()
+async fn metrics<E: Context>(ctx: Ctx<E>) -> Response {
+    match ctx.metrics().await {
+        Ok(text) => text.into_response(),
+        Err(error) => failed::<()>(error).into_response(),
+    }
 }
 
-async fn p2p<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    upgrade: WebSocketUpgrade,
-) -> Response {
-    let mesh = daemon.mesh;
+async fn p2p<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
+    let mesh = ctx.mesh();
     upgrade.on_upgrade(move |socket| crate::transport::inbound_websocket(socket, mesh))
 }
 
 /// The UDP port a client dials for live tracks, `None` when the node runs no QUIC door.
-async fn live_port<E: Context>(State(daemon): State<Arc<Daemon<E>>>) -> Reply<Option<u16>> {
-    Reply::Answered(daemon.live.port())
+async fn live_port<E: Context>(ctx: Ctx<E>) -> Reply<Option<u16>> {
+    Reply::Answered(ctx.live_port())
 }
 
-async fn live_socket<E: Context>(
-    State(daemon): State<Arc<Daemon<E>>>,
-    upgrade: WebSocketUpgrade,
-) -> Response {
-    let live = daemon.live.clone();
+async fn live_socket<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
+    let live = ctx.live();
     crate::live::ws_upgrade(upgrade).on_upgrade(move |socket| live.serve_ws(socket))
 }
 

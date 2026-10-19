@@ -1,6 +1,7 @@
 use std::path::Path;
+use std::sync::Arc;
 
-use fluent31::{Db, Options, WriteBatch};
+use fluent31::{Db, Options, Snapshot, WriteBatch};
 
 use crate::{Error, Result, Writes};
 
@@ -10,36 +11,51 @@ const PENDING: &[u8] = b"\xffpending";
 pub const RESERVED_PREFIX: char = '$';
 
 pub struct Storage {
-    db: Db,
+    reads: Reads,
 }
 
-impl Storage {
-    pub fn open(dir: &Path) -> Result<Storage> {
-        let options = Options {
-            wasm_enabled: false,
-            max_key_size: usize::MAX,
-            max_value_size: usize::MAX,
-            max_txn_write_bytes: usize::MAX,
-            ..Options::default()
+#[derive(Clone)]
+pub struct Reads {
+    db: Arc<Db>,
+    at: At,
+}
+
+#[derive(Clone)]
+enum At {
+    Latest,
+    Pinned(Arc<Snapshot>),
+}
+
+impl Reads {
+    pub fn pinned(&self) -> Reads {
+        let at = match &self.at {
+            At::Latest => At::Pinned(Arc::new(self.db.snapshot())),
+            At::Pinned(snapshot) => At::Pinned(snapshot.clone()),
         };
-        Ok(Storage {
-            db: Db::open(dir, options)?,
-        })
+        Reads {
+            db: self.db.clone(),
+            at,
+        }
     }
 
     pub fn height(&self) -> Result<Option<u64>> {
-        self.db.get(HEIGHT)?.map(|bytes| decode(&bytes)).transpose()
+        self.raw(HEIGHT)?.map(|bytes| decode(&bytes)).transpose()
     }
 
     pub fn pending(&self) -> Result<Option<Writes>> {
-        self.db
-            .get(PENDING)?
-            .map(|bytes| decode(&bytes))
-            .transpose()
+        self.raw(PENDING)?.map(|bytes| decode(&bytes)).transpose()
     }
 
     pub fn get(&self, program: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.db.get(&namespaced(program, key))?)
+        self.raw(&namespaced(program, key))
+    }
+
+    fn raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let value = match &self.at {
+            At::Latest => self.db.get(key)?,
+            At::Pinned(snapshot) => self.db.get_at(key, snapshot)?,
+        };
+        Ok(value)
     }
 
     pub fn iter(
@@ -55,13 +71,36 @@ impl Storage {
             None => namespace_end(program),
         };
         let strip = program.len() + 1;
-        Ok(self
-            .db
-            .iter(Some(&lo), Some(&hi), reverse)?
-            .map(move |entry| {
-                let (key, value) = entry?;
-                Ok((key[strip..].to_vec(), value))
-            }))
+        let entries = match &self.at {
+            At::Latest => self.db.iter(Some(&lo), Some(&hi), reverse)?,
+            At::Pinned(snapshot) => self.db.iter_at(Some(&lo), Some(&hi), reverse, snapshot)?,
+        };
+        Ok(entries.map(move |entry| {
+            let (key, value) = entry?;
+            Ok((key[strip..].to_vec(), value))
+        }))
+    }
+}
+
+impl Storage {
+    pub fn open(dir: &Path) -> Result<Storage> {
+        let options = Options {
+            wasm_enabled: false,
+            max_key_size: usize::MAX,
+            max_value_size: usize::MAX,
+            max_txn_write_bytes: usize::MAX,
+            ..Options::default()
+        };
+        Ok(Storage {
+            reads: Reads {
+                db: Arc::new(Db::open(dir, options)?),
+                at: At::Latest,
+            },
+        })
+    }
+
+    fn db(&self) -> &Db {
+        &self.reads.db
     }
 
     pub fn commit(&self, height: u64, writes: &Writes) -> Result<()> {
@@ -69,11 +108,11 @@ impl Storage {
         stage(&mut batch, writes);
         batch.put(HEIGHT, abi::encode(&height));
         batch.put(PENDING, abi::encode(writes));
-        Ok(self.db.write(batch)?)
+        Ok(self.db().write(batch)?)
     }
 
     pub fn flush(&self) -> Result<()> {
-        Ok(self.db.flush()?)
+        Ok(self.db().flush()?)
     }
 
     /// Deletes every key under `program`: a dropped program leaves no
@@ -84,7 +123,7 @@ impl Storage {
             let (key, _) = entry?;
             batch.delete(namespaced(program, &key));
         }
-        Ok(self.db.write(batch)?)
+        Ok(self.db().write(batch)?)
     }
 
     /// Replaces everything this storage holds with `writes` at `height`: a
@@ -94,14 +133,22 @@ impl Storage {
     /// the batch's write limit.
     pub fn install(&self, height: u64, writes: &Writes) -> Result<()> {
         let mut batch = WriteBatch::new();
-        for entry in self.db.iter(None, None, false)? {
+        for entry in self.db().iter(None, None, false)? {
             let (key, _) = entry?;
             batch.delete(key);
         }
         stage(&mut batch, writes);
         batch.put(HEIGHT, abi::encode(&height));
         batch.delete(PENDING);
-        Ok(self.db.write(batch)?)
+        Ok(self.db().write(batch)?)
+    }
+}
+
+impl std::ops::Deref for Storage {
+    type Target = Reads;
+
+    fn deref(&self) -> &Reads {
+        &self.reads
     }
 }
 

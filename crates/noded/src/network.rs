@@ -15,16 +15,18 @@ impl<E: Context> Daemon<E> {
     /// for it carries the height of the newest block this node applied that
     /// it sent a finalize vote for.
     pub async fn network(&self) -> Result<Network> {
-        let node = self.node.lock().await;
-        let tip = node.tip()?;
-        let epoch = self.network.epoch_after(tip.height);
-        let unrecorded = || Error::Corrupt(format!("the state records no epoch {epoch}"));
-        let members = node.epoch_members(epoch)?.ok_or_else(unrecorded)?;
-        let validators = node.epoch_validators(epoch)?.ok_or_else(unrecorded)?;
-        // read before the node lock drops: `applied` books a height only
-        // under it, once that block is applied, so none passes `tip`
         let heights = self.votes.heights();
-        drop(node);
+        let view = self.view()?;
+        let tip = view.tip();
+        let epoch = self.network.epoch_after(tip.height);
+        let (members, validators) = crate::offload(move || {
+            let source = view.source();
+            let unrecorded = || Error::Corrupt(format!("the state records no epoch {epoch}"));
+            let members = source.epoch_members(epoch)?.ok_or_else(unrecorded)?;
+            let validators = source.epoch_validators(epoch)?.ok_or_else(unrecorded)?;
+            Ok::<_, Error>((members, validators))
+        })
+        .await??;
         Ok(Network {
             height: tip.height,
             members: rows(&members, &validators, &heights),

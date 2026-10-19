@@ -12,7 +12,7 @@ use commonware_storage::Context;
 
 pub use commitment::{Commitment, Db, Family, Op, SyncTarget, Tuning, codec_config, digest};
 pub use overlay::{Checkpoint, Overlay, Slot};
-pub use storage::{RESERVED_PREFIX, Storage, reserved, valid_program_id};
+pub use storage::{RESERVED_PREFIX, Reads, Storage, reserved, valid_program_id};
 pub use view::View;
 
 #[derive(Debug, thiserror::Error)]
@@ -277,6 +277,17 @@ where
         View::new(&self.storage, layers)
     }
 
+    pub fn pin(&self) -> Result<Pinned> {
+        Ok(Pinned {
+            reads: self.storage.pinned(),
+            roots: self
+                .commitments
+                .iter()
+                .map(|(program, commitment)| Ok((program.clone(), commitment.root()?)))
+                .collect::<Result<_>>()?,
+        })
+    }
+
     pub async fn sync(&mut self) -> Result<()> {
         self.storage.flush()?;
         for commitment in self.commitments.values_mut() {
@@ -324,4 +335,84 @@ where
         "the node opened a program's commitment"
     );
     Ok(commitment)
+}
+
+#[derive(Clone)]
+pub struct Pinned {
+    reads: Reads,
+    roots: BTreeMap<ProgramId, Root>,
+}
+
+impl Pinned {
+    pub fn reads(&self) -> &Reads {
+        &self.reads
+    }
+
+    pub fn view<'a>(&'a self, layers: Vec<&'a Overlay>) -> View<'a> {
+        View::new(&self.reads, layers)
+    }
+
+    pub fn height(&self) -> Result<Option<u64>> {
+        self.reads.height()
+    }
+
+    pub fn root(&self, program: &str) -> Option<Root> {
+        self.roots.get(program).copied()
+    }
+
+    pub fn roots(&self) -> Vec<(ProgramId, Root)> {
+        self.roots
+            .iter()
+            .map(|(program, root)| (program.clone(), *root))
+            .collect()
+    }
+}
+
+pub enum Committed<'a, E>
+where
+    E: Context + Spawner,
+{
+    Live(&'a Store<E>),
+    Pinned(&'a Pinned),
+}
+
+impl<E> Clone for Committed<'_, E>
+where
+    E: Context + Spawner,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Copy for Committed<'_, E> where E: Context + Spawner {}
+
+impl<'a, E> Committed<'a, E>
+where
+    E: Context + Spawner,
+{
+    pub fn view(self, layers: Vec<&'a Overlay>) -> View<'a> {
+        View::new(self.reads(), layers)
+    }
+
+    pub fn reads(self) -> &'a Reads {
+        match self {
+            Committed::Live(store) => store.storage(),
+            Committed::Pinned(pinned) => pinned.reads(),
+        }
+    }
+
+    pub fn root(self, program: &str) -> Result<Option<Root>> {
+        match self {
+            Committed::Live(store) => store.root(program),
+            Committed::Pinned(pinned) => Ok(pinned.root(program)),
+        }
+    }
+
+    pub fn roots(self) -> Result<Vec<(ProgramId, Root)>> {
+        match self {
+            Committed::Live(store) => store.roots(),
+            Committed::Pinned(pinned) => Ok(pinned.roots()),
+        }
+    }
 }

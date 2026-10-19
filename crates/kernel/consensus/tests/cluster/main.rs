@@ -22,7 +22,7 @@ use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use host::{Founding, Genesis, Layer, Limits, Tip};
-use node::{Block, Frame, Node, Preconfirm, Proposer, Sequenced, Source};
+use node::{Block, Frame, Mempool, Node, Preconfirm, Sequenced, Source};
 
 mod epochs;
 
@@ -34,6 +34,7 @@ const LABELS: [&str; 5] = ["v0", "v1", "v2", "v3", "v4"];
 
 type Ctx = deterministic::Context;
 type Shared = Arc<futures::lock::Mutex<Node<Ctx>>>;
+type Pool = Arc<futures::lock::Mutex<Mempool<Ctx>>>;
 type Roots = Arc<Mutex<BTreeMap<u64, Root>>>;
 type Carried = Arc<Mutex<BTreeMap<u64, Vec<Vec<u8>>>>>;
 type Stalls = Arc<Mutex<Option<Stall>>>;
@@ -265,7 +266,7 @@ async fn heal(
 
 #[derive(Clone)]
 struct Participant {
-    proposer: Proposer,
+    pool: Pool,
     inbox: mpsc::UnboundedSender<Delivery>,
     proposed: mpsc::UnboundedSender<u64>,
 }
@@ -277,11 +278,13 @@ impl Chain for Participant {
         ancestors: impl Ancestry<Block>,
         time: u64,
     ) -> Option<Block> {
-        let applied = self.proposer.applied().height;
+        let applied = self.pool.lock().await.applied().height;
         let unapplied = consensus::unapplied(parent.clone(), ancestors, applied).await;
-        let block = self
-            .proposer
-            .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
+        let block =
+            self.pool
+                .lock()
+                .await
+                .build(parent.tip(), unapplied.iter().map(AsRef::as_ref), time);
         let _ = self.proposed.unbounded_send(block.height);
         Some(block)
     }
@@ -307,6 +310,7 @@ impl Stall {
 struct Peer {
     key: ed25519::PrivateKey,
     node: Shared,
+    pool: Pool,
     roster: Roster,
     marshal: Marshal,
     heights: mpsc::UnboundedReceiver<u64>,
@@ -336,7 +340,13 @@ impl Peer {
         .await
         .unwrap();
         let seated = node.epoch_validators(0).unwrap().unwrap();
-        let proposer = node.proposer();
+        let mempool = Mempool::new(
+            context.child("pool"),
+            node.network().to_vec(),
+            node.snapshot().unwrap(),
+        )
+        .unwrap();
+        let pool: Pool = Arc::new(futures::lock::Mutex::new(mempool));
         let node: Shared = Arc::new(futures::lock::Mutex::new(node));
         let roster = Roster::new(NETWORK.to_vec(), Some(key.clone()));
         let mesh = SimMesh::new(
@@ -351,7 +361,7 @@ impl Peer {
         let roots: Roots = Arc::default();
         let carried: Carried = Arc::default();
         let chain = Participant {
-            proposer,
+            pool: pool.clone(),
             inbox,
             proposed: proposals,
         };
@@ -389,6 +399,7 @@ impl Peer {
         context.child("pump").spawn({
             let pump = Pump {
                 node: node.clone(),
+                pool: pool.clone(),
                 applied,
                 stalls: stalls.clone(),
                 roots: roots.clone(),
@@ -400,6 +411,7 @@ impl Peer {
         Peer {
             key,
             node,
+            pool,
             roster,
             marshal,
             heights,
@@ -461,7 +473,7 @@ impl Peer {
 
     async fn submit(&self, frame: Vec<u8>) {
         let taken = self
-            .node
+            .pool
             .lock()
             .await
             .submit(frame, Source::Client, Preconfirm::On)
@@ -489,6 +501,7 @@ impl Peer {
 
 struct Pump {
     node: Shared,
+    pool: Pool,
     applied: mpsc::UnboundedSender<u64>,
     stalls: Stalls,
     roots: Roots,
@@ -509,6 +522,12 @@ impl Pump {
                 stall.hold().await;
             }
             let sequenced = node.apply(&block).await.unwrap();
+            let mut pool = self.pool.lock().await;
+            pool.rebase(node.snapshot().unwrap()).unwrap();
+            while pool.replaying() {
+                pool.replay().await.unwrap();
+            }
+            drop(pool);
             let replayed = matches!(sequenced, Sequenced::Replayed);
             if let Sequenced::Applied {
                 applied: outcome, ..
@@ -648,7 +667,7 @@ fn a_frame_every_validator_holds_lands_once_when_leaders_build_ahead_of_finality
                 [0, 1, 2, 3].map(Some),
                 "each frame rides one block"
             );
-            assert_eq!(peer.node.lock().await.pending(), 0);
+            assert_eq!(peer.pool.lock().await.len(), 0);
         }
     });
 }

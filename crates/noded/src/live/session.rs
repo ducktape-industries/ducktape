@@ -3,9 +3,10 @@
 //! a task per connection turns into control messages, group streams and datagrams.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
@@ -88,30 +89,25 @@ pub enum Out {
 /// dropped, which is a datagram's semantics done in software.
 #[derive(Default)]
 pub struct Latest {
-    slots: Mutex<HashMap<Alias, (DatagramHeader, Bytes)>>,
+    slots: ArcSwap<HashMap<Alias, (DatagramHeader, Bytes)>>,
     ready: Notify,
 }
 
 impl Latest {
     /// Whether an older datagram for the track was dropped for this one.
     pub fn put(&self, header: DatagramHeader, payload: Bytes) -> bool {
-        let replaced = self
-            .slots
-            .lock()
-            .expect("the slots lock is never poisoned")
-            .insert(header.alias, (header, payload))
-            .is_some();
+        let before = self.slots.rcu(|slots| {
+            let mut slots = HashMap::clone(slots);
+            slots.insert(header.alias, (header, payload.clone()));
+            slots
+        });
         self.ready.notify_one();
-        replaced
+        before.contains_key(&header.alias)
     }
 
     pub fn take(&self) -> Vec<(DatagramHeader, Bytes)> {
-        self.slots
-            .lock()
-            .expect("the slots lock is never poisoned")
-            .drain()
-            .map(|(_, datagram)| datagram)
-            .collect()
+        let slots = self.slots.swap(Arc::default());
+        slots.values().cloned().collect()
     }
 
     /// Resolves once a datagram was put since it was last awaited (a permit is kept, so one

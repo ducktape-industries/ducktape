@@ -12,7 +12,8 @@ use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, RELAY
 use host::{ANCHOR_WINDOW, Founding, Genesis, Layer, Limits, Tip};
 use keyscheme::KeyScheme;
 use node::{
-    BLOCK_BYTES, Block, Body, Error, Frame, NAMESPACE, Node, Preconfirm, Sequenced, Source, Taken,
+    BLOCK_BYTES, Block, Body, Error, Frame, Mempool, NAMESPACE, Node, Preconfirm, Sequenced,
+    Source, Taken,
 };
 
 const NETWORK: &[u8] = b"net";
@@ -20,7 +21,85 @@ const TIME: u64 = 1_700_000_000;
 const EPOCH_LENGTH: u64 = 2;
 
 type Ctx = deterministic::Context;
-type TestNode = Node<Ctx>;
+
+struct TestNode {
+    node: Node<Ctx>,
+    mempool: Mempool<Ctx>,
+}
+
+impl TestNode {
+    fn over(context: Ctx, node: Node<Ctx>) -> TestNode {
+        let network = node.network().to_vec();
+        let mempool = Mempool::new(context, network, node.snapshot().unwrap()).unwrap();
+        TestNode { node, mempool }
+    }
+
+    async fn submit(
+        &mut self,
+        frame: Vec<u8>,
+        source: Source,
+        preconfirm: Preconfirm,
+    ) -> node::Result<Result<Taken, abi::Refusal>> {
+        self.mempool.submit(frame, source, preconfirm).await
+    }
+
+    async fn apply(&mut self, block: &Block) -> node::Result<Sequenced> {
+        let sequenced = self.node.apply(block).await?;
+        self.mempool.rebase(self.node.snapshot()?)?;
+        while self.mempool.replaying() {
+            self.mempool.replay().await?;
+        }
+        Ok(sequenced)
+    }
+
+    fn build<'a>(
+        &self,
+        parent: Tip,
+        unapplied: impl IntoIterator<Item = &'a Block>,
+        time: u64,
+    ) -> Block {
+        self.mempool.build(parent, unapplied, time)
+    }
+
+    fn tip(&self) -> node::Result<Tip> {
+        self.node.tip()
+    }
+
+    fn view(&self, layer: Layer) -> state::View<'_> {
+        match layer {
+            Layer::Confirmed => self.node.view(layer),
+            Layer::Preconfirmed => self.mempool.speculative().source().view(layer),
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.mempool.len()
+    }
+
+    fn due(&self) -> bool {
+        !self.mempool.is_empty()
+    }
+
+    fn reoffer(&mut self) -> Vec<Vec<u8>> {
+        self.mempool.reoffer()
+    }
+
+    fn reoffer_all(&mut self) -> Vec<Vec<u8>> {
+        self.mempool.reoffer_all()
+    }
+
+    fn epoch_length(&self) -> node::Result<u64> {
+        self.node.epoch_length()
+    }
+
+    fn epoch_validators(&self, epoch: u64) -> node::Result<Option<Vec<Vec<u8>>>> {
+        self.node.epoch_validators(epoch)
+    }
+
+    fn epoch_members(&self, epoch: u64) -> node::Result<Option<Vec<validators::Member>>> {
+        self.node.epoch_members(epoch)
+    }
+}
 
 fn key(seed: u64) -> ed25519::PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
@@ -91,10 +170,15 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
 }
 
 async fn found(context: Ctx, dir: &Path) -> (TestNode, Block) {
-    let (node, block, _) = Node::found(context, "net", dir, genesis(vec![member(&key(1), "v1:1")]))
-        .await
-        .unwrap();
-    (node, block)
+    let (node, block, _) = Node::found(
+        context.child("node"),
+        "net",
+        dir,
+        genesis(vec![member(&key(1), "v1:1")]),
+    )
+    .await
+    .unwrap();
+    (TestNode::over(context, node), block)
 }
 
 fn script(steps: Vec<Step>) -> Vec<u8> {
@@ -128,9 +212,7 @@ fn message(target: &str, payload: &[u8], reply: bool) -> Vec<u8> {
 
 async fn seal(node: &mut TestNode) -> (Block, host::Applied) {
     let tip = node.tip().unwrap();
-    let block = node
-        .proposer()
-        .build(tip, std::iter::empty(), TIME + tip.height + 1);
+    let block = node.build(tip, std::iter::empty(), TIME + tip.height + 1);
     let Sequenced::Applied { applied, .. } = node.apply(&block).await.unwrap() else {
         panic!("block {} was already applied", block.height);
     };
@@ -336,9 +418,10 @@ fn a_heavy_frame_not_preconfirmed_waits_in_the_pool_unrun() {
             fuel: Some(10_000_000),
             memory_bytes: None,
         };
-        let (mut node, _, _) = Node::found(context, "net", dir.path(), metered)
+        let (node, _, _) = Node::found(context.child("node"), "net", dir.path(), metered)
             .await
             .unwrap();
+        let mut node = TestNode::over(context, node);
         let spinning = frame(&key(7), "probe", script(vec![Step::Spin]));
         node.submit(spinning.clone(), Source::Client, Preconfirm::Off)
             .await
@@ -487,7 +570,7 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
         }
 
         let tip = node.tip().unwrap();
-        let parent = node.proposer().build(tip, std::iter::empty(), TIME + 1);
+        let parent = node.build(tip, std::iter::empty(), TIME + 1);
         assert_eq!(parent.frames, vec![alice_first.clone(), bob_first.clone()]);
         new(node
             .submit(alice_second.clone(), Source::Client, Preconfirm::On)
@@ -495,11 +578,9 @@ fn a_leader_leaves_out_what_the_blocks_it_has_not_applied_already_carry() {
             .unwrap()
             .unwrap());
 
-        let child = node.proposer().build(parent.tip(), [&parent], TIME + 2);
+        let child = node.build(parent.tip(), [&parent], TIME + 2);
         assert_eq!(child.frames, vec![alice_second.clone()]);
-        let again = node
-            .proposer()
-            .build(parent.tip(), std::iter::empty(), TIME + 2);
+        let again = node.build(parent.tip(), std::iter::empty(), TIME + 2);
         assert_eq!(again.frames, vec![alice_first, bob_first, alice_second]);
 
         for block in [&parent, &child] {
@@ -709,14 +790,10 @@ fn a_held_frame_leaves_the_pool_when_its_anchor_ages_out() {
         }
         assert_eq!(node.pending(), 1);
         let tip = node.tip().unwrap();
-        let last = node
-            .proposer()
-            .build(tip, std::iter::empty(), TIME + ANCHOR_WINDOW);
+        let last = node.build(tip, std::iter::empty(), TIME + ANCHOR_WINDOW);
         assert_eq!(last.frames, vec![aging.clone()]);
         let empty = Block::next(tip, TIME + ANCHOR_WINDOW, Vec::new());
-        let past = node
-            .proposer()
-            .build(empty.tip(), [&empty], TIME + ANCHOR_WINDOW + 1);
+        let past = node.build(empty.tip(), [&empty], TIME + ANCHOR_WINDOW + 1);
         assert_eq!(past.frames, Vec::<Vec<u8>>::new());
 
         node.apply(&empty).await.unwrap();
@@ -882,6 +959,36 @@ fn a_message_lands_in_the_block_that_carries_its_frame() {
 }
 
 #[test]
+fn a_frame_answered_while_a_block_applies_is_dropped_at_the_recheck_when_that_block_carries_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let given = frame(&key(7), "probe", script(vec![set(b"k", b"v")]));
+        let block = Block::next(node.tip().unwrap(), TIME + 1, vec![given.clone()]);
+        node.node.apply(&block).await.unwrap();
+
+        let answered = new(node
+            .mempool
+            .submit(given.clone(), Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(matches!(answered.outcome, Outcome::Applied { .. }));
+        assert_eq!(node.pending(), 1);
+
+        let stale = node.mempool.rebase(node.node.snapshot().unwrap()).unwrap();
+        assert_eq!(stale, vec![node::verify(&given, NETWORK).unwrap().id()]);
+        assert_eq!(node.pending(), 0);
+        let refusal = node
+            .submit(given, Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.reason, reason::DUPLICATE);
+    });
+}
+
+#[test]
 fn a_restart_reopens_at_the_tip() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -907,9 +1014,10 @@ fn a_restart_reopens_at_the_tip() {
         let (second, _) = seal(&mut node).await;
         drop(node);
 
-        let mut node = Node::open(context.child("second"), "net", dir.path())
+        let node = Node::open(context.child("second"), "net", dir.path())
             .await
             .unwrap();
+        let mut node = TestNode::over(context.child("pool"), node);
         assert_eq!(node.tip().unwrap(), second.tip());
         let view = node.view(Layer::Confirmed);
         assert_eq!(view.get("probe", b"a").unwrap(), Some(b"1".to_vec()));

@@ -337,6 +337,22 @@ enum Taken {
     Dropped,
 }
 
+pub fn admissible_ask(chain: &str, ask: &Ask) -> bool {
+    match ask {
+        Ask::Publish { track, .. } | Ask::Subscribe { track, .. } => admissible_track(chain, track),
+        Ask::Watch { namespace } => admissible_namespace(chain, namespace),
+    }
+}
+
+fn admissible_track(chain: &str, track: &Track) -> bool {
+    admissible_namespace(chain, &track.namespace) && well_named(&track.name)
+}
+
+fn admissible_namespace(chain: &str, namespace: &str) -> bool {
+    let on_this_chain = super::grants::place(namespace).is_some_and(|place| place.chain == chain);
+    on_this_chain && namespace.len() <= MAX_NAMESPACE
+}
+
 impl State {
     pub fn new(chain: String, metrics: Metrics) -> State {
         State {
@@ -527,16 +543,7 @@ impl State {
 
     /// Whether the namespace is this chain's and within its cap, and the name is well formed.
     pub fn admissible(&self, track: &Track) -> bool {
-        self.admissible_namespace(&track.namespace) && well_named(&track.name)
-    }
-
-    /// An ask the node could take: its namespace, and a track's name, as `admissible` holds
-    /// them.
-    pub fn admissible_ask(&self, ask: &Ask) -> bool {
-        match ask {
-            Ask::Publish { track, .. } | Ask::Subscribe { track, .. } => self.admissible(track),
-            Ask::Watch { namespace } => self.admissible_namespace(namespace),
-        }
+        admissible_track(&self.chain, track)
     }
 
     /// A publish, subscribe or watch, decided on the grant read for it (`None`: no row, or
@@ -594,9 +601,7 @@ impl State {
     /// within its cap. A room-less `<chain>/<program>` or an empty part is not a namespace, so
     /// an ask in it is refused `Malformed`, not held forever for a grant no block can write.
     pub fn admissible_namespace(&self, namespace: &str) -> bool {
-        let on_this_chain =
-            super::grants::place(namespace).is_some_and(|place| place.chain == self.chain);
-        on_this_chain && namespace.len() <= MAX_NAMESPACE
+        admissible_namespace(&self.chain, namespace)
     }
 
     /// A request id is free when no live request of the session wears it, nor a waiting one

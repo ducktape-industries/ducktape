@@ -87,6 +87,7 @@ impl core::fmt::Debug for Suspended {
     }
 }
 
+#[derive(Clone)]
 pub struct Runtime {
     engine: Engine,
     limits: Limits,
