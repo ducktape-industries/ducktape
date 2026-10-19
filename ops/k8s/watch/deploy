@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Builds the watch image around the ducktape CLI built from the source of DUCKTAPE_COMMIT, pushes it to the cluster node's registry, and applies watch.yaml with the root and rlm-home lines read from the kubelet's own config.
+# Usage: WATCH_ROOT_DISK=DIR WATCH_NODE_DISK=DIR WATCH_HOME_DISK=DIR [WATCH_CCS=URL] [WATCH_PAGER=COMMAND] ops/k8s/watch/deploy DUCKTAPE_COMMIT; each DIR is an empty host directory on that filesystem, and the Secret watch/key (key, password) is created apart from it.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+usage="usage: WATCH_ROOT_DISK=DIR WATCH_NODE_DISK=DIR WATCH_HOME_DISK=DIR [WATCH_CCS=URL] [WATCH_PAGER=COMMAND] ops/k8s/watch/deploy DUCKTAPE_COMMIT"
+commit=$(git -C "$here" rev-parse --verify "${1:?$usage}^{commit}")
+root_disk=${WATCH_ROOT_DISK:?$usage}
+node_disk=${WATCH_NODE_DISK:?$usage}
+home_disk=${WATCH_HOME_DISK:?$usage}
+ccs=${WATCH_CCS:-}
+pager=${WATCH_PAGER:-}
+node=${DEPLOY_NODE:-fabrics@fabrics-1}
+context=${DEPLOY_CONTEXT:-fabrics-1}
+kube_node=${DEPLOY_KUBE_NODE:-fabrics-1}
+tunnel_port=35314
+
+fail() { echo "deploy: $*" >&2; exit 1; }
+k() { kubectl --context "$context" "$@"; }
+
+for name in $(sed -n 's/^ *- {name: WATCH_DEPLOYMENTS, value: \(.*\)}$/\1/p' "$here/watch.yaml"); do
+  k -n "${name%/*}" get deployment "${name#*/}" >/dev/null || fail "watch.yaml names Deployment $name, which the cluster does not run"
+done
+read -r image_gc nodefs < <(k get --raw "/api/v1/nodes/$kube_node/proxy/configz" | python3 -c 'import json, sys; c = json.load(sys.stdin)["kubeletconfig"]; print(c["imageGCHighThresholdPercent"], c["evictionHard"]["nodefs.available"])')
+[[ $image_gc =~ ^[0-9]+$ ]] || fail "the kubelet's imageGCHighThresholdPercent reads as $image_gc"
+[[ $nodefs =~ ^([0-9]+)%$ ]] || fail "the kubelet's evictionHard nodefs.available reads as $nodefs, not a whole percent"
+nodefs=${BASH_REMATCH[1]}
+
+stage=$(mktemp -d)
+socket="$stage.ssh"
+trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
+mkdir "$stage/src"
+git -C "$(git -C "$here" rev-parse --show-toplevel)" archive "$commit" | tar -x -C "$stage/src"
+cp "$here/watch.py" "$stage/watch.py"
+tag=$(cat "$here/Containerfile" "$stage/watch.py" <(echo "$commit") | sha256sum | cut -c1-12)
+nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \
+  --tag "localhost:$tunnel_port/watch:$tag" "$stage"
+ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
+podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/watch:$tag"
+image="localhost:5000/watch:$tag@$(cat "$stage/digest")"
+sed -e "s#@IMAGE@#$image#g" -e "s#@IMAGE_GC_PERCENT@#$image_gc#g" -e "s#@NODEFS_PERCENT@#$nodefs#g" -e "s#@CCS@#$ccs#g" -e "s#@PAGER@#$pager#g" \
+  -e "s#@ROOT_DISK@#$root_disk#g" -e "s#@NODE_DISK@#$node_disk#g" -e "s#@HOME_DISK@#$home_disk#g" \
+  "$here/watch.yaml" | k apply -f -
+k -n watch rollout status deployment/watch
+echo "$image image_gc=$image_gc% nodefs_available=$nodefs% ccs=${ccs:-unchecked} pager=${pager:-none}"

@@ -383,6 +383,71 @@ scripts back a `make` target; see the repository `Makefile`.
   local stand-in node that passes on only `/v1/status` and keeps the frame.
   `k8s/pi-chief/pi-chief-test.py` covers it.
 
+## duckpond's alarms
+
+- `k8s/watch/watch.py` is watch, a read-only daemon off the chain. It
+  samples every 10 s and posts to chat channel `alerts` once when a check
+  turns bad and once when it is good again, never while a check stays as
+  it was. Its checks:
+  - the block rate over the last 40 s, from the height in the node's
+    `/v1/status` at `node-http.duckpond.svc:8844`: bad under 0.7 blocks/s;
+    a sample the node does not answer starts the window again;
+  - the node's `/v1/status`, and the public one at
+    `duckpond.ducktape.industries` while the node's answers;
+  - harness's `Budget`: bad while any account or window has an Anthropic
+    status other than `allowed`;
+  - ccs, when `WATCH_CCS` names it: bad when `/ccs/status` gets no answer
+    or answers 500 or more;
+  - the Kubernetes API's `/readyz` and, while it is ready, the `Available`
+    condition of Deployments `duckpond/node`, `duckpond/ccs`,
+    `duckpond/tunnel`, `pods/pods` and `pi-chief/pi-chief` (not the
+    registry: a registry that fails shows as a roll that cannot pull);
+  - the node volume's free bytes as `df` counts them (`f_bavail`), in two
+    rows: bad under 10 GB and under 6 GB, the node-volume plan's heads-up
+    and fallback lines; fabrics-1's root disk, which holds the kubelet's
+    nodefs, bad when its free share falls under the kubelet's
+    `evictionHard` `nodefs.available`; and `rlm-home`, the kubelet's image
+    filesystem, bad at its `imageGCHighThresholdPercent` as the kubelet
+    counts usage. Each is read with `statvfs` on an empty host directory
+    on that filesystem, mounted read-only, so the pod sees no file there.
+- A check it cannot read changes nothing, and logs `check_unread` once as
+  it turns unread: with the node down, the rate and the public URL are
+  unread. It saves what it decided to its claim `state` before it posts,
+  and posts with `ducktape op chat … --land` as its own agent account,
+  which orthory (15) manages.
+  Each post is read back by its message id before it is sent, so a post
+  that landed unseen, or before the pod stopped, is never sent again;
+  posts that do not land wait in `state` and go out once the chain
+  answers. An alert whose
+  post does not land is also handed once, as its text on stdin, to the
+  command `WATCH_PAGER` names (again only after that command fails, with
+  `page_failed` logged at the first failed page and every tenth); with
+  none named it logs `page_unsent`. An alert that cannot be posted logs
+  `alert_unposted` at its first attempt and every tenth. The account's key
+  and password are the Secret `key` in namespace `watch`:
+
+  ```sh
+  kubectl -n watch create secret generic key --from-file=key=KEY --from-file=password=PASSWORD
+  ```
+
+- `WATCH_ROOT_DISK=DIR WATCH_NODE_DISK=DIR WATCH_HOME_DISK=DIR
+  [WATCH_CCS=URL] [WATCH_PAGER=COMMAND] k8s/watch/deploy DUCKTAPE_COMMIT`
+  checks that every
+  Deployment `k8s/watch/watch.yaml` names runs, reads
+  `imageGCHighThresholdPercent` and `evictionHard` `nodefs.available` (a
+  whole percent) from the kubelet's `configz`, builds
+  `k8s/watch/Containerfile` with the CLI from `git archive
+  DUCKTAPE_COMMIT`, pushes it to the cluster node's registry and applies
+  `k8s/watch/watch.yaml`: namespace `watch`, service account `watch`, a
+  Role in `duckpond`, `pods` and `pi-chief` that may get only
+  those Deployments, the claim, a policy closing every inbound port, and
+  Deployment `watch`. Each DIR is an empty directory made beforehand on
+  that filesystem. ccs's NetworkPolicy `duckpond/ccs-node-only` admits only
+  the node, so `WATCH_CCS` is set once it also admits namespace `watch`.
+- `watch.py once`, run in its pod, prints one sample's readings and posts
+  nothing. `k8s/watch/watch-test.py` covers it. Stop it with
+  `kubectl -n watch scale deployment/watch --replicas=0`.
+
 ## Phone builds and simulator runs on a Mac
 
 - `k8s/mac/relay.py` is the egress service `mac`, the relay: Deployment

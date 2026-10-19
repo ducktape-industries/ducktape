@@ -1,0 +1,162 @@
+# watch on fabrics-1: its namespace and service account, a Role in each namespace whose Deployment it reads, its state claim, a policy closing every inbound port, and its Deployment.
+# Applied by ops/k8s/watch/deploy, which substitutes @IMAGE@, @NODEFS_PERCENT@, @IMAGE_GC_PERCENT@, @ROOT_DISK@, @NODE_DISK@, @HOME_DISK@, @CCS@ and @PAGER@; it signs chat posts with the key in the Secret `key`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: watch
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: watch
+  namespace: watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: watch
+  namespace: duckpond
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [node, ccs, tunnel]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: watch
+  namespace: pods
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [pods]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: watch
+  namespace: pi-chief
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [pi-chief]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: watch
+  namespace: duckpond
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: watch}
+subjects: [{kind: ServiceAccount, name: watch, namespace: watch}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: watch
+  namespace: pods
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: watch}
+subjects: [{kind: ServiceAccount, name: watch, namespace: watch}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: watch
+  namespace: pi-chief
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: watch}
+subjects: [{kind: ServiceAccount, name: watch, namespace: watch}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: state
+  namespace: watch
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path-retain
+  resources:
+    requests:
+      storage: "1"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: no-ingress
+  namespace: watch
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watch
+  namespace: watch
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: watch
+  template:
+    metadata:
+      labels:
+        app: watch
+    spec:
+      serviceAccountName: watch
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: watch
+          image: "@IMAGE@"
+          env:
+            - {name: WATCH_NODE, value: http://node-http.duckpond.svc:8844}
+            - {name: WATCH_PUBLIC, value: https://duckpond.ducktape.industries}
+            - {name: WATCH_CCS, value: "@CCS@"}
+            - {name: WATCH_CHANNEL, value: alerts}
+            - {name: WATCH_PAGER, value: "@PAGER@"}
+            - {name: WATCH_DEPLOYMENTS, value: duckpond/node duckpond/ccs duckpond/tunnel pods/pods pi-chief/pi-chief}
+            - name: WATCH_DISKS
+              value: >-
+                [{"check": "disk-node-low", "label": "node volume", "path": "/disks/node", "rule": "free_bytes_under", "limit": 10000000000},
+                {"check": "disk-node-fallback", "label": "node volume, at the fallback line", "path": "/disks/node", "rule": "free_bytes_under", "limit": 6000000000},
+                {"check": "disk-root", "label": "fabrics-1 root disk", "path": "/disks/root", "rule": "free_percent_under", "limit": @NODEFS_PERCENT@},
+                {"check": "disk-home", "label": "rlm-home disk", "path": "/disks/home", "rule": "used_percent_at", "limit": @IMAGE_GC_PERCENT@}]
+            - {name: WATCH_STATE, value: /state}
+            - {name: WATCH_KEYS, value: /keys}
+            - {name: WATCH_WORKSPACE, value: /tmp/ducktape}
+            - {name: HOME, value: /tmp}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: state, mountPath: /state}
+            - {name: keys, mountPath: /keys, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            - {name: disk-node, mountPath: /disks/node, readOnly: true}
+            - {name: disk-root, mountPath: /disks/root, readOnly: true}
+            - {name: disk-home, mountPath: /disks/home, readOnly: true}
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: state
+        - name: keys
+          secret:
+            secretName: key
+        - name: tmp
+          emptyDir: {}
+        - name: disk-node
+          hostPath: {path: "@NODE_DISK@", type: Directory}
+        - name: disk-root
+          hostPath: {path: "@ROOT_DISK@", type: Directory}
+        - name: disk-home
+          hostPath: {path: "@HOME_DISK@", type: Directory}
