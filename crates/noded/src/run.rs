@@ -16,6 +16,7 @@ use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver};
 use commonware_runtime::Handle;
+use commonware_runtime::telemetry::metrics::{Counter, raw};
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
@@ -595,6 +596,7 @@ async fn start<E: Context>(
             commands,
             membership,
             tracker,
+            syncs: Syncs::registered(&context.child("writer")),
         };
         move |_| write(writing, deliveries)
     });
@@ -835,12 +837,35 @@ struct Writing<E: Context> {
     commands: mpsc::UnboundedReceiver<Command>,
     membership: Seating<E>,
     tracker: Tracker,
+    syncs: Syncs,
 }
 
-enum Event {
-    Delivered(Delivery),
+struct Syncs {
+    served: Counter,
+    abandoned: Counter,
+}
+
+impl Syncs {
+    fn registered<E: Context>(context: &E) -> Syncs {
+        Syncs {
+            served: context.register(
+                "sync_served",
+                "state sync requests the writer answered",
+                raw::Counter::default(),
+            ),
+            abandoned: context.register(
+                "sync_abandoned",
+                "state sync requests the writer dropped unserved because their caller had gone",
+                raw::Counter::default(),
+            ),
+        }
+    }
+}
+
+enum Event<D = Delivery, C = Command> {
+    Delivered(D),
     Unfed,
-    Asked(Option<Command>),
+    Asked(Option<C>),
 }
 
 type Closer = futures::channel::oneshot::Sender<Result<u64>>;
@@ -864,7 +889,7 @@ async fn write<E: Context>(mut writing: Writing<E>, deliveries: mpsc::UnboundedR
         let flow = match event {
             Event::Delivered(delivery) => delivered(&mut writing, &mut deliveries, delivery).await,
             Event::Unfed => unfed(&mut deliveries),
-            Event::Asked(command) => asked(&mut writing.node, command).await,
+            Event::Asked(command) => asked(&mut writing.node, &writing.syncs, command).await,
         };
         match flow {
             Flow::Writing => {}
@@ -874,14 +899,15 @@ async fn write<E: Context>(mut writing: Writing<E>, deliveries: mpsc::UnboundedR
     }
 }
 
-async fn next(
-    deliveries: &mut Option<mpsc::UnboundedReceiver<Delivery>>,
-    commands: &mut mpsc::UnboundedReceiver<Command>,
-) -> Event {
+async fn next<D, C>(
+    deliveries: &mut Option<mpsc::UnboundedReceiver<D>>,
+    commands: &mut mpsc::UnboundedReceiver<C>,
+) -> Event<D, C> {
     let Some(fed) = deliveries else {
         return Event::Asked(commands.next().await);
     };
     tokio::select! {
+        biased;
         delivery = fed.next() => delivery.map_or(Event::Unfed, Event::Delivered),
         command = commands.next() => Event::Asked(command),
     }
@@ -919,19 +945,24 @@ async fn delivered<E: Context>(
     }
 }
 
-async fn asked<E: Context>(node: &mut Node<E>, command: Option<Command>) -> Flow {
+async fn asked<E: Context>(node: &mut Node<E>, syncs: &Syncs, command: Option<Command>) -> Flow {
     let Some(command) = command else {
         return Flow::Unasked;
     };
     match command {
-        Command::Sync(sync) => synced(node, sync).await,
+        Command::Sync(sync) => synced(node, syncs, sync).await,
         Command::Hold(hold) => held(hold).await,
         Command::Close(closer) => Flow::Closing(closer),
     }
 }
 
-async fn synced<E: Context>(node: &mut Node<E>, sync: Sync) -> Flow {
+async fn synced<E: Context>(node: &mut Node<E>, syncs: &Syncs, sync: Sync) -> Flow {
+    if sync.reply.is_canceled() {
+        syncs.abandoned.inc();
+        return Flow::Writing;
+    }
     let served = statesync::serve(node, sync.request).await;
+    syncs.served.inc();
     let _ = sync.reply.send(served);
     Flow::Writing
 }
@@ -949,6 +980,7 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
         commands,
         membership,
         tracker,
+        ..
     } = writing;
     daemon.hang_up().await;
     daemon.current.withdraw();
@@ -1001,7 +1033,7 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
                 () = &mut fetched => break,
                 command = writing.commands.next() => command,
             };
-            match asked(&mut writing.node, command).await {
+            match asked(&mut writing.node, &writing.syncs, command).await {
                 Flow::Writing => {}
                 Flow::Closing(closer) => return Ok(Held::Closing(closer)),
                 Flow::Unasked => return Ok(Held::Unasked),
@@ -1186,7 +1218,9 @@ async fn applied<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{listing, rewrites};
+    use futures::channel::mpsc;
+
+    use super::{Event, listing, next, rewrites};
 
     #[test]
     fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
@@ -1201,6 +1235,24 @@ mod tests {
         assert!(!rewrites(&writes(host::PROGRAMS, b"blobs"), "halo"));
         assert!(!rewrites(&writes("blobs", b"halo"), "halo"));
         assert!(!rewrites(&state::Writes::default(), "halo"));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_block_goes_before_a_waiting_command() {
+        let (blocks, fed) = mpsc::unbounded();
+        let (commands, mut asked) = mpsc::unbounded();
+        let turns = 16;
+        for turn in 0..turns {
+            commands.unbounded_send(turn).unwrap();
+            blocks.unbounded_send(turn).unwrap();
+        }
+        let mut deliveries = Some(fed);
+        for turn in 0..turns {
+            let event = next(&mut deliveries, &mut asked).await;
+            assert!(matches!(event, Event::Delivered(block) if block == turn));
+        }
+        let event = next(&mut deliveries, &mut asked).await;
+        assert!(matches!(event, Event::Asked(Some(0))));
     }
 
     #[test]

@@ -1087,6 +1087,42 @@ fn a_node_answers_reads_from_its_last_applied_block_while_its_writer_is_held() {
 }
 
 #[test]
+fn a_sync_whose_caller_has_gone_is_dropped_unserved_and_the_next_is_answered() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        reach(&client, 2).await;
+        let held = daemon.hold().await.unwrap();
+        let mut gone = Box::pin(daemon.sync(statesync::Request::Head));
+        assert!(futures::poll!(gone.as_mut()).is_pending());
+        drop(gone);
+        held.release();
+        let answered = daemon.sync(statesync::Request::Head).await.unwrap();
+        assert!(matches!(answered, statesync::Response::Head(_)));
+        let text = client.metrics().await.unwrap();
+        let counted = |name: &str| -> u64 {
+            let line = text
+                .lines()
+                .find(|line| !line.starts_with('#') && line.contains(name))
+                .unwrap();
+            line.rsplit(' ').next().unwrap().parse().unwrap()
+        };
+        assert_eq!((counted("sync_abandoned"), counted("sync_served")), (1, 1));
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
+#[test]
 fn a_preconfirmed_submit_is_answered_while_the_writer_is_held_and_lands_after() {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
