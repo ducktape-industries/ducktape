@@ -102,6 +102,18 @@ impl Blobs {
         }
     }
 
+    pub fn framed_once(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
+        let mut file = match fs::File::open(self.path(id)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        not_kept(&file)?;
+        let mut framed = Vec::new();
+        file.read_to_end(&mut framed)?;
+        Ok(Some(framed))
+    }
+
     pub fn get(&self, id: &BlobId) -> Result<Option<Blob>> {
         let Some(framed) = self.framed(id)? else {
             return Ok(None);
@@ -324,6 +336,17 @@ fn staged<'a>(id: &BlobId, framed: &'a [u8]) -> Result<(BlobHeader, &'a [u8])> {
     parse(framed).ok_or_else(|| Error::Corrupt(*id, "the staged frame does not parse".into()))
 }
 
+#[cfg(target_os = "linux")]
+fn not_kept(file: &fs::File) -> std::io::Result<()> {
+    use rustix::fs::{Advice, fadvise};
+    Ok(fadvise(file, 0, None, Advice::NoReuse)?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn not_kept(_: &fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use abi::BlobHeader;
@@ -368,6 +391,8 @@ mod tests {
         assert_eq!(blobs.read(&id, 3, 4).unwrap().unwrap(), b"3456");
         assert_eq!(blobs.read(&id, 8, 100).unwrap().unwrap(), b"89");
         assert_eq!(blobs.read(&id, 100, 1).unwrap().unwrap(), b"");
+        assert_eq!(blobs.framed_once(&id).unwrap(), blobs.framed(&id).unwrap());
+        assert_eq!(blobs.framed_once(&BlobId::Sha1([0; 20])).unwrap(), None);
         assert_eq!(blobs.get(&BlobId::Sha1([0; 20])).unwrap(), None);
         assert_eq!(blobs.stat(&BlobId::Sha1([0; 20])).unwrap(), None);
     }

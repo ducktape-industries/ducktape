@@ -21,6 +21,15 @@ pub(crate) struct Ctx<E: Context> {
     daemon: Arc<Daemon<E>>,
 }
 
+impl<E: Context> Clone for Ctx<E> {
+    fn clone(&self) -> Self {
+        Ctx {
+            view: self.view.clone(),
+            daemon: self.daemon.clone(),
+        }
+    }
+}
+
 pub(crate) struct Stopped(Error);
 
 pub(crate) enum EgressSigner {

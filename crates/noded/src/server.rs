@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use abi::Receipt;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{FromRequest, Path, RawQuery, Request};
 use axum::http::StatusCode;
@@ -342,52 +342,67 @@ async fn blob_get<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<V
         Ok(id) => id,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    match served(&ctx, &[id]).await {
-        Ok(page) => Reply::Answered(page.into_iter().next().flatten()),
+    match served(&ctx, id).await {
+        Ok(framed) => Reply::Answered(framed),
         Err(error) => failed(error),
     }
 }
 
-async fn blobs<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<Option<Vec<u8>>>> {
+async fn blobs<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Response {
     let ids: Vec<BlobId> = match abi::decode(&body) {
         Ok(ids) => ids,
-        Err(refusal) => return Reply::Refused(refusal),
+        Err(refusal) => return Reply::<()>::Refused(refusal).into_response(),
     };
-    match served(&ctx, &ids).await {
-        Ok(page) => Reply::Answered(page),
-        Err(error) => failed(error),
-    }
+    let count = Bytes::copy_from_slice(&(ids.len() as u32).to_le_bytes());
+    let items = futures::stream::iter(ids)
+        .then(move |id| {
+            let ctx = ctx.clone();
+            async move { served(&ctx, id).await }
+        })
+        .flat_map(|read| futures::stream::iter(encoded(read)));
+    let answer = futures::stream::once(async move { Ok(count) }).chain(items);
+    (StatusCode::OK, Body::from_stream(answer)).into_response()
 }
 
-async fn served<E: Context>(ctx: &Ctx<E>, ids: &[BlobId]) -> crate::Result<Vec<Option<Vec<u8>>>> {
+async fn served<E: Context>(ctx: &Ctx<E>, id: BlobId) -> crate::Result<Option<Vec<u8>>> {
     let view = ctx.view().clone();
     let now = ctx.now();
-    let asked = ids.to_vec();
     let readable = offload(move || {
-        let source = view.source();
-        let mut readable = Vec::with_capacity(asked.len());
-        for id in &asked {
-            let read = tokio::runtime::Handle::current().block_on(source.readable(id, now));
-            readable.push(read?);
-        }
-        Ok::<_, host::Error>(readable)
+        tokio::runtime::Handle::current().block_on(view.source().readable(&id, now))
     })
     .await??;
-    let store = ctx.blobs().store();
-    let mut page = Vec::with_capacity(ids.len());
-    for (id, readable) in ids.iter().zip(readable) {
-        if !readable {
-            page.push(None);
-            continue;
-        }
-        if !store.has(id) {
-            ctx.fetch(*id).await;
-        }
-        let read = store.clone();
-        let id = *id;
-        page.push(offload(move || read.framed(&id)).await??);
+    if !readable {
+        return Ok(None);
     }
-    Ok(page)
+    let store = ctx.blobs().store().clone();
+    if !store.has(&id) {
+        ctx.fetch(id).await;
+    }
+    Ok(offload(move || store.framed_once(&id)).await??)
+}
+
+fn encoded(read: crate::Result<Option<Vec<u8>>>) -> Vec<crate::Result<Bytes>> {
+    let framed = match read {
+        Ok(Some(framed)) => framed,
+        Ok(None) => return vec![Ok(Bytes::from_static(&[0]))],
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::http",
+                event = "blobs_cut",
+                %error,
+                reason = "blob_unread",
+                "a blob answer stops mid-stream: a blob it lists could not be read"
+            );
+            return vec![Err(error)];
+        }
+    };
+    let Ok(len) = u32::try_from(framed.len()) else {
+        let over = std::io::Error::other("a framed blob is longer than a u32 length says");
+        return vec![Err(over.into())];
+    };
+    let mut head = vec![1];
+    head.extend_from_slice(&len.to_le_bytes());
+    vec![Ok(Bytes::from(head)), Ok(Bytes::from(framed))]
 }
 
 async fn blob_put<E: Context>(ctx: Ctx<E>, request: Request) -> Reply<Submitted> {
@@ -809,6 +824,18 @@ mod tests {
             panic!("a body over the cap is refused");
         };
         assert_eq!(refusal.reason, reason::CAPACITY);
+    }
+
+    #[test]
+    fn a_streamed_blob_answer_is_the_bytes_of_the_whole_one() {
+        let page = vec![Some(b"page 1\x00a".to_vec()), None, Some(Vec::new())];
+        let mut streamed = (page.len() as u32).to_le_bytes().to_vec();
+        for read in &page {
+            for part in encoded(Ok(read.clone())) {
+                streamed.extend_from_slice(&part.unwrap());
+            }
+        }
+        assert_eq!(streamed, abi::encode(&page));
     }
 
     const PAST_AXUM_DEFAULT_LIMIT: usize = (2 << 20) + 1;

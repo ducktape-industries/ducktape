@@ -416,6 +416,7 @@ dependencies = [
  "commonware-runtime",
  "futures",
  "halo",
+ "rustix",
  "sha1-checked",
  "sha2 0.10.9",
  "tempfile",
