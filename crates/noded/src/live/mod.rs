@@ -13,7 +13,6 @@ mod tests;
 mod tracks;
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -451,8 +450,11 @@ struct Decided {
 
 /// The QUIC door: the node key's certificate, which a client pins from `/v1/status`, on the live
 /// ALPN, asking no client for a certificate; a client proves its key in the session instead.
-/// The QUIC door at `at`, with the node key's certificate; the relay serves it.
-pub fn door(identity: &PrivateKey, at: SocketAddr) -> Result<quinn::Endpoint, halo::quic::Error> {
+/// The QUIC door on `socket`, with the node key's certificate; the relay serves it.
+pub fn door(
+    identity: &PrivateKey,
+    socket: std::net::UdpSocket,
+) -> Result<quinn::Endpoint, halo::quic::Error> {
     let mut server = halo::quic::open_server(identity, ALPN)?;
     // The live wire's keep-alive and idle limit, the ones a client links, so a client that
     // holds tracks stays open through a NAT and a dead one is closed when the wire says.
@@ -461,7 +463,14 @@ pub fn door(identity: &PrivateKey, at: SocketAddr) -> Result<quinn::Endpoint, ha
     transport.max_idle_timeout(Some(idle));
     transport.keep_alive_interval(Some(KEEP_ALIVE));
     server.transport_config(Arc::new(transport));
-    Ok(quinn::Endpoint::server(server, at)?)
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| std::io::Error::other("the live door runs QUIC on no async runtime"))?;
+    Ok(quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server),
+        socket,
+        runtime,
+    )?)
 }
 
 async fn accepting<E: crate::Context>(relay: Weak<Relay<E>>, door: quinn::Endpoint) {

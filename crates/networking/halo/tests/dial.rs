@@ -13,7 +13,7 @@ async fn a_dial_to_a_member_that_never_answers_ends_when_quic_times_it_out() {
     let identity = PrivateKey::from_seed(1);
     let silent = PrivateKey::from_seed(2).public_key();
     let quic = Quic::bind(
-        "127.0.0.1:0".parse().unwrap(),
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
         &identity,
         Arc::new(Members::default()),
     )

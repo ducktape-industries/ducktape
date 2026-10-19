@@ -52,6 +52,39 @@ pub struct Listen {
     pub live: Option<SocketAddr>,
 }
 
+/// Every socket a node serves on, bound: what `run_on` runs on. `Listen::bind` binds them at
+/// their addresses; a caller that binds them itself knows each port before the node starts.
+pub struct Listeners {
+    pub p2p: std::net::TcpListener,
+    pub http: std::net::TcpListener,
+    pub tls: Option<std::net::TcpListener>,
+    pub halo: std::net::UdpSocket,
+    pub live: Option<std::net::UdpSocket>,
+}
+
+impl Listen {
+    /// Binds every socket, so one in use refuses the start before the node does any work.
+    pub fn bind(&self) -> Result<Listeners> {
+        let halo = std::net::UdpSocket::bind(self.halo)
+            .map_err(|error| Error::Address(format!("--halo {}: {error}", self.halo)))?;
+        let live = self
+            .live
+            .map(|at| {
+                std::net::UdpSocket::bind(at)
+                    .map_err(|error| Error::Address(format!("--live {at}: {error}")))
+            })
+            .transpose()?;
+        let tcp = std::net::TcpListener::bind;
+        Ok(Listeners {
+            p2p: tcp(self.p2p)?,
+            http: tcp(self.http)?,
+            tls: self.tls.map(tcp).transpose()?,
+            halo,
+            live,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HaloConfig {
     pub egress_bytes_per_sec: Option<u64>,
@@ -197,7 +230,25 @@ pub fn run<'a, E: Context>(
     load: LoadConfig,
     cadence: Cadence,
 ) -> Boxed<'a, Result<Running<E>>> {
-    Box::pin(start(context, workspace, logs, listen, halo, load, cadence))
+    Box::pin(async move {
+        let listeners = listen.bind()?;
+        start(context, workspace, logs, listeners, halo, load, cadence).await
+    })
+}
+
+/// `run` on sockets the caller bound.
+pub fn run_on<'a, E: Context>(
+    context: E,
+    workspace: &'a Workspace,
+    logs: Logs,
+    listeners: Listeners,
+    halo: HaloConfig,
+    load: LoadConfig,
+    cadence: Cadence,
+) -> Boxed<'a, Result<Running<E>>> {
+    Box::pin(start(
+        context, workspace, logs, listeners, halo, load, cadence,
+    ))
 }
 
 async fn found<E: Context>(
@@ -288,11 +339,13 @@ async fn start<E: Context>(
     context: E,
     workspace: &Workspace,
     logs: Logs,
-    listen: Listen,
+    listeners: Listeners,
     halo: HaloConfig,
     load: LoadConfig,
     cadence: Cadence,
 ) -> Result<Running<E>> {
+    let p2p = listeners.p2p.local_addr()?;
+    let udp = listeners.halo.local_addr()?;
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
     let anchor = workspace.anchor()?;
@@ -322,11 +375,11 @@ async fn start<E: Context>(
             identity.clone(),
             halo::Config {
                 egress_bytes_per_sec: halo.egress_bytes_per_sec,
-                udp: listen.halo,
+                udp: listeners.halo,
                 queues: halo.queues(),
             },
         )
-        .map_err(|error| Error::Address(format!("--halo {}: {error}", listen.halo)))?,
+        .map_err(|error| Error::Address(format!("--halo {udp}: {error}")))?,
     );
     halo.seat(halo_seats(&node, &network).await?);
     tabled(&halo, halo_lanes(&node).await?, tip.height);
@@ -341,13 +394,13 @@ async fn start<E: Context>(
     let proposer = node.proposer();
     let node: Shared<E> = Arc::new(futures::lock::Mutex::new(node));
 
-    // the live door binds its socket here, beside halo's, so a socket in use fails the start
-    // before consensus does any work
+    // the live door opens on its socket here, beside halo's, before consensus does any work
     let (shutdown, _) = watch::channel(false);
-    let door = listen
+    let door = listeners
         .live
-        .map(|at| {
-            live::door(&identity, at)
+        .map(|socket| {
+            let at = socket.local_addr()?;
+            live::door(&identity, socket)
                 .map_err(|error| Error::Address(format!("--live {at}: {error}")))
         })
         .transpose()?;
@@ -373,7 +426,7 @@ async fn start<E: Context>(
             context.child("mesh"),
             identity.clone(),
             &descriptor.id(),
-            listen.p2p,
+            listeners.p2p,
             member_cap,
             cadence,
         )?;
@@ -448,7 +501,7 @@ async fn start<E: Context>(
         live,
         egress,
         key: identity.clone(),
-        mesh: transport::loopback(listen.p2p),
+        mesh: transport::loopback(p2p),
         subscribers: Mutex::new(Vec::new()),
     });
     let founding = tip.height == 0;
@@ -467,13 +520,10 @@ async fn start<E: Context>(
         let daemon = daemon.clone();
         move |_| relay::serve(daemon, relay_receiver)
     });
-    let listener = tokio::net::TcpListener::bind(listen.http).await?;
+    let listener = transport::served(listeners.http)?;
     let http = listener.local_addr()?;
-    let tls = match listen.tls {
-        Some(socket) => Some((
-            tokio::net::TcpListener::bind(socket).await?,
-            transport::acceptor()?,
-        )),
+    let tls = match listeners.tls {
+        Some(socket) => Some((transport::served(socket)?, transport::acceptor()?)),
         None => None,
     };
     let server = context.child("http").spawn({
@@ -493,7 +543,7 @@ async fn start<E: Context>(
     let egressing = crate::egress::spawn(daemon.clone());
     let mut tasks = vec![pump, server, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
-        let mesh = transport::loopback(listen.p2p);
+        let mesh = transport::loopback(p2p);
         tasks.push(
             context
                 .child("tls")
@@ -503,7 +553,7 @@ async fn start<E: Context>(
     workspace.write_http(http)?;
     Ok(Running {
         http,
-        p2p: listen.p2p,
+        p2p,
         daemon,
         _marshal: marshal,
         _mesh: mesh,

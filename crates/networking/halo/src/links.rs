@@ -216,7 +216,7 @@ impl Links {
         context: &E,
         identity: PrivateKey,
         members: Arc<Members>,
-        udp: SocketAddr,
+        udp: std::net::UdpSocket,
         queues: Queues,
     ) -> Result<Arc<Links>, quic::Error> {
         let quic = Quic::bind(udp, &identity, members.clone())?;

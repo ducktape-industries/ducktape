@@ -231,7 +231,7 @@ pub struct Quic {
 
 impl Quic {
     pub fn bind(
-        address: SocketAddr,
+        socket: std::net::UdpSocket,
         identity: &PrivateKey,
         members: Arc<Members>,
     ) -> Result<Quic, Error> {
@@ -252,7 +252,14 @@ impl Quic {
         let crypto = QuicServerConfig::try_from(crypto)?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         server.transport_config(transport());
-        let endpoint = quinn::Endpoint::server(server, address)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| std::io::Error::other("halo runs QUIC on no async runtime"))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server),
+            socket,
+            runtime,
+        )?;
         Ok(Quic {
             endpoint,
             certified,

@@ -32,7 +32,7 @@ const EGRESS_BURST: u64 = 256 << 10;
 
 pub struct Config {
     pub egress_bytes_per_sec: Option<u64>,
-    pub udp: SocketAddr,
+    pub udp: std::net::UdpSocket,
     pub queues: Queues,
 }
 

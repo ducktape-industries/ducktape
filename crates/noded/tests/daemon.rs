@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use abi::role::validators::{Motion, Op};
 use abi::role::{egress, halo};
@@ -23,7 +22,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
 use noded::wire::{Admin, BlockAsk, BlockRef, Blocks, Change, Submitted, TxAsk, TxRef};
-use noded::{Client, Endpoint, HaloConfig, Listen, LoadConfig, Logs, Upload, Workspace};
+use noded::{Client, Endpoint, HaloConfig, Listen, Listeners, LoadConfig, Logs, Upload, Workspace};
 
 const NETWORK: &str = "daemon";
 const TIME: u64 = 1_700_000_000;
@@ -36,11 +35,6 @@ fn runner(dir: &Path) -> tokio::Runner {
     tokio::Runner::new(tokio::Config::new().with_storage_directory(dir))
 }
 
-fn free_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
-}
-
 fn outbound_ip() -> IpAddr {
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     socket.connect("192.0.2.1:9").expect(
@@ -49,13 +43,33 @@ fn outbound_ip() -> IpAddr {
     socket.local_addr().unwrap().ip()
 }
 
-fn free_udp_port() -> SocketAddr {
-    let socket = UdpSocket::bind((outbound_ip(), 0)).unwrap();
-    socket.local_addr().unwrap()
+/// Every socket a seat's node serves on, bound before any port is named, so nothing else can
+/// take one in between. halo and live are at this host's outbound address.
+fn listeners() -> Listeners {
+    let tcp = || TcpListener::bind("127.0.0.1:0").unwrap();
+    let udp = || UdpSocket::bind((outbound_ip(), 0)).unwrap();
+    Listeners {
+        p2p: tcp(),
+        http: tcp(),
+        tls: Some(tcp()),
+        halo: udp(),
+        live: Some(udp()),
+    }
 }
 
-fn unheard() -> String {
-    format!("tcp://localhost:{}", free_port().port())
+/// A p2p address no node answers at: the listener holding it never accepts.
+fn unheard() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("tcp://localhost:{}", listener.local_addr().unwrap().port());
+    (listener, address)
+}
+
+/// A halo address nothing answers at: the socket holding it is connected to itself, so the
+/// kernel answers every other sender as if nothing were bound there.
+fn unanswered() -> UdpSocket {
+    let socket = UdpSocket::bind((outbound_ip(), 0)).unwrap();
+    socket.connect(socket.local_addr().unwrap()).unwrap();
+    socket
 }
 
 const PUTTER_SEED: u64 = 21;
@@ -68,9 +82,13 @@ struct Seat {
     http: SocketAddr,
     tls: SocketAddr,
     halo: SocketAddr,
-    live: Option<SocketAddr>,
+    /// The listeners `new` bound, until the first start takes them. A restart binds fresh ones,
+    /// so a seat that restarts among peers registers no address and dials out.
+    held: StdMutex<Option<Listeners>>,
     registered: String,
     address: Option<String>,
+    /// What holds an unreachable seat's registered halo address.
+    _unanswered: Option<UdpSocket>,
 }
 
 impl Seat {
@@ -80,24 +98,29 @@ impl Seat {
             let workspace = workspace.clone();
             |mut context| async move { workspace.identity_or_create(&mut context).unwrap() }
         });
-        let p2p = free_port();
-        let halo = free_udp_port();
+        let held = listeners();
+        let bound = |listener: &TcpListener| listener.local_addr().unwrap();
+        let p2p = bound(&held.p2p);
+        let halo = held.halo.local_addr().unwrap();
         Seat {
             workspace,
             identity,
             p2p,
-            http: free_port(),
-            tls: free_port(),
+            http: bound(&held.http),
+            tls: held.tls.as_ref().map(bound).unwrap(),
             halo,
-            live: Some((outbound_ip(), 0).into()),
+            held: StdMutex::new(Some(held)),
             registered: halo.to_string(),
             address: Some(format!("tcp://localhost:{}", p2p.port())),
+            _unanswered: None,
         }
     }
 
     fn unreachable(root: &Path, name: &str) -> Seat {
+        let unanswered = unanswered();
         Seat {
-            registered: free_udp_port().to_string(),
+            registered: unanswered.local_addr().unwrap().to_string(),
+            _unanswered: Some(unanswered),
             ..Seat::new(root, name)
         }
     }
@@ -153,13 +176,8 @@ impl Seat {
     fn start_with(&self, load: LoadConfig) -> Live {
         let (ready, started) = mpsc::channel();
         let workspace = self.workspace.clone();
-        let listen = Listen {
-            p2p: self.p2p,
-            http: self.http,
-            tls: Some(self.tls),
-            halo: self.halo,
-            live: self.live,
-        };
+        let held = self.held.lock().unwrap().take();
+        let bound = held.unwrap_or_else(listeners);
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
                 let logs = Logs::install("info").unwrap();
@@ -168,11 +186,11 @@ impl Seat {
                     .unwrap()
                     .cadence(consensus::Timeouts::default())
                     .unwrap();
-                let running = noded::run(
+                let running = noded::run_on(
                     context,
                     &workspace,
                     logs,
-                    listen,
+                    bound,
                     HaloConfig::default(),
                     load,
                     cadence,
@@ -334,10 +352,11 @@ fn submission(frame: &[u8]) -> Submission {
     Frame::decode(frame).unwrap().body.submission()
 }
 
-/// Polls until `client`'s node has applied `height`.
+/// Waits until `client`'s node has applied `height`: every block writes `$recent`.
 async fn reach(client: &Client, height: u64) {
+    let mut blocks = client.changes(host::RECENT).await.unwrap();
     while client.status().await.unwrap().height < height {
-        ::tokio::time::sleep(Duration::from_millis(100)).await;
+        blocks.next().await.unwrap().unwrap();
     }
 }
 
@@ -855,15 +874,16 @@ fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
     seat.init(&founding);
-    // The one test that names a live port up front: the socket it holds is the one the node
-    // is told to bind.
-    let taken = free_udp_port();
-    let _holder = UdpSocket::bind(taken).unwrap();
+    // The one test that names its sockets by address: the live socket it holds is the one the
+    // node is told to bind, and every other is any free port.
+    let holder = UdpSocket::bind((outbound_ip(), 0)).unwrap();
+    let taken = holder.local_addr().unwrap();
+    let any = SocketAddr::from(([127, 0, 0, 1], 0));
     let listen = Listen {
-        p2p: seat.p2p,
-        http: seat.http,
-        tls: Some(seat.tls),
-        halo: seat.halo,
+        p2p: any,
+        http: any,
+        tls: Some(any),
+        halo: (outbound_ip(), 0).into(),
         live: Some(taken),
     };
     let workspace = seat.workspace.clone();
@@ -898,10 +918,8 @@ fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
 #[test]
 fn a_node_run_without_live_names_no_live_port() {
     let root = tempfile::tempdir().unwrap();
-    let seat = Seat {
-        live: None,
-        ..Seat::new(root.path(), "n0")
-    };
+    let seat = Seat::new(root.path(), "n0");
+    seat.held.lock().unwrap().as_mut().unwrap().live = None;
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
     seat.init(&founding);
     let live = seat.start();
@@ -984,9 +1002,11 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
     let live = seat.start();
     let client = live.client.clone();
     let offline = ed25519::PrivateKey::from_seed(12);
+    let (_unheard, address) = unheard();
+    let unanswered = unanswered();
     let enroll = Op::Enroll {
-        address: Some(unheard()),
-        halo: free_udp_port().to_string(),
+        address: Some(address),
+        halo: unanswered.local_addr().unwrap().to_string(),
         invite: None,
     };
 
@@ -994,9 +1014,8 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
         let recorded = membership(&client, &offline, enroll).await;
         let resident_epoch = recorded / EPOCH_LENGTH + 1;
         let beyond = resident_epoch * EPOCH_LENGTH + 1;
-        ::tokio::time::timeout(Duration::from_secs(30), reach(&client, beyond))
-            .await
-            .expect("the chain finalizes past the first block of the resident's epoch");
+        // the chain finalizes past the first block of the resident's epoch
+        reach(&client, beyond).await;
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
@@ -1011,7 +1030,7 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
 /// With the second validator back, the resident applies a change the
 /// validators make after it started, and hears their finalize votes. The
 /// second validator registers no address and dials out, so it comes back on
-/// ports of its own: none it left free can be taken in between.
+/// listeners it binds afresh.
 #[test]
 fn a_resident_follows_at_the_tip() {
     // long enough that the resident joins and the chain stops inside one
@@ -1059,9 +1078,6 @@ fn a_resident_follows_at_the_tip() {
         }
     });
 
-    let back = &mut seats[1];
-    (back.p2p, back.http, back.tls) = (free_port(), free_port(), free_port());
-    back.halo = free_udp_port();
     live.push(seats[1].start());
     runtime.block_on(async {
         let mut changes = follower.client.changes("probe").await.unwrap();
@@ -1122,18 +1138,13 @@ fn a_shrunk_set_finalizes_without_the_removed_member() {
         let client = &live[0].client;
         let recorded = membership(client, &seats[0].identity, remove).await;
         let shrunk = recorded / EPOCH_LENGTH + 1;
-        ::tokio::time::timeout(
-            Duration::from_secs(30),
-            reach(client, shrunk * EPOCH_LENGTH),
-        )
-        .await
-        .expect("the chain enters the epoch that seats two");
+        // the chain enters the epoch that seats two
+        reach(client, shrunk * EPOCH_LENGTH).await;
         seats[2].admin(&live[2].client, Admin::Shutdown).await;
         let beyond = (shrunk + 1) * EPOCH_LENGTH + 1;
+        // the two finalize across the next boundary
         for node in &live[..2] {
-            ::tokio::time::timeout(Duration::from_secs(30), reach(&node.client, beyond))
-                .await
-                .expect("the two finalize across the next boundary");
+            reach(&node.client, beyond).await;
         }
         for (seat, node) in seats.iter().zip(&live).take(2) {
             seat.admin(&node.client, Admin::Shutdown).await;
@@ -1255,11 +1266,8 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
         matches!(early.outcome, Outcome::Applied { .. }),
         "{early:?}"
     );
-    runtime.block_on(async {
-        ::tokio::time::timeout(Duration::from_secs(60), landed(&mut changes, &[b"early"]))
-            .await
-            .expect("a frame given the instant the resident starts lands");
-    });
+    // a frame given the instant the resident starts lands
+    runtime.block_on(landed(&mut changes, &[b"early"]));
 
     let failing = given(vec![Step::Fail("no".into())]);
     let mut spent = runtime
@@ -1271,11 +1279,8 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
         "{predicted:?}"
     );
     let carried = host::spent(&submission(&failing));
-    runtime.block_on(async {
-        ::tokio::time::timeout(Duration::from_secs(60), landed(&mut spent, &[&carried]))
-            .await
-            .expect("a frame predicted to fail is relayed and a block carries it");
-    });
+    // a frame predicted to fail is relayed and a block carries it
+    runtime.block_on(landed(&mut spent, &[&carried]));
     drop(spent);
 
     let nearly_a_block = node::BLOCK_BYTES - (1 << 16);
@@ -1287,14 +1292,8 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
             .block_on(follower.client.submit(large, Preconfirm::Off))
             .unwrap();
     }
-    let [one, two] = runtime.block_on(async {
-        ::tokio::time::timeout(
-            Duration::from_secs(120),
-            landed(&mut changes, &[b"large0", b"large1"]),
-        )
-        .await
-        .expect("two nearly full frames land")
-    })[..] else {
+    let heights = runtime.block_on(landed(&mut changes, &[b"large0", b"large1"]));
+    let [one, two] = heights[..] else {
         panic!("both large frames land");
     };
     assert!(
@@ -1325,7 +1324,7 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
 
 /// Ends TLS at `listen` and carries the bytes to `to`, as a tunnel or a
 /// reverse proxy in front of a node's HTTP port does.
-fn terminate_tls(runtime: &::tokio::runtime::Runtime, listen: SocketAddr, to: SocketAddr) {
+fn terminate_tls(runtime: &::tokio::runtime::Runtime, listen: TcpListener, to: SocketAddr) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
     let server = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
@@ -1338,7 +1337,8 @@ fn terminate_tls(runtime: &::tokio::runtime::Runtime, listen: SocketAddr, to: So
     .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
     runtime.spawn(async move {
-        let listener = ::tokio::net::TcpListener::bind(listen).await.unwrap();
+        listen.set_nonblocking(true).unwrap();
+        let listener = ::tokio::net::TcpListener::from_std(listen).unwrap();
         loop {
             let (remote, _) = listener.accept().await.unwrap();
             let acceptor = acceptor.clone();
@@ -1408,22 +1408,17 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
         };
         assert_eq!(refusal.reason, reason::INVALID_INPUT);
 
-        let (_, receipt) = ::tokio::time::timeout(
-            Duration::from_secs(60),
-            client.land_blobs(&put(entries.clone(), 2), uploads()),
-        )
-        .await
-        .expect("the put lands")
-        .unwrap();
+        let (_, receipt) = client
+            .land_blobs(&put(entries.clone(), 2), uploads())
+            .await
+            .unwrap();
         let Outcome::Applied { output } = receipt.outcome else {
             panic!("the put applies: {receipt:?}");
         };
         let bundle: u64 = abi::decode(&output).unwrap();
         let gathered = &live[1].client;
-        ::tokio::time::timeout(Duration::from_secs(60), gathered.held(&role, bundle))
-            .await
-            .expect("the gatherer applies the block where both validators hold the bundle")
-            .unwrap();
+        // the gatherer applies the block where both validators hold the bundle
+        gathered.held(&role, bundle).await.unwrap();
 
         let ids: Vec<BlobId> = entries.iter().map(|entry| entry.id).collect();
         let framed = [
@@ -1480,13 +1475,8 @@ async fn put_page(client: &Client, path: &Path, salt: u64) -> (BlobId, u64) {
         kind: "page".into(),
         path: path.to_path_buf(),
     };
-    let (_, receipt) = ::tokio::time::timeout(
-        Duration::from_secs(60),
-        client.land_blobs(&put_frame(&status, vec![entry.clone()], salt), vec![upload]),
-    )
-    .await
-    .expect("the put lands")
-    .unwrap();
+    let put = put_frame(&status, vec![entry.clone()], salt);
+    let (_, receipt) = client.land_blobs(&put, vec![upload]).await.unwrap();
     let Outcome::Applied { output } = receipt.outcome else {
         panic!("the put applies: {receipt:?}");
     };
@@ -1560,10 +1550,8 @@ fn a_lane_the_validators_vote_open_is_served_from_its_block() {
             .bound(role::BLOBS)
             .unwrap()
             .clone();
-        ::tokio::time::timeout(Duration::from_secs(60), live[1].client.held(&role, bundle))
-            .await
-            .expect("the gatherer gathers and receipts the bundle over the lane the vote opened")
-            .unwrap();
+        // the gatherer gathers and receipts the bundle over the lane the vote opened
+        live[1].client.held(&role, bundle).await.unwrap();
         let framed = blob::frame("page", b"gathered once the lane is open").unwrap();
         assert_eq!(
             live[1].client.blobs(&[id]).await.unwrap(),
@@ -1598,16 +1586,12 @@ fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_di
             .get(role::BLOBS)
             .unwrap()
             .clone();
-        ::tokio::time::timeout(Duration::from_secs(120), live[2].client.held(&role, bundle))
-            .await
-            .expect("both members that can be dialed gather the bundle from the one that cannot")
-            .unwrap();
+        // both members that can be dialed gather the bundle from the one that cannot
+        live[2].client.held(&role, bundle).await.unwrap();
         let framed = blob::frame("page", b"held through a hidden member").unwrap();
         for gathered in &live[..2] {
-            ::tokio::time::timeout(Duration::from_secs(60), gathered.client.held(&role, bundle))
-                .await
-                .expect("the gatherer applied the block that holds the bundle")
-                .unwrap();
+            // the gatherer applied the block that holds the bundle
+            gathered.client.held(&role, bundle).await.unwrap();
             assert_eq!(
                 gathered.client.blobs(&[id]).await.unwrap(),
                 vec![Some(framed.clone())]
@@ -1649,19 +1633,15 @@ fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
             .get(role::BLOBS)
             .unwrap()
             .clone();
-        let since = ::tokio::time::timeout(Duration::from_secs(300), client.held(&role, bundle))
-            .await
-            .expect("the hidden member gathers the bundle once it dials the moved address")
-            .unwrap();
+        // the hidden member gathers the bundle once it dials the moved address
+        let since = client.held(&role, bundle).await.unwrap();
         assert_eq!(
             since / EPOCH,
             moved / EPOCH,
             "the move landed at {moved} and the bundle was held at {since}, past the epoch's end"
         );
-        ::tokio::time::timeout(Duration::from_secs(60), live[1].client.held(&role, bundle))
-            .await
-            .expect("the gatherer applied the block that holds the bundle")
-            .unwrap();
+        // the gatherer applied the block that holds the bundle
+        live[1].client.held(&role, bundle).await.unwrap();
         let framed = blob::frame("page", b"gathered at the new address").unwrap();
         assert_eq!(
             live[1].client.blobs(&[id]).await.unwrap(),
@@ -1687,11 +1667,8 @@ fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, diale
             )
             .await
             .unwrap();
-        let change = ::tokio::time::timeout(Duration::from_secs(60), changes.next())
-            .await
-            .expect("the two validators finalize a block")
-            .unwrap()
-            .unwrap();
+        // the two validators finalize a block
+        let change = changes.next().await.unwrap().unwrap();
         assert_eq!(change.writes, vec![(b"a".to_vec(), Some(b"1".to_vec()))]);
         for (seat, node) in [(&dialer, &live[0]), (&dialed, &live[1])] {
             seat.admin(&node.client, Admin::Shutdown).await;
@@ -1732,10 +1709,11 @@ fn a_validator_is_dialed_over_wss_through_a_tls_terminator() {
     let runtime = client_runtime();
     let mut dialer = Seat::new(root.path(), "n0");
     let mut dialed = Seat::new(root.path(), "n1");
-    let terminator = free_port();
+    let terminator = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = terminator.local_addr().unwrap().port();
     terminate_tls(&runtime, terminator, dialed.http);
     dialer.address = None;
-    dialed.address = Some(format!("wss://localhost:{}", terminator.port()));
+    dialed.address = Some(format!("wss://localhost:{port}"));
     reached(&runtime, root.path(), dialer, dialed);
 }
 
@@ -2131,9 +2109,11 @@ async fn agreed(clients: &[Client]) -> Vec<u64> {
 #[test]
 fn parked_state_prunes_while_a_restart_and_two_joins_reach_the_same_root() {
     let root = tempfile::tempdir().unwrap();
-    let seats: Vec<Seat> = (0..4)
+    let mut seats: Vec<Seat> = (0..4)
         .map(|i| Seat::new(root.path(), &format!("n{i}")))
         .collect();
+    // the second restarts on listeners it binds afresh, so it registers no address and dials out
+    seats[1].address = None;
     let mut plain = Seat::new(root.path(), "r0");
     plain.address = None;
     let mut held = Seat::new(root.path(), "r1");

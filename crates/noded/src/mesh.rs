@@ -58,7 +58,7 @@ impl<E: Context> Mesh<E> {
         context: E,
         identity: PrivateKey,
         namespace: &[u8],
-        listen: SocketAddr,
+        listener: std::net::TcpListener,
         member_cap: u32,
         cadence: Cadence,
     ) -> Result<Started<E>> {
@@ -67,6 +67,7 @@ impl<E: Context> Mesh<E> {
         // it can leave or join the set without a restart, so the +1 is kept.
         let peers = NZUsize!(member_cap as usize + 1);
         let me = identity.public_key();
+        let listen = listener.local_addr()?;
         let mut config = Config::local(identity, namespace, listen, peers, node::MESSAGE_BYTES);
         config.bypass_ip_check = true;
         config.allow_dns = false;
@@ -74,7 +75,7 @@ impl<E: Context> Mesh<E> {
         // only the current epoch's set: nothing reads an older one, and the
         // previous epoch's engine is gone at the switch
         config.tracked_peer_sets = NZUsize!(1);
-        let linked = Linked::new(context, link_timeout(cadence));
+        let linked = Linked::handing(context, link_timeout(cadence), listener);
         let (mut network, oracle) = Network::new(linked, config);
         let quota = Quota::per_second(NZU32!(QUOTA_PER_SECOND));
         let marshal = MarshalLanes {
@@ -229,10 +230,7 @@ mod tests {
     /// none of them this node.
     fn track_foreign(foreign: u64) {
         tokio::Runner::default().start(|context| async move {
-            let listen = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
+            let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let identity = PrivateKey::from_seed(0);
             let (_mesh, mut tracker, _, _, _) =
                 Mesh::start(context, identity, b"mesh", listen, 3, cadence()).unwrap();
@@ -261,10 +259,7 @@ mod tests {
     #[test]
     fn a_member_without_an_address_is_a_primary_peer() {
         tokio::Runner::default().start(|context| async move {
-            let listen = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
+            let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let (mesh, mut tracker, _, _, _) = Mesh::start(
                 context,
                 PrivateKey::from_seed(0),

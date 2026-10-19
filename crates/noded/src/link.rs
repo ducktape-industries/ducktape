@@ -1,9 +1,10 @@
-// The p2p mesh's connections: the runtime's own, read and written in pieces so a link dies after a stretch with no bytes moving, never while a long message is still moving.
-// `Mesh::start` hands `Linked` to commonware p2p in place of the runtime context.
+// The p2p mesh's connections: the runtime's own, and those accepted on the listener the node was handed, read and written in pieces so a link dies after a stretch with no bytes moving, never while a long message is still moving.
+// `Mesh::start` hands `Linked` to commonware p2p in place of the runtime context, so commonware's one bind takes that listener.
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use commonware_runtime::signal::Signal;
@@ -15,19 +16,52 @@ use commonware_runtime::{
 use futures::future::{Either, select};
 use governor::clock::{Clock as GovernorClock, ReasonablyRealtime};
 use rand_core::{TryCryptoRng, TryRng};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 const PIECE_BYTES: usize = 64 << 10;
 
 pub struct Linked<E> {
     context: E,
     idle: Duration,
+    handed: Handed,
+}
+
+/// The bound listener a node hands its mesh, until commonware binds it; every child of a
+/// `Linked` shares it.
+#[derive(Clone, Default)]
+struct Handed(Arc<Mutex<Option<std::net::TcpListener>>>);
+
+impl Handed {
+    fn take(&self) -> Option<std::net::TcpListener> {
+        self.0
+            .lock()
+            .expect("the handed listener's lock is never poisoned")
+            .take()
+    }
 }
 
 pub struct Listener<L, C> {
-    inner: L,
+    inner: Door<L>,
     clock: C,
     idle: Duration,
 }
+
+/// Where a listener accepts: the runtime's own socket, or the one the node was handed.
+enum Door<L> {
+    Runtime(L),
+    Handed(tokio::net::TcpListener),
+}
+
+/// One end of a connection: the runtime's own, or one accepted on the handed listener.
+pub enum Half<R, T> {
+    Runtime(R),
+    Handed(T),
+}
+
+pub struct Written(OwnedWriteHalf);
+
+pub struct Read(BufReader<OwnedReadHalf>);
 
 pub struct Sink<S, C> {
     inner: S,
@@ -43,13 +77,35 @@ pub struct Stream<S, C> {
 
 impl<E> Linked<E> {
     pub fn new(context: E, idle: Duration) -> Linked<E> {
-        Linked { context, idle }
+        Linked {
+            context,
+            idle,
+            handed: Handed::default(),
+        }
+    }
+
+    /// A `Linked` whose bind takes `listener`, which the caller bound, rather than binding one.
+    pub fn handing(context: E, idle: Duration, listener: std::net::TcpListener) -> Linked<E> {
+        Linked {
+            context,
+            idle,
+            handed: Handed(Arc::new(Mutex::new(Some(listener)))),
+        }
     }
 
     fn map(self, f: impl FnOnce(E) -> E) -> Linked<E> {
         Linked {
             context: f(self.context),
             idle: self.idle,
+            handed: self.handed,
+        }
+    }
+
+    fn with(&self, context: E) -> Linked<E> {
+        Linked {
+            context,
+            idle: self.idle,
+            handed: self.handed.clone(),
         }
     }
 }
@@ -83,11 +139,26 @@ fn wrapped<S, T, C: Supervisor>(
     (sink, stream)
 }
 
+/// The handed listener, which must be bound at `socket`, as tokio's.
+fn handed(
+    listener: std::net::TcpListener,
+    socket: SocketAddr,
+) -> Result<tokio::net::TcpListener, Error> {
+    let bound = listener.local_addr().map_err(|_| Error::BindFailed)?;
+    if bound != socket {
+        return Err(Error::BindFailed);
+    }
+    crate::transport::served(listener).map_err(|_| Error::BindFailed)
+}
+
 impl<E: Network + Clock + Supervisor> Network for Linked<E> {
     type Listener = Listener<E::Listener, E>;
 
     async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
-        let inner = self.context.bind(socket).await?;
+        let inner = match self.handed.take() {
+            Some(listener) => Door::Handed(handed(listener, socket)?),
+            None => Door::Runtime(self.context.bind(socket).await?),
+        };
         Ok(Listener {
             inner,
             clock: self.context.child("listener"),
@@ -96,25 +167,95 @@ impl<E: Network + Clock + Supervisor> Network for Linked<E> {
     }
 
     async fn dial(&self, socket: SocketAddr) -> Result<(SinkOf<Self>, StreamOf<Self>), Error> {
-        let dialed = self.context.dial(socket).await?;
+        let (sink, stream) = self.context.dial(socket).await?;
+        let dialed = (Half::Runtime(sink), Half::Runtime(stream));
         Ok(wrapped(dialed, &self.context, self.idle))
     }
+}
+
+/// A connection accepted on the handed listener, set as the node's runtime sets the ones it
+/// accepts itself: no delay, no linger. Its reads and writes are bounded by the link's idle limit.
+fn accepted(stream: tokio::net::TcpStream) -> (Written, Read) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(target: "ducktape::mesh", %error, "an accepted link keeps its delay");
+    }
+    if let Err(error) = stream.set_zero_linger() {
+        tracing::debug!(target: "ducktape::mesh", %error, "an accepted link keeps its linger");
+    }
+    let (read, write) = stream.into_split();
+    (
+        Written(write),
+        Read(BufReader::with_capacity(PIECE_BYTES, read)),
+    )
 }
 
 impl<L: commonware_runtime::Listener, C: Clock + Supervisor> commonware_runtime::Listener
     for Listener<L, C>
 {
-    type Sink = Sink<L::Sink, C>;
-    type Stream = Stream<L::Stream, C>;
+    type Sink = Sink<Half<L::Sink, Written>, C>;
+    type Stream = Stream<Half<L::Stream, Read>, C>;
 
     async fn accept(&mut self) -> Result<(SocketAddr, Self::Sink, Self::Stream), Error> {
-        let (address, sink, stream) = self.inner.accept().await?;
+        let (address, sink, stream) = match &mut self.inner {
+            Door::Runtime(listener) => {
+                let (address, sink, stream) = listener.accept().await?;
+                (address, Half::Runtime(sink), Half::Runtime(stream))
+            }
+            Door::Handed(listener) => {
+                let (stream, address) = listener.accept().await.map_err(|_| Error::Closed)?;
+                let (sink, stream) = accepted(stream);
+                (address, Half::Handed(sink), Half::Handed(stream))
+            }
+        };
         let (sink, stream) = wrapped((sink, stream), &self.clock, self.idle);
         Ok((address, sink, stream))
     }
 
     fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
-        self.inner.local_addr()
+        match &self.inner {
+            Door::Runtime(listener) => listener.local_addr(),
+            Door::Handed(listener) => listener.local_addr(),
+        }
+    }
+}
+
+impl<R: commonware_runtime::Sink> commonware_runtime::Sink for Half<R, Written> {
+    async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), Error> {
+        match self {
+            Half::Runtime(sink) => sink.send(bufs).await,
+            Half::Handed(Written(sink)) => {
+                let mut bufs = bufs.into();
+                sink.write_all_buf(&mut bufs)
+                    .await
+                    .map_err(|_| Error::SendFailed)
+            }
+        }
+    }
+}
+
+impl<R: commonware_runtime::Stream> commonware_runtime::Stream for Half<R, Read> {
+    async fn recv(&mut self, len: usize) -> Result<IoBufs, Error> {
+        match self {
+            Half::Runtime(stream) => stream.recv(len).await,
+            Half::Handed(Read(stream)) => {
+                let mut buf = vec![0; len];
+                stream
+                    .read_exact(&mut buf)
+                    .await
+                    .map_err(|_| Error::RecvFailed)?;
+                Ok(IoBufs::from(buf))
+            }
+        }
+    }
+
+    fn peek(&self, max_len: usize) -> &[u8] {
+        match self {
+            Half::Runtime(stream) => stream.peek(max_len),
+            Half::Handed(Read(stream)) => {
+                let buffered = stream.buffer();
+                &buffered[..buffered.len().min(max_len)]
+            }
+        }
     }
 }
 
@@ -152,7 +293,7 @@ impl<E: Supervisor> Supervisor for Linked<E> {
     }
 
     fn child(&self, label: &'static str) -> Self {
-        Linked::new(self.context.child(label), self.idle)
+        self.with(self.context.child(label))
     }
 
     fn with_attribute(self, key: &'static str, value: impl std::fmt::Display) -> Self {
@@ -175,9 +316,14 @@ impl<E: Spawner> Spawner for Linked<E> {
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let idle = self.idle;
-        self.context
-            .spawn(move |context| f(Linked::new(context, idle)))
+        let (idle, handed) = (self.idle, self.handed.clone());
+        self.context.spawn(move |context| {
+            f(Linked {
+                context,
+                idle,
+                handed,
+            })
+        })
     }
 
     fn stop(

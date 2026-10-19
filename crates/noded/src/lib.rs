@@ -32,7 +32,9 @@ pub use config::{
 pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
-pub use run::{HaloConfig, Listen, LoadConfig, Running, init, invite, join, run};
+pub use run::{
+    HaloConfig, Listen, Listeners, LoadConfig, Running, init, invite, join, run, run_on,
+};
 pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
 

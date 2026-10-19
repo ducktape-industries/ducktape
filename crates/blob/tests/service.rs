@@ -25,7 +25,7 @@ fn node(context: &runtime::Context, seed: u64, validator: bool) -> (Node, Arc<Ha
     let key = identity.public_key();
     let config = Config {
         egress_bytes_per_sec: None,
-        udp: "127.0.0.1:0".parse().unwrap(),
+        udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
         queues: Queues::default(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());

@@ -176,7 +176,7 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
     let key = identity.public_key();
     let config = halo::Config {
         egress_bytes_per_sec: Some(1 << 30),
-        udp: "127.0.0.1:0".parse().unwrap(),
+        udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
         queues: halo::Queues::default(),
     };
     let halo = Arc::new(Halo::start(&context.child("halo"), identity.clone(), config).unwrap());
@@ -198,7 +198,7 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
         },
         ledger,
         halo.clone(),
-        Some(super::door(&identity, "127.0.0.1:0".parse().unwrap()).unwrap()),
+        Some(super::door(&identity, std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap()),
         Config::default(),
         down,
     );

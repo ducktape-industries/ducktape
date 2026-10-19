@@ -18,8 +18,8 @@ fn members(keys: &[PublicKey]) -> Arc<Members> {
     members
 }
 
-fn loopback() -> std::net::SocketAddr {
-    "127.0.0.1:0".parse().unwrap()
+fn loopback() -> std::net::UdpSocket {
+    std::net::UdpSocket::bind("127.0.0.1:0").unwrap()
 }
 
 async fn quic_reaches(server_admits: &[PublicKey], meant: &PublicKey) -> bool {

@@ -83,6 +83,12 @@ impl ServerCertVerifier for Carrier {
     }
 }
 
+/// A bound listener as tokio's, which accepts on it.
+pub fn served(listener: std::net::TcpListener) -> io::Result<TcpListener> {
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener)
+}
+
 pub fn dialer() -> Result<Arc<ClientConfig>> {
     let provider = provider();
     let carrier = Carrier(provider.signature_verification_algorithms);
