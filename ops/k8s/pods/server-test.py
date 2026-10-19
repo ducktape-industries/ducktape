@@ -821,6 +821,23 @@ class Retried(Served):
         self.assertEqual((len(files), len(self.signer.submits), self.paused), (2, 2, [1]))
         self.assertEqual(self.signer.submits[0], self.signer.submits[1])
 
+    def test_a_write_files_moved_under_reads_the_head_again_and_commits_onto_it(self):
+        moved = "sha256:" + "cd" * 32
+        for refusal in [b"not_found: files minted no snapshot " + b"ab" * 32, b"stale: /r changed since its base"]:
+            with self.subTest(refusal=refusal):
+                self.kube.answer("exec", ran(b"abc"))
+                self.signer.put_ran = ran(CHUNKS[0].encode() + b"\n")
+                head = bytes([0, 1, 0]) + bytes.fromhex("cd" * 32) + b"rest of the row"
+                self.signer.head = [Signer().head, ran(head)]
+                self.signer.submitted = [ran(b"preconfirmed rejected " + refusal + b"\n"), ran(b"preconfirmed applied 00ff\n")]
+                self.signer.queries, self.signer.submits, self.paused[:] = [], [], []
+                status, answer = self.call("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/r", "message": "m"})
+                self.assertEqual((status, answer["base"]), (200, moved), answer)
+                ((_, first), (_, second)) = self.signer.submits
+                self.assertEqual(first, server.files_commit(SNAPSHOT, "m", "/r", 3, [CHUNKS[0]]))
+                self.assertEqual(second, server.files_commit(moved, "m", "/r", 3, [CHUNKS[0]]))
+                self.assertEqual(self.paused, [1])
+
     def test_a_failure_the_service_did_not_foresee_answers_500_with_why(self):
         self.kube.answer("get", ran(b"not json"))
         status, answer = self.call("GET", "/v1/pods/duckpond-41")

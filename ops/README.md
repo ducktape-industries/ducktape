@@ -114,6 +114,9 @@ scripts back a `make` target; see the repository `Makefile`.
   `ducktape-request` header). Once it is gone the step is not tried again.
   Any other failure answers at once, and a failure the service did not
   foresee answers 500 with `{"error"}` rather than closing the connection.
+  A files commit files refuses because its head moved after it was read
+  (`not_found: files minted no snapshot …`, or `stale`) is made again onto
+  files' head as read then, with the same pauses while the request is open.
 - An exec, `blob`, `file` or `push` that reaches a container which has not
   started yet (kubectl's `container not found ("run")`, while the `fetch`
   init container still fetches the pod's inputs, or `does not have a host

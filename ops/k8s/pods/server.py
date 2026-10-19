@@ -203,6 +203,15 @@ def dropped(text):
     return any(words in lowered for words in DROPPED)
 
 
+# files refused a commit because its head moved after it was read: the base it named is a
+# snapshot files has not minted on the node that applied it, or a later commit touched the path.
+# Made again onto files' head as read then, it lands.
+def moved_under(outcome, reason, sentence):
+    if outcome != "rejected":
+        return False
+    return reason == "stale" or (reason == "not_found" and "minted no snapshot" in sentence)
+
+
 def failed(ran):
     if ran.code == 0:
         return None
@@ -1496,7 +1505,20 @@ class Service:
             return base, receipt(self.signer.submit(FILES_PROGRAM, commit(base)))
 
         unsent = lambda tried: tried[1][2] if tried[1][0] == "failed" else None
-        return self.retried(asked_by, attempt, unsent)
+        pause = RETRY_PAUSE
+        while True:
+            tried = self.retried(asked_by, attempt, unsent)
+            outcome, reason, sentence = tried[1]
+            if not moved_under(outcome, reason, sentence):
+                return tried
+            say("pods_retried", reason="files_moved", detail=json.dumps(f"{reason}: {sentence}"))
+            if not self.waiting(asked_by):
+                raise Refused(
+                    502,
+                    f"files moved under the write ({reason}: {sentence}); request {asked_by['request']}, which asked for this, is gone, so it was not tried again",
+                )
+            self.pause(pause)
+            pause *= 2
 
     def push(self, name, asked_by, body):
         asked = named(checked(body, PUSH, "a push"), ["path"], "a push")
