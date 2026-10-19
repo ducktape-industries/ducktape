@@ -39,7 +39,7 @@ spec:
         - name: node
           image: IMAGE
           resources:
-            requests: {cpu: "1", memory: 2Gi}
+            requests: {cpu: "8", memory: 2Gi}
           volumeMounts:
             - {name: home, mountPath: /data}
           securityContext:
