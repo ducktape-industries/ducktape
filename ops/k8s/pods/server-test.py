@@ -59,6 +59,17 @@ def asked(request):
     return {**ASKED, "ducktape-request": str(request)}
 
 
+def room(owner=99, members_only=False, archived=False):
+    row = server.borsh_text("c") + server.borsh_text("c") + server.u64(1) + server.u8(1 if members_only else 0)
+    row += server.u8(0) + server.u64(owner) + server.u8(1 if archived else 0)
+    return server.u8(1) + server.u8(1) + row + server.u64(0) + server.borsh_vec([])
+
+
+def members(accounts, after=None):
+    rows = [server.u8(0) + server.u64(account) + server.u64(1) + server.u64(1) for account in accounts]
+    return server.u8(7) + server.u64(1) + server.borsh_vec(rows) + server.borsh_option(after, server.borsh_bytes)
+
+
 def taken(holder, field):
     value = getattr(holder, field)
     if isinstance(value, list):
@@ -110,6 +121,8 @@ class Kube:
         self.answers = {}
         self.watches = []
         self.gate = None
+        self.follows = []
+        self.logs_of = {}
 
     def answer(self, verb, *answers):
         self.answers[verb] = list(answers)
@@ -172,6 +185,18 @@ class Kube:
         self.calls.append(("watch_pod", name))
         return self.watches.pop(0)
 
+    def follow(self, name):
+        self.follows.append(name)
+        return Log(self.logs_of.get(name, b""))
+
+
+class Log:
+    def __init__(self, data):
+        self.stdout = io.BytesIO(data)
+
+    def wait(self):
+        return 0
+
 
 class Watch:
     def __init__(self, code=0):
@@ -202,6 +227,8 @@ class Signer:
         self.puts = []
         self.submits = []
         self.queries = []
+        self.asked = []
+        self.rooms = {}
         self.put_ran = ran(b"sha256:ab12cd34ef56ab78cd90\nbundle 7 put at block 900\nbundle 7 held since block 901\n")
         self.submitted = ran(POOLED + b"landed 960 applied 00ff\n")
         self.head = ran(bytes([0, 1, 0]) + bytes.fromhex("ab" * 32) + b"rest of the row")
@@ -219,6 +246,10 @@ class Signer:
         return taken(self, "submitted")
 
     def query(self, program, request):
+        if program == "chat":
+            self.asked.append(request)
+            answer = self.rooms.get(request, room())
+            return answer if isinstance(answer, server.Ran) else ran(answer)
         self.queries.append((program, request))
         return taken(self, "request" if program == "egress" else "head")
 
@@ -1598,7 +1629,8 @@ class Posts(unittest.TestCase):
     def test_an_ended_pod_is_posted_once_and_marked(self):
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         self.assertEqual(self.signer.submits, [("chat", POSTED)])
-        self.assertEqual(self.kube.calls, [("annotate", "duckpond-41", "ducktape.industries/notified", "ended")])
+        read = ("logs", "duckpond-41", ["--container", "run"])
+        self.assertEqual(self.kube.calls, [read, ("annotate", "duckpond-41", "ducktape.industries/notified", "ended")])
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes={**NOTIFY, "ducktape.industries/notified": "ended"}))
         self.assertEqual(len(self.signer.submits), 1)
 
@@ -1606,6 +1638,107 @@ class Posts(unittest.TestCase):
         self.notifier.seen(pod_json(state={"running": {}}, phase="Running", notes=NOTIFY))
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded"))
         self.assertEqual((self.signer.submits, self.kube.calls), ([], []))
+
+    def test_a_notified_pods_notify_line_is_posted_led_by_the_pod(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.kube.logs_of["duckpond-41"] = b"building\nducktape-notify j-093 20261019-1 ended: exit 0, GATES ok\n"
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        line = "duckpond-41 \u00b7 20261019-1 ended: exit 0, GATES ok"
+        posted = server.post_message("j-093", server.notify_id("duckpond-41", "j-093", line), 17, line, None)
+        self.assertEqual(self.signer.submits, [("chat", posted)])
+        self.assertEqual((self.kube.follows, self.kube.calls, self.notifier.following), (["duckpond-41"], [], set()))
+
+    def test_a_pod_followed_again_posts_each_line_once(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.kube.logs_of["duckpond-41"] = b"ducktape-notify j-093 run 1 ended\n"
+        for _ in range(2):
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(len(self.signer.submits), 1)
+
+    def test_a_lines_id_keeps_its_whole_digest(self):
+        line = "duckpond-41 \u00b7 run 1 ended"
+        digest = server.hashlib.sha256(f"j-093\n{line}".encode()).hexdigest()
+        self.assertEqual(server.notify_id("duckpond-41", "j-093", line), f"pods-duckpond-41-notify-{digest}")
+
+    def test_a_line_to_a_room_its_requester_may_not_post_in_is_not_posted(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.signer.rooms[server.chat_channel("dm-22-23")] = room(owner=22, members_only=True)
+        self.signer.rooms[server.chat_members("dm-22-23", None)] = members([22, 23])
+        self.kube.logs_of["duckpond-41"] = b"ducktape-notify dm-22-23 relay this\n"
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [])
+
+    def test_a_member_found_on_a_later_page_of_a_members_only_room_posts(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.signer.rooms[server.chat_channel("team")] = room(owner=22, members_only=True)
+        self.signer.rooms[server.chat_members("team", None)] = members([5], after=b"next")
+        self.signer.rooms[server.chat_members("team", b"next")] = members([17])
+        self.kube.logs_of["duckpond-41"] = b"ducktape-notify team run 1 ended\n"
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(len(self.signer.submits), 1)
+
+    def test_an_archived_room_and_a_pod_with_no_requester_post_nothing(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.signer.rooms[server.chat_channel("old")] = room(archived=True)
+        self.kube.logs_of["duckpond-41"] = b"ducktape-notify old run 1 ended\n"
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.kube.logs_of["duckpond-42"] = b"ducktape-notify j-093 run 2 ended\n"
+        self.notifier.seen(pod_json(name="duckpond-42", state=RUNNING, phase="Running", notes=NOTIFY, requester=None))
+        self.assertEqual(self.signer.submits, [])
+
+    def test_the_end_post_needs_its_requester_admitted_too(self):
+        self.signer.rooms[server.chat_channel("builds")] = room(owner=22, members_only=True)
+        self.signer.rooms[server.chat_members("builds", None)] = members([22])
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual((self.signer.submits, self.kube.verbs()), ([], ["logs"]))
+
+    def test_a_pod_never_seen_running_posts_its_lines_before_its_end(self):
+        self.kube.answer("logs", ran(b"building\nducktape-notify j-093 run 1 ended: exit 0, GATES ok\n"))
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        line = "duckpond-41 \u00b7 run 1 ended: exit 0, GATES ok"
+        posted = server.post_message("j-093", server.notify_id("duckpond-41", "j-093", line), 17, line, None)
+        self.assertEqual(self.signer.submits, [("chat", posted), ("chat", POSTED)])
+        self.assertEqual(self.notifier.posted, {})
+
+    def test_a_deleted_pod_forgets_the_lines_it_posted(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.kube.logs_of["duckpond-41"] = b"ducktape-notify j-093 run 1 ended\n"
+        self.notifier.event({"type": "ADDED", "object": pod_json(state=RUNNING, phase="Running", notes=NOTIFY)})
+        self.assertEqual(len(self.notifier.posted["duckpond-41"]), 1)
+        self.notifier.event({"type": "DELETED", "object": pod_json(state=RUNNING, phase="Running", notes=NOTIFY)})
+        self.assertEqual(self.notifier.posted, {})
+
+    def test_a_failed_chat_read_posts_nothing_and_says_why_in_detail(self):
+        self.signer.rooms[server.chat_channel("builds")] = ran(code=1, err="node unreachable")
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [])
+        said.assert_any_call("pods_unposted", message="pods-duckpond-41-ended", reason="chat_unasked", detail=json.dumps("node unreachable"))
+
+    def test_a_refusal_with_no_sentence_logs_its_token_alone(self):
+        self.signer.rooms[server.chat_channel("builds")] = room(archived=True)
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        said.assert_any_call("pods_unposted", message="pods-duckpond-41-ended", reason="archived")
+
+    def test_a_pod_already_followed_is_not_followed_twice(self):
+        started = []
+        self.notifier.spawn = lambda target, *args: started.append(args)
+        for _ in range(2):
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(started, [("duckpond-41", 17)])
+
+    def test_a_line_with_no_channel_or_no_text_posts_nothing(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.kube.logs_of["duckpond-41"] = b"ducktape-notify\nducktape-notify j-1\nducktape-notify j-1    \nnotify j-1 x\n"
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [])
+
+    def test_a_pod_without_notify_or_not_running_is_not_followed(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running"))
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes={**NOTIFY, "ducktape.industries/notified": "ended"}))
+        self.assertEqual(self.kube.follows, [])
 
     def test_a_pod_whose_inputs_failed_is_posted_with_why(self):
         failed = {"terminated": {"exitCode": 1, "message": "cloning\nduck://duckpond/forge/x was not cloned: not found\n"}}
@@ -1618,25 +1751,25 @@ class Posts(unittest.TestCase):
     def test_a_refused_post_is_not_marked_and_a_repeated_one_is(self):
         self.signer.submitted = ran(POOLED + b"landed 960 rejected unauthorized: pods may not post in builds\n")
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
-        self.assertEqual(self.kube.calls, [])
+        self.assertEqual(self.kube.verbs(), ["logs"])
         self.signer.submitted = ran(POOLED + b"landed 960 rejected already_exists: message pods-duckpond-41-ended exists\n")
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
-        self.assertEqual(len(self.kube.calls), 1)
+        self.assertEqual(self.kube.verbs(), ["logs", "logs", "annotate"])
 
     def test_a_post_no_block_carried_is_not_marked(self):
         self.signer.submitted = ran(POOLED + b"unlanded\n")
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
-        self.assertEqual(self.kube.calls, [])
+        self.assertEqual(self.kube.verbs(), ["logs"])
 
     def test_a_post_that_was_not_sent_is_not_marked(self):
         self.signer.submitted = ran(code=1, err="node unreachable")
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
-        self.assertEqual(self.kube.calls, [])
+        self.assertEqual(self.kube.verbs(), ["logs"])
 
     def test_without_a_key_nothing_is_posted_or_marked(self):
         self.signer.keyed = False
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
-        self.assertEqual((self.signer.submits, self.kube.calls), ([], []))
+        self.assertEqual((self.signer.submits, self.kube.verbs()), ([], ["logs"]))
 
 
 class Encodings(unittest.TestCase):

@@ -210,8 +210,17 @@ scripts back a `make` target; see the repository `Makefile`.
   gets one too. A reply with nothing to warn of has no `warnings` field.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
-  container's exit code, or why fetching its inputs or the pod failed. A pod
-  without one gets none. Nothing else posts: `pods/NAME/blob` and
+  container's exit code, or why fetching its inputs or the pod failed. While
+  its run container runs, each line it prints that reads `ducktape-notify
+  <channel> <text>` is posted to that channel too, as `<pod> · <text>`, so
+  nothing the service posts can pass for a person or a program; a line is
+  posted once, under an id from the pod and the sha256 of the channel and
+  the text. A pod that ends before the service saw it run, or while the
+  service was down, has its log read before its end post. Every post, the
+  end post too, goes only where its requester may post, as chat decides
+  (the channel is not archived, and is open, or the requester owns it or
+  is a member; asked of chat before each post): a pod with no requester
+  posts nothing. A pod without a `notify` gets none of either. Nothing else posts: `pods/NAME/blob` and
   `pods/NAME/file` answer with their result, so they post nothing.
 - Namespace `agents` holds the ResourceQuota `hardcap`, the operator's
   ceiling: `requests.storage` 500Gi, and `requests.cpu` and

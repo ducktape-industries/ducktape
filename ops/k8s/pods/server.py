@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends, and usage.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends or a notified pod prints a `ducktape-notify` line, and usage.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import copy
+import hashlib
 import json
 import os
 import queue
@@ -41,6 +42,7 @@ REQUESTER = NOTE + "requester"
 NOTIFY_CHANNEL = NOTE + "notify-channel"
 NOTIFY_THREAD = NOTE + "notify-thread"
 NOTIFIED = NOTE + "notified"
+NOTIFY_LINE = "ducktape-notify "
 SPEC = {
     "image": str,
     "command": list,
@@ -396,6 +398,45 @@ def post_message(channel, message_id, requester, line, thread):
     return u8(4) + borsh_text(channel) + borsh_text(message_id) + borsh_vec([paragraph]) + borsh_option(thread, u64)
 
 
+def chat_channel(channel):
+    return u8(1) + borsh_text(channel)
+
+
+def chat_members(channel, after):
+    return u8(7) + borsh_text(channel) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+
+
+def principal_of(reader):
+    return reader.u64() if reader.u8() == 0 else None
+
+
+def room_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != 1:
+        raise Refused(502, "chat answered a channel with something else")
+    if reader.u8() == 0:
+        return None
+    reader.bytes()
+    reader.bytes()
+    reader.u64()
+    members_only = reader.u8() == 1
+    owner = principal_of(reader)
+    return {"members_only": members_only, "owner": owner, "archived": reader.u8() == 1}
+
+
+def members_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != 7:
+        raise Refused(502, "chat answered a channel's members with something else")
+    reader.u64()
+    accounts = []
+    for _ in range(int.from_bytes(reader.take(4), "little")):
+        accounts.append(principal_of(reader))
+        reader.u64()
+        reader.u64()
+    return accounts, reader.bytes() if reader.u8() == 1 else None
+
+
 def files_head():
     return u8(0)
 
@@ -529,6 +570,10 @@ class Kube:
     def watch_pod(self, name):
         argv = self.argv("get", "pod", name, "--watch", "--output-watch-events", "--output", "json")
         return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def follow(self, name):
+        argv = self.argv("logs", name, "--container", RUN, "--follow")
+        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
 class Signer:
@@ -1059,6 +1104,21 @@ def ended_line(pod):
     return None
 
 
+def notify_lines(name, stream):
+    for raw in stream:
+        line = raw.decode(errors="replace").rstrip("\r\n")
+        if not line.startswith(NOTIFY_LINE):
+            continue
+        channel, _, text = line[len(NOTIFY_LINE):].partition(" ")
+        if channel and text.strip():
+            yield channel, f"{name} \u00b7 {text.strip()}"
+
+
+def notify_id(name, channel, line):
+    digest = hashlib.sha256(f"{channel}\n{line}".encode()).hexdigest()
+    return f"pods-{name}-notify-{digest}"
+
+
 def ended_event(pod):
     line = ended_line(pod)
     if line is None:
@@ -1277,6 +1337,10 @@ class Notifier:
     def __init__(self, kube, signer):
         self.kube = kube
         self.signer = signer
+        self.following = set()
+        self.posted = {}
+        self.lock = threading.Lock()
+        self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
 
     def post(self, notes, requester, message_id, line):
         notify = notify_of(notes)
@@ -1284,6 +1348,12 @@ class Notifier:
             return False
         if not self.signer.held():
             say("pods_unposted", message=message_id, reason="no_key")
+            return False
+        refused = self.refusal(notify["channel"], requester)
+        if refused is not None:
+            reason, detail = refused
+            fields = {} if detail is None else {"detail": json.dumps(detail)}
+            say("pods_unposted", message=message_id, reason=reason, **fields)
             return False
         payload = post_message(notify["channel"], message_id, requester, line, notify["thread"])
         outcome, reason, sentence, _ = receipt(self.signer.submit(CHAT, payload))
@@ -1294,7 +1364,73 @@ class Notifier:
         say("pods_unposted", message=message_id, reason=reason or outcome, detail=json.dumps(sentence))
         return False
 
+    def asked(self, request):
+        ran = self.signer.query(CHAT, request)
+        if ran.code != 0:
+            raise Refused(502, ran.err or ran.out.decode(errors="replace") or f"ducktape exited {ran.code}")
+        return ran.out
+
+    def refusal(self, channel, requester):
+        if requester is None:
+            return "no_requester", None
+        try:
+            room = room_of(self.asked(chat_channel(channel)))
+            if room is None:
+                return "no_channel", None
+            if room["archived"]:
+                return "archived", None
+            if not room["members_only"] or room["owner"] == requester:
+                return None
+            after = None
+            while True:
+                accounts, after = members_of(self.asked(chat_members(channel, after)))
+                if requester in accounts:
+                    return None
+                if after is None:
+                    return "not_a_member", None
+        except Refused as refused:
+            return "chat_unasked", refused.sentence
+
+    def lines(self, name, requester, stream):
+        for channel, line in notify_lines(name, stream):
+            message_id = notify_id(name, channel, line)
+            with self.lock:
+                if message_id in self.posted.get(name, ()):
+                    continue
+            if self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line):
+                with self.lock:
+                    self.posted.setdefault(name, set()).add(message_id)
+
+    def follow(self, name, requester):
+        try:
+            process = self.kube.follow(name)
+            self.lines(name, requester, process.stdout)
+            process.wait()
+        finally:
+            with self.lock:
+                self.following.discard(name)
+
+    def read(self, name, requester):
+        ran = self.kube.logs(name, ["--container", RUN])
+        if ran.code == 0:
+            self.lines(name, requester, ran.out.splitlines(keepends=True))
+
+    def followed(self, pod):
+        meta = pod["metadata"]
+        if NOTIFY_CHANNEL not in (meta.get("annotations") or {}):
+            return
+        ran = state_of(pod.get("status", {}).get("containerStatuses", []), RUN)
+        if ran is None or ran["state"] != "running":
+            return
+        name = meta["name"]
+        with self.lock:
+            if name in self.following:
+                return
+            self.following.add(name)
+        self.spawn(self.follow, name, requester_of(meta.get("labels") or {}))
+
     def seen(self, pod):
+        self.followed(pod)
         meta = pod["metadata"]
         notes = meta.get("annotations") or {}
         line = ended_line(pod)
@@ -1302,16 +1438,27 @@ class Notifier:
         if not unposted:
             return
         name = meta["name"]
-        if self.post(notes, requester_of(meta.get("labels") or {}), f"pods-{name}-ended", line):
+        requester = requester_of(meta.get("labels") or {})
+        self.read(name, requester)
+        if self.post(notes, requester, f"pods-{name}-ended", line):
             self.kube.annotate(name, NOTIFIED, "ended")
+            with self.lock:
+                self.posted.pop(name, None)
+
+    def event(self, event):
+        kind = event.get("type")
+        if kind in ("ADDED", "MODIFIED"):
+            self.seen(event["object"])
+        elif kind == "DELETED":
+            with self.lock:
+                self.posted.pop(event["object"]["metadata"]["name"], None)
 
     def watch(self):
         failures = 0
         while True:
             process = self.kube.watch()
             for event in json_stream(process.stdout):
-                if event.get("type") in ("ADDED", "MODIFIED"):
-                    self.seen(event["object"])
+                self.event(event)
             code = process.wait()
             if code == 0:
                 failures = 0
