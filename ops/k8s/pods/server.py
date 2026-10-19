@@ -1051,6 +1051,21 @@ def sse(event, data):
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
 
+def streamed(events):
+    try:
+        yield from events
+    except Exception as error:
+        say("pods_failed", reason="stream", detail=json.dumps(repr(error)))
+        yield sse("refused", {"status": 500, "error": f"the pods service failed while it streamed: {error!r}"})
+
+
+def chunk(data):
+    return f"{len(data):x}\r\n".encode() + data + b"\r\n"
+
+
+LAST_CHUNK = b"0\r\n\r\n"
+
+
 class Beat:
     def __init__(self, every):
         self.every = every
@@ -1795,15 +1810,20 @@ def handler(service):
             self.send_response(status)
             self.send_header("content-type", "text/event-stream")
             self.send_header("cache-control", "no-cache")
+            self.send_header("transfer-encoding", "chunked")
             self.send_header("connection", "close")
             self.end_headers()
+            said = streamed(events)
             try:
-                for event in events:
-                    self.wfile.write(event)
+                for event in said:
+                    self.wfile.write(chunk(event))
                     self.wfile.flush()
+                self.wfile.write(LAST_CHUNK)
+                self.wfile.flush()
             except OSError:
                 say("pods_stream_unheard", reason="caller_gone")
             finally:
+                said.close()
                 events.close()
                 self.close_connection = True
 

@@ -91,7 +91,10 @@ scripts back a `make` target; see the repository `Makefile`.
   `text/event-stream`, which a network hears event by event
   (`Delivery::Events`): an `alive` event each `every` seconds, which moves
   the caller's egress expiry on, then one `ended` event and the end of the
-  stream. A wait ends when the pod's run container ends, the pod fails or is
+  stream. A stream is chunked and ends with its last chunk only once its last
+  event is sent, so one the service stops before then (a restart, a crash)
+  reaches the node broken (`stream_broken`), never as a whole end; one that
+  fails inside ends with `refused` `{status: 500, error}`. A wait ends when the pod's run container ends, the pod fails or is
   deleted, with `{line, exit_code, pod}`; an exec ends with its whole
   answer, or `refused` with `{status, error}` when the cluster refused it.
   So a build that outlives a request's `wait` still answers. `every` is the

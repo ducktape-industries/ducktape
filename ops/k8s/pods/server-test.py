@@ -1,6 +1,7 @@
 """Exercise the pods service over real HTTP against a recording kubectl, ducktape and kubelet, and its input fetcher against a recording runner; run by `make test`."""
 import contextlib
 import http.client
+import socket
 import importlib.util
 import io
 import json
@@ -358,6 +359,53 @@ class Wait(Streamed):
         self.kube.watches.append(watch)
         kind, data = self.event(self.stream("/v1/pods/duckpond-9/wait?every=30"))
         self.assertEqual((kind, data["line"], data["pod"]), ("ended", "pod duckpond-9 is gone", None))
+
+
+class Framing(Streamed):
+    def answering(self, events):
+        self.service.answer = lambda *_: (200, server.Stream(events))
+
+    def test_a_stream_is_chunked_and_ends_with_its_last_chunk(self):
+        self.answering(event for event in [server.sse("ended", {"exit_code": 0})])
+        with socket.create_connection(self.http.server_address) as raw:
+            raw.sendall(b"GET /v1/pods/duckpond-41/wait?every=5 HTTP/1.1\r\nhost: pods\r\n\r\n")
+            heard = b""
+            while data := raw.recv(65536):
+                heard += data
+        head, _, body = heard.partition(b"\r\n\r\n")
+        self.assertIn(b"transfer-encoding: chunked", head.lower())
+        self.assertTrue(body.endswith(server.LAST_CHUNK), body)
+        self.assertIn(b"event: ended", body)
+
+    def test_a_stream_the_service_stops_before_its_end_reads_as_broken_not_as_an_end(self):
+        class Stopped(BaseException):
+            pass
+
+        def events():
+            yield server.sse("alive", {})
+            raise Stopped()
+
+        hook = threading.excepthook
+        threading.excepthook = lambda _: None
+        self.addCleanup(setattr, threading, "excepthook", hook)
+        self.answering(events())
+        response = self.stream("/v1/pods/duckpond-41/wait?every=5")
+        self.assertEqual(self.event(response), ("alive", {}))
+        with self.assertRaises(http.client.IncompleteRead):
+            response.read()
+
+    def test_a_stream_that_fails_inside_ends_with_a_refused_event_saying_why(self):
+        def events():
+            yield server.sse("alive", {})
+            raise RuntimeError("the watch broke")
+
+        self.answering(events())
+        response = self.stream("/v1/pods/duckpond-41/wait?every=5")
+        self.assertEqual(self.event(response), ("alive", {}))
+        kind, data = self.event(response)
+        self.assertEqual((kind, data["status"]), ("refused", 500))
+        self.assertIn("the watch broke", data["error"])
+        self.assertEqual(response.read(), b"")
 
 
 class StreamedExec(Streamed):
