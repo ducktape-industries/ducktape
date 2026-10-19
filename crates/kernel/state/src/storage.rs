@@ -72,6 +72,10 @@ impl Storage {
         Ok(self.db.write(batch)?)
     }
 
+    pub fn flush(&self) -> Result<()> {
+        Ok(self.db.flush()?)
+    }
+
     /// Deletes every key under `program`: a dropped program leaves no
     /// storage for one admitted again under its id to read.
     pub fn clear(&self, program: &str) -> Result<()> {

@@ -571,6 +571,13 @@ votes and `ducktape halo` never preconfirm. `ducktape logs`,
 node's own identity key. Each verb's
 `--help` carries the rest.
 
+`ducktape shutdown`, SIGTERM and SIGINT stop `ducktape run` the same way.
+The node stops taking blocks and lets the block it is applying finish. It
+closes every `/v1/changes` socket with a going-away close frame, flushes its
+state to disk and exits 0, so the next start replays no write log. A signal
+that arrives while the node is still opening its state ends the start at
+once.
+
 ## How it is built
 
 | Layer | Where | What |

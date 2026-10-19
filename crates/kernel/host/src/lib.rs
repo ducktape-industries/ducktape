@@ -646,6 +646,10 @@ where
         Ok(named.into_iter().filter(|id| !self.blobs.has(id)).collect())
     }
 
+    pub async fn sync(&mut self) -> Result<()> {
+        Ok(self.store.sync().await?)
+    }
+
     pub fn install(&mut self, id: BlobId, framed: &[u8]) -> Result<()> {
         let hashed = blob::id_of(id.kind(), framed)
             .map_err(|collision| Error::Corrupt(collision.to_string()))?;

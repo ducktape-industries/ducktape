@@ -23,4 +23,11 @@ node = { workspace = true }
 noded = { workspace = true }
 rand = { version = "0.10", features = ["sys_rng"] }
 rand_core = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+fixture-wasm = { workspace = true }
+live-wire = { workspace = true }
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }

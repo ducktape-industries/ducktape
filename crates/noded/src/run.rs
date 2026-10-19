@@ -182,13 +182,51 @@ pub struct Running<E: Context> {
     pub daemon: Arc<Daemon<E>>,
     _marshal: Marshal,
     _mesh: Mesh<E>,
-    _tasks: Vec<Handle<()>>,
+    tasks: Vec<Handle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Asked,
+    Signalled,
+}
+
+impl Stop {
+    fn reason(self) -> &'static str {
+        match self {
+            Stop::Asked => "shutdown",
+            Stop::Signalled => "signal",
+        }
+    }
 }
 
 impl<E: Context> Running<E> {
-    pub async fn stopped(self) {
+    pub async fn stopped(self, signalled: impl Future<Output = ()>) -> Result<()> {
         let mut down = self.daemon.shutdown.subscribe();
-        let _ = down.wait_for(|down| *down).await;
+        let stop = tokio::select! {
+            _ = down.wait_for(|down| *down) => Stop::Asked,
+            () = signalled => Stop::Signalled,
+        };
+        self.close(stop).await
+    }
+
+    async fn close(self, stop: Stop) -> Result<()> {
+        self.daemon.shutdown.send_replace(true);
+        let mut node = self.daemon.node.lock().await;
+        for task in &self.tasks {
+            task.abort();
+        }
+        self.daemon.hang_up();
+        node.sync().await?;
+        let height = node.tip()?.height;
+        tracing::info!(
+            target: "ducktape::node",
+            event = "node_stopped",
+            reason = stop.reason(),
+            height,
+            "the node stopped taking blocks and closed its state"
+        );
+        Ok(())
     }
 }
 
@@ -557,7 +595,7 @@ async fn start<E: Context>(
         daemon,
         _marshal: marshal,
         _mesh: mesh,
-        _tasks: tasks,
+        tasks,
     })
 }
 

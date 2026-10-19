@@ -212,6 +212,10 @@ where
         self.host.view(layer)
     }
 
+    pub async fn sync(&mut self) -> Result<()> {
+        Ok(self.host.sync().await?)
+    }
+
     pub fn install(&mut self, id: BlobId, framed: &[u8]) -> Result<()> {
         Ok(self.host.install(id, framed)?)
     }

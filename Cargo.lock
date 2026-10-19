@@ -2957,15 +2957,20 @@ dependencies = [
  "commonware-runtime",
  "dialoguer",
  "ducktape-home",
+ "fixture-wasm",
  "futures",
  "hex",
  "host",
  "keystore",
+ "live-wire",
  "node",
  "noded",
  "rand 0.10.2",
  "rand_core 0.10.1",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
 ]
 
 [[package]]
@@ -4525,6 +4530,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

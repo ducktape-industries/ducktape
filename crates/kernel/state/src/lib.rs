@@ -228,6 +228,14 @@ where
         View::new(&self.storage, layers)
     }
 
+    pub async fn sync(&mut self) -> Result<()> {
+        self.storage.flush()?;
+        for commitment in self.commitments.values_mut() {
+            commitment.sync().await?;
+        }
+        Ok(())
+    }
+
     pub async fn commit(&mut self, height: u64, writes: Writes) -> Result<()> {
         self.storage.commit(height, &writes)?;
         for (program, keys) in &writes.programs {

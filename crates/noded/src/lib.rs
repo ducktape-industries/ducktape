@@ -186,15 +186,27 @@ impl<E: Context> Daemon<E> {
         keys: bool,
     ) -> mpsc::UnboundedReceiver<Published> {
         let (sender, receiver) = mpsc::unbounded();
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .expect("the subscriber lock is never poisoned");
+        let stopping = *self.shutdown.borrow();
+        if stopping {
+            return receiver;
+        }
+        subscribers.push(Subscriber {
+            program,
+            keys,
+            sender,
+        });
+        receiver
+    }
+
+    pub(crate) fn hang_up(&self) {
         self.subscribers
             .lock()
             .expect("the subscriber lock is never poisoned")
-            .push(Subscriber {
-                program,
-                keys,
-                sender,
-            });
-        receiver
+            .clear();
     }
 
     pub fn publish(&self, applied: &Applied) {

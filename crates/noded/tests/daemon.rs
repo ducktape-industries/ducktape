@@ -198,7 +198,7 @@ impl Seat {
                 .await
                 .unwrap();
                 ready.send(running.http).unwrap();
-                running.stopped().await;
+                running.stopped(std::future::pending()).await.unwrap();
             });
         });
         let http = started.recv().unwrap();

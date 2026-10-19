@@ -535,7 +535,8 @@ fn execute(cli: Cli) -> Result<(), String> {
             let runtime = runtime_config(&workspace).with_read_write_timeout(config.link_timeout());
             Runner::new(runtime).start(|context| async move {
                 let logs = Logs::install(&config.log)?;
-                let running = noded::run(
+                let mut signalled = Box::pin(signalled().sentence()?);
+                let starting = noded::run(
                     context,
                     &workspace,
                     logs,
@@ -543,12 +544,16 @@ fn execute(cli: Cli) -> Result<(), String> {
                     config.halo,
                     config.load,
                     config.cadence,
-                )
-                .await
-                .sentence()?;
+                );
+                let running = tokio::select! {
+                    running = starting => running.sentence()?,
+                    () = &mut signalled => {
+                        stopped_starting();
+                        return Ok(());
+                    }
+                };
                 println!("http {}", running.http);
-                running.stopped().await;
-                Ok(())
+                running.stopped(signalled).await.sentence()
             })
         }
         Verb::Wallet(verb) => wallet(&workspace, verb),
@@ -557,6 +562,35 @@ fn execute(cli: Cli) -> Result<(), String> {
             client_runtime()?.block_on(talk(&workspace, &client, verb))
         }
     }
+}
+
+#[cfg(unix)]
+fn signalled() -> std::io::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn signalled() -> std::io::Result<impl Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+fn stopped_starting() {
+    tracing::info!(
+        target: "ducktape::node",
+        event = "node_stopped",
+        reason = "signal",
+        "the node stopped before it was up"
+    );
 }
 
 fn runtime_config(workspace: &Workspace) -> Config {

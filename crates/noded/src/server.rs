@@ -4,7 +4,7 @@ use abi::Receipt;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{FromRequest, Path, RawQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware;
@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use borsh::BorshSerialize;
 use futures::channel::mpsc;
+use futures::stream::SplitSink;
 use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use node::{BLOCK_BYTES, Preconfirm, Source, Taken};
@@ -429,6 +430,7 @@ async fn changes<E: Context>(
 enum Next {
     Published(Published),
     Frame,
+    Stopped,
     Ended,
 }
 
@@ -436,7 +438,7 @@ async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Publishe
     let (mut client, mut frames) = socket.split();
     loop {
         let next = tokio::select! {
-            published = changes.next() => published.map_or(Next::Ended, Next::Published),
+            published = changes.next() => published.map_or(Next::Stopped, Next::Published),
             frame = frames.next() => match frame {
                 Some(Ok(_)) => Next::Frame,
                 Some(Err(_)) | None => Next::Ended,
@@ -447,6 +449,7 @@ async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Publishe
                 Message::Binary(abi::encode(&change).into())
             }
             Next::Published(Published::Quiet) => Message::Ping(Bytes::new()),
+            Next::Stopped => return goodbye(client).await,
             Next::Frame => continue,
             Next::Ended => return,
         };
@@ -454,6 +457,14 @@ async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Publishe
             return;
         }
     }
+}
+
+async fn goodbye(mut client: SplitSink<WebSocket, Message>) {
+    let stopped = CloseFrame {
+        code: close_code::AWAY,
+        reason: "the node stopped".into(),
+    };
+    let _ = client.send(Message::Close(Some(stopped))).await;
 }
 
 async fn blocks<E: Context>(

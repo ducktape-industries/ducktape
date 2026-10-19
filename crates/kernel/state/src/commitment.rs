@@ -251,6 +251,15 @@ where
         Ok(())
     }
 
+    pub async fn sync(&mut self) -> Result<()> {
+        let db = self
+            .db
+            .take()
+            .ok_or_else(|| Error::Lost(self.name.clone()))?;
+        self.db = Some(db.sync().await?);
+        Ok(())
+    }
+
     async fn pruned(&self, db: Db<E>) -> Result<Db<E>> {
         let floor = db.sync_boundary();
         let from = db.bounds().start;
