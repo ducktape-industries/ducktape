@@ -234,6 +234,73 @@ scripts back a `make` target; see the repository `Makefile`.
   agents build ducktape, programs and the app with, pushes it to the
   cluster node's registry and prints its reference.
 
+## duckpond's recovery daemon
+
+- `k8s/pi-chief/pi-chief.py` is pi-chief, a daemon off the chain that holds
+  two powers and nothing else. It rolls a program that fills no role back to
+  the code it ran before a change, and it rolls the node Deployment's `node`
+  container back to the image it ran before an image change. Everything
+  else it reports. It ticks once per block time (`/v1/status`) and reads
+  the node in the cluster at `node-http.duckpond.svc:8844`: `/v1/status`,
+  `/v1/programs` and `/v1/blocks`. It signs only through the ducktape CLI,
+  as its own agent account, which orthory (15) manages. The account's key
+  and password are the Secret `key` (files `key` and `password`) in
+  namespace `pi-chief`, created apart from the deploy:
+
+  ```sh
+  kubectl -n pi-chief create secret generic key --from-file=key=KEY --from-file=password=PASSWORD
+  ```
+
+- It acts only on a change it saw happen. At its first start, what runs is
+  its baseline. The node trigger is an image change made while the chain
+  was making blocks, not yet proven (the chain has not made `epoch_length`
+  blocks since the rollout completed), and then a stall or the Deployment's
+  `ProgressDeadlineExceeded`. A stall is no new block for the Deployment's
+  `progressDeadlineSeconds`, read each tick, measured from the newest
+  block's own time. The rollback is a strategic-merge patch of that one
+  image, carrying the Deployment's `resourceVersion`. It is sent only after
+  a server-side dry run that changes nothing but that image, and only to
+  the image it last saw proven, which must also be the image of the newest
+  older ReplicaSet with another image.
+- The program trigger is a code change of a program that fills no role,
+  after which the host refused at least one of its receipts, nested ones
+  included, as `trap` or `protocol` and applied none, while the old code
+  was seen applying ops. The rollback is a `Schedule` of `Set` back to the
+  old code with the program's params, at the tip plus `host::ANCHOR_WINDOW`
+  plus `programs::NOTICE`, so it is valid in whichever block carries it. It
+  reports instead when the change was scheduled by account 18 or an agent
+  18 manages (the signer of the `Schedule` in the blocks, through
+  identity), when it finds no such `Schedule`, when a change for the program
+  already waits, or when the live `programs` code is not the one NOTICE was
+  read from.
+- A stall with the tip at a program's switch, or with a change due at the
+  next block, is reported only: no block can carry a program change, and a
+  node rollback does not change a program's code. So are a stall with no
+  change to name and a failing program that fills a role.
+- It reports in DMs to 15 and 17, one post per incident; with the chain
+  down it logs to its pod log and posts once the chain answers. After any
+  rollback it takes no other action until 15 or 17 reacts to that report.
+  Its state (what it saw run, the open hold, unposted reports) is the
+  claim `state`. Stop it with
+  `kubectl -n pi-chief scale deployment/pi-chief --replicas=0`.
+- `PI_CHIEF_MODE=report|act k8s/pi-chief/deploy DUCKTAPE_COMMIT
+  PROGRAMS_CHECKOUT PROGRAMS_COMMIT ACCOUNT` builds
+  `k8s/pi-chief/Containerfile` with the CLI from `git archive
+  DUCKTAPE_COMMIT`, pushes it to the cluster node's registry and applies
+  `k8s/pi-chief/pi-chief.yaml`: namespace `pi-chief`, service account
+  `pi-chief`, a Role in `duckpond` (deployment `node` get, watch and patch;
+  replicasets get and list; pods and their logs get, list and watch), the
+  claim, a policy closing every inbound port, and Deployment `pi-chief`.
+  It reads ANCHOR_WINDOW from that source and NOTICE from
+  `PROGRAMS_COMMIT`, the commit the live `programs` code was built from,
+  and stores the live code's id with it. In `report` mode every rollback
+  runs as its dry run and the report says what it would do.
+- `pi-chief.py dry-run node` and `pi-chief.py dry-run program PROGRAM CODE`,
+  run in its pod, show a rollback without making it: the server-side dry
+  run of the patch and what it changes, or the `Schedule` signed through a
+  local stand-in node that passes on only `/v1/status` and keeps the frame.
+  `k8s/pi-chief/pi-chief-test.py` covers it.
+
 ## Forge and GitHub
 
 - dev and main of ducktape, programs and app are held by duckpond's forge
