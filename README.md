@@ -514,7 +514,7 @@ ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100  
 ```sh
 ducktape status                         # height, tip, root, epoch, identity, role bindings
 ducktape wallet new alice               # a user key; DUCKTAPE_PASSWORD or a prompt
-ducktape submit ping request.bin        # sign a frame with the active wallet and pool it; --preconfirm prints its predicted receipt
+ducktape submit ping request.bin        # sign a frame with the active wallet and pool it; --preconfirm prints its predicted receipt; --land waits for its block's receipt
 ducktape get ping 6b6579                # a key in hex, from the preconfirmed layer
 ducktape get ping 6b6579 --confirmed    # the committed layer
 ducktape scan ping --lo 6b               # a key range
@@ -565,6 +565,13 @@ the frames it already holds, so it can be answered while the next block is
 still being applied, and that block can change the outcome. After each block
 the node checks every frame it holds again and drops the ones no block may
 carry any more; a dropped frame never shows in `/v1/tx`.
+`submit --land` waits for the verdict instead: it opens the `/v1/changes`
+socket on `$recent`, submits the frame to the pool through `/v1/submit`,
+prints `pooled <id>`, and reads each new block through `/v1/block` until one
+carries the frame. It then prints `landed <height> applied <output>` or
+`landed <height> rejected <reason>: <sentence>` and the receipt's events, or
+`unlanded` once the chain passes the frame's anchor window with no block
+carrying it, which is how a frame dropped at the check ends.
 A frame predicted to fail is still relayed and waits for a block. `blob put`,
 votes and `ducktape halo` never preconfirm. `ducktape logs`,
 `ducktape log-filter`, `ducktape egress reload`, `ducktape metrics` and

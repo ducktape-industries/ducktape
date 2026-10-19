@@ -1,5 +1,6 @@
 //! `ducktape run` stops on SIGTERM: it exits 0 with its state closed and its sockets released,
-//! and the next start on the same ports opens that state with nothing to replay.
+//! and the next start on the same ports opens that state with nothing to replay. `ducktape submit
+//! --land` against a running node answers with the block that carried the frame.
 use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 const HALO_ADDRESS: &str = "node.invalid:9100";
+const PASSWORD: &str = "a test wallet password";
 
 struct Run {
     child: Child,
@@ -182,4 +184,52 @@ fn a_node_stops_on_sigterm_and_opens_again_with_nothing_to_replay() {
         .filter(|line| line.contains(" WARN commonware_storage"))
         .collect();
     assert!(recovered.is_empty(), "{recovered:?}");
+}
+
+#[test]
+fn submit_land_answers_with_the_block_that_carried_the_frame() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = founded(root.path());
+    let node = run(&workspace, "127.0.0.1:0", "node");
+    let key = root.path().join("wallet.key");
+    keystore::userkey::mint_user_key(&key, PASSWORD).unwrap();
+    let payload = root.path().join("op");
+    std::fs::write(&payload, [0xff]).unwrap();
+    let submit = |flags: &[&str]| {
+        let mut command = ducktape(&workspace);
+        command
+            .args([
+                "--node",
+                &format!("http://{}", node.http),
+                "submit",
+                "identity",
+            ])
+            .arg(&payload)
+            .args(flags)
+            .env("DUCKTAPE_USER_KEY", &key)
+            .env("DUCKTAPE_PASSWORD", PASSWORD);
+        command
+    };
+
+    let refused = submit(&["--land", "--preconfirm"]).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+
+    let answered = said(&mut submit(&["--land"]));
+    let lines: Vec<&str> = answered.lines().collect();
+    let [pooled, landed, ..] = lines.as_slice() else {
+        panic!("{answered}");
+    };
+    let id = pooled
+        .strip_prefix("pooled ")
+        .unwrap_or_else(|| panic!("{answered}"));
+    assert_eq!(hex::decode(id).unwrap().len(), 32, "{answered}");
+    let verdict = landed
+        .strip_prefix("landed ")
+        .unwrap_or_else(|| panic!("{answered}"));
+    let (height, receipt) = verdict.split_once(' ').unwrap();
+    assert!(height.parse::<u64>().unwrap() > 0, "{answered}");
+    assert!(receipt.starts_with("rejected "), "{answered}");
+
+    let (status, log) = terminated(node);
+    assert_eq!(status.code(), Some(0), "{log}");
 }

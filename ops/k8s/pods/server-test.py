@@ -70,6 +70,9 @@ def pack_of(objects):
     return b"PACK" + (2).to_bytes(4, "big") + objects.to_bytes(4, "big") + b"objects" * objects
 
 
+POOLED = b"pooled " + b"ab" * 32 + b"\n"
+
+
 def ran(out=b"", code=0, err=""):
     return server.Ran(code, out if isinstance(out, bytes) else json.dumps(out).encode(), err)
 
@@ -200,7 +203,7 @@ class Signer:
         self.submits = []
         self.queries = []
         self.put_ran = ran(b"sha256:ab12cd34ef56ab78cd90\nbundle 7 put at block 900\nbundle 7 held since block 901\n")
-        self.submitted = ran(b"preconfirmed applied 00ff\n")
+        self.submitted = ran(POOLED + b"landed 960 applied 00ff\n")
         self.head = ran(bytes([0, 1, 0]) + bytes.fromhex("ab" * 32) + b"rest of the row")
         self.request = ran(OPEN)
 
@@ -776,7 +779,7 @@ class File(Served):
     def test_an_output_is_put_as_chunks_and_committed_onto_files_head_as_pods_posting_nothing(self):
         status, answer = self.call("POST", "/v1/pods/duckpond-41/file", {"path": "/out/report.md", "to": "/reports/41.md", "message": "build report"})
         self.assertEqual(status, 200, answer)
-        self.assertEqual(answer, {"written": "/reports/41.md", "size": 10, "chunks": CHUNKS, "base": SNAPSHOT, "preconfirmed": True})
+        self.assertEqual(answer, {"written": "/reports/41.md", "size": 10, "chunks": CHUNKS, "base": SNAPSHOT, "height": 960})
         self.assertEqual(self.signer.puts, [([b"abcd", b"efgh", b"ij"], "chunk")])
         self.assertEqual(self.signer.queries, [("files", bytes([0]))])
         ((program, payload),) = self.signer.submits
@@ -785,10 +788,21 @@ class File(Served):
         self.assertEqual(self.kube.verbs(), ["get", "exec"])
 
     def test_files_refusing_the_write_passes_its_reason_through(self):
-        self.signer.submitted = ran(b"preconfirmed rejected unauthorized: /reports is written by its write list only\n")
+        self.signer.submitted = ran(POOLED + b"landed 960 rejected unauthorized: /reports is written by its write list only\n")
         answer = self.refused("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/reports/41.md"}, 403, [])
-        self.assertEqual(answer["error"], "files refused the write: unauthorized: /reports is written by its write list only")
+        self.assertEqual(answer["error"], "files refused the write at block 960: unauthorized: /reports is written by its write list only")
         self.assertEqual(len(self.signer.submits), 1)
+
+    def test_a_write_no_block_carried_answers_that_it_never_landed(self):
+        self.signer.submitted = ran(POOLED + b"unlanded\n")
+        answer = self.refused("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/reports/41.md"}, 502, [])
+        self.assertEqual(answer["error"], "the write never landed: no block carried the frame before its anchor aged out")
+        self.assertEqual(len(self.signer.submits), 1)
+
+    def test_a_write_whose_wait_for_its_block_failed_is_not_made_again(self):
+        self.signer.submitted = [ran(POOLED, code=1, err="ducktape: error sending request: connection reset"), ran(POOLED + b"landed 960 applied 00ff\n")]
+        answer = self.refused("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/reports/41.md"}, 502, ["the write was sent", "not known", "connection reset"])
+        self.assertEqual((len(self.signer.submits), self.paused), (1, []), answer)
 
     def test_an_empty_output_commits_an_empty_file_without_chunks(self):
         self.kube.answer("exec", ran(b""))
@@ -909,7 +923,7 @@ class Retried(Served):
     def test_a_write_whose_submit_lost_its_connection_reads_the_head_again_and_commits_onto_it(self):
         self.kube.answer("exec", ran(b"abc"))
         self.signer.put_ran = ran(CHUNKS[0].encode() + b"\n")
-        self.signer.submitted = [ran(code=1, err="the node failed: connection closed before message completed"), ran(b"preconfirmed applied 00ff\n")]
+        self.signer.submitted = [ran(code=1, err="the node failed: connection closed before message completed"), ran(POOLED + b"landed 960 applied 00ff\n")]
         status, answer = self.call("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/r", "message": "m"})
         self.assertEqual((status, answer["base"]), (200, SNAPSHOT), answer)
         files = [query for query in self.signer.queries if query[0] == "files"]
@@ -924,7 +938,7 @@ class Retried(Served):
                 self.signer.put_ran = ran(CHUNKS[0].encode() + b"\n")
                 head = bytes([0, 1, 0]) + bytes.fromhex("cd" * 32) + b"rest of the row"
                 self.signer.head = [Signer().head, ran(head)]
-                self.signer.submitted = [ran(b"preconfirmed rejected " + refusal + b"\n"), ran(b"preconfirmed applied 00ff\n")]
+                self.signer.submitted = [ran(POOLED + b"landed 960 rejected " + refusal + b"\n"), ran(POOLED + b"landed 960 applied 00ff\n")]
                 self.signer.queries, self.signer.submits, self.paused[:] = [], [], []
                 status, answer = self.call("POST", "/v1/pods/duckpond-41/file", {"path": "/out/r", "to": "/r", "message": "m"})
                 self.assertEqual((status, answer["base"]), (200, moved), answer)
@@ -1548,12 +1562,17 @@ class Posts(unittest.TestCase):
         self.assertEqual(server.ended_line(pod_json(phase="Failed", reason="Evicted")), "pod duckpond-41 ended: Evicted")
 
     def test_a_refused_post_is_not_marked_and_a_repeated_one_is(self):
-        self.signer.submitted = ran(b"preconfirmed rejected unauthorized: pods may not post in builds\n")
+        self.signer.submitted = ran(POOLED + b"landed 960 rejected unauthorized: pods may not post in builds\n")
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         self.assertEqual(self.kube.calls, [])
-        self.signer.submitted = ran(b"preconfirmed rejected already_exists: message pods-duckpond-41-ended exists\n")
+        self.signer.submitted = ran(POOLED + b"landed 960 rejected already_exists: message pods-duckpond-41-ended exists\n")
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         self.assertEqual(len(self.kube.calls), 1)
+
+    def test_a_post_no_block_carried_is_not_marked(self):
+        self.signer.submitted = ran(POOLED + b"unlanded\n")
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual(self.kube.calls, [])
 
     def test_a_post_that_was_not_sent_is_not_marked(self):
         self.signer.submitted = ran(code=1, err="node unreachable")
@@ -1598,10 +1617,14 @@ class Encodings(unittest.TestCase):
         with self.assertRaises(server.Refused):
             server.contents_of(b"\x05\x00\xab")
 
-    def test_receipts_read_applied_rejected_and_failed(self):
-        self.assertEqual(server.receipt(ran(b"preconfirmed applied 00ff\n")), ("applied", "00ff", ""))
-        self.assertEqual(server.receipt(ran(b"preconfirmed rejected not_found: no channel x\n")), ("rejected", "not_found", "no channel x"))
-        self.assertEqual(server.receipt(ran(code=1, err="refused")), ("failed", "", "refused"))
+    def test_receipts_read_the_block_that_carried_the_frame(self):
+        self.assertEqual(server.receipt(ran(POOLED + b"landed 41 applied 00ff\nevent 0a\n")), ("applied", "00ff", "", 41))
+        self.assertEqual(server.receipt(ran(POOLED + b"landed 42 rejected not_found: no channel x\n")), ("rejected", "not_found", "no channel x", 42))
+        self.assertEqual(server.receipt(ran(POOLED + b"unlanded\n")), ("unlanded", "", server.UNLANDED, None))
+        self.assertEqual(server.receipt(ran(code=1, err="refused")), ("failed", "", "refused", None))
+        lost = server.receipt(ran(POOLED, code=1, err="ducktape: the node closed its change stream"))
+        self.assertEqual(lost, ("unknown", "", f"the node took it as {'ab' * 32}, but whether a block carried it is not known: ducktape: the node closed its change stream", None))
+        self.assertEqual(server.receipt(ran(b"preconfirmed applied 00ff\n")), ("failed", "", "preconfirmed applied 00ff", None))
 
     def test_a_put_answer_holds_every_id_and_the_bundle(self):
         text = "sha256:aa\nsha256:bb\nbundle 3 put at block 10\nbundle 3 held since block 12\n"
@@ -1832,6 +1855,21 @@ class Stopped(unittest.TestCase):
             process.stderr.close()
             self.assertEqual(process.wait(), 0)
             self.assertIn("event=pods_stopping signal=SIGTERM", said)
+
+
+class Signing(unittest.TestCase):
+    def test_a_submit_waits_for_the_block_that_carries_it(self):
+        asked = []
+        real = server.run
+        server.run = lambda argv, stdin=None, env=None: asked.append(argv) or ran(POOLED + b"landed 1 applied \n")
+        self.addCleanup(setattr, server, "run", real)
+        with tempfile.TemporaryDirectory() as temp:
+            keys = pathlib.Path(temp)
+            (keys / "key").write_text("k")
+            (keys / "password").write_text("p")
+            server.Signer(["ducktape"], keys).submit("files", b"op")
+        ((ducktape, verb, program, _, wait),) = asked
+        self.assertEqual((ducktape, verb, program, wait), ("ducktape", "submit", "files", "--land"))
 
 
 class Keys(unittest.TestCase):

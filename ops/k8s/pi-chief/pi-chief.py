@@ -447,13 +447,18 @@ def manager_of(reply):
 
 def receipt(ran):
     text = ran.out.decode(errors="replace").strip()
-    applied = re.match(r"preconfirmed applied ?([0-9a-f]*)", text)
-    rejected = re.match(r"preconfirmed rejected (\w+): (.*)", text, re.S)
+    pooled = re.match(r"pooled ([0-9a-f]+)\n?", text)
+    verdict = text[pooled.end():] if pooled else text
+    applied = re.match(r"landed (\d+) applied ?([0-9a-f]*)", verdict)
+    rejected = re.match(r"landed (\d+) rejected (\w+): (.*)", verdict, re.S)
+    unlanded = re.fullmatch(r"unlanded", verdict)
     if ran.code == 0 and applied:
-        return "applied", applied.group(1), ""
+        return "applied", applied.group(2), "", int(applied.group(1))
     if ran.code == 0 and rejected:
-        return "rejected", rejected.group(1), rejected.group(2).strip()
-    return "unknown", "", ran.err or text or f"ducktape exited {ran.code}"
+        return "rejected", rejected.group(2), rejected.group(3).strip(), int(rejected.group(1))
+    if ran.code == 0 and unlanded:
+        return "unlanded", "", "no block carried the frame before its anchor aged out", None
+    return "unknown", "", ran.err or text or f"ducktape exited {ran.code}", None
 
 
 def short(code_or_image):
@@ -900,8 +905,8 @@ class Cli:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "op"
             path.write_bytes(payload)
-            preconfirm = [] if node else ["--preconfirm"]
-            return self.runner(self.argv(node or self.node, "submit", program, str(path), *preconfirm), env=self.env())
+            land = [] if node else ["--land"]
+            return self.runner(self.argv(node or self.node, "submit", program, str(path), *land), env=self.env())
 
 
 class Kube:
@@ -1090,12 +1095,14 @@ class Rollbacks:
         built = self.program_op(program, code, previous)
         if not isinstance(built, Would):
             return built
-        outcome, said, sentence = receipt(self.cli.submit(PROGRAMS, bytes.fromhex(built.evidence["op_hex"])))
+        outcome, said, sentence, block = receipt(self.cli.submit(PROGRAMS, bytes.fromhex(built.evidence["op_hex"])))
         match outcome:
             case "applied":
-                return Acted(built.evidence)
+                return Acted({**built.evidence, "scheduled_in": block})
             case "rejected":
-                return Refused(said, f"programs refused the Set: {sentence}")
+                return Refused(said, f"programs refused the Set in block {block}: {sentence}")
+            case "unlanded":
+                return Refused("unlanded", f"the Schedule never landed, so nothing changed: {sentence}")
             case "unknown":
                 return Unknown(sentence)
 
@@ -1266,7 +1273,7 @@ class Chief:
                 self.stalled(finding)
 
     def sent(self, op):
-        outcome, said, sentence = receipt(self.cli.submit(CHAT, op))
+        outcome, said, sentence, _ = receipt(self.cli.submit(CHAT, op))
         return outcome == "applied" or said == "already_exists", said or outcome, sentence
 
     def unposted(self, item, to, reason, sentence):

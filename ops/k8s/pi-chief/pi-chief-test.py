@@ -132,6 +132,9 @@ class FakeNode:
         return b(STATUS)
 
 
+POOLED = b"pooled " + b"ab" * 32 + b"\n"
+
+
 class FakeCli:
     def __init__(self, chain):
         self.chain = chain
@@ -185,13 +188,16 @@ class FakeCli:
             reader = pc.Reader(payload[1:])
             reader.text()
             self.posted.add(reader.text())
+        block = self.chain.tip() + 1
         match self.answer:
             case "applied":
-                return pc.Ran(0, b"preconfirmed applied \n", "")
+                return pc.Ran(0, POOLED + f"landed {block} applied \n".encode(), "")
+            case "unlanded":
+                return pc.Ran(0, POOLED + b"unlanded\n", "")
             case "unknown":
-                return pc.Ran(1, b"", "error sending request: connection reset")
+                return pc.Ran(1, POOLED, "ducktape: error sending request: connection reset")
             case reason:
-                return pc.Ran(0, f"preconfirmed rejected {reason}: no\n".encode(), "")
+                return pc.Ran(0, POOLED + f"landed {block} rejected {reason}: no\n".encode(), "")
 
     def sign_through(self, node, program, payload):
         with urllib.request.urlopen(node + "/v1/status") as answer:
@@ -615,6 +621,19 @@ class ProgramTriggers(unittest.TestCase):
         self.assertEqual(len([held for held in world.cli.submits if held[0] == "programs"]), 1)
         self.assertEqual(world.chief.state["held"]["key"], f"program-harness-{pc.short(B)}")
 
+    def test_an_unlanded_rollback_is_reported_once_and_not_held(self):
+        world = World()
+        world.tick()
+        world.tick(tx("harness", applied("harness")))
+        world.switch_harness(B, (25, 15))
+        world.cli.answer = "unlanded"
+        world.tick(tx("harness", refused("harness", "trap")))
+        world.tick(tx("harness", refused("harness", "trap")))
+        text = " ".join(world.lines(f"program-harness-{pc.short(B)}"))
+        self.assertIn("the Schedule never landed, so nothing changed: no block carried the frame before its anchor aged out (unlanded)", text)
+        self.assertIsNone(world.chief.state["held"])
+        self.assertEqual(len([held for held in world.cli.submits if held[0] == "programs"]), 1)
+
     def test_its_own_rollback_landing_is_not_a_change(self):
         world = self.failing_harness()
         world.chief.state["held"] = None
@@ -649,6 +668,10 @@ class RevertReports(unittest.TestCase):
         height = tip + ANCHOR + NOTICE
         self.assertEqual(self.scheduled(world).height, height)
         self.assertIn(f"It lands at block {height} (about 5 min); Cancel before {height} if this revert is wrong.", text)
+
+    def test_an_acted_revert_names_the_block_that_carried_its_schedule(self):
+        world, tip, text = self.failing("counter", "act")
+        self.assertIn(f'"scheduled_in": {tip + 1}', text)
 
     def test_a_dry_run_revert_names_the_block_it_would_land_at(self):
         world, tip, text = self.failing("counter", "report")
@@ -812,6 +835,24 @@ class Shapes(unittest.TestCase):
     def test_a_rollout_reads_complete_and_the_deadline(self):
         rollout = pc.rollout_of(deployment(Z, complete=False, exceeded=True, deadline=321), "node")
         self.assertEqual((rollout.image, rollout.complete, rollout.deadline_exceeded, rollout.deadline_s), (Z, False, True, 321))
+
+
+class Receipts(unittest.TestCase):
+    def test_a_receipt_is_the_block_that_carried_the_frame(self):
+        self.assertEqual(pc.receipt(pc.Ran(0, POOLED + b"landed 41 applied 00ff\nevent 0a\n", "")), ("applied", "00ff", "", 41))
+        self.assertEqual(pc.receipt(pc.Ran(0, POOLED + b"landed 42 rejected stale: moved\n", "")), ("rejected", "stale", "moved", 42))
+        self.assertEqual(pc.receipt(pc.Ran(0, POOLED + b"unlanded\n", "")), ("unlanded", "", "no block carried the frame before its anchor aged out", None))
+        self.assertEqual(pc.receipt(pc.Ran(1, POOLED, "ducktape: the node closed its change stream")), ("unknown", "", "ducktape: the node closed its change stream", None))
+        self.assertEqual(pc.receipt(pc.Ran(0, b"preconfirmed applied 00ff\n", "")), ("unknown", "", "preconfirmed applied 00ff", None))
+
+    def test_a_submit_waits_for_its_block_and_a_capture_signs_only(self):
+        asked = []
+        cli = pc.Cli(["ducktape"], "http://node", pathlib.Path("/w"), runner=lambda argv, stdin=None, env=None: asked.append(argv) or pc.Ran(0, b"", ""))
+        cli.submit("chat", b"op")
+        cli.submit("programs", b"op", node="http://capture")
+        (chat, capture) = asked
+        self.assertEqual((chat[chat.index("--node") + 1], chat[-4], chat[-3], chat[-1]), ("http://node", "submit", "chat", "--land"))
+        self.assertEqual((capture[capture.index("--node") + 1], capture[-3], capture[-2]), ("http://capture", "submit", "programs"))
 
 
 class Opened:

@@ -10,7 +10,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::Runner as _;
 use commonware_runtime::tokio::{Config, Runner};
 use futures::StreamExt as _;
-use host::Layer;
+use host::{Layer, RECENT};
 use node::{Frame, Preconfirm};
 use noded::wire::{Admin, Submitted};
 use noded::{
@@ -82,13 +82,18 @@ enum Verb {
     Status,
     #[command(
         about = "submit a signed frame to the pool; the payload is a file or stdin. With \
-                 --preconfirm the node also runs it now and prints its predicted receipt"
+                 --preconfirm the node also runs it now and prints its predicted receipt; with \
+                 --land it waits for the block that carries the frame and prints that block's \
+                 height and receipt, or `unlanded` when no block carried it before its anchor \
+                 aged out"
     )]
     Submit {
         program: String,
         payload: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "land")]
         preconfirm: bool,
+        #[arg(long)]
+        land: bool,
     },
     #[command(about = "query a program; the request is a file or stdin, the answer is stdout")]
     Query {
@@ -620,6 +625,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             program,
             payload,
             preconfirm,
+            land,
         } => {
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
@@ -631,6 +637,9 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
                 &program,
                 bytes(payload)?,
             );
+            if land {
+                return submit_landed(client, &frame).await;
+            }
             let preconfirm = match preconfirm {
                 true => Preconfirm::On,
                 false => Preconfirm::Off,
@@ -872,6 +881,34 @@ async fn put_blobs(
     println!("bundle {bundle} put at block {height}");
     let since = client.held(role, bundle).await.sentence()?;
     println!("bundle {bundle} held since block {since}");
+    Ok(())
+}
+
+async fn submit_landed(client: &Client, frame: &Frame) -> Result<(), String> {
+    let blocks = client.changes(RECENT).await.sentence()?;
+    client
+        .submit(frame.encode(), Preconfirm::Off)
+        .await
+        .sentence()?;
+    println!("pooled {}", hex::encode(frame.body.submission().id()));
+    let (height, receipt) = match client.landed(frame, blocks).await {
+        Ok(landed) => landed,
+        Err(noded::Error::Unlanded) => {
+            println!("unlanded");
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    match receipt.outcome {
+        Outcome::Applied { output } => println!("landed {height} applied {}", hex::encode(output)),
+        Outcome::Rejected(refusal) => println!(
+            "landed {height} rejected {}: {}",
+            refusal.reason, refusal.sentence
+        ),
+    }
+    for event in receipt.events {
+        println!("event {}", hex::encode(event));
+    }
     Ok(())
 }
 

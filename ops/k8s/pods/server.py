@@ -114,6 +114,7 @@ SCALE = {
 }
 ENDED = ("Succeeded", "Failed")
 REJECTED = {"unauthorized": 403, "not_found": 404, "already_exists": 409, "wrong_state": 409}
+UNLANDED = "no block carried the frame before its anchor aged out"
 CHAT = "chat"
 FILES_PROGRAM = "files"
 CHUNK = "chunk"
@@ -448,13 +449,21 @@ def objects_of(pack):
 
 def receipt(ran):
     text = ran.out.decode(errors="replace").strip()
-    applied = re.match(r"preconfirmed applied ?([0-9a-f]*)", text)
-    rejected = re.match(r"preconfirmed rejected (\w+): (.*)", text, re.S)
+    pooled = re.match(r"pooled ([0-9a-f]+)\n?", text)
+    verdict = text[pooled.end():] if pooled else text
+    applied = re.match(r"landed (\d+) applied ?([0-9a-f]*)", verdict)
+    rejected = re.match(r"landed (\d+) rejected (\w+): (.*)", verdict, re.S)
+    unlanded = re.fullmatch(r"unlanded", verdict)
+    why = ran.err or text or f"ducktape exited {ran.code}"
     if ran.code == 0 and applied:
-        return "applied", applied.group(1), ""
+        return "applied", applied.group(2), "", int(applied.group(1))
     if ran.code == 0 and rejected:
-        return "rejected", rejected.group(1), rejected.group(2).strip()
-    return "failed", "", ran.err or text or f"ducktape exited {ran.code}"
+        return "rejected", rejected.group(2), rejected.group(3).strip(), int(rejected.group(1))
+    if ran.code == 0 and unlanded:
+        return "unlanded", "", UNLANDED, None
+    if pooled:
+        return "unknown", "", f"the node took it as {pooled.group(1)}, but whether a block carried it is not known: {why}", None
+    return "failed", "", why, None
 
 
 class Kube:
@@ -545,7 +554,7 @@ class Signer:
         with tempfile.TemporaryDirectory() as temp:
             file = Path(temp) / "op"
             file.write_bytes(payload)
-            return run([*self.ducktape, "submit", program, str(file), "--preconfirm"], env=self.env())
+            return run([*self.ducktape, "submit", program, str(file), "--land"], env=self.env())
 
     def query(self, program, request):
         return run([*self.ducktape, "query", program], stdin=request, env=self.env())
@@ -1252,7 +1261,7 @@ class Notifier:
             say("pods_unposted", message=message_id, reason="no_key")
             return False
         payload = post_message(notify["channel"], message_id, requester, line, notify["thread"])
-        outcome, reason, sentence = receipt(self.signer.submit(CHAT, payload))
+        outcome, reason, sentence, _ = receipt(self.signer.submit(CHAT, payload))
         posted = outcome == "applied" or (outcome == "rejected" and reason == "already_exists")
         if posted:
             say("pods_posted", message=message_id)
@@ -1578,12 +1587,18 @@ class Service:
                     raise Refused(502, f"the file's chunks were not put: {put.err or put.out.decode(errors='replace')}")
                 chunks = put_answer(put.out.decode(), len(paths))["blobs"]
         message = asked.get("message") or f"pods: {name} wrote {to}"
-        base, (outcome, reason, sentence) = self.committed(asked_by, files_commit_of(message, to, len(data), chunks))
-        if outcome == "rejected":
-            raise Refused(REJECTED.get(reason, 422), f"files refused the write: {reason}: {sentence}")
-        if outcome == "failed":
-            raise Refused(502, f"the write was not sent: {sentence}")
-        return 200, {"written": to, "size": len(data), "chunks": chunks, "base": base, "preconfirmed": True}
+        base, (outcome, reason, sentence, height) = self.committed(asked_by, files_commit_of(message, to, len(data), chunks))
+        match outcome:
+            case "applied":
+                return 200, {"written": to, "size": len(data), "chunks": chunks, "base": base, "height": height}
+            case "rejected":
+                raise Refused(REJECTED.get(reason, 422), f"files refused the write at block {height}: {reason}: {sentence}")
+            case "unlanded":
+                raise Refused(502, f"the write never landed: {sentence}")
+            case "unknown":
+                raise Refused(502, f"the write was sent: {sentence}")
+            case "failed":
+                raise Refused(502, f"the write was not sent: {sentence}")
 
     def committed(self, asked_by, commit):
         def attempt():
@@ -1597,7 +1612,7 @@ class Service:
         pause = RETRY_PAUSE
         while True:
             tried = self.retried(asked_by, attempt, unsent)
-            outcome, reason, sentence = tried[1]
+            outcome, reason, sentence, _ = tried[1]
             if not moved_under(outcome, reason, sentence):
                 return tried
             say("pods_retried", reason="files_moved", detail=json.dumps(f"{reason}: {sentence}"))

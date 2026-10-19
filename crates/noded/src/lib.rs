@@ -114,6 +114,8 @@ pub enum Error {
     Failed { status: u16, sentence: String },
     #[error("the node closed its change stream")]
     Closed,
+    #[error("no block carried the frame before its anchor aged out")]
+    Unlanded,
     #[error("the node stopped")]
     Stopped,
     #[error("the node's reader stopped: {0}")]

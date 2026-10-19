@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use abi::Receipt;
-use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
+use abi::{BlobId, Entry, ProgramId, Refusal, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::{Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
@@ -68,7 +68,7 @@ impl Client {
         self.landed(frame, blocks).await
     }
 
-    async fn landed(
+    pub async fn landed(
         &self,
         frame: &Frame,
         mut blocks: impl Stream<Item = Result<Change>> + Unpin,
@@ -83,10 +83,7 @@ impl Client {
             }
             let aged_out = height >= last;
             if aged_out {
-                return Err(Error::Refused(Refusal::new(
-                    reason::ANCHOR,
-                    "no block carried the frame before its anchor aged out",
-                )));
+                return Err(Error::Unlanded);
             }
         }
         Err(Error::Closed)

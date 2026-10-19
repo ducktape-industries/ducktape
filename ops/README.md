@@ -120,6 +120,15 @@ scripts back a `make` target; see the repository `Makefile`.
   A files commit files refuses because its head moved after it was read
   (`not_found: files minted no snapshot …`, or `stale`) is made again onto
   files' head as read then, with the same pauses while the request is open.
+  A commit whose submit the node took but whose wait for its block lost its
+  connection is not made again: it answers 502, naming the frame and that
+  whether a block carried it is not known.
+- `pods/NAME/file` answers only after the block that carries its files
+  commit (`ducktape submit --land`): 200 with `{written, size, chunks, base,
+  height}`, `height` that block's; files refusing the commit in its block
+  answers files' reason (`unauthorized` 403, `not_found` 404,
+  `already_exists` and `wrong_state` 409, any other 422); a commit no block
+  carried before its anchor aged out answers 502 that it never landed.
 - An exec, `blob`, `file` or `push` that reaches a container which has not
   started yet (kubectl's `container not found ("run")`, while the `fetch`
   init container still fetches the pod's inputs, or `does not have a host
@@ -279,12 +288,16 @@ scripts back a `make` target; see the repository `Makefile`.
   included, as `trap` or `protocol` and applied none, while the old code
   was seen applying ops. The rollback is a `Schedule` of `Set` back to the
   old code with the program's params, at the tip plus `host::ANCHOR_WINDOW`
-  plus `programs::NOTICE`, so it is valid in whichever block carries it. It
-  reports instead when the change was scheduled by account 18 or an agent
-  18 manages (the signer of the `Schedule` in the blocks, through
-  identity), when it finds no such `Schedule`, when a change for the program
-  already waits, or when the live `programs` code is not the one NOTICE was
-  read from.
+  plus `programs::NOTICE`, so it is valid in whichever block carries it.
+  It sends the `Schedule` with `ducktape submit --land` and counts the
+  rollback made only when a block applied it, naming that block
+  (`scheduled_in`). A `Schedule` refused in its block, or one no block
+  carried before its anchor aged out (`unlanded`), is reported and holds
+  nothing. Chat posts are sent the same way. It reports instead when the
+  change was scheduled by account 18 or an agent 18 manages (the signer of
+  the `Schedule` in the blocks, through identity), when it finds no such
+  `Schedule`, when a change for the program already waits, or when the live
+  `programs` code is not the one NOTICE was read from.
 - A stall with the tip at a program's switch, or with a change due at the
   next block, is reported only: no block can carry a program change, and a
   node rollback does not change a program's code. So are a stall with no
