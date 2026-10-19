@@ -2061,8 +2061,51 @@ class Stopped(unittest.TestCase):
             process.send_signal(signal.SIGTERM)
             said = process.stderr.read()
             process.stderr.close()
-            self.assertEqual(process.wait(), 0)
+            self.assertEqual(process.wait(), 0, said)
             self.assertIn("event=pods_stopping signal=SIGTERM", said)
+
+    def test_a_sigterm_with_requests_in_flight_ends_the_service_at_once(self):
+        with tempfile.TemporaryDirectory() as keys:
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE="https://node", PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
+            process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(process.kill)
+            lines = iter(process.stderr.readline, "")
+            serving = next(line for line in lines if "event=pods_serving" in line)
+            port = int(serving.split("listen=127.0.0.1:")[1].split()[0])
+            stopped = threading.Event()
+
+            def asking():
+                while not stopped.is_set():
+                    try:
+                        link = http.client.HTTPConnection("127.0.0.1", port)
+                        link.request("GET", "/")
+                        link.getresponse().read()
+                        link.close()
+                    except OSError:
+                        return
+
+            clients = [threading.Thread(target=asking) for _ in range(os.cpu_count())]
+            for client in clients:
+                client.start()
+            logged = (line for line in lines if "event=pods_request" in line)
+            for _ in range(len(clients)):
+                next(logged)
+            process.send_signal(signal.SIGTERM)
+            said = process.stderr.read()
+            process.stderr.close()
+            stopped.set()
+            for client in clients:
+                client.join()
+            self.assertEqual(process.wait(), 0, said)
+            self.assertIn("event=pods_stopping signal=SIGTERM", said)
+
+    def test_a_signal_while_a_line_is_being_written_writes_nothing_itself(self):
+        written = io.StringIO()
+        with contextlib.redirect_stderr(written), self.assertRaises(server.Stopping) as stopped:
+            print("event=pods_serving", end="", file=sys.stderr)
+            server.exit_on_signal(signal.SIGTERM, None)
+        self.assertEqual(stopped.exception.args, ("SIGTERM",))
+        self.assertEqual(written.getvalue(), "event=pods_serving")
 
 
 class Signing(unittest.TestCase):

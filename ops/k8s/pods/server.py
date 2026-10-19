@@ -2183,9 +2183,12 @@ def fetch_main():
         sys.exit(1)
 
 
+class Stopping(BaseException):
+    pass
+
+
 def exit_on_signal(number, frame):
-    say("pods_stopping", signal=signal.Signals(number).name)
-    sys.exit(0)
+    raise Stopping(signal.Signals(number).name)
 
 
 def main():
@@ -2205,9 +2208,14 @@ def main():
     threading.Thread(target=service.sweeper, daemon=True).start()
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), handler(service))
-    signal.signal(signal.SIGTERM, exit_on_signal)
-    say("pods_serving", namespace=kube.namespace, listen=f"{host}:{port}", keyed=signer.held())
-    server.serve_forever()
+    try:
+        signal.signal(signal.SIGTERM, exit_on_signal)
+        bound, at = server.server_address[:2]
+        say("pods_serving", namespace=kube.namespace, listen=f"{bound}:{at}", keyed=signer.held())
+        server.serve_forever()
+    except Stopping as stopping:
+        say("pods_stopping", signal=stopping.args[0])
+        os._exit(0)
 
 
 if __name__ == "__main__":
