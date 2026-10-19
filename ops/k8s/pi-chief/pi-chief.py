@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 PROGRAMS = "programs"
 CHAT = "chat"
 IDENTITY = "identity"
+HARNESS = "harness"
 HOST_FAULTS = ("trap", "protocol")
 HASHES = {"sha256": (0, 32), "sha1": (1, 20)}
 SOURCE_SECTION = "ducktape.source"
@@ -815,6 +816,28 @@ def verdict_lines(verdict, action):
             ]
 
 
+def landing_line(evidence, lands):
+    height = evidence["height"]
+    minutes = round((height - evidence["tip"]) * evidence["block_time_ms"] / 60_000)
+    return f"It {lands} at block {height} (about {minutes} min); Cancel before {height} if this revert is wrong."
+
+
+def harness_lines(program, line):
+    if program != HARNESS:
+        return []
+    return [line]
+
+
+def revert_lines(program, verdict):
+    match verdict:
+        case Would(evidence):
+            return [landing_line(evidence, "would land"), *harness_lines(program, "harness would be reverted, so chief would sweep threads.")]
+        case Acted(evidence):
+            return [landing_line(evidence, "lands"), *harness_lines(program, "harness reverted: chief, sweep threads")]
+        case Held() | Refused() | Unknown() | Waiting():
+            return []
+
+
 class Node:
     def __init__(self, url):
         self.url = url.rstrip("/")
@@ -1047,7 +1070,7 @@ class Rollbacks:
             return Refused("code_moved", f"programs answers {entry} for {program}")
         height = status.height + self.config.anchor_window + self.config.notice
         op = schedule_set(height, program, previous, entry[2])
-        evidence = {"program": program, "from": code, "to": previous, "height": height, "tip": status.height, "params_hex": entry[2].hex(), "op_hex": op.hex()}
+        evidence = {"program": program, "from": code, "to": previous, "height": height, "tip": status.height, "block_time_ms": status.block_time_ms, "params_hex": entry[2].hex(), "op_hex": op.hex()}
         return Would(evidence)
 
     def program_dry_run(self, program, code, previous):
@@ -1223,7 +1246,7 @@ class Chief:
         if isinstance(verdict, Acted | Unknown):
             self.state["own_programs"][finding.program] = finding.previous
             self.hold(finding.key)
-        self.report(finding.key, finding_lines(finding) + verdict_lines(verdict, action))
+        self.report(finding.key, finding_lines(finding) + verdict_lines(verdict, action) + revert_lines(finding.program, verdict))
 
     def halted(self, finding):
         self.report(finding.key, finding_lines(finding))

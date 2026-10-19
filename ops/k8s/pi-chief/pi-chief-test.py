@@ -298,11 +298,14 @@ class World:
         return []
 
     def switch_harness(self, code, scheduled_by, signer=SIGNER):
-        self.chain.payloads[(self.chain.tip() + 1, 0)] = pc.u8(0) + pc.u64(self.chain.tip() + 3) + pc.u8(0) + pc.borsh_text("harness") + pc.blob_id(code) + pc.borsh_bytes(b"params")
+        self.switch("harness", code, scheduled_by, signer)
+
+    def switch(self, program, code, scheduled_by, signer=SIGNER):
+        self.chain.payloads[(self.chain.tip() + 1, 0)] = pc.u8(0) + pc.u64(self.chain.tip() + 3) + pc.u8(0) + pc.borsh_text(program) + pc.blob_id(code) + pc.borsh_bytes(b"params")
         self.cli.accounts[signer] = scheduled_by
         self.tick(tx("programs", applied("programs"), signer=signer))
         self.tick()
-        self.chain.programs["harness"] = code
+        self.chain.programs[program] = code
         self.tick()
 
 
@@ -628,6 +631,60 @@ class ProgramTriggers(unittest.TestCase):
         self.assertIn('"sent": false', text)
         self.assertIn('"carries_op": true', text)
         self.assertIsNone(world.chief.state["held"])
+
+
+class RevertReports(unittest.TestCase):
+    def failing(self, program, mode):
+        world = World(mode=mode)
+        world.chain.programs.setdefault(program, A)
+        world.tick()
+        world.tick(tx(program, applied(program)))
+        world.switch(program, B, (25, 15))
+        tip = world.chain.tip()
+        world.tick(tx(program, refused(program, "trap")))
+        return world, tip + 1, " ".join(world.lines(f"program-{program}-{pc.short(B)}"))
+
+    def test_an_acted_revert_names_the_block_it_lands_at_and_how_to_cancel_it(self):
+        world, tip, text = self.failing("counter", "act")
+        height = tip + ANCHOR + NOTICE
+        self.assertEqual(self.scheduled(world).height, height)
+        self.assertIn(f"It lands at block {height} (about 5 min); Cancel before {height} if this revert is wrong.", text)
+
+    def test_a_dry_run_revert_names_the_block_it_would_land_at(self):
+        world, tip, text = self.failing("counter", "report")
+        height = tip + ANCHOR + NOTICE
+        self.assertIn(f"It would land at block {height} (about 5 min); Cancel before {height} if this revert is wrong.", text)
+
+    def test_the_minutes_come_from_the_block_time(self):
+        line = pc.landing_line({"height": 1316, "tip": 1000, "block_time_ms": 2000}, "lands")
+        self.assertEqual(line, "It lands at block 1316 (about 11 min); Cancel before 1316 if this revert is wrong.")
+
+    def test_a_harness_revert_asks_chief_to_sweep_threads(self):
+        _, _, text = self.failing("harness", "act")
+        self.assertIn("harness reverted: chief, sweep threads", text)
+
+    def test_a_harness_dry_run_says_what_would_follow_and_asks_for_no_sweep(self):
+        _, _, text = self.failing("harness", "report")
+        self.assertIn("harness would be reverted, so chief would sweep threads.", text)
+        self.assertNotIn("harness reverted: chief, sweep threads", text)
+
+    def test_a_revert_of_another_program_asks_for_no_sweep(self):
+        _, _, text = self.failing("counter", "act")
+        self.assertNotIn("sweep threads", text)
+
+    def test_a_refused_revert_names_no_block(self):
+        world = World(mode="act")
+        world.tick()
+        world.tick(tx("harness", applied("harness")))
+        world.switch_harness(B, (24, 18))
+        world.tick(tx("harness", refused("harness", "trap")))
+        text = " ".join(world.lines(f"program-harness-{pc.short(B)}"))
+        self.assertIn("hands_off", text)
+        self.assertNotIn("Cancel before", text)
+        self.assertNotIn("sweep threads", text)
+
+    def scheduled(self, world):
+        return next(pc.schedule_of(payload) for program, payload in world.cli.submits if program == "programs")
 
 
 class Halts(unittest.TestCase):
