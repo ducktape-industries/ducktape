@@ -1,0 +1,19 @@
+# The reconcile image: Python and the ducktape CLI built from one forge commit, running reconcile.py as uid 1000.
+# Built by ops/k8s/reconcile/deploy from a staged context holding `git archive` of that commit under src/ and reconcile.py.
+FROM docker.io/library/rust:1.96.1-trixie AS build
+WORKDIR /src
+COPY src/ .
+RUN cargo build --locked --release -p node-bin
+
+FROM docker.io/library/debian:trixie-slim
+ARG COMMIT
+LABEL org.opencontainers.image.revision=$COMMIT
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --user-group --create-home --home-dir /home/reconcile reconcile
+COPY --from=build /src/target/release/ducktape /usr/local/bin/ducktape
+COPY reconcile.py /usr/local/lib/reconcile/reconcile.py
+ENV NO_COLOR=1 PYTHONDONTWRITEBYTECODE=1 DUCKTAPE_DEVICE_KEY_STORE=file
+USER 1000:1000
+WORKDIR /home/reconcile
+ENTRYPOINT ["python3", "/usr/local/lib/reconcile/reconcile.py"]

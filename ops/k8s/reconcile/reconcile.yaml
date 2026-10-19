@@ -1,0 +1,90 @@
+# reconcile on fabrics-1: its namespace and service account, which holds no Kubernetes right, its state claim, a policy closing every inbound port, and its Deployment.
+# Applied by ops/k8s/reconcile/deploy, which substitutes @IMAGE@ and @MODE@; it signs with the key in the Secret `key`, which the node's workspace file egress-grants lists.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reconcile
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reconcile
+  namespace: reconcile
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: state
+  namespace: reconcile
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path-retain
+  resources:
+    requests:
+      storage: "1"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: no-ingress
+  namespace: reconcile
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reconcile
+  namespace: reconcile
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: reconcile
+  template:
+    metadata:
+      labels:
+        app: reconcile
+    spec:
+      serviceAccountName: reconcile
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reconcile
+          image: "@IMAGE@"
+          env:
+            - {name: RECONCILE_MODE, value: "@MODE@"}
+            - {name: RECONCILE_NODE, value: http://node-http.duckpond.svc:8844}
+            - {name: RECONCILE_NODE_NAME, value: fabrics-1}
+            - {name: RECONCILE_CHANNEL, value: infra}
+            - {name: RECONCILE_STATE, value: /state}
+            - {name: RECONCILE_KEYS, value: /keys}
+            - {name: RECONCILE_WORKSPACE, value: /tmp/ducktape}
+            - {name: HOME, value: /tmp}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: state, mountPath: /state}
+            - {name: keys, mountPath: /keys, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: state
+        - name: keys
+          secret:
+            secretName: key
+        - name: tmp
+          emptyDir: {}

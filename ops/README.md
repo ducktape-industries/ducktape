@@ -531,6 +531,47 @@ one up for another network.
   Stop it with
   `kubectl -n registry patch cronjob registry-gc -p '{"spec":{"suspend":true}}'`.
 
+## duckpond's desired infrastructure
+
+- Forge repo `infra` holds what fabrics-1 should run, one file per duty; a
+  merge into its `main` (protected, so only merges move it) is the
+  decision. `k8s/reconcile/reconcile.py` is reconcile, a daemon off the
+  chain that applies it. Its one duty today is `egress/fabrics-1.toml`, the
+  node's own `egress.toml`.
+- Each block time it reads `infra`'s `main` through forge. For every open
+  change into `main` whose head changes that file, it posts a commit status
+  `reconcile/egress` and a review comment, once per head: refused when the
+  file is not UTF-8, does not parse or is not shaped as `egress.toml` is,
+  when a service carries `secrets`, which the node never takes through
+  `egress set` (a service that needs a secret sits behind a proxy in the
+  cluster that holds it), else the node's own dry run (`ducktape egress
+  set --dry`), refused when a base does not answer from the node.
+- On a new `main` it plans the file the same way and, when the node would
+  change, sends it once (`RECONCILE_MODE=act`) with `ducktape egress set`,
+  signed by its account's key, which the node's workspace file
+  `egress-grants` lists. It plans it again at once: a base that no longer
+  answers puts back the file it applied before. It posts each outcome to
+  chat channel `infra`: applied, refused, rolled back, and proven when the
+  egress program's row for the node lists what the file serves. It never
+  sends a refused file again; a new `main` is a new try. With
+  `RECONCILE_MODE=report` it does all of this except the set that is not
+  dry: it posts what it would apply and leaves the node as it is. Its state
+  is the claim `state`, saved before it posts; each post is read back by
+  its id before it is sent. A post that cannot be posted logs
+  `report_unposted`, and a tick that cannot read forge or the node logs
+  `unread`, each at its first attempt and every tenth; a good read logs
+  `read` once.
+- `RECONCILE_MODE=report|act k8s/reconcile/deploy DUCKTAPE_COMMIT` checks
+  that Secret `reconcile/key` exists, builds `k8s/reconcile/Containerfile`
+  with the CLI from `git archive DUCKTAPE_COMMIT`, pushes it to the
+  cluster node's registry and applies `k8s/reconcile/reconcile.yaml`:
+  namespace `reconcile`, service account `reconcile` with no Kubernetes
+  right and no token mounted, the claim, a policy closing every inbound
+  port, and Deployment `reconcile`. Its account must be on `infra`'s write
+  list to post statuses. `k8s/reconcile/reconcile-test.py` covers it.
+  Stop it with `kubectl -n reconcile scale deployment/reconcile
+  --replicas=0`.
+
 ## Phone builds and simulator runs on a Mac
 
 - `k8s/mac/relay.py` is the egress service `mac`, the relay: Deployment

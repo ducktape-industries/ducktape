@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Builds the reconcile image around the ducktape CLI built from the source of DUCKTAPE_COMMIT, pushes it to the cluster node's registry, and applies reconcile.yaml.
+# Usage: RECONCILE_MODE=report|act ops/k8s/reconcile/deploy DUCKTAPE_COMMIT; the Secret reconcile/key (key, password) is created apart from it, and its public key is a line of the node's workspace file egress-grants.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+usage="usage: RECONCILE_MODE=report|act ops/k8s/reconcile/deploy DUCKTAPE_COMMIT"
+commit=$(git -C "$here" rev-parse --verify "${1:?$usage}^{commit}")
+node=${DEPLOY_NODE:-fabrics@fabrics-1}
+context=${DEPLOY_CONTEXT:-fabrics-1}
+tunnel_port=35314
+
+fail() { echo "deploy: $*" >&2; exit 1; }
+mode=${RECONCILE_MODE:?RECONCILE_MODE is report, which sends only dry runs, or act}
+case $mode in report | act) ;; *) fail "RECONCILE_MODE is report or act, not $mode" ;; esac
+k() { kubectl --context "$context" "$@"; }
+
+k -n reconcile get secret key >/dev/null || fail "Secret reconcile/key does not exist"
+
+stage=$(mktemp -d)
+socket="$stage.ssh"
+trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
+mkdir "$stage/src"
+git -C "$(git -C "$here" rev-parse --show-toplevel)" archive "$commit" | tar -x -C "$stage/src"
+cp "$here/reconcile.py" "$stage/reconcile.py"
+tag=$(cat "$here/Containerfile" "$stage/reconcile.py" <(echo "$commit") | sha256sum | cut -c1-12)
+nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \
+  --tag "localhost:$tunnel_port/reconcile:$tag" "$stage"
+ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
+podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/reconcile:$tag"
+image="localhost:5000/reconcile:$tag@$(cat "$stage/digest")"
+sed -e "s#@IMAGE@#$image#g" -e "s#@MODE@#$mode#g" "$here/reconcile.yaml" | k apply -f -
+k -n reconcile rollout status deployment/reconcile
+echo "$image mode=$mode"

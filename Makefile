@@ -95,6 +95,7 @@ test:
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/pi-chief/pi-chief-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/watch/watch-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/registry-gc/gc-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/reconcile/reconcile-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/mac/relay-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/mac/mac-test.py; \
 	else echo "[test] skipped the ops/ script tests — they need python 3.11 (tomllib)" >&2; fi
