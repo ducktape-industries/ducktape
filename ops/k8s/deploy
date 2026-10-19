@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
 # Builds the node image from the source of a ducktape commit, pushes it to the cluster node's registry, and applies a network's node and tunnel.
-# Usage: [HOST=IP [HTTP_PORT=8844] [HALO_PORT=9100]] ops/k8s/deploy NETWORK COMMIT [--found]
+# Usage: [CONTEXT=NAME] [HOST=IP [HTTP_PORT=8844] [HALO_PORT=9100]] [EGRESS=FILE] ops/k8s/deploy NETWORK COMMIT [--found]
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-usage="usage: [HOST=IP [HTTP_PORT=8844] [HALO_PORT=9100]] ops/k8s/deploy NETWORK COMMIT [--found]"
+usage="usage: [CONTEXT=NAME] [HOST=IP [HTTP_PORT=8844] [HALO_PORT=9100]] [EGRESS=FILE] ops/k8s/deploy NETWORK COMMIT [--found]"
 network=${1:?$usage}
 commit=$(git -C "$here" rev-parse --verify "${2:?$usage}^{commit}")
 mode=${3:-}
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 tunnel_port=35311
 tag=${commit:0:12}
+context=${CONTEXT:-$(kubectl config current-context)}
 host=${HOST:-}
 http_port=${HTTP_PORT:-8844}
 halo_port=${HALO_PORT:-9100}
+egress=${EGRESS:-}
+if [ -n "$egress" ] && [ "$mode" != --found ]; then
+  echo "deploy: EGRESS is written into the claim with --found" >&2
+  exit 1
+fi
+if [ -n "$egress" ] && [ ! -r "$egress" ]; then
+  echo "deploy: EGRESS $egress does not read" >&2
+  exit 1
+fi
+echo "deploy: $network on context $context" >&2
 
 stage=$(mktemp -d)
 socket="$stage.ssh"
@@ -25,6 +36,9 @@ ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:1
 podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/ducktape:$tag"
 image="localhost:5000/ducktape:$tag@$(cat "$stage/digest")"
 
+k() {
+  kubectl --context "$context" "$@"
+}
 render() {
   sed -e "s#NETWORK#$network#g" -e "s#image: IMAGE\$#image: $image#" "$here/$1"
 }
@@ -35,18 +49,21 @@ bind() {
          -e "s#containerPort: 9100, protocol: UDP}#containerPort: 9100, protocol: UDP, hostIP: $host, hostPort: $halo_port}#" ;;
   esac
 }
-render network.yaml | kubectl apply -f -
+storage=$(k get storageclass local-path-retain --ignore-not-found -o name)
+if [ -z "$storage" ]; then k apply -f "$here/storage.yaml"; fi
+render network.yaml | k apply -f -
 case $mode in
   --found)
-    render found.yaml | kubectl apply -f -
-    kubectl -n "$network" wait pod/found --for=condition=Ready --timeout=5m
+    render found.yaml | k apply -f -
+    k -n "$network" wait pod/found --for=condition=Ready --timeout=5m
+    if [ -n "$egress" ]; then k -n "$network" exec -i found -- sh -c 'cat > /data/egress.toml' < "$egress"; fi
     ;;
   "")
-    tunnel=$(kubectl -n "$network" get secret tunnel --ignore-not-found -o name)
-    if [ -n "$tunnel" ]; then render tunnel.yaml | kubectl apply -f -; fi
-    render node.yaml | bind | kubectl apply -f -
-    if [ -n "$tunnel" ]; then kubectl -n "$network" rollout status deployment/tunnel --timeout=5m; fi
-    kubectl -n "$network" rollout status deployment/node --timeout=5m
+    tunnel=$(k -n "$network" get secret tunnel --ignore-not-found -o name)
+    if [ -n "$tunnel" ]; then render tunnel.yaml | k apply -f -; fi
+    render node.yaml | bind | k apply -f -
+    if [ -n "$tunnel" ]; then k -n "$network" rollout status deployment/tunnel --timeout=5m; fi
+    k -n "$network" rollout status deployment/node --timeout=5m
     ;;
   *)
     echo "deploy: unknown mode $mode" >&2

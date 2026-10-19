@@ -1,0 +1,9 @@
+# The StorageClass every network's claim uses: local-path volumes kept when their claim is deleted.
+# Applied by ops/k8s/deploy only when the cluster lacks it, since every network shares it.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path-retain
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer

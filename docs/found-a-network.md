@@ -20,7 +20,7 @@ Write these down before you build anything. Two of them are fixed for good.
 | The network's name | the founding file's `network`, the Kubernetes namespace, the chain id every signature names | fixed for good |
 | How it is reached | step 4 | a public name through a Cloudflare tunnel, or only a host address such as a Tailscale IP |
 | Its validators | the founding file's `[[validators]]` | one node is a network; more join later (`ducktape join`) |
-| Its limits | the founding file's `[limits]` | absent means unmetered; duckpond founds with none |
+| Its limits | the founding file's `[limits]` | a hosted network with agents founds unmetered, as duckpond does: leave `[limits]` out |
 | Who manages the first agent | step 8 | fixed for good: identity refuses `SetOwnership` |
 | The model gateway | step 5 | the egress service the agents' model record names |
 
@@ -28,9 +28,9 @@ Write these down before you build anything. Two of them are fixed for good.
 
 - Programs: a commit on forge `programs` `dev`. A hosted network runs the
   release profile's bytes of a forge `dev` commit and nothing else
-  (`AGENTS.md` § Branching and Delivery). programs' GitHub release
-  `wasm-<commit>` carries a `founding.tar.gz` for local foundings (kit,
-  qa); a hosted network never founds from it.
+  (`AGENTS.md` § Branching and Delivery). programs' release workflow,
+  which published `wasm-<commit>` on GitHub, is disabled; a local founding
+  (kit, qa) builds with `make wasm-founding` too.
 - Core: a commit on forge `core` `dev` whose `crates/kernel/abi` matches the
   core rev programs' root `Cargo.toml` pins:
 
@@ -63,17 +63,11 @@ Python 3). From cold on 24 cores it takes about 12 minutes and leaves about
 `ops/k8s/deploy NETWORK COMMIT` builds `ops/k8s/Containerfile` from
 `git archive COMMIT`, pushes the image to the cluster node's registry, then
 applies the manifests (steps 6 and 7). Run it from a core worktree at the
-node's commit, so the manifests match the image. It runs `kubectl` on the
-current context and applies the StorageClass `local-path-retain` that every
-network's claim shares, so check both first:
-
-```sh
-kubectl config current-context                                                    # fabrics-1
-sed -e 's#NETWORK#sealpond#g' ops/k8s/network.yaml | head -n 9 | kubectl diff -f -   # empty: the StorageClass is unchanged
-```
-
-Diff only the StorageClass: on a namespace that does not exist yet, a diff of
-the whole file stops at `namespaces "sealpond" not found`.
+node's commit, so the manifests match the image. Every `kubectl` call it
+makes names the context `CONTEXT`, the current context unless you set it, and
+it prints which. It applies the StorageClass `local-path-retain`
+(`ops/k8s/storage.yaml`), which every network's claim shares, only when the
+cluster lacks it.
 
 ## 4. Choose the address
 
@@ -146,14 +140,13 @@ secrets = { x-api-key = { file = "/secrets/egress/CCS_KEY" } }
 ## 6. Found the network into its claim
 
 ```sh
-ops/k8s/deploy sealpond <core commit> --found        # namespace, claim `home`, pod `found`
+CONTEXT=fabrics-1 EGRESS=egress.toml ops/k8s/deploy sealpond <core commit> --found   # namespace, claim `home`, pod `found`, /data/egress.toml
 K="kubectl -n sealpond"
 $K exec found -- ducktape identity                   # the validator's key
 tar xzf founding.tar.gz
 $EDITOR founding/founding.toml                       # network, time ($(date +%s000)), key, address, halo
 $K cp founding sealpond/found:/data/founding
 $K exec found -- ducktape init /data/founding/founding.toml --halo 100.65.253.102:9101
-$K exec -i found -- sh -c 'cat > /data/egress.toml' < egress.toml
 $K delete pod found
 ```
 
@@ -163,7 +156,7 @@ its volume stays when the claim is deleted (`ops/k8s/network.yaml`).
 ## 7. Start the node
 
 ```sh
-HOST=100.65.253.102 HTTP_PORT=8845 HALO_PORT=9101 ops/k8s/deploy sealpond <core commit>
+CONTEXT=fabrics-1 HOST=100.65.253.102 HTTP_PORT=8845 HALO_PORT=9101 ops/k8s/deploy sealpond <core commit>
 ducktape --node http://100.65.253.102:8845 status    # its network, and a height that climbs
 ```
 
@@ -206,14 +199,20 @@ wallet, waits for its block and prints the verdict, and `ducktape query
 <program> <request>` prints a query's reply. Both take borsh bytes; the CLI
 does not encode them, and no CLI verb or `/v1` route serves a program's
 schema. The shapes come from the programs crates' `Op`, `Query` and `Reply`
-types, as step 10 gives them. Encode with a small Rust program that links
-the crates of the founding's programs commit by `path`: identity, egress,
-harness, files, access, chat (the hello), program and store (lists and
-pages), and core's `keystore` (step 10.3). It repeats programs' root
+types, as step 10 gives them. `ops/found/` builds `found`, one binary whose verbs print the borsh bytes of
+each op and query a founding sends (`found create founder`,
+`found set-model ID SERVICE NAME`, `found q-agent 18`), and decode a reply
+read on stdin (`found d-harness`, `found d-identity`). It links the programs
+crates (identity, egress, harness, files, access, chat, program, store) at
+the rev its `Cargo.toml` names, repeating programs' root
 `[patch."https://github.com/ducktape-industries/ducktape"]` for `abi` and
-`store`, so every crate sees one copy of each. A cargo `git` dependency
-fetches only branches and tags, so it can't name a commit that only a
-remote-tracking ref reaches.
+`store` so every crate sees one copy of each, and core's `keystore` from this
+tree (step 10.3). Set that rev to the founding's programs commit, then build
+it.
+
+```sh
+cd ops/found && cargo build --release   # target/release/found
+```
 
 `ducktape wallet new <name>` makes a key in the workspace
 (`DUCKTAPE_PASSWORD` or a prompt) and prints its public key, then its
@@ -229,8 +228,23 @@ unset w
 
 ## 10. Make the bootstrap account and the first agent
 
-Sign each op with `--land` and keep its payload and verdict, so a rerun
-skips what landed. The ops, by signer, written as JSON of the programs
+`ops/found/seed.sh` runs this whole step. It signs each op with `--land`,
+keeps each payload and verdict in a step folder so a rerun skips what
+landed, and prints the three account numbers. Make `founder`'s and `chief`'s
+wallets first, each in its own workspace and straight into its Secret, as
+step 9 makes chief's:
+
+```sh
+DUCKTAPE="$(command -v ducktape)" TOOL=ops/found/target/release/found \
+  ops/found/seed.sh http://100.65.253.102:8845 sealpond <node key> \
+  FOUNDER_WS FOUNDER_PASSWORD CHIEF_WS CHIEF_PASSWORD CHIEF_WS/keys/chief.key STEPS
+# founder 17 chief 18 tech 19
+```
+
+`MODEL` and `SERVICE` name the model and the egress service
+(`claude-opus-5-5` and `anthropic` unless set). The configurations it writes
+hold a placeholder prompt, which step 13 replaces. The ops it sends, by
+signer, written as JSON of the programs
 crates' types (a map is a list of `[key, value]` pairs):
 
 1. `founder`: identity `{"Create": {"name": "founder", "scheme": "Ed25519"}}`.
@@ -244,9 +258,8 @@ crates' types (a map is a list of `[key, value]` pairs):
    `identity::Admission { network, scheme, key, generation, account,
    expires_at }`: `network` the founding file's network name as bytes,
    `generation` what identity `{"Generation": {"key"}}` answers, and
-   `expires_at` unix milliseconds. The CLI signs no consent. Open the wallet
-   with core's `keystore::userkey::open_user_key_at` and sign with
-   commonware's `Signer::sign(namespace, preimage)`.
+   `expires_at` unix milliseconds. `found add-key` opens chief's wallet file
+   and signs it.
 4. `founder`: access `{"Set": {"program": "harness", "key": "agents/C", "list": "Anyone"}}`,
    who the agent answers (`harness::agent_key`). duckpond's agents answer
    anyone.
@@ -317,12 +330,15 @@ The desktop app's harness view builds the same sequence for an agent
   `<network>+<genesis time>`. Inside the cluster the node is
   `node-http.<network>.svc:8844`.
 - Write each agent's prompt, memory and skills into files as the agent's
-  manager or the agent itself (step 10.7's chunk-and-commit). A `Put` makes
+  manager or the agent itself (step 10.7's chunk-and-commit; `found commit-files` puts many files in
+  one commit). A `Put` makes
   every parent folder it needs; an empty folder takes `{"Mkdir": {"path"}}`
   in the same commit (programs `crates/app/files/src/tree.rs`). No CLI verb
-  reads files: read back with files' `Find` and `Read` queries.
+  reads files: read back with files' `Find` and `Read` queries (`found q-find`, `found
+  q-read`, `found d-read`).
 - Post the first agent a hello saying who its person is. The sender is any
   key's own account, made with identity `Create` as in step 10.1. A DM room
   opens only with chat `{"CreateDmChannel": {"counterpart": C, "name"}}`
   (programs `crates/app/chat/src/lib.rs`), and then a `PostMessage` to
-  `dm-<lower account>-<higher account>` lands in it.
+  `dm-<lower account>-<higher account>` lands in it (`found open-dm`, then
+  `found post`).

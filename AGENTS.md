@@ -136,9 +136,9 @@ under `ops/`.
   24). The builder builds it with the repo's pinned toolchain and `--locked`,
   packs it the way a founding packs a program (its view, describe module and
   any notifier embedded), and puts the blob itself. GitHub releases
-  (`wasm-<commit>`) and programs' `main` play no part in a deploy: the
-  programs release workflow publishes wasm for local foundings (kit, qa), not
-  for a hosted network. Never deploy a build of a branch that is not merged,
+  (`wasm-<commit>`) and programs' `main` play no part in a deploy; the
+  programs release workflow that published them is disabled, and a local
+  founding (kit, qa) builds with `make wasm-founding`. Never deploy a build of a branch that is not merged,
   a build of a working tree with local changes, or a build made by any other
   builder. A role program (programs, identity, valset, blobs, awaits, halo,
   access, scheduler, egress) changes only by the validators' vote, which the

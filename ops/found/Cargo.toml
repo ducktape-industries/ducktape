@@ -1,0 +1,26 @@
+[package]
+name = "found"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+access = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+chat = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+egress = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+files = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+harness = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+identity = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+program = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+store = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+keystore = { path = "../../crates/keystore" }
+borsh = { version = "1", default-features = false, features = ["derive", "std", "unstable__schema"] }
+hex = "0.4"
+commonware-cryptography = "2026.9.0"
+commonware-codec = "2026.9.0"
+
+[patch."https://github.com/ducktape-industries/ducktape"]
+abi = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }
+store = { git = "https://github.com/ducktape-industries/programs", rev = "681e30b34d82f3e843c8efc5b53adcb57bcd6b6f" }

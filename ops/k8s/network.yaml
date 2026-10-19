@@ -1,13 +1,5 @@
 # A network's namespace and the volume its node's home lives on, kept when the claim is deleted.
 # Applied by ops/k8s/deploy, which substitutes NETWORK.
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: local-path-retain
-provisioner: rancher.io/local-path
-reclaimPolicy: Retain
-volumeBindingMode: WaitForFirstConsumer
----
 apiVersion: v1
 kind: Namespace
 metadata:

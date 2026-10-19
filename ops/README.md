@@ -19,20 +19,20 @@ scripts back a `make` target; see the repository `Makefile`.
   the registry on the cluster node (`DEPLOY_NODE`, default
   `fabrics@fabrics-1`, at its `127.0.0.1:5000`), and applies
   `k8s/network.yaml`: the namespace `NETWORK` and the claim `home`, whose
-  volume is kept when the claim is deleted. It runs `kubectl` on the current
-  context, and `network.yaml` also holds the StorageClass
-  `local-path-retain` every network's claim uses.
+  volume is kept when the claim is deleted. Every `kubectl` call names the context
+  `CONTEXT`, the current context unless set. It applies `k8s/storage.yaml`,
+  the StorageClass `local-path-retain` every network's claim uses, only when
+  the cluster lacks it.
   [`../docs/found-a-network.md`](../docs/found-a-network.md) walks a
   founding through these steps.
 - With `--found` it then applies `k8s/found.yaml`, a pod `found` that holds
-  `home` at `/data` and runs nothing. Found the network into it, then
-  delete it:
+  `home` at `/data` and runs nothing, and with `EGRESS=FILE` copies FILE
+  into it as `/data/egress.toml`. Found the network into it, then delete it:
 
   ```sh
   kubectl -n NETWORK exec found -- ducktape identity
   kubectl cp founding NETWORK/found:/data/founding
   kubectl -n NETWORK exec found -- ducktape init /data/founding/founding.toml --halo node.example.org:9100
-  kubectl -n NETWORK exec -i found -- sh -c 'cat > /data/egress.toml' < egress.toml
   kubectl -n NETWORK delete pod found
   ```
 
@@ -78,6 +78,23 @@ scripts back a `make` target; see the repository `Makefile`.
   the node's. The tunnel's score follows from its memory request, as for any
   pod that requests some. Both request the CPU and memory they were measured
   to use and set no limit, so nothing kills the node for passing one.
+
+## A network's first accounts
+
+- `found/` is the crate `found`, its own workspace: one binary whose verbs
+  print the borsh bytes of the identity, egress, harness, files, access and
+  chat ops and queries a founding sends, for `ducktape submit` and
+  `ducktape query`, and decode their replies (`d-*`, read on stdin). It
+  links the programs crates at the rev `found/Cargo.toml` names, which must
+  be the founding's programs commit, and core's `keystore` from this tree,
+  which `add-key` opens a wallet file with to sign a key's consent.
+- `found/seed.sh` turns a freshly founded network into one with two agents:
+  the account `founder` creates the agent `chief`, adds chief's own key to
+  it and lists who chief answers; chief's key then registers and assigns
+  the egress service, sets the model, writes chief's configuration, sets
+  its script, and creates `tech` the same way, chief managing it. Each
+  step's frame and receipt stay in the step folder, and a rerun skips the
+  steps that landed. `../docs/found-a-network.md` step 10 gives the call.
 
 ## Agents' computing on Kubernetes
 

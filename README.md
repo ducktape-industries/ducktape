@@ -35,10 +35,9 @@ This puts the `ducktape` binary in `~/.cargo/bin`. `make install` also
 delegates the desktop installation to the pinned
 [ducktape-app](https://github.com/ducktape-industries/ducktape-app) checkout.
 
-Each commit on `main` also has a built `ducktape` for Linux on x86_64 and
-macOS on arm64: the prerelease `bin-<commit>` carries
-`ducktape-x86_64-unknown-linux-gnu.tar.gz` and
-`ducktape-aarch64-apple-darwin.tar.gz` (`.github/workflows/release.yml`).
+`.github/workflows/release.yml`, which published a built `ducktape` for each
+commit on `main` as the prerelease `bin-<commit>`, is still in the tree, but
+the workflow is disabled: build the binary with `make install-node`.
 
 ## Found a network
 
@@ -47,13 +46,12 @@ programs it starts with. Every path is relative to the file.
 programs' `make wasm-founding` packs a founding: `founding.tar.gz` holds
 every program it builds, packed with its view, and a `founding.toml` with
 only its network, time, key, address and halo address left to fill. A local
-network founds from the one
-[programs](https://github.com/ducktape-industries/programs) publishes for
-each commit on its `main`, in the GitHub release `wasm-<commit>`. A hosted
-network never does: it founds from `make wasm-founding` run at a commit on
-forge `programs` `dev` (`AGENTS.md` § Branching and Delivery), and
+network and a hosted one both found from it. A hosted network runs it at a
+commit on forge `programs` `dev` (`AGENTS.md` § Branching and Delivery), and
 [`docs/found-a-network.md`](docs/found-a-network.md) walks it through every
-step, from the founding to agents that answer. The fields:
+step, from the founding to agents that answer. programs' release workflow,
+which published a founding as the GitHub release `wasm-<commit>`, is still
+in its tree, but the workflow is disabled. The fields:
 
 ```toml
 network = "mynet"
@@ -230,9 +228,8 @@ seeds the programs role's list; a running network hooks or unhooks a program
 through the programs role like any other change.
 
 ```sh
-curl -fsSL https://github.com/ducktape-industries/programs/releases/download/wasm-<commit>/founding.tar.gz | tar xz
-# a hosted network instead: make -C programs wasm-founding at a forge dev commit, then
-# tar xzf programs/target/wasm32-unknown-unknown/release/founding.tar.gz
+make -C programs wasm-founding                      # a programs checkout; a hosted network's is at a forge dev commit
+tar xzf programs/target/wasm32-unknown-unknown/release/founding.tar.gz
 ducktape identity                                   # mint this workspace's node key
 $EDITOR founding/founding.toml                      # network, time (`date +%s000`), that key, this node's address
 ducktape init founding/founding.toml --halo a.example.org:9100   # found the network in $DUCKTAPE_HOME
