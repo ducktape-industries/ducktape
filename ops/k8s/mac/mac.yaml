@@ -1,0 +1,106 @@
+# The mac relay: namespace mac, its state claim, its Deployment and its fixed-address Service, whose port 8080 only the duckpond node reaches
+# (the egress service `mac`) and whose port 8081 the Mac dials out to, through whatever route the operator gives it (the tailnet, a tunnel hostname).
+# Applied by ops/k8s/mac/deploy, which substitutes @IMAGE@, @NODE_URL@ and @FORGE@; the key it signs with is the Secret `mac-key`, the Mac's token the Secret `mac-token`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mac
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: state
+  namespace: mac
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: "1"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: node-and-mac
+  namespace: mac
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: duckpond}
+          podSelector:
+            matchLabels: {app: node}
+      ports:
+        - {protocol: TCP, port: 8080}
+    - ports:
+        - {protocol: TCP, port: 8081}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mac
+  namespace: mac
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mac
+  template:
+    metadata:
+      labels:
+        app: mac
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: mac
+          image: "@IMAGE@"
+          env:
+            - {name: MAC_DUCKTAPE, value: "ducktape --workspace /home/mac --node @NODE_URL@"}
+            - {name: MAC_NODE, value: "@NODE_URL@"}
+            - {name: MAC_FORGE, value: "@FORGE@"}
+            - {name: MAC_KEYS, value: /keys}
+            - {name: MAC_TOKEN, value: /token/token}
+            - {name: MAC_STATE, value: /state}
+          ports:
+            - {name: agents, containerPort: 8080}
+            - {name: mac, containerPort: 8081}
+          volumeMounts:
+            - {name: keys, mountPath: /keys, readOnly: true}
+            - {name: token, mountPath: /token, readOnly: true}
+            - {name: state, mountPath: /state}
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+      volumes:
+        - name: keys
+          secret:
+            secretName: mac-key
+            optional: true
+        - name: token
+          secret:
+            secretName: mac-token
+            optional: true
+        - name: state
+          persistentVolumeClaim:
+            claimName: state
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mac
+  namespace: mac
+spec:
+  clusterIP: 10.43.80.81
+  selector:
+    app: mac
+  ports:
+    - {name: agents, port: 8080, targetPort: agents}
+    - {name: mac, port: 8081, targetPort: mac}

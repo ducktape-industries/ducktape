@@ -331,6 +331,82 @@ scripts back a `make` target; see the repository `Makefile`.
   local stand-in node that passes on only `/v1/status` and keeps the frame.
   `k8s/pi-chief/pi-chief-test.py` covers it.
 
+## Phone builds and simulator runs on a Mac
+
+- `k8s/mac/relay.py` is the egress service `mac`, the relay: Deployment
+  `mac` in namespace `mac`, at `http://10.43.80.81:8080`
+  (`[services.mac] base` in the node's `egress.toml`). It holds agents'
+  runs: a phone build of a forge commit (`make -C phone <target>` of the
+  app), then, if the run has one, a UI script in the iOS simulator. Its
+  routes, under `/v1`: `runs` (create, list), `runs/ID` (status, delete),
+  `runs/ID/wait` (an event stream like pods' wait), and `mac` (whether the
+  Mac is connected, since when, and what it said of itself). Every answer
+  says whether the Mac is connected, so a call made while the laptop sleeps
+  is answered at once and its run waits in the queue. A run's script and
+  `media` files are read from files when the run is asked for, its outputs
+  go into files at `<to>/<run>/` in one commit when it ends, and one chat
+  post says it ended. It signs as the account `mac`, with the Secret
+  `mac-key` (files `key` and `password`). Its state (`runs.json`, each
+  run's inputs and outputs until written, mirrors of the repositories the
+  Mac builds) is on the claim `state`. `relay-test.py` covers it.
+- The Mac dials out to the relay's port 8081, which the operator routes to
+  it (the tailnet, a tunnel hostname). Every call there carries the token in
+  the Secret `mac-token` (file `token`):
+  `kubectl -n mac create secret generic mac-token --from-file=token=TOKEN`.
+  `POST /v1/mac/work` is the Mac's event stream: it lists the runs the Mac
+  holds, and the relay sends `run` and `forget` events on it. The Mac counts
+  as connected while it is open. `POST /v1/mac/bye` ends it. Both ends of
+  the stream set TCP keepalive (`KEEPALIVE` in `relay.py` and `mac.py`,
+  and on the relay `TCP_USER_TIMEOUT` to match), so a peer gone without a
+  word (the Mac off the network, fabrics-1 down hard) is heard as gone
+  within half a minute: the relay says the Mac is away, and the Mac dials
+  again. A relay the Mac can't reach is tried again when `power.swift` says
+  the Mac woke or its network changed, and, while the relay is down with
+  the network up, every 5 s (`RELAY_DOWN_PAUSE`, orthory's ruling), never
+  doubling.
+- Nothing the relay does is tried again on a clock. A files read, a
+  forge step or a source bundle that fails answers its reason at once,
+  and the next ask tries again. Outputs files did not take (a write not
+  sent, chunks not put) stay on the claim, the run stays `writing`, and the
+  next call about the run writes them again: an agent's read of it or wait
+  on it, the Mac's report of its end, or the Mac connecting. A commit files
+  refuses because its head moved is made again onto the new head at once.
+  `POST /v1/mac/runs/ID/state`, `PUT /v1/mac/runs/ID/outputs/PATH` and
+  `GET /v1/mac/runs/ID/inputs/N` carry a run's progress, outputs and media.
+  `POST /v1/mac/source` answers a git bundle of a forge commit, less what
+  the Mac already has, so the Mac needs no way into forge of its own.
+- When the Mac connects, the relay sends it every queued run again. It marks
+  `interrupted` each run it believed the Mac held that the Mac no longer
+  lists, and tells the Mac to forget the runs deleted while it was away.
+- `k8s/mac/deploy NODE_URL FORGE COMMIT` builds `k8s/mac/Containerfile`
+  around the ducktape CLI built from `git archive COMMIT` and
+  git-remote-duck, pushes it to the cluster node's registry, and applies
+  `k8s/mac/mac.yaml`.
+- `mac/mac.py` is the Mac's side, kept running by the LaunchAgent
+  `mac/com.ducktape.mac.plist`. It needs Python 3.11 or later, Xcode with an
+  iOS simulator runtime, XcodeGen, rustup's cargo first on `PATH` (so the
+  app's `rust-toolchain.toml` holds) and Rust's iOS targets. Its work
+  directory (`MAC_HOME`) holds the relay's token (`token`), a bare
+  repository per repo filled from the relay's bundles, one cargo target dir
+  per repo, and each run's worktree, outputs and `state.json`.
+- A run's script runs against the simulator device `MAC_DEVICE`, which the
+  operator makes once and signs the app in on, or a fresh device of the
+  same type and runtime (`ducktape-run-<run>`), deleted when the run ends.
+  Steps reach the app through its AX door (the `ax-door` build, whose token
+  the Mac reads from the app's container), the device through
+  `xcrun simctl`, and system UI (the photo picker, permission alerts)
+  through the app's XCUITest driver (`make -C phone ios-driver`). Runs on
+  the kept device take it in turn: a run waits, saying which run holds it,
+  until that one's script has ended. Builds and fresh devices run side by
+  side.
+- `mac/power.swift` (`swift power.swift`) says on its stdout when macOS is
+  about to sleep, and holds the sleep until `mac.py` has said goodbye to
+  the relay, then says when it woke, and `mac.py` connects again. When
+  `mac.py` starts, every run its work directory holds in a working state
+  becomes `interrupted`, and fresh devices left behind are deleted.
+  `mac/mac-test.py` covers it on Linux, against the real relay and git and
+  a fake `xcrun`, `make` and `xcodebuild`.
+
 ## Forge and GitHub
 
 - dev and main of ducktape, programs and app are held by duckpond's forge

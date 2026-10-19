@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The mac service's LaunchAgent: ops/mac/mac.py, started at login and again whenever it ends (a crash, a wake that found it gone).
+     The operator replaces @CORE@ (this checkout), @PYTHON@ (a python3.11 or later), @PATH@ (rustup's cargo first, so rust-toolchain.toml holds,
+     then XcodeGen's and the system's), @RELAY@ (the relay's Mac port), @DEVICE@ (the kept simulator) and @HOME_DIR@ (with the token in token), then: cp com.ducktape.mac.plist ~/Library/LaunchAgents/ && launchctl load -w ~/Library/LaunchAgents/com.ducktape.mac.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ducktape.mac</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PYTHON@</string>
+    <string>@CORE@/ops/mac/mac.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+    <key>MAC_RELAY</key>
+    <string>@RELAY@</string>
+    <key>MAC_HOME</key>
+    <string>@HOME_DIR@</string>
+    <key>MAC_DEVICE</key>
+    <string>@DEVICE@</string>
+    <key>CARGO_HOME</key>
+    <string>@HOME_DIR@/cargo</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME_DIR@/mac.log</string>
+  <key>StandardOutPath</key>
+  <string>@HOME_DIR@/mac.log</string>
+</dict>
+</plist>
