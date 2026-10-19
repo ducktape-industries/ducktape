@@ -1804,6 +1804,29 @@ class Posts(unittest.TestCase):
         self.assertEqual(self.signer.submits, [("chat", posted), ("chat", POSTED)])
         self.assertEqual(self.notifier.posted, {})
 
+    def test_a_run_a_dead_pod_held_is_posted_lost_in_its_channel_and_one_that_ended_is_not(self):
+        self.kube.answer("logs", ran(
+            b"ducktape-run armed j-101 20261019-1 app b2ae apply /home/tech/work/j-101/snap.sh\n"
+            b"ducktape-run armed j-080 20261019-2 tools 3f52 sh make check\n"
+            b"ducktape-run done 20261019-2\n"
+            b"ducktape-notify j-080 20261019-2 ended: exit 0, GATES ok\n"
+            b"[20261019-1] fetching app\n"
+        ))
+        self.notifier.seen(pod_json(phase="Failed", reason="NodeShutdown", notes=NOTIFY))
+        ended = "duckpond-41 \u00b7 20261019-2 ended: exit 0, GATES ok"
+        lost = "duckpond-41 \u00b7 run 20261019-1 lost with pod duckpond-41: it ended before the run did, so nothing of it runs now; call it again: app b2ae apply /home/tech/work/j-101/snap.sh"
+        posts = [
+            ("chat", server.post_message("j-080", server.notify_id("duckpond-41", "j-080", ended), 17, ended, None)),
+            ("chat", server.post_message("j-101", server.notify_id("duckpond-41", "j-101", lost), 17, lost, None)),
+        ]
+        self.assertEqual(self.signer.submits[:2], posts)
+        self.assertEqual(len(self.signer.submits), 3)
+
+    def test_a_pod_whose_runs_all_ended_posts_none_lost(self):
+        self.kube.answer("logs", ran(b"ducktape-run armed j-101 20261019-1 app b2ae gates\nducktape-run done 20261019-1\n"))
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [("chat", POSTED)])
+
     def test_a_deleted_pod_forgets_the_lines_it_posted(self):
         self.notifier.spawn = lambda target, *args: target(*args)
         self.kube.logs_of["duckpond-41"] = b"ducktape-notify j-093 run 1 ended\n"

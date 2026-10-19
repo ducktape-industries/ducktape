@@ -44,6 +44,7 @@ NOTIFY_CHANNEL = NOTE + "notify-channel"
 NOTIFY_THREAD = NOTE + "notify-thread"
 NOTIFIED = NOTE + "notified"
 NOTIFY_LINE = "ducktape-notify "
+RUN_LINE = "ducktape-run "
 SPEC = {
     "image": str,
     "command": list,
@@ -1143,6 +1144,23 @@ def notify_lines(name, stream):
             yield channel, f"{name} \u00b7 {text.strip()}"
 
 
+def lost_runs(name, stream):
+    armed, done = {}, set()
+    for raw in stream:
+        line = raw.decode(errors="replace").rstrip("\r\n")
+        if not line.startswith(RUN_LINE):
+            continue
+        words = line[len(RUN_LINE):].split(" ", 3)
+        if words[0] == "armed" and len(words) >= 3 and words[1] and words[2]:
+            armed[words[2]] = (words[1], words[3].strip() if len(words) > 3 else "")
+        elif words[0] == "done" and len(words) >= 2:
+            done.add(words[1].strip())
+    for run, (channel, call) in armed.items():
+        if run not in done:
+            again = f"; call it again: {call}" if call else "; call it again"
+            yield channel, f"{name} \u00b7 run {run} lost with pod {name}: it ended before the run did, so nothing of it runs now{again}"
+
+
 def notify_id(name, channel, line):
     digest = hashlib.sha256(f"{channel}\n{line}".encode()).hexdigest()
     return f"pods-{name}-notify-{digest}"
@@ -1423,7 +1441,10 @@ class Notifier:
             return "chat_unasked", refused.sentence
 
     def lines(self, name, requester, stream):
-        for channel, line in notify_lines(name, stream):
+        self.each(name, requester, notify_lines(name, stream))
+
+    def each(self, name, requester, said):
+        for channel, line in said:
             message_id = notify_id(name, channel, line)
             with self.lock:
                 if message_id in self.posted.get(name, ()):
@@ -1444,7 +1465,9 @@ class Notifier:
     def read(self, name, requester):
         ran = self.kube.logs(name, ["--container", RUN])
         if ran.code == 0:
-            self.lines(name, requester, ran.out.splitlines(keepends=True))
+            logged = ran.out.splitlines(keepends=True)
+            self.lines(name, requester, logged)
+            self.each(name, requester, lost_runs(name, logged))
 
     def followed(self, pod):
         meta = pod["metadata"]
