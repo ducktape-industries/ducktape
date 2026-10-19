@@ -916,6 +916,62 @@ fn a_changes_socket_asked_for_keys_carries_none_of_the_values_and_a_quiet_one_is
 }
 
 #[test]
+fn a_changes_socket_that_answers_no_ping_for_a_whole_epoch_is_cut_and_one_that_reads_stays() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        let base = format!("ws://{}{}", seat.http, noded::wire::route::CHANGES);
+        let height = |frame: &Message| match frame {
+            Message::Ping(echo) => Some(u64::from_le_bytes(echo[..].try_into().unwrap())),
+            _ => None,
+        };
+        let open =
+            |url: String| async move { tokio_tungstenite::connect_async(url).await.unwrap().0 };
+        // never read until the end, so it answers no ping
+        let mut stalled = open(format!("{base}/probe")).await;
+        let mut reading = open(format!("{base}/probe")).await;
+        let mut busy = open(format!("{base}/{}", host::RECENT)).await;
+        let opened = client.status().await.unwrap().height;
+        // every block writes the kernel's table of recent blocks, so its
+        // pings are the epochs' last blocks alone
+        let ping = loop {
+            if let Some(at) = height(&busy.next().await.unwrap().unwrap()) {
+                break at;
+            }
+        };
+        assert_eq!((ping + 1) % EPOCH_LENGTH, 0, "{ping}");
+        // the stalled socket is cut at the second epoch close after it was
+        // opened at the latest; the one that reads (and so answers each
+        // ping) is still open past it
+        let past = opened + 3 * EPOCH_LENGTH;
+        loop {
+            let frame = reading
+                .next()
+                .await
+                .expect("a socket that reads stays open");
+            if height(&frame.unwrap()).is_some_and(|at| at >= past) {
+                break;
+            }
+        }
+        // what the stalled socket was sent before its cut, then its end
+        while let Some(Ok(frame)) = stalled.next().await {
+            if let Some(at) = height(&frame) {
+                assert!(at < past, "the stalled socket was still sent block {at}");
+            }
+        }
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
 fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");

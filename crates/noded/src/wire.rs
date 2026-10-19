@@ -19,8 +19,9 @@ pub mod route {
     pub const BLOBS: &str = "/v1/blobs";
     pub const PROGRAMS: &str = "/v1/programs";
     /// `/v1/changes/<program>[?keys]`: a websocket of each block's writes
-    /// to the program (`?keys`: the keys alone), a ping for a block that
-    /// wrote nothing there.
+    /// to the program (`?keys`: the keys alone), a ping carrying the block's
+    /// height for a block that wrote nothing there and for each epoch's last
+    /// block. A client that answers no ping for a whole epoch is cut.
     pub const CHANGES: &str = "/v1/changes";
     pub const BLOCKS: &str = "/v1/blocks";
     pub const BLOCK: &str = "/v1/block";

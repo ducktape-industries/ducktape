@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use abi::Receipt;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
@@ -11,7 +12,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use borsh::BorshSerialize;
-use futures::channel::mpsc;
+use futures::pin_mut;
 use futures::stream::SplitSink;
 use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
@@ -23,7 +24,7 @@ use crate::wire::{
     Admin, BlockAsk, Blocks, Finalized, Get, Located, Network, Page, Query, Range, Submit,
     Submitted, TxAsk, route,
 };
-use crate::{Context, Daemon, LoadConfig, Published};
+use crate::{Context, Daemon, LoadConfig, Published, Subscription};
 
 const SUBMIT_BYTES: usize = BLOCK_BYTES;
 const SUBMIT_BODY_BYTES: usize = SUBMIT_BYTES + size_of::<u32>() + size_of::<bool>();
@@ -413,7 +414,9 @@ async fn programs<E: Context>(
 /// `/v1/changes/<program>`: each block that writes to `program`, as a
 /// `Change`; `?keys` asks for the keys alone, every value `None` (a client
 /// that re-reads what moved, as the app does, never reads the values). A
-/// block that writes nothing there is a ping.
+/// block that writes nothing there is a ping, and so is the block that
+/// closes each epoch. Every ping carries its block's height; a client that
+/// answers none of them for a whole epoch is cut (`Daemon::publish`).
 async fn changes<E: Context>(
     State(daemon): State<Arc<Daemon<E>>>,
     Path(program): Path<ProgramId>,
@@ -429,17 +432,31 @@ async fn changes<E: Context>(
 
 enum Next {
     Published(Published),
+    Pong(Bytes),
     Frame,
+    Stopping,
     Stopped,
     Ended,
 }
 
-async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Published>) {
+async fn stream(socket: WebSocket, subscription: Subscription) {
+    let Subscription {
+        mut changes,
+        read,
+        mut cut,
+    } = subscription;
+    // the node is stopping: what is queued still goes, then the goodbye
+    let mut stopping = false;
     let (mut client, mut frames) = socket.split();
     loop {
         let next = tokio::select! {
+            dropped = &mut cut, if !stopping => match dropped {
+                Ok(()) => Next::Stopping,
+                Err(_) => Next::Ended,
+            },
             published = changes.next() => published.map_or(Next::Stopped, Next::Published),
             frame = frames.next() => match frame {
+                Some(Ok(Message::Pong(echo))) => Next::Pong(echo),
                 Some(Ok(_)) => Next::Frame,
                 Some(Err(_)) | None => Next::Ended,
             },
@@ -448,13 +465,37 @@ async fn stream(socket: WebSocket, mut changes: mpsc::UnboundedReceiver<Publishe
             Next::Published(Published::Change(change)) => {
                 Message::Binary(abi::encode(&change).into())
             }
-            Next::Published(Published::Quiet) => Message::Ping(Bytes::new()),
+            Next::Published(Published::Ping(height)) => {
+                Message::Ping(Bytes::copy_from_slice(&height.to_le_bytes()))
+            }
+            Next::Pong(echo) => {
+                if let Ok(height) = <[u8; 8]>::try_from(echo.as_ref()) {
+                    read.fetch_max(u64::from_le_bytes(height), Ordering::Relaxed);
+                }
+                continue;
+            }
+            Next::Stopping => {
+                stopping = true;
+                continue;
+            }
             Next::Stopped => return goodbye(client).await,
             Next::Frame => continue,
             Next::Ended => return,
         };
-        if client.send(message).await.is_err() {
-            return;
+        // a client that stopped reading holds the send: its cut ends it
+        let send = client.send(message);
+        pin_mut!(send);
+        loop {
+            tokio::select! {
+                sent = &mut send => match sent {
+                    Ok(()) => break,
+                    Err(_) => return,
+                },
+                dropped = &mut cut, if !stopping => match dropped {
+                    Ok(()) => stopping = true,
+                    Err(_) => return,
+                },
+            }
         }
     }
 }

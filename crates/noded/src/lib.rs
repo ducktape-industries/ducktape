@@ -15,12 +15,13 @@ mod transport;
 pub mod wire;
 mod workspace;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use abi::{ProgramId, Refusal};
 use commonware_cryptography::Digestible as _;
 use consensus::{MarshalMailbox, Network, Summaries, Votes};
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use host::Applied;
 use node::Node;
 use tokio::sync::watch;
@@ -143,19 +144,35 @@ pub struct Daemon<E: Context> {
 
 /// One `/v1/changes` socket's end: the program it follows, whether it
 /// asked for the keys alone, and where each block's word for it goes.
+/// `since` is the tip it was opened at and `read` the newest height a pong
+/// of its client echoed. `cut` reaches the socket's task even while a send
+/// waits on a client that stopped reading: dropped, it ends the task and
+/// its queue; sent, the node is stopping and the task says goodbye.
 struct Subscriber {
     program: ProgramId,
     keys: bool,
     sender: mpsc::UnboundedSender<Published>,
+    since: u64,
+    read: Arc<AtomicU64>,
+    cut: oneshot::Sender<()>,
+}
+
+/// A `/v1/changes` socket's side of its [`Subscriber`].
+pub(crate) struct Subscription {
+    pub(crate) changes: mpsc::UnboundedReceiver<Published>,
+    pub(crate) read: Arc<AtomicU64>,
+    pub(crate) cut: oneshot::Receiver<()>,
 }
 
 /// What a `/v1/changes` socket hears of each block the node applies: what
-/// the block wrote to its program, or that it wrote nothing there
-/// (`Quiet`: the socket sends a ping, so a quiet program's socket is never
-/// idle long enough for a proxy to cut it).
+/// the block wrote to its program, or a ping carrying the block's height
+/// (8 bytes, little-endian). A block that wrote nothing there is a ping, so
+/// a quiet program's socket is never idle long enough for a proxy to cut
+/// it; so is the block that closes each epoch, after its change, so every
+/// client is asked once an epoch to show that it still reads (its pong).
 pub(crate) enum Published {
     Change(Change),
-    Quiet,
+    Ping(u64),
 }
 
 impl<E: Context> Daemon<E> {
@@ -180,44 +197,72 @@ impl<E: Context> Daemon<E> {
 
     /// Each block's word for `program` (`keys`: its changes' keys alone,
     /// every value left out as `None`).
-    pub(crate) fn subscribe(
-        &self,
-        program: ProgramId,
-        keys: bool,
-    ) -> mpsc::UnboundedReceiver<Published> {
-        let (sender, receiver) = mpsc::unbounded();
+    pub(crate) fn subscribe(&self, program: ProgramId, keys: bool) -> Subscription {
+        let (sender, changes) = mpsc::unbounded();
+        let (cut, dropped) = oneshot::channel();
+        let read = Arc::new(AtomicU64::new(0));
+        let subscription = Subscription {
+            changes,
+            read: read.clone(),
+            cut: dropped,
+        };
         let mut subscribers = self
             .subscribers
             .lock()
             .expect("the subscriber lock is never poisoned");
         let stopping = *self.shutdown.borrow();
         if stopping {
-            return receiver;
+            let _ = cut.send(());
+            return subscription;
         }
         subscribers.push(Subscriber {
             program,
             keys,
             sender,
+            since: *self.tips.borrow(),
+            read,
+            cut,
         });
-        receiver
+        subscription
     }
 
     pub(crate) fn hang_up(&self) {
-        self.subscribers
-            .lock()
-            .expect("the subscriber lock is never poisoned")
-            .clear();
+        let subscribers = std::mem::take(
+            &mut *self
+                .subscribers
+                .lock()
+                .expect("the subscriber lock is never poisoned"),
+        );
+        for subscriber in subscribers {
+            let _ = subscriber.cut.send(());
+        }
     }
 
+    /// Each socket's word for the block. At the block that closes an
+    /// epoch, a socket that was open at the previous epoch's close but has
+    /// answered no ping since hasn't read for a whole epoch: it is dropped,
+    /// its queue with it, and its client reads again when it reconnects.
     pub fn publish(&self, applied: &Applied) {
         self.live.invalidate(&applied.writes);
+        let height = applied.height;
+        let closes = self.network.closes_an_epoch(height);
+        let last = height.checked_sub(self.network.epoch_length);
         let mut subscribers = self
             .subscribers
             .lock()
             .expect("the subscriber lock is never poisoned");
         subscribers.retain(|subscriber| {
+            if let Some(last) = last.filter(|_| closes)
+                && subscriber.since < last
+                && subscriber.read.load(Ordering::Relaxed) < last
+            {
+                return false;
+            }
             let Some(writes) = applied.writes.programs.get(&subscriber.program) else {
-                return subscriber.sender.unbounded_send(Published::Quiet).is_ok();
+                return subscriber
+                    .sender
+                    .unbounded_send(Published::Ping(height))
+                    .is_ok();
             };
             let value = |value: &Option<Vec<u8>>| match subscriber.keys {
                 true => None,
@@ -231,10 +276,13 @@ impl<E: Context> Daemon<E> {
                     .map(|(key, written)| (key.clone(), value(written)))
                     .collect(),
             };
-            subscriber
-                .sender
-                .unbounded_send(Published::Change(change))
-                .is_ok()
+            let sent = subscriber.sender.unbounded_send(Published::Change(change));
+            sent.is_ok()
+                && (!closes
+                    || subscriber
+                        .sender
+                        .unbounded_send(Published::Ping(height))
+                        .is_ok())
         });
     }
 }
