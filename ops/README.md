@@ -126,6 +126,15 @@ scripts back a `make` target; see the repository `Makefile`.
   each change the watch hears asks egress again, and once the request is
   gone it answers 502 and runs nothing. A container that ended, or a pod
   that failed, succeeded or was deleted, answers kubectl's failure at once.
+- An exec kubectl could not take to the API server (`apiserver not ready`,
+  `the server is currently unable to handle the request`, `ServiceUnavailable`,
+  a refused connection to it) never reached its container, so it is sent again,
+  the pause doubling from a second, while the egress request that asked is
+  open; once it is gone the answer is 503 `apiserver unavailable: …` and
+  nothing ran. An exec whose own stream was cut while its command ran
+  (`websocket: close 1006`) is never run again: it answers 502 `apiserver
+  unavailable: …`, saying the command may still be running in the pod. A
+  streamed exec ends with either as its `refused` event.
 - An exec runs its command once per egress request (the `ducktape-chain`,
   `ducktape-program` and `ducktape-request` headers). A node that restarted
   calls each request still open again, and that call waits for the command
@@ -168,6 +177,11 @@ scripts back a `make` target; see the repository `Makefile`.
   the pod's inputs and `/out`. `volume_disks` holds, once per node, the used and
   capacity bytes of the disk under the pods' inputs and `/out`. `claims`
   lists only the claims no pod owns.
+- A `scratch` input (`{"path", "scratch": {"medium": "Memory"}}`) is an
+  empty directory in the pod's memory (an `emptyDir` of medium `Memory`):
+  nothing is fetched into it, and what is written there never reaches the
+  node's disk. It counts against the pod's memory, so a pod that builds into
+  it states a memory request sized to what it writes.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one post there when it ends, mentioning its `requester`: the run
   container's exit code, or why fetching its inputs or the pod failed. A pod

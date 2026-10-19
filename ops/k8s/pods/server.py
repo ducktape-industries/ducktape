@@ -55,8 +55,11 @@ SPEC = {
 RESOURCES = {"limits": dict, "requests": dict}
 AMOUNTS = {"cpu": str, "memory": str}
 NOTIFY = {"channel": str, "thread": int}
-INPUT = {"path": str, "forge": dict, "files": dict, "blob": str}
-SOURCES = ("forge", "files", "blob")
+INPUT = {"path": str, "forge": dict, "files": dict, "blob": str, "scratch": dict}
+SOURCES = ("forge", "files", "blob", "scratch")
+SCRATCH = "scratch"
+SCRATCH_SHAPE = {"medium": str}
+SCRATCH_MEDIUM = "Memory"
 FORGE = {"repo": str, "commit": str}
 FILES = {"path": str, "snapshot": str}
 BLOB = {"path": str, "kind": str, "container": str}
@@ -132,6 +135,16 @@ DROPPED = (
     "use of closed network connection",
     "http2: client connection lost",
 )
+UNREACHED = (
+    "the server is currently unable to handle the request",
+    "apiserver not ready",
+    "unable to connect to the server",
+    "did you specify the right host or port",
+    "error from server (serviceunavailable)",
+    "error from server (internalerror)",
+    "error from server (timeout)",
+)
+CUT = ("websocket: close 1006", "abnormal closure")
 UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
 UNPLACED = "does not have a host assigned"
 REQUEST_NUMBER = re.compile(r"[0-9]+")
@@ -201,6 +214,20 @@ def kube_refusal(ran, doing):
 def dropped(text):
     lowered = text.lower()
     return any(words in lowered for words in DROPPED)
+
+
+def ran_its_command(ran):
+    return re.search(r"command terminated with exit code \d+", ran.err) is not None
+
+
+def unreached(ran):
+    lowered = ran.err.lower()
+    return ran.code != 0 and not ran_its_command(ran) and any(words in lowered for words in UNREACHED)
+
+
+def cut(ran):
+    lowered = ran.err.lower()
+    return ran.code != 0 and not ran_its_command(ran) and any(words in lowered for words in CUT)
 
 
 # files refused a commit because its head moved after it was read: the base it named is a
@@ -647,6 +674,10 @@ def input_of(given, index):
                 blob_id(files["snapshot"])
         case "blob":
             blob_id(given["blob"])
+        case "scratch":
+            scratch = named(checked(given["scratch"], SCRATCH_SHAPE, f"{what}'s scratch"), ["medium"], f"{what}'s scratch")
+            if scratch["medium"] != SCRATCH_MEDIUM:
+                raise Refused(400, f"{what}'s scratch medium is {SCRATCH_MEDIUM}: a scratch input lives in the pod's memory, never on the node's disk")
     return given
 
 
@@ -678,15 +709,25 @@ def claimed(name, labels):
     return {"name": name, "ephemeral": {"volumeClaimTemplate": template}}
 
 
+def input_mount(index, given):
+    if SCRATCH in given:
+        return {"name": f"in-{index}", "mountPath": given["path"]}
+    return {"name": f"in-{index}", "mountPath": given["path"], "subPath": "data"}
+
+
+def input_volume(index, given, labels):
+    if SCRATCH in given:
+        return {"name": f"in-{index}", "emptyDir": {"medium": given[SCRATCH]["medium"]}}
+    return claimed(f"in-{index}", labels)
+
+
 def pod_spec(asked, spec, fetching, namespace):
     named(spec, ["image"], "a pod")
     env = spec.get("env", {})
     if not all(isinstance(value, str) for value in env.values()):
         raise Refused(400, "env maps names to strings")
     inputs = [input_of(given, index) for index, given in enumerate(spec.get("inputs", []))]
-    mounts = [{"name": OUT, "mountPath": OUT_PATH}] + [
-        {"name": f"in-{index}", "mountPath": given["path"], "subPath": "data"} for index, given in enumerate(inputs)
-    ]
+    mounts = [{"name": OUT, "mountPath": OUT_PATH}] + [input_mount(index, given) for index, given in enumerate(inputs)]
     run_container = {
         "name": RUN,
         "image": spec["image"],
@@ -720,7 +761,7 @@ def pod_spec(asked, spec, fetching, namespace):
     if "resources" in spec:
         body["resources"] = resources_of(spec["resources"])
     labels = {**dict([MANAGED]), **labels_for(asked, spec.get("requester"))}
-    body["volumes"] = [claimed(OUT, labels)] + [claimed(f"in-{index}", labels) for index in range(len(inputs))]
+    body["volumes"] = [claimed(OUT, labels)] + [input_volume(index, given, labels) for index, given in enumerate(inputs)]
     if inputs:
         body["initContainers"] = [fetch_container(inputs, fetching)]
     return {
@@ -746,7 +787,7 @@ def fetch_container(inputs, fetching):
             {"name": "PODS_NODE", "value": fetching.node},
             {"name": "PODS_FORGE", "value": fetching.forge},
         ],
-        "volumeMounts": [{"name": f"in-{index}", "mountPath": f"{IN_ROOT}/{index}"} for index in range(len(inputs))],
+        "volumeMounts": [{"name": f"in-{index}", "mountPath": f"{IN_ROOT}/{index}"} for index, given in enumerate(inputs) if SCRATCH not in given],
         "terminationMessagePolicy": "FallbackToLogsOnError",
         "securityContext": confined(),
     }
@@ -1329,10 +1370,27 @@ class Service:
             return self.kube.exec(name, container, command)
 
         while True:
-            ran = self.retried(asked, attempt, failed) if again else attempt()
+            ran = self.through_apiserver(asked, name, lambda: self.retried(asked, attempt, failed) if again else attempt())
             waited = unstarted(ran, container)
             if waited is None or not self.started(asked, name, waited.container):
                 return ran
+
+    def through_apiserver(self, asked, name, attempt):
+        pause = RETRY_PAUSE
+        attempts = 0
+        while True:
+            ran = attempt()
+            if cut(ran):
+                raise Refused(502, f"apiserver unavailable: the exec's connection to pod {name} was cut while it ran ({ran.err}); its command may still be running there, so it was not run again")
+            if not unreached(ran):
+                return ran
+            attempts += 1
+            if attempts & (attempts - 1) == 0:
+                say("pods_retried", attempts=attempts, reason="apiserver_unreachable", detail=json.dumps(ran.err))
+            if not self.waiting(asked):
+                raise Refused(503, f"apiserver unavailable: {ran.err}; request {asked['request']}, which asked for this, is gone, so nothing ran")
+            self.pause(pause)
+            pause *= 2
 
     def started(self, asked, name, container):
         process = None
@@ -1867,6 +1925,8 @@ class Fetcher:
                     self.files_input(given["files"], target)
                 case ["blob"]:
                     self.blob_input(given["blob"], target)
+                case ["scratch"]:
+                    continue
                 case other:
                     raise Refused(400, f"input {index} names {other}, not one source")
             shared(target)

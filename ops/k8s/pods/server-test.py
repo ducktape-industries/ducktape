@@ -47,6 +47,8 @@ GONE = bytes([3, 0])
 COMMIT = "c0ffee" + "0" * 34
 HAVE = "be" * 20
 UNSTARTED = 'error: unable to upgrade connection: container not found ("run")'
+APISERVER = "Error from server (ServiceUnavailable): apiserver not ready"
+WEBSOCKET = "error: error reading from error stream: websocket: close 1006 (abnormal closure): unexpected EOF"
 UNPLACED = "error: unable to upgrade connection: pod duckpond-41 does not have a host assigned"
 FETCHING_STATE = {"waiting": {"reason": "PodInitializing"}}
 FAILED = {"terminated": {"exitCode": 128, "reason": "Error", "message": "clone failed"}}
@@ -485,6 +487,28 @@ class Create(Served):
         labels = self.created()["metadata"]["labels"]
         self.assertEqual(body["volumes"], [claimed(name, labels) for name in ("out", "in-0", "in-1", "in-2")])
 
+    def test_a_scratch_input_is_an_empty_directory_in_memory_that_nothing_fetches(self):
+        self.kube.answer("create", ran(pod_json()))
+        inputs = [
+            {"path": "/work/programs", "forge": {"repo": "programs", "commit": "83b18766"}},
+            {"path": "/var/tmp/target", "scratch": {"medium": "Memory"}},
+        ]
+        self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs})
+        body = self.created()["spec"]
+        (fetch,) = body["initContainers"]
+        self.assertEqual([mount["name"] for mount in fetch["volumeMounts"]], ["in-0"])
+        run = body["containers"][0]
+        self.assertEqual(run["volumeMounts"][2], {"name": "in-1", "mountPath": "/var/tmp/target"})
+        self.assertEqual(body["containers"][1]["volumeMounts"], run["volumeMounts"])
+        self.assertEqual(body["volumes"][2], {"name": "in-1", "emptyDir": {"medium": "Memory"}})
+        labels = self.created()["metadata"]["labels"]
+        self.assertEqual(body["volumes"][:2], [claimed("out", labels), claimed("in-0", labels)])
+
+    def test_a_scratch_input_lives_in_memory_only(self):
+        for scratch, words in (({}, "names its medium"), ({"medium": "Disk"}, "medium is Memory"), ({"medium": "Memory", "size": "1Gi"}, "no field size")):
+            self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": scratch}]}, 400, [words])
+        self.assertNotIn("create", self.kube.verbs())
+
     def test_an_input_names_one_source_an_absolute_path_and_well_formed_ids(self):
         two = {"path": "/a", "blob": CHUNKS[0], "files": {"path": "/b"}}
         self.refused("POST", "/v1/pods", {"image": "t", "inputs": [two]}, 400, ["input 0 names one source"])
@@ -843,6 +867,46 @@ class Retried(Served):
         status, answer = self.call("GET", "/v1/pods/duckpond-41")
         self.assertEqual(status, 500)
         self.assertIn("the pods service failed", answer["error"])
+
+
+class Unreached(Streamed):
+    def test_an_exec_the_api_server_could_not_take_is_sent_again_while_its_request_waits(self):
+        self.kube.answer("exec", ran(code=1, err=APISERVER), ran(code=1, err=APISERVER), ran(b"built\n"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})
+        self.assertEqual((status, answer["stdout"]), (200, "built\n"), answer)
+        self.assertEqual((self.kube.verbs(), self.paused), (["exec"] * 3, [1, 2]))
+        self.assertEqual(self.signer.queries, [("egress", server.egress_request(41))] * 2)
+
+    def test_once_its_request_is_gone_a_streamed_exec_ends_saying_the_apiserver_was_unavailable(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        self.kube.answer("exec", ran(code=1, err=APISERVER))
+        self.signer.request = ran(GONE)
+        kind, data = self.event(self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"], "every": 30}))
+        self.assertEqual((kind, data["status"]), ("refused", 503))
+        self.assertTrue(data["error"].startswith("apiserver unavailable: "), data)
+        self.assertIn("nothing ran", data["error"])
+        self.assertEqual(self.kube.verbs().count("exec"), 1)
+
+    def test_an_exec_whose_stream_was_cut_mid_run_is_not_run_again_and_says_so(self):
+        self.kube.answer("exec", ran(code=1, err=WEBSOCKET), ran(b"twice\n"))
+        answer = self.refused("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]}, 502, ["apiserver unavailable", "may still be running", "not run again"])
+        self.assertIn("close 1006", answer["error"])
+        self.assertEqual((self.kube.verbs(), self.paused), (["exec"], []))
+
+    def test_a_command_that_prints_the_apiserver_phrases_and_fails_is_answered_once_as_it_ran(self):
+        for printed in ("Unable to connect to the server: dial tcp", "websocket: close 1006 (abnormal closure)"):
+            with self.subTest(printed=printed):
+                self.kube.calls.clear()
+                self.kube.answer("exec", ran(code=1, err=f"{printed}\ncommand terminated with exit code 1"))
+                status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]}, asked(60 + len(printed)))
+                self.assertEqual((status, answer["exit_code"], answer["stderr"]), (200, 1, printed))
+                self.assertEqual((self.kube.verbs(), self.paused), (["exec"], []))
+
+    def test_a_command_that_fails_on_its_own_is_answered_as_it_ran(self):
+        self.kube.answer("exec", ran(code=2, err="make: *** [all] Error 2"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})
+        self.assertEqual((status, answer["exit_code"]), (200, 2))
+        self.assertEqual((self.kube.verbs(), self.paused, self.signer.queries), (["exec"], [], []))
 
 
 class Unstarted(Streamed):
@@ -1549,6 +1613,11 @@ class Fetch(unittest.TestCase):
         self.fetcher.fetch([{"path": "/w/a.wasm", "blob": CHUNKS[0]}], self.root)
         self.assertEqual(self.calls[0][0][-3:], ["blob", "get", CHUNKS[0]])
         self.assertEqual((self.root / "0" / "data").read_bytes(), b"\x00asm")
+
+    def test_a_scratch_input_fetches_nothing(self):
+        self.fetcher.fetch([{"path": "/var/tmp/target", "scratch": {"medium": "Memory"}}], self.root)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.root / "0").exists())
 
     def test_a_fetch_that_fails_says_what_and_why(self):
         self.slot(0)
