@@ -162,6 +162,7 @@ pub struct Applied {
     pub height: u64,
     pub admissions: Vec<Receipt>,
     pub submissions: Vec<Receipt>,
+    pub records: Vec<hook::Record>,
     pub writes: Writes,
     pub root: Root,
 }
@@ -457,6 +458,7 @@ where
                 overlay,
                 stage,
                 receipts,
+                Vec::new(),
                 Vec::new(),
             )
             .await?;
@@ -771,6 +773,7 @@ where
             .hooks(block.height, block.time, &overlay, &stage)
             .await?;
         let mut submissions = Vec::new();
+        let mut records = Vec::new();
         for (position, submission) in block.submissions.into_iter().enumerate() {
             let signer = submission.signer.clone();
             let target = submission.target.clone();
@@ -798,6 +801,7 @@ where
                     self.source()
                         .tell(&mut hooks, &record, block.time, &mut overlay, &mut stage)
                         .await?;
+                    records.push(record);
                     receipt
                 }
             };
@@ -826,6 +830,7 @@ where
                 stage,
                 admissions,
                 submissions,
+                records,
             )
             .await;
         let committed = self.store.clock().current();
@@ -1911,6 +1916,7 @@ where
         stage: Stage,
         admissions: Vec<Receipt>,
         submissions: Vec<Receipt>,
+        records: Vec<hook::Record>,
     ) -> Result<Applied> {
         overlay.set(RECENT, namespace::height(tip.height), abi::encode(&tip.id));
         if let Some(expired) = tip.height.checked_sub(ANCHOR_WINDOW) {
@@ -1936,6 +1942,7 @@ where
             height: tip.height,
             admissions,
             submissions,
+            records,
             writes,
             root: self.root()?,
         })

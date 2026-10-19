@@ -229,6 +229,22 @@ its own writes undone, and the block goes on. The founding file's `hooks`
 seeds the programs role's list; a running network hooks or unhooks a program
 through the programs role like any other change.
 
+Each node keeps an activity index of its own, in `activity/` under its data
+directory, which no commitment covers and state sync never ships: every frame
+a block carried (its height, position, time, signer, target and whether it
+applied), newest first network-wide, under its signer and under the account it
+acted as, each account's count of frames per program, and the refusal of
+each frame that did not apply. The host returns a
+block's records with its receipts (`host::Applied`'s `records`), and a thread
+of the node's own writes them after the block, so the index may lag the chain
+but never holds a block up. `POST /v1/activity` reads it: a borsh
+`noded::wire::activity::Query` (`Acted`, `Signed`, `Used` and `Frames`, each a
+page resumed by its `next`, and `Indexed`, the first height whose frames it
+holds and the newest it has indexed, and `Refusal`, why the frame at a height
+and position did not apply) answered by a `Reply`. An index opens at
+the node's tip, seeded from the `activity` program's tables where the network
+still runs that program, so a node's history starts where its index did.
+
 ```sh
 make -C programs wasm-founding                      # a programs checkout; a hosted network's is at a forge dev commit
 tar xzf programs/target/wasm32-unknown-unknown/release/founding.tar.gz

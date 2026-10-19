@@ -26,6 +26,7 @@ pub mod route {
     pub const BLOCKS: &str = "/v1/blocks";
     pub const BLOCK: &str = "/v1/block";
     pub const TX: &str = "/v1/tx";
+    pub const ACTIVITY: &str = "/v1/activity";
     pub const LOGS: &str = "/v1/logs";
     pub const ADMIN: &str = "/v1/admin";
     pub const SYNC: &str = "/v1/sync";
@@ -197,4 +198,77 @@ pub struct Network {
 pub struct PeerStatus {
     pub key: Vec<u8>,
     pub signed: Option<u64>,
+}
+
+pub mod activity {
+    use abi::role::identity::AccountNumber;
+    use abi::{ProgramId, Refusal};
+    use borsh::{BorshDeserialize, BorshSerialize};
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct PageRequest {
+        pub after: Option<Vec<u8>>,
+        pub limit: Option<u64>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct PageResponse<T> {
+        pub height: u64,
+        pub items: Vec<T>,
+        pub next: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Frame {
+        pub height: u64,
+        pub position: u32,
+        pub time: u64,
+        pub signer: Vec<u8>,
+        pub target: ProgramId,
+        pub applied: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Used {
+        pub account: AccountNumber,
+        pub program: ProgramId,
+        pub frames: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Indexed {
+        pub from: u64,
+        pub height: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Query {
+        Acted {
+            account: AccountNumber,
+            page: PageRequest,
+        },
+        Signed {
+            key: Vec<u8>,
+            page: PageRequest,
+        },
+        Used {
+            page: PageRequest,
+        },
+        Frames {
+            page: PageRequest,
+        },
+        Indexed,
+        Refusal {
+            height: u64,
+            position: u32,
+        },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub enum Reply {
+        Frames(PageResponse<Frame>),
+        Used(PageResponse<Used>),
+        Indexed(Indexed),
+        Refusal(Option<Refusal>),
+    }
 }

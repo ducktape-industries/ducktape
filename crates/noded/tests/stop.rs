@@ -272,15 +272,22 @@ fn a_node_stopped_while_it_serves_state_sync_and_compacts_logs_no_error_and_open
             .rposition(|line| line.contains(what))
             .unwrap_or_else(|| panic!("no {what}: {lines:#?}"))
     };
-    let flushed = at("fluent31::db flushed memtable");
-    let closed = at("fluent31::db store closed");
-    let stopped = at("event=\"node_stopped\"");
     let trigger = fluent31::Options::default().l0_compaction_trigger;
-    let compacting = lines[flushed].contains(&format!(" l0_runs={trigger} "));
-    assert!(
-        flushed < closed && compacting,
-        "the stop's flush fills level 0, so a compaction runs as the state closes: {lines:#?}"
-    );
+    let compacting = format!(" l0_runs={trigger} ");
+    let flushed = lines
+        .iter()
+        .rposition(|line| {
+            line.contains("fluent31::db flushed memtable") && line.contains(&compacting)
+        })
+        .unwrap_or_else(|| {
+            panic!("the stop's flush fills level 0, so a compaction runs as the state closes: {lines:#?}")
+        });
+    let closed = lines[flushed..]
+        .iter()
+        .position(|line| line.contains("fluent31::db store closed"))
+        .map(|after| flushed + after)
+        .unwrap_or_else(|| panic!("the state never closed: {lines:#?}"));
+    let stopped = at("event=\"node_stopped\"");
     assert!(
         closed < stopped,
         "the state closes before the node says it stopped"
@@ -302,11 +309,21 @@ fn a_node_stopped_while_it_serves_state_sync_and_compacts_logs_no_error_and_open
     second.thread.join().unwrap();
 
     let lines = logs.lines();
-    let opened = lines
+    let restarted = lines
         .iter()
-        .rfind(|line| line.contains("fluent31::db store opened"))
+        .position(|line| line.contains("event=\"node_stopped\""))
         .unwrap_or_else(|| panic!("{lines:#?}"));
-    assert!(opened.contains("records_replayed=0"), "{opened}");
+    let opened: Vec<&String> = lines[restarted..]
+        .iter()
+        .filter(|line| line.contains("fluent31::db store opened"))
+        .collect();
+    assert!(!opened.is_empty(), "{lines:#?}");
+    assert!(
+        opened
+            .iter()
+            .all(|line| line.contains("records_replayed=0")),
+        "{opened:#?}"
+    );
     let recovered: Vec<&String> = lines
         .iter()
         .filter(|line| line.starts_with("WARN commonware_storage"))

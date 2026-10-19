@@ -228,6 +228,7 @@ impl<E: Context> Running<E> {
         drop(rpc);
         marshal.stop().await;
         drop(mesh);
+        daemon.activity.close().await;
         let height = closed?;
         tracing::info!(
             target: "ducktape::node",
@@ -451,6 +452,11 @@ async fn start<E: Context>(
     let base = Arc::new(View::of(&node, &facts)?);
     let current = Arc::new(Current::new());
     current.views.store(Some(base.clone()));
+    let seeding = base.clone();
+    let activity =
+        crate::activity::Index::open(&workspace.dir().join(crate::activity::DIR), move || {
+            seed_of(&seeding)
+        })?;
 
     // the live door opens on its socket here, beside halo's, before consensus does any work
     let (shutdown, _) = watch::channel(false);
@@ -574,6 +580,7 @@ async fn start<E: Context>(
         anchors: marshal.mailbox().clone(),
         summaries,
         recent: crate::blocks::Recent::new(),
+        activity,
         logs,
         shutdown,
         tips,
@@ -633,6 +640,18 @@ async fn start<E: Context>(
         mesh,
         tasks,
         rpc,
+    })
+}
+
+fn seed_of<E: Context>(view: &View<E>) -> Result<crate::activity::Seed> {
+    let rows = view
+        .source()
+        .view(Layer::Confirmed)
+        .scan(crate::activity::PROGRAM, &Scan::prefix(b""))
+        .map_err(host::Error::from)?;
+    Ok(crate::activity::Seed {
+        height: view.tip().height,
+        rows,
     })
 }
 
@@ -1307,7 +1326,15 @@ async fn applied<E: Context>(
             let spent = node.host().spent();
             phases.executing = spent.executing;
             phases.committing = spent.committing;
+            let records = std::mem::take(&mut applied.records);
+            let refused = crate::activity::refused(&records, &receipts);
             phases.waiting = daemon.record(node, block, ran, Some(receipts)).await?;
+            daemon.activity.offer(crate::activity::Block {
+                height: block.height,
+                time: block.time,
+                records,
+                refused,
+            });
             phases.recording = lap.lap();
             daemon.publish(&applied);
             let validators = node.host().role(role::VALIDATORS)?;

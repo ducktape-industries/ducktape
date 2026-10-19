@@ -145,6 +145,7 @@ blob = { path = "crates/blob", default-features = false }
 borsh-json = { git = "https://github.com/ducktape-industries/programs", rev = "15f232d1a4bd1b5fbac526f392d9029c2aa306df" }
 identity = { git = "https://github.com/ducktape-industries/programs", rev = "15f232d1a4bd1b5fbac526f392d9029c2aa306df" }
 programs-sdk = { package = "program", git = "https://github.com/ducktape-industries/programs", rev = "15f232d1a4bd1b5fbac526f392d9029c2aa306df" }
+store = { git = "https://github.com/ducktape-industries/programs", rev = "15f232d1a4bd1b5fbac526f392d9029c2aa306df" }
 
 # the rng bounds commonware-runtime 2026.9.0 depends on (a different
 # semver-major would be a different trait).

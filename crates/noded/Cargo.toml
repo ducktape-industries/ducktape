@@ -17,6 +17,7 @@ commonware-p2p = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-utils = { workspace = true }
 consensus = { workspace = true }
+fluent31 = { workspace = true }
 futures = { workspace = true }
 governor = { workspace = true }
 halo = { workspace = true }
@@ -56,6 +57,7 @@ fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }
 fixture-valset = { path = "../kernel/fixtures/valset" }
 fixture-wasm = { workspace = true }
-fluent31 = { workspace = true }
+programs-sdk = { workspace = true }
+store = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

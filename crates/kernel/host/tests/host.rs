@@ -3242,6 +3242,22 @@ fn a_hook_is_told_of_every_carried_frame_after_it_runs_and_changes_none() {
         assert_eq!(preconfirmed, None, "a preconfirmed frame is told nothing");
         let applied = host.apply(block(1, frames())).await.unwrap();
         assert_eq!(applied.submissions, unhooked.submissions);
+        let records = vec![
+            told_of("ping", SIGNER, Some(ACCOUNT), true),
+            hook::Record {
+                position: 1,
+                ..told_of("ping", SIGNER, Some(ACCOUNT), false)
+            },
+            hook::Record {
+                position: 3,
+                ..told_of("ping", b"nobody", None, true)
+            },
+        ];
+        assert_eq!(
+            unhooked.records, records,
+            "a block returns its records unhooked too"
+        );
+        assert_eq!(applied.records, records);
         assert_eq!(
             stored(&host, "ping", b"got/ping/0"),
             stored(&plain, "ping", b"got/ping/0")

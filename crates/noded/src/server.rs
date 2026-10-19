@@ -94,7 +94,7 @@ fn yielding(cpus: &[usize]) {
 }
 
 #[cfg(target_os = "linux")]
-fn lowest_priority() {
+pub(crate) fn lowest_priority() {
     const LOWEST: i32 = 19;
     let thread = rustix::thread::gettid();
     if let Err(error) = rustix::process::setpriority_process(Some(thread), LOWEST) {
@@ -103,7 +103,7 @@ fn lowest_priority() {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lowest_priority() {}
+pub(crate) fn lowest_priority() {}
 
 impl Drop for Rpc {
     fn drop(&mut self) {
@@ -126,6 +126,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::BLOCKS, post(blocks::<E>))
         .route(route::BLOCK, post(block::<E>))
         .route(route::TX, post(tx::<E>))
+        .route(route::ACTIVITY, post(activity::<E>))
         .route(route::LOGS, get(logs::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::SYNC, post(sync::<E>))
@@ -597,6 +598,21 @@ async fn tx<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Located
     };
     match ctx.tx(ask).await {
         Ok(tx) => Reply::Answered(tx),
+        Err(error) => failed(error),
+    }
+}
+
+async fn activity<E: Context>(
+    ctx: Ctx<E>,
+    Whole(body): Whole,
+) -> Reply<crate::wire::activity::Reply> {
+    let query: crate::wire::activity::Query = match abi::decode(&body) {
+        Ok(query) => query,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match ctx.activity(query).await {
+        Ok(Ok(reply)) => Reply::Answered(reply),
+        Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }
 }

@@ -13,7 +13,7 @@ use node::{Preconfirm, Source, Taken};
 
 use crate::changes::Subscription;
 use crate::view::{Reading, View};
-use crate::wire::{BlockAsk, Blocks, Finalized, Located, Network, Page, TxAsk};
+use crate::wire::{BlockAsk, Blocks, Finalized, Located, Network, Page, TxAsk, activity};
 use crate::{Context, Daemon, Error, Result};
 
 pub(crate) struct Ctx<E: Context> {
@@ -101,6 +101,14 @@ impl<E: Context> Ctx<E> {
 
     pub(crate) async fn tx(&self, ask: TxAsk) -> Result<Option<Located>> {
         self.daemon.tx(ask).await
+    }
+
+    pub(crate) async fn activity(
+        &self,
+        query: activity::Query,
+    ) -> Result<std::result::Result<activity::Reply, Refusal>> {
+        let reads = self.daemon.activity.reads();
+        crate::offload(move || reads.read(query)).await?
     }
 
     pub(crate) fn blobs(&self) -> &blob::service::Service {

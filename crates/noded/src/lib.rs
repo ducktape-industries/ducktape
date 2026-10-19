@@ -1,3 +1,4 @@
+mod activity;
 mod blocks;
 mod changes;
 mod client;
@@ -97,6 +98,8 @@ pub enum Error {
     #[error(transparent)]
     Summaries(#[from] consensus::SummariesError),
     #[error(transparent)]
+    Store(#[from] fluent31::Error),
+    #[error(transparent)]
     Marshal(#[from] consensus::MarshalError),
     #[error(transparent)]
     Lane(#[from] halo::Taken),
@@ -145,6 +148,7 @@ pub struct Daemon<E: Context> {
     pub anchors: MarshalMailbox,
     pub summaries: Summaries<E>,
     recent: blocks::Recent,
+    activity: activity::Index,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub tips: watch::Sender<u64>,
@@ -162,6 +166,10 @@ pub struct Daemon<E: Context> {
 impl<E: Context> Daemon<E> {
     pub fn view(&self) -> Result<Arc<View<E>>> {
         self.current.view()
+    }
+
+    pub fn indexed(&self) -> watch::Receiver<Option<wire::activity::Indexed>> {
+        self.activity.indexed()
     }
 
     pub(crate) fn facts(&self) -> view::Facts<'_> {

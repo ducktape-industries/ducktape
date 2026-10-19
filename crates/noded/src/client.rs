@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
     BlockAsk, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
-    Status, Submit, Submitted, TxAsk, route,
+    Status, Submit, Submitted, TxAsk, activity, route,
 };
 use crate::{Error, Result};
 
@@ -191,6 +191,10 @@ impl Client {
         self.post(route::TX, &ask).await
     }
 
+    pub async fn activity(&self, query: &activity::Query) -> Result<activity::Reply> {
+        self.post(route::ACTIVITY, query).await
+    }
+
     pub async fn logs(&self) -> Result<Vec<String>> {
         self.fetch(route::LOGS).await
     }
@@ -311,6 +315,7 @@ impl Fault for Error {
             | Error::Blob(_)
             | Error::Sync(_)
             | Error::Summaries(_)
+            | Error::Store(_)
             | Error::Marshal(_)
             | Error::Lane(_)
             | Error::Membership(_)
