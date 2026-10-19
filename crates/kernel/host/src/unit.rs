@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::role::identity::AccountNumber;
-use abi::role::ownership::{self, Table, Write};
+use abi::role::ownership::{self, Write};
 use abi::{
     BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
     ProgramCall, ProgramId, Receipt, Refusal, Roles, reason, role,
@@ -48,12 +48,6 @@ impl Loaded {
             Slot::Running { module, .. } => Some(module),
             Slot::Awaiting { .. } => None,
         }
-    }
-
-    /// The tables `program`'s running code declares; none for a program
-    /// that does not run here.
-    pub fn tables(&self, program: &str) -> &[Table] {
-        self.module(program).map_or(&[], Code::tables)
     }
 
     pub fn code(&self, program: &str) -> Option<BlobId> {
@@ -286,6 +280,7 @@ where
                 HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not await"))
             }
             HostOp::Set { .. }
+            | HostOp::SetOwned { .. }
             | HostOp::Delete(_)
             | HostOp::BlobPut { .. }
             | HostOp::Emit(_)
@@ -548,7 +543,6 @@ pub struct Effects {
     pub resumes: Vec<Resumed>,
     pub deferred: bool,
     pub parked: Option<Suspended>,
-    /// Each owned key a guarded run wrote, once, in key order.
     pub writes: Vec<Write>,
 }
 
@@ -592,26 +586,38 @@ where
     effects: Effects,
     output: Vec<u8>,
     fault: Option<Error>,
-    guarded: bool,
-    tables: &'a [Table],
-    touched: BTreeMap<Vec<u8>, bool>,
+    guardian: Option<ProgramId>,
+    touched: BTreeMap<Vec<u8>, Touch>,
+}
+
+struct Touch {
+    existed: bool,
+    recorded: bool,
+    claimed: Option<String>,
 }
 
 impl<E> Execute<'_, E>
 where
     E: Context + Spawner,
 {
-    /// Notes, the first time a guarded run touches an owned key, whether a
-    /// value was there before the run.
-    fn note(&mut self, key: &[u8]) -> Result<()> {
-        let unwatched = !self.guarded || ownership::shared(self.tables, key);
-        let noted = self.touched.contains_key(key);
-        if unwatched || noted {
+    fn note(&mut self, key: &[u8], claim: Option<String>) -> Result<()> {
+        let Some(guardian) = &self.guardian else {
+            return Ok(());
+        };
+        if let Some(touch) = self.touched.get_mut(key) {
+            touch.claimed = claim.or(touch.claimed.take());
             return Ok(());
         }
         let view = View::new(self.world.store.reads(), vec![&*self.overlay]);
         let existed = view.get(&self.env.me, key)?.is_some();
-        self.touched.insert(key.to_vec(), existed);
+        let record = ownership::record_key(&self.env.me, key);
+        let recorded = view.get(guardian, &record)?.is_some();
+        let touch = Touch {
+            existed,
+            recorded,
+            claimed: claim,
+        };
+        self.touched.insert(key.to_vec(), touch);
         Ok(())
     }
 
@@ -702,11 +708,15 @@ where
     async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply {
         let me = self.env.me.clone();
         let result = match op {
-            HostOp::Set { key, value } => self.note(&key).map(|()| {
+            HostOp::Set { key, value } => self.note(&key, None).map(|()| {
                 self.overlay.set(&me, key, value);
                 HostReply::Done
             }),
-            HostOp::Delete(key) => self.note(&key).map(|()| {
+            HostOp::SetOwned { key, value, kind } => self.note(&key, Some(kind)).map(|()| {
+                self.overlay.set(&me, key, value);
+                HostReply::Done
+            }),
+            HostOp::Delete(key) => self.note(&key, None).map(|()| {
                 self.overlay.delete(&me, key);
                 HostReply::Done
             }),
@@ -787,7 +797,12 @@ where
         ProgramCall::Execute(_) | ProgramCall::Resume { .. }
     );
     let guarded = guarded(&invocation.env, &invocation.call);
-    let tables = world.loaded.tables(program);
+    let guardian = invocation
+        .env
+        .roles
+        .get(role::OWNERSHIP)
+        .filter(|_| guarded)
+        .cloned();
     let (verdict, events, mut effects, output, fault, touched) = {
         let mut unit = Execute {
             world,
@@ -799,8 +814,7 @@ where
             effects: Effects::default(),
             output: Vec::new(),
             fault: None,
-            guarded,
-            tables,
+            guardian,
             touched: BTreeMap::new(),
         };
         let runtime = world.loaded.runtime();
@@ -844,7 +858,7 @@ where
     };
     let effects = match &outcome {
         Outcome::Applied { .. } => Effects {
-            writes: written(world.store.reads(), overlay, program, tables, touched)?,
+            writes: written(world.store.reads(), overlay, program, touched)?,
             ..effects
         },
         Outcome::Rejected(_) => {
@@ -862,29 +876,27 @@ where
     Ok((receipt, effects))
 }
 
-/// The owned keys a run touched, as they stand once it returns: whether each
-/// held a value before it and holds one after. A key that held none either
-/// side changed nothing, and is left out.
 fn written(
     storage: &Reads,
     overlay: &Overlay,
     program: &str,
-    tables: &[Table],
-    touched: BTreeMap<Vec<u8>, bool>,
+    touched: BTreeMap<Vec<u8>, Touch>,
 ) -> Result<Vec<Write>> {
     let view = View::new(storage, vec![overlay]);
     let mut writes = Vec::new();
-    for (key, existed) in touched {
+    for (key, touch) in touched {
         let kept = view.get(program, &key)?.is_some();
-        let changed = existed || kept;
-        if !changed {
+        let changed = touch.existed || kept;
+        let created = !touch.existed && kept;
+        let claims = created && touch.claimed.is_some();
+        let asks = claims || (changed && touch.recorded);
+        if !asks {
             continue;
         }
-        let kind = ownership::kind_of(tables, &key);
         writes.push(Write {
             key,
-            kind,
-            existed,
+            claimed: touch.claimed,
+            existed: touch.existed,
             kept,
         });
     }

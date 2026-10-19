@@ -143,25 +143,27 @@ through `HostOp::Resource`. A key shaped like a path answers to the nearest
 list on it or above it, and no list anywhere means anyone may act. A query is
 never checked.
 
-Every key a program writes is owned unless the program declares the table it
-falls in shared: a module's `ducktape.tables` custom section, borsh
-`Vec<role::ownership::Table>`, each a key prefix that is `Shared` or
-`Owned(kind)`, the longest prefix deciding. A module with no such section
-declares nothing, so every key it writes is owned; one whose section does not
-decode, or that carries it twice, does not load. While an op runs, or a
-parked op resumes, the host notes the first time it touches each owned key
-and whether the key held a value before. Once the run returns, and before
-anything it emitted is delivered, the host makes one call to the program
-filling the ownership role, `role::ownership::Op::Guard`, from the `System`
-origin: the program written, the frame's origin and sender, and each owned
-key with its table's kind, whether it existed before the run and whether it
-holds a value after it (a key that held none on either side is left out). The
-ownership program decides; its refusal undoes the run, and a guard that
-sends, calls, defers or parks is refused. A run that wrote no owned key makes
-no call, and the kernel's own runs (`System` origin), a message the program
-filling the validators role sent, and the ownership program's own runs are
-not guarded. The ownership role is an optional row: on a network that binds
-no program to it the host notes nothing and makes no call, and every frame
+Every key a program writes is shared unless the program claims it as it
+creates it: `HostOp::SetOwned { key, value, kind }` writes as `Set` does and
+claims the key as an item of `kind`, while `Set` and `Delete` claim nothing.
+While an op runs, or a parked op resumes, on a network that binds a program
+to the ownership role, the host notes the first time the run touches each key:
+whether it held a value before the run, and whether the ownership program
+holds a record for it, read in that program's state at
+`role::ownership::record_key(program, key)`. Once the run returns, and before
+anything it emitted is delivered, the host makes one call to the ownership
+program, `role::ownership::Op::Guard`, from the `System` origin: the program
+written, the frame's origin and sender, and each key the run created with a
+claim or changed while it had a record, with the kind it was claimed as,
+whether it held a value before the run and whether it holds one after it. A
+claim on a key that already held a value is an ordinary write. The ownership
+program decides; its refusal undoes the run, and a guard that sends, calls,
+defers or parks is refused. A run that claimed no new key and changed no
+recorded key makes no call, and the kernel's own runs (`System` origin), a
+message the program filling the validators role sent, and the ownership
+program's own runs are not guarded. The ownership role is an optional row: on
+a network that binds no program to it the host notes nothing and makes no
+call, `SetOwned` writes as `Set` does, and every frame
 runs as it would without the guard. As the kernel admits a
 program, at founding or later off the programs role, it gives the program an
 account: the identity role's

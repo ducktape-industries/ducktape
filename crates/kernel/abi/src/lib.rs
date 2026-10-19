@@ -434,6 +434,11 @@ pub enum HostOp {
         program: ProgramId,
         key: String,
     },
+    SetOwned {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        kind: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -1297,43 +1302,27 @@ pub mod role {
     pub mod ownership {
         use crate::{BorshDeserialize, BorshSchema, BorshSerialize, Origin, Principal, ProgramId};
 
-        pub const TABLES_SECTION: &str = "ducktape.tables";
-
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
-        pub enum TableKind {
-            Shared,
-            Owned(String),
+        pub fn record_key(program: &str, key: &[u8]) -> Vec<u8> {
+            let mut bytes = b"record/".to_vec();
+            escaped(&mut bytes, program.as_bytes());
+            escaped(&mut bytes, key);
+            bytes
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
-        pub struct Table {
-            pub prefix: Vec<u8>,
-            pub kind: TableKind,
-        }
-
-        pub fn table_of<'t>(tables: &'t [Table], key: &[u8]) -> Option<&'t Table> {
-            tables
-                .iter()
-                .filter(|table| key.starts_with(&table.prefix))
-                .max_by_key(|table| table.prefix.len())
-        }
-
-        pub fn shared(tables: &[Table], key: &[u8]) -> bool {
-            let table = table_of(tables, key);
-            matches!(table.map(|table| &table.kind), Some(TableKind::Shared))
-        }
-
-        pub fn kind_of(tables: &[Table], key: &[u8]) -> Option<String> {
-            match &table_of(tables, key)?.kind {
-                TableKind::Owned(kind) => Some(kind.clone()),
-                TableKind::Shared => None,
+        fn escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+            for &byte in bytes {
+                out.push(byte);
+                if byte == 0 {
+                    out.push(0xFF);
+                }
             }
+            out.extend_from_slice(&[0, 0]);
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub struct Write {
             pub key: Vec<u8>,
-            pub kind: Option<String>,
+            pub claimed: Option<String>,
             pub existed: bool,
             pub kept: bool,
         }
@@ -1987,30 +1976,29 @@ mod tests {
     }
 
     #[test]
-    fn an_owned_key_answers_to_the_longest_table_it_falls_under() {
-        use role::ownership::{Guard, Op, Table, TableKind, Write, kind_of, shared, table_of};
-        let tables = vec![
-            Table {
-                prefix: b"m/".to_vec(),
-                kind: TableKind::Owned("chat.message".into()),
-            },
-            Table {
-                prefix: b"m/h/".to_vec(),
-                kind: TableKind::Shared,
-            },
-        ];
-        assert_eq!(table_of(&tables, b"m/h/7"), Some(&tables[1]));
-        assert!(shared(&tables, b"m/h/7"));
-        assert_eq!(kind_of(&tables, b"m/7").as_deref(), Some("chat.message"));
-        assert!(!shared(&tables, b"x") && kind_of(&tables, b"x").is_none());
-        assert_eq!(decode::<Vec<Table>>(&encode(&tables)).unwrap(), tables);
+    fn a_record_key_is_ownerships_records_key_byte_for_byte() {
+        use role::ownership::{Guard, Op, Write, record_key};
+        let expected = b"record/chat\0\0m\0\xff/7\0\0".to_vec();
+        assert_eq!(record_key("chat", b"m\0/7"), expected);
+        assert_eq!(record_key("", b""), b"record/\0\0\0\0".to_vec());
+        let set = HostOp::Set {
+            key: b"k".to_vec(),
+            value: Vec::new(),
+        };
+        let claim = HostOp::SetOwned {
+            key: b"k".to_vec(),
+            value: Vec::new(),
+            kind: "chat.message".into(),
+        };
+        assert_eq!((encode(&set)[0], encode(&claim)[0]), (1, 21));
+        assert_eq!(decode::<HostOp>(&encode(&claim)).unwrap(), claim);
         let guard = Op::Guard(Guard {
             program: "chat".into(),
             origin: Origin::Program("harness".into()),
             sender: Some(Principal::Account(17)),
             writes: vec![Write {
                 key: b"m/7".to_vec(),
-                kind: Some("chat.message".into()),
+                claimed: Some("chat.message".into()),
                 existed: false,
                 kept: true,
             }],

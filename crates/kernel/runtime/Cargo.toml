@@ -9,7 +9,6 @@ async-trait = { workspace = true }
 borsh = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
-wasmparser = { workspace = true }
 wasmtime = { workspace = true }
 
 [dev-dependencies]

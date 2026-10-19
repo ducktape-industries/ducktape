@@ -4233,7 +4233,6 @@ dependencies = [
  "futures",
  "sha2 0.10.9",
  "tokio",
- "wasmparser 0.251.0",
  "wasmtime",
  "wat",
 ]

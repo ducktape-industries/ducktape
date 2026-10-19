@@ -3,7 +3,6 @@ mod image;
 use std::future::Future;
 use std::sync::Arc;
 
-use abi::role::ownership::{TABLES_SECTION, Table};
 use abi::{HostOp, HostReply, Invocation, ProgramReply};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::future::{Either, select};
@@ -56,15 +55,6 @@ pub use image::{Image, PAGE_BYTES, Page};
 pub struct Code {
     module: Module,
     fresh: Arc<OnceCell<Vec<u8>>>,
-    tables: Arc<[Table]>,
-}
-
-impl Code {
-    /// The tables the program declares in its `ducktape.tables` section:
-    /// none when it has no such section, so every key it writes is owned.
-    pub fn tables(&self) -> &[Table] {
-        &self.tables
-    }
 }
 
 pub enum Ran {
@@ -135,11 +125,9 @@ impl Runtime {
 
     pub fn load(&self, bytes: &[u8]) -> Result<Code, Fault> {
         let module = Module::new(&self.engine, bytes).map_err(load)?;
-        let tables = tables_of(bytes)?;
         Ok(Code {
             module,
             fresh: Arc::new(OnceCell::new()),
-            tables: tables.into(),
         })
     }
 
@@ -359,36 +347,6 @@ fn restore(store: &mut Store<Data>, memory: Memory, restored: &[u8]) -> Result<(
     memory
         .write(&mut *store, 0, restored)
         .map_err(|e| Fault::Protocol(format!("the image does not fit its memory: {e}")))
-}
-
-/// The tables a module declares: its one `ducktape.tables` custom section,
-/// borsh `Vec<Table>`. A second such section, or one that does not decode,
-/// is a load fault, as a malformed module is.
-fn tables_of(bytes: &[u8]) -> Result<Vec<Table>, Fault> {
-    let mut declared = None;
-    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-        let payload = payload.map_err(|error| Fault::Load(error.to_string()))?;
-        let wasmparser::Payload::CustomSection(section) = payload else {
-            continue;
-        };
-        let names_the_tables = section.name() == TABLES_SECTION;
-        if !names_the_tables {
-            continue;
-        }
-        if declared.is_some() {
-            return Err(Fault::Load(format!(
-                "the program declares its {TABLES_SECTION} section twice"
-            )));
-        }
-        let tables = abi::decode::<Vec<Table>>(section.data()).map_err(|refusal| {
-            Fault::Load(format!(
-                "the program's {TABLES_SECTION} section does not decode: {}",
-                refusal.sentence
-            ))
-        })?;
-        declared = Some(tables);
-    }
-    Ok(declared.unwrap_or_default())
 }
 
 fn load(error: wasmtime::Error) -> Fault {

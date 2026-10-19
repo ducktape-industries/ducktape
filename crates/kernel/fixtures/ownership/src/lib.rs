@@ -1,6 +1,6 @@
 //! An ownership program for the kernel's tests: it allows each run the kernel's guard reports,
-//! keeping the last guard and a count, refuses a key a test denies, and can be told to send a
-//! message while it guards, which the kernel refuses.
+//! keeping the last guard and a count and a record for each claimed create until its key goes,
+//! refuses a key a test denies, and can be told to send a message while it guards.
 use abi::ProgramId;
 use abi::role::ownership::Guard;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -10,6 +10,7 @@ pub enum Op {
     Guard(Guard),
     Deny { program: ProgramId, key: Vec<u8> },
     Chatty,
+    Record { program: ProgramId, key: Vec<u8> },
 }
 
 pub const LAST: &[u8] = b"last";
@@ -23,13 +24,23 @@ pub fn denied(program: &str, key: &[u8]) -> Vec<u8> {
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::role::access::{Need, Resource};
-    use abi::role::ownership::Guard;
+    use abi::role::ownership::{Guard, Write, record_key};
     use abi::{Env, Origin, Refusal, reason};
     use program::{Execute, Program, Query, Reads};
 
     use crate::{CALLS, CHATTY, LAST, Op, denied};
 
     struct Ownership;
+
+    fn keep(ctx: &mut Execute, program: &str, write: &Write, owner: &[u8]) {
+        let at = record_key(program, &write.key);
+        let created = write.claimed.is_some() && !write.existed && write.kept;
+        match (created, write.kept) {
+            (true, _) => ctx.set(at, owner.to_vec()),
+            (false, false) => ctx.delete(at),
+            (false, true) => {}
+        }
+    }
 
     fn guard(ctx: &mut Execute, env: &Env, guard: Guard) -> Result<(), Refusal> {
         let by_the_kernel = env.origin == Origin::System;
@@ -44,6 +55,10 @@ mod program {
                     format!("{:?} may not write {:?}", guard.sender, write.key),
                 ));
             }
+        }
+        let owner = abi::encode(&guard.sender);
+        for write in &guard.writes {
+            keep(ctx, &guard.program, write, &owner);
         }
         let calls: u64 = ctx.record(CALLS)?.unwrap_or(0);
         ctx.put(CALLS, &(calls + 1));
@@ -64,6 +79,10 @@ mod program {
                 }
                 Op::Chatty => {
                     ctx.set(CHATTY, Vec::new());
+                    Ok(())
+                }
+                Op::Record { program, key } => {
+                    ctx.set(record_key(&program, &key), Vec::new());
                     Ok(())
                 }
             }
