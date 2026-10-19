@@ -12,7 +12,7 @@ use commonware_consensus::marshal::resolver::p2p as backfill;
 use commonware_consensus::marshal::standard::Standard;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::simplex::types::Finalization;
-use commonware_consensus::types::{FixedEpocher, Height, ViewDelta};
+use commonware_consensus::types::{Epoch, FixedEpocher, Height, ViewDelta};
 use commonware_cryptography::certificate::Verifier as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
@@ -20,6 +20,7 @@ use commonware_parallel::Sequential;
 use commonware_runtime::Handle;
 use commonware_runtime::buffer::paged::CacheRef;
 use commonware_storage::archive::{self, Archive as _, Identifier, immutable};
+use commonware_storage::metadata::{self, Metadata};
 use commonware_utils::vec::NonEmptyVec;
 use node::{Block, Digest};
 
@@ -42,6 +43,7 @@ const FREEZER_TABLE_INITIAL_SIZE: u32 = 1 << 16;
 const FREEZER_TABLE_RESIZE_FREQUENCY: u8 = 4;
 const FREEZER_TABLE_RESIZE_CHUNK_SIZE: u32 = 1 << 16;
 const FREEZER_VALUE_TARGET_SIZE: u64 = 1 << 26;
+const EPOCH_CACHE_BOUNDS: u8 = 0;
 
 pub type Certificate = Finalization<Scheme, Digest>;
 pub type MarshalMailbox = Mailbox<Scheme, Standard<Block>>;
@@ -86,6 +88,8 @@ impl Marshal {
         B: Blocker<PublicKey = PublicKey>,
     {
         let cadence = network.cadence;
+        let prefix = format!("{partition}-marshal");
+        seed_epoch_cache_floor(context.child("cache_floor"), &prefix, &anchor).await;
         let page_cache = CacheRef::from_pooler(
             &context,
             NonZeroU16::new(PAGE_SIZE).expect("nonzero"),
@@ -168,7 +172,7 @@ impl Marshal {
                     NonZeroU64::new(network.epoch_length).expect("an epoch spans blocks"),
                 ),
                 start: anchor.start(),
-                partition_prefix: format!("{partition}-marshal"),
+                partition_prefix: prefix,
                 mailbox_size: MAILBOX,
                 view_retention: ViewDelta::new(VIEW_RETENTION),
                 prunable_items_per_section: ITEMS_PER_SECTION,
@@ -319,6 +323,30 @@ impl<E: Context> Summaries<E> {
         let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
         Ok(kept.blocks.first_index().zip(kept.blocks.last_index()))
     }
+}
+
+async fn seed_epoch_cache_floor<E: Context>(context: E, prefix: &str, anchor: &Anchor) {
+    let Anchor::Finalized(certificate) = anchor else {
+        return;
+    };
+    let bounds = Metadata::<E, u8, (Epoch, Epoch)>::init(
+        context,
+        metadata::Config {
+            partition: format!("{prefix}-cache-metadata"),
+            codec_config: ((), ()),
+        },
+    )
+    .await
+    .expect("the epoch cache bounds open");
+    let recorded = bounds.get(&EPOCH_CACHE_BOUNDS).is_some();
+    if recorded {
+        return;
+    }
+    let floor = certificate.proposal.round.epoch();
+    bounds
+        .put_sync(EPOCH_CACHE_BOUNDS, (floor, floor))
+        .await
+        .expect("the epoch cache bounds write");
 }
 
 fn archive_config<C>(prefix: &str, page_cache: CacheRef, codec_config: C) -> immutable::Config<C> {
