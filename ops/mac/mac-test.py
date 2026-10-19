@@ -70,6 +70,9 @@ match sys.argv[2:]:
         state["devices"].append({"name": name, "udid": udid, "deviceTypeIdentifier": kind, "runtime": runtime, "state": "Shutdown", "isAvailable": True})
         save()
         print(udid)
+    case ["status_bar", udid, "override", "--time", time]:
+        device(udid)["clock"] = time
+        save()
     case ["bootstatus", udid, "-b"]:
         device(udid)["state"] = "Booted"
         save()
@@ -463,7 +466,18 @@ class Mac(unittest.TestCase):
         self.assertEqual(run["state"], "succeeded")
         created = next(call for call in self.calls() if call[2] == "create")
         self.assertEqual(created[3:], [f"ducktape-run-{run['id']}", KEPT["deviceTypeIdentifier"], KEPT["runtime"]])
+        held = [call[3:] for call in self.calls() if call[2] == "status_bar"]
+        self.assertEqual([at[1:] for at in held], [["override", "--time", "9:41"]])
+        self.assertNotEqual(held[0][0], "KEPT-1")
         self.assertEqual([device["udid"] for device in self.sim_state()["devices"]], ["KEPT-1"])
+
+    def test_the_status_bar_clock_holds_still_before_any_step(self):
+        self.start()
+        run = self.ended(self.ask(self.build(script={"steps": [{"launch": {}}]})))
+        self.assertEqual(run["state"], "succeeded")
+        names = [call[2] for call in self.calls() if call[0] == "xcrun" and call[3:4] == ["KEPT-1"]]
+        self.assertLess(names.index("status_bar"), names.index("launch"))
+        self.assertEqual(self.sim_state()["devices"][0]["clock"], "9:41")
 
     def test_a_run_left_working_is_interrupted_when_the_mac_starts_again(self):
         name = self.ask(self.build())

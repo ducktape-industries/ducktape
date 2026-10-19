@@ -31,6 +31,7 @@ CRASHES = Path.home() / "Library/Logs/DiagnosticReports"
 FRESH = "ducktape-run-"
 DRIVER = "TEST_RUNNER_DUCKTAPE_DRIVER"
 RELAY_DOWN_PAUSE = 5
+STILL_TIME = "9:41"
 KEEPALIVE = (10, 5, 3)
 
 
@@ -393,6 +394,7 @@ class Simulator:
             self.held = True
             self.udid = kept["udid"]
         self.simctl("bootstatus", self.udid, "-b")
+        self.simctl("status_bar", self.udid, "override", "--time", STILL_TIME)
         self.simctl("install", self.udid, str(self.app))
         self.container = Path(self.simctl("get_app_container", self.udid, self.bundle, "data").strip())
 
