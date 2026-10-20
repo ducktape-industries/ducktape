@@ -4,6 +4,7 @@
 import base64
 import binascii
 import copy
+import datetime
 import decimal
 import hashlib
 import itertools
@@ -205,6 +206,7 @@ MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-t
 WEIGHTS = frozenset({"heavy", "light", "quiet", "lane", "quick"})
 READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
 STARTED = re.compile(rb"^run (\S+)$", re.M)
+GO_TIME = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))? ([+-]\d{4})(?: \S+)?")
 AHEAD = re.compile(rb"ahead (heavy|lane|quick|light) ([0-9]+)")
 MOVABLE_RUN = re.compile(r"move (\S+) (heavy|lane|quick:\S+) ([0-9]+) (\S+)")
 LANE_WAIT = re.compile(r"(heavy|lane|quick:\S+) ([0-9]+)")
@@ -460,6 +462,20 @@ def post_message(channel, message_id, requester, line, thread):
 
 def chat_channel(channel):
     return u8(1) + borsh_text(channel)
+
+
+HELD = "held"
+
+
+def chat_message(message_id):
+    return u8(2) + borsh_text(message_id)
+
+
+def message_held(reply):
+    reader = Reader(reply)
+    if reader.u8() != 2:
+        raise Refused(502, "chat answered a message id with something else")
+    return reader.u8() == 1
 
 
 def chat_members(channel, after):
@@ -740,6 +756,15 @@ def notifies(words):
     except (binascii.Error, ValueError):
         return False
     return any(word.startswith(b"NOTIFY=") and word != b"NOTIFY=" for word in said)
+
+
+def go_time(text):
+    found = GO_TIME.fullmatch(text) if isinstance(text, str) else None
+    if found is None:
+        return None
+    clock, fraction, offset = found.groups()
+    whole = datetime.datetime.strptime(f"{clock} {offset}", "%Y-%m-%d %H:%M:%S %z").timestamp()
+    return whole + int((fraction or "0").ljust(9, "0")) / 1e9
 
 
 def on_machine(machine, ran, started=True):
@@ -1691,6 +1716,12 @@ class Notifier:
                 pause *= 2
 
     def post_once(self, notify, requester, message_id, line, unvouched):
+        try:
+            held = message_held(self.asked(chat_message(message_id)))
+        except Refused:
+            held = False
+        if held:
+            return HELD
         refused = self.refusal(notify["channel"], requester, unvouched)
         if refused is not None:
             reason, detail = refused
@@ -1741,17 +1772,21 @@ class Notifier:
             return "chat_unasked", refused.sentence
 
     def lines(self, name, requester, stream, unvouched=False):
-        self.each(name, requester, notify_lines(name, stream), unvouched)
+        return self.each(name, requester, notify_lines(name, stream), unvouched)
 
     def each(self, name, requester, said, unvouched=False):
+        held = 0
         for channel, line in said:
             message_id = notify_id(name, channel, line)
             with self.lock:
                 if message_id in self.posted.get(name, ()):
                     continue
-            if self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line, unvouched):
+            posted = self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line, unvouched)
+            if posted:
+                held += posted is HELD
                 with self.lock:
                     self.posted.setdefault(name, set()).add(message_id)
+        return held
 
     def follow(self, name, requester):
         try:
@@ -1849,6 +1884,7 @@ class Service:
         self.rest = self.desktop_wanted.wait
         self.retry_pause = fetching.block_ms / 1000
         self.clock = time.monotonic
+        self.wall = time.time
         self.signer = signer
         self.fetching = fetching
         self.stats = stats
@@ -2421,14 +2457,17 @@ class Service:
     def follow_desktop(self):
         with self.lock:
             if self.desktop_follower is None:
-                self.desktop_follower = threading.Thread(target=self.followed_desktop, args=(self.clock(),), daemon=True)
+                self.desktop_follower = threading.Thread(target=self.followed_desktop, args=(self.clock(), self.wall()), daemon=True)
                 self.desktop_follower.start()
         self.desktop_wanted.set()
 
-    def followed_desktop(self, begun):
+    def followed_desktop(self, begun, wall):
         since = begun
+        reached = False
         pause = self.retry_pause
         while True:
+            if not reached:
+                since, reached = self.runner_began(since, begun, wall)
             asked = self.clock()
             heard = []
             try:
@@ -2437,14 +2476,29 @@ class Service:
                 say("pods_unfollowed", pod=DESKTOP, detail=json.dumps(refused.sentence))
             else:
                 with process.stdout:
-                    self.notifier.lines(DESKTOP, None, heard_in(process.stdout, heard), unvouched=True)
-                say("pods_unfollowed", pod=DESKTOP, code=process.wait())
+                    held = self.notifier.lines(DESKTOP, None, heard_in(process.stdout, heard), unvouched=True)
+                say("pods_unfollowed", pod=DESKTOP, code=process.wait(), already_posted=held)
             if heard:
                 since, pause = asked, self.retry_pause
             self.rest(pause)
             if not heard:
                 pause *= 2
             self.desktop_wanted.clear()
+
+    def runner_began(self, since, begun, wall):
+        try:
+            said = self.desktop.state()
+        except Refused as refused:
+            say("pods_unresumed", pod=DESKTOP, detail=json.dumps(refused.sentence))
+            return since, False
+        if said.get("started") is None:
+            say("pods_unresumed", pod=DESKTOP, detail=json.dumps("the desktop's ping names no start time"))
+            return since, False
+        started = go_time(said["started"])
+        if started is None:
+            say("pods_unresumed", pod=DESKTOP, detail=json.dumps(f"the desktop's ping names its start as {said['started']!r}, not as podman's StartedAt (date, time, offset, zone)"))
+            return since, False
+        return min(since, begun - max(0.0, wall - started)), True
 
     def desktop_waited(self, process, every):
         ended = queue.Queue()
@@ -3007,6 +3061,8 @@ def main():
     service = Service(kube, signer, fetching, Stats(), Api(), desktop, os.environ.get("PODS_WARM_POD"))
     threading.Thread(target=service.notifier.watch, daemon=True).start()
     threading.Thread(target=service.sweeper, daemon=True).start()
+    if desktop.held():
+        service.follow_desktop()
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), handler(service))
     try:

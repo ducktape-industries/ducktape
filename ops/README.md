@@ -158,11 +158,19 @@ one up for another network.
   log from then on and ends when that stream does. A streamed exec and a wait keep the ssh
   connection alive at their own `every` (`ServerAliveInterval`). It is never
   deleted. With no Secret mounted every call to it answers 503. An exec whose
-  words name `NOTIFY=<channel>` starts one follower of the runner's log (kept
+  words name `NOTIFY=<channel>` starts one follower of the runner's log, and so
+  does the service's own start when the Secret is mounted (kept
   for good, and joined again a block's time after it breaks, from the time the
   last stream that delivered a line began, or at once when the next such exec
   comes; a join that delivers no line keeps that window and doubles the
-  pause): each `ducktape-notify`
+  pause). Its first window reaches back to when the runner started (its
+  ping's `started`, podman's StartedAt: date, time with up to nine fraction
+  digits, offset, zone), so a run that ended while the service was down, rolled
+  or restarted still posts its end; before any post, chat is asked for its message id
+  (`MessageById`, the line's hash), and one chat already holds is not
+  offered again: each stream's end line (`pods_unfollowed`) counts them
+  as `already_posted`, with no line of its own for each. While the ping names no start, or one not in
+  that shape, it reads from then on, logs `pods_unresumed` with why, and asks again on the next join. Each `ducktape-notify`
   line is posted as `desktop · <line>` in its channel, as `pods` with no
   mention, where the channel exists, is not archived and is open to anyone
   (a desktop run has no requester to vouch for a members-only room).

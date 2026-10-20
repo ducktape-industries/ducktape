@@ -1,6 +1,7 @@
 """Exercise the pods service over real HTTP against a recording kubectl, ducktape and kubelet, and its input fetcher against a recording runner; run by `make test`."""
 import base64
 import contextlib
+import datetime
 import http.client
 import socket
 import importlib.util
@@ -232,6 +233,7 @@ class Signer:
         self.queries = []
         self.asked = []
         self.rooms = {}
+        self.messages = set()
         self.put_ran = ran(b"sha256:ab12cd34ef56ab78cd90\nbundle 7 put at block 900\nbundle 7 held since block 901\n")
         self.submitted = ran(POOLED + b"landed 960 applied 00ff\n")
         self.head = ran(bytes([0, 1, 0]) + bytes.fromhex("ab" * 32) + b"rest of the row")
@@ -251,6 +253,8 @@ class Signer:
     def query(self, program, request):
         if program == "chat":
             self.asked.append(request)
+            if request[:1] == server.u8(2):
+                return ran(server.u8(2) + server.u8(1 if request[5:].decode() in self.messages else 0))
             answer = self.rooms.get(request, room())
             return answer if isinstance(answer, server.Ran) else ran(answer)
         self.queries.append((program, request))
@@ -1751,7 +1755,7 @@ class Unanswering(Signer):
         self.why = why
 
     def query(self, program, request):
-        if program == "chat" and self.misses:
+        if program == "chat" and self.misses and request[:1] != server.u8(2):
             self.misses -= 1
             self.asked.append(request)
             return ran(code=1, err=self.why)
@@ -2229,7 +2233,8 @@ class ForgeRefs(unittest.TestCase):
         self.assertEqual(self.log.getvalue().splitlines(), [f"cloned duck://duckpond/forge/programs at {self.dev}"])
 
 
-UP = {"runner": "desktop", "up": True, "state": "running", "started": "2026-10-19T16:00:00Z", "busy": [], "busy_exit": 0, "heavy_runs": 1}
+UP = {"runner": "desktop", "up": True, "state": "running", "started": "2026-10-20 12:58:31.072128879 +0900 KST", "busy": [], "busy_exit": 0, "heavy_runs": 1}
+RUNNER_STARTED = datetime.datetime(2026, 10, 20, 3, 58, 31, tzinfo=datetime.timezone.utc).timestamp() + 72128879 / 1e9
 BUILD = server.BUILD_SH
 NONE_AHEAD = ran(b"ahead heavy 0\n")
 
@@ -2304,6 +2309,7 @@ class DesktopRunner(Streamed):
         desktop = server.Desktop(self.keys, pathlib.Path(held.name) / "home", runner=self.gate.run, spawn=self.gate.spawn)
         self.serve(desktop=desktop)
         self.service.rest = self.paused.append
+        self.service.wall = lambda: RUNNER_STARTED
 
     def notified(self, line):
         self.gate.answers["exec"] = ran(b"run r1\n")
@@ -2332,6 +2338,55 @@ class DesktopRunner(Streamed):
             self.gate.followers.put(Followed(255, b"", out))
             asked.append(self.gate.spawned.get(timeout=10))
         return [words[1] for words in asked]
+
+    def test_a_run_that_ended_while_the_service_was_down_still_posts_its_end(self):
+        self.service.clock = lambda: 1000.0
+        self.service.wall = lambda: RUNNER_STARTED + 599.5
+        self.gate.answers["exec"] = ran(b"run r2\n")
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "NOTIFY=j-1", "programs", "dev", "gates"]})
+        words = self.gate.spawned.get(timeout=10)
+        self.assertEqual(words[1], "--since=600s")
+        self.gate.followers.put(Followed(0, b"", b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\n"))
+        self.gate.spawned.get(timeout=10)
+        line = "desktop · r1 ended: exit 0, GATES ok"
+        self.assertIn(("chat", server.post_message("j-1", server.notify_id("desktop", "j-1", line), None, line, None)), self.signer.submits)
+
+    def test_a_desktop_whose_ping_names_no_start_is_followed_from_now_and_asked_again(self):
+        self.gate.answers["ping"] = ran({name: value for name, value in UP.items() if name != "started"})
+        self.service.clock = lambda: 1000.0
+        self.service.wall = lambda: RUNNER_STARTED + 599.5
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.follow_desktop()
+            self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=0s")
+            self.gate.answers["ping"] = ran(UP)
+            self.gate.followers.put(Followed(255, b""))
+            self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=600s")
+        said.assert_any_call("pods_unresumed", pod="desktop", detail=json.dumps("the desktop's ping names no start time"))
+
+    def test_a_start_time_not_in_podmans_shape_is_named_and_followed_from_now(self):
+        self.gate.answers["ping"] = ran({**UP, "started": "2026-10-20T03:58:31Z"})
+        self.service.clock = lambda: 1000.0
+        self.service.wall = lambda: RUNNER_STARTED + 599.5
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.follow_desktop()
+            self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=0s")
+        said.assert_any_call("pods_unresumed", pod="desktop", detail=json.dumps("the desktop's ping names its start as '2026-10-20T03:58:31Z', not as podman's StartedAt (date, time, offset, zone)"))
+
+    def test_a_line_chat_already_holds_is_not_offered_again(self):
+        line = "desktop · r1 ended: exit 0, GATES ok"
+        held = server.notify_id("desktop", "j-1", line)
+        self.signer.messages.add(held)
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notified(b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\nducktape-notify j-1 r2 ended: exit 0, GATES ok\n")
+        self.assertEqual(len(self.signer.submits), 1)
+        said.assert_any_call("pods_unfollowed", pod="desktop", code=0, already_posted=1)
+        self.assertNotIn(held, repr(said.call_args_list))
+
+    def test_podmans_start_times_read_with_or_without_a_fraction(self):
+        self.assertEqual(server.go_time(UP["started"]), RUNNER_STARTED)
+        self.assertEqual(server.go_time("2026-10-20 03:58:31 +0000 UTC"), datetime.datetime(2026, 10, 20, 3, 58, 31, tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual(server.go_time("2026-10-19 19:58:31.5 -0800"), datetime.datetime(2026, 10, 20, 3, 58, 31, tzinfo=datetime.timezone.utc).timestamp() + 0.5)
+        self.assertIsNone(server.go_time("2026-10-20T03:58:31Z"))
 
     def test_a_join_that_delivers_nothing_keeps_the_window_of_the_last_stream_that_did(self):
         windows = self.joins(iter([0, 10, 400, 420]).__next__, [b"[r1] a line\n", b""])
