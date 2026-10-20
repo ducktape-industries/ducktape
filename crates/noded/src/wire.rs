@@ -18,6 +18,7 @@ pub mod route {
     pub const BLOB_PUT: &str = "/v1/blob/put";
     pub const BLOB_MISSING: &str = "/v1/blob/missing";
     pub const BLOBS: &str = "/v1/blobs";
+    pub const BLOBS_ZSTD: &str = "/v1/blobs/zstd";
     pub const PROGRAMS: &str = "/v1/programs";
     /// `/v1/changes/<program>[?keys]`: a websocket of each block's writes
     /// to the program (`?keys`: the keys alone), a ping carrying the block's

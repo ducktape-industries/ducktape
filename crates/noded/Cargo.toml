@@ -45,6 +45,7 @@ tracing = { workspace = true }
 tower-http = { workspace = true, features = ["cors"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+zstd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true }

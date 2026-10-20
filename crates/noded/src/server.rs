@@ -171,6 +171,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::SCAN, post(scan::<E>))
         .route(route::BLOB_GET, post(blob_get::<E>))
         .route(route::BLOBS, post(blobs::<E>))
+        .route(route::BLOBS_ZSTD, post(blobs_zstd::<E>))
         .route(route::BLOB_MISSING, get(blob_missing::<E>))
         .route(route::PROGRAMS, get(programs::<E>))
         .route(route::BLOCKS, post(blocks::<E>))
@@ -492,15 +493,85 @@ async fn blobs<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Response {
         Ok(ids) => ids,
         Err(refusal) => return Reply::<()>::Refused(refusal).into_response(),
     };
-    let count = Bytes::copy_from_slice(&(ids.len() as u32).to_le_bytes());
-    let items = futures::stream::iter(ids)
-        .then(move |id| {
-            let ctx = ctx.clone();
-            async move { served(&ctx, id).await }
-        })
-        .flat_map(|read| futures::stream::iter(encoded(read)));
-    let answer = futures::stream::once(async move { Ok(count) }).chain(items);
+    let answer = pieces(ctx, ids).flat_map(futures::stream::iter);
     (StatusCode::OK, Body::from_stream(answer)).into_response()
+}
+
+fn pieces<E: Context>(
+    ctx: Ctx<E>,
+    ids: Vec<BlobId>,
+) -> impl futures::Stream<Item = Vec<crate::Result<Bytes>>> + Send + 'static {
+    let count = Bytes::copy_from_slice(&(ids.len() as u32).to_le_bytes());
+    let reads = futures::stream::iter(ids).then(move |id| {
+        let ctx = ctx.clone();
+        async move { encoded(served(&ctx, id).await) }
+    });
+    futures::stream::once(async move { vec![Ok(count)] }).chain(reads)
+}
+
+type Encoder = zstd::stream::raw::Encoder<'static>;
+
+async fn blobs_zstd<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Response {
+    let ids: Vec<BlobId> = match abi::decode(&body) {
+        Ok(ids) => ids,
+        Err(refusal) => return Reply::<()>::Refused(refusal).into_response(),
+    };
+    let encoder = match Encoder::new(zstd::DEFAULT_COMPRESSION_LEVEL) {
+        Ok(encoder) => encoder,
+        Err(error) => return failed::<()>(error).into_response(),
+    };
+    let start = (pieces(ctx, ids).boxed(), encoder);
+    let answer = futures::stream::unfold(Some(start), |state| async move {
+        let (mut pieces, encoder) = state?;
+        let Some(piece) = pieces.next().await else {
+            let last = settled(offload(move || finished(encoder)).await);
+            return Some((last.map(Bytes::from), None));
+        };
+        let plain = match piece.into_iter().collect::<crate::Result<Vec<Bytes>>>() {
+            Ok(plain) => plain,
+            Err(error) => return Some((Err(error), None)),
+        };
+        match settled(offload(move || compressed(encoder, &plain)).await) {
+            Ok((encoder, out)) => Some((Ok(Bytes::from(out)), Some((pieces, encoder)))),
+            Err(error) => Some((Err(error), None)),
+        }
+    });
+    (StatusCode::OK, Body::from_stream(answer)).into_response()
+}
+
+fn settled<T>(done: crate::Result<std::io::Result<T>>) -> crate::Result<T> {
+    Ok(done??)
+}
+
+fn compressed(mut encoder: Encoder, plain: &[Bytes]) -> std::io::Result<(Encoder, Vec<u8>)> {
+    use zstd::stream::raw::{InBuffer, Operation, OutBuffer};
+    let mut out = Vec::new();
+    for part in plain {
+        let mut input = InBuffer::around(part);
+        while input.pos() < part.len() {
+            let mut room = vec![0; zstd::zstd_safe::CCtx::out_size()];
+            let mut output = OutBuffer::around(&mut room[..]);
+            encoder.run(&mut input, &mut output)?;
+            let wrote = output.pos();
+            out.extend_from_slice(&room[..wrote]);
+        }
+    }
+    Ok((encoder, out))
+}
+
+fn finished(mut encoder: Encoder) -> std::io::Result<Vec<u8>> {
+    use zstd::stream::raw::{Operation, OutBuffer};
+    let mut out = Vec::new();
+    loop {
+        let mut room = vec![0; zstd::zstd_safe::CCtx::out_size()];
+        let mut output = OutBuffer::around(&mut room[..]);
+        let left = encoder.finish(&mut output, true)?;
+        let wrote = output.pos();
+        out.extend_from_slice(&room[..wrote]);
+        if left == 0 {
+            return Ok(out);
+        }
+    }
 }
 
 async fn served<E: Context>(ctx: &Ctx<E>, id: BlobId) -> crate::Result<Option<Vec<u8>>> {

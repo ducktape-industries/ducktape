@@ -1939,6 +1939,29 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
         );
         let named_by_none = blob::id_of(HashKind::Sha256, b"page 1\0x").unwrap();
         assert_eq!(gathered.blobs(&[named_by_none]).await.unwrap(), vec![None]);
+        let mut asked = ids.clone();
+        asked.push(named_by_none);
+        asked.push(ids[1]);
+        let http = reqwest::Client::new();
+        let answer_of = |at: &str| {
+            let request = http
+                .post(format!("{}{at}", gathered.base()))
+                .body(abi::encode(&asked));
+            async move {
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                response.bytes().await.unwrap()
+            }
+        };
+        let plain = answer_of(noded::wire::route::BLOBS).await;
+        let packed = answer_of(noded::wire::route::BLOBS_ZSTD).await;
+        assert_eq!(zstd::decode_all(packed.as_ref()).unwrap(), plain.to_vec());
+        assert!(
+            packed.len() < plain.len(),
+            "{} of {}",
+            packed.len(),
+            plain.len()
+        );
 
         let reading = frame(gathered, &alice, vec![Step::Op(HostOp::BlobGet(ids[0]))]).await;
         let (_, read) = gathered
