@@ -362,7 +362,7 @@ relay = true                  # answer `relay` requests
 http = true                   # answer `http` requests, to the public internet
 private = false               # optional: let `http` reach loopback, private and link-local addresses
 
-[services.anthropic]          # a registered service this node fronts; an agent's model record names it
+[services.anthropic]          # a registered service this node fronts; the provider's route names it (SetRoute, found-a-network § 10 step 6)
 base = "http://127.0.0.1:4141"   # a model gateway, such as ccs
 secrets = { x-api-key = "CCS_KEY" }   # header = the environment variable holding its value
 

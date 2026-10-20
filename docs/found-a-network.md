@@ -22,11 +22,13 @@ Write these down before you build anything. Two of them are fixed for good.
 | Its validators | the founding file's `[[validators]]` | one node is a network; more join later (`ducktape join`) |
 | Its limits | the founding file's `[limits]` | a hosted network with agents founds unmetered, as duckpond does: leave `[limits]` out |
 | Who manages the first agent | step 8 | fixed for good: identity refuses `SetOwnership` |
-| The model gateway | step 5 | the egress service the agents' model record names |
+| The model gateway | step 5 | the egress service the provider's route names (`SetRoute`, § 10 step 6) |
 
 ## 1. Pick the commits
 
-- Programs: a commit on forge `programs` `dev`. A hosted network runs the
+- Programs: a commit on forge `programs` `dev` at or after `8c44f3e7`, the
+  first whose harness reads `provider` and routes; an older harness refuses
+  a configuration that names one. A hosted network runs the
   release profile's bytes of a forge `dev` commit and nothing else
   (`AGENTS.md` § Branching and Delivery). programs' release workflow,
   which published `wasm-<commit>` on GitHub, is disabled; a local founding
@@ -97,7 +99,8 @@ threads compete for the same CPUs like any other processes.
 ## 5. Reach a model gateway
 
 An agent's model calls go out through egress: harness asks the egress
-service its model record names, and a node that fronts that service in its
+services the provider's route names (`SetRoute`, § 10 step 6), and a node
+that fronts that service in its
 `egress.toml` answers. The node must also serve `relay`, which harness uses
 for every tool call. The service name is yours to choose. duckpond's is
 `anthropic`, and sealpond uses the same.
@@ -258,8 +261,9 @@ signer, as `ducktape op` takes them:
    anyone.
 5. `chief`: egress `{"Register": {"service": "anthropic"}}`, then
    `{"Assign": {"service": "anthropic", "nodes": [<node key>]}}`.
-6. `chief`: harness `{"SetModel": {"id": "<model>", "wire": "AnthropicMessages", "service": "anthropic", "name": "<model>"}}`.
-   The first account to set a model owns it.
+6. `chief`: harness `{"SetRoute": {"provider": "anthropic", "services": [{"service": "anthropic", "wire": "AnthropicMessages"}]}}`,
+   the services that reach the provider's models, in the order harness tries
+   them. The first account to set a provider's route owns it.
 7. `chief`: its configuration file, `/shared/agents/chief/md`. File bytes
    never ride in a frame: put them as a chunk blob
    (`ducktape blob put chief.md --kind chunk --wait`), then files
@@ -273,13 +277,19 @@ signer, as `ducktape op` takes them:
    `{"Set": {"program": "harness", "key": "agents/T/conversation", "list": {"Listed": [{"Account": C}]}}}`.
 
 A configuration file is TOML front matter between `+++` lines, then the
-prompt (programs `crates/app/harness/src/config.rs`). `model` and
-`max_tokens` are required. `wait`, `thinking`, `server_tools`, `listen`,
-`settle`, `compact_at`, `service` and `account` are optional:
+prompt (programs `crates/app/harness/src/config.rs`). `model` (as its vendor
+names it), `provider` (whose route reaches it) and `max_tokens` are required;
+`provider` is required in practice: a harness from `8c44f3e7` reads a file
+without one through a model record, and with none it tells the conversation
+once that the file names a model harness keeps no record of, and asks no
+model.
+`wait`, `thinking`, `server_tools`, `listen`, `settle`, `compact_at` and
+`service` are optional:
 
 ```
 +++
 model = "claude-opus-5-5"
+provider = "anthropic"
 max_tokens = 65535
 thinking = "high"
 server_tools = ["web_search", "web_fetch"]

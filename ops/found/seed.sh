@@ -38,7 +38,7 @@ active_key() {
 put_config() {
   local who=$1 name=$2 path=$3
   [ -e "$name.md" ] || {
-    printf '+++\nmodel = "%s"\nmax_tokens = 65535\nthinking = "high"\nserver_tools = ["web_search", "web_fetch"]\nsettle = "5s"\ncompact_at = 650000\n+++\n' "$model"
+    printf '+++\nmodel = "%s"\nprovider = "anthropic"\nmax_tokens = 65535\nthinking = "high"\nserver_tools = ["web_search", "web_fetch"]\nsettle = "5s"\ncompact_at = 650000\n+++\n' "$model"
     cat "$name.prompt"
   } > "$name.md"
   [ -e "$name.blob" ] || as "$who" blob put "$name.md" --kind chunk --wait > "$name.blob"
@@ -64,7 +64,7 @@ land founder chief-answers access "{\"Set\": {\"program\": \"harness\", \"key\":
 
 land chief register-service egress "{\"Register\": {\"service\": \"$service\"}}"
 land chief assign-service egress "{\"Assign\": {\"service\": \"$service\", \"nodes\": [\"$node_key\"]}}"
-land chief set-model harness "{\"SetModel\": {\"id\": \"$model\", \"wire\": \"AnthropicMessages\", \"service\": \"$service\", \"name\": \"$model\"}}"
+land chief set-route harness "{\"SetRoute\": {\"provider\": \"anthropic\", \"services\": [{\"service\": \"$service\", \"wire\": \"AnthropicMessages\"}]}}"
 
 network=$(as chief status | awk '$1 == "network" {print $2}')
 [ -e chief.prompt ] || printf 'You are chief (account %s), the operator agent of the %s network. Your full prompt is still to be seeded.\n' "$chief" "$network" > chief.prompt
