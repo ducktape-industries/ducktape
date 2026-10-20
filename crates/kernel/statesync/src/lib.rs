@@ -65,6 +65,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub type Holding = Box<dyn std::any::Any + Send>;
 
+pub type Ending = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
     Transient(&'static str),
@@ -91,10 +93,10 @@ pub trait Exchange: Clone + Send + Sync + 'static {
 
     fn hold(
         &self,
-    ) -> impl Future<Output = std::result::Result<(Response, Holding), Self::Error>> + Send {
+    ) -> impl Future<Output = std::result::Result<(Response, Ending), Self::Error>> + Send {
         async move {
             let head = self.exchange(Request::Head).await?;
-            let unheld: Holding = Box::new(());
+            let unheld: Ending = Box::pin(futures::future::pending());
             Ok((head, unheld))
         }
     }
@@ -205,14 +207,31 @@ async fn adopted_head<E: Context, X: Exchange>(
     asking: &Asking<E, X>,
 ) -> Result<(Head, BTreeMap<ProgramId, Commitment<E>>)> {
     let mut retargets: u64 = 0;
+    let mut ended: u64 = 0;
     loop {
         let (head, hold) = held_head(asking).await?;
         let anchor_names_the_tip = head.anchor.names(head.tip);
         if !anchor_names_the_tip {
             return Err(Error::Head);
         }
-        let synced = synced_to(context, name, asking, &head.targets).await;
-        drop(hold);
+        let syncing = synced_to(context, name, asking, &head.targets);
+        let Some(synced) = while_held(syncing, hold).await else {
+            retargets += 1;
+            ended += 1;
+            if ended.is_power_of_two() {
+                tracing::info!(
+                    target: "ducktape::sync",
+                    event = "join_retargeted",
+                    reason = "hold_ended",
+                    height = head.tip.height,
+                    retargets,
+                    ended,
+                    "the source's hold on the head this join synced to ended; it reads the head again under a new hold"
+                );
+            }
+            asking.context.sleep(asking.pause).await;
+            continue;
+        };
         let error = match synced {
             Ok(commitments) => return Ok((head, commitments)),
             Err(error) => error,
@@ -229,6 +248,14 @@ async fn adopted_head<E: Context, X: Exchange>(
             retargets,
             "the source pruned past the head this join synced to; it reads the head again"
         );
+    }
+}
+
+async fn while_held<T>(work: impl Future<Output = T>, hold: Ending) -> Option<T> {
+    let work = std::pin::pin!(work);
+    match futures::future::select(work, hold).await {
+        futures::future::Either::Left((done, _)) => Some(done),
+        futures::future::Either::Right(_) => None,
     }
 }
 
@@ -301,7 +328,7 @@ async fn head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<Head> {
     }
 }
 
-async fn held_head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<(Head, Holding)> {
+async fn held_head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<(Head, Ending)> {
     let (answer, hold) = asking.held().await?;
     match answer {
         Response::Head(head) => Ok((head, hold)),
@@ -463,7 +490,7 @@ impl<E: Context, X: Exchange> Asking<E, X> {
         }
     }
 
-    async fn held(&self) -> Result<(Response, Holding)> {
+    async fn held(&self) -> Result<(Response, Ending)> {
         let mut attempts: u64 = 0;
         loop {
             let error = match self.exchange.hold().await {

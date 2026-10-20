@@ -304,8 +304,11 @@ syncs the state, `join` holds the head it read open (`POST /v1/sync/hold`):
 the node it joins through keeps serving that head, past its own prunes, until
 the hold closes: once the state is synced, or when the hold's connection drops (the
 joiner stops, or a proxy between them closes it), so a busy network cannot
-prune past a slow join. A join whose hold dropped learns it from the next
-sync the source refuses as pruned, and reads the head again under a new hold. `run` fetches every other blob the state names
+prune past a slow join. The joiner reads the hold's answer as it comes, one
+line per block the source applies; when that answer ends or breaks, the join
+drops the request it is waiting on and reads the head again under a new hold.
+A hold the source let go of while its connection stays open shows as the next
+sync the source refuses as pruned, and the join reads the head again then. `run` fetches every other blob the state names
 afterwards (see the blobs below). A stranger joins as a resident: it follows the
 chain and never votes or proposes. A validator named in the file joins the
 same way and keeps its seat. `ducktape enroll` takes the same source, `--halo` and

@@ -7,7 +7,7 @@ use futures::{Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
 use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
-use statesync::{Exchange, Failure, Fault, Holding, Request, Response};
+use statesync::{Ending, Exchange, Failure, Fault, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -340,7 +340,7 @@ impl Exchange for Client {
         self.post(route::SYNC, &request).await.map_err(without_url)
     }
 
-    async fn hold(&self) -> Result<(Response, Holding)> {
+    async fn hold(&self) -> Result<(Response, Ending)> {
         held(self).await.map_err(without_url)
     }
 
@@ -365,7 +365,7 @@ fn without_url(error: Error) -> Error {
     }
 }
 
-async fn held(client: &Client) -> Result<(Response, Holding)> {
+async fn held(client: &Client) -> Result<(Response, Ending)> {
     let response = client
         .http
         .post(client.url(route::SYNC_HOLD))
@@ -381,7 +381,8 @@ async fn held(client: &Client) -> Result<(Response, Holding)> {
     let mut read = Vec::new();
     loop {
         if let Some(head) = framed_head(&read)? {
-            let holding: Holding = Box::new(body);
+            let holding: Ending =
+                Box::pin(async move { while let Some(Ok(_)) = body.next().await {} });
             return Ok((head, holding));
         }
         match body.next().await {

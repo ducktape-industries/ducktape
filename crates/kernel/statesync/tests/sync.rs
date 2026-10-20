@@ -251,13 +251,16 @@ impl Exchange for Loopback {
         Ok(abi::decode(&abi::encode(&response)).unwrap())
     }
 
-    async fn hold(&self) -> Result<(Response, statesync::Holding), Infallible> {
+    async fn hold(&self) -> Result<(Response, statesync::Ending), Infallible> {
         let node = self.0.node.lock().await;
         let published = Arc::new(statesync::Published::of(&node).unwrap());
         drop(node);
         let (served, hold) = statesync::held(published, &self.0.holds);
         let response = anchored(served, &*self.0).await;
-        let holding: statesync::Holding = Box::new(hold);
+        let holding: statesync::Ending = Box::pin(async move {
+            let _hold = hold;
+            futures::future::pending::<()>().await
+        });
         Ok((abi::decode(&abi::encode(&response)).unwrap(), holding))
     }
 
@@ -1150,7 +1153,7 @@ struct Pruning {
     prunes: Arc<Mutex<Vec<u64>>>,
     hold: Hold,
     releases: Vec<Vec<u8>>,
-    kept: Arc<Mutex<Vec<statesync::Holding>>>,
+    kept: Arc<Mutex<Vec<statesync::Ending>>>,
     passed: Arc<Mutex<Option<(u64, u64, u64)>>>,
 }
 
@@ -1246,10 +1249,10 @@ impl Exchange for Pruning {
         Ok(response)
     }
 
-    async fn hold(&self) -> Result<(Response, statesync::Holding), Infallible> {
+    async fn hold(&self) -> Result<(Response, statesync::Ending), Infallible> {
         if self.hold == Hold::Unheld {
             let head = self.exchange(Request::Head).await?;
-            let unheld: statesync::Holding = Box::new(());
+            let unheld: statesync::Ending = Box::pin(futures::future::pending());
             return Ok((head, unheld));
         }
         self.heads.fetch_add(1, Ordering::SeqCst);
@@ -1258,7 +1261,7 @@ impl Exchange for Pruning {
             return Ok((head, holding));
         }
         self.kept.lock().unwrap().push(holding);
-        let restartable: statesync::Holding = Box::new(());
+        let restartable: statesync::Ending = Box::pin(futures::future::pending());
         Ok((head, restartable))
     }
 
@@ -1832,6 +1835,126 @@ fn a_join_whose_source_restarts_mid_sync_holds_the_new_head_and_finishes() {
             joined.node.host().root().unwrap(),
             source.host().root().unwrap()
         );
+    });
+}
+
+const ENDED_HOLDS: usize = 3;
+
+#[derive(Clone)]
+struct Unholding {
+    source: Loopback,
+    ending: usize,
+    holds: Arc<AtomicUsize>,
+    syncs: Arc<AtomicUsize>,
+    ends: Arc<Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
+}
+
+fn unholding(network: &Network, ending: usize) -> Unholding {
+    Unholding {
+        source: network.exchange(),
+        ending,
+        holds: Arc::new(AtomicUsize::new(0)),
+        syncs: Arc::new(AtomicUsize::new(0)),
+        ends: Arc::new(Mutex::new(None)),
+    }
+}
+
+impl Exchange for Unholding {
+    type Error = Infallible;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
+        if matches!(request, Request::Sync { .. }) {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            let end = self.ends.lock().unwrap().take();
+            if let Some(end) = end {
+                end.send(()).unwrap();
+                futures::future::pending::<()>().await;
+            }
+        }
+        self.source.exchange(request).await
+    }
+
+    async fn hold(&self) -> Result<(Response, statesync::Ending), Infallible> {
+        let (head, held) = self.source.hold().await?;
+        let ends = self.holds.fetch_add(1, Ordering::SeqCst) < self.ending;
+        if !ends {
+            return Ok((head, held));
+        }
+        let (end, ended) = futures::channel::oneshot::channel();
+        *self.ends.lock().unwrap() = Some(end);
+        let ending: statesync::Ending = Box::pin(async move {
+            let _held = held;
+            let _ = ended.await;
+        });
+        Ok((head, ending))
+    }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        self.source.stream_blobs(ids)
+    }
+}
+
+#[test]
+fn a_join_whose_hold_ends_while_a_request_waits_asks_again_under_a_new_hold_and_finishes() {
+    deterministic::Runner::default().start(|context| async move {
+        let network = found(&context).await;
+        let unholding = unholding(&network, 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            unholding.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(unholding.holds.load(Ordering::SeqCst), 2);
+        assert!(unholding.syncs.load(Ordering::SeqCst) > 1);
+        let source = network.source.node.lock().await;
+        assert_eq!(joined.node.tip().unwrap(), source.tip().unwrap());
+        assert_eq!(
+            joined.node.host().root().unwrap(),
+            source.host().root().unwrap()
+        );
+    });
+}
+
+#[test]
+fn a_join_whose_holds_keep_ending_reads_the_head_once_a_pause() {
+    deterministic::Runner::default().start(|context| async move {
+        let network = found(&context).await;
+        let unholding = unholding(&network, ENDED_HOLDS);
+
+        let dir = tempfile::tempdir().unwrap();
+        let started = context.current();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            unholding.clone(),
+        )
+        .await
+        .unwrap();
+        let took = context.current().duration_since(started).unwrap();
+
+        assert_eq!(unholding.holds.load(Ordering::SeqCst), ENDED_HOLDS + 1);
+        let pauses = took.as_nanos() / PAUSE.as_nanos();
+        assert!(
+            pauses >= ENDED_HOLDS as u128,
+            "the join read {} heads in {took:?}: one pause after each ended hold",
+            ENDED_HOLDS + 1
+        );
+        let source = network.source.node.lock().await;
+        assert_eq!(joined.node.tip().unwrap(), source.tip().unwrap());
     });
 }
 

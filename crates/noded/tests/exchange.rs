@@ -153,8 +153,10 @@ fn a_blob_answer_cut_short_is_asked_again() {
 }
 
 async fn hold_failure_of(base: String) -> Failure {
-    let held = Client::new(base).hold().await;
-    held.expect_err("the source held a head").failure()
+    match Client::new(base).hold().await {
+        Ok(_) => panic!("the source held a head"),
+        Err(error) => error.failure(),
+    }
 }
 
 #[test]
@@ -207,5 +209,24 @@ fn a_hold_whose_head_arrives_in_pieces_takes_it_whole() {
         let base = streaming(chunks).await;
         let (head, _holding) = Client::new(base).hold().await.unwrap();
         assert_eq!(abi::encode(&head), encoded);
+    });
+}
+
+#[test]
+fn a_hold_reads_each_line_after_its_head_and_ends_when_its_answer_does() {
+    runtime().block_on(async {
+        let refusal = abi::Refusal::new(abi::reason::NOT_FOUND, "a head and its lines");
+        let encoded = abi::encode(&Response::Refused(refusal));
+        let mut framed = (encoded.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&encoded);
+        let mut chunks = vec![framed];
+        for height in [7u64, 8] {
+            let mut line = 8u32.to_le_bytes().to_vec();
+            line.extend_from_slice(&height.to_le_bytes());
+            chunks.push(line);
+        }
+        let base = streaming(chunks).await;
+        let (_, holding) = Client::new(base).hold().await.unwrap();
+        holding.await;
     });
 }
