@@ -184,7 +184,22 @@ one up for another network.
   requester (the pod `PODS_WARM_POD` names; for no one while none is named,
   or while that pod can't be read, which logs `pods_unconcerned` with why),
   posted as `pods` where the channel exists, is not archived and is open to anyone
-  (a desktop run has no requester to vouch for a members-only room).
+  (a desktop run has no requester to vouch for a members-only room). A
+  build.sh call (on pod `builds` or `desktop`, as an argv or a plain-words
+  script, or on any pod as the argv `sh /var/tmp/warm/build.sh …`) gets the
+  word `CALLER=<account>` from the service: the account egress says sent its
+  request (egress `Sender { id }`, for the `ducktape-request` number), so a
+  call that names `CALLER` itself is refused (400). While egress can't say,
+  the call goes as it came, logged once as `pods_uncalled` and, when it can
+  again, once as `pods_called` with how many went uncalled. A line
+  `ducktape-notify-for <account> <channel> <text>` is a notice as a
+  `ducktape-notify` line is, for that account in place of the requester; an
+  account that isn't a u64 (identity's account number) makes it no
+  notify-for line at all. `CALLER` comes from egress only on those calls:
+  `desktop`, `builds`, and a pod's bare build.sh argv. Anything else a pod
+  runs (a `sh -c` script on any other pod, say) goes as it came, so a pod's
+  own output can name any account in a notify-for line, as a chat mention can
+  name anyone.
 - The reserved pod `builds` routes a build.sh call to the machine where it
   waits least: `desktop` when its `ping` says it is up, its `busy` reads (a
   list of `build.sh busy` lines, `busy_exit` 0) and

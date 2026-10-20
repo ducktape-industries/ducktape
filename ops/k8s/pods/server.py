@@ -51,6 +51,11 @@ NOTIFY_CHANNEL = NOTE + "notify-channel"
 NOTIFY_THREAD = NOTE + "notify-thread"
 NOTIFIED = NOTE + "notified"
 NOTIFY_LINE = "ducktape-notify "
+NOTIFY_FOR = "ducktape-notify-for "
+CALLER_WORD = "CALLER="
+ACCOUNT = re.compile(r"[0-9]{1,20}")
+U64_MAX = (1 << 64) - 1
+EGRESS_SENDER = 7
 RUN_LINE = "ducktape-run "
 SPEC = {
     "image": str,
@@ -590,6 +595,17 @@ def open_of(reply):
     return reader.u8() == 1
 
 
+def egress_sender(request):
+    return u8(EGRESS_SENDER) + u64(request)
+
+
+def sender_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != EGRESS_SENDER:
+        raise Refused(502, "egress answered a sender with something else")
+    return reader.u64() if reader.u8() == 1 else None
+
+
 def objects_of(pack):
     if pack[:4] != b"PACK" or len(pack) < 12:
         raise Refused(502, "git pack-objects wrote no pack")
@@ -741,6 +757,23 @@ def desktop_words(command, name=DESKTOP):
             f'pod {name} runs build.sh alone: the command ["sh", "{BUILD_SH}", ...], or a script of plain words that calls it (KEY=VALUE words first; no expansion, operator or comment outside quotes), not {shlex.join(command)}',
         )
     return settings + called[2:]
+
+
+def build_settings(command, scripted):
+    words = command
+    if scripted and len(command) == 3 and command[:2] == ["sh", "-c"]:
+        words = plain_words(command[2]) or []
+    before = list(itertools.takewhile(SETTING.fullmatch, words))
+    called = words[len(before) :]
+    if called[:2] != ["sh", BUILD_SH]:
+        return None
+    return before + list(itertools.takewhile(SETTING.fullmatch, called[2:]))
+
+
+def with_caller(command, caller):
+    if command[:2] == ["sh", BUILD_SH]:
+        return [*command[:2], f"{CALLER_WORD}{caller}", *command[2:]]
+    return [*command[:2], f"{CALLER_WORD}{caller} {command[2]}"]
 
 
 def desktop_view(said):
@@ -1460,14 +1493,27 @@ def ended_line(pod):
     return None
 
 
+def account_number(word):
+    if not ACCOUNT.fullmatch(word) or int(word) > U64_MAX:
+        return None
+    return int(word)
+
+
 def notify_lines(name, stream):
     for raw in stream:
         line = raw.decode(errors="replace").rstrip("\r\n")
+        caller = None
+        if line.startswith(NOTIFY_FOR):
+            named, _, rest = line[len(NOTIFY_FOR):].partition(" ")
+            caller = account_number(named)
+            if caller is None:
+                continue
+            line = NOTIFY_LINE + rest
         if not line.startswith(NOTIFY_LINE):
             continue
         channel, _, text = line[len(NOTIFY_LINE):].partition(" ")
         if channel and text.strip():
-            yield channel, text.strip()
+            yield channel, text.strip(), caller
 
 
 def lost_runs(name, stream):
@@ -1484,7 +1530,7 @@ def lost_runs(name, stream):
     for run, (channel, call) in armed.items():
         if run not in done:
             again = f"; call it again: {call}" if call else "; call it again"
-            yield channel, f"run {run}{RUN_LOST}{name}: it ended before the run did, so nothing of it runs now{again}"
+            yield channel, f"run {run}{RUN_LOST}{name}: it ended before the run did, so nothing of it runs now{again}", None
 
 
 def line_id(name, channel, text):
@@ -1835,7 +1881,7 @@ class Notifier:
     def passed(self, name, said):
         asked = 0
         for newest in range(len(said) - 1, -1, -1):
-            channel, text = said[newest]
+            channel, text, _ = said[newest]
             asked += 1
             try:
                 held = message_held(self.asked(chat_message(line_id(name, channel, text))))
@@ -1845,7 +1891,7 @@ class Notifier:
                 return 0, asked, str(why)
             if held:
                 with self.lock:
-                    self.posted.setdefault(name, set()).update(line_id(name, channel, text) for channel, text in said[: newest + 1])
+                    self.posted.setdefault(name, set()).update(line_id(name, channel, text) for channel, text, _ in said[: newest + 1])
                 return newest + 1, asked, None
         return 0, asked, None
 
@@ -1862,12 +1908,12 @@ class Notifier:
     def each(self, name, requester, said, unvouched=False, concerned=None):
         concerned = requester if concerned is None else concerned
         held = 0
-        for channel, text in said:
+        for channel, text, caller in said:
             message_id = line_id(name, channel, text)
             with self.lock:
                 if message_id in self.posted.get(name, ()):
                     continue
-            posted = self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line_said(name, text, concerned), unvouched)
+            posted = self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line_said(name, text, concerned if caller is None else caller), unvouched)
             if posted:
                 held += posted is HELD
                 with self.lock:
@@ -1969,6 +2015,7 @@ class Service:
     def __init__(self, kube, signer, fetching, stats, api, desktop=None, warm_pod=None):
         self.kube = kube
         self.warm_pod = warm_pod
+        self.uncalled = 0
         self.desktop = desktop or Desktop(Path(DESKTOP_KEYS))
         self.desktop_wanted = threading.Event()
         self.desktop_follower = None
@@ -2619,6 +2666,34 @@ class Service:
             return
         self.notifier.caught_up(DESKTOP, logged.splitlines(keepends=True))
 
+    def called(self, asked, name, command):
+        settings = build_settings(command, name in (DESKTOP, BUILDS))
+        if settings is None:
+            return command
+        if any(word.startswith(CALLER_WORD) for word in settings):
+            raise Refused(400, f"pods names a build.sh call's caller itself, as the account egress says sent its request: leave {CALLER_WORD}<n> out of the call")
+        try:
+            caller = self.sender(asked)
+        except Refused as refused:
+            with self.lock:
+                self.uncalled += 1
+                first = self.uncalled == 1
+            if first:
+                say("pods_uncalled", detail=json.dumps(refused.sentence))
+            return command
+        with self.lock:
+            missed, self.uncalled = self.uncalled, 0
+        if missed:
+            say("pods_called", missed=missed)
+        return command if caller is None else with_caller(command, caller)
+
+    def sender(self, asked):
+        reply = self.signer.query(EGRESS, egress_sender(int(asked["request"])))
+        why = failed(reply)
+        if why is not None:
+            raise Refused(502, f"egress was not asked who sent request {asked['request']}: {why}")
+        return sender_of(reply.out)
+
     def warm_requester(self):
         if not self.warm_pod:
             return None
@@ -2703,7 +2778,7 @@ class Service:
 
     def exec(self, name, asked_by, body):
         asked = checked(body, EXEC, "an exec")
-        command = strings(asked.get("command", []), "command")
+        command = self.called(asked_by, name, strings(asked.get("command", []), "command"))
         container = asked.get("container")
         if name == DESKTOP and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in desktop_words(command)):
             self.follow_desktop()

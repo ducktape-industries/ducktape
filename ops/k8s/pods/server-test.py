@@ -244,6 +244,8 @@ class Signer:
         self.submitted = ran(POOLED + b"landed 960 applied 00ff\n")
         self.head = ran(bytes([0, 1, 0]) + bytes.fromhex("ab" * 32) + b"rest of the row")
         self.request = ran(OPEN)
+        self.sender = ran(server.u8(server.EGRESS_SENDER) + server.u8(0))
+        self.senders = []
 
     def held(self):
         return self.keyed
@@ -263,6 +265,9 @@ class Signer:
                 return ran(server.u8(2) + server.u8(1 if request[5:].decode() in self.messages else 0))
             answer = self.rooms.get(request, room())
             return answer if isinstance(answer, server.Ran) else ran(answer)
+        if program == "egress" and request[:1] == server.u8(server.EGRESS_SENDER):
+            self.senders.append(request)
+            return taken(self, "sender")
         self.queries.append((program, request))
         return taken(self, "request" if program == "egress" else "head")
 
@@ -1841,14 +1846,33 @@ class Posts(unittest.TestCase):
         }
         self.assertEqual({text: server.line_said("duckpond-41", text, 17)["group"] for text in cases}, cases)
 
+    def test_a_notify_for_line_concerns_the_caller_it_names(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.kube.logs_of["duckpond-41"] = b"ducktape-notify-for 33 j-093 20261019-1 ended: exit 0, GATES ok\nducktape-notify-for x j-093 20261019-2 ended: exit 0, GATES ok\n"
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        text = "20261019-1 ended: exit 0, GATES ok"
+        posted = server.notice_message("j-093", server.line_id("duckpond-41", "j-093", text), None, server.line_said("duckpond-41", text, 33))
+        self.assertEqual(self.signer.submits, [("chat", posted)])
+
+    def test_a_notify_for_number_no_u64_holds_is_no_notify_for_line_and_the_next_line_still_posts(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        past = str(2**64)
+        long = "9" * 5000
+        lines = [f"ducktape-notify-for {past} j-093 r0 ended: exit 0", f"ducktape-notify-for {long} j-093 r0 ended: exit 0", "ducktape-notify-for 33 j-093 20261019-1 ended: exit 0, GATES ok"]
+        self.kube.logs_of["duckpond-41"] = "".join(f"{line}\n" for line in lines).encode()
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        text = "20261019-1 ended: exit 0, GATES ok"
+        posted = server.notice_message("j-093", server.line_id("duckpond-41", "j-093", text), None, server.line_said("duckpond-41", text, 33))
+        self.assertEqual(self.signer.submits, [("chat", posted)])
+
     def test_the_catch_up_walk_finds_a_held_notice_by_the_id_each_posts_it_under(self):
         text = "r1 ended: exit 0, GATES ok"
         message_id = server.line_id("desktop", "j-1", text)
         self.assertEqual(message_id, server.notify_id("desktop", "j-1", f"desktop \u00b7 {text}"))
         self.signer.messages.add(message_id)
-        self.assertEqual(self.notifier.passed("desktop", [("j-1", text)]), (1, 1, None))
+        self.assertEqual(self.notifier.passed("desktop", [("j-1", text, None)]), (1, 1, None))
         self.assertEqual(self.notifier.posted, {"desktop": {message_id}})
-        self.assertEqual(self.notifier.each("desktop", None, [("j-1", text)], unvouched=True), 0)
+        self.assertEqual(self.notifier.each("desktop", None, [("j-1", text, None)], unvouched=True), 0)
         self.assertEqual(self.signer.submits, [])
 
     def test_a_lines_status_is_its_runs_exit_and_a_lost_run_fails(self):
@@ -2408,6 +2432,41 @@ class DesktopRunner(Streamed):
         self.gate.followers.put(Followed(0, b"", line))
         self.gate.spawned.get(timeout=10)
         self.gate.spawned.get(timeout=10)
+
+    def test_a_build_call_goes_with_the_caller_egress_names_and_names_none_itself(self):
+        self.signer.sender = ran(server.u8(server.EGRESS_SENDER) + server.u8(1) + server.u64(21))
+        self.gate.answers["exec"] = ran(b"run r1\n")
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "JOB=j-1", "programs", "dev", "gates"]}, headers=asked(51))
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", "-c", f"JOB=j-1 sh {BUILD} programs dev lint"]}, headers=asked(52))
+        self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["sh", BUILD, "programs", "dev", "lint"]}, headers=asked(53))
+        self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["cat", "/out/a"]}, headers=asked(54))
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "status", "r1"]}, headers=asked(55))
+        execs = [words for words in self.gate.words() if words[0] == "exec"]
+        self.assertEqual(
+            execs,
+            [
+                ["exec", "CALLER=21", "JOB=j-1", "programs", "dev", "gates"],
+                ["exec", "CALLER=21", "JOB=j-1", "programs", "dev", "lint"],
+                ["exec", "CALLER=21", "status", "r1"],
+            ],
+        )
+        pods = [call[3] for call in self.kube.calls if call[0] == "exec"]
+        self.assertEqual(pods, [["sh", BUILD, "CALLER=21", "programs", "dev", "lint"], ["cat", "/out/a"]])
+        self.assertEqual(self.signer.senders, [server.egress_sender(request) for request in (51, 52, 53, 55)])
+        self.refused("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "CALLER=9", "programs", "dev", "gates"]}, 400, ["leave CALLER=<n> out"])
+
+    def test_a_build_call_egress_names_no_sender_for_goes_as_it_came_and_says_so_once(self):
+        self.signer.sender = ran(code=1, err="egress: no such query")
+        self.gate.answers["exec"] = ran(b"run r1\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            for request in (61, 62):
+                self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "programs", "dev", "gates"]}, headers=asked(request))
+            self.signer.sender = ran(server.u8(server.EGRESS_SENDER) + server.u8(0))
+            self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "programs", "dev", "lint"]}, headers=asked(63))
+        execs = [words for words in self.gate.words() if words[0] == "exec"]
+        self.assertEqual(execs, [["exec", "programs", "dev", "gates"]] * 2 + [["exec", "programs", "dev", "lint"]])
+        self.assertEqual([call for call in said.call_args_list if call.args == ("pods_uncalled",)], [unittest.mock.call("pods_uncalled", detail=unittest.mock.ANY)])
+        said.assert_any_call("pods_called", missed=2)
 
     def test_with_no_warm_pod_named_a_notify_run_s_end_line_concerns_no_one(self):
         self.notified(b"[r1] GATES ok\nducktape-notify j-1 r1 ended: exit 0, GATES ok\n")
