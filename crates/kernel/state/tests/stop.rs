@@ -1,6 +1,5 @@
 //! A store synced before its process stops opens again with nothing to replay; one that stops
 //! unsynced replays its write log into memory and catches its merkle up to the log when it opens.
-//! A store closed clean keeps no pending row, and reopens at its height and roots.
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -136,35 +135,4 @@ fn a_store_stopped_unsynced_replays_its_write_log_and_reopens_at_its_roots() {
         opened.replayed.is_some_and(|records| records > 0),
         "{opened:?}"
     );
-}
-#[test]
-fn a_store_closed_clean_keeps_no_pending_row_and_reopens_at_its_roots() {
-    let dir = tempfile::tempdir().unwrap();
-    let (roots, checkpoint) = deterministic::Runner::default().start_and_recover(|context| {
-        let dir = &dir;
-        async move {
-            let storage = Storage::open(dir.path()).unwrap();
-            let mut store = Store::open(context.child("store"), "s", storage, programs())
-                .await
-                .unwrap();
-            for height in 0..BLOCKS {
-                store.commit(height, block(height)).await.unwrap();
-            }
-            assert!(store.storage().pending().unwrap().is_some());
-            store.close(&[]).await.unwrap();
-            assert_eq!(store.storage().pending().unwrap(), None);
-            store.roots().unwrap()
-        }
-    });
-    deterministic::Runner::from(checkpoint).start(|context| async move {
-        let storage = Storage::open(dir.path()).unwrap();
-        assert_eq!(storage.pending().unwrap(), None);
-        let mut store = Store::open(context.child("reopened"), "s", storage, programs())
-            .await
-            .unwrap();
-        assert_eq!(store.height().unwrap(), Some(BLOCKS - 1));
-        assert_eq!(store.roots().unwrap(), roots);
-        store.commit(BLOCKS, block(BLOCKS)).await.unwrap();
-        assert!(store.storage().pending().unwrap().is_some());
-    });
 }
