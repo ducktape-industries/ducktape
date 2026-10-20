@@ -633,7 +633,13 @@ until the program lets go with the host op `BlobRelease`. `BlobPut { hash,
 kind, body }` holds a blob on its own line, until released, and so does every
 row written before lines existed. A program that holds one blob on several
 lines holds it while any of them does, and `BlobRelease` lets go of it on all of
-them. The roster row keeps only how many lines hold a blob; each line that holds
+them. `BlobReleaseLines { prefix }` lets go, in one op, of every line the program
+holds whose name starts with `prefix` (a dropped scratchpad's `scratch/<branch>/`;
+an empty prefix names them all), as a newer put on each line would: a blob it
+also holds alone or on a line outside the prefix stays. A line's key is its
+program's length-prefixed name followed by the line's own bytes, so a prefix is one range. The
+prefix is a byte prefix, not a folder: `scratch/b` also covers `scratch/bx/1`, so a
+caller who means a folder passes its trailing `/`. The roster row keeps only how many lines hold a blob; each line that holds
 it is a key of its own, so a put rewrites one small row however many paths share
 the blob. Once no program holds it, the row goes, and after that block commits the
 node deletes the blob's file, unless a held bundle names it or a program runs it

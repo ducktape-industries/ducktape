@@ -27,8 +27,12 @@ pub fn blob(id: &BlobId) -> Vec<u8> {
     abi::encode(id)
 }
 
+pub fn lines(holder: &str) -> Vec<u8> {
+    [LINES, abi::encode(&holder).as_slice()].concat()
+}
+
 pub fn line(holder: &str, line: &[u8]) -> Vec<u8> {
-    [LINES, abi::encode(&(holder, line)).as_slice()].concat()
+    [lines(holder).as_slice(), line].concat()
 }
 
 pub fn on(id: &BlobId, holder: &str, line: &[u8]) -> Vec<u8> {
@@ -149,8 +153,10 @@ fn one_more(program: &str, lines: u32) -> Result<u32> {
     })
 }
 
+pub fn on_line(value: &[u8]) -> Result<BlobId> {
+    abi::decode(value).map_err(corrupt)
+}
+
 pub fn latest(value: Option<&[u8]>) -> Result<Option<BlobId>> {
-    value
-        .map(|value| abi::decode(value).map_err(corrupt))
-        .transpose()
+    value.map(on_line).transpose()
 }

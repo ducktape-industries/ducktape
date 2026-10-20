@@ -446,6 +446,9 @@ pub enum HostOp {
         body: Vec<u8>,
         line: Vec<u8>,
     },
+    BlobReleaseLines {
+        prefix: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -509,7 +512,8 @@ impl HostOp {
             | HostOp::Resume { .. }
             | HostOp::Resource { .. }
             | HostOp::SetOwned { .. }
-            | HostOp::BlobRelease(_) => None,
+            | HostOp::BlobRelease(_)
+            | HostOp::BlobReleaseLines { .. } => None,
         }
     }
 }
@@ -2130,6 +2134,16 @@ mod tests {
         );
         assert_eq!(alone.as_put().unwrap().line, None);
         assert_eq!(release.as_put(), None);
+    }
+
+    #[test]
+    fn a_release_by_line_prefix_takes_the_tag_after_blob_keep() {
+        let lines = HostOp::BlobReleaseLines {
+            prefix: b"scratch/".to_vec(),
+        };
+        assert_eq!(encode(&lines)[0], 24);
+        assert_eq!(decode::<HostOp>(&encode(&lines)).unwrap(), lines);
+        assert_eq!(lines.as_put(), None);
     }
 
     #[test]

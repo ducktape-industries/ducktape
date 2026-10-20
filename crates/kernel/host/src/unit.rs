@@ -285,6 +285,7 @@ where
             | HostOp::BlobPut { .. }
             | HostOp::BlobRelease(_)
             | HostOp::BlobKeep { .. }
+            | HostOp::BlobReleaseLines { .. }
             | HostOp::Emit(_)
             | HostOp::Event(_)
             | HostOp::Output(_)
@@ -679,6 +680,23 @@ where
         Ok(HostReply::Done)
     }
 
+    fn release_lines(&mut self, prefix: &[u8]) -> Result<HostReply> {
+        let me = self.env.me.clone();
+        let mine = namespace::lines(&me);
+        let under = [mine.as_slice(), prefix].concat();
+        let held = View::new(self.world.store.reads(), vec![&*self.overlay])
+            .scan(namespace::BLOBS, &abi::Scan::prefix(&under))?;
+        for entry in held {
+            let id = namespace::on_line(&entry.value)?;
+            let line = entry.key.get(mine.len()..).unwrap_or_default();
+            let on = namespace::on(&id, &me, line);
+            self.overlay.delete(namespace::BLOBS, on);
+            self.overlay.delete(namespace::BLOBS, entry.key);
+            self.change(&id, namespace::Change::Unlist)?;
+        }
+        Ok(HostReply::Done)
+    }
+
     fn change(&mut self, id: &BlobId, change: namespace::Change) -> Result<()> {
         let key = namespace::blob(id);
         let row = self.roster(&key)?;
@@ -791,6 +809,7 @@ where
                 body,
                 line,
             } => self.keep(hash, &kind, &body, &line),
+            HostOp::BlobReleaseLines { prefix } => self.release_lines(&prefix),
             HostOp::Emit(message) => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
                 Ok(self.emit(message))

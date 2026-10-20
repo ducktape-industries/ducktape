@@ -33,3 +33,4 @@ fixture-valset = { path = "../fixtures/valset" }
 fixture-wasm = { workspace = true }
 keyscheme = { workspace = true, features = ["testkit"] }
 tempfile = { workspace = true }
+tracing-subscriber = "0.3"

@@ -3854,6 +3854,144 @@ fn a_release_leaves_no_line_behind_and_a_put_keeps_a_blobs_lines() {
 }
 
 #[test]
+fn a_release_by_line_prefix_lets_go_of_the_callers_lines_under_it_and_no_others() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let founded = genesis(vec![
+            founding("probe", PROBE, script(Vec::new())),
+            founding("other", PROBE, script(Vec::new())),
+        ]);
+        let mut host = found(context, "net", dir.path(), founded).await;
+        let run = |program: &str, steps: Vec<Step>, salt: u64| Submission {
+            salt: Some(salt),
+            ..submit(program, script(steps))
+        };
+        let kept = |host: &Host<Ctx>, body: &[u8]| {
+            let id = blob_id("file", body);
+            let rostered = host
+                .view(Layer::Confirmed)
+                .get(BLOBS, &abi::encode(&id))
+                .unwrap()
+                .is_some();
+            assert_eq!(rostered, host.blobs().has(&id), "{body:?}");
+            rostered
+        };
+        let keep = |body: &[u8], line: &[u8]| {
+            op(HostOp::put(
+                HashKind::Sha256,
+                "file".to_owned(),
+                body.to_vec(),
+                Some(line.to_vec()),
+            ))
+        };
+        let release_lines = |prefix: &[u8]| {
+            op(HostOp::BlobReleaseLines {
+                prefix: prefix.to_vec(),
+            })
+        };
+        let indexed = |host: &Host<Ctx>| {
+            let view = host.view(Layer::Confirmed);
+            let lines = view.scan(BLOBS, &abi::Scan::prefix(b"line/")).unwrap();
+            let on = view.scan(BLOBS, &abi::Scan::prefix(b"on/")).unwrap();
+            lines.len() + on.len()
+        };
+
+        host.apply(block(
+            1,
+            vec![
+                run(
+                    "probe",
+                    vec![
+                        keep(b"a", b"scratch/b/1"),
+                        keep(b"b", b"scratch/b/2"),
+                        keep(b"c", b"scratch/b/2/deep"),
+                        keep(b"c", b"scratch/b/3"),
+                        keep(b"d", b"scratch/bc"),
+                        keep(b"j", b"scratch/b0"),
+                        keep(b"e", b"scratch/b/4"),
+                        keep(b"e", b"kept/e"),
+                        keep(b"f", b"scratch/b/5"),
+                        put_blob("file", b"f"),
+                    ],
+                    1,
+                ),
+                run("other", vec![keep(b"g", b"scratch/b/1")], 2),
+            ],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(indexed(&host), 2 * 10);
+
+        host.apply(block(
+            2,
+            vec![run("probe", vec![release_lines(b"scratch/b/")], 3)],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            [b"a", b"b", b"c", b"d", b"j", b"e", b"f", b"g"].map(|body| kept(&host, &body[..])),
+            [false, false, false, true, true, true, true, true],
+            "a b c go; d and j (the first key past the range) are outside the prefix, e has a line outside it, f is held alone, g is other's"
+        );
+        assert_eq!(indexed(&host), 2 * 4);
+
+        let applied = host
+            .apply(block(
+                3,
+                vec![run("probe", vec![release_lines(b"scratch/b/")], 4)],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !applied.writes.programs.contains_key(BLOBS),
+            "a prefix no line is under writes nothing"
+        );
+
+        host.apply(block(
+            4,
+            vec![run("probe", vec![keep(b"a", b"scratch/b/1")], 5)],
+        ))
+        .await
+        .unwrap();
+        assert!(kept(&host, b"a"), "a released line takes a new put");
+
+        host.apply(block(
+            5,
+            vec![run(
+                "probe",
+                vec![keep(b"h", b"scratch/bx/1"), release_lines(b"scratch/b")],
+                6,
+            )],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            [b"a", b"d", b"j", b"h", b"e"].map(|body| kept(&host, &body[..])),
+            [false, false, false, false, true],
+            "a prefix with no trailing / is bytes: scratch/b covers scratch/bc and scratch/bx/1"
+        );
+
+        host.apply(block(6, vec![run("probe", vec![release_lines(b"")], 7)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            [b"e", b"f", b"g"].map(|body| kept(&host, &body[..])),
+            [false, true, true],
+            "an empty prefix lets go of every line, and a blob held alone stays"
+        );
+        assert_eq!(indexed(&host), 2);
+
+        assert_eq!(
+            ask(&host, Layer::Confirmed, "probe", vec![release_lines(b"")]).await,
+            vec![Reply::Host(HostReply::Refused(Refusal::new(
+                reason::UNSUPPORTED,
+                "a query does not write"
+            )))]
+        );
+    });
+}
+
+#[test]
 fn a_released_blob_whose_file_will_not_go_leaves_its_block_applied() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
