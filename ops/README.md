@@ -179,8 +179,11 @@ one up for another network.
   chat refused) is final: it is not offered again, not even after a restart. Of the rest, each stream's end line (`pods_unfollowed`) counts them
   as `already_posted`, with no line of its own for each. While the ping names no start, or one not in
   that shape, it reads from then on, logs `pods_unresumed` with why, and asks again on the next join. Each `ducktape-notify`
-  line is posted as `desktop · <line>` in its channel, as `pods` with no
-  mention, where the channel exists, is not archived and is open to anyone
+  line is a chat notice in its channel (subject `desktop`, the line as its
+  detail, grouped by the run it names as `desktop:<run>`), for the warm pod's
+  requester (the pod `PODS_WARM_POD` names; for no one while none is named,
+  or while that pod can't be read, which logs `pods_unconcerned` with why),
+  posted as `pods` where the channel exists, is not archived and is open to anyone
   (a desktop run has no requester to vouch for a members-only room).
 - The reserved pod `builds` routes a build.sh call to the machine where it
   waits least: `desktop` when its `ping` says it is up, its `busy` reads (a
@@ -385,10 +388,14 @@ one up for another network.
   processes are OOM-killed. A reply with nothing to warn of has no
   `warnings` field.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
-  it) gets one post there when it ends, mentioning its `requester`: the run
-  container's exit code, or why fetching its inputs or the pod failed. While
-  its run container runs, each line it prints that reads `ducktape-notify
-  <channel> <text>` is posted to that channel too, as `<pod> · <text>`, so
+  it) gets one chat notice there when it ends (chat `Notify`: kind `pod`,
+  group and subject the pod, status passed or failed by the run container's
+  exit), for its `requester` alone: the run container's exit code, or why
+  fetching its inputs or the pod failed. While its run container runs, each
+  line it prints that reads `ducktape-notify <channel> <text>` is a notice
+  for the requester in that channel too, with the pod as its subject and
+  `<text>` as its detail, grouped by the run the text names (`<pod>:<run>`
+  for `<run> ended: …` and `run <run> lost with pod …`, else the pod), so
   nothing the service posts can pass for a person or a program; a line is
   posted once, under an id from the pod and the sha256 of the channel and
   the text. A pod that ends before the service saw it run, or while the

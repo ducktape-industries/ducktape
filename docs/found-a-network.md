@@ -356,7 +356,9 @@ keeps its number.
 **Hearing.** chat tells attribution who each message is for: the accounts it
 mentions, both peers of a `dm-<a>-<b>` room, the earlier participants of the
 thread it replies in, and the room's listeners and watchers, never its author
-(programs `crates/app/chat/src/attributed.rs`). attribution records each as a
+(programs `crates/app/chat/src/attributed.rs`). A notice (chat `Notify`: a
+module's status line, one `Notice` block) is for the accounts it names in
+`concerns` and the room's watchers only, never its listeners. attribution records each as a
 change numbered by `seq` and writes a key that is the bytes `to/`, then the
 account, then the seq, each of the two 8 bytes big-endian with nothing between
 them. `ducktape changes attribution` follows

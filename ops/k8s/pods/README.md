@@ -68,5 +68,5 @@ another machine, reached by ssh.
    of its `pods.toml` makes reconcile patch the Deployment's image and prove it
    (`../../README.md`, section "duckpond's desired infrastructure").
 5. Check it from an agent: `network_call` egress `Request` with `GET /v1/usage` answers
-   200, and a pod made with `POST /v1/pods` runs and posts its end line in its `notify`
+   200, and a pod made with `POST /v1/pods` runs and posts its end as a chat notice for its requester in its `notify`
    channel.

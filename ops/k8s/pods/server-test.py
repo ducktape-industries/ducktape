@@ -36,10 +36,16 @@ NOTIFY = {"ducktape.industries/notify-channel": "builds"}
 ENDED = {"terminated": {"exitCode": 0, "reason": "Completed", "startedAt": "s", "finishedAt": "f"}}
 RUNNING = {"running": {"startedAt": "s"}}
 POSTED = bytes.fromhex(
-    "04060000006275696c647316000000706f64732d6475636b706f6e642d34312d656e646564010000000002000000050000003c4031"
-    "373e01000000030011000000000000002f00000020706f64206475636b706f6e642d343120656e6465643a206578697420636f6465"
-    "20302028436f6d706c65746564290000000000"
+    "1a060000006275696c647316000000706f64732d6475636b706f6e642d34312d656e64656400"
+    "03000000706f640b0000006475636b706f6e642d34310f000000706f64206475636b706f6e642d3431"
+    "00021e000000656e6465643a206578697420636f646520302028436f6d706c6574656429"
+    "010000001100000000000000"
 )
+
+
+def notified(channel, message_id, requester, line, thread):
+    name, _, text = line.partition(" \u00b7 ")
+    return server.notice_message(channel, message_id, thread, server.line_said(name, text, requester))
 KINDS = b"namespaces  ns  v1  false  Namespace\nclusterroles    rbac.authorization.k8s.io/v1  false  ClusterRole\n"
 FETCHING = server.Fetching(image="localhost:5000/pods@sha256:00", node="https://node.example", forge="duck://duckpond/forge", block_ms=1000)
 
@@ -1797,15 +1803,67 @@ class Posts(unittest.TestCase):
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         self.assertEqual((self.signer.submits, self.paused), ([], []))
 
-    def test_the_post_is_chats_post_message_with_a_mention_of_the_requester(self):
-        line = "pod duckpond-41 ended: exit code 0 (Completed)"
-        self.assertEqual(server.post_message("builds", "pods-duckpond-41-ended", 17, line, None), POSTED)
-        threaded = server.post_message("builds", "pods-duckpond-41-ended", 17, line, 5)
-        self.assertEqual(threaded, POSTED[:-1] + b"\x01" + (5).to_bytes(8, "little"))
+    def test_the_post_is_chats_notify_of_a_notice_for_the_requester(self):
+        ended = server.ended_said(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual(ended, {"group": "duckpond-41", "subject": "pod duckpond-41", "status": "passed", "detail": "ended: exit code 0 (Completed)", "concerns": [17]})
+        self.assertEqual(server.notice_message("builds", "pods-duckpond-41-ended", None, ended), POSTED)
+        threaded = server.notice_message("builds", "pods-duckpond-41-ended", 5, ended)
+        self.assertEqual(threaded[:37], POSTED[:37])
+        self.assertEqual(threaded[37:46], b"\x01" + (5).to_bytes(8, "little"))
+        self.assertEqual(threaded[46:], POSTED[38:])
+        failed = server.ended_said(pod_json(state=FAILED, phase="Failed", notes=NOTIFY))
+        self.assertEqual(failed["status"], "failed")
 
-    def test_a_post_without_a_requester_mentions_no_one(self):
-        posted = server.post_message("builds", "m", None, "pod p ended", None)
-        self.assertNotIn(b"<@", posted)
+    def test_a_post_without_a_requester_concerns_no_one(self):
+        posted = server.notice_message("builds", "m", None, server.line_said("p", "ended", None))
+        self.assertTrue(posted.endswith(b"\x00\x00\x00\x00"))
+
+    def test_a_pods_notify_thread_reaches_its_notice(self):
+        notes = {**NOTIFY, server.NOTIFY_THREAD: "5"}
+        pod = pod_json(state=ENDED, phase="Succeeded", notes=notes)
+        self.notifier.seen(pod)
+        posted = server.notice_message("builds", "pods-duckpond-41-ended", 5, server.ended_said(pod))
+        self.assertEqual(self.signer.submits, [("chat", posted)])
+
+    def test_a_notice_chat_rejects_is_logged_unposted_with_its_reason_and_not_marked(self):
+        self.signer.submitted = ran(POOLED + b"landed 961 rejected invalid_input: there is no account 17\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [("chat", POSTED)])
+        said.assert_any_call("pods_unposted", message="pods-duckpond-41-ended", reason="invalid_input", detail=unittest.mock.ANY)
+        self.assertNotIn("annotate", self.kube.verbs())
+
+    def test_a_lines_group_is_the_run_it_names_else_the_pod(self):
+        cases = {
+            "20261019-1 ended: exit 0, GATES ok": "duckpond-41:20261019-1",
+            "run 20261019-1 lost with pod duckpond-41: it ended before the run did": "duckpond-41:20261019-1",
+            "relay this": "duckpond-41",
+        }
+        self.assertEqual({text: server.line_said("duckpond-41", text, 17)["group"] for text in cases}, cases)
+
+    def test_the_catch_up_walk_finds_a_held_notice_by_the_id_each_posts_it_under(self):
+        text = "r1 ended: exit 0, GATES ok"
+        message_id = server.line_id("desktop", "j-1", text)
+        self.assertEqual(message_id, server.notify_id("desktop", "j-1", f"desktop \u00b7 {text}"))
+        self.signer.messages.add(message_id)
+        self.assertEqual(self.notifier.passed("desktop", [("j-1", text)]), (1, 1, None))
+        self.assertEqual(self.notifier.posted, {"desktop": {message_id}})
+        self.assertEqual(self.notifier.each("desktop", None, [("j-1", text)], unvouched=True), 0)
+        self.assertEqual(self.signer.submits, [])
+
+    def test_a_lines_status_is_its_runs_exit_and_a_lost_run_fails(self):
+        cases = {
+            "20261019-1 ended: exit 0, GATES ok": "passed",
+            "20261019-1 ended: exit 1, GATES FAIL: test": "failed",
+            "20261019-1 ended: exit 143, stopped by build.sh stop": "failed",
+            "20261019-1 ended: sh exit 0 (core c293b001070e, slot 2)": "passed",
+            "20261019-1 ended: sh exit 1 (core c293b001070e, slot 2)": "failed",
+            "20261019-1 ended: shot exit 0 (programs 6064e86c9aa5, slot shot)": "passed",
+            "20261019-1 ended: shot exit 1 (programs 6064e86c9aa5, slot shot)": "failed",
+            "run 20261019-1 lost with pod duckpond-41: it ended before the run did": "failed",
+            "relay this": "note",
+        }
+        self.assertEqual({text: server.line_status(text) for text in cases}, cases)
 
     def test_an_ended_pod_is_posted_once_and_marked(self):
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
@@ -1825,7 +1883,7 @@ class Posts(unittest.TestCase):
         self.kube.logs_of["duckpond-41"] = b"building\nducktape-notify j-093 20261019-1 ended: exit 0, GATES ok\n"
         self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
         line = "duckpond-41 \u00b7 20261019-1 ended: exit 0, GATES ok"
-        posted = server.post_message("j-093", server.notify_id("duckpond-41", "j-093", line), 17, line, None)
+        posted = notified("j-093", server.notify_id("duckpond-41", "j-093", line), 17, line, None)
         self.assertEqual(self.signer.submits, [("chat", posted)])
         self.assertEqual((self.kube.follows, self.kube.calls, self.notifier.following), (["duckpond-41"], [], set()))
 
@@ -1877,7 +1935,7 @@ class Posts(unittest.TestCase):
         self.kube.answer("logs", ran(b"building\nducktape-notify j-093 run 1 ended: exit 0, GATES ok\n"))
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         line = "duckpond-41 \u00b7 run 1 ended: exit 0, GATES ok"
-        posted = server.post_message("j-093", server.notify_id("duckpond-41", "j-093", line), 17, line, None)
+        posted = notified("j-093", server.notify_id("duckpond-41", "j-093", line), 17, line, None)
         self.assertEqual(self.signer.submits, [("chat", posted), ("chat", POSTED)])
         self.assertEqual(self.notifier.posted, {})
 
@@ -1893,8 +1951,8 @@ class Posts(unittest.TestCase):
         ended = "duckpond-41 \u00b7 20261019-2 ended: exit 0, GATES ok"
         lost = "duckpond-41 \u00b7 run 20261019-1 lost with pod duckpond-41: it ended before the run did, so nothing of it runs now; call it again: app b2ae apply /home/tech/work/j-101/snap.sh"
         posts = [
-            ("chat", server.post_message("j-080", server.notify_id("duckpond-41", "j-080", ended), 17, ended, None)),
-            ("chat", server.post_message("j-101", server.notify_id("duckpond-41", "j-101", lost), 17, lost, None)),
+            ("chat", notified("j-080", server.notify_id("duckpond-41", "j-080", ended), 17, ended, None)),
+            ("chat", notified("j-101", server.notify_id("duckpond-41", "j-101", lost), 17, lost, None)),
         ]
         self.assertEqual(self.signer.submits[:2], posts)
         self.assertEqual(len(self.signer.submits), 3)
@@ -2322,10 +2380,10 @@ class DesktopRunner(Streamed):
         self.gate.spawned.get(timeout=10)
         self.gate.spawned.get(timeout=10)
 
-    def test_a_notify_run_s_end_line_is_posted_with_no_mention(self):
+    def test_with_no_warm_pod_named_a_notify_run_s_end_line_concerns_no_one(self):
         self.notified(b"[r1] GATES ok\nducktape-notify j-1 r1 ended: exit 0, GATES ok\n")
         line = "desktop · r1 ended: exit 0, GATES ok"
-        posted = server.post_message("j-1", server.notify_id("desktop", "j-1", line), None, line, None)
+        posted = notified("j-1", server.notify_id("desktop", "j-1", line), None, line, None)
         self.assertEqual(self.signer.submits, [("chat", posted)])
         self.assertEqual(self.paused, [1, 1])
 
@@ -2349,7 +2407,7 @@ class DesktopRunner(Streamed):
         self.gate.followers.put(Followed(0, b"", b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\n"))
         self.gate.spawned.get(timeout=10)
         line = "desktop · r1 ended: exit 0, GATES ok"
-        self.assertIn(("chat", server.post_message("j-1", server.notify_id("desktop", "j-1", line), None, line, None)), self.signer.submits)
+        self.assertIn(("chat", notified("j-1", server.notify_id("desktop", "j-1", line), None, line, None)), self.signer.submits)
 
     def test_a_desktop_whose_ping_names_no_start_is_followed_from_now_and_asked_again(self):
         self.gate.answers["ping"] = ran({name: value for name, value in UP.items() if name != "started"})
@@ -2398,7 +2456,7 @@ class DesktopRunner(Streamed):
         self.assertIn(["logs", "--since=600s"], self.gate.words())
         self.assertNotIn(server.chat_message(ids[0]), self.signer.asked)
         self.assertEqual([request for request in self.signer.asked if request in map(server.chat_message, ids)], [server.chat_message(ids[2]), server.chat_message(ids[1]), server.chat_message(ids[2])])
-        self.assertEqual(self.signer.submits, [("chat", server.post_message("j-1", ids[2], None, lines[2][1], None))])
+        self.assertEqual(self.signer.submits, [("chat", notified("j-1", ids[2], None, lines[2][1], None))])
         said.assert_any_call("pods_caught_up", pod="desktop", already_posted=2, asked=2)
 
     def test_a_chat_ask_that_fails_mid_walk_marks_nothing_and_each_line_is_asked_as_it_comes(self):
@@ -2432,7 +2490,7 @@ class DesktopRunner(Streamed):
         said.assert_any_call("pods_uncaught", pod="desktop", asked=1, detail=json.dumps(error))
         self.assertNotIn("pods_caught_up", [call.args[0] for call in said.call_args_list])
         self.assertEqual([request for request in self.signer.asked if request in map(server.chat_message, ids)], [server.chat_message(id) for id in ids])
-        self.assertEqual(self.signer.submits, [("chat", server.post_message("j-1", ids[2], None, lines[2][1], None))])
+        self.assertEqual(self.signer.submits, [("chat", notified("j-1", ids[2], None, lines[2][1], None))])
 
     def test_a_backlog_the_gate_does_not_serve_leaves_each_line_to_its_own_check(self):
         self.gate.answers["logs"] = ran(code=64, err="gate: refused bad_log_option: --since")
@@ -2670,6 +2728,23 @@ class Builds(Streamed):
 
     def warm_execs(self):
         return [call[1:] for call in self.kube.calls if call[0] == "exec"]
+
+    def test_a_desktop_line_concerns_the_warm_pods_requester_and_is_grouped_by_its_run(self):
+        self.kube.answer("get", ran(pod_json(name=WARM, requester="21")))
+        DesktopRunner.notified(self, b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\n")
+        said = server.line_said("desktop", "r1 ended: exit 0, GATES ok", 21)
+        self.assertEqual((said["group"], said["concerns"]), ("desktop:r1", [21]))
+        message_id = server.notify_id("desktop", "j-1", "desktop \u00b7 r1 ended: exit 0, GATES ok")
+        self.assertIn(("chat", server.notice_message("j-1", message_id, None, said)), self.signer.submits)
+
+    def test_a_warm_pod_that_cannot_be_read_leaves_a_desktop_line_for_no_one_and_says_why(self):
+        self.kube.answer("get", ran(code=1, err=f'Error from server (NotFound): pods "{WARM}" not found'))
+        with unittest.mock.patch.object(server, "say") as said:
+            DesktopRunner.notified(self, b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\n")
+        message_id = server.notify_id("desktop", "j-1", "desktop \u00b7 r1 ended: exit 0, GATES ok")
+        posted = server.notice_message("j-1", message_id, None, server.line_said("desktop", "r1 ended: exit 0, GATES ok", None))
+        self.assertIn(("chat", posted), self.signer.submits)
+        said.assert_any_call("pods_unconcerned", pod="desktop", detail=unittest.mock.ANY)
 
     def test_a_free_desktop_takes_the_run_and_the_answer_names_it(self):
         status, answer = self.built("JOB=j-1", "programs", "dev", "gates")

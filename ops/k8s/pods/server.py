@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends or a notified pod prints a `ducktape-notify` line, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import base64
 import binascii
@@ -449,15 +449,46 @@ class Reader:
         raise Refused(502, f"a reply names hash kind {tag}")
 
 
-def mention(account):
-    return borsh_text(f"<@{account}>") + borsh_vec([u8(3) + u8(0) + u64(account)])
+CHAT_NOTIFY = 26
+NOTICE_KIND = "pod"
+STATUSES = {"note": 0, "running": 1, "passed": 2, "failed": 3}
+RUN_ENDED = re.compile(r"\bended: (?:sh |shot )?exit (\d+)")
+RUN_LOST = " lost with pod "
+RUN_NAMED = re.compile(rf"(?:run )?(\S+)(?: ended: |{RUN_LOST})")
 
 
-def post_message(channel, message_id, requester, line, thread):
-    plain = lambda text: borsh_text(text) + borsh_vec([])
-    spans = [plain(line)] if requester is None else [mention(requester), plain(f" {line}")]
-    paragraph = u8(0) + borsh_vec(spans)
-    return u8(4) + borsh_text(channel) + borsh_text(message_id) + borsh_vec([paragraph]) + borsh_option(thread, u64)
+def concerning(account):
+    return [] if account is None else [account]
+
+
+def notice_message(channel, message_id, thread, said):
+    concerns = [u64(account) for account in said["concerns"]]
+    notice = (
+        borsh_text(NOTICE_KIND)
+        + borsh_text(said["group"])
+        + borsh_text(said["subject"])
+        + borsh_option(None, borsh_text)
+        + u8(STATUSES[said["status"]])
+        + borsh_text(said["detail"])
+        + borsh_vec(concerns)
+    )
+    return u8(CHAT_NOTIFY) + borsh_text(channel) + borsh_text(message_id) + borsh_option(thread, u64) + notice
+
+
+def line_status(text):
+    ended = RUN_ENDED.search(text)
+    if ended is not None:
+        return "passed" if ended.group(1) == "0" else "failed"
+    return "failed" if RUN_LOST in text else "note"
+
+
+def line_group(name, text):
+    run = RUN_NAMED.match(text)
+    return name if run is None else f"{name}:{run.group(1)}"
+
+
+def line_said(name, text, concerned):
+    return {"group": line_group(name, text), "subject": name, "status": line_status(text), "detail": text, "concerns": concerning(concerned)}
 
 
 def chat_channel(channel):
@@ -1422,7 +1453,7 @@ def notify_lines(name, stream):
             continue
         channel, _, text = line[len(NOTIFY_LINE):].partition(" ")
         if channel and text.strip():
-            yield channel, f"{name} \u00b7 {text.strip()}"
+            yield channel, text.strip()
 
 
 def lost_runs(name, stream):
@@ -1439,12 +1470,28 @@ def lost_runs(name, stream):
     for run, (channel, call) in armed.items():
         if run not in done:
             again = f"; call it again: {call}" if call else "; call it again"
-            yield channel, f"{name} \u00b7 run {run} lost with pod {name}: it ended before the run did, so nothing of it runs now{again}"
+            yield channel, f"run {run}{RUN_LOST}{name}: it ended before the run did, so nothing of it runs now{again}"
+
+
+def line_id(name, channel, text):
+    return notify_id(name, channel, f"{name} \u00b7 {text}")
 
 
 def notify_id(name, channel, line):
     digest = hashlib.sha256(f"{channel}\n{line}".encode()).hexdigest()
     return f"pods-{name}-notify-{digest}"
+
+
+def ended_said(pod):
+    line = ended_line(pod)
+    if line is None:
+        return None
+    name = pod["metadata"]["name"]
+    ran = state_of(pod.get("status", {}).get("containerStatuses", []), RUN)
+    passed = ran is not None and ran["state"] == "terminated" and ran["exit_code"] == 0
+    detail = line.removeprefix(f"pod {name} ")
+    requester = requester_of(pod["metadata"].get("labels") or {})
+    return {"group": name, "subject": f"pod {name}", "status": "passed" if passed else "failed", "detail": detail, "concerns": concerning(requester)}
 
 
 def ended_event(pod):
@@ -1696,7 +1743,7 @@ class Notifier:
         self.pause = time.sleep
         self.retry_pause = retry_pause
 
-    def post(self, notes, requester, message_id, line, unvouched=False):
+    def post(self, notes, requester, message_id, said, unvouched=False):
         notify = notify_of(notes)
         if notify is None:
             return False
@@ -1707,7 +1754,7 @@ class Notifier:
         attempts = 0
         while True:
             try:
-                return self.post_once(notify, requester, message_id, line, unvouched)
+                return self.post_once(notify, requester, message_id, said, unvouched)
             except Unanswered as why:
                 attempts += 1
                 if attempts & (attempts - 1) == 0:
@@ -1715,7 +1762,7 @@ class Notifier:
                 self.pause(pause)
                 pause *= 2
 
-    def post_once(self, notify, requester, message_id, line, unvouched):
+    def post_once(self, notify, requester, message_id, said, unvouched):
         try:
             held = message_held(self.asked(chat_message(message_id)))
         except Refused:
@@ -1728,7 +1775,7 @@ class Notifier:
             fields = {} if detail is None else {"detail": json.dumps(detail)}
             say("pods_unposted", message=message_id, reason=reason, **fields)
             return False
-        payload = post_message(notify["channel"], message_id, requester, line, notify["thread"])
+        payload = notice_message(notify["channel"], message_id, notify["thread"], said)
         outcome, reason, sentence, _ = receipt(self.signer.submit(CHAT, payload))
         posted = outcome == "applied" or (outcome == "rejected" and reason == "already_exists")
         if posted:
@@ -1774,31 +1821,32 @@ class Notifier:
     def passed(self, name, said):
         asked = 0
         for newest in range(len(said) - 1, -1, -1):
-            channel, line = said[newest]
+            channel, text = said[newest]
             asked += 1
             try:
-                held = message_held(self.asked(chat_message(notify_id(name, channel, line))))
+                held = message_held(self.asked(chat_message(line_id(name, channel, text))))
             except Refused as refused:
                 return 0, asked, refused.sentence
             except Unanswered as why:
                 return 0, asked, str(why)
             if held:
                 with self.lock:
-                    self.posted.setdefault(name, set()).update(notify_id(name, channel, line) for channel, line in said[: newest + 1])
+                    self.posted.setdefault(name, set()).update(line_id(name, channel, text) for channel, text in said[: newest + 1])
                 return newest + 1, asked, None
         return 0, asked, None
 
-    def lines(self, name, requester, stream, unvouched=False):
-        return self.each(name, requester, notify_lines(name, stream), unvouched)
+    def lines(self, name, requester, stream, unvouched=False, concerned=None):
+        return self.each(name, requester, notify_lines(name, stream), unvouched, concerned)
 
-    def each(self, name, requester, said, unvouched=False):
+    def each(self, name, requester, said, unvouched=False, concerned=None):
+        concerned = requester if concerned is None else concerned
         held = 0
-        for channel, line in said:
-            message_id = notify_id(name, channel, line)
+        for channel, text in said:
+            message_id = line_id(name, channel, text)
             with self.lock:
                 if message_id in self.posted.get(name, ()):
                     continue
-            posted = self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line, unvouched)
+            posted = self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line_said(name, text, concerned), unvouched)
             if posted:
                 held += posted is HELD
                 with self.lock:
@@ -1839,14 +1887,14 @@ class Notifier:
         self.followed(pod)
         meta = pod["metadata"]
         notes = meta.get("annotations") or {}
-        line = ended_line(pod)
-        unposted = line is not None and NOTIFIED not in notes and NOTIFY_CHANNEL in notes
+        ended = ended_said(pod)
+        unposted = ended is not None and NOTIFIED not in notes and NOTIFY_CHANNEL in notes
         if not unposted:
             return
         name = meta["name"]
         requester = requester_of(meta.get("labels") or {})
         self.read(name, requester)
-        if self.post(notes, requester, f"pods-{name}-ended", line):
+        if self.post(notes, requester, f"pods-{name}-ended", ended):
             self.kube.annotate(name, NOTIFIED, "ended")
             with self.lock:
                 self.posted.pop(name, None)
@@ -2494,8 +2542,9 @@ class Service:
             except Refused as refused:
                 say("pods_unfollowed", pod=DESKTOP, detail=json.dumps(refused.sentence))
             else:
+                concerned = self.warm_requester()
                 with process.stdout:
-                    held = self.notifier.lines(DESKTOP, None, heard_in(process.stdout, heard), unvouched=True)
+                    held = self.notifier.lines(DESKTOP, None, heard_in(process.stdout, heard), unvouched=True, concerned=concerned)
                 say("pods_unfollowed", pod=DESKTOP, code=process.wait(), already_posted=held)
             if heard:
                 since, pause = asked, self.retry_pause
@@ -2515,6 +2564,15 @@ class Service:
             say("pods_uncaught", pod=DESKTOP, asked=asked, detail=json.dumps(why))
             return
         say("pods_caught_up", pod=DESKTOP, already_posted=passed, asked=asked)
+
+    def warm_requester(self):
+        if not self.warm_pod:
+            return None
+        try:
+            return requester_of(self.pod(self.warm()).get("metadata", {}).get("labels") or {})
+        except Refused as refused:
+            say("pods_unconcerned", pod=DESKTOP, detail=json.dumps(refused.sentence))
+            return None
 
     def runner_began(self, since, begun, wall):
         try:
