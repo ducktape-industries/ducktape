@@ -210,6 +210,10 @@ impl<E: Context> Ctx<E> {
         self.daemon.holds_ended.clone()
     }
 
+    pub(crate) fn snapshot(&self) -> Option<Arc<crate::snapshot::Kept>> {
+        self.daemon.snapshot.load_full()
+    }
+
     pub(crate) fn live_port(&self) -> Option<u16> {
         self.daemon.live.port()
     }

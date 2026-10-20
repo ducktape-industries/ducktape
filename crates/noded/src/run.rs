@@ -641,6 +641,7 @@ async fn start<E: Context>(
         anchors: marshal.mailbox().clone(),
         holds: statesync::Holds::default(),
         holds_ended: Default::default(),
+        snapshot: snapshot_removals.served(),
         history,
         recent: crate::blocks::Recent::new(),
         activity,

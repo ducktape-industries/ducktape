@@ -1,19 +1,25 @@
-// A follower whose filesystem reflinks keeps its newest whole snapshot: at each epoch's last block,
-// unless a later epoch's last block is already finalized, the writer clones every commitment file
-// beside a manifest; a thread of its own removes older snapshots, and a stop waits for it.
+// A follower whose filesystem reflinks keeps its newest whole snapshot and serves it: at each
+// epoch's last block, unless a later epoch's last block is already finalized, the writer clones every
+// commitment file beside a manifest; a thread removes older ones, a download holding the one before.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
+use arc_swap::ArcSwapOption;
 use node::Node;
 use statesync::Manifest;
 use tokio::sync::watch;
 
 use crate::Context;
+
+mod stream;
+
+pub(crate) use stream::{fetched, resumed, served};
 
 pub(crate) const DIR: &str = "snapshots";
 pub(crate) const MANIFEST: &str = "manifest";
@@ -32,34 +38,136 @@ impl From<io::Error> for Refused {
 
 pub(crate) type Reflink = fn(&File, &File) -> Result<(), Refused>;
 
+pub(crate) type Served = Arc<ArcSwapOption<Kept>>;
+
+pub(crate) struct Kept {
+    height: u64,
+    dir: PathBuf,
+    manifest: Manifest,
+    released: mpsc::Sender<Removal>,
+    cut: watch::Receiver<u64>,
+}
+
+impl Kept {
+    fn open(
+        snapshots: &Path,
+        height: u64,
+        removals: &mpsc::Sender<Removal>,
+        cut: &watch::Sender<u64>,
+    ) -> io::Result<Kept> {
+        let dir = snapshots.join(height.to_string());
+        let written = std::fs::read(dir.join(MANIFEST))?;
+        let manifest: Manifest = abi::decode(&written)
+            .map_err(|refusal| io::Error::new(io::ErrorKind::InvalidData, refusal.sentence))?;
+        let its_own = manifest.tip.height == height;
+        if !its_own {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("its manifest names height {}", manifest.tip.height),
+            ));
+        }
+        removals
+            .send(Removal::Kept(height))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(Kept {
+            height,
+            dir,
+            manifest,
+            released: removals.clone(),
+            cut: cut.subscribe(),
+        })
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        let _ = self.released.send(Removal::Released(self.height));
+    }
+}
+
+enum Removal {
+    Kept(u64),
+    Released(u64),
+    Cut(u64),
+    Unable,
+    Stop,
+    #[cfg(test)]
+    Settled(mpsc::Sender<()>),
+}
+
 pub(crate) struct Removals {
-    below: Option<mpsc::Sender<u64>>,
+    dir: PathBuf,
+    sender: mpsc::Sender<Removal>,
+    cut: watch::Sender<u64>,
+    served: Served,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Removals {
     pub(crate) fn start(dir: PathBuf) -> io::Result<Removals> {
-        let (below, heard) = mpsc::channel();
+        let (sender, heard) = mpsc::channel();
+        let (cut, _) = watch::channel(0);
+        let adopted = adopted(&dir, &sender, &cut);
+        let live: BTreeSet<u64> = adopted.iter().map(|kept| kept.height).collect();
+        swept(&dir, &live, true);
         let thread = std::thread::Builder::new()
             .name("snapshots".into())
-            .spawn(move || removing(&dir, heard))?;
+            .spawn({
+                let dir = dir.clone();
+                move || removing(&dir, heard)
+            })?;
         Ok(Removals {
-            below: Some(below),
+            dir,
+            sender,
+            cut,
+            served: Arc::new(ArcSwapOption::new(adopted.map(Arc::new))),
             thread: Some(thread),
         })
     }
 
-    fn below(&self, height: u64) {
-        let sent = self.below.as_ref().map(|below| below.send(height));
-        if let Some(Err(error)) = sent {
-            unremoved(Path::new(DIR), &io::Error::other(error.to_string()));
+    pub(crate) fn served(&self) -> Served {
+        self.served.clone()
+    }
+
+    fn publish(&self, height: u64) -> io::Result<()> {
+        let kept = Kept::open(&self.dir, height, &self.sender, &self.cut)?;
+        let Some(replaced) = self.served.swap(Some(Arc::new(kept))) else {
+            return Ok(());
+        };
+        let below = replaced.height;
+        self.cut.send_if_modified(|cut| {
+            let later = below > *cut;
+            if later {
+                *cut = below;
+            }
+            later
+        });
+        self.send(Removal::Cut(below));
+        Ok(())
+    }
+
+    fn unable(&self) {
+        self.served.store(None);
+        self.send(Removal::Unable);
+    }
+
+    fn send(&self, removal: Removal) {
+        if let Err(error) = self.sender.send(removal) {
+            unremoved(&self.dir, &io::Error::other(error.to_string()));
         }
+    }
+
+    #[cfg(test)]
+    fn settled(&self) {
+        let (done, settled) = mpsc::channel();
+        self.send(Removal::Settled(done));
+        let _ = settled.recv();
     }
 }
 
 impl Drop for Removals {
     fn drop(&mut self) {
-        drop(self.below.take());
+        let _ = self.sender.send(Removal::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -122,24 +230,28 @@ impl Snapshots {
             return;
         }
         match self.written(height, prefixes, manifest) {
-            Ok(partitions) => {
-                self.removals.below(height);
-                tracing::info!(
-                    target: "ducktape::node",
-                    event = "snapshot_taken",
-                    height,
-                    partitions,
-                    "the node keeps a snapshot of its commitments at an epoch's last block"
-                );
-            }
+            Ok(partitions) => self.published(height, partitions),
             Err(Refused::Unsupported(error)) => self.unsupported(&error),
             Err(Refused::Failed(error)) => failed(height, &error.to_string()),
         }
     }
 
+    fn published(&self, height: u64, partitions: usize) {
+        if let Err(error) = self.removals.publish(height) {
+            return failed(height, &error.to_string());
+        }
+        tracing::info!(
+            target: "ducktape::node",
+            event = "snapshot_taken",
+            height,
+            partitions,
+            "the node keeps and serves a snapshot of its commitments at an epoch's last block"
+        );
+    }
+
     fn unsupported(&mut self, error: &io::Error) {
         self.able = false;
-        self.removals.below(u64::MAX);
+        self.removals.unable();
         tracing::info!(
             target: "ducktape::node",
             event = "snapshot_unsupported",
@@ -184,25 +296,64 @@ impl Snapshots {
     }
 }
 
-fn removing(dir: &Path, heard: mpsc::Receiver<u64>) {
-    for kept in heard {
-        older_removed(dir, kept);
+fn adopted(dir: &Path, removals: &mpsc::Sender<Removal>, cut: &watch::Sender<u64>) -> Option<Kept> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut heights: Vec<u64> = entries
+        .filter_map(|entry| whole(&entry.ok()?.file_name()))
+        .collect();
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    heights
+        .into_iter()
+        .find_map(|height| match Kept::open(dir, height, removals, cut) {
+            Ok(kept) => Some(kept),
+            Err(error) => {
+                unserved(height, &error);
+                None
+            }
+        })
+}
+
+fn whole(name: &OsStr) -> Option<u64> {
+    name.to_str()?.parse().ok()
+}
+
+fn removing(dir: &Path, heard: mpsc::Receiver<Removal>) {
+    let mut live = BTreeSet::new();
+    let mut all = false;
+    for removal in heard {
+        match removal {
+            Removal::Kept(height) => {
+                live.insert(height);
+            }
+            Removal::Released(height) => {
+                live.remove(&height);
+            }
+            Removal::Cut(below) => live.retain(|height| *height >= below),
+            Removal::Unable => all = true,
+            Removal::Stop => return,
+            #[cfg(test)]
+            Removal::Settled(done) => {
+                let _ = done.send(());
+                continue;
+            }
+        }
+        swept(dir, &live, all);
     }
 }
 
-fn older_removed(dir: &Path, kept: u64) {
+fn swept(dir: &Path, live: &BTreeSet<u64>, all: bool) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return,
         Err(error) => return unremoved(dir, &error),
     };
+    let newest = live.last().copied();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => return unremoved(dir, &error),
         };
-        let older = height_of(&entry.file_name()).is_none_or(|height| height < kept);
-        if !older {
+        if !unused(&entry.file_name(), live, newest, all) {
             continue;
         }
         if let Err(error) = removed(&entry.path()) {
@@ -211,8 +362,25 @@ fn older_removed(dir: &Path, kept: u64) {
     }
 }
 
-fn height_of(name: &OsStr) -> Option<u64> {
-    name.to_str()?.trim_start_matches('.').parse().ok()
+fn unused(name: &OsStr, live: &BTreeSet<u64>, newest: Option<u64>, all: bool) -> bool {
+    let Some(name) = name.to_str() else {
+        return true;
+    };
+    let (fresh, digits) = match name.strip_prefix('.') {
+        Some(digits) => (true, digits),
+        None => (false, name),
+    };
+    let Ok(height) = digits.parse::<u64>() else {
+        return true;
+    };
+    let serving = !fresh && live.contains(&height);
+    if serving {
+        return false;
+    }
+    if all {
+        return true;
+    }
+    newest.is_some_and(|newest| height < newest || (fresh && height == newest))
 }
 
 fn unremoved(path: &Path, error: &io::Error) {
@@ -222,7 +390,18 @@ fn unremoved(path: &Path, error: &io::Error) {
         path = %path.display(),
         %error,
         reason = "snapshot_unremoved",
-        "the node could not remove an older snapshot; the next snapshot tries again"
+        "the node could not remove a snapshot nothing serves; the next removal tries again"
+    );
+}
+
+fn unserved(height: u64, error: &io::Error) {
+    tracing::warn!(
+        target: "ducktape::node",
+        event = "snapshot_unserved",
+        height,
+        %error,
+        reason = "snapshot_unread",
+        "the node does not serve a snapshot whose manifest does not read as its own, and removes it"
     );
 }
 

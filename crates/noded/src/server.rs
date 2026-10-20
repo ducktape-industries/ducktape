@@ -188,6 +188,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::EGRESS_SET, post(egress_set::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::SYNC_HOLD, post(sync_hold::<E>))
+        .route(route::SNAPSHOT, post(snapshot::<E>))
         .route(route::METRICS, get(metrics::<E>))
         .route(live_wire::PORT_ROUTE, get(live_port::<E>))
         .route(route::QUERY, post(query::<E>))
@@ -1114,6 +1115,19 @@ fn length_framed(bytes: &[u8]) -> Vec<u8> {
     let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
     framed.extend_from_slice(bytes);
     framed
+}
+
+async fn snapshot<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Response {
+    let ask: crate::wire::snapshot::Ask = match abi::decode(&body) {
+        Ok(ask) => ask,
+        Err(refusal) => return Reply::<()>::Refused(refusal).into_response(),
+    };
+    let Some(kept) = ctx.snapshot() else {
+        let none = Refusal::new(reason::NOT_FOUND, "this node keeps no snapshot");
+        return Reply::<()>::Refused(none).into_response();
+    };
+    let answer = crate::snapshot::served(kept, ask);
+    (StatusCode::OK, Body::from_stream(answer)).into_response()
 }
 
 async fn metrics<E: Context>(ctx: Ctx<E>) -> Response {

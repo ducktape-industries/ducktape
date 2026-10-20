@@ -34,6 +34,7 @@ pub mod route {
     pub const EGRESS_SET: &str = "/v1/egress/set";
     pub const SYNC: &str = "/v1/sync";
     pub const SYNC_HOLD: &str = "/v1/sync/hold";
+    pub const SNAPSHOT: &str = "/v1/snapshot";
     pub const NETWORK: &str = "/v1/network";
     pub const P2P: &str = "/v1/p2p";
     pub const METRICS: &str = "/metrics";
@@ -295,5 +296,28 @@ pub mod activity {
         Used(PageResponse<Used>),
         Indexed(Indexed),
         Refusal(Option<Refusal>),
+    }
+}
+
+pub mod snapshot {
+    use borsh::{BorshDeserialize, BorshSerialize};
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Ask {
+        pub resume: Option<Resume>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Resume {
+        pub height: u64,
+        pub path: String,
+        pub offset: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+    pub struct Part {
+        pub path: String,
+        pub len: u64,
+        pub from: u64,
     }
 }

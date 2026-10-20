@@ -259,14 +259,33 @@ commitment files (every runtime partition under `state::partition_prefix`)
 into the snapshot's `runtime/` and
 writes its `manifest`, a borsh `statesync::Manifest`: the tip and each
 program's sync target, the root and op range its copy opens at. The snapshot
-appears whole by a rename; then a thread of its own, off the block CPUs,
-removes every older one, so a node holds one (a stop waits for that thread).
+appears whole by a rename, and the node serves it from then on; a thread of
+its own, off the block CPUs, removes each older one once no download reads it,
+and the one before that even while a download reads it, so a node holds at
+most two (a stop waits for that thread).
 A node that already knows a later epoch's last block is finalized (it is
 catching up) skips the snapshot, since the next one replaces it; marshal's
 finalized tip reaches the writer through `Chain::finalized`.
 A node whose filesystem refuses the clone logs `snapshot_unsupported` once,
 clears `snapshots/` and makes none until it restarts; a snapshot that fails
 logs `snapshot_failed` and leaves the one before it.
+
+`POST /v1/snapshot` answers the newest snapshot in one stream. It takes a
+borsh `noded::wire::snapshot::Ask` and answers the manifest as a length-framed
+borsh `statesync::Manifest`, then each file under the snapshot's `runtime/` in
+the order of its path, as a length-framed `wire::snapshot::Part` (its path, its
+length and where its bytes start) followed by those bytes, then an empty
+frame. A download holds the snapshot it reads, so a newer one does not remove
+it until its answer ends; once a second newer snapshot lands, the answer is cut
+and that snapshot goes, and a resume downloads the newest. An `Ask` whose
+`resume` names the snapshot's height,
+the last file a cut download holds and that file's length is answered from
+there; one naming another height gets the newest snapshot whole.
+`Client::snapshot` writes a snapshot into a directory (its `manifest` and
+`runtime/`) and resumes from whatever that directory holds. Nothing fsyncs a
+snapshot, so a node that restarts serves its newest one only if its manifest
+decodes and names that height (`snapshot_unserved` otherwise), and removes the
+rest. A node with no snapshot refuses `not_found`.
 
 ```sh
 make -C programs wasm-founding                      # a programs checkout; a hosted network's is at a forge dev commit

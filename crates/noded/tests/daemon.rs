@@ -1511,18 +1511,24 @@ fn a_resident_snapshots_each_epoch_where_its_directory_clones_and_a_validator_ne
     resident.address = None;
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
     seat.init(&founding);
+    let cloning = clones(root.path());
+    let into = root.path().join("downloaded");
     let live = seat.start();
     let client = live.client.clone();
     let runtime = client_runtime();
     resident.join(&client);
     let follower = resident.start();
-    let closing = runtime.block_on(async {
+    let (closing, downloaded) = runtime.block_on(async {
         let joined = follower.client.status().await.unwrap().height;
         let closing = (joined / EPOCH_LENGTH + 1) * EPOCH_LENGTH - 1;
         reach(&follower.client, closing + EPOCH_LENGTH + 1).await;
+        let downloaded = match cloning {
+            true => Some(fetched_snapshot(&follower.client, &into).await),
+            false => None,
+        };
         seat.admin(&client, Admin::Shutdown).await;
         resident.admin(&follower.client, Admin::Shutdown).await;
-        closing
+        (closing, downloaded)
     });
     live.thread.join().unwrap();
     follower.thread.join().unwrap();
@@ -1534,7 +1540,7 @@ fn a_resident_snapshots_each_epoch_where_its_directory_clones_and_a_validator_ne
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect();
-    if !clones(root.path()) {
+    if !cloning {
         println!(
             "{} does not clone: the resident tried a snapshot, cleared snapshots/ and followed \
              past the next epoch",
@@ -1564,7 +1570,33 @@ fn a_resident_snapshots_each_epoch_where_its_directory_clones_and_a_validator_ne
         "{:?}",
         manifest.targets.keys()
     );
-    let (opened, targets) = runner(&snapshot.join("runtime")).start(|context| async move {
+    opens_at_its_targets(&snapshot.join("runtime"), manifest);
+    let downloaded = downloaded.unwrap();
+    let height = downloaded.tip.height;
+    assert!(
+        height >= closing && (height + 1).is_multiple_of(EPOCH_LENGTH),
+        "the download is at {height}, after {closing}"
+    );
+    opens_at_its_targets(&into.join("runtime"), downloaded);
+}
+
+#[cfg(target_os = "linux")]
+async fn fetched_snapshot(client: &Client, into: &Path) -> statesync::Manifest {
+    let mut blocks = client.changes(host::RECENT).await.unwrap();
+    loop {
+        match client.snapshot(into).await {
+            Ok(manifest) => return manifest,
+            Err(noded::Error::Refused(refusal)) if refusal.reason == reason::NOT_FOUND => {
+                blocks.next().await.unwrap().unwrap();
+            }
+            Err(error) => panic!("the resident's snapshot does not download: {error}"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn opens_at_its_targets(runtime: &Path, manifest: statesync::Manifest) {
+    let (opened, targets) = runner(runtime).start(|context| async move {
         let mut opened = BTreeMap::new();
         for program in manifest.targets.keys() {
             let context = context.child("snapshot").with_attribute("program", program);

@@ -159,6 +159,7 @@ pub struct Daemon<E: Context> {
     pub anchors: MarshalMailbox,
     holds: statesync::Holds<E>,
     holds_ended: Arc<std::sync::atomic::AtomicU64>,
+    snapshot: snapshot::Served,
     history: history::History,
     recent: blocks::Recent,
     activity: activity::Index,

@@ -195,6 +195,27 @@ impl Client {
         self.post(route::ACTIVITY, query).await
     }
 
+    pub async fn snapshot(&self, into: &std::path::Path) -> Result<statesync::Manifest> {
+        let resume = crate::snapshot::resumed(into).await?;
+        let ask = crate::wire::snapshot::Ask { resume };
+        let response = self
+            .http
+            .post(self.url(route::SNAPSHOT))
+            .body(abi::encode(&ask))
+            .send()
+            .await?;
+        let status = response.status();
+        let answered = status == StatusCode::OK;
+        if !answered {
+            let body = response.bytes().await?;
+            return Err(unanswered(status, &body));
+        }
+        let answer = response
+            .bytes_stream()
+            .map(|read| read.map_err(Error::from));
+        crate::snapshot::fetched(answer, into).await
+    }
+
     pub async fn logs(&self) -> Result<Vec<String>> {
         self.fetch(route::LOGS).await
     }
