@@ -10,6 +10,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "access"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/programs?rev=1a246b60d056e5c7bcc692fea719de691e02cc4f#1a246b60d056e5c7bcc692fea719de691e02cc4f"
+dependencies = [
+ "abi",
+ "borsh",
+ "describe",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=1a246b60d056e5c7bcc692fea719de691e02cc4f)",
+ "store",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1915,6 +1927,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
+name = "files"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/programs?rev=1a246b60d056e5c7bcc692fea719de691e02cc4f#1a246b60d056e5c7bcc692fea719de691e02cc4f"
+dependencies = [
+ "abi",
+ "access",
+ "borsh",
+ "describe",
+ "ownership",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=1a246b60d056e5c7bcc692fea719de691e02cc4f)",
+ "store",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3044,6 +3071,7 @@ dependencies = [
  "commonware-runtime",
  "dialoguer",
  "ducktape-home",
+ "files",
  "fixture-wasm",
  "futures",
  "hex",
@@ -3054,8 +3082,10 @@ dependencies = [
  "live-wire",
  "node",
  "noded",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=1a246b60d056e5c7bcc692fea719de691e02cc4f)",
  "rand 0.10.2",
  "rand_core 0.10.1",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3386,6 +3416,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "ownership"
+version = "0.1.0"
+source = "git+https://github.com/ducktape-industries/programs?rev=1a246b60d056e5c7bcc692fea719de691e02cc4f#1a246b60d056e5c7bcc692fea719de691e02cc4f"
+dependencies = [
+ "abi",
+ "access",
+ "borsh",
+ "describe",
+ "design",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=1a246b60d056e5c7bcc692fea719de691e02cc4f)",
+ "store",
 ]
 
 [[package]]

@@ -147,6 +147,7 @@ halo = { path = "crates/networking/halo" }
 live-wire = { path = "crates/networking/live-wire" }
 blob = { path = "crates/blob", default-features = false }
 borsh-json = { git = "https://github.com/ducktape-industries/programs", rev = "1a246b60d056e5c7bcc692fea719de691e02cc4f" }
+files = { git = "https://github.com/ducktape-industries/programs", rev = "1a246b60d056e5c7bcc692fea719de691e02cc4f" }
 identity = { git = "https://github.com/ducktape-industries/programs", rev = "1a246b60d056e5c7bcc692fea719de691e02cc4f" }
 programs-sdk = { package = "program", git = "https://github.com/ducktape-industries/programs", rev = "1a246b60d056e5c7bcc692fea719de691e02cc4f" }
 store = { git = "https://github.com/ducktape-industries/programs", rev = "1a246b60d056e5c7bcc692fea719de691e02cc4f" }

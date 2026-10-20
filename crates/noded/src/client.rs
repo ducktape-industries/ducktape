@@ -68,6 +68,12 @@ impl Client {
         self.landed(frame, blocks).await
     }
 
+    pub async fn land_framed(&self, frame: &Frame, framed: Vec<Vec<u8>>) -> Result<(u64, Receipt)> {
+        let blocks = self.changes(RECENT).await?;
+        self.put_framed(frame, framed).await?;
+        self.landed(frame, blocks).await
+    }
+
     pub async fn landed(
         &self,
         frame: &Frame,
@@ -128,16 +134,26 @@ impl Client {
     }
 
     pub async fn put_blobs(&self, frame: &Frame, uploads: Vec<Upload>) -> Result<Submitted> {
-        let encoded = frame.encode();
-        let mut opening = (encoded.len() as u32).to_le_bytes().to_vec();
-        opening.extend_from_slice(&encoded);
-        let mut parts: Vec<Part> = vec![once(opening)];
+        let mut parts: Vec<Part> = Vec::new();
         for upload in uploads {
             let file = tokio::fs::File::open(&upload.path).await?;
             let len = file.metadata().await?.len();
             parts.push(once(blob::header(&upload.kind, len)));
             parts.push(Box::pin(tokio_util::io::ReaderStream::new(file)));
         }
+        self.put_parts(frame, parts).await
+    }
+
+    pub async fn put_framed(&self, frame: &Frame, framed: Vec<Vec<u8>>) -> Result<Submitted> {
+        let parts = framed.into_iter().map(once).collect();
+        self.put_parts(frame, parts).await
+    }
+
+    async fn put_parts(&self, frame: &Frame, parts: Vec<Part>) -> Result<Submitted> {
+        let encoded = frame.encode();
+        let mut opening = (encoded.len() as u32).to_le_bytes().to_vec();
+        opening.extend_from_slice(&encoded);
+        let parts = std::iter::once(once(opening)).chain(parts);
         let body = reqwest::Body::wrap_stream(futures::stream::iter(parts).flatten());
         let response = self
             .http

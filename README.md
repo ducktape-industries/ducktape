@@ -335,8 +335,9 @@ from, the node a joined node read its state from (`source`), the address its
 HTTP surface bound, the runtime's storage and, when the
 operator writes them, `node.toml`, `egress.toml` and `egress-grants`. Under `schemas/` the
 CLI keeps the schema section of each program code it has spoken to in JSON,
-named by the code's id, so `ducktape query` and `ducktape op` fetch a code
-from the node once, not on every call; an id names its bytes, so a kept
+and under `tools/` its tools section (`{}` for a code that carries none),
+each named by the code's id, so `ducktape query`, `ducktape op` and
+`ducktape mcp` fetch a code from the node once, not on every call; an id names its bytes, so a kept
 schema never goes stale, and one that no longer reads is fetched and kept
 again.
 
@@ -668,6 +669,7 @@ ducktape changes ping                   # follow a program's confirmed writes
 ducktape query files '"Head"'           # a signed read-only call, written and answered as JSON
 ducktape query ping --raw request.bin   # the same with borsh bytes, from a file or stdin
 ducktape wallet consent --account 18    # the active key's consent to a key joining account 18, as AddKey's JSON
+ducktape mcp                            # the Model Context Protocol on stdio for any MCP client: network_schema, network_query, network_call, files_read, files_write, signed by the active key, which must act as an agent account
 ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ducktape blob put code.wasm --kind program --wait  # put a bundle, print its ids, wait until it is held

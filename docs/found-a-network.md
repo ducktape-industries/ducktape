@@ -211,6 +211,20 @@ borsh bytes.
 ducktape --node http://100.65.253.102:8845 query identity '{"Profile": 17}'
 ```
 
+`ducktape mcp` serves the same to an agent whose harness is not a
+network's own (Claude Code, Codex, any MCP client) over the Model Context
+Protocol: a JSON-RPC 2.0 loop on stdin and stdout, one message a line. Its
+tools are `network_schema`, `network_query` and `network_call` in harness's
+own words (programs' `borsh_json::discover`), and `files_read` and
+`files_write`, since a file's bytes travel as chunk blobs that no single op
+carries. It signs with the active wallet key, which must act as an agent
+account (identity `CreateAgent`, then `AddKey`): a model can do anything the
+key's account can, so at start it refuses a key that acts as a person's
+account, a program's own account or none. The password comes from
+`DUCKTAPE_PASSWORD`, which the client's server config sets in its `env`; the
+key's bytes never reach the model, and `initialize` names the agent and its
+manager. A client runs it as `ducktape --workspace W --node URL mcp`.
+
 `ducktape wallet new <name>` makes a key in the workspace
 (`DUCKTAPE_PASSWORD` or a prompt) and prints its public key, then its
 mnemonic, on stdout. Keep one workspace per key, and take that output

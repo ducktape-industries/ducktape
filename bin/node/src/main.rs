@@ -1,4 +1,5 @@
 mod json;
+mod mcp;
 
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
@@ -149,6 +150,14 @@ enum Verb {
         #[arg(long)]
         confirmed: bool,
     },
+    #[command(
+        about = "serve the Model Context Protocol on stdin and stdout, one JSON-RPC message a line, \
+                 for any MCP client: network_schema, network_query and network_call over every \
+                 program's live code, and files_read and files_write, each op and query signed by \
+                 the active wallet key, whose password comes from DUCKTAPE_PASSWORD; it refuses a \
+                 key that acts as no agent account"
+    )]
+    Mcp,
     #[command(about = "print a key's value; the key is hex, the value is raw")]
     Get {
         program: String,
@@ -900,6 +909,13 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
                 json::ask(client, &key, &status, &program, request, layer(confirmed)).await?;
             json::print(&json::reply(&interface, &program, &answer)?);
             Ok(())
+        }
+        Verb::Mcp => {
+            let live = mcp::Live::seat(workspace, client, signer(workspace)?).await?;
+            let input = tokio::io::BufReader::new(tokio::io::stdin());
+            mcp::serve(&live, input, tokio::io::stdout())
+                .await
+                .sentence()
         }
         Verb::Get {
             program,

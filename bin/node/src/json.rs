@@ -1,10 +1,11 @@
-//! A program spoken to in JSON: the interface its live code's `ducktape.schema` section carries,
-//! read through programs' borsh-json as harness's network tools read it and kept in the workspace
-//! by code id, and an AddKey consent signed over identity's own admission.
+//! A program spoken to in JSON: the interface its live code's `ducktape.schema` section carries and
+//! what its `ducktape.tools` section tells, read through programs' borsh-json as harness reads them
+//! and kept in the workspace by code id, and an AddKey consent signed over identity's own admission.
 use std::path::{Path, PathBuf};
 
 use abi::{BlobId, Outcome, Receipt, Scheme, role};
 use borsh_json::Interface;
+use borsh_json::tools::Described;
 use commonware_cryptography::{Signer as _, ed25519};
 use host::Layer;
 use node::{Frame, Preconfirm};
@@ -15,6 +16,8 @@ use serde_json::{Map, Value, json};
 use crate::{Sentence as _, blob_text};
 
 const SCHEMAS: &str = "schemas";
+const TOOLS: &str = "tools";
+const UNTOLD: &[u8] = b"{}";
 
 pub async fn interface(
     workspace: &Workspace,
@@ -47,7 +50,7 @@ async fn fetched(client: &Client, program: &str, code: &BlobId) -> Result<Vec<u8
         .sentence()?
         .ok_or_else(|| absent(program, code))?;
     let (_, module) = blob::parse(&framed).ok_or_else(|| absent(program, code))?;
-    match section(module).sentence()? {
+    match section(module, borsh_json::SECTION).sentence()? {
         Some(section) => Ok(section.to_vec()),
         None => Err(format!(
             "program {program}'s code carries no {} section, so it has no schema",
@@ -83,15 +86,107 @@ fn absent(program: &str, code: &BlobId) -> String {
     )
 }
 
-fn section(module: &[u8]) -> Result<Option<&[u8]>, wasmparser::BinaryReaderError> {
+fn section<'a>(
+    module: &'a [u8],
+    name: &str,
+) -> Result<Option<&'a [u8]>, wasmparser::BinaryReaderError> {
     for payload in wasmparser::Parser::new(0).parse_all(module) {
         if let wasmparser::Payload::CustomSection(custom) = payload?
-            && custom.name() == borsh_json::SECTION
+            && custom.name() == name
         {
             return Ok(Some(custom.data()));
         }
     }
     Ok(None)
+}
+
+pub struct Code {
+    pub interface: Result<Interface, String>,
+    pub told: Result<Described, String>,
+}
+
+struct Sections {
+    schema: Vec<u8>,
+    tools: Vec<u8>,
+}
+
+impl Sections {
+    fn read(&self, program: &str) -> Code {
+        let interface = Interface::read(&self.schema).map_err(|unreadable| {
+            format!(
+                "program {program}'s {} section {unreadable}",
+                borsh_json::SECTION
+            )
+        });
+        let told = borsh_json::tools::read(&self.tools)
+            .map_err(|unreadable| format!("program {program}'s code: {unreadable}"));
+        Code { interface, told }
+    }
+}
+
+pub async fn codes(
+    workspace: &Workspace,
+    client: &Client,
+    programs: Vec<(String, BlobId)>,
+) -> Result<Vec<(String, Result<Code, String>)>, String> {
+    let schemas = schemas(workspace.dir());
+    let tools = workspace.dir().join(TOOLS);
+    let kept: Vec<Option<Code>> = programs
+        .iter()
+        .map(|(program, code)| {
+            let sections = Sections {
+                schema: kept(&schemas, code)?,
+                tools: kept(&tools, code)?,
+            };
+            let read = sections.read(program);
+            (read.interface.is_ok() && read.told.is_ok()).then_some(read)
+        })
+        .collect();
+    let wanted: Vec<BlobId> = programs
+        .iter()
+        .zip(&kept)
+        .filter(|(_, kept)| kept.is_none())
+        .map(|((_, code), _)| *code)
+        .collect();
+    let fetched = match wanted.is_empty() {
+        true => Vec::new(),
+        false => client.blobs(&wanted).await.sentence()?,
+    };
+    let mut fetched = fetched.into_iter();
+    let mut read = Vec::with_capacity(programs.len());
+    for ((program, code), kept) in programs.into_iter().zip(kept) {
+        let told = match kept {
+            Some(code) => Ok(code),
+            None => sections_in(&program, &code, fetched.next().flatten())
+                .inspect(|sections| {
+                    let _ = keep(&schemas, &code, &sections.schema);
+                    let _ = keep(&tools, &code, &sections.tools);
+                })
+                .map(|sections| sections.read(&program)),
+        };
+        read.push((program, told));
+    }
+    Ok(read)
+}
+
+fn sections_in(program: &str, code: &BlobId, framed: Option<Vec<u8>>) -> Result<Sections, String> {
+    let framed = framed.ok_or_else(|| absent(program, code))?;
+    let (_, module) = blob::parse(&framed).ok_or_else(|| absent(program, code))?;
+    let schema = section(module, borsh_json::SECTION)
+        .sentence()?
+        .ok_or_else(|| {
+            format!(
+                "program {program}'s code carries no {} section, so it has no schema",
+                borsh_json::SECTION
+            )
+        })?;
+    let tools = section(module, programs_sdk::tools::SECTION)
+        .sentence()?
+        .unwrap_or(UNTOLD);
+    Ok(Sections {
+        schema: schema.to_vec(),
+        tools: tools.to_vec(),
+    })
 }
 
 pub fn parse(text: &str, what: &str) -> Result<Value, String> {
@@ -344,14 +439,23 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_section_is_found_among_a_codes_custom_sections() {
-        let code = module(&[("ducktape.view", b"view"), (borsh_json::SECTION, b"schema")]);
-        assert_eq!(section(&code).unwrap(), Some(&b"schema"[..]));
+    fn each_section_is_found_by_its_name_among_a_codes_custom_sections() {
+        let code = module(&[
+            ("ducktape.view", b"view"),
+            (borsh_json::SECTION, b"schema"),
+            (programs_sdk::tools::SECTION, b"{}"),
+        ]);
         assert_eq!(
-            section(&module(&[("ducktape.view", b"view")])).unwrap(),
-            None
+            section(&code, borsh_json::SECTION).unwrap(),
+            Some(&b"schema"[..])
         );
-        assert!(section(b"not a module").is_err());
+        assert_eq!(
+            section(&code, programs_sdk::tools::SECTION).unwrap(),
+            Some(&b"{}"[..])
+        );
+        let viewed = module(&[("ducktape.view", b"view")]);
+        assert_eq!(section(&viewed, borsh_json::SECTION).unwrap(), None);
+        assert!(section(b"not a module", borsh_json::SECTION).is_err());
     }
 
     #[test]

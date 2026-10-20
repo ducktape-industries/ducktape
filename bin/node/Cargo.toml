@@ -16,6 +16,7 @@ commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 ducktape-home = { workspace = true }
+files = { workspace = true }
 futures = { workspace = true }
 hex = "0.4"
 host = { workspace = true }
@@ -23,10 +24,12 @@ identity = { workspace = true }
 keystore = { workspace = true }
 node = { workspace = true }
 noded = { workspace = true }
+programs-sdk = { workspace = true }
 rand = { version = "0.10", features = ["sys_rng"] }
 rand_core = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "io-std", "io-util"] }
 tracing = { workspace = true }
 wasmparser = { workspace = true }
 
