@@ -8,7 +8,7 @@ use std::time::Duration;
 use abi::BlobId;
 use blob::service::{Kept, Service};
 
-use crate::{Client, Context, Daemon, Result, offload};
+use crate::{Client, Context, Daemon, Error, Result, View, offload};
 
 pub(crate) async fn fill<E: Context>(daemon: Arc<Daemon<E>>, source: Client) {
     let missing = match missing(&daemon).await {
@@ -78,25 +78,58 @@ impl statesync::Install for Held<'_> {
     }
 }
 
-async fn settled<E: Context>(daemon: &Daemon<E>, landed: BTreeSet<BlobId>) -> Result<()> {
+async fn settled<E: Context>(daemon: &Arc<Daemon<E>>, landed: BTreeSet<BlobId>) -> Result<()> {
     if landed.is_empty() {
         return Ok(());
     }
     let mut tips = daemon.tips.subscribe();
-    let stopped = tips.changed().await.is_err();
-    if stopped {
-        return Ok(());
-    }
-    let view = daemon.view()?;
-    let now = daemon.now();
-    let store = daemon.blobs.store().clone();
-    offload(move || -> Result<()> {
-        let source = view.source();
-        let unnamed = tokio::runtime::Handle::current().block_on(source.unnamed(&landed, now))?;
-        for id in unnamed {
-            store.remove(&id)?;
+    loop {
+        let stopped = tips.changed().await.is_err();
+        if stopped {
+            return Ok(());
         }
-        Ok(())
-    })
-    .await?
+        let view = daemon.view()?;
+        let now = daemon.now();
+        let ids = landed.clone();
+        let unnamed = offload(move || unnamed_in(&view, &ids, now)).await??;
+        if unnamed.is_empty() {
+            return Ok(());
+        }
+        match daemon.drop_unnamed(unnamed.into_iter().collect()).await {
+            Ok(true) | Err(Error::Stopped) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn unnamed_in<E: Context>(view: &View<E>, ids: &BTreeSet<BlobId>, now: u64) -> Result<Vec<BlobId>> {
+    let source = view.source();
+    let unnamed = tokio::runtime::Handle::current().block_on(source.unnamed(ids, now))?;
+    Ok(unnamed)
+}
+
+impl<E: Context> Daemon<E> {
+    pub async fn drop_unnamed(self: &Arc<Self>, ids: BTreeSet<BlobId>) -> Result<bool> {
+        let daemon = self.clone();
+        offload(move || {
+            let held = tokio::runtime::Handle::current().block_on(daemon.hold())?;
+            let dropped = daemon.unnamed_dropped(&held, &ids);
+            held.release();
+            dropped
+        })
+        .await?
+    }
+
+    pub fn unnamed_dropped(&self, _held: &crate::Held, ids: &BTreeSet<BlobId>) -> Result<bool> {
+        let view = self.view()?;
+        let behind = view.tip().height < *self.tips.borrow();
+        if behind {
+            return Ok(false);
+        }
+        for id in unnamed_in(&view, ids, self.now())? {
+            self.blobs.store().remove(&id)?;
+        }
+        Ok(true)
+    }
 }

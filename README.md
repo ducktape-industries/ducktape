@@ -864,9 +864,13 @@ lacks, in one stream on the RPC threads, beside the blocks. It writes each
 blob through the same per-blob owner a fetch over halo takes, so it leaves a
 blob another fetch is pulling to that fetch, and a block that needs a blob
 takes it over. It goes past each blob the source no longer serves. Once the
-stream ends and the next block has applied, it deletes each blob it fetched
-that the state no longer names, so a release that landed while a blob was on
-its way leaves no file. A node holds every blob once `GET /v1/blob/missing`
+stream ends and the next block has applied, it finds each blob it fetched
+that the state no longer names, then, on an RPC thread of its own, holds the
+writer between blocks and deletes each that the last block applied still
+leaves unnamed (if the newest view lags the tip, it keeps them and checks again
+after the next block): a release that
+landed while a blob was on its way leaves no file, and a block that put the
+same bytes again keeps it. A node holds every blob once `GET /v1/blob/missing`
 answers none. A source that has gone away is asked again every block time
 (`join_unanswered`, logged on the first try and every tenth): deleting the
 workspace's `source` file and restarting the node stops it. New program

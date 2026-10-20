@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -1897,6 +1897,110 @@ fn a_read_of_a_blob_no_member_gives_is_answered_and_a_stream_goes_on_past_it() {
     live.thread.join().unwrap();
 }
 
+#[test]
+fn a_blob_a_block_puts_again_after_the_fill_found_it_unnamed_keeps_its_file() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let (again, gone) = (part(b"again"), part(b"gone"));
+
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        for body in [&b"again"[..], &b"gone"[..]] {
+            let framed = blob::frame("part", body).unwrap();
+            let kept = daemon.blobs.keep(part(body), framed).await;
+            assert_eq!(kept, Ok(blob::service::Kept::Landed));
+        }
+        assert_eq!(client.blob(again).await.unwrap(), None);
+        assert_eq!(client.blob(gone).await.unwrap(), None);
+        let mut changes = client.changes("probe").await.unwrap();
+        let put = frame(&client, &alice, vec![put_part(b"again"), set(b"put", b"1")]).await;
+        client.submit(put, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"put"]).await;
+        let rechecked = daemon
+            .drop_unnamed(BTreeSet::from([again, gone]))
+            .await
+            .unwrap();
+        assert!(
+            rechecked,
+            "the view the re-check read is the newest block's"
+        );
+        let dir = seat.workspace.dir();
+        assert!(
+            holds_file(dir, &again),
+            "a blob a block put again after it was found unnamed keeps its file"
+        );
+        assert!(
+            !holds_file(dir, &gone),
+            "a blob still unnamed leaves no file"
+        );
+        assert!(client.blob(again).await.unwrap().is_some());
+        assert_eq!(client.blob(gone).await.unwrap(), None);
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_blob_found_unnamed_keeps_its_file_while_the_newest_view_lags_the_tip() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+    let gone = part(b"gone");
+    let dir = seat.workspace.dir().to_path_buf();
+
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        let framed = blob::frame("part", b"gone").unwrap();
+        let kept = daemon.blobs.keep(gone, framed).await;
+        assert_eq!(kept, Ok(blob::service::Kept::Landed));
+        let held = daemon.hold().await.unwrap();
+        let viewed = daemon.view().unwrap().tip().height;
+        let ids = BTreeSet::from([gone]);
+        let (behind, caught_up) = ::tokio::task::spawn_blocking({
+            let daemon = daemon.clone();
+            move || {
+                daemon.tips.send_replace(viewed + 1);
+                let behind = daemon.unnamed_dropped(&held, &ids).unwrap();
+                let kept = holds_file(&dir, &gone);
+                daemon.tips.send_replace(viewed);
+                let caught_up = daemon.unnamed_dropped(&held, &ids).unwrap();
+                held.release();
+                ((behind, kept), caught_up)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            behind,
+            (false, true),
+            "a blob stays on disk while the newest view lags the tip"
+        );
+        assert!(caught_up, "the re-check runs once the view is the tip's");
+    });
+    assert!(
+        !holds_file(seat.workspace.dir(), &gone),
+        "a blob still unnamed leaves no file"
+    );
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
 async fn landed(
     changes: &mut (impl futures::Stream<Item = noded::Result<noded::wire::Change>> + Unpin),
     keys: &[&[u8]],
@@ -3076,6 +3180,72 @@ fn parked_state_prunes_while_a_restart_and_two_joins_reach_the_same_root() {
 
 const RPC_BLOCKING_THREADS: std::num::NonZeroUsize =
     std::num::NonZeroUsize::new(512).expect("nonzero");
+
+#[test]
+fn blocks_finalize_while_dropping_unnamed_blobs_waits_for_an_rpc_blocking_thread() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let load = LoadConfig {
+        rpc_blocking_threads: Some(RPC_BLOCKING_THREADS),
+        ..LoadConfig::default()
+    };
+    let (live, (daemon, rpc)) =
+        seat.start_handing(load, |running| (running.daemon.clone(), running.rpc()));
+    let rpc = rpc.expect("a running node serves rpc");
+    let client = live.client.clone();
+    let runtime = client_runtime();
+    let gone = part(b"gone");
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        let framed = blob::frame("part", b"gone").unwrap();
+        let kept = daemon.blobs.keep(gone, framed).await;
+        assert_eq!(kept, Ok(blob::service::Kept::Landed));
+    });
+    let release = Arc::new(std::sync::RwLock::new(()));
+    let held = release.write().unwrap();
+    let (holding, holds) = mpsc::channel();
+    for _ in 0..RPC_BLOCKING_THREADS.get() {
+        let release = release.clone();
+        let holding = holding.clone();
+        rpc.spawn_blocking(move || {
+            holding.send(()).unwrap();
+            drop(release.read().unwrap());
+        });
+    }
+    for _ in 0..RPC_BLOCKING_THREADS.get() {
+        holds.recv().unwrap();
+    }
+    let (asking, asked) = mpsc::channel();
+    let dropping = {
+        let daemon = daemon.clone();
+        rpc.spawn(async move {
+            asking.send(()).unwrap();
+            daemon.drop_unnamed(BTreeSet::from([gone])).await
+        })
+    };
+    asked.recv().unwrap();
+    runtime.block_on(async {
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        let from = client.status().await.unwrap().height;
+        let mut height = from;
+        while height < from + EPOCH_LENGTH {
+            height = blocks.next().await.unwrap().unwrap().height;
+        }
+    });
+    drop(held);
+    let rechecked = runtime.block_on(dropping).unwrap().unwrap();
+    assert!(rechecked);
+    assert!(
+        !holds_file(seat.workspace.dir(), &gone),
+        "a blob still unnamed leaves no file"
+    );
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
 
 fn unlanded() -> TxAsk {
     TxAsk {
