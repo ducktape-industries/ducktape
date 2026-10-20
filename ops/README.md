@@ -635,6 +635,11 @@ one up for another network.
   decision. `k8s/reconcile/reconcile.py` is reconcile, a daemon off the
   chain that applies it. Its duties are `egress/fabrics-1.toml`, the
   node's own `egress.toml`, and `pods.toml`, the pods service's image.
+- On duckpond a new egress service goes into `infra` first, as a change to
+  `egress/fabrics-1.toml`, and reconcile applies it once it merges. Nobody
+  edits the node's `/data/egress.toml` or runs `ducktape egress reload` by
+  hand: a hand edit leaves `infra` behind what the node serves, and the next
+  `main` reconcile applies undoes it.
 - Each block time it reads `infra`'s `main` through forge. For every open
   change into `main` whose head changes that file, it posts a commit status
   `reconcile/egress` and a review comment, once per head: refused when the

@@ -36,7 +36,10 @@ another machine, reached by ssh.
      account that registers it owns it.
   2. Each of those nodes names it in its `egress.toml`, as
      `[services.pods] base = "http://<the Service's address>:8080"`, then runs
-     `ducktape egress reload`. The node then sends `Serve` by itself.
+     `ducktape egress reload`. The node then sends `Serve` by itself. On duckpond that
+     entry is a change to forge repo `infra`'s `egress/fabrics-1.toml`, which reconcile
+     applies once it merges (`../../README.md`, section "duckpond's desired
+     infrastructure"); nobody edits the node's file by hand.
 - **Its node's status.** It reads the network's block time from `NODE_URL`'s `/v1/status` as
   it starts, and every retry pause starts there; it stops, saying why, when that node
   doesn't answer.
@@ -60,7 +63,7 @@ another machine, reached by ssh.
    `kubectl -n pods create secret generic blob-key --from-file=key=KEY --from-file=password=PASSWORD`
    and `kubectl -n pods rollout restart deployment/pods`.
 3. Bind it in egress: `Register` and `Assign` as above, then the node's `egress.toml`
-   entry and `ducktape egress reload`.
+   entry and `ducktape egress reload` (on duckpond, the `infra` change above).
 4. On duckpond a new image after that rolls through forge repo `infra`: a merge
    of its `pods.toml` makes reconcile patch the Deployment's image and prove it
    (`../../README.md`, section "duckpond's desired infrastructure").
