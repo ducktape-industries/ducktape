@@ -38,6 +38,7 @@ impl Rpc {
         listener: std::net::TcpListener,
         fanout: Fanout,
         rpc_cpus: Option<Vec<usize>>,
+        blocking_threads: Option<std::num::NonZeroUsize>,
     ) -> crate::Result<Rpc> {
         let pinned = rpc_cpus.is_some();
         let cpus = match rpc_cpus {
@@ -47,12 +48,16 @@ impl Rpc {
         let threads = cpus.len();
         tracing::info!(target: "ducktape::http", event = "rpc_cores", rpc = threads, pinned, "the rpc runtime runs beside the block threads");
         let cpus = Arc::new(cpus);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
             .worker_threads(threads)
             .thread_name("rpc")
             .on_thread_start(move || yielding(&cpus))
-            .enable_all()
-            .build()?;
+            .enable_all();
+        if let Some(blocking) = blocking_threads {
+            builder.max_blocking_threads(blocking.get());
+        }
+        let runtime = builder.build()?;
         let router = router(daemon.clone());
         runtime.spawn(changes::fan(fanout));
         for _ in 0..threads {
@@ -60,6 +65,10 @@ impl Rpc {
             runtime.spawn(accepting(door, router.clone(), daemon.shutdown.subscribe()));
         }
         Ok(Rpc(Some(runtime)))
+    }
+
+    pub(crate) fn handle(&self) -> Option<tokio::runtime::Handle> {
+        self.0.as_ref().map(|runtime| runtime.handle().clone())
     }
 }
 

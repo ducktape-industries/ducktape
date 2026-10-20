@@ -1,5 +1,6 @@
 mod activity;
 mod blocks;
+mod carry;
 mod changes;
 mod client;
 mod config;
@@ -7,6 +8,7 @@ mod cores;
 mod ctx;
 mod egress;
 mod endpoint;
+mod history;
 mod link;
 pub mod live;
 mod logs;
@@ -25,11 +27,12 @@ mod writer;
 use std::sync::Arc;
 
 use abi::{ProgramId, Refusal};
-use consensus::{MarshalMailbox, Network, Summaries, Votes};
+use consensus::{MarshalMailbox, Network, Votes};
 use host::Applied;
 use node::{Preconfirm, Source, Taken};
 use tokio::sync::watch;
 
+pub use carry::{Carry, carry_history, restore_archives, restore_history};
 pub use client::{Client, Upload};
 pub use config::{
     ConsensusSettings, DEFAULT_HTTP, DEFAULT_LOG, LoadSettings, NodeConfig, Settings, permits,
@@ -97,7 +100,7 @@ pub enum Error {
     #[error(transparent)]
     Sync(#[from] statesync::Error),
     #[error(transparent)]
-    Summaries(#[from] consensus::SummariesError),
+    Archives(#[from] consensus::ArchivesError),
     #[error(transparent)]
     Store(#[from] fluent31::Error),
     #[error(transparent)]
@@ -149,7 +152,7 @@ pub struct Daemon<E: Context> {
     pub network: Network,
     pub identity: Vec<u8>,
     pub anchors: MarshalMailbox,
-    pub summaries: Summaries<E>,
+    history: history::History,
     recent: blocks::Recent,
     activity: activity::Index,
     pub logs: Logs,

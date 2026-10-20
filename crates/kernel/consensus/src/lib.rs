@@ -1,9 +1,11 @@
 mod anchor;
+mod archives;
 mod cadence;
 mod catchup;
 mod chain;
 mod elector;
 mod engine;
+mod gap;
 mod lanes;
 mod marshal;
 mod membership;
@@ -13,14 +15,14 @@ mod votes;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 
 pub use anchor::Anchor;
+pub use archives::{Archives, ArchivesError};
 pub use cadence::{Cadence, CadenceError, Timeouts};
 pub use chain::{App, Chain, unapplied};
 pub use commonware_consensus::marshal::ancestry::Ancestry;
 pub use engine::proposer;
+pub use gap::CopyError;
 pub use lanes::{EngineChannels, EngineMux, MarshalLanes, channel};
-pub use marshal::{
-    Certificate, Marshal, MarshalError, MarshalMailbox, Summaries, SummariesError, Transport,
-};
+pub use marshal::{Certificate, Marshal, MarshalError, MarshalMailbox, Transport};
 pub use membership::{Error as MembershipError, Membership, Standing};
 pub use roster::{Roster, validators_of};
 pub use votes::Votes;

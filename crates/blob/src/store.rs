@@ -76,6 +76,10 @@ impl Blobs {
         self.path(id).is_file()
     }
 
+    pub fn holds_named(&self, name: &str) -> bool {
+        self.dir.join(name).is_file()
+    }
+
     pub fn write(&self, id: &BlobId, framed: &[u8]) -> Result<()> {
         let target = self.path(id);
         if target.is_file() {
@@ -208,9 +212,13 @@ impl Blobs {
     }
 
     pub fn partial(&self, id: &BlobId) -> Result<PathBuf> {
+        Ok(self.partials()?.join(name_of(id)))
+    }
+
+    pub fn partials(&self) -> Result<PathBuf> {
         let dir = self.dir.join(PARTIAL);
         fs::create_dir_all(&dir)?;
-        Ok(dir.join(name_of(id)))
+        Ok(dir)
     }
 
     pub fn adopt(&self, id: &BlobId, from: &Path) -> Result<()> {

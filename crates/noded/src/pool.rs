@@ -26,6 +26,40 @@ pub(crate) struct Submit {
     reply: oneshot::Sender<Answer>,
 }
 
+pub(crate) struct Receipt {
+    pub(crate) bundle: u64,
+    pub(crate) posted: Option<Vec<u8>>,
+    pub(crate) fresh: Vec<u8>,
+    pub(crate) reseated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reposted {
+    Pending,
+    Retaken,
+    Refused,
+    Unheld,
+}
+
+impl Reposted {
+    fn of(taken: &Answer) -> Reposted {
+        match taken {
+            Ok(Ok(Taken::Held(_))) => Reposted::Pending,
+            Ok(Ok(Taken::New(_))) => Reposted::Retaken,
+            Ok(Err(refusal)) if refusal.reason == abi::reason::DUPLICATE => Reposted::Refused,
+            Ok(Err(_)) | Err(_) => Reposted::Unheld,
+        }
+    }
+
+    fn wants_fresh(self, reseated: bool) -> bool {
+        match self {
+            Reposted::Pending | Reposted::Retaken => false,
+            Reposted::Refused => reseated,
+            Reposted::Unheld => true,
+        }
+    }
+}
+
 pub(crate) struct Build {
     parent: Tip,
     unapplied: Vec<Arc<Block>>,
@@ -41,6 +75,7 @@ pub(crate) enum Offer {
 
 pub(crate) enum Event<E: Context> {
     Build(Build),
+    Receipt(Receipt),
     Viewed(Arc<View<E>>),
     Withdrawn,
     Replay,
@@ -59,6 +94,7 @@ enum Flow {
 pub(crate) struct Pooling<E: Context> {
     inbox: mpsc::UnboundedSender<Event<E>>,
     builds: mpsc::UnboundedSender<Build>,
+    receipts: mpsc::UnboundedSender<Receipt>,
     applied: Arc<AtomicU64>,
 }
 
@@ -67,6 +103,7 @@ impl<E: Context> Clone for Pooling<E> {
         Pooling {
             inbox: self.inbox.clone(),
             builds: self.builds.clone(),
+            receipts: self.receipts.clone(),
             applied: self.applied.clone(),
         }
     }
@@ -96,6 +133,10 @@ impl<E: Context> Pooling<E> {
 
     pub(crate) fn offer(&self, offer: Offer) {
         let _ = self.inbox.send(Event::Offer(offer));
+    }
+
+    pub(crate) fn receipt(&self, receipt: Receipt) {
+        let _ = self.receipts.send(receipt);
     }
 
     pub(crate) fn applied(&self) -> u64 {
@@ -133,10 +174,13 @@ struct Pool<E: Context> {
     published: Arc<Current<E>>,
     applied: Arc<AtomicU64>,
     relay: Arc<Relay<E>>,
+    network: Vec<u8>,
+    posts: blob::service::Posts,
 }
 
 struct Wakes<E: Context> {
     builds: mpsc::UnboundedReceiver<Build>,
+    receipts: mpsc::UnboundedReceiver<Receipt>,
     tips: watch::Receiver<u64>,
     inbox: mpsc::UnboundedReceiver<Event<E>>,
 }
@@ -149,18 +193,21 @@ pub(crate) fn start<E: Context>(
     base: Arc<View<E>>,
     published: Arc<Current<E>>,
     relay: Arc<Relay<E>>,
+    posts: blob::service::Posts,
     tips: watch::Receiver<u64>,
 ) -> Result<Pooling<E>> {
-    let mempool = Mempool::new(context, network, base.snapshot())?;
+    let mempool = Mempool::new(context, network.clone(), base.snapshot())?;
     let applied = Arc::new(AtomicU64::new(mempool.applied().height));
     published
         .speculative
         .store(Some(Arc::new(speculative(&base, &mempool))));
     let (inbox, asked) = mpsc::unbounded_channel();
     let (builds, building) = mpsc::unbounded_channel();
+    let (receipts, receipting) = mpsc::unbounded_channel();
     let pooling = Pooling {
         inbox,
         builds,
+        receipts,
         applied: applied.clone(),
     };
     let pool = Pool {
@@ -169,9 +216,12 @@ pub(crate) fn start<E: Context>(
         published,
         applied,
         relay,
+        network,
+        posts,
     };
     let wakes = Wakes {
         builds: building,
+        receipts: receipting,
         tips,
         inbox: asked,
     };
@@ -186,9 +236,10 @@ pub(crate) fn start<E: Context>(
 
 async fn pooled<E: Context>(mut pool: Pool<E>, mut wakes: Wakes<E>) {
     loop {
-        let event = next(&pool, &mut wakes).await;
+        let event = next(&pool.published, pool.mempool.replaying(), &mut wakes).await;
         let flow = match event {
-            Event::Build(build) => built(&pool, build),
+            Event::Build(build) => built(&mut pool, build),
+            Event::Receipt(receipt) => receipted(&mut pool, receipt).await,
             Event::Viewed(view) => viewed(&mut pool, view),
             Event::Withdrawn => withdrawn(),
             Event::Replay => replayed(&mut pool).await,
@@ -205,22 +256,26 @@ async fn pooled<E: Context>(mut pool: Pool<E>, mut wakes: Wakes<E>) {
     }
 }
 
-async fn next<E: Context>(pool: &Pool<E>, wakes: &mut Wakes<E>) -> Event<E> {
-    let replaying = pool.mempool.replaying();
+async fn next<E: Context>(
+    published: &Current<E>,
+    replaying: bool,
+    wakes: &mut Wakes<E>,
+) -> Event<E> {
     tokio::select! {
         biased;
         build = wakes.builds.recv() => build.map_or(Event::Unasked, Event::Build),
-        changed = wakes.tips.changed() => match (changed, pool.published.views.load_full()) {
+        changed = wakes.tips.changed() => match (changed, published.views.load_full()) {
             (Ok(()), Some(view)) => Event::Viewed(view),
             (Ok(()), None) => Event::Withdrawn,
             (Err(_), _) => Event::Unasked,
         },
         () = std::future::ready(()), if replaying => Event::Replay,
+        receipt = wakes.receipts.recv() => receipt.map_or(Event::Unasked, Event::Receipt),
         asked = wakes.inbox.recv() => asked.unwrap_or(Event::Unasked),
     }
 }
 
-fn built<E: Context>(pool: &Pool<E>, build: Build) -> Flow {
+fn built<E: Context>(pool: &mut Pool<E>, build: Build) -> Flow {
     let Build {
         parent,
         unapplied,
@@ -296,6 +351,18 @@ async fn submitted<E: Context>(pool: &mut Pool<E>, submit: Submit) -> Flow {
         preconfirm,
         reply,
     } = submit;
+    let taken = take(pool, frame, submission, source, preconfirm).await;
+    let _ = reply.send(taken);
+    Flow::Pooling
+}
+
+async fn take<E: Context>(
+    pool: &mut Pool<E>,
+    frame: Vec<u8>,
+    submission: Submission,
+    source: Source,
+    preconfirm: Preconfirm,
+) -> Answer {
     let taken = pool
         .mempool
         .take(frame, submission, source, preconfirm)
@@ -305,7 +372,60 @@ async fn submitted<E: Context>(pool: &mut Pool<E>, submit: Submit) -> Flow {
     if predicted {
         publish(pool);
     }
-    let _ = reply.send(taken);
+    taken
+}
+
+async fn own<E: Context>(pool: &mut Pool<E>, frame: Vec<u8>) -> Answer {
+    let submission = match node::admissible(&frame, &pool.network) {
+        Ok(submission) => submission,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    let taken = take(pool, frame, submission, Source::Client, Preconfirm::Off).await;
+    if let Err(error) = &taken {
+        tracing::warn!(
+            target: TARGET,
+            event = "receipt_untaken",
+            %error,
+            reason = "take_failed",
+            "the pool could not take the node's own receipt"
+        );
+    }
+    taken
+}
+
+async fn receipted<E: Context>(pool: &mut Pool<E>, receipt: Receipt) -> Flow {
+    let Receipt {
+        bundle,
+        posted,
+        fresh,
+        reseated,
+    } = receipt;
+    let reposted = match posted {
+        Some(frame) => {
+            let reposted = Reposted::of(&own(pool, frame.clone()).await);
+            if reposted == Reposted::Retaken {
+                pool.relay.send([frame.as_slice()]);
+            }
+            reposted
+        }
+        None => Reposted::Unheld,
+    };
+    if !reposted.wants_fresh(reseated) {
+        return Flow::Pooling;
+    }
+    match own(pool, fresh.clone()).await {
+        Ok(Ok(Taken::New(_))) => {
+            pool.posts.posted(bundle, fresh.clone());
+            pool.relay.send([fresh.as_slice()]);
+        }
+        Ok(Ok(Taken::Held(_))) | Err(_) => {}
+        Ok(Err(refusal)) => tracing::debug!(
+            target: "ducktape::blob",
+            bundle,
+            reason = refusal.reason,
+            "the node did not take its own receipt"
+        ),
+    }
     Flow::Pooling
 }
 
@@ -331,4 +451,65 @@ fn publish<E: Context>(pool: &Pool<E>) {
 
 fn speculative<E: Context>(base: &Arc<View<E>>, mempool: &Mempool<E>) -> Speculative<E> {
     Speculative::over(base.clone(), mempool.speculative().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use abi::Refusal;
+    use commonware_runtime::tokio::Context;
+    use tokio::sync::{mpsc, watch};
+
+    use super::{Answer, Event, Offer, Receipt, Reposted, Wakes, next};
+    use crate::view::Current;
+
+    #[test]
+    fn a_receipt_is_signed_again_only_when_its_posted_one_is_gone() {
+        let refused = |reason| -> Answer { Ok(Err(Refusal::new(reason, "refused"))) };
+        assert_eq!(
+            Reposted::of(&refused(abi::reason::DUPLICATE)),
+            Reposted::Refused
+        );
+        assert_eq!(
+            Reposted::of(&refused(abi::reason::INVALID_INPUT)),
+            Reposted::Unheld
+        );
+        assert_eq!(Reposted::of(&Err(crate::Error::Stopped)), Reposted::Unheld);
+        assert!(!Reposted::Pending.wants_fresh(true));
+        assert!(!Reposted::Retaken.wants_fresh(true));
+        assert!(!Reposted::Refused.wants_fresh(false));
+        assert!(Reposted::Refused.wants_fresh(true));
+        assert!(Reposted::Unheld.wants_fresh(false));
+    }
+
+    #[tokio::test]
+    async fn the_writers_receipts_follow_their_block_and_go_before_every_client_submit() {
+        let (inbox, asked) = mpsc::unbounded_channel();
+        let (_builds, building) = mpsc::unbounded_channel();
+        let (receipts, receipting) = mpsc::unbounded_channel();
+        let (tips, tipped) = watch::channel(0);
+        let mut wakes = Wakes::<Context> {
+            builds: building,
+            receipts: receipting,
+            tips: tipped,
+            inbox: asked,
+        };
+        let published = Current::<Context>::new();
+        inbox.send(Event::Offer(Offer::Due)).unwrap();
+        inbox.send(Event::Offer(Offer::Every)).unwrap();
+        tips.send_replace(1);
+        receipts
+            .send(Receipt {
+                bundle: 0,
+                posted: None,
+                fresh: Vec::new(),
+                reseated: false,
+            })
+            .unwrap();
+        let event = next(&published, false, &mut wakes).await;
+        assert!(matches!(event, Event::Withdrawn));
+        let event = next(&published, false, &mut wakes).await;
+        assert!(matches!(event, Event::Receipt(_)));
+        let event = next(&published, false, &mut wakes).await;
+        assert!(matches!(event, Event::Offer(Offer::Due)));
+    }
 }

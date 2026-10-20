@@ -408,7 +408,7 @@ impl Peer {
             tamper: tamper.clone(),
             tampered: tampering,
         };
-        let (marshal, _receipts) = Marshal::start(
+        let marshal = Marshal::start(
             context.child("marshal"),
             name,
             &network,

@@ -188,6 +188,7 @@ fn file_only_settings_reach_the_config() {
             live_lane_per_sender: count(16),
             live_linger: Duration::from_millis(700),
             rpc_cpus: None,
+            rpc_blocking_threads: None,
         }
     );
     assert_eq!(config.block_cpus.unwrap().cpus(), &[0, 1, 2, 3, 4, 5]);

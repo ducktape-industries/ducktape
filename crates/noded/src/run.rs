@@ -29,11 +29,12 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use halo::{Class, Halo, Lane, Seat};
 use host::Layer;
-use node::{Block, Frame, Node, Preconfirm, Sequenced, Source, Taken};
+use node::{Block, Frame, Node, Sequenced};
 use tokio::sync::watch;
 
 use crate::changes::Changes;
 use crate::endpoint::Endpoint;
+use crate::history::{Durability, History};
 use crate::live;
 use crate::mesh::{Mesh, Outbound, Tracker};
 use crate::pool::{self, Offer, Pooling};
@@ -133,6 +134,7 @@ pub struct LoadConfig {
     pub live_lane_per_sender: NonZeroUsize,
     pub live_linger: Duration,
     pub rpc_cpus: Option<Vec<usize>>,
+    pub rpc_blocking_threads: Option<NonZeroUsize>,
 }
 
 impl Default for LoadConfig {
@@ -151,6 +153,7 @@ impl Default for LoadConfig {
             live_lane_per_sender: live.lane_per_sender,
             live_linger: live.linger,
             rpc_cpus: None,
+            rpc_blocking_threads: None,
         }
     }
 }
@@ -203,6 +206,10 @@ impl Stop {
 }
 
 impl<E: Context> Running<E> {
+    pub fn rpc(&self) -> Option<tokio::runtime::Handle> {
+        self.rpc.handle()
+    }
+
     pub async fn stopped(self, signalled: impl Future<Output = ()>) -> Result<()> {
         let mut down = self.daemon.shutdown.subscribe();
         let stop = tokio::select! {
@@ -231,7 +238,9 @@ impl<E: Context> Running<E> {
         marshal.stop().await;
         drop(mesh);
         daemon.activity.close().await;
+        let flushed = daemon.history.close();
         let height = closed?;
+        flushed?;
         tracing::info!(
             target: "ducktape::node",
             event = "node_stopped",
@@ -407,6 +416,11 @@ async fn start<E: Context>(
         epoch_length: node.epoch_length()?,
         cadence,
     };
+    let history_dir = workspace.dir().join(crate::history::DIR);
+    let carried =
+        crate::carry::carry_history(context.child("history"), &descriptor.network, &history_dir)
+            .await?;
+    let history = History::open(&history_dir, Durability::EachBlock)?;
     let seated = recorded_epochs(&node)?;
     let tip = node.tip()?;
     let epoch = network.epoch_after(tip.height);
@@ -525,6 +539,7 @@ async fn start<E: Context>(
         base,
         current.clone(),
         relay.clone(),
+        blobs.posts(),
         tips.subscribe(),
     )?;
     let (inbox, deliveries) = mpsc::unbounded();
@@ -532,7 +547,7 @@ async fn start<E: Context>(
         pool: pooling.clone(),
         inbox,
     };
-    let (marshal, summaries) = Marshal::start(
+    let marshal = Marshal::start(
         context.child("marshal"),
         &descriptor.network,
         &network,
@@ -588,7 +603,7 @@ async fn start<E: Context>(
         network,
         identity: identity_key,
         anchors: marshal.mailbox().clone(),
-        summaries,
+        history,
         recent: crate::blocks::Recent::new(),
         activity,
         logs,
@@ -609,6 +624,20 @@ async fn start<E: Context>(
         && founding
     {
         daemon.record_unrecorded(&node, genesis).await?;
+    }
+    let applied_unsummarized = carried
+        .unsummarized
+        .into_iter()
+        .filter(|height| *height <= tip.height);
+    let archived = marshal.mailbox().clone();
+    for height in applied_unsummarized {
+        let asked = commonware_consensus::types::Height::new(height);
+        let block = archived.get_block(asked).await.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "block {height} is archived and marshal does not read it"
+            ))
+        })?;
+        daemon.record_unrecorded(&node, &block).await?;
     }
 
     let pump = context.child("pump").spawn({
@@ -631,7 +660,13 @@ async fn start<E: Context>(
         Some(socket) => Some((transport::served(socket)?, transport::acceptor()?)),
         None => None,
     };
-    let rpc = crate::server::Rpc::start(daemon.clone(), listeners.http, fanout, load.rpc_cpus)?;
+    let rpc = crate::server::Rpc::start(
+        daemon.clone(),
+        listeners.http,
+        fanout,
+        load.rpc_cpus,
+        load.rpc_blocking_threads,
+    )?;
     let egressing = crate::egress::spawn(daemon.clone());
     let mut tasks = vec![pump, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
@@ -942,7 +977,8 @@ struct Phases {
     committing: Duration,
     publishing: Duration,
     recording: Duration,
-    waiting: Duration,
+    proposing: Duration,
+    keeping: Duration,
     receipting: Duration,
     seating: Duration,
 }
@@ -983,7 +1019,8 @@ fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
         verifying_ms = ms(phases.verifying()),
         publishing_ms = ms(phases.publishing),
         recording_ms = ms(phases.recording),
-        summary_wait_ms = ms(phases.waiting),
+        proposer_ms = ms(phases.proposing),
+        history_ms = ms(phases.keeping),
         receipting_ms = ms(phases.receipting),
         seating_ms = ms(phases.seating),
         reason = "block_time_exceeded",
@@ -1211,92 +1248,32 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
     }
 }
 
-enum Posted {
-    Pending,
-    Retaken(Vec<u8>),
-    Refused,
-    Unheld,
-}
-
-async fn reposted<E: Context>(daemon: &Daemon<E>, posted: Option<Vec<u8>>) -> Result<Posted> {
-    let Some(receipt) = posted else {
-        return Ok(Posted::Unheld);
-    };
-    match daemon
-        .submit(receipt.clone(), Source::Client, Preconfirm::Off)
-        .await?
-    {
-        Ok(Taken::Held(_)) => Ok(Posted::Pending),
-        Ok(Taken::New(_)) => Ok(Posted::Retaken(receipt)),
-        Err(refusal) => {
-            let carried = refusal.reason == abi::reason::DUPLICATE;
-            if carried {
-                return Ok(Posted::Refused);
-            }
-            Ok(Posted::Unheld)
-        }
-    }
-}
-
-async fn receipt_for<E: Context>(
-    daemon: &Daemon<E>,
-    node: &Node<E>,
-    height: u64,
-    bundle: u64,
-) -> Result<Option<Vec<u8>>> {
-    let tip = node.tip()?;
-    let role = node.host().role(role::BLOBS)?.clone();
-    let receipt = Frame::sign(
-        &daemon.key,
-        &daemon.descriptor.id(),
-        tip,
-        Some(height),
-        &role,
-        abi::encode(&blob::contract::Op::Receipt { bundle }),
-    )
-    .encode();
-    match daemon
-        .submit(receipt.clone(), Source::Client, Preconfirm::Off)
-        .await?
-    {
-        Ok(Taken::New(_)) => {
-            daemon.blobs.posted(bundle, receipt.clone());
-            Ok(Some(receipt))
-        }
-        Ok(Taken::Held(_)) => Ok(None),
-        Err(refusal) => {
-            tracing::debug!(
-                target: "ducktape::blob",
-                bundle,
-                reason = refusal.reason,
-                "the node did not take its own receipt"
-            );
-            Ok(None)
-        }
-    }
-}
-
-async fn receipts_for<E: Context>(
+fn receipts_for<E: Context>(
     daemon: &Daemon<E>,
     node: &Node<E>,
     height: u64,
     due: Vec<blob::service::Due>,
     reseated: bool,
-) -> Result<Vec<Vec<u8>>> {
-    let mut taken = Vec::new();
+) -> Result<()> {
+    let role = node.host().role(role::BLOBS)?.clone();
     for due in due {
-        match reposted(daemon, due.posted).await? {
-            Posted::Pending => {}
-            Posted::Retaken(receipt) => taken.push(receipt),
-            Posted::Refused => {
-                if reseated {
-                    taken.extend(receipt_for(daemon, node, height, due.bundle).await?);
-                }
-            }
-            Posted::Unheld => taken.extend(receipt_for(daemon, node, height, due.bundle).await?),
-        }
+        let fresh = Frame::sign(
+            &daemon.key,
+            &daemon.descriptor.id(),
+            node.tip()?,
+            Some(height),
+            &role,
+            abi::encode(&blob::contract::Op::Receipt { bundle: due.bundle }),
+        )
+        .encode();
+        daemon.pool.receipt(pool::Receipt {
+            bundle: due.bundle,
+            posted: due.posted,
+            fresh,
+            reseated,
+        });
     }
-    Ok(taken)
+    Ok(())
 }
 
 async fn applied<E: Context>(
@@ -1327,7 +1304,7 @@ async fn applied<E: Context>(
     let closes = daemon.network.closes_an_epoch(block.height);
     let replayed = matches!(sequenced, Sequenced::Replayed);
     let opens_an_epoch = !replayed && closes;
-    let (receipted, members_written) = match sequenced {
+    let members_written = match sequenced {
         Sequenced::Applied {
             mut applied,
             carried,
@@ -1339,7 +1316,9 @@ async fn applied<E: Context>(
             phases.committing = spent.committing;
             let records = std::mem::take(&mut applied.records);
             let refused = crate::activity::refused(&records, &receipts);
-            phases.waiting = daemon.record(node, block, ran, Some(receipts)).await?;
+            let recorded = daemon.record(node, block, ran, Some(receipts)).await?;
+            phases.proposing = recorded.proposing;
+            phases.keeping = recorded.keeping;
             daemon.activity.offer(crate::activity::Block {
                 height: block.height,
                 time: block.time,
@@ -1365,14 +1344,14 @@ async fn applied<E: Context>(
                 .blobs
                 .applied(block.height, &writes.unwrap_or_default());
             let reseated = members_written || closes;
-            let receipted = receipts_for(daemon, node, block.height, due, reseated).await?;
+            receipts_for(daemon, node, block.height, due, reseated)?;
             phases.receipting = lap.lap();
-            (receipted, members_written)
+            members_written
         }
         Sequenced::Replayed => {
             daemon.record_unrecorded(node, block).await?;
             phases.recording = lap.lap();
-            (Vec::new(), false)
+            false
         }
     };
     let reseats = members_written || closes;
@@ -1381,7 +1360,6 @@ async fn applied<E: Context>(
     }
     if !opens_an_epoch {
         daemon.pool.offer(Offer::Due);
-        daemon.relay.send(receipted.iter().map(Vec::as_slice));
         phases.seating = lap.lap();
         return Ok(Flow::Writing);
     }
@@ -1401,7 +1379,6 @@ async fn applied<E: Context>(
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
     tracker.track(epoch, &members);
-    daemon.relay.send(receipted.iter().map(Vec::as_slice));
     membership.seat(block.tip(), &validators).await?;
     phases.seating = lap.lap();
     Ok(Flow::Writing)

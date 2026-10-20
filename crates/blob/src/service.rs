@@ -2,9 +2,9 @@
 // halo and receipts what it holds. noded starts it, tells it each applied block and asks it
 // for a blob it lacks.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -103,13 +103,57 @@ struct State {
     senders: HashMap<BlobId, SentBy>,
 }
 
+struct Owner {
+    generation: u64,
+    class: Class,
+    ended: watch::Sender<()>,
+}
+
+#[derive(Default)]
+struct Pulls {
+    owners: HashMap<BlobId, Owner>,
+    live: HashSet<u64>,
+    generations: u64,
+}
+
+struct Owning {
+    inner: Arc<Inner>,
+    id: BlobId,
+    generation: u64,
+    superseded: watch::Receiver<()>,
+}
+
+impl Drop for Owning {
+    fn drop(&mut self) {
+        let mut pulls = self.inner.pulls();
+        pulls.live.remove(&self.generation);
+        let mine = pulls
+            .owners
+            .get(&self.id)
+            .is_some_and(|owner| owner.generation == self.generation);
+        if mine {
+            pulls.owners.remove(&self.id);
+        }
+    }
+}
+
+enum Turn {
+    Mine(Owning),
+    Joined(watch::Receiver<()>),
+}
+
+enum Pulled {
+    Landed,
+    Superseded,
+}
+
 struct Inner {
     halo: Arc<Halo>,
     lane: Streams<Arc<Links>>,
     store: Blobs,
     state: Mutex<State>,
     work: Notify,
-    pulls: Mutex<HashMap<BlobId, Arc<tokio::sync::Mutex<()>>>>,
+    pulls: Mutex<Pulls>,
     uploads: AtomicU64,
     landed: watch::Sender<u64>,
 }
@@ -135,6 +179,7 @@ impl Service {
         config: Config,
     ) -> crate::Result<Service> {
         store.clear_staging()?;
+        let generations = leftovers(&store, &store.partials()?)?;
         let lane = halo
             .plane()
             .streams(crate::contract::LANE, config.backlog.get())
@@ -145,7 +190,10 @@ impl Service {
             store,
             state: Mutex::default(),
             work: Notify::new(),
-            pulls: Mutex::default(),
+            pulls: Mutex::new(Pulls {
+                generations,
+                ..Pulls::default()
+            }),
             uploads: AtomicU64::new(0),
             landed: watch::Sender::new(0),
         });
@@ -190,8 +238,12 @@ impl Service {
     }
 
     pub fn posted(&self, bundle: u64, receipt: Vec<u8>) {
-        if let Some(open) = self.inner.state().open.get_mut(&bundle) {
-            open.posted = Some(receipt);
+        self.inner.posted(bundle, receipt);
+    }
+
+    pub fn posts(&self) -> Posts {
+        Posts {
+            inner: self.inner.clone(),
         }
     }
 
@@ -227,6 +279,17 @@ impl Service {
     }
 }
 
+#[derive(Clone)]
+pub struct Posts {
+    inner: Arc<Inner>,
+}
+
+impl Posts {
+    pub fn posted(&self, bundle: u64, receipt: Vec<u8>) {
+        self.inner.posted(bundle, receipt);
+    }
+}
+
 fn unread(error: std::io::Error) -> Refusal {
     Refusal::new(
         reason::INVALID_INPUT,
@@ -245,11 +308,113 @@ fn pause(rounds: u32) -> Duration {
     PAUSE.saturating_mul(rounds).min(PAUSE_MOST)
 }
 
+async fn closed(pulling: &mut watch::Receiver<()>) {
+    while pulling.changed().await.is_ok() {}
+}
+
+async fn unless_superseded<T>(
+    superseded: &mut watch::Receiver<()>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = closed(superseded) => None,
+        done = work => Some(done),
+    }
+}
+
+fn leftovers(store: &Blobs, partials: &Path) -> std::io::Result<u64> {
+    let mut highest = 0;
+    for entry in std::fs::read_dir(partials)? {
+        let entry = entry?;
+        let file = entry.file_name();
+        let Some(name) = file.to_str() else {
+            continue;
+        };
+        let numbered = name
+            .rsplit_once('.')
+            .and_then(|(stem, n)| Some((stem, n.parse::<u64>().ok()?)));
+        let stem = match numbered {
+            Some((stem, generation)) => {
+                highest = highest.max(generation);
+                stem
+            }
+            None => name,
+        };
+        if store.holds_named(stem) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(highest)
+}
+
+fn generation_path(partial: &Path, generation: u64) -> PathBuf {
+    let mut name = partial.as_os_str().to_owned();
+    name.push(format!(".{generation}"));
+    PathBuf::from(name)
+}
+
+fn seed(partial: &Path, generation: u64, live: &HashSet<u64>) -> std::io::Result<PathBuf> {
+    let mine = generation_path(partial, generation);
+    let named = partial.file_name().and_then(|name| name.to_str());
+    let (Some(dir), Some(name)) = (partial.parent(), named) else {
+        return Ok(mine);
+    };
+    let mut older = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file = entry.file_name();
+        let Some(rest) = file.to_str().and_then(|file| file.strip_prefix(name)) else {
+            continue;
+        };
+        let owner = match rest {
+            "" => None,
+            rest => match rest.strip_prefix('.').and_then(|n| n.parse::<u64>().ok()) {
+                Some(owner) if owner < generation => Some(owner),
+                _ => continue,
+            },
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        older.push((meta.len(), owner, entry.path()));
+    }
+    older.sort_by_key(|(len, ..)| std::cmp::Reverse(*len));
+    let written = |owner: Option<u64>| owner.is_some_and(|owner| live.contains(&owner));
+    let mut seeded = false;
+    for (_, owner, path) in older {
+        if !seeded {
+            let taken = match written(owner) {
+                true => std::fs::copy(&path, &mine).map(drop),
+                false => std::fs::rename(&path, &mine),
+            };
+            match taken {
+                Ok(()) => {
+                    seeded = true;
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        if !written(owner) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(mine)
+}
+
 impl Inner {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
             .expect("the blob state lock is never poisoned")
+    }
+
+    fn posted(&self, bundle: u64, receipt: Vec<u8>) {
+        if let Some(open) = self.state().open.get_mut(&bundle) {
+            open.posted = Some(receipt);
+        }
     }
 
     fn local(&self, entry: &Entry) -> Local {
@@ -401,7 +566,7 @@ impl Inner {
     /// Asks each candidate member in turn until one gives the blob; failing that, the reason
     /// the round names.
     async fn round(
-        &self,
+        self: &Arc<Self>,
         id: &BlobId,
         declared: Option<&Entry>,
         class: Class,
@@ -425,7 +590,7 @@ impl Inner {
         Err(NO_MEMBER_GAVE_IT)
     }
 
-    async fn fetch(&self, id: BlobId, class: Class) {
+    async fn fetch(self: &Arc<Self>, id: BlobId, class: Class) {
         let declared = self.declared(&id);
         let mut rounds = 0u32;
         loop {
@@ -444,10 +609,41 @@ impl Inner {
         }
     }
 
-    fn pull_lock(&self, id: &BlobId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut pulls = self.pulls.lock().expect("the pull lock is never poisoned");
-        pulls.retain(|_, lock| Arc::strong_count(lock) > 1);
-        pulls.entry(*id).or_default().clone()
+    fn pulls(&self) -> MutexGuard<'_, Pulls> {
+        self.pulls.lock().expect("the pull table is never poisoned")
+    }
+
+    fn turn(self: &Arc<Self>, id: &BlobId, class: Class) -> Turn {
+        let mut pulls = self.pulls();
+        if let Some(owner) = pulls.owners.get(id)
+            && owner.class <= class
+        {
+            return Turn::Joined(owner.ended.subscribe());
+        }
+        pulls.generations += 1;
+        let generation = pulls.generations;
+        let ended = watch::Sender::new(());
+        let superseded = ended.subscribe();
+        let owner = Owner {
+            generation,
+            class,
+            ended,
+        };
+        pulls.owners.insert(*id, owner);
+        pulls.live.insert(generation);
+        Turn::Mine(Owning {
+            inner: self.clone(),
+            id: *id,
+            generation,
+            superseded,
+        })
+    }
+
+    async fn seeded(&self, id: &BlobId, generation: u64) -> Result<PathBuf, &'static str> {
+        let partial = self.store.partial(id).map_err(|_| "unwritten")?;
+        let live = self.pulls().live.clone();
+        let seeded = tokio::task::spawn_blocking(move || seed(&partial, generation, &live)).await;
+        seeded.map_err(|_| "unwritten")?.map_err(|_| "unwritten")
     }
 
     async fn asked(
@@ -464,25 +660,79 @@ impl Inner {
     }
 
     async fn pull(
-        &self,
+        self: &Arc<Self>,
         peer: &PublicKey,
         id: &BlobId,
         declared: Option<&Entry>,
         class: Class,
     ) -> Result<(), &'static str> {
-        let lock = self.pull_lock(id);
-        let _pulling = lock.lock().await;
-        if self.store.has(id) {
-            return Ok(());
+        loop {
+            let owning = match self.turn(id, class) {
+                Turn::Mine(owning) => owning,
+                Turn::Joined(mut pulling) => {
+                    closed(&mut pulling).await;
+                    if self.store.has(id) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            if self.store.has(id) {
+                return Ok(());
+            }
+            let work = tokio::spawn({
+                let inner = self.clone();
+                let peer = peer.clone();
+                let declared = declared.cloned();
+                async move { inner.owned(owning, &peer, declared.as_ref(), class).await }
+            });
+            match work.await.map_err(|_| "unwritten")?? {
+                Pulled::Landed => return Ok(()),
+                Pulled::Superseded => {}
+            }
         }
-        let partial = self.store.partial(id).map_err(|_| "unwritten")?;
-        let offset = size_of(&partial).map_err(|_| "unread")?.unwrap_or(0);
+    }
+
+    async fn owned(
+        &self,
+        mut owning: Owning,
+        peer: &PublicKey,
+        declared: Option<&Entry>,
+        class: Class,
+    ) -> Result<Pulled, &'static str> {
+        let id = owning.id;
+        let file = self.seeded(&id, owning.generation).await?;
+        let pulled = self.pulled(peer, &id, declared, class, &file, &mut owning.superseded);
+        let pulled = pulled.await?;
+        if let Pulled::Superseded = pulled {
+            let _ = tokio::fs::remove_file(&file).await;
+        }
+        Ok(pulled)
+    }
+
+    async fn pulled(
+        &self,
+        peer: &PublicKey,
+        id: &BlobId,
+        declared: Option<&Entry>,
+        class: Class,
+        partial: &Path,
+        superseded: &mut watch::Receiver<()>,
+    ) -> Result<Pulled, &'static str> {
+        if self.store.has(id) {
+            return Ok(Pulled::Landed);
+        }
+        let offset = size_of(partial).map_err(|_| "unread")?.unwrap_or(0);
         let overrun = declared.is_some_and(|entry| offset > entry.len);
         if overrun {
-            let _ = tokio::fs::remove_file(&partial).await;
+            let _ = tokio::fs::remove_file(partial).await;
             return Err("overrun");
         }
-        let (answer, mut stream) = self.asked(peer, class, &Ask { id: *id, offset }).await?;
+        let ask = Ask { id: *id, offset };
+        let Some(asked) = unless_superseded(superseded, self.asked(peer, class, &ask)).await else {
+            return Ok(Pulled::Superseded);
+        };
+        let (answer, mut stream) = asked?;
         let Answer::Have { len } = answer else {
             return Err("lacks");
         };
@@ -491,45 +741,35 @@ impl Inner {
             return Err("missized");
         }
         if offset > len {
-            let _ = tokio::fs::remove_file(&partial).await;
+            let _ = tokio::fs::remove_file(partial).await;
             return Err("overrun");
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&partial)
+            .open(partial)
             .await
             .map_err(|_| "unwritten")?;
-        let mut left = len - offset;
-        let mut chunk = vec![0u8; CHUNK];
-        while left > 0 {
-            let want = left.min(CHUNK as u64) as usize;
-            let read = stream
-                .read(&mut chunk[..want])
-                .await
-                .map_err(|_| "broken")?;
-            if read == 0 {
-                return Err("cut");
-            }
-            file.write_all(&chunk[..read])
-                .await
-                .map_err(|_| "unwritten")?;
-            left -= read as u64;
-        }
-        file.flush().await.map_err(|_| "unwritten")?;
+        let streamed = streamed(&mut file, &mut stream, len - offset, superseded).await;
+        let flushed = file.flush().await;
         drop(file);
-        let refused = match checked(&partial, id, declared).await {
+        let whole = streamed?;
+        flushed.map_err(|_| "unwritten")?;
+        if !whole {
+            return Ok(Pulled::Superseded);
+        }
+        let refused = match checked(partial, id, declared).await {
             Checked::Named => None,
             Checked::Misnamed => Some("misnamed"),
             Checked::Collision(_) => Some("collision"),
         };
         if let Some(reason) = refused {
-            let _ = tokio::fs::remove_file(&partial).await;
+            let _ = tokio::fs::remove_file(partial).await;
             return Err(reason);
         }
-        self.store.adopt(id, &partial).map_err(|_| "unwritten")?;
+        self.store.adopt(id, partial).map_err(|_| "unwritten")?;
         self.landed.send_modify(|landed| *landed += 1);
-        Ok(())
+        Ok(Pulled::Landed)
     }
 
     async fn stage(
@@ -567,6 +807,31 @@ impl Inner {
             .await
             .map_err(unstored)
     }
+}
+
+async fn streamed(
+    file: &mut tokio::fs::File,
+    stream: &mut (impl AsyncRead + Unpin),
+    mut left: u64,
+    superseded: &mut watch::Receiver<()>,
+) -> Result<bool, &'static str> {
+    let mut chunk = vec![0u8; CHUNK];
+    while left > 0 {
+        let want = left.min(CHUNK as u64) as usize;
+        let reading = stream.read(&mut chunk[..want]);
+        let Some(read) = unless_superseded(superseded, reading).await else {
+            return Ok(false);
+        };
+        let read = read.map_err(|_| "broken")?;
+        if read == 0 {
+            return Err("cut");
+        }
+        file.write_all(&chunk[..read])
+            .await
+            .map_err(|_| "unwritten")?;
+        left -= read as u64;
+    }
+    Ok(true)
 }
 
 enum Checked {
@@ -697,3 +962,6 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| "broken")?;
     stream.shutdown().await.map_err(|_| "broken")
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,14 +1,6 @@
-use std::collections::HashSet;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
-use std::sync::Arc;
-use std::time::Duration;
-
-use arc_swap::ArcSwapOption;
-
-use abi::Refusal;
 
 use commonware_broadcast::buffered;
-use commonware_codec::RangeCfg;
 use commonware_consensus::marshal::Config;
 use commonware_consensus::marshal::core::{Actor, Mailbox};
 use commonware_consensus::marshal::resolver::p2p as backfill;
@@ -20,13 +12,12 @@ use commonware_cryptography::certificate::Verifier as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Sequential;
+use commonware_runtime::Handle;
 use commonware_runtime::buffer::paged::CacheRef;
-use commonware_runtime::{Clock, Handle};
-use commonware_storage::archive::{self, Archive as _, Identifier, immutable};
+use commonware_storage::archive::immutable;
 use commonware_storage::metadata::{self, Metadata};
 use commonware_utils::vec::NonEmptyVec;
 use node::{Block, Digest};
-use tokio::sync::RwLock;
 
 use crate::anchor::Anchor;
 use crate::chain::{App, Chain};
@@ -48,6 +39,7 @@ const FREEZER_TABLE_RESIZE_FREQUENCY: u8 = 4;
 const FREEZER_TABLE_RESIZE_CHUNK_SIZE: u32 = 1 << 16;
 const FREEZER_VALUE_TARGET_SIZE: u64 = 1 << 26;
 const EPOCH_CACHE_BOUNDS: u8 = 0;
+pub(crate) const VALUE_LEVEL: u8 = zstd::DEFAULT_COMPRESSION_LEVEL as u8;
 
 pub type Certificate = Finalization<Scheme, Digest>;
 pub type MarshalMailbox = Mailbox<Scheme, Standard<Block>>;
@@ -90,7 +82,7 @@ impl Marshal {
         anchor: Anchor,
         transport: Transport<S, R, P, B>,
         chain: C,
-    ) -> Result<(Marshal, Summaries<E>), MarshalError>
+    ) -> Result<Marshal, MarshalError>
     where
         E: Context,
         C: Chain,
@@ -102,49 +94,29 @@ impl Marshal {
         let cadence = network.cadence;
         let prefix = format!("{partition}-marshal");
         seed_epoch_cache_floor(context.child("cache_floor"), &prefix, &anchor).await;
-        let page_cache = CacheRef::from_pooler(
-            &context,
-            NonZeroU16::new(PAGE_SIZE).expect("nonzero"),
-            NonZeroUsize::new(PAGE_CACHE_PAGES).expect("nonzero"),
-        );
+        let page_cache = page_cache_of(&context);
         let certificates = immutable::Archive::init(
             context.child("certificates"),
             archive_config(
                 &format!("{partition}-certificates"),
                 page_cache.clone(),
                 Scheme::certificate_codec_config_unbounded(),
+                None,
             ),
         )
         .await
         .expect("the certificate archive opens");
         let blocks = immutable::Archive::init(
             context.child("blocks"),
-            archive_config(&format!("{partition}-blocks"), page_cache.clone(), ()),
+            archive_config(
+                &format!("{partition}-blocks-z"),
+                page_cache.clone(),
+                (),
+                Some(VALUE_LEVEL),
+            ),
         )
         .await
         .expect("the block archive opens");
-        let summaries = Kept {
-            blocks: immutable::Archive::init(
-                context.child("summaries"),
-                archive_config(
-                    &format!("{partition}-summaries"),
-                    page_cache.clone(),
-                    (RangeCfg::from(..), ()),
-                ),
-            )
-            .await
-            .expect("the summary archive opens"),
-            txs: immutable::Archive::init(
-                context.child("txs"),
-                archive_config(
-                    &format!("{partition}-txs"),
-                    page_cache.clone(),
-                    (RangeCfg::from(..), ()),
-                ),
-            )
-            .await
-            .expect("the transaction index opens"),
-        };
 
         let (broadcast_engine, buffer) = buffered::Engine::new(
             context.child("broadcast"),
@@ -207,20 +179,14 @@ impl Marshal {
         .await;
         let fed = Some((buffer.clone(), resolver.1.clone()));
         let actor = actor.start(App::<E, C>::new(chain, cadence), buffer, resolver);
-        let marshal = Marshal {
+        Ok(Marshal {
             mailbox,
             anchor,
             actor,
             broadcast,
             backfill,
             fed,
-        };
-        let span = span_of(&summaries.blocks).map(Arc::new);
-        let summaries = Summaries {
-            kept: Arc::new(RwLock::new(Some(summaries))),
-            span: Arc::new(ArcSwapOption::new(span)),
-        };
-        Ok((marshal, summaries))
+        })
     }
 
     pub fn mailbox(&self) -> &MarshalMailbox {
@@ -264,118 +230,12 @@ pub enum MarshalError {
     Backfill,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum SummariesError {
-    #[error(transparent)]
-    Archive(#[from] archive::Error),
-    #[error("a kept transaction place does not decode: {}", .0.sentence)]
-    Decode(Refusal),
-    #[error("the summary archive failed a write and is closed")]
-    Closed,
-}
-
-type SummaryArchive<E> = immutable::Archive<E, Digest, Vec<u8>>;
-
-struct Kept<E: Context> {
-    blocks: SummaryArchive<E>,
-    txs: SummaryArchive<E>,
-}
-
-pub struct Summaries<E: Context> {
-    kept: Arc<RwLock<Option<Kept<E>>>>,
-    span: Arc<ArcSwapOption<(u64, u64)>>,
-}
-
-impl<E: Context> Clone for Summaries<E> {
-    fn clone(&self) -> Self {
-        Summaries {
-            kept: self.kept.clone(),
-            span: self.span.clone(),
-        }
-    }
-}
-
-impl<E: Context> Summaries<E> {
-    pub async fn keep(
-        &self,
-        clock: &impl Clock,
-        height: u64,
-        id: Digest,
-        summary: Vec<u8>,
-        txs: &[[u8; 32]],
-    ) -> Result<Duration, SummariesError> {
-        let asked = clock.current();
-        let mut slot = self.kept.write().await;
-        let waited = clock.current().duration_since(asked).unwrap_or_default();
-        let Kept {
-            blocks,
-            txs: mut places,
-        } = slot.take().ok_or(SummariesError::Closed)?;
-        let first = places.last_index().map_or(0, |last| last + 1);
-        let mut next = first;
-        let mut seen = HashSet::new();
-        for (position, hash) in txs.iter().enumerate() {
-            let key = Digest::from(*hash);
-            let landed_before = !seen.insert(*hash) || places.has(Identifier::Key(&key)).await?;
-            if landed_before {
-                continue;
-            }
-            places = places
-                .put(next, key, abi::encode(&(height, position as u32)))
-                .await?;
-            next += 1;
-        }
-        let placed_any = next > first;
-        let places = if placed_any {
-            places.sync().await?
-        } else {
-            places
-        };
-        let blocks = blocks.put_sync(height, id, summary).await?;
-        self.span.store(span_of(&blocks).map(Arc::new));
-        *slot = Some(Kept {
-            blocks,
-            txs: places,
-        });
-        Ok(waited)
-    }
-
-    pub async fn get(&self, height: u64) -> Result<Option<Vec<u8>>, SummariesError> {
-        let slot = self.kept.read().await;
-        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
-        Ok(kept.blocks.get(Identifier::Index(height)).await?)
-    }
-
-    pub async fn get_by_id(&self, id: Digest) -> Result<Option<Vec<u8>>, SummariesError> {
-        let slot = self.kept.read().await;
-        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
-        Ok(kept.blocks.get(Identifier::Key(&id)).await?)
-    }
-
-    pub async fn has(&self, height: u64) -> Result<bool, SummariesError> {
-        let slot = self.kept.read().await;
-        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
-        Ok(kept.blocks.has(Identifier::Index(height)).await?)
-    }
-
-    pub async fn place(&self, tx: [u8; 32]) -> Result<Option<(u64, u32)>, SummariesError> {
-        let slot = self.kept.read().await;
-        let kept = slot.as_ref().ok_or(SummariesError::Closed)?;
-        let Some(bytes) = kept.txs.get(Identifier::Key(&Digest::from(tx))).await? else {
-            return Ok(None);
-        };
-        abi::decode(&bytes)
-            .map(Some)
-            .map_err(SummariesError::Decode)
-    }
-
-    pub fn span(&self) -> Option<(u64, u64)> {
-        self.span.load().as_deref().copied()
-    }
-}
-
-fn span_of<E: Context>(blocks: &SummaryArchive<E>) -> Option<(u64, u64)> {
-    blocks.first_index().zip(blocks.last_index())
+pub(crate) fn page_cache_of<E: Context>(context: &E) -> CacheRef {
+    CacheRef::from_pooler(
+        context,
+        NonZeroU16::new(PAGE_SIZE).expect("nonzero"),
+        NonZeroUsize::new(PAGE_CACHE_PAGES).expect("nonzero"),
+    )
 }
 
 async fn seed_epoch_cache_floor<E: Context>(context: E, prefix: &str, anchor: &Anchor) {
@@ -402,7 +262,12 @@ async fn seed_epoch_cache_floor<E: Context>(context: E, prefix: &str, anchor: &A
         .expect("the epoch cache bounds write");
 }
 
-fn archive_config<C>(prefix: &str, page_cache: CacheRef, codec_config: C) -> immutable::Config<C> {
+pub(crate) fn archive_config<C>(
+    prefix: &str,
+    page_cache: CacheRef,
+    codec_config: C,
+    compression: Option<u8>,
+) -> immutable::Config<C> {
     immutable::Config {
         metadata_partition: format!("{prefix}-metadata"),
         freezer_table_partition: format!("{prefix}-table"),
@@ -413,7 +278,7 @@ fn archive_config<C>(prefix: &str, page_cache: CacheRef, codec_config: C) -> imm
         freezer_key_page_cache: page_cache,
         freezer_value_partition: format!("{prefix}-values"),
         freezer_value_target_size: FREEZER_VALUE_TARGET_SIZE,
-        freezer_value_compression: None,
+        freezer_value_compression: compression,
         ordinal_partition: format!("{prefix}-ordinal"),
         items_per_section: ITEMS_PER_SECTION,
         codec_config,

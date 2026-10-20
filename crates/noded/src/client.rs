@@ -442,7 +442,7 @@ impl Fault for Error {
             | Error::Host(_)
             | Error::Blob(_)
             | Error::Sync(_)
-            | Error::Summaries(_)
+            | Error::Archives(_)
             | Error::Store(_)
             | Error::Marshal(_)
             | Error::Lane(_)

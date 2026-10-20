@@ -19,6 +19,7 @@ commonware-actor = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-codec = { workspace = true }
+zstd = { workspace = true }
 futures = { workspace = true }
 rand_core = { workspace = true }
 thiserror = { workspace = true }

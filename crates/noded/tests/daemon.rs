@@ -776,7 +776,7 @@ fn a_validator_serves_its_network_over_http() {
 }
 
 #[test]
-fn a_node_reads_a_transaction_of_a_block_it_lists_no_summary_for() {
+fn a_node_that_lost_its_history_summarizes_every_block_it_holds_again() {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -800,56 +800,91 @@ fn a_node_reads_a_transaction_of_a_block_it_lists_no_summary_for() {
     live.thread.join().unwrap();
 
     let (landed, position, large) = large;
-    for entry in std::fs::read_dir(seat.workspace.runtime_dir()).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let summarized = name.contains("-summaries-") || name.contains("-txs-");
-        if summarized {
-            std::fs::remove_dir_all(&path).unwrap();
-        }
-    }
+    std::fs::remove_dir_all(seat.workspace.dir().join("history")).unwrap();
 
     let live = seat.start();
     let client = live.client.clone();
     client_runtime().block_on(async {
-        let mut blocks = client.changes(host::RECENT).await.unwrap();
-        blocks.next().await.unwrap().unwrap();
         let newest = client.blocks(page(None, 10, 0)).await.unwrap();
-        let listed_from = newest.listed_from.expect("the blocks applied since");
-        assert!(listed_from > landed, "{listed_from} lists {landed}");
-        assert!(
-            newest
-                .blocks
-                .iter()
-                .all(|block| block.height >= listed_from)
-        );
-        let below = client.blocks(page(Some(listed_from), 10, 0)).await.unwrap();
-        assert!(below.blocks.is_empty());
-        assert_eq!(below.listed_from, Some(listed_from));
-        assert_eq!(client.block(block_at(landed, 0)).await.unwrap(), None);
-
-        let at = TxRef::At {
-            height: landed,
-            position,
-        };
-        let read = client
-            .tx(TxAsk {
-                tx: at,
-                most: u32::MAX,
-            })
+        let listed_from = newest.listed_from.expect("every block the node holds");
+        assert!(listed_from <= landed, "{listed_from} lists {landed}");
+        let block = client
+            .block(block_at(landed, WHOLE))
             .await
             .unwrap()
-            .expect("read out of the block archive");
-        assert_eq!((read.height, read.position), (landed, position));
-        assert_eq!(read.tx.hash, large.id());
-        assert_eq!(read.tx.size as usize, large.payload.len());
-        assert_eq!(read.tx.payload.as_ref(), Some(&large.payload));
-        assert_eq!(read.tx.receipt, None, "no run recorded");
+            .expect("summarized again out of the block archive");
+        let tx = &block.txs[position as usize];
+        assert_eq!(tx.hash, large.id());
+        assert_eq!(tx.payload.as_ref(), Some(&large.payload));
+        assert_eq!(tx.receipt, None, "no run recorded");
         let by_hash = TxAsk {
             tx: TxRef::Hash(large.id()),
+            most: u32::MAX,
+        };
+        let read = client
+            .tx(by_hash)
+            .await
+            .unwrap()
+            .expect("its place is kept again");
+        assert_eq!((read.height, read.position), (landed, position));
+        assert_eq!(read.tx.size as usize, large.payload.len());
+        assert_eq!(read.tx.payload.as_ref(), Some(&large.payload));
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn an_older_build_finds_every_block_and_summary_in_the_archives_restore_writes_back() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let (landed, position, id) = client_runtime().block_on(async {
+        let kept = frame(&client, &alice, vec![set(b"kept", &[3; 64])]).await;
+        let (landed, receipt) = client.land(&Frame::decode(&kept).unwrap()).await.unwrap();
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        let id = submission(&kept).id();
+        let block = client.block(block_at(landed, 0)).await.unwrap().unwrap();
+        let position = block.txs.iter().position(|tx| tx.hash == id).unwrap() as u32;
+        seat.admin(&client, Admin::Shutdown).await;
+        (landed, position, id)
+    });
+    live.thread.join().unwrap();
+
+    let workspace = &seat.workspace;
+    let (blocks, summaries) = runner(&workspace.runtime_dir())
+        .start(|context| async move { noded::restore_archives(context, workspace).await.unwrap() });
+    assert!(blocks > landed, "{blocks} blocks written back");
+    assert!(summaries > landed, "{summaries} summaries written back");
+    std::fs::remove_dir_all(seat.workspace.dir().join("history")).unwrap();
+
+    let live = seat.start();
+    let client = live.client.clone();
+    client_runtime().block_on(async {
+        let block = client
+            .block(block_at(landed, 0))
+            .await
+            .unwrap()
+            .expect("copied out of the summaries restore wrote back");
+        let tx = &block.txs[position as usize];
+        assert_eq!(tx.hash, id);
+        assert!(
+            tx.receipt.is_some(),
+            "the summary an older build reads carries the run's receipt"
+        );
+        let by_hash = TxAsk {
+            tx: TxRef::Hash(id),
             most: 0,
         };
-        assert_eq!(client.tx(by_hash).await.unwrap(), None);
+        let read = client.tx(by_hash).await.unwrap().unwrap();
+        assert_eq!((read.height, read.position), (landed, position));
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
@@ -2915,4 +2950,99 @@ fn parked_state_prunes_while_a_restart_and_two_joins_reach_the_same_root() {
     for node in live.into_iter().chain([plain_live, held_live]) {
         node.thread.join().unwrap();
     }
+}
+
+const RPC_BLOCKING_THREADS: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(512).expect("nonzero");
+
+fn unlanded() -> TxAsk {
+    TxAsk {
+        tx: TxRef::Hash([7; 32]),
+        most: 0,
+    }
+}
+
+const FLOOD_SEED: u64 = 1 << 20;
+
+fn crowded(anchor: Tip, key: &ed25519::PrivateKey, salt: u64) -> Vec<u8> {
+    let steps = vec![set(b"crowd", &salt.to_le_bytes())];
+    Frame::sign(
+        key,
+        NETWORK.as_bytes(),
+        anchor,
+        Some(salt),
+        "probe",
+        abi::encode(&steps),
+    )
+    .encode()
+}
+
+async fn held_under_a_submit_flood(client: &Client, page: &Path) {
+    let anchor = client.status().await.unwrap().anchor();
+    let (stop, stopped) = ::tokio::sync::watch::channel(false);
+    let mut floods = ::tokio::task::JoinSet::new();
+    for submitter in 0..RPC_BLOCKING_THREADS.get() as u64 {
+        let client = client.clone();
+        let stopped = stopped.clone();
+        floods.spawn(async move {
+            let key = ed25519::PrivateKey::from_seed(FLOOD_SEED + submitter);
+            let resent = crowded(anchor, &key, submitter);
+            while !*stopped.borrow() {
+                let _ = client.submit(resent.clone(), Preconfirm::Off).await;
+            }
+        });
+    }
+    let (_, bundle) = put_page(client, page, 1).await;
+    let status = client.status().await.unwrap();
+    let role = status.roles.bound(role::BLOBS).unwrap();
+    client.held(role, bundle).await.unwrap();
+    stop.send_replace(true);
+    floods.join_all().await;
+}
+
+#[test]
+fn blocks_finalize_under_a_submit_flood_and_every_rpc_blocking_thread_held_except_v1_sync_which_the_writer_serves()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let load = LoadConfig {
+        rpc_blocking_threads: Some(RPC_BLOCKING_THREADS),
+        ..LoadConfig::default()
+    };
+    let (live, rpc) = seat.start_handing(load, |running| running.rpc());
+    let rpc = rpc.expect("a running node serves rpc");
+    let client = live.client.clone();
+    let page = root.path().join("page");
+    std::fs::write(&page, b"receipted while submits flood the pool").unwrap();
+    let runtime = client_runtime();
+    runtime.block_on(held_under_a_submit_flood(&client, &page));
+    let release = Arc::new(std::sync::RwLock::new(()));
+    let held = release.write().unwrap();
+    let (holding, holds) = mpsc::channel();
+    for _ in 0..RPC_BLOCKING_THREADS.get() {
+        let release = release.clone();
+        let holding = holding.clone();
+        rpc.spawn_blocking(move || {
+            holding.send(()).unwrap();
+            drop(release.read().unwrap());
+        });
+    }
+    for _ in 0..RPC_BLOCKING_THREADS.get() {
+        holds.recv().unwrap();
+    }
+    runtime.block_on(async {
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        let from = client.status().await.unwrap().height;
+        let mut height = from;
+        while height < from + EPOCH_LENGTH {
+            let reader = client.clone();
+            ::tokio::spawn(async move { reader.tx(unlanded()).await });
+            height = blocks.next().await.unwrap().unwrap().height;
+        }
+    });
+    drop(held);
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
 }

@@ -77,7 +77,7 @@ impl Peer {
         );
         let (inbox, mut deliveries) = mpsc::unbounded();
         let chain = Empty(inbox);
-        let (marshal, _receipts) = Marshal::start(
+        let marshal = Marshal::start(
             context.child("marshal"),
             name,
             &network,

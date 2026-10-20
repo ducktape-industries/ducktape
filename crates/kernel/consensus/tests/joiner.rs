@@ -104,7 +104,7 @@ async fn join(
     roster.seat(ANCHOR_EPOCH, validators);
     let mesh = SimMesh::new(oracle, key.public_key(), Quota::per_second(NZU32!(1024)));
     let (inbox, deliveries) = mpsc::unbounded();
-    let (marshal, _summaries) = Marshal::start(
+    let marshal = Marshal::start(
         context.child("marshal"),
         NAME,
         &network(),

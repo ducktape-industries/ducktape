@@ -1,19 +1,20 @@
 //! Block summaries this node records as it applies blocks, served by the
-//! block read routes; a route reads a block out of the marshal archive only
-//! for a payload its caller asks for.
+//! block read routes from the recent window and, past it, from the node's
+//! history store; no route reads the marshal archive.
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use abi::Receipt;
 use arc_swap::ArcSwap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_consensus::types::Height;
-use commonware_cryptography::{Digestible as _, sha256};
-use consensus::validators_of;
+use commonware_cryptography::Digestible as _;
+use consensus::{Certificate, validators_of};
 use host::{ANCHOR_WINDOW, Submission, SubmissionId};
 use node::{Block, Body, Carried, Frame, Node};
 
+use crate::history::Row;
 use crate::wire::{BlockAsk, BlockRef, Blocks, Finalized, Located, Page, Tx, TxAsk, TxRef};
 use crate::{Context, Daemon, Error, Result};
 
@@ -24,6 +25,11 @@ struct Kept {
 }
 
 type Ran = Vec<(u32, SubmissionId, Submission)>;
+
+pub(crate) struct Recorded {
+    pub(crate) proposing: Duration,
+    pub(crate) keeping: Duration,
+}
 
 pub(crate) struct Recent {
     window: ArcSwap<VecDeque<Arc<Kept>>>,
@@ -81,7 +87,7 @@ impl Recent {
 
 impl<E: Context> Daemon<E> {
     pub async fn blocks(&self, page: Blocks) -> Result<Page> {
-        let Some((lowest, newest)) = self.summaries.span() else {
+        let Some((lowest, newest)) = self.history.span() else {
             return Ok(Page {
                 blocks: Vec::new(),
                 listed_from: None,
@@ -124,16 +130,19 @@ impl<E: Context> Daemon<E> {
 
     async fn listed(&self, kept: &Kept, most: u32) -> Result<Finalized> {
         let mut block = kept.block.clone();
-        let carries_a_payload = block.txs.iter().any(|tx| tx.size <= most);
-        if !carries_a_payload {
+        let within: Vec<u32> = block
+            .txs
+            .iter()
+            .enumerate()
+            .filter(|(_, tx)| tx.size <= most)
+            .map(|(position, _)| position as u32)
+            .collect();
+        if within.is_empty() {
             return Ok(block);
         }
-        let archived = self.archived(block.height).await?;
-        for (tx, frame) in block.txs.iter_mut().zip(&kept.frames) {
-            let within = tx.size <= most;
-            if within {
-                tx.payload = Some(payload_of(&archived, *frame)?);
-            }
+        let payloads = self.payloads(block.height, within.clone()).await?;
+        for (position, payload) in within.into_iter().zip(payloads) {
+            block.txs[position as usize].payload = Some(payload);
         }
         Ok(block)
     }
@@ -146,24 +155,27 @@ impl<E: Context> Daemon<E> {
         let Some((height, position)) = place else {
             return Ok(None);
         };
-        match self.summary(height).await? {
-            Some(kept) => self.recorded(&kept, position, ask.most).await,
-            None => self.unrecorded(height, position, ask.most).await,
-        }
+        let Some(kept) = self.summary(height).await? else {
+            return Ok(None);
+        };
+        self.recorded(&kept, position, ask.most).await
     }
 
     async fn placed(&self, hash: [u8; 32]) -> Result<Option<(u64, u32)>> {
         if let Some(place) = self.recent.place(hash) {
             return Ok(Some(place));
         }
-        Ok(self.summaries.place(hash).await?)
+        let history = self.history.clone();
+        crate::offload(move || history.place(hash)).await?
     }
 
     async fn summary(&self, height: u64) -> Result<Option<Arc<Kept>>> {
         if let Some(kept) = self.recent.at(height) {
             return Ok(Some(kept));
         }
-        let Some(bytes) = self.summaries.get(height).await? else {
+        let history = self.history.clone();
+        let read = crate::offload(move || history.summary(height)).await??;
+        let Some(bytes) = read else {
             return Ok(None);
         };
         Ok(Some(Arc::new(decoded(&bytes)?)))
@@ -173,22 +185,40 @@ impl<E: Context> Daemon<E> {
         if let Some(kept) = self.recent.by_id(id) {
             return Ok(Some(kept));
         }
-        let Some(bytes) = self.summaries.get_by_id(sha256::Digest(id)).await? else {
+        let history = self.history.clone();
+        let read = crate::offload(move || history.summary_by_id(id)).await??;
+        let Some(bytes) = read else {
             return Ok(None);
         };
         Ok(Some(Arc::new(decoded(&bytes)?)))
     }
 
+    async fn payloads(&self, height: u64, positions: Vec<u32>) -> Result<Vec<Vec<u8>>> {
+        let history = self.history.clone();
+        crate::offload(move || {
+            positions
+                .into_iter()
+                .map(|position| {
+                    history.payload(height, position)?.ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "block {height} is summarized and keeps no payload for tx {position}"
+                        ))
+                    })
+                })
+                .collect()
+        })
+        .await?
+    }
+
     async fn recorded(&self, kept: &Kept, position: u32, most: u32) -> Result<Option<Located>> {
-        let at = position as usize;
-        let (Some(summary), Some(frame)) = (kept.block.txs.get(at), kept.frames.get(at)) else {
+        let Some(summary) = kept.block.txs.get(position as usize) else {
             return Ok(None);
         };
         let mut tx = summary.clone();
         let within = tx.size <= most;
         if within {
-            let archived = self.archived(kept.block.height).await?;
-            tx.payload = Some(payload_of(&archived, *frame)?);
+            let payload = self.payloads(kept.block.height, vec![position]).await?;
+            tx.payload = payload.into_iter().next();
         }
         Ok(Some(Located {
             height: kept.block.height,
@@ -198,61 +228,30 @@ impl<E: Context> Daemon<E> {
         }))
     }
 
-    async fn archived(&self, height: u64) -> Result<Block> {
-        let missing = || Error::Corrupt(format!("block {height} is summarized and not archived"));
-        self.anchors
-            .get_block(Height::new(height))
-            .await
-            .ok_or_else(missing)
-    }
-
-    async fn unrecorded(&self, height: u64, position: u32, most: u32) -> Result<Option<Located>> {
-        let Some(block) = self.anchors.get_block(Height::new(height)).await else {
-            return Ok(None);
-        };
-        let network = self.descriptor.id();
-        let time = block.time;
-        let found = tokio::task::spawn_blocking(move || {
-            node::carried(&block, &network).nth(position as usize)
-        })
-        .await
-        .map_err(std::io::Error::other)?;
-        Ok(found.map(|(_, submission)| {
-            let (mut tx, payload) = tx_of(submission.id(), submission, None);
-            let within = tx.size <= most;
-            if within {
-                tx.payload = Some(payload);
-            }
-            Located {
-                height,
-                position,
-                time,
-                tx,
-            }
-        }))
-    }
-
     pub(crate) async fn record(
         &self,
         node: &Node<E>,
         block: &Block,
         ran: Ran,
         receipts: Option<Vec<Receipt>>,
-    ) -> Result<Duration> {
+    ) -> Result<Recorded> {
+        let asked = self.context.current();
         let proposer = self.proposer(node, block.height).await?;
-        let kept = summarize(block, self.network.epoch_length, proposer, ran, receipts)?;
-        let bytes = abi::encode(&kept);
-        let hashes: Vec<[u8; 32]> = kept.block.txs.iter().map(|tx| tx.hash).collect();
-        let waited = self
-            .summaries
-            .keep(&self.context, block.height, block.digest(), bytes, &hashes)
-            .await?;
+        let proposed = self.context.current();
+        let (kept, payloads) =
+            summarize(block, self.network.epoch_length, proposer, ran, receipts)?;
+        let summary = abi::encode(&kept);
+        self.history.keep(row_of(&kept, summary, payloads))?;
+        let stored = self.context.current();
         self.recent.keep(Arc::new(kept));
-        Ok(waited)
+        Ok(Recorded {
+            proposing: since(asked, proposed),
+            keeping: since(proposed, stored),
+        })
     }
 
     pub(crate) async fn record_unrecorded(&self, node: &Node<E>, block: &Block) -> Result<()> {
-        if self.summaries.has(block.height).await? {
+        if self.history.has(block.height)? {
             return Ok(());
         }
         let network = self.descriptor.id();
@@ -267,24 +266,32 @@ impl<E: Context> Daemon<E> {
         let Some(certificate) = self.anchors.get_finalization(Height::new(height)).await else {
             return Ok(None);
         };
-        let epoch = certificate.proposal.round.epoch().get();
-        let validators = node.epoch_validators(epoch)?;
-        let Some(validators) = validators.as_deref().and_then(validators_of) else {
-            return Ok(None);
-        };
-        let previous = match epoch.checked_sub(1) {
-            Some(before) => {
-                let previous = node.epoch_validators(before)?;
-                let Some(previous) = previous.as_deref().and_then(validators_of) else {
-                    return Ok(None);
-                };
-                Some(previous)
-            }
-            None => None,
-        };
-        let proposer = consensus::proposer(&certificate, &validators, previous.as_ref());
-        Ok(proposer.map(|key| key.as_ref().to_vec()))
+        proposer_of(node, &certificate)
     }
+}
+
+fn proposer_of<E: Context>(node: &Node<E>, certificate: &Certificate) -> Result<Option<Vec<u8>>> {
+    let epoch = certificate.proposal.round.epoch().get();
+    let validators = node.epoch_validators(epoch)?;
+    let Some(validators) = validators.as_deref().and_then(validators_of) else {
+        return Ok(None);
+    };
+    let previous = match epoch.checked_sub(1) {
+        Some(before) => {
+            let previous = node.epoch_validators(before)?;
+            let Some(previous) = previous.as_deref().and_then(validators_of) else {
+                return Ok(None);
+            };
+            Some(previous)
+        }
+        None => None,
+    };
+    let proposer = consensus::proposer(certificate, &validators, previous.as_ref());
+    Ok(proposer.map(|key| key.as_ref().to_vec()))
+}
+
+fn since(from: SystemTime, to: SystemTime) -> Duration {
+    to.duration_since(from).unwrap_or_default()
 }
 
 pub(crate) fn ran(block: &Block, carried: &[Carried]) -> Result<Ran> {
@@ -323,13 +330,53 @@ pub(crate) fn ran(block: &Block, carried: &[Carried]) -> Result<Ran> {
         .collect()
 }
 
+pub(crate) fn carried_over(summary: Vec<u8>, block: &Block) -> Result<Row> {
+    let kept = decoded(&summary)?;
+    let payloads = kept
+        .frames
+        .iter()
+        .map(|frame| payload_of(block, *frame))
+        .collect::<Result<_>>()?;
+    Ok(row_of(&kept, summary, payloads))
+}
+
+pub(crate) struct Landed {
+    pub(crate) id: [u8; 32],
+    pub(crate) places: Vec<([u8; 32], u32)>,
+}
+
+pub(crate) fn places_of(summary: &[u8]) -> Result<Landed> {
+    let kept = decoded(summary)?;
+    let places = kept
+        .block
+        .txs
+        .iter()
+        .enumerate()
+        .map(|(position, tx)| (tx.hash, position as u32))
+        .collect();
+    Ok(Landed {
+        id: kept.block.id,
+        places,
+    })
+}
+
+fn row_of(kept: &Kept, summary: Vec<u8>, payloads: Vec<Vec<u8>>) -> Row {
+    Row {
+        height: kept.block.height,
+        id: kept.block.id,
+        summary,
+        txs: kept.block.txs.iter().map(|tx| tx.hash).collect(),
+        payloads,
+    }
+}
+
 fn summarize(
     block: &Block,
     epoch_length: u64,
     proposer: Option<Vec<u8>>,
     ran: Ran,
     receipts: Option<Vec<Receipt>>,
-) -> Result<Kept> {
+) -> Result<(Kept, Vec<Vec<u8>>)> {
     let receipts: Vec<Option<Receipt>> = match receipts {
         None => vec![None; ran.len()],
         Some(receipts) if receipts.len() == ran.len() => receipts.into_iter().map(Some).collect(),
@@ -342,12 +389,16 @@ fn summarize(
             )));
         }
     };
-    let (frames, txs) = ran
-        .into_iter()
-        .zip(receipts)
-        .map(|((frame, id, submission), receipt)| (frame, tx_of(id, submission, receipt).0))
-        .unzip();
-    Ok(Kept {
+    let mut frames = Vec::with_capacity(ran.len());
+    let mut txs = Vec::with_capacity(ran.len());
+    let mut payloads = Vec::with_capacity(ran.len());
+    for ((frame, id, submission), receipt) in ran.into_iter().zip(receipts) {
+        let (tx, payload) = tx_of(id, submission, receipt);
+        frames.push(frame);
+        txs.push(tx);
+        payloads.push(payload);
+    }
+    let kept = Kept {
         block: Finalized {
             height: block.height,
             id: block.digest().0,
@@ -358,7 +409,8 @@ fn summarize(
             txs,
         },
         frames,
-    })
+    };
+    Ok((kept, payloads))
 }
 
 fn tx_of(id: SubmissionId, submission: Submission, receipt: Option<Receipt>) -> (Tx, Vec<u8>) {

@@ -197,6 +197,7 @@ impl LoadSettings {
                 .live_linger_ms
                 .map_or(default.live_linger, |ms| Duration::from_millis(ms.get())),
             rpc_cpus: None,
+            rpc_blocking_threads: None,
         }
     }
 }

@@ -53,7 +53,7 @@ impl TestNode {
     }
 
     fn build<'a>(
-        &self,
+        &mut self,
         parent: Tip,
         unapplied: impl IntoIterator<Item = &'a Block>,
         time: u64,

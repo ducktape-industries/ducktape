@@ -80,6 +80,12 @@ enum Verb {
     },
     #[command(about = "run the node; a flag overrides the workspace's node.toml")]
     Run(Box<RunArgs>),
+    #[command(
+        about = "write the block history this build keeps back into the archives an older \
+                 build reads; run it with the node stopped, before an older build starts on \
+                 this workspace"
+    )]
+    RestoreArchives,
     #[command(about = "print the node's height, tip, root, epoch and identity")]
     Status,
     #[command(
@@ -633,6 +639,14 @@ fn execute(cli: Cli) -> Result<(), String> {
                 running.stopped(signalled).await.sentence()
             })
         }
+        Verb::RestoreArchives => {
+            Runner::new(runtime_config(&workspace)).start(|context| async move {
+                let restored = noded::restore_archives(context, &workspace).await;
+                let (blocks, summaries) = restored.sentence()?;
+                println!("wrote back {blocks} blocks and {summaries} summaries");
+                Ok(())
+            })
+        }
         Verb::Wallet(verb) if !matches!(verb, WalletVerb::Consent { .. }) => {
             wallet(&workspace, verb)
         }
@@ -993,6 +1007,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Init { .. }
         | Verb::Join { .. }
         | Verb::Run(_)
+        | Verb::RestoreArchives
         | Verb::Wallet(_) => unreachable!("handled before the client is built"),
     }
 }

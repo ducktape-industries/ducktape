@@ -695,6 +695,17 @@ votes and `ducktape halo` never preconfirm. `ducktape logs`,
 node's own identity key. Each verb's
 `--help` carries the rest.
 
+A node keeps its block history (each block's summary, where each transaction
+first landed and the payload of each transaction a block ran) in a store of its
+own under `history/` in the workspace. Only the block writer writes it, and the
+block read routes read it from snapshots, so no read can hold up a block. The
+node keeps its blocks in a compressed archive (zstd's default level). Each start copies
+into both whatever the archives of an older build hold that they lack, and
+refuses to start when a summary names a block the block archive lacks. Before
+an older build starts on the same workspace, `ducktape restore-archives`, run
+with the node stopped, writes the history and the blocks back into the archives
+that build reads.
+
 `ducktape shutdown`, SIGTERM and SIGINT stop `ducktape run` the same way.
 The node stops taking blocks and lets the block it is applying finish. It
 closes every `/v1/changes` socket with a going-away close frame, flushes its
