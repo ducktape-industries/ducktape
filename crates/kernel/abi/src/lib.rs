@@ -754,44 +754,50 @@ pub mod role {
         /// `System` origin, it gives the program its account. Registering a
         /// program that has one changes nothing.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Op {
-            RegisterProgram { program: ProgramId },
+            RegisterProgram { program: ProgramId } = 0,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Query {
             /// The kernel's: the account a frame signed by this key acts
             /// as, `None` for a key that holds none. Refused while that
             /// account does not act (a program account whose [`Standing`] is
             /// not `Active`). The host rejects a frame whose key is
             /// refused.
-            Account(Vec<u8>),
+            Account(Vec<u8>) = 0,
             /// The kernel's: the account of a program, answered as
             /// `Account`.
-            OfProgram(ProgramId),
+            OfProgram(ProgramId) = 1,
             /// One account's profile, `None` for a number no account has.
-            Profile(AccountNumber),
+            Profile(AccountNumber) = 2,
             /// Every account's profile, ascending by number from past
             /// `after`, at most `limit` of them (the program may cap it).
             Profiles {
                 after: Option<AccountNumber>,
                 limit: u32,
-            },
+            } = 3,
             Runs {
                 program: ProgramId,
                 account: AccountNumber,
-            },
+            } = 4,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Reply {
-            Account(Option<AccountNumber>),
-            Profile(Option<Profile>),
+            Account(Option<AccountNumber>) = 0,
+            Profile(Option<Profile>) = 1,
             /// `next` is the `after` of the following page; `None` at the end.
             Profiles {
                 profiles: Vec<Profile>,
                 next: Option<AccountNumber>,
-            },
+            } = 2,
         }
     }
 
@@ -1342,8 +1348,10 @@ pub mod role {
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Op {
-            Guard(Guard),
+            Guard(Guard) = 0,
         }
     }
 
@@ -1529,26 +1537,32 @@ pub mod role {
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Op {
             Check {
                 program: ProgramId,
                 actor: Vec<Party>,
                 needs: Vec<Need>,
-            },
+            } = 0,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Query {
-            List { program: ProgramId, key: String },
-            Resource { program: ProgramId, key: String },
-            Writers { program: ProgramId, key: String },
+            List { program: ProgramId, key: String } = 0,
+            Resource { program: ProgramId, key: String } = 1,
+            Writers { program: ProgramId, key: String } = 2,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Reply {
-            List(Option<Ownership>),
-            Resource(Resource),
-            Writers(Writers),
+            List(Option<Ownership>) = 0,
+            Resource(Resource) = 1,
+            Writers(Writers) = 2,
         }
     }
 }
