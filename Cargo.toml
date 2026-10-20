@@ -70,6 +70,7 @@ async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tower-http = "0.6"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 rustix = { version = "1", features = ["process", "thread"] }
 arc-swap = "1"

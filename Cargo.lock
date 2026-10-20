@@ -3116,6 +3116,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tokio-util",
  "toml 0.8.23",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",

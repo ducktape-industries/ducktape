@@ -19,6 +19,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use node::{BLOCK_BYTES, Preconfirm, Taken};
 use statesync::Request as SyncRequest;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::changes::{self, Fanout, Published, Subscription};
 use crate::ctx::{Ctx, EgressSigner};
@@ -197,6 +198,14 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             timed::<E>,
         ))
         .with_state(daemon)
+        .layer(cors())
+}
+
+fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
 }
 
 async fn timed<E: Context>(

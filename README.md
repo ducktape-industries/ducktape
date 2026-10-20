@@ -512,6 +512,11 @@ need addresses.
   ngrok) or reverse proxy is reached at `wss://` the tunnel's name; it
   opens no port of its own.
 
+A browser page of any origin may call the `--http` surface: every `/v1`
+answer carries `Access-Control-Allow-Origin: *` and a preflight is answered,
+with no credentials. Reads are public, and a write is a signed frame that
+carries its own authority, so an origin proves nothing a node would check.
+
 Halo is the network members move blobs over. It runs QUIC on UDP, apart
 from the mesh. Every member registers a halo address, `host:port`, that the
 other members dial: a founder in the founding file or with `init --halo`, a
