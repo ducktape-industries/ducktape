@@ -2868,7 +2868,13 @@ class Service:
                 machine, looked = self.holder(asked, run, alive)
                 if first == "status" and len(called) == 2 and not settings:
                     return on_machine(machine, looked, started=False)
-            return on_machine(machine, self.on(asked, machine, [*settings, first, run, *called[2:]], alive), started=first == "requeue")
+            rest = []
+            for word in called[2:]:
+                on, colon, its = word.partition(":")
+                if colon and on != machine:
+                    raise Refused(400, f"build.sh {first} on pod {BUILDS} acts on one machine per call, and {word} names pod {on} while {named} names pod {machine}: call it once for each")
+                rest.append(its if colon else word)
+            return on_machine(machine, self.on(asked, machine, [*settings, first, run, *rest], alive), started=first == "requeue")
         verb = first if first == "apply" else (called[2] if len(called) > 2 else first)
         claimed = self.claim(asked, settings, words, alive)
         if claimed is not None:

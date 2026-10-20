@@ -3508,6 +3508,15 @@ class Builds(Streamed):
         self.built("wait", f"{WARM}:w1", request=42)
         self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "wait", "w1"])])
 
+    def test_each_run_a_call_names_on_its_machine_goes_without_the_machine(self):
+        self.kube.answer("exec", ran(b"stopped w1 (job j-1)\nstopped w2 (job j-1)\n"))
+        self.assertEqual(self.built("stop", f"{WARM}:w1", f"{WARM}:w2", "w3")[0], 200)
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "stop", "w1", "w2", "w3"])])
+
+    def test_runs_on_two_machines_in_one_call_are_refused(self):
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "stop", f"{WARM}:w1", "desktop:r1"]}, 400, ["one machine per call", "desktop:r1 names pod desktop", "call it once for each"])
+        self.assertEqual((self.warm_execs(), self.gate.words()), ([], []))
+
     def test_a_bare_run_id_is_read_on_the_desktop_that_holds_it(self):
         self.gate.answers["exec"] = ran(b"job j-1\nsh exit 0\n")
         status, answer = self.built("status", "r1")

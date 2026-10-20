@@ -311,7 +311,10 @@ one up for another network.
   and go to the first machine, the desktop then the warm pod, whose
   `build.sh status` of it starts with its `job` line (a bare `status` answers
   that read itself): 404 only when every machine answered `no run`, else
-  503 naming each machine that could not be asked or answered otherwise;
+  503 naming each machine that could not be asked or answered otherwise.
+  The runs after the first (`stop` and `wait` take several) go to the
+  first's machine, each without its `<machine>:` part, and one naming
+  another machine is refused with 400 (call once per machine);
   calls that act on one machine (`busy`, `bump`, `prune`, `jobs`,
   `heavy-runs`, `disk-targets`, `queue-out`, `queue-in`, `self-update`,
   `worktree`, `measure`) are refused with 400, since they name a machine. A run the
