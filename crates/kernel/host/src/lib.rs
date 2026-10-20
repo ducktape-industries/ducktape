@@ -838,9 +838,7 @@ where
             executing: executed.duration_since(started).unwrap_or_default(),
             committing: committed.duration_since(executed).unwrap_or_default(),
         };
-        let applied = applied?;
-        self.unlink(&applied.writes, block.time).await?;
-        Ok(applied)
+        applied
     }
 }
 
@@ -1948,29 +1946,6 @@ where
             writes,
             root: self.root()?,
         })
-    }
-
-    async fn unlink(&self, writes: &Writes, time: u64) -> Result<()> {
-        let Some(roster) = writes.programs.get(BLOBS) else {
-            return Ok(());
-        };
-        let dropped = roster
-            .iter()
-            .filter(|(_, slot)| slot.is_none())
-            .map(|(key, _)| abi::decode::<BlobId>(key).map_err(corrupt))
-            .collect::<Result<Vec<_>>>()?;
-        if dropped.is_empty() {
-            return Ok(());
-        }
-        let running: BTreeSet<BlobId> = self.programs()?.into_values().collect();
-        for id in dropped {
-            let still_read = running.contains(&id) || self.readable(&id, time).await?;
-            if still_read {
-                continue;
-            }
-            self.blobs.remove(&id)?;
-        }
-        Ok(())
     }
 
     fn forget(&self, height: u64, overlay: &mut Overlay) -> Result<()> {

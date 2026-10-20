@@ -1,8 +1,6 @@
-use std::collections::BTreeMap;
+use abi::BlobId;
 
-use abi::{BlobId, ProgramId, Retention};
-
-use crate::{Result, Submission, corrupt};
+use crate::Submission;
 
 pub const BLOBS: &str = "$blobs";
 pub const PROGRAMS: &str = "$programs";
@@ -37,52 +35,4 @@ pub fn epoch(number: u64) -> Vec<u8> {
 
 pub fn epoch_validators(number: u64) -> Vec<u8> {
     format!("validators/{number}").into_bytes()
-}
-
-pub enum Released {
-    Kept,
-    Held(Vec<u8>),
-    Dropped,
-}
-
-fn holders(value: &[u8]) -> Result<Option<BTreeMap<ProgramId, Retention>>> {
-    let unknown = value.is_empty();
-    if unknown {
-        return Ok(None);
-    }
-    abi::decode(value).map(Some).map_err(corrupt)
-}
-
-pub fn put_by(row: Option<&[u8]>, program: &str) -> Result<Option<Vec<u8>>> {
-    let Some(value) = row else {
-        let held = BTreeMap::from([(program.to_owned(), Retention::Referenced)]);
-        return Ok(Some(abi::encode(&held)));
-    };
-    let Some(mut held) = holders(value)? else {
-        return Ok(None);
-    };
-    let holds_already = held.contains_key(program);
-    if holds_already {
-        return Ok(None);
-    }
-    held.insert(program.to_owned(), Retention::Referenced);
-    Ok(Some(abi::encode(&held)))
-}
-
-pub fn released_by(row: Option<&[u8]>, program: &str) -> Result<Released> {
-    let Some(value) = row else {
-        return Ok(Released::Kept);
-    };
-    let Some(mut held) = holders(value)? else {
-        return Ok(Released::Kept);
-    };
-    let removed = held.remove(program).is_some();
-    if !removed {
-        return Ok(Released::Kept);
-    }
-    let none_left = held.is_empty();
-    if none_left {
-        return Ok(Released::Dropped);
-    }
-    Ok(Released::Held(abi::encode(&held)))
 }

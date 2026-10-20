@@ -87,14 +87,6 @@ impl Blobs {
         Ok(())
     }
 
-    pub fn remove(&self, id: &BlobId) -> Result<()> {
-        match fs::remove_file(self.path(id)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     pub fn promote(&self, stage: Stage) -> Result<()> {
         for (id, framed) in stage.framed {
             self.write(&id, &framed)?;
@@ -403,19 +395,6 @@ mod tests {
         assert_eq!(blobs.framed_once(&BlobId::Sha1([0; 20])).unwrap(), None);
         assert_eq!(blobs.get(&BlobId::Sha1([0; 20])).unwrap(), None);
         assert_eq!(blobs.stat(&BlobId::Sha1([0; 20])).unwrap(), None);
-    }
-
-    #[test]
-    fn a_removed_blob_is_gone_and_removing_it_again_is_no_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let blobs = Blobs::open(dir.path()).unwrap();
-        let mut stage = Stage::default();
-        let id = stage.put(HashKind::Sha256, "part", b"gone").unwrap();
-        blobs.promote(stage).unwrap();
-        assert!(blobs.has(&id));
-        blobs.remove(&id).unwrap();
-        assert!(!blobs.has(&id));
-        blobs.remove(&id).unwrap();
     }
 
     #[test]

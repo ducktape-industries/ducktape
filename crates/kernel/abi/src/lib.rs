@@ -387,11 +387,6 @@ pub enum CryptoReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum Retention {
-    Referenced,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum HostOp {
     Get(Vec<u8>),
     Set {
@@ -444,7 +439,6 @@ pub enum HostOp {
         value: Vec<u8>,
         kind: String,
     },
-    BlobRelease(BlobId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
