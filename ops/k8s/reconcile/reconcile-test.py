@@ -339,6 +339,51 @@ class Mode(unittest.TestCase):
             self.assertIn("would apply egress (3 served: 1 added", cli.posts[0])
             self.assertIsNone(reconcile.state["proving"])
 
+    def test_a_switch_to_act_applies_the_main_report_mode_only_reported_once(self):
+        node, cli, forge, kube, reconcile, temp = world(mode="report")
+        with temp:
+            reconcile.tick()
+            forge.merge("7" * 40, {PATH: WITH_MAC})
+            reconcile.tick()
+            self.assertEqual(node.sets, [])
+            acting = rc.Reconcile("act", "fabrics-1", KEY, "infra", cli, forge, rc.Store(reconcile.store.path), kube, PROBER)
+            acting.tick()
+            acting.tick()
+            self.assertEqual(node.sets, [WITH_MAC])
+            self.assertIn("egress applied (3 served: 1 added", cli.posts[1])
+            again = rc.Reconcile("act", "fabrics-1", KEY, "infra", cli, forge, rc.Store(reconcile.store.path), kube, PROBER)
+            again.tick()
+            self.assertEqual(node.sets, [WITH_MAC])
+            self.assertEqual(len(cli.posts), 2)
+
+    def test_a_switch_to_act_rolls_the_image_report_mode_only_reported(self):
+        node, cli, forge, kube, reconcile, temp = world(pods_text=pods_toml(POD_A), mode="report")
+        with temp:
+            reconcile.tick()
+            forge.merge("e" * 40, {PATH: LIVE, PODS: pods_toml(POD_B)})
+            reconcile.tick()
+            self.assertEqual(kube.patches, [])
+            acting = rc.Reconcile("act", "fabrics-1", KEY, "infra", cli, forge, rc.Store(reconcile.store.path), kube, PROBER)
+            acting.tick()
+            self.assertEqual(kube.patches, [POD_B])
+
+    def test_a_main_reported_in_this_mode_is_not_followed_again_at_a_restart(self):
+        node, cli, forge, kube, reconcile, temp = world(mode="report")
+        with temp:
+            forge.merge("7" * 40, {PATH: WITH_MAC})
+            reconcile.tick()
+            sent = []
+            real = node.egress_set
+
+            def watched(text, dry):
+                sent.append(dry)
+                return real(text, dry)
+
+            cli.egress_set = watched
+            again = rc.Reconcile("report", "fabrics-1", KEY, "infra", cli, forge, rc.Store(reconcile.store.path), kube, PROBER)
+            again.tick()
+            self.assertEqual(sent, [])
+
     def test_an_unknown_mode_is_refused_at_start(self):
         with self.assertRaises(ValueError):
             rc.Reconcile("acts", "fabrics-1", KEY, "infra", None, None, None, None, PROBER)

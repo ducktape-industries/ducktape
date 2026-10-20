@@ -474,6 +474,10 @@ class Reconcile:
         self.kube = kube
         self.prober = prober
         self.state = store.load()
+        if self.state.get("mode") != mode:
+            self.state["seen_tip"] = None
+            self.state["pods"]["seen_tip"] = None
+            self.state["mode"] = mode
         self.unread = 0
 
     def report(self, key, lines, mention=None):

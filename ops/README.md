@@ -657,7 +657,9 @@ one up for another network.
   egress program's row for the node lists what the file serves. It never
   sends a refused file again; a new `main` is a new try. With
   `RECONCILE_MODE=report` it does all of this except the set that is not
-  dry: it posts what it would apply and leaves the node as it is. Its state
+  dry: it posts what it would apply and leaves the node as it is. A start
+  in another mode than its state was saved in follows `main` again, so a
+  switch to `act` applies the `main` that report mode only reported. Its state
   is the claim `state`, saved before it posts; each post is read back by
   its id before it is sent. A post that cannot be posted logs
   `report_unposted`, and a tick that cannot read forge, the node or
@@ -698,6 +700,7 @@ one up for another network.
   `pods` (get, watch and patch deployment `pods`; list pods), the
   claim, a policy closing every inbound port, and Deployment `reconcile`. Its account must be on `infra`'s write
   list to post statuses. `k8s/reconcile/reconcile-test.py` covers it.
+  Switch the mode by running `deploy` again with the other `RECONCILE_MODE`.
   Stop it with `kubectl -n reconcile scale deployment/reconcile
   --replicas=0`.
 
