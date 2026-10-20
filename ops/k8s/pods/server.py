@@ -2056,9 +2056,15 @@ class Service:
         if first in MACHINE_WIDE:
             raise Refused(400, f"build.sh {first} acts on one machine, so name it (pod {DESKTOP}, or the warm pod) rather than pod {BUILDS}")
         if first in ADDRESSED:
-            machine, _, run = (called[1] if len(called) > 1 else "").partition(":")
+            named = called[1] if len(called) > 1 else ""
+            if not named:
+                raise Refused(400, f"build.sh {first} on pod {BUILDS} names its run, as <machine>:<run> or the bare run id")
+            machine, _, run = named.partition(":")
             if not run:
-                raise Refused(400, f"build.sh {first} on pod {BUILDS} names its run as <machine>:<run>, the way pod {BUILDS} answered it")
+                run = named
+                machine, looked = self.holder(asked, run, alive)
+                if first == "status" and len(called) == 2 and not settings:
+                    return on_machine(machine, looked, started=False)
             return on_machine(machine, self.on(asked, machine, [*settings, first, run, *called[2:]], alive), started=first == "requeue")
         verb = first if first == "apply" else (called[2] if len(called) > 2 else first)
         machine = self.pick()
@@ -2077,6 +2083,30 @@ class Service:
             machine = self.warm()
             ran = self.on(asked, machine, words, alive)
         return on_machine(machine, ran)
+
+    def holder(self, asked, run, alive):
+        unasked, lacking = [], []
+        for machine in (DESKTOP, None):
+            where = f"pod {machine}" if machine else "the warm pod"
+            try:
+                if machine is None and not self.warm_pod:
+                    raise Refused(503, "this service names no warm pod (PODS_WARM_POD)")
+                machine = machine or self.warm()
+                where = f"pod {machine}"
+                ran = self.on(asked, machine, ["status", run], alive)
+            except Refused as refused:
+                unasked.append(f"{where} could not be asked: {refused.sentence}")
+                continue
+            if ran.out.startswith(b"job "):
+                return machine, ran
+            if ran.code == 2 and f"no run {run} in pod" in ran.err:
+                lacking.append(f"{where} has no run {run}")
+            else:
+                unasked.append(f"{where} answered build.sh status {run} with exit {ran.code} and no job line: {ran.err}")
+        said = "; ".join(unasked + lacking)
+        if unasked:
+            raise Refused(503, f"run {run} was not found, and not every machine of pod {BUILDS} could be asked ({said}): ask again, or name it as <machine>:<run>")
+        raise Refused(404, f"no machine of pod {BUILDS} holds run {run}: {said}")
 
     def status(self, name):
         if name == BUILDS:

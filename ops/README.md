@@ -156,7 +156,12 @@ one up for another network.
   (duckpond: `/shared/tools/warm-pod`). Its exec takes build.sh's words as
   `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
   stderr starts `builds: on <machine>`. `status`, `log`, `stop`, `wait` and
-  `requeue` name their run as `<machine>:<run>` and go to that machine;
+  `requeue` name their run as `<machine>:<run>` and go to that machine, or
+  by its bare id (as build.sh's `read it with:` line and NOTIFY name it),
+  and go to the first machine, the desktop then the warm pod, whose
+  `build.sh status` of it starts with its `job` line (a bare `status` answers
+  that read itself): 404 only when every machine answered `no run`, else
+  503 naming each machine that could not be asked or answered otherwise;
   calls that act on one machine (`busy`, `bump`, `prune`, `jobs`,
   `heavy-runs`, `disk-targets`, `queue-out`, `queue-in`, `self-update`,
   `worktree`, `measure`) are refused with 400, since they name a machine. A run the

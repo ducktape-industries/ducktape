@@ -2634,8 +2634,57 @@ class Builds(Streamed):
         self.built("wait", f"{WARM}:w1", request=42)
         self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "wait", "w1"])])
 
+    def test_a_bare_run_id_is_read_on_the_desktop_that_holds_it(self):
+        self.gate.answers["exec"] = ran(b"job j-1\nsh exit 0\n")
+        status, answer = self.built("status", "r1")
+        self.assertEqual((status, answer["stdout"]), (200, "job j-1\nsh exit 0\n"))
+        self.assertTrue(answer["stderr"].startswith("builds: on desktop"))
+        self.assertEqual(self.gate.words(), [["exec", "status", "r1"]])
+        self.assertEqual(self.warm_execs(), [])
+
+    def test_a_bare_run_id_the_desktop_lacks_is_read_on_the_warm_pod(self):
+        self.gate.answers["exec"] = ran(code=2, err="build.sh: no run w1 in pod orthorymain (a run of an earlier warm pod is gone with it)")
+        self.kube.answer("exec", ran(b"job j-1\nGATES ok\n"))
+        status, answer = self.built("wait", "w1")
+        self.assertEqual((status, answer["stdout"]), (200, "job j-1\nGATES ok\n"))
+        self.assertTrue(answer["stderr"].startswith(f"builds: on {WARM}"))
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "status", "w1"]), (WARM, None, ["sh", BUILD, "wait", "w1"])])
+
+    def test_a_bare_run_id_no_machine_holds_is_refused_naming_both(self):
+        self.gate.answers["exec"] = ran(code=2, err="build.sh: no run r0 in pod orthorymain (a run of an earlier warm pod is gone with it)")
+        self.kube.answer("exec", ran(code=2, err=f"build.sh: no run r0 in pod {WARM} (a run of an earlier warm pod is gone with it)"))
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "stop", "r0"]}, 404, ["no machine of pod builds holds run r0", "pod desktop has no run r0", f"pod {WARM} has no run r0"])
+
+    def test_a_bare_run_id_skips_a_desktop_that_does_not_answer(self):
+        self.gate.down = {"lan", "tail", "wifi"}
+        self.kube.answer("exec", ran(b"job j-1\nGATES ok\n"))
+        self.assertTrue(self.built("log", "w1")[1]["stderr"].startswith(f"builds: on {WARM}"))
+
+    def test_a_bare_run_id_is_never_called_gone_while_a_machine_could_not_be_asked(self):
+        self.gate.down = {"lan", "tail", "wifi"}
+        self.kube.answer("exec", ran(code=2, err=f"build.sh: no run r1 in pod {WARM} (a run of an earlier warm pod is gone with it)"))
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "stop", "r1"]}, 503, ["not every machine of pod builds could be asked", "pod desktop could not be asked", f"pod {WARM} has no run r1", "<machine>:<run>"])
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "status", "r1"])])
+
+    def test_a_bare_run_id_holds_only_where_status_prints_its_job_line(self):
+        for request, answer in enumerate((ran(code=125, err="Error: no container with name or ID \"build-runner\" found"), ran(code=64, err="gate: refused")), start=80):
+            self.kube.calls.clear()
+            self.gate.calls.clear()
+            self.gate.answers["exec"] = answer
+            self.kube.answer("exec", ran(b"job j-1\nstopped r1 (job j-1)\n"))
+            status, said = self.built("stop", "r1", request=request)
+            self.assertEqual(status, 200, said)
+            self.assertTrue(said["stderr"].startswith(f"builds: on {WARM}"))
+            self.assertEqual(self.gate.words(), [["exec", "status", "r1"]])
+            self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "status", "r1"]), (WARM, None, ["sh", BUILD, "stop", "r1"])])
+
+    def test_a_bare_run_id_with_no_warm_pod_named_says_so(self):
+        self.service.warm_pod = None
+        self.gate.answers["exec"] = ran(code=2, err="build.sh: no run r1 in pod orthorymain (a run of an earlier warm pod is gone with it)")
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "status", "r1"]}, 503, ["the warm pod could not be asked: this service names no warm pod (PODS_WARM_POD)", "pod desktop has no run r1"])
+
     def test_a_run_named_without_its_machine_or_a_machine_wide_call_is_refused(self):
-        refusals = ((["sh", BUILD, "status", "r1"], "<machine>:<run>"), (["sh", BUILD, "busy"], "acts on one machine"), (["sh", BUILD, "disk-targets", "programs"], "acts on one machine"), (["make"], "pod builds runs build.sh alone"))
+        refusals = ((["sh", BUILD, "status"], "names its run"), (["sh", BUILD, "busy"], "acts on one machine"), (["sh", BUILD, "disk-targets", "programs"], "acts on one machine"), (["make"], "pod builds runs build.sh alone"))
         for request, (command, words) in enumerate(refusals, start=50):
             status, answer = self.call("POST", "/v1/pods/builds/exec", {"command": command}, headers=asked(request))
             self.assertEqual(status, 400, answer)
