@@ -40,6 +40,14 @@ another machine, reached by ssh.
      entry is a change to forge repo `infra`'s `egress/fabrics-1.toml`, which reconcile
      applies once it merges (`../../README.md`, section "duckpond's desired
      infrastructure"); nobody edits the node's file by hand.
+- **The API server's OpenAPI.** Before it passes a body on (a manifest, a pod's resources, a
+  `/v1/k8s/` write, patch or subresource), it reads `/openapi/v3` (granted to every account by
+  the default `system:discovery` role) to find each field typed as a Quantity in the kind
+  Kubernetes will decode the body as (the last top-level key that case-folds to `kind`, and
+  for a merge patch the kind of the object it makes; a strategic or apply patch is its
+  endpoint's kind), and sends
+  Kubernetes its own reading of each in Kubernetes' canonical form, so Kubernetes never parses an
+  agent's text. Each group-version's schema is kept by the hash the index names.
 - **Its node's status.** It reads the network's block time from `NODE_URL`'s `/v1/status` as
   it starts, and every retry pause starts there; it stops, saying why, when that node
   doesn't answer.

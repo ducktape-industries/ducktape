@@ -172,6 +172,25 @@ UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
 UNPLACED = "does not have a host assigned"
 REQUEST_NUMBER = re.compile(r"[0-9]+")
 KUBERNETES_QUANTITY = re.compile(r"([+-]?)([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE]([+-]?[0-9]+)|(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E))?")
+QUANTITY_SCHEMA = "io.k8s.apimachinery.pkg.api.resource.Quantity"
+PATCH_SCHEMA = "io.k8s.apimachinery.pkg.apis.meta.v1.Patch"
+SCHEMA_REF = "#/components/schemas/"
+OPENAPI = "/openapi/v3"
+WRITES = ("POST", "PUT", "PATCH")
+JSON_PATCH = "application/json-patch+json"
+MERGE_PATCH = "application/merge-patch+json"
+STRATEGIC_PATCH = "application/strategic-merge-patch+json"
+APPLY_PATCH = "application/apply-patch+yaml"
+JSON_BODIES = ("application/json", MERGE_PATCH, STRATEGIC_PATCH, JSON_PATCH, APPLY_PATCH)
+PATCHED_VALUES = ("add", "replace")
+COPIED_VALUES = ("copy", "move")
+DIRECTIVE = "$"
+GO_SPACE = "\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+TYPE_FIELDS = {"apiversion": "apiVersion", "kind": "kind"}
+BINARY_SI = ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei")
+DECIMAL_SI = {-9: "n", -6: "u", -3: "m", 0: "", 3: "k", 6: "M", 9: "G", 12: "T", 15: "P", 18: "E"}
+INTEGER = re.compile(r"-?[0-9]+")
+U64_DIGITS = len(str(2**64 - 1))
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
 HAVING = """having() {
@@ -265,6 +284,36 @@ class Answered:
 @dataclass
 class Stream:
     events: object
+
+
+@dataclass(frozen=True)
+class Numeral:
+    text: str
+
+
+class Pairs(dict):
+    def __init__(self, pairs):
+        super().__init__(pairs)
+        self.typing = [(key, value) for key, value in pairs if key.casefold() in TYPE_FIELDS]
+
+
+def kept(body):
+    try:
+        return json.loads(body or b"{}", parse_int=Numeral, parse_float=Numeral, parse_constant=Numeral, object_pairs_hook=Pairs)
+    except ValueError as error:
+        raise Refused(400, f"the body is not JSON: {error}") from error
+
+
+def written(value):
+    match value:
+        case Numeral(text=text):
+            return text
+        case dict():
+            return "{" + ",".join(f"{json.dumps(key)}:{written(item)}" for key, item in value.items()) + "}"
+        case list():
+            return "[" + ",".join(written(item) for item in value) + "]"
+        case _:
+            return json.dumps(value)
 
 
 def run(argv, stdin=None, env=None):
@@ -667,10 +716,10 @@ class Kube:
     def apply(self, objects, dry):
         listed = {"apiVersion": "v1", "kind": "List", "items": objects}
         tried = ["--dry-run=server"] if dry else []
-        return self.call("apply", *tried, "--filename", "-", "--output", "json", stdin=json.dumps(listed).encode())
+        return self.call("apply", *tried, "--filename", "-", "--output", "json", stdin=written(listed).encode())
 
     def trial(self, pod):
-        return self.call("create", "--dry-run=server", "--filename", "-", "--output", "name", stdin=json.dumps(pod).encode())
+        return self.call("create", "--dry-run=server", "--filename", "-", "--output", "name", stdin=written(pod).encode())
 
     def objects(self, kind, name):
         return self.call("get", kind, *([name] if name else []), "--output", "json")
@@ -1109,7 +1158,7 @@ def input_of(given, index):
 
 
 def scratch_size(text, what):
-    found = KUBERNETES_QUANTITY.fullmatch(text.strip())
+    found = KUBERNETES_QUANTITY.fullmatch(text.strip(GO_SPACE))
     if found is None:
         raise Refused(400, f"{what} {text!r} is not a Kubernetes quantity such as 48Gi")
     exponent = found.group(3)
@@ -1175,7 +1224,8 @@ class Fetching:
 
 def resources_of(given):
     checked(given, RESOURCES, "resources")
-    return {group: dict(checked(given[group], AMOUNTS, f"resources' {group}")) for group in RESOURCES if group in given}
+    amounts = {group: checked(given[group], AMOUNTS, f"resources' {group}") for group in RESOURCES if group in given}
+    return {group: {name: canonical_quantity(amount, f"resources' {group} {name}") for name, amount in held.items()} for group, held in amounts.items()}
 
 
 def claimed(name, labels):
@@ -1199,7 +1249,7 @@ def input_mount(index, given):
 def input_volume(index, given, labels):
     if SCRATCH in given:
         scratch = given[SCRATCH]
-        sized = {"sizeLimit": scratch["size"]} if "size" in scratch else {}
+        sized = {"sizeLimit": str(math.ceil(quantity(scratch["size"])))} if "size" in scratch else {}
         return {"name": f"in-{index}", "emptyDir": {"medium": scratch["medium"], **sized}}
     return claimed(f"in-{index}", labels)
 
@@ -1323,7 +1373,7 @@ def confine_pod(spec, where):
 
 
 def confine_manifest(manifest, what, cluster_kinds, namespace, labels):
-    if not isinstance(manifest, dict) or not manifest.get("kind") or not manifest.get("apiVersion"):
+    if not isinstance(manifest, dict) or not all(isinstance(manifest.get(field), str) and manifest[field] for field in ("apiVersion", "kind")):
         raise Refused(400, f"{what} is a Kubernetes object with an apiVersion and a kind")
     kind = manifest["kind"]
     meta = manifest.setdefault("metadata", {})
@@ -1691,19 +1741,20 @@ def parsed_exponent(text):
     return value if -INT64 <= value < INT64 else None
 
 
-def quantity(text):
-    found = KUBERNETES_QUANTITY.fullmatch(str(text).strip())
+def reading(text):
+    found = KUBERNETES_QUANTITY.fullmatch(text.strip(GO_SPACE))
     if found is None:
-        raise Refused(502, f"{text} is not a Kubernetes quantity")
+        return None
     sign, digits, exponent, suffix = found.groups()
     power = parsed_exponent(exponent or "0")
     if power is None:
-        raise Refused(502, f"{text} is not a Kubernetes quantity: its exponent is past int64")
+        return None
     power = (power + INT32) % (2 * INT32) - INT32
     amount = Decimal(f"{digits}e{power}")
     scale = SCALE[suffix or ""]
+    form = "exponent" if exponent is not None else "binary" if (suffix or "").endswith("i") else "decimal"
     if amount.is_zero():
-        return Fraction(0)
+        return Fraction(0), form
     if amount.adjusted() + min(SCALE.values()).adjusted() > MOST.adjusted():
         value = MOST
     elif amount.adjusted() + max(SCALE.values()).adjusted() + 2 <= NANO.adjusted():
@@ -1711,7 +1762,376 @@ def quantity(text):
     else:
         exact = decimal.Context(prec=decimal.MAX_PREC, Emax=decimal.MAX_EMAX, Emin=decimal.MIN_EMIN, rounding=decimal.ROUND_UP)
         value = min(exact.multiply(amount, scale).quantize(NANO, context=exact), MOST)
-    return Fraction(-value if sign == "-" else value)
+    return Fraction(-value if sign == "-" else value), form
+
+
+def quantity(text):
+    read = reading(str(text))
+    if read is None:
+        raise Refused(502, f"{text} is not a Kubernetes quantity")
+    return read[0]
+
+
+def canonical(value, form):
+    if value == 0:
+        return "0"
+    sign, size = "-" if value < 0 else "", abs(value)
+    if form == "binary" and size >= 1024 and size.denominator == 1:
+        amount, power = size.numerator, 0
+        while amount % 1024 == 0:
+            amount, power = amount // 1024, power + 1
+        return f"{sign}{amount}{BINARY_SI[power]}"
+    amount, power = int(size / Fraction(NANO)), -9
+    while amount % 10 == 0:
+        amount, power = amount // 10, power + 1
+    while power % 3:
+        amount, power = amount * 10, power - 1
+    suffix = DECIMAL_SI[power] if form != "exponent" else f"e{power}" if power else ""
+    return f"{sign}{amount}{suffix}"
+
+
+def canonical_quantity(text, what):
+    read = reading(text)
+    if read is None:
+        raise Refused(400, f"{what} is not a Kubernetes quantity such as 48Gi")
+    return canonical(*read)
+
+
+def field_of(where):
+    what, *steps = where
+    path = "".join(f"[{step}]" if isinstance(step, int) else f".{step}" for step in steps).lstrip(".")
+    return f"{what}'s {path}" if path else what
+
+
+def canonical_at(value, where):
+    match value:
+        case Numeral(text=text) | str(text):
+            return canonical_quantity(text, field_of(where))
+        case _:
+            return value
+
+
+def referred(node):
+    refs = [node["$ref"]] if "$ref" in node else [part["$ref"] for part in node.get("allOf") or [] if isinstance(part, dict) and "$ref" in part]
+    return refs[0].removeprefix(SCHEMA_REF) if len(refs) == 1 else None
+
+
+def pruned(node, reaching):
+    if not isinstance(node, dict):
+        return None
+    name = referred(node)
+    if name is not None:
+        return name if name in reaching else None
+    declared = node.get("properties") or {}
+    properties = {key: shape for key, child in declared.items() if (shape := pruned(child, reaching)) is not None}
+    items, values = pruned(node.get("items"), reaching), pruned(node.get("additionalProperties"), reaching)
+    shape = {"properties": properties} if properties else {}
+    if items is not None:
+        shape["items"] = items
+    if values is not None:
+        shape |= {"values": values, "declared": frozenset(declared)}
+    return shape or None
+
+
+def step(shape, key):
+    properties = shape.get("properties") or {}
+    if key in properties:
+        return properties[key]
+    if key in shape.get("declared", ()):
+        return None
+    return shape.get("values")
+
+
+def content_schema(content):
+    names = {referred(media.get("schema") or {}) for media in (content or {}).values() if isinstance(media, dict)} - {None}
+    return names.pop() if len(names) == 1 else None
+
+
+@dataclass(frozen=True)
+class Operation:
+    body: bool
+    kind: tuple | None
+
+
+def gvk_of(held):
+    return (held.get("group", ""), held.get("version"), held.get("kind"))
+
+
+def operations_of(item, schema_kinds):
+    found = {}
+    for method in WRITES:
+        operation = item.get(method.lower()) if isinstance(item, dict) else None
+        if not isinstance(operation, dict):
+            continue
+        content = (operation.get("requestBody") or {}).get("content")
+        name = content_schema(content)
+        if name == PATCH_SCHEMA:
+            name = content_schema(((operation.get("responses") or {}).get("200") or {}).get("content"))
+        stated = operation.get("x-kubernetes-group-version-kind")
+        found[method] = Operation(bool(content), gvk_of(stated) if isinstance(stated, dict) else schema_kinds.get(name))
+    return found
+
+
+def fitted(template, segments):
+    if template and template[-1] == "{path}" and len(segments) > len(template):
+        segments = [*segments[: len(template) - 1], "/".join(segments[len(template) - 1 :])]
+    if len(template) != len(segments) or not all(part == segment or part.startswith("{") for part, segment in zip(template, segments)):
+        return None
+    return sum(part == segment for part, segment in zip(template, segments))
+
+
+def pointer(path):
+    if not isinstance(path, str) or (path and not path.startswith("/")):
+        return None
+    return [token.replace("~1", "/").replace("~0", "~") for token in path.split("/")[1:]]
+
+
+class Published:
+    def __init__(self, document):
+        schemas = {name: schema for name, schema in ((document.get("components") or {}).get("schemas") or {}).items() if isinstance(schema, dict)}
+        reaching = {QUANTITY_SCHEMA}
+        while more := {name for name, schema in schemas.items() if name not in reaching and pruned(schema, reaching) is not None}:
+            reaching |= more
+        self.shapes = {name: pruned(schemas[name], reaching) for name in reaching if name in schemas and name != QUANTITY_SCHEMA}
+        named = [
+            (gvk_of(held), name)
+            for name, schema in schemas.items()
+            for held in schema.get("x-kubernetes-group-version-kind") or []
+            if isinstance(held, dict)
+        ]
+        self.kinds = dict(named)
+        schema_kinds = {name: kind for kind, name in named}
+        self.operations = [(path.strip("/").split("/"), found) for path, item in (document.get("paths") or {}).items() if (found := operations_of(item, schema_kinds))]
+
+    def operation(self, segments, method):
+        fitting = [(literal, found[method]) for template, found in self.operations if method in found and (literal := fitted(template, segments)) is not None]
+        return max(fitting, key=lambda fit: fit[0])[1] if fitting else None
+
+    def canonicalised(self, value, shape, where, directives=False):
+        if isinstance(shape, str):
+            if shape == QUANTITY_SCHEMA:
+                return canonical_at(value, where)
+            shape = self.shapes.get(shape)
+        if shape is None:
+            return value
+        if isinstance(value, dict):
+            return {key: item if directives and key.startswith(DIRECTIVE) else self.canonicalised(item, step(shape, key), (*where, key), directives) for key, item in value.items()}
+        if isinstance(value, list) and "items" in shape:
+            return [self.canonicalised(item, shape["items"], (*where, index), directives) for index, item in enumerate(value)]
+        return value
+
+    def resolved(self, shape):
+        return self.shapes.get(shape, shape) if isinstance(shape, str) else shape
+
+    def at(self, shape, tokens):
+        for token in tokens:
+            if isinstance(shape, str):
+                shape = None if shape == QUANTITY_SCHEMA else self.shapes.get(shape)
+            if shape is None:
+                return None
+            shape = shape["items"] if "items" in shape and (token == "-" or token.isdigit()) else step(shape, token)
+        return shape if not isinstance(shape, str) or shape == QUANTITY_SCHEMA or shape in self.shapes else None
+
+    def patched(self, operation, name, index):
+        if not isinstance(operation, dict) or operation.get("op") not in (*PATCHED_VALUES, *COPIED_VALUES):
+            return operation
+        tokens = pointer(operation.get("path"))
+        shape = None if tokens is None else self.at(name, tokens)
+        if shape is None:
+            return operation
+        if operation["op"] in COPIED_VALUES:
+            source = pointer(operation.get("from"))
+            if self.resolved(None if source is None else self.at(name, source)) != self.resolved(shape):
+                raise Refused(
+                    400,
+                    f"the patch's operation {index} {operation['op']}s {operation.get('from')!r} to {operation['path']!r}, where Kubernetes reads quantities it doesn't read at {operation.get('from')!r}: write the quantity as a value (add or replace)",
+                )
+            return operation
+        if "value" not in operation:
+            return operation
+        return {**operation, "value": self.canonicalised(operation["value"], shape, (f"the patch's operation {index}", *tokens))}
+
+
+class Schemas:
+    def __init__(self, api):
+        self.api = api
+        self.held = {}
+
+    def reading(self):
+        return Reading(self)
+
+    def read(self, path, query, what):
+        answered = self.api.call("GET", path, query, b"", None)
+        if answered.status != 200:
+            raise Refused(502, f"the API server's {what} was not read: it answered {answered.status}")
+        return json.loads(answered.body)
+
+    def index(self):
+        listed = self.read(OPENAPI, "", "OpenAPI index").get("paths") or {}
+        index = {group_version: entry.get("serverRelativeURL") for group_version, entry in listed.items()}
+        live = set(index.values())
+        self.held = {url: published for url, published in self.held.items() if url in live}
+        return index
+
+    def document(self, index, group_version):
+        url = index.get(group_version)
+        if url is None:
+            raise Refused(400, f"the API server publishes no schema for {group_version}")
+        if url not in self.held:
+            path, _, query = url.partition("?")
+            self.held[url] = Published(self.read(path, query, f"OpenAPI schema of {group_version}"))
+        return self.held[url]
+
+
+class Reading:
+    def __init__(self, schemas):
+        self.schemas = schemas
+        self.index = None
+
+    def published(self, group_version):
+        if self.index is None:
+            self.index = self.schemas.index()
+        return self.schemas.document(self.index, group_version)
+
+    def schema(self, kind, home, what):
+        name = None if home is None else home.kinds.get(kind)
+        if name is not None:
+            return home, name
+        group, version, named = kind
+        published = self.published(f"apis/{group}/{version}" if group else f"api/{version}")
+        name = published.kinds.get(kind)
+        if name is None:
+            raise Refused(400, f"{what} is a {api_version(kind)} {named}, which the API server publishes no schema for")
+        return published, name
+
+    def object(self, manifest, what):
+        group, _, version = manifest["apiVersion"].rpartition("/")
+        published, name = self.schema((group, version, manifest["kind"]), None, what)
+        return published.canonicalised(manifest, name, (what,))
+
+    def operation(self, segments, method):
+        home = self.published("/".join(segments[: 2 if segments[0] == "api" else 3]))
+        operation = home.operation(segments, method)
+        if operation is None:
+            raise Refused(400, f"the API server publishes no {method} of /{'/'.join(segments)}, so the body's quantities could not be read")
+        if operation.body and operation.kind is None:
+            raise Refused(400, f"the API server publishes no kind for {method} /{'/'.join(segments)}, so the body's quantities could not be read")
+        return home, operation
+
+    def body(self, home, operation, media, given):
+        endpoint = operation.kind
+        if media == JSON_PATCH:
+            if not isinstance(given, list):
+                raise Refused(400, "a JSON patch is a list of operations")
+            kept_kind(given, endpoint)
+            published, name = self.schema(endpoint, home, "the patched object")
+            return [published.patched(change, name, index) for index, change in enumerate(given)]
+        if media in (STRATEGIC_PATCH, APPLY_PATCH):
+            kind = endpoint
+        elif media == MERGE_PATCH:
+            given, kind = merged(given, endpoint)
+        else:
+            given, found = as_decoded(given, "the body")
+            kind = decoded_kind(found, endpoint, "the body")
+        published, name = self.schema(kind, home, "the body")
+        return published.canonicalised(given, name, ("the body",), media == STRATEGIC_PATCH)
+
+
+def api_version(kind):
+    group, version, _ = kind
+    return f"{group}/{version}" if group else version
+
+
+def stated_types(pairs, what):
+    found = {}
+    for key, value in pairs:
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise Refused(400, f"{what}'s {key!r} is not a string, and Kubernetes reads it as the object's {TYPE_FIELDS[key.casefold()]}")
+        found[TYPE_FIELDS[key.casefold()]] = value
+    return found
+
+
+def decoded_kind(found, default, what):
+    stated = found.get("apiVersion", "")
+    if stated.count("/") > 1:
+        raise Refused(400, f"{what}'s apiVersion {stated!r} is not GROUP/VERSION")
+    group, _, version = stated.rpartition("/")
+    if not version and (not group or group == default[0]):
+        group, version = default[0], default[1]
+    return group, version, found.get("kind") or default[2]
+
+
+def untyped(body):
+    return {key: value for key, value in body.items() if key.casefold() not in TYPE_FIELDS}
+
+
+def as_decoded(body, what):
+    if not isinstance(body, Pairs):
+        return body, {}
+    found = stated_types(body.typing, what)
+    return {**found, **untyped(body)}, found
+
+
+def merged(patch, endpoint):
+    if not isinstance(patch, Pairs):
+        return patch, endpoint
+    live = {"apiVersion": api_version(endpoint), "kind": endpoint[2]}
+    held = dict(live)
+    for key, value in patch.typing:
+        if value is None:
+            held.pop(key, None)
+        else:
+            held[key] = value
+    kind = decoded_kind(stated_types(sorted(held.items()), "the patch"), endpoint, "the patch")
+    decoded = {"apiVersion": api_version(kind), "kind": kind[2]}
+    return {**{field: value for field, value in decoded.items() if value != live[field]}, **untyped(patch)}, kind
+
+
+def kept_kind(operations, endpoint):
+    held = {"apiVersion": api_version(endpoint), "kind": endpoint[2]}
+    for index, change in enumerate(operations):
+        if not isinstance(change, dict):
+            continue
+        op, tokens = change.get("op"), pointer(change.get("path"))
+        taken = pointer(change.get("from")) if op == "move" else None
+        changed = taken is not None and len(taken) == 1 and taken[0].casefold() in TYPE_FIELDS
+        if changed:
+            held.pop(taken[0], None)
+        if tokens is not None and op in (*PATCHED_VALUES, *COPIED_VALUES, "remove"):
+            if not tokens and op in COPIED_VALUES:
+                raise Refused(400, f"the patch's operation {index} {op}s a value to the whole document, whose type then can't be read: write the document as a value (replace)")
+            if not tokens and op in PATCHED_VALUES and isinstance(change.get("value"), Pairs):
+                held, changed = dict(change["value"].typing), True
+            elif len(tokens) == 1 and tokens[0].casefold() in TYPE_FIELDS:
+                if op in COPIED_VALUES:
+                    raise Refused(400, f"the patch's operation {index} {op}s a value to {change['path']!r}, the object's type: write the type as a value (add or replace)")
+                if op == "remove":
+                    held.pop(tokens[0], None)
+                else:
+                    held[tokens[0]] = change.get("value")
+                changed = True
+        if not changed:
+            continue
+        what = f"the patch's operation {index}"
+        kind = decoded_kind(stated_types(sorted(held.items()), what), endpoint, what)
+        if kind != endpoint:
+            raise Refused(400, f"{what} makes the object a {api_version(kind)} {kind[2]}, where the endpoint holds a {api_version(endpoint)} {endpoint[2]}: Kubernetes refuses that patch")
+
+
+def media_of(kind):
+    media = (kind or JSON_BODIES[0]).split(";")[0].strip().lower()
+    if media not in JSON_BODIES:
+        raise Refused(415, f"a {media} body is refused: the service reads each quantity in a body before Kubernetes does, and it reads JSON only ({', '.join(JSON_BODIES)})")
+    return media
+
+
+def enveloped(given):
+    held = given.get("requester") if isinstance(given, dict) else None
+    if isinstance(held, Numeral) and INTEGER.fullmatch(held.text) and len(held.text.lstrip("-")) <= U64_DIGITS:
+        return {**given, "requester": int(held.text)}
+    return given
 
 
 def pod_limit(spec, resource):
@@ -2027,6 +2447,7 @@ class Service:
         self.fetching = fetching
         self.stats = stats
         self.api = api
+        self.schemas = Schemas(api)
         self.notifier = Notifier(kube, signer, self.retry_pause)
         self.pause = time.sleep
         self.execs = {}
@@ -2931,11 +3352,13 @@ class Service:
                 raise kube_refusal(tried, f"{what} ({manifest['kind']} {manifest['metadata'].get('name', '')})'s pods would be refused")
 
     def apply(self, asked, body):
-        request = named(checked(body, APPLY, "an apply"), ["manifests"], "an apply")
+        request = named(checked(enveloped(kept(body)), APPLY, "an apply"), ["manifests"], "an apply")
         labels = labels_for(asked, request.get("requester"))
         kinds = self.cluster_kinds()
         namespace = self.kube.namespace
-        objects = [confine_manifest(manifest, f"manifest {index}", kinds, namespace, labels) for index, manifest in enumerate(request["manifests"])]
+        confined = [confine_manifest(as_decoded(manifest, f"manifest {index}")[0], f"manifest {index}", kinds, namespace, labels) for index, manifest in enumerate(request["manifests"])]
+        reading = self.schemas.reading()
+        objects = [reading.object(manifest, f"manifest {index}") for index, manifest in enumerate(confined)]
         for index, manifest in enumerate(objects):
             self.tried(manifest, f"manifest {index}")
         tried = self.kube.apply(objects, dry=True)
@@ -2973,23 +3396,29 @@ class Service:
         self.readable(target.resource, None)
         kind = headers.get("content-type")
         whole = target.subresource in (None, "ephemeralcontainers")
-        match (method, whole):
-            case ("POST" | "PUT", True):
-                body, kind = self.confined(asked, parsed(body)), "application/json"
-            case ("PATCH", True):
-                tried = self.api.call(method, target.path, dry_run(query), body, kind)
-                refused = not 200 <= tried.status < 300
-                if refused:
-                    return tried.status, tried
-                self.patchable(json.loads(tried.body))
+        if method in WRITES and (whole or body):
+            reading = self.schemas.reading()
+            home, operation = reading.operation(segments, method)
+            if operation.body:
+                media = media_of(kind)
+                if method in ("POST", "PUT") and whole:
+                    body, kind = self.confined(asked, kept(body), reading), "application/json"
+                else:
+                    body = written(reading.body(home, operation, media, kept(body))).encode()
+        if method == "PATCH" and whole:
+            tried = self.api.call(method, target.path, dry_run(query), body, kind)
+            refused = not 200 <= tried.status < 300
+            if refused:
+                return tried.status, tried
+            self.patchable(json.loads(tried.body))
         answered = self.api.call(method, target.path, query, body, kind)
         return answered.status, answered
 
-    def confined(self, asked, manifest):
+    def confined(self, asked, manifest, reading):
         what = "the object"
-        confined = confine_manifest(manifest, what, self.cluster_kinds(), self.kube.namespace, labels_for(asked, None))
+        confined = reading.object(confine_manifest(as_decoded(manifest, what)[0], what, self.cluster_kinds(), self.kube.namespace, labels_for(asked, None)), what)
         self.tried(confined, what)
-        return json.dumps(confined).encode()
+        return written(confined).encode()
 
     def patchable(self, result):
         what = "the patched object"
@@ -3060,7 +3489,7 @@ class Service:
             case ("DELETE", "pods", name):
                 return self.delete(name)
             case ("POST", "manifests"):
-                return self.apply(asked, parsed(body))
+                return self.apply(asked, body)
             case ("DELETE", "manifests"):
                 return self.remove(parsed(body))
             case ("GET", "manifests", kind):

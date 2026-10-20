@@ -179,8 +179,15 @@ one up for another network.
   (`api/v1/namespaces/agents/...`, `apis/GROUP/VERSION/namespaces/agents/...`)
   and answers Kubernetes' own status and body. It checks what it creates or
   replaces as `manifests` does, and sends a PATCH first as a dry run, checks
-  the object it would store, and only then sends it. `server-test.py` covers
-  them.
+  the object it would store, and only then sends it. Every quantity it passes
+  on (a pod's resources and scratch sizes, manifests, and `k8s/PATH` writes,
+  patches and subresource bodies) reaches Kubernetes as the service's own
+  reading in Kubernetes' canonical form, found by the API server's
+  `/openapi/v3` schema for the kind Kubernetes will decode the body as; a
+  write whose body isn't JSON is refused 415 (an apply-patch+yaml body
+  that isn't also JSON is a 400), and one whose operation
+  declares no body (a proxy) passes as sent.
+  `server-test.py` covers them.
 - The reserved pod `desktop` is orthory's desktop build runner, a rootless
   podman container that runs the warm pod's `build.sh`. The service
   reaches it by ssh with the Secret `desktop-runner` in namespace `pods`

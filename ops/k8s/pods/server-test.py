@@ -282,12 +282,130 @@ class Stats:
         return self.summaries.get(host, {"pods": []})
 
 
+QUANTITY_NAME = "io.k8s.apimachinery.pkg.api.resource.Quantity"
+CORE = "io.k8s.api.core.v1."
+ZEROS = "1" + "0" * 10**6
+SEVENS = "7" * 10**6
+MOST = "9223372036854775807"
+
+
+def ref(name, wrapped=False):
+    pointer = {"$ref": f"#/components/schemas/{name}"}
+    return {"allOf": [pointer], "default": {}} if wrapped else pointer
+
+
+def kind_of(group, version, kind, **properties):
+    known = {"apiVersion": {"type": "string"}, "kind": {"type": "string"}, "metadata": {"type": "object"}, **properties}
+    return {"type": "object", "x-kubernetes-group-version-kind": [{"group": group, "version": version, "kind": kind}], "properties": known}
+
+
+def amounts():
+    return {"type": "object", "additionalProperties": ref(QUANTITY_NAME)}
+
+
+def operations(name, *methods):
+    answer = {"200": {"content": {"application/json": {"schema": ref(name)}}}}
+    patches = ("application/json-patch+json", "application/merge-patch+json", "application/strategic-merge-patch+json", "application/apply-patch+yaml")
+    patch = {media: {"schema": ref("io.k8s.apimachinery.pkg.apis.meta.v1.Patch")} for media in patches}
+    return {method: {"requestBody": {"content": patch if method == "patch" else {"*/*": {"schema": ref(name)}}}, "responses": answer} for method in methods}
+
+
+def unbodied(*methods):
+    return {method: {"responses": {"200": {"content": {"*/*": {"schema": {"type": "string"}}}}}} for method in methods}
+
+
+POD_SCHEMAS = {
+    QUANTITY_NAME: {"type": "string"},
+    CORE + "ResourceRequirements": {"type": "object", "properties": {"limits": amounts(), "requests": amounts()}},
+    CORE + "EnvVar": {"type": "object", "properties": {"name": {"type": "string"}, "value": {"type": "string"}}},
+    CORE + "Container": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "env": {"type": "array", "items": ref(CORE + "EnvVar", True)}, "resources": ref(CORE + "ResourceRequirements", True)},
+    },
+    CORE + "EmptyDirVolumeSource": {"type": "object", "properties": {"medium": {"type": "string"}, "sizeLimit": {"allOf": [ref(QUANTITY_NAME)]}}},
+    CORE + "Volume": {"type": "object", "properties": {"name": {"type": "string"}, "emptyDir": ref(CORE + "EmptyDirVolumeSource", True)}},
+    CORE + "PodSpec": {
+        "type": "object",
+        "properties": {
+            "containers": {"type": "array", "items": ref(CORE + "Container")},
+            "volumes": {"type": "array", "items": ref(CORE + "Volume", True)},
+            "resources": ref(CORE + "ResourceRequirements", True),
+            "overhead": amounts(),
+        },
+    },
+    CORE + "PodTemplateSpec": {"type": "object", "properties": {"metadata": {"type": "object"}, "spec": ref(CORE + "PodSpec", True)}},
+    "io.k8s.example.Circle": {"type": "object", "properties": {"next": ref("io.k8s.example.Circle"), "all": {"type": "array", "items": ref("io.k8s.example.Circle")}}},
+    "io.k8s.example.Spiral": {"type": "object", "properties": {"next": ref("io.k8s.example.Spiral", True), "size": ref(QUANTITY_NAME)}},
+}
+CORE_V1 = {
+    "components": {
+        "schemas": {
+            **POD_SCHEMAS,
+            CORE + "Pod": kind_of("", "v1", "Pod", spec=ref(CORE + "PodSpec", True)),
+            CORE + "ConfigMap": kind_of("", "v1", "ConfigMap", data={"type": "object", "additionalProperties": {"type": "string"}}),
+            CORE + "Service": kind_of("", "v1", "Service", spec={"type": "object"}),
+            CORE + "ServiceAccount": kind_of("", "v1", "ServiceAccount"),
+            CORE + "VolumeResourceRequirements": {"type": "object", "properties": {"limits": amounts(), "requests": amounts()}},
+            CORE + "PersistentVolumeClaimSpec": {"type": "object", "properties": {"resources": ref(CORE + "VolumeResourceRequirements", True)}},
+            CORE + "PersistentVolumeClaim": kind_of("", "v1", "PersistentVolumeClaim", spec=ref(CORE + "PersistentVolumeClaimSpec", True)),
+            CORE + "ResourceQuotaSpec": {"type": "object", "properties": {"hard": amounts()}},
+            CORE + "ResourceQuota": kind_of("", "v1", "ResourceQuota", spec=ref(CORE + "ResourceQuotaSpec", True)),
+            "io.k8s.api.policy.v1.Eviction": kind_of("policy", "v1", "Eviction"),
+            CORE + "Binding": kind_of("", "v1", "Binding", target={"type": "object"}),
+        }
+    },
+    "paths": {
+        "/api/v1/namespaces/{namespace}/pods": operations(CORE + "Pod", "post"),
+        "/api/v1/namespaces/{namespace}/pods/{name}": operations(CORE + "Pod", "put", "patch"),
+        "/api/v1/namespaces/{namespace}/pods/{name}/resize": operations(CORE + "Pod", "put", "patch"),
+        "/api/v1/namespaces/{namespace}/pods/{name}/eviction": operations("io.k8s.api.policy.v1.Eviction", "post"),
+        "/api/v1/namespaces/{namespace}/configmaps": operations(CORE + "ConfigMap", "post"),
+        "/api/v1/namespaces/{namespace}/resourcequotas/{name}": operations(CORE + "ResourceQuota", "put", "patch"),
+        "/api/v1/namespaces/{namespace}/configmaps/{name}": operations(CORE + "ConfigMap", "put", "patch"),
+        "/api/v1/namespaces/{namespace}/services/{name}": operations(CORE + "Service", "put", "patch"),
+        "/api/v1/namespaces/{namespace}/pods/{name}/binding": operations(CORE + "Binding", "post"),
+        "/api/v1/namespaces/{namespace}/pods/{name}/exec": unbodied("get", "post"),
+        "/api/v1/namespaces/{namespace}/pods/{name}/proxy": unbodied("post", "put", "patch"),
+        "/api/v1/namespaces/{namespace}/pods/{name}/proxy/{path}": unbodied("post", "put", "patch"),
+    },
+}
+APPS_V1 = {
+    "components": {
+        "schemas": {
+            **POD_SCHEMAS,
+            "io.k8s.api.apps.v1.DeploymentSpec": {"type": "object", "properties": {"replicas": {"type": "integer"}, "template": ref(CORE + "PodTemplateSpec", True)}},
+            "io.k8s.api.apps.v1.Deployment": kind_of("apps", "v1", "Deployment", spec=ref("io.k8s.api.apps.v1.DeploymentSpec", True)),
+            "io.k8s.api.autoscaling.v1.Scale": kind_of("autoscaling", "v1", "Scale", spec={"type": "object"}),
+        }
+    },
+    "paths": {
+        "/apis/apps/v1/namespaces/{namespace}/deployments": operations("io.k8s.api.apps.v1.Deployment", "post"),
+        "/apis/apps/v1/namespaces/{namespace}/deployments/{name}": operations("io.k8s.api.apps.v1.Deployment", "put", "patch"),
+        "/apis/apps/v1/namespaces/{namespace}/deployments/{name}/scale": operations("io.k8s.api.autoscaling.v1.Scale", "put", "patch"),
+    },
+}
+POLICY_V1 = {"components": {"schemas": {"io.k8s.api.policy.v1.Eviction": kind_of("policy", "v1", "Eviction")}}, "paths": {}}
+PUBLISHED = {"api/v1": ("c0", CORE_V1), "apis/apps/v1": ("a0", APPS_V1), "apis/policy/v1": ("p0", POLICY_V1)}
+
+
 class Api:
     def __init__(self):
         self.calls = []
         self.answers = []
+        self.published = dict(PUBLISHED)
+        self.read = []
+
+    def openapi(self, path, query):
+        if path == server.OPENAPI:
+            index = {name: {"serverRelativeURL": f"{server.OPENAPI}/{name}?hash={held}"} for name, (held, _) in self.published.items()}
+            return answered(200, {"paths": index})
+        held, document = self.published.get(path.removeprefix(server.OPENAPI + "/"), (None, None))
+        return answered(200, document) if query == f"hash={held}" else answered(404, {})
 
     def call(self, method, path, query, body, kind):
+        if path.startswith(server.OPENAPI):
+            self.read.append(path + (f"?{query}" if query else ""))
+            return self.openapi(path, query)
         self.calls.append((method, path, query, body, kind))
         return self.answers.pop(0) if self.answers else server.Answered(200, "application/json", b"{}")
 
@@ -547,7 +665,15 @@ class Create(Served):
         self.refused("POST", "/v1/pods", {"image": "t", "resources": {"limits": {"gpu": "1"}}}, 400, ["no field gpu"])
         self.refused("POST", "/v1/pods", {"image": "t", "resources": {"cpu": "1"}}, 400, ["no field cpu"])
         self.refused("POST", "/v1/pods", {"image": "t", "resources": {"limits": {"cpu": 1}}}, 400, ["cpu is a JSON str"])
+        self.refused("POST", "/v1/pods", {"image": "t", "resources": {"limits": {"memory": "48GB"}}}, 400, ["resources' limits memory is not a Kubernetes quantity"])
         self.assertNotIn("create", self.kube.verbs())
+
+    def test_resources_reach_kubernetes_as_kubernetes_writes_them(self):
+        self.kube.answer("create", ran(pod_json()))
+        resources = {"limits": {"cpu": "1e-10000000", "memory": ZEROS}, "requests": {"cpu": "0.5", "memory": ZEROS + "e-1000000"}}
+        status, _ = self.call("POST", "/v1/pods", {"image": "toolchain", "resources": resources})
+        self.assertEqual(status, 201)
+        self.assertEqual(self.created()["spec"]["resources"], {"limits": {"cpu": "1e-9", "memory": MOST}, "requests": {"cpu": "500m", "memory": "1"}})
 
     def test_kubernetes_refusing_a_pod_passes_its_reason_through(self):
         self.kube.answer("create", ran(code=1, err=TERMINATING))
@@ -612,12 +738,28 @@ class Create(Served):
 
     def test_a_scratch_size_is_its_empty_directorys_size_limit(self):
         self.kube.answer("create", ran(pod_json()))
-        sizes = ["48Gi", "512M", "1e9", "1.5Gi", "+64Mi", ".5Ti", "1000000000000000000n", "1000000000000u", " 48Gi", "1e-10000000", "1e2147483647"]
+        sizes = {
+            "48Gi": "51539607552",
+            "512M": "512000000",
+            "1e9": "1000000000",
+            "1.5Gi": "1610612736",
+            "+64Mi": "67108864",
+            ".5Ti": "549755813888",
+            "1000000000000000000n": "1000000000",
+            "1000000000000u": "1000000",
+            " 48Gi": "51539607552",
+            "1500m": "2",
+            "1e-10000000": "1",
+            "1e2147483647": MOST,
+            ZEROS: MOST,
+            ZEROS + "e-1000000": "1",
+            SEVENS + "e-1000000": "1",
+        }
         inputs = [{"path": f"/scratch/{index}", "scratch": {"medium": "Memory", "size": size}} for index, size in enumerate(sizes)]
         status, _ = self.call("POST", "/v1/pods", {"image": "toolchain", "inputs": inputs})
         self.assertEqual(status, 201)
         volumes = self.created()["spec"]["volumes"][1:]
-        self.assertEqual(volumes, [{"name": f"in-{index}", "emptyDir": {"medium": "Memory", "sizeLimit": size}} for index, size in enumerate(sizes)])
+        self.assertEqual(volumes, [{"name": f"in-{index}", "emptyDir": {"medium": "Memory", "sizeLimit": limit}} for index, limit in enumerate(sizes.values())])
 
     def test_a_scratch_without_a_size_has_no_size_limit(self):
         self.kube.answer("create", ran(pod_json()))
@@ -625,7 +767,7 @@ class Create(Served):
         self.assertNotIn("sizeLimit", self.created()["spec"]["volumes"][1]["emptyDir"])
 
     def test_a_scratch_size_is_a_kubernetes_quantity_above_zero(self):
-        malformed = ("", "48GB", "48gi", "Gi", "1.2.3Gi", "48 Gi", "1e", "1e3Gi", "0x10", "forty")
+        malformed = ("", "48GB", "48gi", "Gi", "1.2.3Gi", "48 Gi", "1e", "1e3Gi", "0x10", "forty", "48Gi\u001f")
         for size in malformed:
             self.refused("POST", "/v1/pods", {"image": "t", "inputs": [{"path": "/s", "scratch": {"medium": "Memory", "size": size}}]}, 400, ["is not a Kubernetes quantity"])
         for size in ("1e2147483648", "1e-2147483649", "1e9223372036854775808", "1e" + "9" * 100000):
@@ -1620,7 +1762,8 @@ class Passthrough(Served):
         self.assertEqual(self.call("PATCH", DEPLOYMENTS + "/web", patch, headers=MERGE)[0], 200)
         target = "/apis/apps/v1/namespaces/agents/deployments/web"
         kind = "application/merge-patch+json"
-        self.assertEqual(self.api.calls, [("PATCH", target, "dryRun=All", patch, kind), ("PATCH", target, "", patch, kind)])
+        sent = b'{"spec":{"replicas":2}}'
+        self.assertEqual(self.api.calls, [("PATCH", target, "dryRun=All", sent, kind), ("PATCH", target, "", sent, kind)])
 
     def test_a_patch_whose_result_breaks_a_rule_is_refused_after_the_dry_run(self):
         results = (
@@ -1638,11 +1781,357 @@ class Passthrough(Served):
         self.assertEqual(self.call("PATCH", DEPLOYMENTS + "/web", b"{}", headers=MERGE), (422, invalid))
         self.assertEqual(len(self.api.calls), 1)
 
-    def test_a_subresource_passes_through_unchecked(self):
+    def test_a_subresource_is_read_for_quantities_but_not_confined(self):
         self.call("PATCH", DEPLOYMENTS + "/web/scale", b'{"spec": {"replicas": 0}}', headers=MERGE)
         self.call("POST", "/v1/k8s/api/v1/namespaces/agents/pods/p/eviction", {"apiVersion": "policy/v1", "kind": "Eviction"})
         self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("PATCH", ""), ("POST", "")])
         self.assertEqual(self.kube.calls, [])
+
+
+PODS = "/v1/k8s/api/v1/namespaces/agents/pods"
+PLACED = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}, "spec": {"priorityClassName": "agents", "automountServiceAccountToken": False}}
+
+
+def numbered(body, numerals):
+    text = json.dumps(body)
+    for name, numeral in numerals.items():
+        text = text.replace(json.dumps(name), numeral)
+    return text.encode()
+
+
+class Quantities(Served):
+    def test_each_quantity_is_written_as_kubernetes_writes_it(self):
+        cases = {
+            "0": "0",
+            "0Gi": "0",
+            "-0.0": "0",
+            "1": "1",
+            "1000": "1k",
+            "1024": "1024",
+            "1500": "1500",
+            "1Ki": "1Ki",
+            "1024Ki": "1Mi",
+            "1023Ki": "1023Ki",
+            "1.5Gi": "1536Mi",
+            "0.5Ki": "512",
+            "96Gi": "96Gi",
+            ".5Ti": "512Gi",
+            "+64Mi": "64Mi",
+            " 48Gi ": "48Gi",
+            "0.5": "500m",
+            "100m": "100m",
+            "0.1m": "100u",
+            "1n": "1n",
+            "0.5n": "1n",
+            "1e3": "1e3",
+            "1E3": "1e3",
+            "1500e-3": "1500e-3",
+            "-1.5k": "-1500",
+            "9E": "9E",
+            "33.2G": "33200M",
+            "1000000000000000000n": "1G",
+            "8Ei": MOST,
+            "7Ei": "7Ei",
+            "1e4294967296": "1",
+            "1e-10000000": "1e-9",
+            "1e-2147483648": "1e-9",
+            "-1e-2147483648": "-1e-9",
+            ZEROS: MOST,
+            ZEROS + "e-1000000": "1",
+            SEVENS: MOST,
+            SEVENS + "e-1000000": "777777778e-9",
+            "0." + SEVENS: "777777778n",
+            "\u00a01\u3000": "1",
+            "\t\v\f\r\n\x851\u2028": "1",
+        }
+        for given, expected in cases.items():
+            self.assertEqual(server.canonical(*server.reading(given)), expected, given[:24])
+        for malformed in ("", "48GB", "1e", "1e3Gi", "1e9223372036854775808", "1e" + "9" * 100000, "NaN", "1\u001f", "\u001c1", "1\u001d", "\u001e1"):
+            self.assertIsNone(server.reading(malformed))
+
+    def test_a_schema_keeps_only_what_leads_to_a_quantity_and_ends_on_cycles(self):
+        published = server.Published(CORE_V1)
+        self.assertIn("io.k8s.example.Spiral", published.shapes)
+        for empty in ("io.k8s.example.Circle", CORE + "EnvVar", CORE + "ConfigMap", CORE + "Service"):
+            self.assertNotIn(empty, published.shapes)
+        limits = {"values": QUANTITY_NAME, "declared": frozenset()}
+        self.assertEqual(published.shapes[CORE + "ResourceRequirements"], {"properties": {"limits": limits, "requests": limits}})
+        pod = ["api", "v1", "namespaces", "agents", "pods", "p"]
+        self.assertEqual(published.operation([*pod, "resize"], "PATCH"), server.Operation(True, ("", "v1", "Pod")))
+        self.assertEqual(published.operation([*pod, "binding"], "POST"), server.Operation(True, ("", "v1", "Binding")))
+        self.assertEqual(published.operation([*pod, "exec"], "POST"), server.Operation(False, None))
+        self.assertEqual(published.operation([*pod, "proxy", "a", "b"], "PUT"), server.Operation(False, None))
+        self.assertIsNone(published.operation([*pod, "bogus"], "POST"))
+
+    def test_every_quantity_in_a_manifest_reaches_kubernetes_as_kubernetes_writes_it(self):
+        self.kube.answer("apply", ran({"kind": "List", "items": []}))
+        container = {
+            "name": "web",
+            "image": "nginx",
+            "env": [{"name": "SIZE", "value": "1e-10000000"}],
+            "resources": {"limits": {"memory": ZEROS, "cpu": "@cpu@"}, "requests": {"memory": "1.5Gi"}},
+        }
+        manifests = [
+            deployment(containers=[container], volumes=[{"name": "s", "emptyDir": {"medium": "Memory", "sizeLimit": SEVENS}}]),
+            {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "c"}, "spec": {"resources": {"requests": {"storage": "1e-2147483648"}}}},
+            {"apiVersion": "v1", "kind": "ResourceQuota", "metadata": {"name": "mine"}, "spec": {"hard": {"requests.memory": "0." + SEVENS}}},
+            {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m"}, "data": {"zeros": ZEROS}},
+        ]
+        body = numbered({"manifests": manifests, "requester": "@requester@"}, {"@cpu@": "1e-10000000", "@requester@": "17"})
+        status, answer = self.call("POST", "/v1/manifests", body)
+        self.assertEqual(status, 200, answer)
+        (_, objects, _), (_, again, _) = [call for call in self.kube.calls if call[0] == "apply"]
+        self.assertEqual(objects, again)
+        made, claim, quota, config = json.loads(server.written(objects))
+        spec = made["spec"]["template"]["spec"]
+        self.assertEqual(spec["containers"][0]["resources"], {"limits": {"memory": MOST, "cpu": "1e-9"}, "requests": {"memory": "1536Mi"}})
+        self.assertEqual(spec["containers"][0]["env"], [{"name": "SIZE", "value": "1e-10000000"}])
+        self.assertEqual(spec["volumes"][0]["emptyDir"]["sizeLimit"], MOST)
+        self.assertEqual(made["spec"]["replicas"], 1)
+        self.assertEqual(made["metadata"]["labels"]["ducktape.industries/requester"], "17")
+        self.assertEqual(claim["spec"]["resources"]["requests"]["storage"], "1e-9")
+        self.assertEqual(quota["spec"]["hard"]["requests.memory"], "777777778n")
+        self.assertEqual(config["data"]["zeros"], ZEROS)
+        trial = [call[1] for call in self.kube.calls if call[0] == "trial"][0]
+        self.assertEqual(json.loads(server.written(trial))["spec"]["containers"][0]["resources"]["limits"], {"memory": MOST, "cpu": "1e-9"})
+        self.assertEqual(self.api.read, ["/openapi/v3", "/openapi/v3/apis/apps/v1?hash=a0", "/openapi/v3/api/v1?hash=c0"])
+
+    def test_a_malformed_or_unpublished_manifest_is_refused_before_anything_applies(self):
+        malformed = deployment(containers=[{"name": "web", "image": "nginx", "resources": {"limits": {"memory": "1e"}}}])
+        words = ["manifest 0's spec.template.spec.containers[0].resources.limits.memory is not a Kubernetes quantity"]
+        self.refused("POST", "/v1/manifests", {"manifests": [malformed]}, 400, words)
+        self.refused("POST", "/v1/manifests", {"manifests": [{"apiVersion": "apps/v1", "kind": "Widget", "metadata": {"name": "w"}}]}, 400, ["apps/v1 Widget", "no schema"])
+        self.refused("POST", "/v1/manifests", {"manifests": [{"apiVersion": "example.com/v1", "kind": "Widget"}]}, 400, ["no schema for apis/example.com/v1"])
+        self.refused("POST", "/v1/manifests", {"manifests": [{"apiVersion": 1, "kind": "Pod"}]}, 400, ["manifest 0's 'apiVersion' is not a string"])
+        self.refused("POST", "/v1/manifests", {"manifests": [{"apiVersion": "", "kind": "Pod"}]}, 400, ["apiVersion and a kind"])
+        self.assertEqual([verb for verb in self.kube.verbs() if verb != "cluster_kinds"], [])
+
+    def test_a_created_or_resized_pod_reaches_kubernetes_as_kubernetes_writes_it(self):
+        pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "image": "i", "resources": {"limits": {"memory": ZEROS}}}], "overhead": {"cpu": "0.5"}}}
+        resized = {"spec": {"containers": [{"name": "c", "resources": {"requests": {"cpu": "@cpu@"}}}]}}
+        self.assertEqual(self.call("POST", PODS, pod)[0], 200)
+        self.assertEqual(self.call("PUT", PODS + "/p/resize", numbered(resized, {"@cpu@": "1e-10000000"}))[0], 200)
+        created, resize = (json.loads(call[3]) for call in self.api.calls)
+        self.assertEqual(created["spec"]["containers"][0]["resources"]["limits"]["memory"], MOST)
+        self.assertEqual(created["spec"]["overhead"], {"cpu": "500m"})
+        self.assertEqual(resize["spec"]["containers"][0]["resources"]["requests"]["cpu"], "1e-9")
+
+    def test_every_patch_shape_reaches_kubernetes_as_kubernetes_writes_it(self):
+        merge = {"spec": {"containers": [{"name": "c", "resources": {"limits": {"memory": ZEROS}}}]}}
+        strategic = {
+            "$patch": "merge",
+            "spec": {
+                "$setElementOrder/containers": [{"name": "c"}],
+                "containers": [{"name": "c", "resources": {"limits": {"cpu": "1e-10000000"}}, "env": [{"name": "E", "value": ZEROS}]}],
+            },
+        }
+        operations = [
+            {"op": "replace", "path": "/spec/containers/0/resources/limits/memory", "value": ZEROS},
+            {"op": "add", "path": "/spec/containers/-/resources", "value": {"requests": {"cpu": "0.5", "memory": "0." + SEVENS}}},
+            {"op": "add", "path": "/spec/overhead/cpu", "value": "@cpu@"},
+            {"op": "test", "path": "/spec/containers/0/resources/limits/cpu", "value": "1e-10000000"},
+            {"op": "add", "path": "/metadata/annotations/size", "value": ZEROS},
+            {"op": "add", "path": "/spec/overhead~1x", "value": ZEROS},
+            {"op": "remove", "path": "/spec/overhead"},
+        ]
+        applied = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}, "spec": {"overhead": {"memory": "1.5Gi"}}}
+        cases = (
+            ("application/merge-patch+json", merge, lambda sent: sent["spec"]["containers"][0]["resources"]["limits"], {"memory": MOST}),
+            ("application/strategic-merge-patch+json", strategic, lambda sent: sent, {**strategic, "spec": {**strategic["spec"], "containers": [{**strategic["spec"]["containers"][0], "resources": {"limits": {"cpu": "1e-9"}}}]}}),
+            (
+                "application/json-patch+json",
+                operations,
+                lambda sent: sent,
+                [
+                    {**operations[0], "value": MOST},
+                    {**operations[1], "value": {"requests": {"cpu": "500m", "memory": "777777778n"}}},
+                    {**operations[2], "value": "1e-9"},
+                    *operations[3:],
+                ],
+            ),
+            ("application/apply-patch+yaml", applied, lambda sent: sent["spec"], {"overhead": {"memory": "1536Mi"}}),
+        )
+        for media, patch, part, expected in cases:
+            self.api.calls, self.api.answers = [], [answered(200, PLACED), answered(200, PLACED)]
+            status, answer = self.call("PATCH", PODS + "/p", numbered(patch, {"@cpu@": "1e-10000000"}), headers={**ASKED, "content-type": media})
+            self.assertEqual(status, 200, answer)
+            (_, _, dry, tried, _), (_, _, _, sent, kind) = self.api.calls
+            self.assertEqual((dry, tried, kind), ("dryRun=All", sent, media))
+            self.assertEqual(part(json.loads(sent)), expected, media)
+
+    def test_a_strategic_directive_inside_a_map_of_quantities_is_a_directive(self):
+        patch = {
+            "spec": {
+                "containers": [{"name": "c", "resources": {"limits": {"$patch": "replace", "cpu": "1e-10000000"}, "requests": {"$patch": "delete"}}}],
+                "overhead": {"$patch": "replace", "$retainKeys": ["cpu"], "cpu": ZEROS},
+            }
+        }
+        self.api.answers = [answered(200, PLACED), answered(200, PLACED)]
+        status, answer = self.call("PATCH", PODS + "/p", json.dumps(patch).encode(), headers={**ASKED, "content-type": "application/strategic-merge-patch+json"})
+        self.assertEqual(status, 200, answer)
+        sent = json.loads(self.api.calls[-1][3])["spec"]
+        self.assertEqual(sent["containers"][0]["resources"], {"limits": {"$patch": "replace", "cpu": "1e-9"}, "requests": {"$patch": "delete"}})
+        self.assertEqual(sent["overhead"], {"$patch": "replace", "$retainKeys": ["cpu"], "cpu": MOST})
+        self.api.calls = []
+        merge = {"spec": {"overhead": {"$patch": "replace"}}}
+        code, answer = self.call("PATCH", PODS + "/p", json.dumps(merge).encode(), headers={**ASKED, "content-type": "application/merge-patch+json"})
+        self.assertEqual(code, 400, answer)
+        self.assertIn("the body's spec.overhead.$patch is not a Kubernetes quantity", answer["error"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_a_malformed_quantity_or_a_body_that_is_not_json_reaches_nothing(self):
+        cases = (
+            ("PATCH", PODS + "/p", [{"op": "add", "path": "/spec/overhead/cpu", "value": "48GB"}], "application/json-patch+json", 400, "the patch's operation 0's spec.overhead.cpu is not a Kubernetes quantity"),
+            ("PATCH", PODS + "/p", {"spec": {"overhead": {"cpu": "48GB"}}}, "application/merge-patch+json", 400, "the body's spec.overhead.cpu is not a Kubernetes quantity"),
+            ("PUT", PODS + "/p/resize", {"spec": {"overhead": {"cpu": "1e"}}}, None, 400, "the body's spec.overhead.cpu"),
+            ("PUT", PODS + "/p/resize", b"\x0a\x02k8s", "application/vnd.kubernetes.protobuf", 415, "reads JSON only"),
+            ("PATCH", PODS + "/p", b"\xa1", "application/apply-patch+cbor", 415, "reads JSON only"),
+            ("POST", PODS, b"kind: Pod", "application/yaml", 415, "reads JSON only"),
+            ("PATCH", PODS + "/p", b"kind: Pod", "application/apply-patch+yaml", 400, "not JSON"),
+            ("POST", PODS + "/p/bogus", {"command": ["sh"]}, None, 400, "publishes no POST of /api/v1/namespaces/agents/pods/p/bogus"),
+        )
+        for method, path, body, media, status, words in cases:
+            headers = ASKED if media is None else {**ASKED, "content-type": media}
+            code, answer = self.call(method, path, body if isinstance(body, bytes) else json.dumps(body).encode(), headers=headers)
+            self.assertEqual(code, status, answer)
+            self.assertIn(words, answer["error"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_a_schema_is_read_once_per_hash_and_again_when_it_changes(self):
+        configmap = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m"}, "data": {}}
+        path = "/v1/k8s/api/v1/namespaces/agents/configmaps"
+        self.call("POST", path, configmap)
+        self.call("POST", path, configmap)
+        self.api.published["api/v1"] = ("c1", CORE_V1)
+        self.call("POST", path, configmap)
+        self.assertEqual(self.api.read, ["/openapi/v3", "/openapi/v3/api/v1?hash=c0", "/openapi/v3", "/openapi/v3", "/openapi/v3/api/v1?hash=c1"])
+        self.assertEqual(list(self.service.schemas.held), ["/openapi/v3/api/v1?hash=c1"])
+        self.call("GET", path)
+        self.assertEqual(len(self.api.read), 5)
+
+
+CONFIGMAPS = "/v1/k8s/api/v1/namespaces/agents/configmaps"
+CONFIGMAP = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "x"}}
+SLOW = "1e-2147483648"
+LIMITED = {"containers": [{"name": "c", "image": "i", "resources": {"limits": {"cpu": SLOW}}}]}
+
+
+def cpu_of(spec):
+    return spec["containers"][0]["resources"]["limits"]["cpu"]
+
+
+def typed(sent):
+    return {key: value for key, value in sent.items() if key.casefold() in ("apiversion", "kind")}
+
+
+class Kinds(Served):
+    def sent(self, method, path, body, media=None, answers=()):
+        self.api.calls, self.api.answers = [], [answered(200, answer) for answer in answers]
+        headers = ASKED if media is None else {**ASKED, "content-type": media}
+        status, answer = self.call(method, path, body if isinstance(body, bytes) else json.dumps(body).encode(), headers=headers)
+        self.assertEqual(status, 200, answer)
+        return self.api.calls[-1][3]
+
+    def test_a_strategic_patch_is_read_as_its_endpoints_kind_whatever_kind_it_states(self):
+        forced = deployment(priorityClassName="agents", automountServiceAccountToken=False)
+        patch = {"apiVersion": "v1", "kind": "ConfigMap", "spec": {"template": {"spec": LIMITED}}}
+        sent = json.loads(self.sent("PATCH", DEPLOYMENTS + "/web", patch, "application/strategic-merge-patch+json", [forced, forced]))
+        self.assertEqual(typed(sent), {"apiVersion": "v1", "kind": "ConfigMap"})
+        self.assertEqual(cpu_of(sent["spec"]["template"]["spec"]), "1e-9")
+
+    def test_an_object_is_read_as_the_last_key_that_folds_to_kind_and_sent_with_that_kind_alone(self):
+        body = b'{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"p"},"spec":' + json.dumps(LIMITED).encode() + b',"Kind":"Pod","kind":null}'
+        sent = json.loads(self.sent("POST", PODS, body))
+        self.assertEqual(typed(sent), {"apiVersion": "v1", "kind": "Pod"})
+        self.assertEqual(cpu_of(sent["spec"]), "1e-9")
+        self.assertEqual(sent["spec"]["priorityClassName"], "agents")
+
+    def test_a_manifest_with_a_kelvin_sign_kind_is_applied_as_the_kind_kubernetes_reads(self):
+        self.kube.answer("apply", ran({"kind": "List", "items": []}))
+        manifest = {"apiVersion": "v1", "kind": "ConfigMap", "\u212aind": "Pod", "metadata": {"name": "m"}, "spec": LIMITED}
+        status, answer = self.call("POST", "/v1/manifests", {"manifests": [manifest]})
+        self.assertEqual(status, 200, answer)
+        (applied,) = json.loads(server.written([call for call in self.kube.calls if call[0] == "apply"][0][1]))
+        self.assertEqual(typed(applied), {"apiVersion": "v1", "kind": "Pod"})
+        self.assertEqual(cpu_of(applied["spec"]), "1e-9")
+        self.assertEqual(applied["spec"]["priorityClassName"], "agents")
+
+    def test_a_merge_patch_is_read_as_the_kind_of_the_object_it_makes(self):
+        cases = (
+            ({"\u212aind": "Pod", "spec": LIMITED}, {"kind": "Pod"}, "1e-9"),
+            ({"\u212aind": "Pod", "kind": "ConfigMap", "spec": LIMITED}, {"kind": "Pod"}, "1e-9"),
+            ({"kind": "Pod", "spec": LIMITED}, {"kind": "Pod"}, "1e-9"),
+            ({"Kind": "Pod", "spec": LIMITED}, {}, SLOW),
+        )
+        for patch, kind, cpu in cases:
+            sent = json.loads(self.sent("PATCH", CONFIGMAPS + "/x", patch, "application/merge-patch+json", [CONFIGMAP, CONFIGMAP]))
+            self.assertEqual(typed(sent), kind, patch)
+            self.assertEqual(cpu_of(sent["spec"]), cpu, patch)
+
+    def test_a_subresource_body_is_read_as_its_kind_with_the_rest_from_its_endpoint(self):
+        sent = json.loads(self.sent("POST", PODS + "/p/binding", {"kind": "Pod", "metadata": {"name": "p"}, "spec": LIMITED}))
+        self.assertEqual((typed(sent), cpu_of(sent["spec"])), ({"kind": "Pod"}, "1e-9"))
+        binding = {"apiVersion": "v1", "kind": "Binding", "metadata": {"name": "p"}, "target": {"name": "n"}}
+        self.assertEqual(json.loads(self.sent("POST", PODS + "/p/binding", binding)), binding)
+        for body in ({"kind": 5}, {"apiVersion": "v1", "Kind": ["Pod"]}):
+            self.refused("POST", PODS + "/p/binding", body, 400, ["is not a string"])
+        self.refused("POST", PODS + "/p/binding", {"apiVersion": "a/b/c"}, 400, ["not GROUP/VERSION"])
+
+    def test_a_json_patch_that_makes_the_object_another_kind_is_refused(self):
+        refused = (
+            [{"op": "replace", "path": "/kind", "value": "Pod"}, {"op": "add", "path": "/spec", "value": LIMITED}],
+            [{"op": "add", "path": "/\u212aind", "value": "Pod"}],
+            [{"op": "replace", "path": "/apiVersion", "value": "apps/v1"}],
+            [{"op": "replace", "path": "", "value": {"apiVersion": "v1", "kind": "Pod", "spec": LIMITED}}],
+            [{"op": "copy", "from": "/metadata/name", "path": "/kind"}],
+            [{"op": "add", "path": "/Kind", "value": "Pod"}, {"op": "move", "from": "/kind", "path": "/metadata/annotations/x"}, {"op": "add", "path": "/spec", "value": LIMITED}],
+            [{"op": "add", "path": "/APIVERSION", "value": "apps/v1"}, {"op": "move", "from": "/apiVersion", "path": "/metadata/annotations/x"}],
+            [{"op": "add", "path": "/Kind", "value": "Pod"}, {"op": "remove", "path": "/kind"}],
+            [{"op": "add", "path": "/data", "value": {"kind": "Pod", "apiVersion": "v1"}}, {"op": "move", "from": "/data", "path": ""}],
+            [{"op": "copy", "from": "/data", "path": ""}],
+        )
+        for patch in refused:
+            self.api.calls = []
+            code, answer = self.call("PATCH", CONFIGMAPS + "/x", json.dumps(patch).encode(), headers={**ASKED, "content-type": "application/json-patch+json"})
+            self.assertEqual(code, 400, patch)
+            self.assertIn(f"the patch's operation {next((at for at, change in enumerate(patch) if change['op'] in ('move', 'remove')), 0)}", answer["error"])
+            self.assertEqual(self.api.calls, [])
+        kept = [
+            {"op": "add", "path": "/Kind", "value": "Pod"},
+            {"op": "replace", "path": "/kind", "value": "ConfigMap"},
+            {"op": "remove", "path": "/apiVersion"},
+            {"op": "replace", "path": "", "value": {"apiVersion": "v1", "kind": "ConfigMap", "data": {"cpu": SLOW}}},
+            {"op": "move", "from": "/kind", "path": "/metadata/annotations/x"},
+        ]
+        self.assertEqual(json.loads(self.sent("PATCH", CONFIGMAPS + "/x", kept, "application/json-patch+json", [CONFIGMAP, CONFIGMAP])), kept)
+
+    def test_a_copy_or_move_is_refused_only_where_its_quantities_would_land_elsewhere(self):
+        media = "application/json-patch+json"
+        for op in ("copy", "move"):
+            for target in ("/spec/containers/0/resources/limits/cpu", "/spec/containers/0/resources"):
+                patch = [{"op": "add", "path": "/metadata/annotations", "value": {"a": SLOW}}, {"op": op, "from": "/metadata/annotations/a", "path": target}]
+                self.api.calls = []
+                code, answer = self.call("PATCH", PODS + "/p", json.dumps(patch).encode(), headers={**ASKED, "content-type": media})
+                self.assertEqual(code, 400, patch)
+                self.assertIn("the patch's operation 1", answer["error"])
+                self.assertIn("write the quantity as a value (add or replace)", answer["error"])
+                self.assertEqual(self.api.calls, [])
+        alike = [
+            {"op": "copy", "from": "/spec/containers/0/resources/limits/cpu", "path": "/spec/containers/0/resources/requests/cpu"},
+            {"op": "move", "from": "/spec/overhead", "path": "/spec/resources/limits"},
+            {"op": "copy", "from": "/metadata/annotations/a", "path": "/metadata/labels/a"},
+        ]
+        self.assertEqual(json.loads(self.sent("PATCH", PODS + "/p", alike, media, [PLACED, PLACED])), alike)
+
+    def test_a_body_the_api_server_takes_no_schema_for_passes_as_sent(self):
+        bodies = (
+            (PODS + "/p/proxy/a/b", b"\x00 not json", "application/octet-stream"),
+            (PODS + "/p/proxy", b'{"cpu": "1e-2147483648"}', "application/json"),
+            (PODS + "/p/exec", b'{"Kind": 5}', None),
+        )
+        for path, body, media in bodies:
+            self.assertEqual(self.sent("POST", path, body, media), body)
+        self.assertEqual([call[4] for call in self.api.calls], [None])
 
 
 class Logged(Served):
