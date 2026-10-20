@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -281,37 +281,33 @@ where
     }
 
     pub async fn entries(&self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        let (keys, _) = self.indexed().await?;
-        Ok(keys
+        Ok(self
+            .indexed()
+            .await?
             .into_iter()
             .filter_map(|(key, slot)| slot.map(|value| (key, value)))
             .collect())
     }
 
-    pub(crate) async fn indexed(
-        &self,
-    ) -> Result<(BTreeMap<Vec<u8>, Slot>, HashMap<Digest, Vec<u8>>)> {
-        let mut names = HashMap::new();
+    pub(crate) async fn indexed(&self) -> Result<BTreeMap<Vec<u8>, Slot>> {
         let from = self.db()?.sync_boundary();
-        let keys = self.replay(from, &mut names).await?;
-        let live = keys
+        let (keys, _) = self.replay(from).await?;
+        Ok(keys
             .into_iter()
             .filter(|(_, slot)| slot.is_some())
-            .collect();
-        Ok((live, names))
+            .collect())
     }
 
     pub(crate) async fn changes(
         &self,
         from: Location<Family>,
-        names: &mut HashMap<Digest, Vec<u8>>,
-    ) -> Result<Option<BTreeMap<Vec<u8>, Slot>>> {
+    ) -> Result<Option<(BTreeMap<Vec<u8>, Slot>, HashSet<Digest>)>> {
         let bounds = self.db()?.bounds();
         let held = bounds.start <= from && from <= bounds.end;
         if !held {
             return Ok(None);
         }
-        self.replay(from, names).await.map(Some)
+        self.replay(from).await.map(Some)
     }
 
     pub(crate) fn end(&self) -> Result<Location<Family>> {
@@ -321,11 +317,12 @@ where
     async fn replay(
         &self,
         from: Location<Family>,
-        names: &mut HashMap<Digest, Vec<u8>>,
-    ) -> Result<BTreeMap<Vec<u8>, Slot>> {
+    ) -> Result<(BTreeMap<Vec<u8>, Slot>, HashSet<Digest>)> {
         let db = self.db()?;
         let bounds = db.bounds();
         let page = Tuning::default().sync_apply_batch;
+        let mut names: HashMap<Digest, Vec<u8>> = HashMap::new();
+        let mut unnamed = HashSet::new();
         let mut keys = BTreeMap::new();
         let mut at = from;
         while at < bounds.end {
@@ -345,16 +342,19 @@ where
                         names.insert(name, entry.key.clone());
                         keys.insert(entry.key, Some(entry.value));
                     }
-                    Op::Delete(name) => {
-                        if let Some(key) = names.get(&name) {
+                    Op::Delete(name) => match names.get(&name) {
+                        Some(key) => {
                             keys.insert(key.clone(), None);
                         }
-                    }
+                        None => {
+                            unnamed.insert(name);
+                        }
+                    },
                     Op::CommitFloor(_, _) => {}
                 }
             }
         }
-        Ok(keys)
+        Ok((keys, unnamed))
     }
 }
 

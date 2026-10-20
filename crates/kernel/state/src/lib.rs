@@ -3,7 +3,7 @@ mod overlay;
 mod storage;
 mod view;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use abi::{ProgramId, Root};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -72,13 +72,31 @@ pub struct Adoption {
 
 struct Adopted {
     end: commonware_storage::merkle::Location<Family>,
-    names: HashMap<commonware_cryptography::sha256::Digest, Vec<u8>>,
 }
 
 impl Adoption {
     pub fn replaced(&self) -> &BTreeSet<ProgramId> {
         &self.replaced
     }
+}
+
+fn deleted_by_digest(
+    storage: &Storage,
+    program: &str,
+    mut unnamed: HashSet<commonware_cryptography::sha256::Digest>,
+    keys: &mut BTreeMap<Vec<u8>, Slot>,
+) -> Result<()> {
+    for entry in storage.iter(program, b"", None, false)? {
+        if unnamed.is_empty() {
+            break;
+        }
+        let (key, _) = entry?;
+        let deleted = unnamed.remove(&digest(&key));
+        if deleted {
+            keys.entry(key).or_insert(None);
+        }
+    }
+    Ok(())
 }
 
 pub struct Store<E>
@@ -184,14 +202,14 @@ where
         let mut replaced = BTreeSet::new();
         for (program, commitment) in &commitments {
             let changed = match earlier.remove(program) {
-                Some(Adopted { end, mut names }) => commitment
-                    .changes(end, &mut names)
-                    .await?
-                    .map(|keys| (keys, names)),
+                Some(Adopted { end }) => commitment.changes(end).await?,
                 None => None,
             };
-            let (keys, names) = match changed {
-                Some(changed) => changed,
+            let keys = match changed {
+                Some((mut keys, unnamed)) => {
+                    deleted_by_digest(&storage, program, unnamed, &mut keys)?;
+                    keys
+                }
                 None => {
                     replaced.insert(program.clone());
                     commitment.indexed().await?
@@ -199,9 +217,7 @@ where
             };
             writes.programs.insert(program.clone(), keys);
             let end = commitment.end()?;
-            adoption
-                .adopted
-                .insert(program.clone(), Adopted { end, names });
+            adoption.adopted.insert(program.clone(), Adopted { end });
         }
         replaced.extend(earlier.into_keys());
         if first {

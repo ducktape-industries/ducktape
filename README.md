@@ -663,8 +663,9 @@ or a program runs it as code. A row written before rows named their holders
 names none, and nothing releases it. A joiner streams every blob its adopted
 state names and notes the ones its source no longer serves. If any are noted
 and the source's head has moved, it syncs to the new head, writes only the
-keys that changed since it last adopted, and fetches only what it still
-lacks. Once it has every blob, it deletes each one it fetched that the state it
+keys that changed since it last adopted (a program whose log no longer reaches
+back that far, or one admitted or dropped since, is rewritten whole), and
+fetches only what it still lacks. Once it has every blob, it deletes each one it fetched that the state it
 ends at no longer names. A source that refuses a blob its own tip names ends
 the join. New program
 code is a bundle of kind `program`: the programs role schedules only code the
