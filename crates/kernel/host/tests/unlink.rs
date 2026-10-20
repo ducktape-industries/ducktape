@@ -181,7 +181,7 @@ fn a_release_on_a_line_logs_no_blob_unlink_failed() {
             assert_eq!(*seen.0.lock().unwrap(), Vec::<String>::new());
 
             let id = blob_id("part", b"stuck on disk");
-            let put = HostOp::BlobPut {
+            let put = HostOp::BlobPutAlone {
                 hash: HashKind::Sha256,
                 kind: "part".to_owned(),
                 body: b"stuck on disk".to_vec(),

@@ -339,11 +339,7 @@ mod context {
             kind: impl Into<String>,
             body: impl Into<Vec<u8>>,
         ) -> Result<BlobId, Refusal> {
-            match host(&HostOp::BlobPut {
-                hash,
-                kind: kind.into(),
-                body: body.into(),
-            }) {
+            match host(&HostOp::put(hash, kind.into(), body.into(), None)) {
                 HostReply::BlobId(id) => Ok(id),
                 HostReply::Refused(refusal) => Err(refusal),
                 other => protocol("blob id", other),

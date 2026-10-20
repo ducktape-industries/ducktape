@@ -397,7 +397,7 @@ pub enum HostOp {
     Scan(Scan),
     CommittedGet(Vec<u8>),
     CommittedScan(Scan),
-    BlobPut {
+    BlobPutAlone {
         hash: HashKind,
         kind: String,
         body: Vec<u8>,
@@ -440,7 +440,7 @@ pub enum HostOp {
         kind: String,
     },
     BlobRelease(BlobId),
-    BlobKeep {
+    BlobPut {
         hash: HashKind,
         kind: String,
         body: Vec<u8>,
@@ -462,8 +462,8 @@ pub struct Put<'a> {
 impl HostOp {
     pub fn put(hash: HashKind, kind: String, body: Vec<u8>, line: Option<Vec<u8>>) -> HostOp {
         match line {
-            None => HostOp::BlobPut { hash, kind, body },
-            Some(line) => HostOp::BlobKeep {
+            None => HostOp::BlobPutAlone { hash, kind, body },
+            Some(line) => HostOp::BlobPut {
                 hash,
                 kind,
                 body,
@@ -474,13 +474,13 @@ impl HostOp {
 
     pub fn as_put(&self) -> Option<Put<'_>> {
         match self {
-            HostOp::BlobPut { hash, kind, body } => Some(Put {
+            HostOp::BlobPutAlone { hash, kind, body } => Some(Put {
                 hash: *hash,
                 kind,
                 body,
                 line: None,
             }),
-            HostOp::BlobKeep {
+            HostOp::BlobPut {
                 hash,
                 kind,
                 body,
@@ -2134,10 +2134,12 @@ mod tests {
         );
         assert_eq!(alone.as_put().unwrap().line, None);
         assert_eq!(release.as_put(), None);
+        assert!(matches!(line, HostOp::BlobPut { .. }));
+        assert!(matches!(alone, HostOp::BlobPutAlone { .. }));
     }
 
     #[test]
-    fn a_release_by_line_prefix_takes_the_tag_after_blob_keep() {
+    fn a_release_by_line_prefix_takes_the_tag_after_the_put_on_a_line() {
         let lines = HostOp::BlobReleaseLines {
             prefix: b"scratch/".to_vec(),
         };

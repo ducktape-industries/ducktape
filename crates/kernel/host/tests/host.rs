@@ -1769,7 +1769,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
         let put = || {
-            op(HostOp::BlobPut {
+            op(HostOp::BlobPutAlone {
                 hash: HashKind::Sha256,
                 kind: "page".into(),
                 body: b"body".to_vec(),
@@ -1864,7 +1864,7 @@ fn a_rejected_unit_leaves_no_writes_and_no_blobs() {
                 vec![
                     submit(
                         "probe",
-                        script(vec![op(HostOp::BlobPut {
+                        script(vec![op(HostOp::BlobPutAlone {
                             hash: HashKind::Sha1,
                             kind: "note".into(),
                             body: b"x".to_vec(),
@@ -2339,7 +2339,7 @@ fn queries_read_layers_and_the_preconfirmed_layer_dies_at_commit() {
 }
 
 fn put_blob(kind: &str, body: &[u8]) -> Step {
-    op(HostOp::BlobPut {
+    op(HostOp::BlobPutAlone {
         hash: HashKind::Sha256,
         kind: kind.to_owned(),
         body: body.to_vec(),
@@ -2742,7 +2742,7 @@ fn a_joiner_adopts_synced_commitments_and_installs_the_blobs_it_lacks() {
                     "probe",
                     script(vec![
                         set(b"k", b"v"),
-                        op(HostOp::BlobPut {
+                        op(HostOp::BlobPutAlone {
                             hash: HashKind::Sha256,
                             kind: "page".into(),
                             body: b"body".to_vec(),

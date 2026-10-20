@@ -1591,7 +1591,7 @@ fn part(body: &[u8]) -> BlobId {
 }
 
 fn put_part(body: &[u8]) -> Step {
-    Step::Op(HostOp::BlobPut {
+    Step::Op(HostOp::BlobPutAlone {
         hash: HashKind::Sha256,
         kind: "part".into(),
         body: body.to_vec(),

@@ -627,9 +627,9 @@ Consensus never waits on a blob: a program reads a blob that a program put
 or a held bundle names (`ctx.blob_get`), and a node that lacks one when a
 block reads it fetches it over halo before it applies the block. A blob's roster row
 names the programs that hold it. A put holds its blob on a line the program
-names (`BlobKeep { hash, kind, body, line }`: a path, a slot, or for a one-off
+names (`BlobPut { hash, kind, body, line }`: a path, a slot, or for a one-off
 the blob's own id) until a newer put by that program on the same line, or
-until the program lets go with the host op `BlobRelease`. `BlobPut { hash,
+until the program lets go with the host op `BlobRelease`. `BlobPutAlone { hash,
 kind, body }` holds a blob on its own line, until released, and so does every
 row written before lines existed. A program that holds one blob on several
 lines holds it while any of them does, and `BlobRelease` lets go of it on all of

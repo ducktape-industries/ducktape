@@ -282,9 +282,9 @@ where
             HostOp::Set { .. }
             | HostOp::SetOwned { .. }
             | HostOp::Delete(_)
-            | HostOp::BlobPut { .. }
+            | HostOp::BlobPutAlone { .. }
             | HostOp::BlobRelease(_)
-            | HostOp::BlobKeep { .. }
+            | HostOp::BlobPut { .. }
             | HostOp::BlobReleaseLines { .. }
             | HostOp::Emit(_)
             | HostOp::Event(_)
@@ -801,9 +801,9 @@ where
                 self.overlay.delete(&me, key);
                 HostReply::Done
             }),
-            HostOp::BlobPut { hash, kind, body } => self.put(hash, &kind, &body),
+            HostOp::BlobPutAlone { hash, kind, body } => self.put(hash, &kind, &body),
             HostOp::BlobRelease(id) => self.release(&id),
-            HostOp::BlobKeep {
+            HostOp::BlobPut {
                 hash,
                 kind,
                 body,

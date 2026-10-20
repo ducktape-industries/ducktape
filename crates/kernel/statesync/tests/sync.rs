@@ -1397,7 +1397,7 @@ impl Exchange for Churning {
 }
 
 fn put_part(body: &[u8]) -> Step {
-    Step::Op(HostOp::BlobPut {
+    Step::Op(HostOp::BlobPutAlone {
         hash: abi::HashKind::Sha256,
         kind: "part".into(),
         body: body.to_vec(),
