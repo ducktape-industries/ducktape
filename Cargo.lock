@@ -4638,6 +4638,7 @@ name = "state"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "arc-swap",
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
@@ -4659,6 +4660,7 @@ name = "statesync"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "blob",
  "borsh",
  "commonware-codec",
  "commonware-consensus",

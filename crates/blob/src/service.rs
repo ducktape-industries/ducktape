@@ -147,6 +147,12 @@ enum Pulled {
     Superseded,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Kept {
+    Landed,
+    Elsewhere,
+}
+
 struct Inner {
     halo: Arc<Halo>,
     lane: Streams<Arc<Links>>,
@@ -249,6 +255,10 @@ impl Service {
 
     pub async fn fetch(&self, id: BlobId, class: Class) {
         self.inner.fetch(id, class).await
+    }
+
+    pub async fn keep(&self, id: BlobId, framed: Vec<u8>) -> Result<Kept, &'static str> {
+        self.inner.keep(id, framed).await
     }
 
     pub async fn stage(
@@ -770,6 +780,52 @@ impl Inner {
         self.store.adopt(id, partial).map_err(|_| "unwritten")?;
         self.landed.send_modify(|landed| *landed += 1);
         Ok(Pulled::Landed)
+    }
+
+    async fn keep(self: &Arc<Self>, id: BlobId, framed: Vec<u8>) -> Result<Kept, &'static str> {
+        let Turn::Mine(mut owning) = self.turn(&id, Class::Client) else {
+            return Ok(Kept::Elsewhere);
+        };
+        if self.store.has(&id) {
+            return Ok(Kept::Elsewhere);
+        }
+        let partial = self.store.partial(&id).map_err(|_| "unwritten")?;
+        let file = generation_path(&partial, owning.generation);
+        let writing = tokio::fs::write(&file, &framed);
+        let written = unless_superseded(&mut owning.superseded, writing).await;
+        let kept = match written {
+            None => Ok(Kept::Elsewhere),
+            Some(Err(_)) => Err("unwritten"),
+            Some(Ok(())) => self.landing(&id, &file, &owning.superseded).await,
+        };
+        let landed = kept == Ok(Kept::Landed);
+        if !landed {
+            let _ = tokio::fs::remove_file(&file).await;
+        }
+        kept
+    }
+
+    async fn landing(
+        &self,
+        id: &BlobId,
+        file: &Path,
+        superseded: &watch::Receiver<()>,
+    ) -> Result<Kept, &'static str> {
+        let refused = match checked(file, id, None).await {
+            Checked::Named => None,
+            Checked::Misnamed => Some("misnamed"),
+            Checked::Collision(_) => Some("collision"),
+        };
+        if let Some(reason) = refused {
+            return Err(reason);
+        }
+        let taken_over = superseded.has_changed().is_err();
+        if taken_over {
+            return Ok(Kept::Elsewhere);
+        }
+        self.store.adopt(id, file).map_err(|_| "unwritten")?;
+        self.landed.send_modify(|landed| *landed += 1);
+        Ok(Kept::Landed)
     }
 
     async fn stage(

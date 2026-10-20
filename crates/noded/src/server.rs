@@ -145,6 +145,7 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::EGRESS_SET, post(egress_set::<E>))
         .route(route::EGRESS_LEND, get(egress_lend::<E>))
         .route(route::SYNC, post(sync::<E>))
+        .route(route::SYNC_HOLD, post(sync_hold::<E>))
         .route(route::METRICS, get(metrics::<E>))
         .route(live_wire::PORT_ROUTE, get(live_port::<E>))
         .route(route::QUERY, post(query::<E>))
@@ -791,6 +792,35 @@ async fn sync<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<statesync::R
         Ok(response) => Reply::Answered(response),
         Err(error) => failed(error),
     }
+}
+
+type Open = (tokio::sync::watch::Receiver<u64>, state::Hold);
+
+async fn sync_hold<E: Context>(ctx: Ctx<E>) -> Response {
+    let (head, hold) = match ctx.held_head().await {
+        Ok(held) => held,
+        Err(error) => return failed::<()>(error).into_response(),
+    };
+    let head = Bytes::from(length_framed(&abi::encode(&head)));
+    let Some(hold) = hold else {
+        return (StatusCode::OK, head).into_response();
+    };
+    let heights = futures::stream::unfold((ctx.tips(), hold), applied);
+    let answer = futures::stream::once(async move { Ok::<_, std::io::Error>(head) }).chain(heights);
+    (StatusCode::OK, Body::from_stream(answer)).into_response()
+}
+
+async fn applied((mut tips, hold): Open) -> Option<(std::io::Result<Bytes>, Open)> {
+    tips.changed().await.ok()?;
+    let height = *tips.borrow_and_update();
+    let line = Bytes::from(length_framed(&height.to_le_bytes()));
+    Some((Ok(line), (tips, hold)))
+}
+
+fn length_framed(bytes: &[u8]) -> Vec<u8> {
+    let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+    framed.extend_from_slice(bytes);
+    framed
 }
 
 async fn metrics<E: Context>(ctx: Ctx<E>) -> Response {

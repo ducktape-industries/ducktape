@@ -1965,12 +1965,8 @@ where
     }
 
     pub async fn drop_unnamed(&self, ids: &BTreeSet<BlobId>, time: u64) -> Result<()> {
-        let running: BTreeSet<BlobId> = self.programs()?.into_values().collect();
-        for id in ids {
-            let named = running.contains(id) || self.readable(id, time).await?;
-            if !named {
-                self.blobs.remove(id)?;
-            }
+        for id in self.source().unnamed(ids, time).await? {
+            self.blobs.remove(&id)?;
         }
         Ok(())
     }

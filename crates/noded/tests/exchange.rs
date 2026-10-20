@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use futures::StreamExt as _;
 use noded::Client;
-use statesync::{Exchange as _, Failure, Fault as _, Request};
+use statesync::{Exchange as _, Failure, Fault as _, Request, Response};
 use tokio::net::TcpListener;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -149,5 +149,63 @@ fn a_blob_answer_cut_short_is_asked_again() {
         let first = Ok(Some(b"first".to_vec()));
         let cut = Err(Failure::Transient("source_dropped"));
         assert_eq!(read, vec![first, cut]);
+    });
+}
+
+async fn hold_failure_of(base: String) -> Failure {
+    let held = Client::new(base).hold().await;
+    held.expect_err("the source held a head").failure()
+}
+
+#[test]
+fn a_hold_the_source_fails_is_asked_again() {
+    runtime().block_on(async {
+        let base = answering(StatusCode::BAD_GATEWAY).await;
+        let failure = hold_failure_of(base).await;
+        assert_eq!(failure, Failure::Transient("source_failed"));
+    });
+}
+
+#[test]
+fn a_hold_whose_connection_is_refused_is_asked_again() {
+    runtime().block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let failure = hold_failure_of(base).await;
+        assert_eq!(failure, Failure::Transient("source_unreachable"));
+    });
+}
+
+#[test]
+fn a_hold_on_a_route_the_source_does_not_serve_is_definite() {
+    runtime().block_on(async {
+        let base = answering(StatusCode::NOT_FOUND).await;
+        assert_eq!(hold_failure_of(base).await, Failure::Definite);
+    });
+}
+
+#[test]
+fn a_hold_answered_without_a_whole_head_is_definite() {
+    runtime().block_on(async {
+        let page = b"<!DOCTYPE html><html><body>a proxy's page</body></html>".to_vec();
+        for answer in [Vec::new(), page] {
+            let base = streaming(vec![answer]).await;
+            assert_eq!(hold_failure_of(base).await, Failure::Definite);
+        }
+    });
+}
+
+#[test]
+fn a_hold_whose_head_arrives_in_pieces_takes_it_whole() {
+    runtime().block_on(async {
+        let refusal = abi::Refusal::new(abi::reason::NOT_FOUND, "a head sent in pieces");
+        let encoded = abi::encode(&Response::Refused(refusal));
+        let mut framed = (encoded.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&encoded);
+        let chunks = framed.chunks(3).map(<[u8]>::to_vec).collect();
+        let base = streaming(chunks).await;
+        let (head, _holding) = Client::new(base).hold().await.unwrap();
+        assert_eq!(abi::encode(&head), encoded);
     });
 }

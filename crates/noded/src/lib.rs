@@ -8,6 +8,7 @@ mod cores;
 mod ctx;
 mod egress;
 mod endpoint;
+mod fill;
 mod history;
 mod link;
 pub mod live;
@@ -215,6 +216,11 @@ impl<E: Context> Daemon<E> {
 
     pub async fn hold(&self) -> Result<Held> {
         self.writer.hold().await
+    }
+
+    pub async fn held_head(&self) -> Result<(statesync::Response, Option<state::Hold>)> {
+        let (served, hold) = self.writer.held_head().await?;
+        Ok((statesync::anchored(served, &self.anchors).await, hold))
     }
 
     pub async fn sync(&self, request: statesync::Request) -> Result<statesync::Response> {

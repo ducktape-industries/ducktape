@@ -34,6 +34,7 @@ pub mod route {
     pub const EGRESS_SET: &str = "/v1/egress/set";
     pub const EGRESS_LEND: &str = "/v1/egress/lend";
     pub const SYNC: &str = "/v1/sync";
+    pub const SYNC_HOLD: &str = "/v1/sync/hold";
     pub const NETWORK: &str = "/v1/network";
     pub const P2P: &str = "/v1/p2p";
     pub const METRICS: &str = "/metrics";

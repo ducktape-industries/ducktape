@@ -217,6 +217,7 @@ struct Source {
     context: Ctx,
     genesis: Block,
     certificates: Mutex<BTreeMap<u64, Certificate>>,
+    blocks: Mutex<Vec<Block>>,
 }
 
 impl Anchors for Source {
@@ -246,6 +247,15 @@ impl Exchange for Loopback {
         drop(node);
         let response = anchored(served, &*self.0).await;
         Ok(abi::decode(&abi::encode(&response)).unwrap())
+    }
+
+    async fn hold(&self) -> Result<(Response, statesync::Holding), Infallible> {
+        let node = self.0.node.lock().await;
+        let (served, hold) = statesync::held(&node);
+        drop(node);
+        let response = anchored(served, &*self.0).await;
+        let holding: statesync::Holding = Box::new(hold);
+        Ok((abi::decode(&abi::encode(&response)).unwrap(), holding))
     }
 
     fn stream_blobs(
@@ -413,10 +423,10 @@ async fn advance(
     frames: Vec<Vec<u8>>,
 ) -> Tip {
     let mut node = source.node.lock().await;
-    let tip = seal(&source.context, &mut node, frames, node::Preconfirm::On)
-        .await
-        .tip();
+    let block = seal(&source.context, &mut node, frames, node::Preconfirm::On).await;
     drop(node);
+    let tip = block.tip();
+    source.blocks.lock().unwrap().push(block);
     let certificate = certify(keys, members, tip);
     source
         .certificates
@@ -458,6 +468,7 @@ async fn found_as(context: &Ctx, name: &'static str) -> Network {
             context: context.child("pool"),
             genesis,
             certificates: Mutex::new(BTreeMap::new()),
+            blocks: Mutex::new(Vec::new()),
         }),
         _dir: dir,
     }
@@ -1117,6 +1128,13 @@ fn a_dropped_program_left_half_synced_is_removed() {
 const PRUNES: usize = 3;
 const CHURN_ROUNDS: u64 = 200;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    Unheld,
+    Held,
+    Restarted,
+}
+
 #[derive(Clone)]
 struct Pruning {
     source: Loopback,
@@ -1126,6 +1144,26 @@ struct Pruning {
     heads: Arc<AtomicUsize>,
     stale: Arc<AtomicUsize>,
     prunes: Arc<Mutex<Vec<u64>>>,
+    hold: Hold,
+    releases: Vec<Vec<u8>>,
+    kept: Arc<Mutex<Vec<statesync::Holding>>>,
+    passed: Arc<Mutex<Option<(u64, u64, u64)>>>,
+}
+
+fn pruning_source(network: &Network, hold: Hold, releases: Vec<Vec<u8>>) -> Pruning {
+    Pruning {
+        source: network.exchange(),
+        keys: network.keys.clone(),
+        members: network.members.clone(),
+        held: Arc::new(AtomicUsize::new(0)),
+        heads: Arc::new(AtomicUsize::new(0)),
+        stale: Arc::new(AtomicUsize::new(0)),
+        prunes: Arc::new(Mutex::new(Vec::new())),
+        hold,
+        releases,
+        kept: Arc::new(Mutex::new(Vec::new())),
+        passed: Arc::new(Mutex::new(None)),
+    }
 }
 
 impl Pruning {
@@ -1133,6 +1171,12 @@ impl Pruning {
         let node = self.source.0.node.lock().await;
         let commitment = node.host().store().commitment("probe").unwrap();
         *commitment.db().unwrap().bounds().start
+    }
+
+    async fn probe_floor(&self) -> u64 {
+        let node = self.source.0.node.lock().await;
+        let commitment = node.host().store().commitment("probe").unwrap();
+        *commitment.db().unwrap().sync_boundary()
     }
 
     async fn prune_past(&self, start: u64) {
@@ -1149,6 +1193,24 @@ impl Pruning {
         starts.dedup();
         *self.prunes.lock().unwrap() = starts;
     }
+
+    async fn churn_past_floor(&self, start: u64) {
+        if !self.releases.is_empty() {
+            let releases = self.releases.clone();
+            advance(&self.source.0, &self.keys, &self.members, releases).await;
+        }
+        let section = state::Tuning::default().items_per_section.get();
+        for round in 0..CHURN_ROUNDS {
+            let floor_passed = self.probe_floor().await > start + section;
+            if floor_passed {
+                break;
+            }
+            advance(&self.source.0, &self.keys, &self.members, churn(round)).await;
+        }
+        let floor = self.probe_floor().await;
+        let kept = self.probe_start().await;
+        *self.passed.lock().unwrap() = Some((start, floor, kept));
+    }
 }
 
 impl Exchange for Pruning {
@@ -1158,7 +1220,14 @@ impl Exchange for Pruning {
         let held =
             probe_sync(Asked::Request(&request)) && self.held.fetch_add(1, Ordering::SeqCst) == 0;
         if let (true, Some(start)) = (held, sync_start(&request)) {
-            self.prune_past(start).await;
+            match self.hold {
+                Hold::Unheld => self.prune_past(start).await,
+                Hold::Held => self.churn_past_floor(start).await,
+                Hold::Restarted => {
+                    self.kept.lock().unwrap().clear();
+                    self.prune_past(start).await;
+                }
+            }
         }
         let response = self.source.exchange(request).await?;
         match &response {
@@ -1171,6 +1240,22 @@ impl Exchange for Pruning {
             Response::Sync(_) | Response::Refused(_) => {}
         }
         Ok(response)
+    }
+
+    async fn hold(&self) -> Result<(Response, statesync::Holding), Infallible> {
+        if self.hold == Hold::Unheld {
+            let head = self.exchange(Request::Head).await?;
+            let unheld: statesync::Holding = Box::new(());
+            return Ok((head, unheld));
+        }
+        self.heads.fetch_add(1, Ordering::SeqCst);
+        let (head, holding) = self.source.hold().await?;
+        if self.hold == Hold::Held {
+            return Ok((head, holding));
+        }
+        self.kept.lock().unwrap().push(holding);
+        let restartable: statesync::Holding = Box::new(());
+        Ok((head, restartable))
     }
 
     fn stream_blobs(
@@ -1208,15 +1293,7 @@ fn a_join_the_source_prunes_past_reads_the_head_again_and_adopts_the_later_root(
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         let first = network.advance(churn(CHURN_ROUNDS)).await;
-        let pruning = Pruning {
-            source: network.exchange(),
-            keys: network.keys.clone(),
-            members: network.members.clone(),
-            held: Arc::new(AtomicUsize::new(0)),
-            heads: Arc::new(AtomicUsize::new(0)),
-            stale: Arc::new(AtomicUsize::new(0)),
-            prunes: Arc::new(Mutex::new(Vec::new())),
-        };
+        let pruning = pruning_source(&network, Hold::Unheld, Vec::new());
 
         let dir = tempfile::tempdir().unwrap();
         let joined = join(
@@ -1327,67 +1404,109 @@ fn put_part(body: &[u8]) -> Step {
     })
 }
 
-const SHARED: &[u8] = b"the part every call shares";
-const CHURNING_ROUNDS: usize = 3;
+struct Installing<'a> {
+    node: &'a mut Node<Ctx>,
+    catching_up: Option<Arc<Source>>,
+    installed: Vec<BlobId>,
+}
 
-fn released_and_put_again(round: usize, asked: &[BlobId]) -> Vec<Vec<Step>> {
-    if round >= CHURNING_ROUNDS {
+impl statesync::Install for Installing<'_> {
+    async fn install(&mut self, id: BlobId, framed: Vec<u8>) -> statesync::Result<()> {
+        if let Some(source) = &self.catching_up {
+            caught_up(self.node, source).await;
+        }
+        self.node.install(id, &framed)?;
+        self.installed.push(id);
+        Ok(())
+    }
+}
+
+async fn caught_up(node: &mut Node<Ctx>, source: &Source) {
+    let tip = node.tip().unwrap().height;
+    let unapplied: Vec<Block> = source
+        .blocks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|block| block.height > tip)
+        .cloned()
+        .collect();
+    for block in unapplied {
+        node.apply(&block).await.unwrap();
+    }
+}
+
+fn released(round: usize, asked: &[BlobId]) -> Vec<Vec<Step>> {
+    if round > 0 {
         return Vec::new();
     }
     let released = asked
         .iter()
         .map(|id| Step::Op(HostOp::BlobRelease(*id)))
         .collect();
-    let first = format!("the request of call {round}");
-    let second = format!("the answer of call {round}");
-    let put = vec![
-        put_part(SHARED),
-        put_part(first.as_bytes()),
-        put_part(second.as_bytes()),
-    ];
-    vec![released, put]
+    vec![released]
 }
 
 #[test]
-fn a_join_whose_parts_are_released_and_put_again_while_it_streams_finishes() {
+fn a_fill_whose_blobs_are_released_while_it_streams_goes_past_them_and_keeps_no_unnamed_file() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
-        let parts = vec![put_part(SHARED), put_part(b"a"), put_part(b"b")];
-        let adopted = network.advance(vec![frame(&key(11), parts)]).await;
-        let churning = Churning {
-            source: network.exchange(),
-            keys: network.keys.clone(),
-            members: network.members.clone(),
-            churn: released_and_put_again,
-            asked: Arc::new(Mutex::new(Vec::new())),
-        };
+        let parts = vec![put_part(b"a"), put_part(b"b"), put_part(b"c")];
+        network.advance(vec![frame(&key(11), parts)]).await;
         let dir = tempfile::tempdir().unwrap();
-        let joined = join(
+        let mut joined = join(
             context.child("joiner"),
             "joiner",
             dir.path(),
             NETWORK.to_vec(),
             PAUSE,
-            churning.clone(),
+            network.exchange(),
         )
         .await
         .unwrap();
+        let missing = joined.node.host().missing_blobs().unwrap();
+        assert_eq!(missing.len(), 3, "the join fetched only the programs' code");
 
-        let asked = churning.asked.lock().unwrap().clone();
-        assert_eq!(asked.len(), CHURNING_ROUNDS + 1, "{asked:?}");
-        let source = network.source.node.lock().await;
-        let tip = source.tip().unwrap();
-        assert!(tip.height > adopted.height);
-        assert_eq!(joined.node.tip().unwrap(), tip);
+        let churning = Churning {
+            source: network.exchange(),
+            keys: network.keys.clone(),
+            members: network.members.clone(),
+            churn: released,
+            asked: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut filling = Installing {
+            node: &mut joined.node,
+            catching_up: Some(network.source.clone()),
+            installed: Vec::new(),
+        };
+        let unserved = statesync::fill(
+            context.child("fill"),
+            PAUSE,
+            churning.clone(),
+            missing.clone(),
+            &mut filling,
+        )
+        .await
+        .unwrap();
+        let landed: std::collections::BTreeSet<BlobId> =
+            filling.installed.iter().copied().collect();
+        assert_eq!(churning.asked.lock().unwrap().len(), 1);
         assert_eq!(
-            joined.node.host().root().unwrap(),
-            source.host().root().unwrap()
+            landed.len(),
+            1,
+            "only the blob read before the release lands"
         );
-        assert!(joined.node.host().missing_blobs().unwrap().is_empty());
+        assert_eq!(unserved.len(), missing.len() - 1);
+
         let now = joined.node.now();
-        for id in asked.iter().flatten() {
+        for id in &landed {
             let named = joined.node.host().readable(id, now).await.unwrap();
-            assert_eq!(joined.node.host().blobs().has(id), named, "{id:?}");
+            let held = joined.node.host().blobs().has(id);
+            assert!(!named && held, "{id:?} landed after its node released it");
+        }
+        joined.node.host().drop_unnamed(&landed, now).await.unwrap();
+        for id in &missing {
+            assert!(!joined.node.host().blobs().has(id), "{id:?} stays unnamed");
         }
     });
 }
@@ -1592,5 +1711,185 @@ fn a_definite_failure_ends_the_join_at_once() {
             .err()
             .expect("a definite failure ends the join");
         assert!(matches!(error, Error::Exchange(_)), "{error}");
+    });
+}
+
+struct Kept(Vec<BlobId>);
+
+impl statesync::Install for Kept {
+    async fn install(&mut self, id: BlobId, _: Vec<u8>) -> statesync::Result<()> {
+        self.0.push(id);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_fill_cut_mid_way_asks_for_what_it_lacks_and_installs_each_blob_once() {
+    deterministic::Runner::default().start(|context| async move {
+        let network = found(&context).await;
+        let programs = network.source.node.lock().await.host().programs().unwrap();
+        let code: std::collections::BTreeSet<BlobId> = programs.into_values().collect();
+        let ids: Vec<BlobId> = code.into_iter().collect();
+        assert!(ids.len() > 1, "the network names {} blobs", ids.len());
+        let transient = Failure::Transient("source_down");
+        let (broken, mut told) = cut(&network, past_the_first_blob, transient);
+        let mut kept = Kept(Vec::new());
+        let filling = statesync::fill(
+            context.child("fill"),
+            PAUSE,
+            broken.clone(),
+            ids.clone(),
+            &mut kept,
+        );
+        let restoring = async {
+            for _ in 0..ASKED_WHILE_DOWN {
+                told.next().await.unwrap();
+            }
+            broken.restore();
+        };
+        let (filled, ()) = futures::join!(filling, restoring);
+        assert_eq!(filled.unwrap(), Vec::<BlobId>::new());
+        assert_eq!(kept.0, ids);
+    });
+}
+
+#[test]
+fn a_join_holding_its_head_adopts_it_while_the_source_churns_past_its_floor() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let first = network.advance(churn(CHURN_ROUNDS)).await;
+        let holding = pruning_source(&network, Hold::Held, Vec::new());
+
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            holding.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(holding.stale.load(Ordering::SeqCst), 0);
+        assert_eq!(holding.heads.load(Ordering::SeqCst), 1);
+        assert_eq!(joined.node.tip().unwrap(), first);
+        let (start, floor, kept) = holding.passed.lock().unwrap().unwrap();
+        assert!(
+            floor > start,
+            "probe's floor {floor} reached past the held {start}"
+        );
+        assert!(
+            kept <= start,
+            "probe kept from {kept} while {start} was held"
+        );
+
+        network.advance(churn(CHURN_ROUNDS + 1)).await;
+        let section = state::Tuning::default().items_per_section.get();
+        assert!(
+            floor > start + section,
+            "the floor {floor} is a section past {start}"
+        );
+        let released = holding.probe_start().await;
+        assert!(
+            released > start,
+            "probe prunes to {released} once the hold is gone"
+        );
+    });
+}
+
+#[test]
+fn a_join_whose_source_restarts_mid_sync_holds_the_new_head_and_finishes() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let first = network.advance(churn(CHURN_ROUNDS)).await;
+        let restarting = pruning_source(&network, Hold::Restarted, Vec::new());
+
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            restarting.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restarting.stale.load(Ordering::SeqCst), 1);
+        assert_eq!(restarting.heads.load(Ordering::SeqCst), 2);
+        let source = network.source.node.lock().await;
+        let tip = source.tip().unwrap();
+        assert!(tip.height > first.height);
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(
+            joined.node.host().root().unwrap(),
+            source.host().root().unwrap()
+        );
+    });
+}
+
+fn part(body: &[u8]) -> BlobId {
+    blob::id_of(abi::HashKind::Sha256, &blob::frame("part", body).unwrap()).unwrap()
+}
+
+#[test]
+fn a_release_that_lands_while_a_join_holds_its_head_leaves_the_join_on_that_head() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let parts = vec![put_part(b"released"), put_part(b"kept")];
+        network.advance(vec![frame(&key(11), parts)]).await;
+        let first = network.advance(churn(CHURN_ROUNDS)).await;
+        let release = vec![Step::Op(HostOp::BlobRelease(part(b"released")))];
+        let holding = pruning_source(&network, Hold::Held, vec![frame(&key(11), release)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            holding.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(holding.stale.load(Ordering::SeqCst), 0);
+        assert_eq!(holding.heads.load(Ordering::SeqCst), 1);
+        assert_eq!(joined.node.tip().unwrap(), first);
+        let now = joined.node.now();
+        let named = joined
+            .node
+            .host()
+            .readable(&part(b"released"), now)
+            .await
+            .unwrap();
+        assert!(named, "the held head names the part released after it");
+        let mut missing = joined.node.host().missing_blobs().unwrap();
+        missing.sort();
+        let mut parts = vec![part(b"released"), part(b"kept")];
+        parts.sort();
+        assert_eq!(missing, parts, "the join fetched only the programs' code");
+
+        let mut filling = Installing {
+            node: &mut joined.node,
+            catching_up: None,
+            installed: Vec::new(),
+        };
+        let unserved = statesync::fill(
+            context.child("fill"),
+            PAUSE,
+            network.exchange(),
+            missing,
+            &mut filling,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unserved, vec![part(b"released")]);
+        assert_eq!(filling.installed, vec![part(b"kept")]);
+        assert!(!joined.node.host().blobs().has(&part(b"released")));
     });
 }

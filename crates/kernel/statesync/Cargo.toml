@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+blob = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-utils = { workspace = true }
 fixture-programs = { path = "../fixtures/programs" }

@@ -151,6 +151,18 @@ where
             .await
     }
 
+    pub async fn unnamed(&self, ids: &BTreeSet<BlobId>, time: u64) -> Result<Vec<BlobId>> {
+        let running: BTreeSet<BlobId> = self.programs()?.into_values().collect();
+        let mut unnamed = Vec::new();
+        for id in ids {
+            let named = running.contains(id) || self.readable(id, time).await?;
+            if !named {
+                unnamed.push(*id);
+            }
+        }
+        Ok(unnamed)
+    }
+
     pub(crate) async fn readable_in(
         &self,
         id: &BlobId,

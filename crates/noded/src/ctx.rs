@@ -102,6 +102,14 @@ impl<E: Context> Ctx<E> {
         self.daemon.sync(request).await
     }
 
+    pub(crate) async fn held_head(&self) -> Result<(statesync::Response, Option<state::Hold>)> {
+        self.daemon.held_head().await
+    }
+
+    pub(crate) fn tips(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.daemon.tips.subscribe()
+    }
+
     pub(crate) async fn network(&self) -> Result<Network> {
         self.daemon.network().await
     }

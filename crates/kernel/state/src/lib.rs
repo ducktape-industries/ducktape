@@ -1,4 +1,5 @@
 mod commitment;
+mod holds;
 mod overlay;
 mod storage;
 mod view;
@@ -11,6 +12,7 @@ use commonware_runtime::{Clock, Spawner};
 use commonware_storage::Context;
 
 pub use commitment::{Commitment, Db, Family, Op, SyncTarget, Tuning, codec_config, digest};
+pub use holds::{Hold, Holds};
 pub use overlay::{Checkpoint, Overlay, Slot};
 pub use storage::{RESERVED_PREFIX, Reads, Storage, reserved, valid_program_id};
 pub use view::View;
@@ -107,6 +109,7 @@ where
     name: String,
     storage: Storage,
     commitments: BTreeMap<ProgramId, Commitment<E>>,
+    holds: Holds,
 }
 
 impl<E> Store<E>
@@ -124,6 +127,7 @@ where
             name: name.to_owned(),
             storage,
             commitments: BTreeMap::new(),
+            holds: Holds::default(),
         };
         // only a founding opens a store with no committed height, and
         // nothing under its name is its own: a failed founding's or join's
@@ -231,6 +235,7 @@ where
             name: name.to_owned(),
             storage,
             commitments,
+            holds: Holds::default(),
         })
     }
 
@@ -291,7 +296,9 @@ where
             let committed = commitment.height().await?;
             let behind = committed.is_none_or(|committed| committed < height);
             if behind {
-                commitment.apply(height, writes).await?;
+                commitment
+                    .apply(height, writes, self.holds.floor(program))
+                    .await?;
             }
         }
         Ok(())
@@ -303,6 +310,10 @@ where
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    pub fn holds(&self) -> &Holds {
+        &self.holds
     }
 
     pub fn clock(&self) -> &E {
@@ -377,12 +388,13 @@ where
             )));
         }
         self.storage.commit(height, &writes)?;
+        let holds = &self.holds;
         let applies = self
             .commitments
             .iter_mut()
             .filter_map(|(program, commitment)| {
                 let keys = writes.programs.get(program)?;
-                Some(commitment.apply(height, keys))
+                Some(commitment.apply(height, keys, holds.floor(program)))
             });
         futures::future::try_join_all(applies).await?;
         Ok(())

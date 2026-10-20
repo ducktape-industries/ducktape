@@ -7,6 +7,7 @@ use commonware_storage::qmdb::sync::Source as _;
 use consensus::MarshalMailbox;
 use host::Tip;
 use node::Node;
+use state::Hold;
 
 use crate::Anchor;
 use crate::wire::{Head, Request, Response};
@@ -60,6 +61,23 @@ pub async fn anchored<A: Anchors>(served: Served, anchors: &A) -> Response {
         }),
         Err(refusal) => Response::Refused(refusal),
     }
+}
+
+pub fn held<E: Context>(node: &Node<E>) -> (Served, Option<Hold>) {
+    let served = head(node);
+    let Served::Unanchored {
+        targets: Ok(targets),
+        ..
+    } = &served
+    else {
+        return (served, None);
+    };
+    let starts = targets
+        .iter()
+        .map(|(program, target)| (program.clone(), *target.range.start()))
+        .collect();
+    let hold = node.host().store().holds().hold(starts);
+    (served, Some(hold))
 }
 
 fn head<E: Context>(node: &Node<E>) -> Served {

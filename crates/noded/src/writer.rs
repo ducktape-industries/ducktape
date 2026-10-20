@@ -11,11 +11,16 @@ pub(crate) enum Command {
     Sync(Sync),
     Hold(Hold),
     Close(oneshot::Sender<Result<u64>>),
+    Head(Head),
 }
 
 pub(crate) struct Sync {
     pub(crate) request: statesync::Request,
     pub(crate) reply: oneshot::Sender<statesync::Served>,
+}
+
+pub(crate) struct Head {
+    pub(crate) reply: oneshot::Sender<(statesync::Served, Option<state::Hold>)>,
 }
 
 pub(crate) struct Hold {
@@ -56,6 +61,11 @@ impl Writer {
         let (reply, answer) = oneshot::channel();
         self.ask(Command::Sync(Sync { request, reply }), answer)
             .await
+    }
+
+    pub(crate) async fn held_head(&self) -> Result<(statesync::Served, Option<state::Hold>)> {
+        let (reply, answer) = oneshot::channel();
+        self.ask(Command::Head(Head { reply }), answer).await
     }
 
     pub(crate) async fn hold(&self) -> Result<Held> {

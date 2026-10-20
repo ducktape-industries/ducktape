@@ -257,8 +257,13 @@ ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100
 
 Any node joins through a running one. `join` signs an enrollment with the
 node's key and sends it to the program in the validators role. Once the
-epoch that seats the node begins, `join` adopts the network's state, and the
-node runs like a founder. A stranger joins as a resident: it follows the
+epoch that seats the node begins, `join` adopts the network's state and
+fetches every program's code, and the node runs like a founder. While it
+syncs the state, `join` holds the head it read open (`POST /v1/sync/hold`):
+the node it joins through prunes nothing that head needs until the hold
+closes, once the state is synced or the joiner goes away, so a busy network
+cannot prune past a slow join. `run` fetches every other blob the state names
+afterwards (see the blobs below). A stranger joins as a resident: it follows the
 chain and never votes or proposes. A validator named in the file joins the
 same way and keeps its seat.
 
@@ -281,7 +286,8 @@ leave. Each prints the block that carried it.
 
 The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
-from, the address its HTTP surface bound, the runtime's storage and, when the
+from, the node a joined node read its state from (`source`), the address its
+HTTP surface bound, the runtime's storage and, when the
 operator writes them, `node.toml`, `egress.toml` and `egress-grants`. Under `schemas/` the
 CLI keeps the schema section of each program code it has spoken to in JSON,
 named by the code's id, so `ducktape query` and `ducktape op` fetch a code
@@ -660,14 +666,26 @@ names the programs that put it, and a program lets go of its own hold with the
 host op `BlobRelease`. Once no program holds it, the row goes, and after that
 block commits the node deletes the blob's file, unless a held bundle names it
 or a program runs it as code. A row written before rows named their holders
-names none, and nothing releases it. A joiner streams every blob its adopted
-state names and notes the ones its source no longer serves. If any are noted
-and the source's head has moved, it syncs to the new head, writes only the
-keys that changed since it last adopted (a program whose log no longer reaches
-back that far, or one admitted or dropped since, is rewritten whole), and
-fetches only what it still lacks. Once it has every blob, it deletes each one it fetched that the state it
-ends at no longer names. A source that refuses a blob its own tip names ends
-the join. New program
+names none, and nothing releases it. A joiner streams only the programs' code
+and notes any its source no longer serves. If any is noted and the source's
+head has moved, it syncs to the new head, holding it as it holds the first,
+writes only the keys that changed since it last adopted (a program whose log
+no longer reaches back that far, or one admitted or dropped since, is
+rewritten whole), and fetches only the code it still lacks. Once it has all
+of it, it deletes each blob it fetched that the state it ends at no longer
+names. A source that refuses code its own tip names ends the join. Every other
+blob comes after: when a joined node starts, `run` asks the node it joined
+through (the workspace's `source`) for every blob its state names and it
+lacks, in one stream on the RPC threads, beside the blocks. It writes each
+blob through the same per-blob owner a fetch over halo takes, so it leaves a
+blob another fetch is pulling to that fetch, and a block that needs a blob
+takes it over. It goes past each blob the source no longer serves. Once the
+stream ends and the next block has applied, it deletes each blob it fetched
+that the state no longer names, so a release that landed while a blob was on
+its way leaves no file. A node holds every blob once `GET /v1/blob/missing`
+answers none. A source that has gone away is asked again every block time
+(`join_unanswered`, logged on the first try and every tenth): deleting the
+workspace's `source` file and restarting the node stops it. New program
 code is a bundle of kind `program`: the programs role schedules only code the
 blobs program reports held.
 

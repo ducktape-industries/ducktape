@@ -223,7 +223,12 @@ where
         }))
     }
 
-    pub async fn apply(&mut self, height: u64, writes: &BTreeMap<Vec<u8>, Slot>) -> Result<()> {
+    pub async fn apply(
+        &mut self,
+        height: u64,
+        writes: &BTreeMap<Vec<u8>, Slot>,
+        held: Option<u64>,
+    ) -> Result<()> {
         let db = self
             .db
             .take()
@@ -247,7 +252,7 @@ where
         };
         let (db, _) = db.apply_batch(batch).await?;
         let db = db.commit().await?;
-        self.db = Some(self.pruned(db).await?);
+        self.db = Some(self.pruned(db, held).await?);
         Ok(())
     }
 
@@ -260,8 +265,9 @@ where
         Ok(())
     }
 
-    async fn pruned(&self, db: Db<E>) -> Result<Db<E>> {
-        let floor = db.sync_boundary();
+    async fn pruned(&self, db: Db<E>, held: Option<u64>) -> Result<Db<E>> {
+        let boundary = db.sync_boundary();
+        let floor = held.map_or(boundary, |held| boundary.min(Location::new(held)));
         let from = db.bounds().start;
         let section = Tuning::default().items_per_section.get();
         let drops_a_section = *floor / section > *from / section;

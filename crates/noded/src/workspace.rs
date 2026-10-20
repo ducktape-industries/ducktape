@@ -21,6 +21,7 @@ const IDENTITY: &str = "identity.key";
 const DESCRIPTOR: &str = "network";
 const ANCHOR: &str = "anchor";
 const HTTP: &str = "http";
+const SOURCE: &str = "source";
 const RUNTIME: &str = "runtime";
 const EGRESS: &str = "egress.toml";
 const EGRESS_FRESH: &str = "egress.toml.fresh";
@@ -110,6 +111,18 @@ impl Workspace {
 
     pub fn write_http(&self, address: SocketAddr) -> Result<()> {
         Ok(std::fs::write(self.dir.join(HTTP), address.to_string())?)
+    }
+
+    pub fn source(&self) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.dir.join(SOURCE)) {
+            Ok(text) => Ok(Some(text.trim().to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn write_source(&self, base: &str) -> Result<()> {
+        Ok(std::fs::write(self.dir.join(SOURCE), base)?)
     }
 
     pub(crate) fn egress(&self) -> std::result::Result<EgressConfig, EgressRefused> {

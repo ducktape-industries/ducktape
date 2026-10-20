@@ -19,7 +19,7 @@ use state::{Adoption, Commitment, SyncFailure, SyncTarget, commitment_name};
 pub use consensus::Anchor;
 pub use consensus::Context;
 pub use remote::Remote;
-pub use serve::{Anchors, Served, anchored, serve};
+pub use serve::{Anchors, Served, anchored, held, serve};
 pub use wire::{Head, Request, Response};
 
 pub type SyncRequest = sync::Request<state::Family>;
@@ -57,9 +57,13 @@ pub enum Error {
     Blob(BlobId),
     #[error("the peer answered {answered} blobs of the {asked} asked")]
     Blobs { asked: usize, answered: usize },
+    #[error("blob {0:?} does not install: {1}")]
+    Install(BlobId, Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub type Holding = Box<dyn std::any::Any + Send>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
@@ -85,10 +89,24 @@ pub trait Exchange: Clone + Send + Sync + 'static {
         request: Request,
     ) -> impl Future<Output = std::result::Result<Response, Self::Error>> + Send;
 
+    fn hold(
+        &self,
+    ) -> impl Future<Output = std::result::Result<(Response, Holding), Self::Error>> + Send {
+        async move {
+            let head = self.exchange(Request::Head).await?;
+            let unheld: Holding = Box::new(());
+            Ok((head, unheld))
+        }
+    }
+
     fn stream_blobs(
         &self,
         ids: Vec<BlobId>,
     ) -> impl Stream<Item = std::result::Result<Option<Vec<u8>>, Self::Error>> + Send;
+}
+
+pub trait Install: Send {
+    fn install(&mut self, id: BlobId, framed: Vec<u8>) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub struct Joined<E: Context> {
@@ -131,7 +149,12 @@ pub async fn join<E: Context, X: Exchange>(
         if let Anchor::Finalized(certificate) = &head.anchor {
             verified(&mut context, &network, &node, certificate)?;
         }
-        let unserved = installed(&asking, &mut node, &mut fetched).await?;
+        let code = unheld_code(&node)?;
+        let mut joining = Joining {
+            node: &mut node,
+            fetched: &mut fetched,
+        };
+        let unserved = installed(&asking, code, &mut joining).await?;
         let Some(&blob) = unserved.first() else {
             if retargets > 0 {
                 node.host().drop_unnamed(&fetched, node.now()).await?;
@@ -156,9 +179,24 @@ pub async fn join<E: Context, X: Exchange>(
             unserved = unserved.len(),
             rewritten = adoption.replaced().len(),
             retargets,
-            "the source no longer serves blobs the adopted state names; it reads the head again"
+            "the source no longer serves code the adopted state runs; it reads the head again"
         );
     }
+}
+
+pub async fn fill<E: Context, X: Exchange>(
+    context: E,
+    pause: Duration,
+    exchange: X,
+    missing: Vec<BlobId>,
+    install: &mut impl Install,
+) -> Result<Vec<BlobId>> {
+    let asking = Asking {
+        context,
+        exchange,
+        pause,
+    };
+    installed(&asking, missing, install).await
 }
 
 async fn adopted_head<E: Context, X: Exchange>(
@@ -168,12 +206,14 @@ async fn adopted_head<E: Context, X: Exchange>(
 ) -> Result<(Head, BTreeMap<ProgramId, Commitment<E>>)> {
     let mut retargets: u64 = 0;
     loop {
-        let head = head(asking).await?;
+        let (head, hold) = held_head(asking).await?;
         let anchor_names_the_tip = head.anchor.names(head.tip);
         if !anchor_names_the_tip {
             return Err(Error::Head);
         }
-        let error = match synced_to(context, name, asking, &head.targets).await {
+        let synced = synced_to(context, name, asking, &head.targets).await;
+        drop(hold);
+        let error = match synced {
             Ok(commitments) => return Ok((head, commitments)),
             Err(error) => error,
         };
@@ -261,17 +301,48 @@ async fn head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<Head> {
     }
 }
 
+async fn held_head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<(Head, Holding)> {
+    let (answer, hold) = asking.held().await?;
+    match answer {
+        Response::Head(head) => Ok((head, hold)),
+        Response::Refused(refusal) => Err(Error::Refused(refusal)),
+        other => Err(Error::Answer(Box::new(other))),
+    }
+}
+
+struct Joining<'a, E: Context> {
+    node: &'a mut Node<E>,
+    fetched: &'a mut BTreeSet<BlobId>,
+}
+
+impl<E: Context> Install for Joining<'_, E> {
+    async fn install(&mut self, id: BlobId, framed: Vec<u8>) -> Result<()> {
+        self.node.install(id, &framed)?;
+        self.fetched.insert(id);
+        Ok(())
+    }
+}
+
+fn unheld_code<E: Context>(node: &Node<E>) -> Result<Vec<BlobId>> {
+    let host = node.host();
+    let code: BTreeSet<BlobId> = host
+        .programs()?
+        .into_values()
+        .filter(|code| !host.blobs().has(code))
+        .collect();
+    Ok(code.into_iter().collect())
+}
+
 async fn installed<E: Context, X: Exchange>(
     asking: &Asking<E, X>,
-    node: &mut Node<E>,
-    fetched: &mut BTreeSet<BlobId>,
+    mut missing: Vec<BlobId>,
+    install: &mut impl Install,
 ) -> Result<Vec<BlobId>> {
-    let mut missing = node.host().missing_blobs()?;
     tracing::info!(
         target: "ducktape::sync",
         event = "join_fetching_blobs",
         blobs = missing.len(),
-        "the join asks the source for every blob its state names, in one stream"
+        "the node asks its source for the blobs it lacks, in one stream"
     );
     let mut attempts: u64 = 0;
     let mut progress = Progress {
@@ -280,9 +351,8 @@ async fn installed<E: Context, X: Exchange>(
     };
     let mut unserved = Vec::new();
     while !missing.is_empty() {
-        let streamed = streamed(&asking.exchange, node, &missing, &mut progress).await?;
+        let streamed = streamed(&asking.exchange, install, &missing, &mut progress).await?;
         missing.drain(..streamed.answered);
-        fetched.extend(streamed.installed);
         unserved.extend(streamed.unserved);
         if let Some(error) = streamed.cut {
             asking.again(error, &mut attempts).await?;
@@ -310,28 +380,26 @@ impl Progress {
             event = "join_blobs",
             installed = self.installed,
             blobs = self.blobs,
-            "the join installed another hundredth of the blobs its state names"
+            "the node installed another hundredth of the blobs it asked its source for"
         );
     }
 }
 
 struct Streamed<F> {
     answered: usize,
-    installed: Vec<BlobId>,
     unserved: Vec<BlobId>,
     cut: Option<F>,
 }
 
-async fn streamed<E: Context, X: Exchange>(
+async fn streamed<X: Exchange>(
     exchange: &X,
-    node: &mut Node<E>,
+    install: &mut impl Install,
     missing: &[BlobId],
     progress: &mut Progress,
 ) -> Result<Streamed<X::Error>> {
     let mut answers = std::pin::pin!(exchange.stream_blobs(missing.to_vec()));
     let mut streamed = Streamed {
         answered: 0,
-        installed: Vec::new(),
         unserved: Vec::new(),
         cut: None,
     };
@@ -354,8 +422,7 @@ async fn streamed<E: Context, X: Exchange>(
             streamed.unserved.push(id);
             continue;
         };
-        node.install(id, &framed)?;
-        streamed.installed.push(id);
+        install.install(id, framed).await?;
         progress.installed();
     }
     let answered_every_blob = streamed.answered == missing.len();
@@ -390,6 +457,17 @@ impl<E: Context, X: Exchange> Asking<E, X> {
         loop {
             let error = match self.exchange.exchange(request.clone()).await {
                 Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            self.again(error, &mut attempts).await?;
+        }
+    }
+
+    async fn held(&self) -> Result<(Response, Holding)> {
+        let mut attempts: u64 = 0;
+        loop {
+            let error = match self.exchange.hold().await {
+                Ok(held) => return Ok(held),
                 Err(error) => error,
             };
             self.again(error, &mut attempts).await?;

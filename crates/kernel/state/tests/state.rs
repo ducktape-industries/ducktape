@@ -417,7 +417,7 @@ fn a_second_adoption_writes_only_what_changed_since_the_first() {
             APP,
             &[(b"a", None), (b"b", Some(b"22")), (b"c", Some(b"3"))],
         );
-        app.apply(1, &next.programs[APP]).await.unwrap();
+        app.apply(1, &next.programs[APP], None).await.unwrap();
         let expected_root = app.root().unwrap();
         let joiner = Store::adopt_from(
             context.child("again"),

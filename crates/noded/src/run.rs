@@ -42,7 +42,7 @@ use crate::relay::{self, Relay};
 use crate::transport;
 use crate::view::{Current, Facts, View, Views};
 use crate::workspace::{Descriptor, Founding, Workspace};
-use crate::writer::{Command, Hold, Sync, Writer};
+use crate::writer::{Command, Head, Hold, Sync, Writer};
 use crate::{Client, Context, Daemon, Error, Logs, Result, millis};
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -371,6 +371,7 @@ async fn adopt<E: Context>(
         time: status.time,
         block_time_ms: status.block_time_ms,
     };
+    let base = source.base().to_owned();
     let joined = statesync::join(
         context.child("join"),
         &descriptor.network,
@@ -380,6 +381,7 @@ async fn adopt<E: Context>(
         source,
     )
     .await?;
+    workspace.write_source(&base)?;
     workspace.write_descriptor(&descriptor)?;
     workspace.write_anchor(&joined.anchor)
 }
@@ -667,6 +669,9 @@ async fn start<E: Context>(
         load.rpc_cpus,
         load.rpc_blocking_threads,
     )?;
+    if let (Some(source), Some(handle)) = (workspace.source()?, rpc.handle()) {
+        handle.spawn(crate::fill::fill(daemon.clone(), Client::new(source)));
+    }
     let egressing = crate::egress::spawn(daemon.clone());
     let mut tasks = vec![pump, relayed, egressing];
     if let Some((listener, acceptor)) = tls {
@@ -1148,6 +1153,7 @@ async fn asked<E: Context>(
         Command::Sync(sync) => synced(node, tally, sync).await,
         Command::Hold(hold) => held(hold).await,
         Command::Close(closer) => Flow::Closing(closer),
+        Command::Head(head) => headed(node, tally, head),
     };
     tally.commands += 1;
     tally.commanding += lap.lap();
@@ -1162,6 +1168,17 @@ async fn synced<E: Context>(node: &mut Node<E>, tally: &Tally, sync: Sync) -> Fl
     let served = statesync::serve(node, sync.request).await;
     tally.served.inc();
     let _ = sync.reply.send(served);
+    Flow::Writing
+}
+
+fn headed<E: Context>(node: &Node<E>, tally: &Tally, head: Head) -> Flow {
+    if head.reply.is_canceled() {
+        tally.abandoned.inc();
+        return Flow::Writing;
+    }
+    let held = statesync::held(node);
+    tally.served.inc();
+    let _ = head.reply.send(held);
     Flow::Writing
 }
 

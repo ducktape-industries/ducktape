@@ -7,7 +7,7 @@ use futures::{Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
 use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
-use statesync::{Exchange, Failure, Fault, Request, Response};
+use statesync::{Exchange, Failure, Fault, Holding, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -300,15 +300,75 @@ impl Exchange for Client {
     type Error = Error;
 
     async fn exchange(&self, request: Request) -> Result<Response> {
-        self.post(route::SYNC, &request).await
+        self.post(route::SYNC, &request).await.map_err(without_url)
+    }
+
+    async fn hold(&self) -> Result<(Response, Holding)> {
+        held(self).await.map_err(without_url)
     }
 
     fn stream_blobs(&self, ids: Vec<BlobId>) -> impl Stream<Item = Result<Option<Vec<u8>>>> + Send {
-        futures::stream::once(blob_answers(self.clone(), ids)).flat_map(|opened| match opened {
-            Ok(answers) => answers.left_stream(),
-            Err(error) => futures::stream::once(futures::future::ready(Err(error))).right_stream(),
-        })
+        let answers =
+            futures::stream::once(blob_answers(self.clone(), ids)).flat_map(
+                |opened| match opened {
+                    Ok(answers) => answers.left_stream(),
+                    Err(error) => {
+                        futures::stream::once(futures::future::ready(Err(error))).right_stream()
+                    }
+                },
+            );
+        answers.map(|read| read.map_err(without_url))
     }
+}
+
+fn without_url(error: Error) -> Error {
+    match error {
+        Error::Http(error) => Error::Http(error.without_url()),
+        error => error,
+    }
+}
+
+async fn held(client: &Client) -> Result<(Response, Holding)> {
+    let response = client
+        .http
+        .post(client.url(route::SYNC_HOLD))
+        .send()
+        .await?;
+    let status = response.status();
+    let answered = status == StatusCode::OK;
+    if !answered {
+        let body = response.bytes().await?;
+        return Err(unanswered(status, &body));
+    }
+    let mut body: Body = Box::pin(response.bytes_stream());
+    let mut read = Vec::new();
+    loop {
+        if let Some(head) = framed_head(&read)? {
+            let holding: Holding = Box::new(body);
+            return Ok((head, holding));
+        }
+        match body.next().await {
+            Some(Ok(bytes)) => read.extend_from_slice(&bytes),
+            Some(Err(error)) => return Err(error.into()),
+            None => {
+                return Err(Error::Decode(Refusal::new(
+                    reason::PROTOCOL,
+                    "the hold's answer ended before its head was whole",
+                )));
+            }
+        }
+    }
+}
+
+fn framed_head(read: &[u8]) -> Result<Option<Response>> {
+    let Some(len) = read.first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let len = u32::from_le_bytes(*len) as usize;
+    let Some(head) = read[4..].get(..len) else {
+        return Ok(None);
+    };
+    abi::decode(head).map(Some).map_err(Error::Decode)
 }
 
 type Body = std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;

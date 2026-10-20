@@ -12,7 +12,7 @@ use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
 use halo::{Class, Halo, Lane, Queues, Seat};
 
-use super::{Config, Service, answer, generation_path, seed};
+use super::{Config, Kept, Service, Turn, answer, generation_path, seed};
 use crate::contract::LANE;
 use crate::{Blobs, frame, id_of};
 
@@ -214,4 +214,56 @@ fn a_late_seed_takes_only_older_files_and_never_one_a_newer_owner_writes() {
         "a live owner's file is copied"
     );
     assert!(!at(2).exists(), "a gone owner's file is removed");
+}
+
+fn quiet(context: &runtime::Context) -> (Service, tempfile::TempDir) {
+    let (asker, _) = member(&context.child("asker"), 2);
+    let fetched = tempfile::tempdir().unwrap();
+    let store = Blobs::open(fetched.path()).unwrap();
+    let service = Service::start(asker, store, Vec::new(), Config::default()).unwrap();
+    (service, fetched)
+}
+
+fn partials_left(service: &Service) -> usize {
+    let partials = service.store().partials().unwrap();
+    std::fs::read_dir(partials).unwrap().count()
+}
+
+#[test]
+fn a_kept_blob_lands_under_its_id_and_leaves_no_partial() {
+    runtime::Runner::default().start(|context| async move {
+        let (service, _dir) = quiet(&context);
+        let framed = frame("part", b"kept").unwrap();
+        let id = id_of(abi::HashKind::Sha256, &framed).unwrap();
+        assert_eq!(service.keep(id, framed.clone()).await, Ok(Kept::Landed));
+        assert_eq!(service.store().framed(&id).unwrap(), Some(framed));
+        assert_eq!(partials_left(&service), 0);
+    });
+}
+
+#[test]
+fn bytes_a_keep_offers_that_do_not_hash_to_the_id_are_refused_and_leave_nothing() {
+    runtime::Runner::default().start(|context| async move {
+        let (service, _dir) = quiet(&context);
+        let id = id_of(abi::HashKind::Sha256, &frame("part", b"named").unwrap()).unwrap();
+        let offered = frame("part", b"offered").unwrap();
+        assert_eq!(service.keep(id, offered).await, Err("misnamed"));
+        assert!(!service.store().has(&id));
+        assert_eq!(partials_left(&service), 0);
+    });
+}
+
+#[test]
+fn a_keep_leaves_a_blob_another_pull_owns_to_that_pull() {
+    runtime::Runner::default().start(|context| async move {
+        let (service, _dir) = quiet(&context);
+        let framed = frame("part", b"pulled").unwrap();
+        let id = id_of(abi::HashKind::Sha256, &framed).unwrap();
+        let pulling = service.inner.turn(&id, Class::Client);
+        assert!(matches!(pulling, Turn::Mine(_)));
+        assert_eq!(service.keep(id, framed).await, Ok(Kept::Elsewhere));
+        assert!(!service.store().has(&id));
+        assert_eq!(partials_left(&service), 0);
+        drop(pulling);
+    });
 }
