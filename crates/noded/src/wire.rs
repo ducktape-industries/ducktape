@@ -1,5 +1,5 @@
 use abi::Receipt;
-use abi::{ProgramId, Root, Scan};
+use abi::{ProgramId, Refusal, Root, Scan};
 use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Tip};
 use node::Preconfirm;
@@ -25,6 +25,7 @@ pub mod route {
     /// height for a block that wrote nothing there and for each epoch's last
     /// block. A client that answers no ping for a whole epoch is cut.
     pub const CHANGES: &str = "/v1/changes";
+    pub const WATCH: &str = "/v1/watch";
     pub const BLOCKS: &str = "/v1/blocks";
     pub const BLOCK: &str = "/v1/block";
     pub const TX: &str = "/v1/tx";
@@ -132,6 +133,34 @@ pub struct Change {
     pub height: u64,
     pub root: Root,
     pub writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Watch {
+    Ask { id: u32, frame: Vec<u8> },
+    Drop { id: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Pushed {
+    Answer {
+        id: u32,
+        height: u64,
+        outcome: Outcome,
+    },
+    Block {
+        height: u64,
+        root: Root,
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        answers: Vec<(u32, Outcome)>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Outcome {
+    Answered(Vec<u8>),
+    Refused(Refusal),
+    Moved,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -319,5 +348,42 @@ pub mod snapshot {
         pub path: String,
         pub len: u64,
         pub from: u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use abi::Refusal;
+
+    use super::{Outcome, Pushed, Watch};
+
+    #[test]
+    fn the_watch_wire_keeps_the_tags_it_was_ruled_with() {
+        let ask = Watch::Ask {
+            id: 1,
+            frame: vec![9],
+        };
+        assert_eq!(abi::encode(&ask), [0, 1, 0, 0, 0, 1, 0, 0, 0, 9]);
+        assert_eq!(abi::encode(&Watch::Drop { id: 2 }), [1, 2, 0, 0, 0]);
+        assert_eq!(abi::encode(&Outcome::Answered(vec![7])), [0, 1, 0, 0, 0, 7]);
+        let refused = Outcome::Refused(Refusal::new("r", "s"));
+        assert_eq!(abi::encode(&refused)[0], 1);
+        assert_eq!(abi::encode(&Outcome::Moved), [2]);
+        let answer = Pushed::Answer {
+            id: 3,
+            height: 4,
+            outcome: Outcome::Moved,
+        };
+        assert_eq!(
+            abi::encode(&answer),
+            [0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2]
+        );
+        let block = Pushed::Block {
+            height: 5,
+            root: abi::Root([0; 32]),
+            writes: Vec::new(),
+            answers: Vec::new(),
+        };
+        assert_eq!(abi::encode(&block)[0], 1);
     }
 }

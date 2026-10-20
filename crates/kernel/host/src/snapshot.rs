@@ -7,13 +7,14 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use abi::role::validators;
-use abi::{BlobId, Origin, ProgramId, Receipt, Refusal, Roles, Root, Scan};
+use abi::{BlobId, Origin, ProgramId, Receipt, Refusal, Roles, Root, Scan, reason};
 use blob::{Blobs, Stage};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use sha2::{Digest as _, Sha256};
 use state::{Committed, Overlay, Pinned, View};
 
+use crate::reads::{ReadSet, Recorder};
 use crate::unit::{self, Loaded, World};
 use crate::{
     BLOBS, Error, Layer, NETWORK, Preconfirmed, RECENT, Result, Submission, Tip, bound, corrupt,
@@ -212,7 +213,50 @@ where
             roles: self.roles,
             height,
             time,
+            recorder: None,
         }
+    }
+
+    pub async fn watch(
+        &self,
+        time: u64,
+        origin: Origin,
+        program: &str,
+        request: Vec<u8>,
+    ) -> Result<(std::result::Result<Vec<u8>, Refusal>, ReadSet)> {
+        let unmetered = self.query_fuel().is_none();
+        if unmetered {
+            let refused = Refusal::new(
+                reason::UNSUPPORTED,
+                "this network meters no fuel, so a standing query could run forever",
+            );
+            return Ok((Err(refused), ReadSet::default()));
+        }
+        if let Some(code) = self.loaded.awaiting(program) {
+            return Err(Error::BlobUnavailable(code));
+        }
+        let recorder = Recorder::default();
+        let world = World {
+            recorder: Some(&recorder),
+            ..self.world(self.height()?, time)
+        };
+        let unstaged = Stage::default();
+        let answer = unit::query(
+            world,
+            Vec::new(),
+            &unstaged,
+            &[],
+            origin,
+            program.to_owned(),
+            request,
+            &mut self.query_fuel(),
+        )
+        .await?;
+        Ok((answer, recorder.into_reads()))
+    }
+
+    fn query_fuel(&self) -> Option<u64> {
+        self.loaded.limits().fuel
     }
 
     pub async fn query(
@@ -240,7 +284,7 @@ where
             origin,
             program.to_owned(),
             request,
-            &mut self.loaded.limits().fuel,
+            &mut self.query_fuel(),
         )
         .await
     }

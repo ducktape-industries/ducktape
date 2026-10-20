@@ -21,6 +21,7 @@ mod relay;
 mod run;
 mod server;
 mod snapshot;
+mod standing;
 mod transport;
 mod view;
 pub mod wire;
@@ -156,7 +157,7 @@ pub struct Daemon<E: Context> {
     readers: watch::Sender<()>,
     writer: writer::Writer,
     pool: pool::Pooling<E>,
-    changes: Changes,
+    changes: Changes<E>,
     pub descriptor: Descriptor,
     pub network: Network,
     pub identity: Vec<u8>,
@@ -270,10 +271,16 @@ impl<E: Context> Daemon<E> {
 
     pub fn publish(&self, applied: &Applied) {
         self.live.invalidate(&applied.writes);
+        let view = self
+            .current
+            .view()
+            .ok()
+            .filter(|view| view.tip().height == applied.height);
         self.changes.wrote(Wrote {
             height: applied.height,
             root: applied.root,
             writes: Arc::new(applied.writes.clone()),
+            view,
         });
     }
 }

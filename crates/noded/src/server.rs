@@ -38,7 +38,7 @@ impl Rpc {
     pub(crate) fn start<E: Context>(
         daemon: Arc<Daemon<E>>,
         listener: std::net::TcpListener,
-        fanout: Fanout,
+        fanout: Fanout<E>,
         answers: tokio::sync::mpsc::UnboundedReceiver<Answered>,
         rpc_cpus: Option<Vec<usize>>,
         blocking_threads: Option<std::num::NonZeroUsize>,
@@ -198,6 +198,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             &format!("{}/{{program}}", route::CHANGES),
             get(changes::<E>),
         )
+        .route(&format!("{}/{{program}}", route::WATCH), get(watching::<E>))
         .route(route::P2P, get(p2p::<E>))
         .route(live_wire::ROUTE, get(live_socket::<E>))
         .layer(axum::middleware::from_fn_with_state(
@@ -772,11 +773,24 @@ async fn changes<E: Context>(
     RawQuery(query): RawQuery,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let keys = query
-        .as_deref()
-        .is_some_and(|query| query.split('&').any(|asked| asked == "keys"));
+    let keys = keys_asked(query.as_deref());
     let subscription = ctx.subscribe(program, keys);
     upgrade.on_upgrade(move |socket| stream(socket, subscription))
+}
+
+async fn watching<E: Context>(
+    ctx: Ctx<E>,
+    Path(program): Path<ProgramId>,
+    RawQuery(query): RawQuery,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let keys = keys_asked(query.as_deref());
+    let watching = ctx.watch(program, keys);
+    upgrade.on_upgrade(move |socket| crate::standing::serve(socket, watching))
+}
+
+fn keys_asked(query: Option<&str>) -> bool {
+    query.is_some_and(|query| query.split('&').any(|asked| asked == "keys"))
 }
 
 enum Next {
@@ -849,7 +863,7 @@ async fn stream(socket: WebSocket, subscription: Subscription) {
     }
 }
 
-async fn goodbye(mut client: SplitSink<WebSocket, Message>) {
+pub(crate) async fn goodbye(mut client: SplitSink<WebSocket, Message>) {
     let stopped = CloseFrame {
         code: close_code::AWAY,
         reason: "the node stopped".into(),

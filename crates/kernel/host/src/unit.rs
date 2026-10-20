@@ -13,6 +13,7 @@ use commonware_storage::Context;
 use runtime::{Code, Fault, Limits, Ran, Runtime, Suspended};
 use state::{Committed, Overlay, Reads, View};
 
+use crate::reads::{ReadSet, Recorder};
 use crate::{Error, Result, crypto, namespace, parked};
 
 #[derive(Clone)]
@@ -145,6 +146,7 @@ where
     pub roles: &'a Roles,
     pub height: u64,
     pub time: u64,
+    pub recorder: Option<&'a Recorder>,
 }
 
 impl<E> Clone for World<'_, E>
@@ -157,6 +159,17 @@ where
 }
 
 impl<E> Copy for World<'_, E> where E: Context + Spawner {}
+
+impl<E> World<'_, E>
+where
+    E: Context + Spawner,
+{
+    fn note(&self, note: impl FnOnce(&mut ReadSet)) {
+        if let Some(recorder) = self.recorder {
+            recorder.note(note);
+        }
+    }
+}
 
 pub fn refusal_of(fault: Fault) -> Refusal {
     match fault {
@@ -210,6 +223,8 @@ where
             .view()
             .get(namespace::BLOBS, &namespace::blob(id))?
             .is_some();
+        self.world
+            .note(|reads| reads.point(namespace::BLOBS, &namespace::blob(id)));
         let readable = rostered
             || held(
                 self.world,
@@ -230,14 +245,35 @@ where
         read(&layered)?.map(Some).ok_or(Error::BlobUnavailable(*id))
     }
 
+    fn got(&self, view: View<'r>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let me = self.env.me.as_str();
+        let value = view.get(me, key)?;
+        self.world.note(|reads| reads.point(me, key));
+        Ok(value)
+    }
+
+    fn scanned(&self, view: View<'r>, scan: &abi::Scan) -> Result<Vec<abi::Entry>> {
+        let me = self.env.me.as_str();
+        let entries = view.scan(me, scan)?;
+        self.world.note(|reads| reads.scanned(me, scan, &entries));
+        Ok(entries)
+    }
+
+    fn rooted(&self, program: &str) -> Result<Option<abi::Root>> {
+        let root = self.world.store.root(program)?;
+        self.world.note(|reads| reads.whole(program));
+        Ok(root)
+    }
+
     /// Serves a read. A query it makes runs on `fuel`, the caller's.
     async fn serve(&self, op: HostOp, fuel: &mut Option<u64>) -> Result<HostReply> {
-        let me = self.env.me.as_str();
         let reply = match op {
-            HostOp::Get(key) => HostReply::Value(self.view().get(me, &key)?),
-            HostOp::Scan(scan) => HostReply::Entries(self.view().scan(me, &scan)?),
-            HostOp::CommittedGet(key) => HostReply::Value(self.confirmed().get(me, &key)?),
-            HostOp::CommittedScan(scan) => HostReply::Entries(self.confirmed().scan(me, &scan)?),
+            HostOp::Get(key) => HostReply::Value(self.got(self.view(), &key)?),
+            HostOp::Scan(scan) => HostReply::Entries(self.scanned(self.view(), &scan)?),
+            HostOp::CommittedGet(key) => HostReply::Value(self.got(self.confirmed(), &key)?),
+            HostOp::CommittedScan(scan) => {
+                HostReply::Entries(self.scanned(self.confirmed(), &scan)?)
+            }
             HostOp::BlobGet(id) => {
                 HostReply::Blob(self.blob(&id, fuel, |layered| layered.get(&id)).await?)
             }
@@ -248,7 +284,7 @@ where
                 self.blob(&id, fuel, |layered| layered.read(&id, offset, len))
                     .await?,
             ),
-            HostOp::Root(program) => HostReply::Root(self.world.store.root(&program)?),
+            HostOp::Root(program) => HostReply::Root(self.rooted(&program)?),
             HostOp::Query { program, request } => HostReply::Query(
                 query(
                     self.world,
@@ -454,6 +490,7 @@ async fn read<'a, E>(
 where
     E: Context + Spawner,
 {
+    world.note(|reads| reads.point(namespace::PROGRAMS, env.me.as_bytes()));
     let Some(module) = world.loaded.module(&env.me) else {
         return Ok(Err(unknown(&env.me)));
     };

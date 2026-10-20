@@ -4026,3 +4026,107 @@ fn a_released_blob_whose_file_will_not_go_leaves_its_block_applied() {
         assert!(file.is_dir());
     });
 }
+
+const METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY: u64 = u64::MAX;
+
+fn wrote_one(program: &str, key: &str) -> host::Written {
+    let keys = [key.as_bytes().to_vec()].into();
+    host::Written::from([(program.to_owned(), keys)])
+}
+
+async fn watched(host: &Host<Ctx>, steps: Vec<Step>) -> host::ReadSet {
+    let snapshot = host.snapshot().unwrap();
+    let source = snapshot.source();
+    let origin = Origin::External(SIGNER.to_vec());
+    let (answer, reads) = source
+        .watch(TIME, origin, "probe", script(steps))
+        .await
+        .unwrap();
+    answer.unwrap();
+    reads
+}
+
+#[test]
+fn a_watched_query_records_each_key_it_read_each_range_its_scans_covered_and_the_code_it_ran() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut genesis = standard();
+        genesis.limits.fuel = Some(METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY);
+        genesis
+            .programs
+            .push(founding("other", PROBE, script(Vec::new())));
+        let mut host = found(context, "net", dir.path(), genesis).await;
+        let setting = vec![
+            set(b"a", b"1"),
+            set(b"k/1", b"v"),
+            set(b"k/2", b"v"),
+            set(b"k/3", b"v"),
+        ];
+        host.apply(block(1, vec![submit("probe", script(setting))]))
+            .await
+            .unwrap();
+        let nested = HostOp::Query {
+            program: "other".into(),
+            request: script(vec![get(b"x")]),
+        };
+        let steps = vec![
+            get(b"a"),
+            get(b"missing"),
+            op(HostOp::Scan(Scan::prefix(b"k/").limit(2))),
+            op(HostOp::Scan(Scan::prefix(b"z/").limit(2))),
+            op(HostOp::Root("ping".into())),
+            op(nested),
+        ];
+        let reads = watched(&host, steps).await;
+        let moved = [
+            ("probe", "a"),
+            ("probe", "missing"),
+            ("probe", "k/0"),
+            ("probe", "k/2"),
+            ("probe", "z/9"),
+            ("ping", "any"),
+            ("other", "x"),
+            (host::PROGRAMS, "probe"),
+            (host::PROGRAMS, "other"),
+        ];
+        for (program, key) in moved {
+            let written = wrote_one(program, key);
+            assert!(reads.touched(&written), "{program} {key} moved nothing");
+        }
+        let unmoved = [
+            ("probe", "b"),
+            ("probe", "k/3"),
+            ("probe", "j"),
+            ("other", "y"),
+            ("pong", "x"),
+            (host::PROGRAMS, "pong"),
+        ];
+        for (program, key) in unmoved {
+            let written = wrote_one(program, key);
+            assert!(!reads.touched(&written), "{program} {key} moved the answer");
+        }
+        let newest = op(HostOp::Scan(Scan::prefix(b"k/").reverse().limit(1)));
+        let reversed = watched(&host, vec![newest]).await;
+        assert!(reversed.touched(&wrote_one("probe", "k/4")));
+        assert!(reversed.touched(&wrote_one("probe", "k/3")));
+        assert!(!reversed.touched(&wrote_one("probe", "k/2")));
+    });
+}
+
+#[test]
+fn a_network_that_meters_no_fuel_refuses_to_watch_a_query() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let host = found(context, "net", dir.path(), standard()).await;
+        let snapshot = host.snapshot().unwrap();
+        let origin = Origin::External(SIGNER.to_vec());
+        let (answer, reads) = snapshot
+            .source()
+            .watch(TIME, origin, "probe", script(vec![get(b"a")]))
+            .await
+            .unwrap();
+        let refusal = answer.unwrap_err();
+        assert_eq!(refusal.reason, reason::UNSUPPORTED);
+        assert_eq!(reads, host::ReadSet::default());
+    });
+}

@@ -194,6 +194,13 @@ impl<E: Context> Ctx<E> {
         self.daemon.subscribe(program, keys)
     }
 
+    pub(crate) fn watch(self, program: ProgramId, keys: bool) -> crate::standing::Watching<E> {
+        crate::standing::Watching {
+            pull: self.daemon.changes.pull(program, keys),
+            daemon: self.daemon,
+        }
+    }
+
     pub(crate) fn mesh(self) -> std::net::SocketAddr {
         self.daemon.mesh
     }

@@ -2,6 +2,7 @@ mod crypto;
 mod namespace;
 mod parked;
 mod parking;
+mod reads;
 mod scheduling;
 mod snapshot;
 mod unit;
@@ -34,7 +35,8 @@ use crate::unit::{Frame, Loaded, World, refusal_of};
 
 pub use namespace::{BLOBS, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT, spent};
 pub use parking::PAGE_FUEL;
-pub use runtime::Limits;
+pub use reads::{ReadSet, Written};
+pub use runtime::{Limits, OUT_OF_FUEL};
 pub use snapshot::{Snapshot, Source};
 
 const STATE_DIR: &str = "state";

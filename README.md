@@ -901,6 +901,29 @@ votes and `ducktape halo` never preconfirm. `ducktape logs`,
 node's own identity key. Each verb's
 `--help` carries the rest.
 
+`/v1/watch/<program>[?keys]` is a WebSocket that carries what
+`/v1/changes/<program>[?keys]` carries, plus standing queries. The client
+sends borsh `Watch` frames: `Ask { id, frame }`, with a query frame signed as
+`/v1/query` takes it, and `Drop { id }`. The node checks the frame and its
+anchor once, runs the query on the confirmed layer as the frame's signer and
+answers `Pushed::Answer { id, height, outcome }`; an ask that is refused does
+not stand. A network whose founding meters no fuel (no `limits.fuel`) refuses
+every ask as `unsupported`, since a query there could run forever. While the query runs, the host records what it read: each key it
+got (a missing one too), the range each scan covered (up to the last key when
+the scan filled its limit), each program it read whole (`Root`), what every
+query it asked read, and the code of each program it ran. For each block that
+writes the program or moves an answer, the node sends one
+`Pushed::Block { height, root, writes, answers }`: `answers` holds each
+standing query whose read set the block wrote, run again at that block's
+view, whose answer differs from the last one sent. A socket holds at most one
+unsent block: until the client can take it, newer blocks merge into it (their
+writes joined, the newer value winning) and no query runs again.
+`Outcome::Moved` says the node could not run the query again (out of fuel,
+code it lacks, a host error) and the client asks it itself. A query's clock
+is not a read, so a query whose answer moves only with time is not run again.
+Pings and the epoch cut are as on `/v1/changes`, and a frame that is not a
+`Watch` ends the socket.
+
 A node keeps its block history (each block's summary, where each transaction
 first landed and the payload of each transaction a block ran) in a store of its
 own under `history/` in the workspace. Only the block writer writes it, and the
@@ -914,7 +937,7 @@ that build reads.
 
 `ducktape shutdown`, SIGTERM and SIGINT stop `ducktape run` the same way.
 The node stops taking blocks and lets the block it is applying finish. It
-closes every `/v1/changes` socket with a going-away close frame, flushes its
+closes every `/v1/changes` and `/v1/watch` socket with a going-away close frame, flushes its
 state to disk and exits 0, so the next start replays no write log. A signal
 that arrives while the node is still opening its state ends the start at
 once.
