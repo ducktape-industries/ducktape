@@ -2929,6 +2929,36 @@ class Builds(Streamed):
             self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\nread it with: build.sh status w1\n"))
             self.assertEqual(self.built("programs", "dev", "gates", request=request)[1]["stdout"].splitlines()[0], f"run {WARM}:w1", line)
 
+    def test_a_run_goes_where_it_ends_first_when_both_machines_say_when(self):
+        self.gate.answers["ahead"] = ran(b"ahead heavy 20 4546\n")
+        self.kube.answer("exec", ran(b"ahead heavy 19 3590\n"), ran(b"run w1\n"))
+        with unittest.mock.patch.object(server, "say") as said:
+            self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], f"run {WARM}:w1")
+        said.assert_any_call("pods_routed", to="warm", reason="sooner_end", detail=json.dumps(f"heavy: ends in 4546s on pod desktop, 3590s on pod {WARM}"))
+
+    def test_a_run_stays_on_the_desktop_that_ends_it_first_though_more_wait_there(self):
+        self.gate.answers["ahead"] = ran(b"ahead heavy 6 1200\n")
+        self.kube.answer("exec", ran(b"ahead heavy 2 1500\n"))
+        self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+
+    def test_an_equal_end_goes_to_the_desktop(self):
+        self.gate.answers["ahead"] = ran(b"ahead heavy 3 900\n")
+        self.kube.answer("exec", ran(b"ahead heavy 1 900\n"))
+        self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+
+    def test_a_machine_with_no_run_time_to_go_by_leaves_the_pick_to_the_counts(self):
+        for request, (desktop, warm, where) in enumerate(
+            (
+                (b"ahead heavy 2 -\n", b"ahead heavy 0 99999\n", f"run {WARM}:w1"),
+                (b"ahead heavy 2 10\n", b"ahead heavy 0 -\n", f"run {WARM}:w1"),
+                (b"ahead heavy 2\n", b"ahead heavy 3 10\n", "run desktop:r1"),
+            ),
+            start=110,
+        ):
+            self.gate.answers["ahead"] = ran(desktop)
+            self.kube.answer("exec", ran(warm), ran(b"run w1\n"))
+            self.assertEqual(self.built("programs", "dev", "gates", request=request)[1]["stdout"].splitlines()[0], where, (desktop, warm))
+
     def test_routing_logs_a_token_and_its_sentence_apart(self):
         self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")
         self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\n"))

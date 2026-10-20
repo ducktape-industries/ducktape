@@ -213,7 +213,7 @@ APPLY_VALUED = frozenset({"-m", "-F", "--onto", "--base"})
 READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
 STARTED = re.compile(rb"^run (\S+)$", re.M)
 GO_TIME = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))? ([+-]\d{4})(?: \S+)?")
-AHEAD = re.compile(rb"ahead (heavy|lane|quick|light) ([0-9]+)")
+AHEAD = re.compile(rb"ahead (heavy|lane|quick|light) ([0-9]+)(?: ([0-9]+|-))?")
 MOVABLE_RUN = re.compile(r"move (\S+) (heavy|lane|quick:\S+) ([0-9]+) (\S+)")
 LANE_WAIT = re.compile(r"(heavy|lane|quick:\S+) ([0-9]+)")
 REROUTE = "reroute"
@@ -2284,6 +2284,11 @@ class Service:
         if there is None:
             say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(why))
             return DESKTOP, False
+        if here[2] is not None and there[2] is not None:
+            if there[2] >= here[2]:
+                return DESKTOP, False
+            say("pods_routed", to="warm", reason="sooner_end", detail=json.dumps(f"{here[0]}: ends in {here[2]}s on pod {DESKTOP}, {there[2]}s on pod {warm}"))
+            return warm, False
         if there[1] >= here[1]:
             return DESKTOP, False
         say("pods_routed", to="warm", reason="shorter_wait", detail=json.dumps(f"{here[0]}: {here[1]} ahead on pod {DESKTOP}, {there[1]} on pod {warm}"))
@@ -2412,7 +2417,8 @@ class Service:
         found = AHEAD.fullmatch(ran.out.strip()) if ran.code == 0 else None
         if found is None:
             return None, f"build.sh ahead on pod {machine} answered exit {ran.code} with no ahead line"
-        return (found.group(1).decode(), int(found.group(2))), None
+        ends = found.group(3)
+        return (found.group(1).decode(), int(found.group(2)), int(ends) if ends and ends != b"-" else None), None
 
     def on(self, asked, machine, words, alive):
         if machine == DESKTOP and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in words):
@@ -2605,7 +2611,7 @@ class Service:
 
     def status(self, name):
         if name == BUILDS:
-            raise Refused(400, f"pod {BUILDS} routes build.sh to the machine where it waits least and is no pod itself: read pod {DESKTOP} or the warm pod")
+            raise Refused(400, f"pod {BUILDS} routes build.sh to the machine where it ends first and is no pod itself: read pod {DESKTOP} or the warm pod")
         if name == DESKTOP:
             return 200, {"pod": desktop_view(self.desktop.state())}
         return 200, {"pod": view(self.pod(name))}

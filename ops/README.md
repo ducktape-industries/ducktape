@@ -201,15 +201,20 @@ one up for another network.
   own output can name any account in a notify-for line, as a chat mention can
   name anyone.
 - The reserved pod `builds` routes a build.sh call to the machine where it
-  waits least: `desktop` when its `ping` says it is up, its `busy` reads (a
+  ends first: `desktop` when its `ping` says it is up, its `busy` reads (a
   list of `build.sh busy` lines, `busy_exit` 0) and
   no quiet run or stray lock holder is among them (a line naming no weight
   build.sh prints, such as a piece of a call whose words hold a line
   break, is skipped), and its `build.sh ahead
-  <the call's words>` (`ahead <lane> <n>`: the lane the call runs in and how
-  many runs in flight there it would wait for) is 0, or no more than the
-  warm pod's (the warm pod the files path `PODS_WARM_POD` names, duckpond:
-  `/shared/tools/warm-pod`), else the warm pod. A machine that can't say
+  <the call's words>` (`ahead <lane> <n> <finish>`: the lane the call runs
+  in, how many runs in flight there it would wait for, and the seconds until
+  it would end there by that machine's own run times, or `-` while that
+  machine has none to go by; an older build.sh says no finish) is 0, or its
+  finish is no later than the warm pod's (the warm pod the files path
+  `PODS_WARM_POD` names, duckpond: `/shared/tools/warm-pod`), else the warm
+  pod (`pods_routed reason=sooner_end`). While either machine says no
+  finish, the counts decide instead: the desktop's no more than the warm
+  pod's (`reason=shorter_wait` otherwise). A machine that can't say
   its wait leaves the run to the other, and a desktop that can't say its
   wait, or that its ping finds busy, keeps the run when the warm pod can't
   be named (an empty or unread warm-pod file, as while the warm pod is
@@ -222,7 +227,7 @@ one up for another network.
   <commit>` (its clone, no fetch); when that machine lacks it and the other
   holds it, the run goes to the other (`pods_routed reason=holds_commit`), so
   a commit made on one machine (an apply not pushed yet) builds where it
-  is; when neither holds it the run goes where it waits least and fetches
+  is; when neither holds it the run goes where it ends first and fetches
   it from forge, and a commit forge lacks too ends saying to push it
   first. `reroute` (build.sh's
   words `reroute` alone) moves the warm pod's queued runs to the desktop
