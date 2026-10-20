@@ -30,7 +30,7 @@ use std::sync::Arc;
 use abi::{ProgramId, Refusal};
 use consensus::{MarshalMailbox, Network, Votes};
 use host::Applied;
-use node::{Preconfirm, Source, Taken};
+use node::{Checked, Preconfirm, Source, Taken};
 use tokio::sync::watch;
 
 pub use carry::{Carry, carry_history, restore_archives, restore_history};
@@ -199,19 +199,28 @@ impl<E: Context> Daemon<E> {
         source: Source,
         preconfirm: Preconfirm,
     ) -> Result<std::result::Result<Taken, Refusal>> {
-        let network = self.descriptor.id();
-        let (frame, admitted) = offload(move || {
-            let admitted = node::admissible(&frame, &network);
-            (frame, admitted)
-        })
-        .await?;
-        let submission = match admitted {
-            Ok(submission) => submission,
+        let checked = match self.admit(frame).await? {
+            Ok(checked) => checked,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        self.pool
-            .submit(frame, submission, source, preconfirm)
-            .await
+        self.take(checked, source, preconfirm).await
+    }
+
+    pub(crate) async fn admit(
+        &self,
+        frame: Vec<u8>,
+    ) -> Result<std::result::Result<Checked, Refusal>> {
+        let network = self.descriptor.id();
+        offload(move || node::admissible(frame, &network)).await
+    }
+
+    pub(crate) async fn take(
+        &self,
+        checked: Checked,
+        source: Source,
+        preconfirm: Preconfirm,
+    ) -> Result<std::result::Result<Taken, Refusal>> {
+        self.pool.submit(checked, source, preconfirm).await
     }
 
     pub async fn hold(&self) -> Result<Held> {

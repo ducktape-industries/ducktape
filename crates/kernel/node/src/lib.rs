@@ -2,8 +2,10 @@ mod block;
 mod frame;
 mod mempool;
 pub mod pool;
+mod verified;
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -17,8 +19,9 @@ use host::{Applied, Genesis, Host, Layer, Snapshot, Submission, SubmissionId, Ti
 use state::{Commitment, View};
 
 pub use block::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES};
-pub use frame::{Body, Frame, NAMESPACE, verify};
+pub use frame::{Body, Checked, Frame, NAMESPACE, verify};
 pub use mempool::Mempool;
+pub use verified::Verified;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -47,17 +50,6 @@ pub struct Carried {
     pub id: SubmissionId,
 }
 
-pub fn carried<'a>(
-    block: &'a Block,
-    network: &'a [u8],
-) -> impl Iterator<Item = (u32, Submission)> + 'a {
-    block
-        .frames
-        .iter()
-        .enumerate()
-        .filter_map(|(index, frame)| Some((index as u32, frame::verify(frame, network).ok()?)))
-}
-
 fn millis(clock: &impl commonware_runtime::Clock) -> u64 {
     let since_epoch = clock
         .current()
@@ -66,15 +58,15 @@ fn millis(clock: &impl commonware_runtime::Clock) -> u64 {
     since_epoch.as_millis() as u64
 }
 
-pub fn admissible(frame: &[u8], network: &[u8]) -> std::result::Result<Submission, Refusal> {
-    if !Block::carries(frame) {
+pub fn admissible(frame: Vec<u8>, network: &[u8]) -> std::result::Result<Checked, Refusal> {
+    if !Block::carries(&frame) {
         let sentence = format!(
             "the frame is {} bytes and a block carries at most {BLOCK_BYTES}",
             frame.len()
         );
         return Err(Refusal::new(reason::CAPACITY, sentence));
     }
-    frame::verify(frame, network)
+    frame::check(frame, network)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +116,7 @@ where
     context: E,
     host: Host<E>,
     network: Vec<u8>,
+    verified: Verified,
 }
 
 impl<E> Node<E>
@@ -174,10 +167,12 @@ where
 
     fn over(context: E, host: Host<E>) -> Result<Node<E>> {
         let network = host.network().to_vec();
+        let verified = Verified::new(&network);
         Ok(Node {
             context,
             host,
             network,
+            verified,
         })
     }
 
@@ -187,6 +182,17 @@ where
 
     pub fn network(&self) -> &[u8] {
         &self.network
+    }
+
+    pub fn verified(&self) -> Verified {
+        self.verified.clone()
+    }
+
+    pub fn carried(&self, block: &Block) -> Vec<(u32, Submission)> {
+        let network = self.network.as_slice();
+        let threads = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let check = |frame: &[u8]| frame::verify(frame, network);
+        verified::carried(&block.frames, network, &self.verified, &check, threads)
     }
 
     pub fn tip(&self) -> Result<Tip> {
@@ -255,7 +261,9 @@ where
                 tip: tip.height,
             });
         }
-        let (carried, submissions): (Vec<Carried>, Vec<Submission>) = carried(block, &self.network)
+        let (carried, submissions): (Vec<Carried>, Vec<Submission>) = self
+            .carried(block)
+            .into_iter()
             .map(|(frame, submission)| {
                 let id = submission.id();
                 (Carried { frame, id }, submission)

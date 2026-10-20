@@ -381,7 +381,7 @@ impl Peer {
         let seated = node.epoch_validators(0).unwrap().unwrap();
         let mempool = Mempool::new(
             context.child("pool"),
-            node.network().to_vec(),
+            node.verified(),
             node.snapshot().unwrap(),
         )
         .unwrap();

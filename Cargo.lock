@@ -3019,6 +3019,7 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "dashmap",
  "fixture-probe",
  "fixture-programs",
  "fixture-relay",

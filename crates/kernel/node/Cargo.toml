@@ -12,6 +12,7 @@ commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-storage = { workspace = true }
+dashmap = "6"
 host = { workspace = true }
 keyscheme = { workspace = true }
 state = { workspace = true }

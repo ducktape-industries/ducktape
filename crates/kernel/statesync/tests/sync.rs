@@ -158,7 +158,7 @@ async fn seal(
 ) -> Block {
     let mut pool = node::Mempool::new(
         context.child("pool"),
-        node.network().to_vec(),
+        node.verified(),
         node.snapshot().unwrap(),
     )
     .unwrap();

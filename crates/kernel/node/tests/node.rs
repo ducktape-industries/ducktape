@@ -29,8 +29,7 @@ struct TestNode {
 
 impl TestNode {
     fn over(context: Ctx, node: Node<Ctx>) -> TestNode {
-        let network = node.network().to_vec();
-        let mempool = Mempool::new(context, network, node.snapshot().unwrap()).unwrap();
+        let mempool = Mempool::new(context, node.verified(), node.snapshot().unwrap()).unwrap();
         TestNode { node, mempool }
     }
 
@@ -768,6 +767,55 @@ fn a_node_refuses_a_frame_whose_anchor_is_not_a_recent_block() {
             .await
             .unwrap()
             .unwrap());
+    });
+}
+
+#[test]
+fn only_a_frame_the_pool_takes_counts_as_verified_and_it_leaves_once_a_block_carries_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let verified = node.node.verified();
+        let signer = key(7);
+        let ahead = Tip {
+            height: 1,
+            ..origin()
+        };
+        let unanchored =
+            Frame::sign(&signer, NETWORK, ahead, None, "probe", script(Vec::new())).encode();
+        let refusal = node
+            .submit(unanchored, Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.reason, reason::ANCHOR);
+        assert_eq!(verified.len(), 0, "a frame the pool refuses is not counted");
+
+        let taken = frame(&signer, "probe", script(vec![set(b"k", b"v")]));
+        new(node
+            .submit(taken.clone(), Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap());
+        held(
+            node.submit(taken.clone(), Source::Client, Preconfirm::On)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(verified.len(), 1, "a frame sent twice is counted once");
+
+        let (block, _) = seal(&mut node).await;
+        assert_eq!(block.frames, vec![taken.clone()]);
+        assert_eq!(verified.len(), 0, "a carried frame leaves with the pool");
+
+        let refusal = node
+            .submit(taken, Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.reason, reason::DUPLICATE);
+        assert_eq!(verified.len(), 0, "a spent frame is not counted");
     });
 }
 

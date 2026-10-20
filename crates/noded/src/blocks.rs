@@ -254,8 +254,9 @@ impl<E: Context> Daemon<E> {
         if self.history.has(block.height)? {
             return Ok(());
         }
-        let network = self.descriptor.id();
-        let ran = node::carried(block, &network)
+        let ran = node
+            .carried(block)
+            .into_iter()
             .map(|(frame, submission)| (frame, submission.id(), submission))
             .collect();
         self.record(node, block, ran, None).await?;

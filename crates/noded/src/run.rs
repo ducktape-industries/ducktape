@@ -537,7 +537,7 @@ async fn start<E: Context>(
     ));
     let pooling = pool::start(
         context.child("pool"),
-        node.network().to_vec(),
+        node.verified(),
         base,
         current.clone(),
         relay.clone(),

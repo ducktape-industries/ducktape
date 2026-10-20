@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use abi::Refusal;
-use host::{Submission, Tip};
-use node::{Block, Mempool, Preconfirm, Source, Taken};
+use host::Tip;
+use node::{Block, Checked, Mempool, Preconfirm, Source, Taken, Verified};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::relay::Relay;
@@ -19,8 +19,7 @@ const TARGET: &str = "ducktape::pool";
 type Answer = Result<std::result::Result<Taken, Refusal>>;
 
 pub(crate) struct Submit {
-    frame: Vec<u8>,
-    submission: Submission,
+    checked: Checked,
     source: Source,
     preconfirm: Preconfirm,
     reply: oneshot::Sender<Answer>,
@@ -112,15 +111,13 @@ impl<E: Context> Clone for Pooling<E> {
 impl<E: Context> Pooling<E> {
     pub(crate) async fn submit(
         &self,
-        frame: Vec<u8>,
-        submission: Submission,
+        checked: Checked,
         source: Source,
         preconfirm: Preconfirm,
     ) -> Answer {
         let (reply, answer) = oneshot::channel();
         let submit = Submit {
-            frame,
-            submission,
+            checked,
             source,
             preconfirm,
             reply,
@@ -189,14 +186,15 @@ pub(crate) const THREAD: &str = "pool";
 
 pub(crate) fn start<E: Context>(
     context: E,
-    network: Vec<u8>,
+    verified: Verified,
     base: Arc<View<E>>,
     published: Arc<Current<E>>,
     relay: Arc<Relay<E>>,
     posts: blob::service::Posts,
     tips: watch::Receiver<u64>,
 ) -> Result<Pooling<E>> {
-    let mempool = Mempool::new(context, network.clone(), base.snapshot())?;
+    let network = verified.network().to_vec();
+    let mempool = Mempool::new(context, verified, base.snapshot())?;
     let applied = Arc::new(AtomicU64::new(mempool.applied().height));
     published
         .speculative
@@ -345,27 +343,25 @@ async fn replayed<E: Context>(pool: &mut Pool<E>) -> Flow {
 
 async fn submitted<E: Context>(pool: &mut Pool<E>, submit: Submit) -> Flow {
     let Submit {
-        frame,
-        submission,
+        checked,
         source,
         preconfirm,
         reply,
     } = submit;
-    let taken = take(pool, frame, submission, source, preconfirm).await;
+    let taken = take(pool, checked, source, preconfirm).await;
     let _ = reply.send(taken);
     Flow::Pooling
 }
 
 async fn take<E: Context>(
     pool: &mut Pool<E>,
-    frame: Vec<u8>,
-    submission: Submission,
+    checked: Checked,
     source: Source,
     preconfirm: Preconfirm,
 ) -> Answer {
     let taken = pool
         .mempool
-        .take(frame, submission, source, preconfirm)
+        .take(checked, source, preconfirm)
         .await
         .map_err(Error::from);
     let predicted = matches!(taken, Ok(Ok(Taken::New(Some(_)))));
@@ -376,11 +372,11 @@ async fn take<E: Context>(
 }
 
 async fn own<E: Context>(pool: &mut Pool<E>, frame: Vec<u8>) -> Answer {
-    let submission = match node::admissible(&frame, &pool.network) {
-        Ok(submission) => submission,
+    let checked = match node::admissible(frame, &pool.network) {
+        Ok(checked) => checked,
         Err(refusal) => return Ok(Err(refusal)),
     };
-    let taken = take(pool, frame, submission, Source::Client, Preconfirm::Off).await;
+    let taken = take(pool, checked, Source::Client, Preconfirm::Off).await;
     if let Err(error) = &taken {
         tracing::warn!(
             target: TARGET,

@@ -38,14 +38,14 @@ impl Block {
         }
     }
 
-    pub fn packed<'a>(
-        parent: Tip,
-        time: u64,
-        frames: impl IntoIterator<Item = &'a Vec<u8>>,
-    ) -> Block {
+    pub fn packed<'a, F>(parent: Tip, time: u64, frames: impl IntoIterator<Item = &'a F>) -> Block
+    where
+        F: AsRef<[u8]> + ?Sized + 'a,
+    {
         let mut block = Block::next(parent, time, Vec::new());
         let mut size = block.encode_size();
         for frame in frames {
+            let frame = frame.as_ref().to_vec();
             let count = block.frames.len();
             let counted = (count + 1).encode_size() - count.encode_size();
             let grown = size + counted + frame.encode_size();
@@ -53,7 +53,7 @@ impl Block {
                 break;
             }
             size = grown;
-            block.frames.push(frame.clone());
+            block.frames.push(frame);
         }
         block
     }

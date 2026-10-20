@@ -10,8 +10,9 @@ use commonware_storage::Context;
 use host::{Snapshot, Submission, SubmissionId, Tip};
 
 use crate::block::{Block, Digest};
-use crate::frame::Frame;
+use crate::frame::{Checked, Frame};
 use crate::pool::Pool;
+use crate::verified::Verified;
 use crate::{Error, Preconfirm, Result, Source, Taken, admissible};
 
 pub struct Mempool<E>
@@ -31,12 +32,12 @@ impl<E> Mempool<E>
 where
     E: Context + Spawner,
 {
-    pub fn new(context: E, network: Vec<u8>, applied: Snapshot<E>) -> Result<Mempool<E>> {
+    pub fn new(context: E, verified: Verified, applied: Snapshot<E>) -> Result<Mempool<E>> {
         let tip = applied.source().tip()?;
         Ok(Mempool {
             context,
-            network,
-            pool: Pool::default(),
+            network: verified.network().to_vec(),
+            pool: Pool::new(verified),
             applied: tip,
             speculative: applied,
             unreplayed: VecDeque::new(),
@@ -70,40 +71,38 @@ where
         source: Source,
         preconfirm: Preconfirm,
     ) -> Result<std::result::Result<Taken, Refusal>> {
-        let submission = match admissible(&frame, &self.network) {
-            Ok(submission) => submission,
+        let checked = match admissible(frame, &self.network) {
+            Ok(checked) => checked,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        self.take(frame, submission, source, preconfirm).await
+        self.take(checked, source, preconfirm).await
     }
 
     pub async fn take(
         &mut self,
-        frame: Vec<u8>,
-        submission: Submission,
+        checked: Checked,
         source: Source,
         preconfirm: Preconfirm,
     ) -> Result<std::result::Result<Taken, Refusal>> {
         let held = self
             .pool
-            .get(&submission.id())
+            .get(&checked.submission().id())
             .map(|held| held.prediction.clone());
         if let Some(prediction) = held {
             return Ok(Ok(Taken::Held(prediction)));
         }
-        if let Err(refusal) = self.speculative.source().fresh(&submission)? {
+        if let Err(refusal) = self.speculative.source().fresh(checked.submission())? {
             return Ok(Err(refusal));
         }
         let prediction = match preconfirm {
             Preconfirm::Off => None,
-            Preconfirm::On => Some(self.preconfirm(submission.clone()).await?),
+            Preconfirm::On => Some(self.preconfirm(checked.submission().clone()).await?),
         };
         let offered = match source {
             Source::Client => Some(self.applied.height),
             Source::Peer => None,
         };
-        self.pool
-            .admit(frame, submission, prediction.clone(), offered);
+        self.pool.admit(checked, prediction.clone(), offered);
         Ok(Ok(Taken::New(prediction)))
     }
 
@@ -111,7 +110,7 @@ where
         let tip = applied.source().tip()?;
         let mut stale = Vec::new();
         for held in self.pool.order() {
-            if applied.source().fresh(&held.submission)?.is_err() {
+            if applied.source().fresh(held.submission())?.is_err() {
                 stale.push(held.id);
             }
         }
@@ -134,7 +133,7 @@ where
         let Some(held) = self.pool.get(&id) else {
             return Ok(());
         };
-        let submission = held.submission.clone();
+        let submission = held.submission().clone();
         let receipt = self.preconfirm(submission).await?;
         self.pool.predict(&id, receipt);
         Ok(())
@@ -155,10 +154,10 @@ where
             .pool
             .order()
             .filter(|held| {
-                let recent = held.submission.anchor.anchors(height);
+                let recent = held.submission().anchor.anchors(height);
                 recent && !carrying.carries(&above, &held.id)
             })
-            .map(|held| &held.frame);
+            .map(|held| held.frame());
         Block::packed(parent, time, frames)
     }
 

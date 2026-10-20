@@ -9,6 +9,7 @@ use arc_swap::ArcSwap;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::authenticated::lookup::Receiver;
 use commonware_p2p::{Receiver as _, Recipients, Sender as _};
+use host::Submission;
 use node::{Preconfirm, Source, Taken};
 
 use crate::mesh::Outbound;
@@ -72,15 +73,20 @@ pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<Pu
                 return;
             }
         };
-        let taken = daemon
-            .submit(frame.clone(), Source::Peer, Preconfirm::Off)
-            .await;
+        let taken = match daemon.admit(frame).await {
+            Ok(Ok(checked)) => daemon
+                .take(checked.clone(), Source::Peer, Preconfirm::Off)
+                .await
+                .map(|taken| taken.map(|taken| (taken, checked))),
+            Ok(Err(refusal)) => Ok(Err(refusal)),
+            Err(error) => Err(error),
+        };
         match taken {
-            Ok(Ok(Taken::New(_))) => {
+            Ok(Ok((Taken::New(_), checked))) => {
                 tracing::debug!(target: "ducktape::relay", %peer, "took a relayed frame");
-                sent(&daemon, role.as_deref(), &frame, &peer);
+                sent(&daemon, role.as_deref(), checked.submission(), &peer);
             }
-            Ok(Ok(Taken::Held(_))) => tracing::debug!(
+            Ok(Ok((Taken::Held(_), _))) => tracing::debug!(
                 target: "ducktape::relay",
                 %peer,
                 "already held a relayed frame"
@@ -102,10 +108,12 @@ pub async fn serve<E: Context>(daemon: Arc<Daemon<E>>, mut receiver: Receiver<Pu
     }
 }
 
-fn sent<E: Context>(daemon: &Daemon<E>, role: Option<&str>, frame: &[u8], peer: &PublicKey) {
-    let Ok(submission) = node::verify(frame, &daemon.descriptor.id()) else {
-        return;
-    };
+fn sent<E: Context>(
+    daemon: &Daemon<E>,
+    role: Option<&str>,
+    submission: &Submission,
+    peer: &PublicKey,
+) {
     let to_the_blobs_program = role == Some(submission.target.as_str());
     if !to_the_blobs_program {
         return;

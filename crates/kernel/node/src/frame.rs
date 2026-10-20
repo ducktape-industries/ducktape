@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use abi::{Refusal, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::{Signer as _, ed25519};
@@ -95,4 +97,38 @@ impl Frame {
 
 pub fn verify(bytes: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
     Frame::decode(bytes)?.verify(network)
+}
+
+#[derive(Clone, Debug)]
+pub struct Checked(Arc<Verdict>);
+
+#[derive(Debug)]
+struct Verdict {
+    frame: Vec<u8>,
+    network: Vec<u8>,
+    submission: Submission,
+}
+
+impl Checked {
+    pub fn frame(&self) -> &[u8] {
+        &self.0.frame
+    }
+
+    pub fn network(&self) -> &[u8] {
+        &self.0.network
+    }
+
+    pub fn submission(&self) -> &Submission {
+        &self.0.submission
+    }
+}
+
+pub(crate) fn check(frame: Vec<u8>, network: &[u8]) -> Result<Checked, Refusal> {
+    let submission = verify(&frame, network)?;
+    let verdict = Verdict {
+        frame,
+        network: network.to_vec(),
+        submission,
+    };
+    Ok(Checked(Arc::new(verdict)))
 }
