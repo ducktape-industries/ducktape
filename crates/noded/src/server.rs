@@ -506,7 +506,15 @@ async fn blob_get<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<V
         Err(refusal) => return Reply::Refused(refusal),
     };
     match served(&ctx, id).await {
-        Ok(framed) => Reply::Answered(framed),
+        Ok(Read::Framed(framed)) => Reply::Answered(Some(framed)),
+        Ok(Read::Unnamed) => Reply::Answered(None),
+        Ok(Read::Fetching) => Reply::Refused(Refusal::new(
+            reason::NOT_FOUND,
+            format!(
+                "this node does not hold blob {} yet; no member gave it, and the node keeps asking",
+                abi::hex(id.digest())
+            ),
+        )),
         Err(error) => failed(error),
     }
 }
@@ -527,7 +535,7 @@ fn pieces<E: Context>(
     let count = Bytes::copy_from_slice(&(ids.len() as u32).to_le_bytes());
     let reads = futures::stream::iter(ids).then(move |id| {
         let ctx = ctx.clone();
-        async move { encoded(served(&ctx, id).await) }
+        async move { encoded(served(&ctx, id).await.map(Read::framed)) }
     });
     futures::stream::once(async move { vec![Ok(count)] }).chain(reads)
 }
@@ -597,7 +605,22 @@ fn finished(mut encoder: Encoder) -> std::io::Result<Vec<u8>> {
     }
 }
 
-async fn served<E: Context>(ctx: &Ctx<E>, id: BlobId) -> crate::Result<Option<Vec<u8>>> {
+enum Read {
+    Framed(Vec<u8>),
+    Unnamed,
+    Fetching,
+}
+
+impl Read {
+    fn framed(self) -> Option<Vec<u8>> {
+        match self {
+            Read::Framed(framed) => Some(framed),
+            Read::Unnamed | Read::Fetching => None,
+        }
+    }
+}
+
+async fn served<E: Context>(ctx: &Ctx<E>, id: BlobId) -> crate::Result<Read> {
     let view = ctx.view().clone();
     let now = ctx.now();
     let readable = offload(move || {
@@ -605,13 +628,15 @@ async fn served<E: Context>(ctx: &Ctx<E>, id: BlobId) -> crate::Result<Option<Ve
     })
     .await??;
     if !readable {
-        return Ok(None);
+        return Ok(Read::Unnamed);
     }
     let store = ctx.blobs().store().clone();
-    if !store.has(&id) {
-        ctx.fetch(id).await;
+    let held = store.has(&id) || ctx.blobs().seek(id).await;
+    if !held {
+        return Ok(Read::Fetching);
     }
-    Ok(offload(move || store.framed_once(&id)).await??)
+    let framed = offload(move || store.framed_once(&id)).await??;
+    Ok(framed.map_or(Read::Unnamed, Read::Framed))
 }
 
 fn encoded(read: crate::Result<Option<Vec<u8>>>) -> Vec<crate::Result<Bytes>> {

@@ -647,7 +647,11 @@ receipted a bundle, the blobs program marks it held, and stops listing who
 receipted. `--wait` follows the blobs program's confirmed writes until then.
 Consensus never waits on a blob: a program reads a blob that a program put
 or a held bundle names (`ctx.blob_get`), and a node that lacks one when a
-block reads it fetches it over halo before it applies the block. A blob's roster row
+block reads it fetches it over halo before it applies the block. A read of
+such a blob (`/v1/blob/get`, `/v1/blobs`) asks every member once, or none
+when the node already asks in the background: if none gives it, `/v1/blob/get` refuses it as not found and `/v1/blobs` answers it as
+not served and goes on to the next id, while the node keeps asking in the
+background, one fetch per blob however many read it. A blob's roster row
 names the programs that hold it. A put holds its blob on a line the program
 names (`BlobPut { hash, kind, body, line }`: a path, a slot, or for a one-off
 the blob's own id) until a newer put by that program on the same line, or

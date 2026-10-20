@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use abi::{BlobId, ProgramId, Refusal};
+use abi::{ProgramId, Refusal};
 use axum::extract::FromRequestParts;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
@@ -136,10 +136,6 @@ impl<E: Context> Ctx<E> {
 
     pub(crate) fn blobs(&self) -> &blob::service::Service {
         &self.daemon.blobs
-    }
-
-    pub(crate) async fn fetch(&self, id: BlobId) {
-        self.daemon.blobs.fetch(id, halo::Class::Client).await;
     }
 
     pub(crate) fn logs(&self) -> Vec<String> {

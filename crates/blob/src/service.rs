@@ -84,14 +84,15 @@ struct SentBy {
 }
 
 struct Wanted {
-    entry: Entry,
+    id: BlobId,
+    declared: Option<Entry>,
     due: Instant,
     rounds: u32,
     pulling: bool,
 }
 
 enum Next {
-    Pull(Entry),
+    Pull(BlobId, Option<Entry>),
     Until(Instant),
     Idle,
 }
@@ -255,6 +256,10 @@ impl Service {
 
     pub async fn fetch(&self, id: BlobId, class: Class) {
         self.inner.fetch(id, class).await
+    }
+
+    pub async fn seek(&self, id: BlobId) -> bool {
+        self.inner.seek(id).await
     }
 
     pub async fn keep(&self, id: BlobId, framed: Vec<u8>) -> Result<Kept, &'static str> {
@@ -455,12 +460,14 @@ impl Inner {
         let mut state = self.state();
         let now = Instant::now();
         for entry in absent {
-            state.wanted.entry(entry.id).or_insert(Wanted {
-                entry,
+            let want = state.wanted.entry(entry.id).or_insert(Wanted {
+                id: entry.id,
+                declared: None,
                 due: now,
                 rounds: 0,
                 pulling: false,
             });
+            want.declared = Some(entry);
         }
         let posted = state.open.remove(&n).and_then(|open| open.posted);
         state.open.insert(n, Open { bundle, posted });
@@ -528,7 +535,7 @@ impl Inner {
             }
             if want.due <= now {
                 want.pulling = true;
-                return Next::Pull(want.entry.clone());
+                return Next::Pull(want.id, want.declared.clone());
             }
             earliest = Some(earliest.map_or(want.due, |at| at.min(want.due)));
         }
@@ -554,7 +561,7 @@ impl Inner {
         let rounds = want.rounds;
         let worth_a_line = rounds == 1 || rounds.is_multiple_of(10);
         if worth_a_line {
-            tracing::warn!(target: "ducktape::blob", event = "blob_ungathered", ?id, attempts = rounds, reason = missed, "no member gave a blob a bundle names; the node asks again");
+            tracing::warn!(target: "ducktape::blob", event = "blob_ungathered", ?id, attempts = rounds, reason = missed, "no member gave a blob this node wants; the node asks again");
         }
     }
 
@@ -617,6 +624,40 @@ impl Inner {
             }
             tokio::time::sleep(pause(rounds)).await;
         }
+    }
+
+    async fn seek(self: &Arc<Self>, id: BlobId) -> bool {
+        if self.store.has(&id) {
+            return true;
+        }
+        let wanted = self.state().wanted.contains_key(&id);
+        if wanted {
+            return false;
+        }
+        let declared = self.declared(&id);
+        let Err(missed) = self.round(&id, declared.as_ref(), Class::Client).await else {
+            return true;
+        };
+        let mut state = self.state();
+        let fresh = match state.wanted.entry(id) {
+            std::collections::btree_map::Entry::Vacant(vacant) => {
+                vacant.insert(Wanted {
+                    id,
+                    declared,
+                    due: Instant::now() + pause(1),
+                    rounds: 1,
+                    pulling: false,
+                });
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        };
+        drop(state);
+        if fresh {
+            tracing::warn!(target: "ducktape::blob", event = "blob_ungathered", ?id, attempts = 1, reason = missed, "no member gave a blob this node wants; the node asks again");
+        }
+        self.work.notify_waiters();
+        false
     }
 
     fn pulls(&self) -> MutexGuard<'_, Pulls> {
@@ -926,9 +967,9 @@ async fn gathering(inner: Arc<Inner>) {
         tokio::pin!(notified);
         notified.as_mut().enable();
         match inner.next() {
-            Next::Pull(entry) => {
-                let round = inner.round(&entry.id, Some(&entry), Class::Member).await;
-                inner.gathered(&entry.id, round);
+            Next::Pull(id, declared) => {
+                let round = inner.round(&id, declared.as_ref(), Class::Member).await;
+                inner.gathered(&id, round);
             }
             Next::Until(at) => {
                 tokio::select! {

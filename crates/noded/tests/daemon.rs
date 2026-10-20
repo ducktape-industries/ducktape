@@ -1826,6 +1826,43 @@ fn a_joined_node_fills_its_blobs_from_its_source_and_keeps_none_released_on_the_
     }
 }
 
+#[test]
+fn a_read_of_a_blob_no_member_gives_is_answered_and_a_stream_goes_on_past_it() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let (lost, kept) = (part(b"lost"), part(b"kept"));
+
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        let mut changes = client.changes("probe").await.unwrap();
+        let steps = vec![put_part(b"lost"), put_part(b"kept"), set(b"put", b"1")];
+        let put = frame(&client, &alice, steps).await;
+        client.submit(put, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"put"]).await;
+        daemon.blobs.store().remove(&lost).unwrap();
+        let read = client.blob(lost).await;
+        assert!(
+            matches!(&read, Err(noded::Error::Refused(refusal)) if refusal.reason == reason::NOT_FOUND),
+            "{read:?}"
+        );
+        let streamed = client.blobs(&[lost, kept]).await.unwrap();
+        assert_eq!(streamed.len(), 2);
+        assert_eq!(streamed[0], None, "a blob no member gives is answered as not served");
+        assert!(streamed[1].is_some(), "the stream goes on past it");
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
 async fn landed(
     changes: &mut (impl futures::Stream<Item = noded::Result<noded::wire::Change>> + Unpin),
     keys: &[&[u8]],

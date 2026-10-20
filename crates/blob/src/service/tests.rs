@@ -216,6 +216,92 @@ fn a_late_seed_takes_only_older_files_and_never_one_a_newer_owner_writes() {
     assert!(!at(2).exists(), "a gone owner's file is removed");
 }
 
+#[test]
+fn a_seek_no_member_answers_ends_after_one_round_and_the_service_gathers_the_blob_after() {
+    runtime::Runner::default().start(|context| async move {
+        let (holder, holder_seat) = member(&context.child("holder"), 1);
+        let (asker, asker_seat) = member(&context.child("asker"), 2);
+        for halo in [&holder, &asker] {
+            halo.seat(vec![holder_seat.clone(), asker_seat.clone()]);
+        }
+        let held = tempfile::tempdir().unwrap();
+        let store = Blobs::open(held.path()).unwrap();
+        let framed = frame("part", b"sought").unwrap();
+        let id = id_of(abi::HashKind::Sha256, &framed).unwrap();
+        let lane = holder
+            .plane()
+            .streams(LANE, Config::default().backlog.get())
+            .unwrap();
+        let fetched = tempfile::tempdir().unwrap();
+        let service = Service::start(
+            asker,
+            Blobs::open(fetched.path()).unwrap(),
+            Vec::new(),
+            Config::default(),
+        )
+        .unwrap();
+        let mut landed = service.landed();
+        let lacked = async {
+            let inbound = lane.accept().await.unwrap();
+            assert_eq!(inbound.class, Class::Client);
+            assert_eq!(answer(&store, inbound).await, Err("lacks"));
+        };
+        let (sought, ()) = tokio::join!(service.seek(id), lacked);
+        assert!(
+            !sought,
+            "no member gave the blob in the one round a seek asks"
+        );
+        assert!(!service.store().has(&id));
+        assert!(
+            !service.seek(id).await,
+            "a blob the node already wants is answered at once"
+        );
+        store.write(&id, &framed).unwrap();
+        let inbound = lane.accept().await.unwrap();
+        assert_eq!(inbound.class, Class::Member);
+        answer(&store, inbound).await.unwrap();
+        landed.wait_for(|landed| *landed == 1).await.unwrap();
+        assert_eq!(service.store().framed(&id).unwrap(), Some(framed));
+        assert!(service.seek(id).await);
+    });
+}
+
+#[test]
+fn a_seek_a_member_answers_within_its_round_lands_the_blob() {
+    runtime::Runner::default().start(|context| async move {
+        let (holder, holder_seat) = member(&context.child("holder"), 1);
+        let (asker, asker_seat) = member(&context.child("asker"), 2);
+        for halo in [&holder, &asker] {
+            halo.seat(vec![holder_seat.clone(), asker_seat.clone()]);
+        }
+        let held = tempfile::tempdir().unwrap();
+        let store = Blobs::open(held.path()).unwrap();
+        let framed = frame("part", b"given").unwrap();
+        let id = id_of(abi::HashKind::Sha256, &framed).unwrap();
+        store.write(&id, &framed).unwrap();
+        let lane = holder
+            .plane()
+            .streams(LANE, Config::default().backlog.get())
+            .unwrap();
+        let fetched = tempfile::tempdir().unwrap();
+        let service = Service::start(
+            asker,
+            Blobs::open(fetched.path()).unwrap(),
+            Vec::new(),
+            Config::default(),
+        )
+        .unwrap();
+        let given = async {
+            let inbound = lane.accept().await.unwrap();
+            assert_eq!(inbound.class, Class::Client);
+            answer(&store, inbound).await.unwrap();
+        };
+        let (sought, ()) = tokio::join!(service.seek(id), given);
+        assert!(sought, "a member gave the blob within the seek's round");
+        assert_eq!(service.store().framed(&id).unwrap(), Some(framed));
+    });
+}
+
 fn quiet(context: &runtime::Context) -> (Service, tempfile::TempDir) {
     let (asker, _) = member(&context.child("asker"), 2);
     let fetched = tempfile::tempdir().unwrap();
