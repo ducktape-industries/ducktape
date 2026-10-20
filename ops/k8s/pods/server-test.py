@@ -1874,9 +1874,10 @@ class Posts(unittest.TestCase):
         self.assertEqual(len(self.signer.submits), 1)
 
     def test_a_pod_still_running_or_asking_for_no_post_is_not_posted(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
         self.notifier.seen(pod_json(state={"running": {}}, phase="Running", notes=NOTIFY))
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded"))
-        self.assertEqual((self.signer.submits, self.kube.calls), ([], []))
+        self.assertEqual((self.signer.submits, self.kube.calls), ([], [("logs", "duckpond-41", ["--container", "run"])]))
 
     def test_a_notified_pods_notify_line_is_posted_led_by_the_pod(self):
         self.notifier.spawn = lambda target, *args: target(*args)
@@ -1885,7 +1886,35 @@ class Posts(unittest.TestCase):
         line = "duckpond-41 \u00b7 20261019-1 ended: exit 0, GATES ok"
         posted = notified("j-093", server.notify_id("duckpond-41", "j-093", line), 17, line, None)
         self.assertEqual(self.signer.submits, [("chat", posted)])
-        self.assertEqual((self.kube.follows, self.kube.calls, self.notifier.following), (["duckpond-41"], [], set()))
+        self.assertEqual((self.kube.follows, self.kube.calls, self.notifier.following), (["duckpond-41"], [("logs", "duckpond-41", ["--container", "run"])], set()))
+
+    def test_a_followed_pod_asks_chat_only_back_to_the_newest_line_it_holds(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        logged = b"[r1] a line\nducktape-notify j-1 r1 ended: exit 0, GATES ok\nducktape-notify j-2 r2 ended: exit 1, GATES FAIL: test\nducktape-notify j-1 r3 ended: exit 0, GATES ok\n"
+        lines = [("j-1", "duckpond-41 \u00b7 r1 ended: exit 0, GATES ok"), ("j-2", "duckpond-41 \u00b7 r2 ended: exit 1, GATES FAIL: test"), ("j-1", "duckpond-41 \u00b7 r3 ended: exit 0, GATES ok")]
+        ids = [server.notify_id("duckpond-41", channel, line) for channel, line in lines]
+        self.signer.messages.update(ids[:2])
+        self.kube.answer("logs", ran(logged))
+        self.kube.logs_of["duckpond-41"] = logged
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual([request for request in self.signer.asked if request in map(server.chat_message, ids)], [server.chat_message(ids[2]), server.chat_message(ids[1]), server.chat_message(ids[2])])
+        self.assertEqual(self.signer.submits, [("chat", notified("j-1", ids[2], 17, lines[2][1], None))])
+        said.assert_any_call("pods_caught_up", pod="duckpond-41", already_posted=2, asked=2)
+
+    def test_a_followed_pod_whose_log_cannot_be_read_asks_each_line_as_it_comes(self):
+        self.notifier.spawn = lambda target, *args: target(*args)
+        logged = b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\nducktape-notify j-1 r2 ended: exit 0, GATES ok\n"
+        lines = [("j-1", f"duckpond-41 \u00b7 r{n} ended: exit 0, GATES ok") for n in (1, 2)]
+        ids = [server.notify_id("duckpond-41", channel, line) for channel, line in lines]
+        self.signer.messages.add(ids[0])
+        self.kube.answer("logs", ran(code=1, err="Error from server: the container is starting"))
+        self.kube.logs_of["duckpond-41"] = logged
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        said.assert_any_call("pods_uncaught", pod="duckpond-41", detail=json.dumps("Error from server: the container is starting"))
+        self.assertEqual([request for request in self.signer.asked if request in map(server.chat_message, ids)], [server.chat_message(id) for id in ids])
+        self.assertEqual(self.signer.submits, [("chat", notified("j-1", ids[1], 17, lines[1][1], None))])
 
     def test_a_pod_followed_again_posts_each_line_once(self):
         self.notifier.spawn = lambda target, *args: target(*args)

@@ -409,7 +409,13 @@ one up for another network.
   for `<run> ended: …` and `run <run> lost with pod …`, else the pod), so
   nothing the service posts can pass for a person or a program; a line is
   posted once, under an id from the pod and the sha256 of the channel and
-  the text. A pod that ends before the service saw it run, or while the
+  the text. Before the service follows a running pod's log (on the pod's
+  start, or the service's own), one read of that log finds the newest line
+  chat holds, asking from the newest line back, and every line up to it
+  counts as posted with no ask of its own (`pods_caught_up pod=
+  already_posted= asked=`, as for the desktop; a log it can't read, or a
+  chat ask that fails during the walk, logs `pods_uncaught` with why, and
+  each line is asked as it comes). A pod that ends before the service saw it run, or while the
   service was down, has its log read before its end post. Every post, the
   end post too, goes only where its requester may post, as chat decides
   (the channel is not archived, and is open, or the requester owns it or

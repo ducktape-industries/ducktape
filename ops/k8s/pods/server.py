@@ -1852,6 +1852,13 @@ class Notifier:
                 return newest + 1, asked, None
         return 0, asked, None
 
+    def caught_up(self, name, logged):
+        passed, asked, why = self.passed(name, list(notify_lines(name, logged)))
+        if why is not None:
+            say("pods_uncaught", pod=name, asked=asked, detail=json.dumps(why))
+            return
+        say("pods_caught_up", pod=name, already_posted=passed, asked=asked)
+
     def lines(self, name, requester, stream, unvouched=False, concerned=None):
         return self.each(name, requester, notify_lines(name, stream), unvouched, concerned)
 
@@ -1872,6 +1879,11 @@ class Notifier:
 
     def follow(self, name, requester):
         try:
+            ran = self.kube.logs(name, ["--container", RUN])
+            if ran.code == 0:
+                self.caught_up(name, ran.out.splitlines(keepends=True))
+            else:
+                say("pods_uncaught", pod=name, detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
             process = self.kube.follow(name)
             self.lines(name, requester, process.stdout)
             process.wait()
@@ -2608,11 +2620,7 @@ class Service:
         except Refused as refused:
             say("pods_uncaught", pod=DESKTOP, detail=json.dumps(refused.sentence))
             return
-        passed, asked, why = self.notifier.passed(DESKTOP, list(notify_lines(DESKTOP, logged.splitlines(keepends=True))))
-        if why is not None:
-            say("pods_uncaught", pod=DESKTOP, asked=asked, detail=json.dumps(why))
-            return
-        say("pods_caught_up", pod=DESKTOP, already_posted=passed, asked=asked)
+        self.notifier.caught_up(DESKTOP, logged.splitlines(keepends=True))
 
     def warm_requester(self):
         if not self.warm_pod:
