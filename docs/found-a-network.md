@@ -105,16 +105,14 @@ for every tool call. The service name is yours to choose. duckpond's is
 On fabrics-1 the gateway is ccs, in namespace `duckpond`. ccs binds only
 `127.0.0.1:4141`, so a socat sidecar forwards its pod's port 4142 to it. The
 Service `ccs` takes 4141 to 4142, and the NetworkPolicy `ccs-node-only`
-admits only pods labelled `app: node` in the namespaces it lists. The gateway
-key, which `ccs serve --key` prints, is `CCS_KEY` in the Secret `egress`. A second network
-needs two things before its node calls ccs. Both touch duckpond's objects, so
-ask duckpond's operator first:
+admits only pods labelled `app: node` in the namespaces it lists. ccs runs
+without `--require-key`, so it answers every request that NetworkPolicy lets
+through, and the node sends no gateway key. A second network needs one thing
+before its node calls ccs, the NetworkPolicy entry. It touches duckpond's
+objects, so ask duckpond's operator first:
 
 ```sh
 kubectl -n duckpond patch networkpolicy ccs-node-only --type=json -p '[{"op":"add","path":"/spec/ingress/-","value":{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"sealpond"}},"podSelector":{"matchLabels":{"app":"node"}}}],"ports":[{"port":4142,"protocol":"TCP"}]}}]'
-kubectl -n duckpond get secret egress -o json \
-  | python3 -c 'import json,sys; s=json.load(sys.stdin); print(json.dumps({"apiVersion":"v1","kind":"Secret","metadata":{"name":"egress","namespace":"sealpond"},"data":{"CCS_KEY":s["data"]["CCS_KEY"]}}))' \
-  | kubectl apply -f -
 ```
 
 The node's pod resolves names through public resolvers only (`dnsPolicy:
@@ -125,22 +123,21 @@ does not resolve there. Name the Service by its ClusterIP:
 kubectl -n duckpond get svc ccs -o jsonpath='{.spec.clusterIP}'   # 10.43.41.41
 ```
 
-`ops/k8s/node.yaml` gives the node each key of the Secret `egress` both as an
-environment variable and as a file under `/secrets/egress/`. A file secret
-changes with `ducktape egress reload` and no restart (README § Answer calls
-outside the chain). The node's `egress.toml`:
+The node's `egress.toml`:
 
 ```toml
 relay = true
 
 [services.anthropic]
 base = "http://10.43.41.41:4141"
-secrets = { x-api-key = { file = "/secrets/egress/CCS_KEY" } }
 ```
 
-Instead of either kubectl step, a network can borrow the service from a
-network that fronts it, and nothing of the lender's is copied (README § Answer
-calls outside the chain, lending). Your node's key makes an account on the
+It carries no `secrets`. So `ducktape egress set` can also send it to the
+running node. That verb refuses any file whose services carry secrets (README
+§ Answer calls outside the chain).
+
+Instead of the NetworkPolicy entry, a network can borrow the service from a
+network that fronts it (README § Answer calls outside the chain, lending). Your node's key makes an account on the
 lending network, the service's owner there names that account in the access
 list on egress `lend/<service>`, and your node's `egress.toml` names the
 lending node:
