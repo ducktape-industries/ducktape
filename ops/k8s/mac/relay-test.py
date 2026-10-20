@@ -596,7 +596,6 @@ class Checks(unittest.TestCase):
         connection.close()
 
     def test_a_check_whose_job_names_other_runners_is_passed_over_for_the_next(self):
-        self.signer.queue = [(3, {}), (4, {})]
         self.signer.queue = [(3, {})]
         self.signer.unnamed = {3}
         connection, answer = self.work()

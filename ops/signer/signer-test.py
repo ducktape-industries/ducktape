@@ -3,6 +3,8 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,6 +30,13 @@ inputs, out = map(pathlib.Path, sys.argv[1:])
 if os.environ.get("SIGNER_ENV_FAIL"):
     print("security unlock-keychain -p hunter2", file=sys.stderr)
     sys.exit(3)
+if os.environ.get("SIGNER_ENV_PUBLISH_JSON"):
+    (out / "publish.json").write_text(os.environ["SIGNER_ENV_PUBLISH_JSON"])
+elif os.environ.get("SIGNER_ENV_PUBLISH"):
+    (out / "inputs-seen.json").write_text(pathlib.Path(os.environ["SIGNER_INPUTS"]).read_text())
+    source = os.environ.get("SIGNER_ENV_FROM", "inputs/build/dist/ducktape.app")
+    wanted = {"files": [{"path": "/shared/releases/app/x/ducktape.app", "from": source}], "tag": {"name": os.environ["SIGNER_ENV_PUBLISH"], "message": '{"record": 1}', "time": 1792000000}}
+    (out / "publish.json").write_text(json.dumps(wanted))
 for path in sorted(inputs.rglob("*")):
     if path.is_file():
         (out / (path.name + ".signed")).write_bytes(b"signed:" + path.read_bytes())
@@ -76,6 +85,12 @@ class Fake:
         self.lost = set()
         self.down = False
         self.accounts = {KEY: 60}
+        self.refs = {}
+        self.packs = {}
+        self.commits = []
+        self.files_answers = []
+        self.ref_refused = False
+        self.pushed = None
 
     def key(self):
         return KEY
@@ -87,6 +102,16 @@ class Fake:
             reader = signer.Reader(request)
             assert reader.u8() == 0
             return ran(signer.u8(0) + signer.borsh_option(self.accounts.get(reader.bytes()), signer.u64))
+        if program == signer.FILES:
+            assert request == signer.files_head()
+            return ran(signer.u8(0) + b"\x01" + signer.blob_id("sha256:" + "cd" * 32))
+        if program == signer.FORGE and request[0] == 16:
+            reader = signer.Reader(request)
+            reader.u8()
+            assert reader.text() == "app"
+            prefix = reader.text()
+            items = [text(name) + text(oid) for name, oid in sorted(self.refs.items()) if name.startswith(prefix)]
+            return ran(signer.u8(14) + signer.u64(9) + signer.u64(9) + signer.borsh_vec(items) + b"\x00")
         if program == signer.FORGE:
             reader = signer.Reader(request)
             assert reader.u8() == 9
@@ -122,6 +147,21 @@ class Fake:
 
     def submit(self, program, payload):
         self.submits.append((program, payload))
+        if program == signer.FILES:
+            self.commits.append(payload)
+            return self.files_answers.pop(0) if self.files_answers else ran(b"preconfirmed applied 0a")
+        if program == signer.FORGE:
+            reader = signer.Reader(payload)
+            assert reader.u8() == 4 and reader.text() == "app"
+            request = reader.bytes()
+            pack = reader.option(reader.blob)
+            line = request[4 : int(request[:4], 16)].split(b"\0")[0].decode()
+            _, oid, ref = line.split(" ")
+            assert request.endswith(b"0000")
+            if not self.ref_refused:
+                self.refs[ref] = oid
+            self.pushed = (oid, ref, self.packs[pack])
+            return ran(b"preconfirmed applied 0a")
         if self.failing and payload[0] != 3:
             return self.failing.pop(0)
         if payload[0] == 3:
@@ -138,6 +178,7 @@ class Fake:
     def put(self, paths, kind):
         files = [(pathlib.Path(path).name, pathlib.Path(path).read_bytes()) for path in paths]
         self.puts.append((kind, files))
+        self.packs.update({blob_of(data): data for _, data in files})
         return ran("".join(f"{blob_of(data)}\n" for _, data in files).encode())
 
     def blob(self, blob):
@@ -156,6 +197,7 @@ class Signing(unittest.TestCase):
             "builders": [MAC, PODS],
             "repos": {"app": {"developer-id": ["main", "dev"], "release-manifest": {"stable": ["main"], "nightly": ["main", "dev"]}}},
             "tools": {"developer-id": tool, "release-manifest": tool, "testflight": tool},
+            "publish": {"app": {"release-manifest": {"files": "/shared/releases/app/", "tags": "release/"}}},
         }
         self.fake = Fake()
         self.signer = signer.Signer(self.fake, self.config, root / "home")
@@ -206,6 +248,7 @@ class Signing(unittest.TestCase):
         named = dict(files)
         self.assertEqual(named["ducktape.app.signed"], b"signed:\xcf\xfa\xed\xfeapp")
         env = json.loads(named["env.json"])
+        self.assertTrue(env.pop("SIGNER_INPUTS").endswith("/work/5/inputs.json"))
         self.assertEqual(env, {"SIGNER_BRANCH": "main", "SIGNER_CHECK": "5", "SIGNER_COMMIT": COMMIT, "SIGNER_ENV_MODE": "dist", "SIGNER_REPO": "app"})
         record = json.loads(named["signed.json"])
         self.assertEqual((record["account"], record["operation"], record["commit"], record["branch"], record["check"]), (60, "developer-id", COMMIT, "main", 5))
@@ -244,6 +287,101 @@ class Signing(unittest.TestCase):
                 self.assertEqual(state, "errored")
                 self.assertIn(sentence, summary)
                 self.assertEqual((self.fake.puts, self.sent(7)), ([], []), "nothing was signed")
+
+    def test_a_check_this_signer_signed_itself_is_an_input_it_trusts(self):
+        self.built(9, b"signed bundle", by=60, reporter=60)
+        self.asks(5, steps=("release-manifest",), env=(("CHANNEL", "stable"),))
+        self.signer.pull()
+        self.assertEqual(self.ended(5)[0], "passed", "its own account's outputs, learnt from its key")
+
+    def test_a_tool_asks_for_files_and_a_tag_and_the_signer_makes_them_with_its_own_key(self):
+        home = pathlib.Path(self.temp.name) / "home"
+        self.asks(5, steps=("release-manifest",), env=(("CHANNEL", "stable"), ("PUBLISH", "release/stable/1792000000")))
+        self.signer.pull()
+        self.assertEqual(self.ended(5)[0], "passed")
+        [commit] = self.fake.commits
+        self.assertIn(b"/shared/releases/app/x/ducktape.app", commit)
+        chunks = [files for kind, files in self.fake.puts if kind == signer.CHUNK]
+        self.assertEqual(chunks, [[("chunk-0", b"\xcf\xfa\xed\xfeapp")]])
+        oid, ref, pack = self.fake.pushed
+        self.assertEqual((ref, self.fake.refs), ("refs/tags/release/stable/1792000000", {ref: oid}))
+        tagger = "signer 60 <60@duckpond>"
+        body = f"object {COMMIT}\ntype commit\ntag release/stable/1792000000\ntagger {tagger} 1792000000 +0000\n\n{{\"record\": 1}}\n".encode()
+        self.assertEqual(oid, hashlib.sha1(f"tag {len(body)}\0".encode() + body).hexdigest())
+        git = shutil.which("git")
+        if git:
+            repo = home / "git"
+            subprocess.run([git, "init", "-q", "--bare", str(repo)], check=True)
+            subprocess.run([git, "-C", str(repo), "index-pack", "--stdin"], input=pack, check=True, capture_output=True)
+            shown = subprocess.run([git, "-C", str(repo), "cat-file", "tag", oid], check=True, capture_output=True).stdout
+            self.assertEqual(shown, body, "git reads the pack as this one tag")
+        named = dict(next(files for kind, files in self.fake.puts if kind == signer.OUTPUT))
+        self.assertNotIn("publish.json", named, "an instruction, not an output")
+        seen = json.loads(named["inputs-seen.json"])
+        self.assertEqual([(item["job"], item["check"], item["blob"]) for item in seen], [("build", 9, self.fake.outputs[9][1][0][1])])
+        record = json.loads(named["signed.json"])
+        published = {"path": "/shared/releases/app/x/ducktape.app", "sha256": hashlib.sha256(b"\xcf\xfa\xed\xfeapp").hexdigest()}
+        self.assertEqual(record["published"], {"files": [published], "tag": {"name": "release/stable/1792000000", "oid": oid}})
+        self.fake.puts.clear()
+        self.fake.pushed = None
+        self.asks(6, steps=("release-manifest",), env=(("CHANNEL", "stable"), ("PUBLISH", "release/stable/1792000000")))
+        self.signer.pull()
+        self.assertEqual((self.ended(6)[0], self.fake.pushed), ("passed", None), "the same record again is already published")
+        self.fake.refs[ref] = "e" * 40
+        written = len(self.fake.commits)
+        self.asks(7, steps=("release-manifest",), env=(("CHANNEL", "stable"), ("PUBLISH", "release/stable/1792000000")))
+        self.signer.pull()
+        self.assertEqual(self.ended(7), ("errored", f"app already has {ref} at {'e' * 40}, another record than this one ({oid})"))
+        self.assertEqual(len(self.fake.commits), written, "a refused record writes no files")
+
+    def test_what_a_tool_may_publish_is_bounded_by_the_signers_config_and_a_refusal_writes_nothing(self):
+        place = lambda path: {"files": [{"path": path, "from": "inputs/build/dist/ducktape.app"}]}
+        tag = lambda name, message="m", time=1: {"tag": {"name": name, "message": message, "time": time}}
+        cases = [
+            ("a path with no write list", place("/shared/anyone/notes.md"), "outside /shared/releases/app/, where this signer publishes release-manifest's files"),
+            ("another's home", place("/home/eddy/notes.md"), "outside /shared/releases/app/"),
+            ("a path climbing out", place("/shared/releases/app/../../x"), "which is not an absolute files path"),
+            ("a relative path", place("shared/releases/app/x"), "which is not an absolute files path"),
+            ("a tag outside its prefix", tag("v9.9.9"), "outside release/, where this signer tags for release-manifest"),
+            ("a tag with ..", tag("release/../x"), "which is no ref name forge takes"),
+            ("a hidden component", tag("release/.hidden"), "which is no ref name forge takes"),
+            ("a lock name", tag("release/x.lock"), "which is no ref name forge takes"),
+            ("a time that is true", tag("release/1", time=True), "its time as a whole unix time"),
+            ("a message that is not text", tag("release/1", message=7), "its name and message as text"),
+            ("not an object", [1], "is an object of files and tag"),
+            ("an operation that publishes nothing", tag("release/1"), "this signer publishes nothing for developer-id in app"),
+        ]
+        for name, wanted, sentence in cases:
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                steps = ("developer-id",) if name.startswith("an operation") else ("release-manifest",)
+                self.asks(5, steps=steps, env=(("CHANNEL", "stable"), ("PUBLISH_JSON", json.dumps(wanted))))
+                self.signer.pull()
+                state, summary = self.ended(5)
+                self.assertEqual(state, "errored")
+                self.assertIn(sentence, summary)
+                self.assertEqual((self.fake.commits, self.fake.refs, self.fake.pushed), ([], {}, None), "nothing was written")
+
+    def test_a_push_forge_applied_without_moving_the_tag_errs_the_check(self):
+        self.fake.ref_refused = True
+        self.asks(5, steps=("release-manifest",), env=(("CHANNEL", "stable"), ("PUBLISH", "release/stable/1792000000")))
+        self.signer.pull()
+        oid = self.fake.pushed[0]
+        self.assertEqual(self.ended(5), ("errored", f"forge took the push, but refs/tags/release/stable/1792000000 does not name {oid}"))
+
+    def test_a_files_commit_whose_head_moved_is_made_again_on_the_new_head(self):
+        self.fake.files_answers = [ran(b"preconfirmed rejected stale: the head moved")]
+        self.asks(5, steps=("release-manifest",), env=(("CHANNEL", "stable"), ("PUBLISH", "release/stable/1792000000")))
+        self.signer.pull()
+        self.assertEqual((self.ended(5)[0], len(self.fake.commits)), ("passed", 2))
+
+    def test_a_tool_that_asks_to_publish_a_file_from_outside_its_work_errs_the_check(self):
+        self.asks(5, steps=("release-manifest",), env=(("CHANNEL", "stable"), ("PUBLISH", "release/stable/1"), ("FROM", "../../pending.json")))
+        self.signer.pull()
+        self.assertTrue((pathlib.Path(self.temp.name) / "home" / "pending.json").is_file(), "it names a file that is there")
+        self.assertEqual(self.ended(5), ("errored", "the tool asked to write '../../pending.json', which is no file of this check's work"))
+        self.assertEqual((self.fake.commits, self.fake.refs), ([], {}))
 
     def test_a_nightly_manifest_from_dev_is_signed(self):
         self.fake.on = {"dev": {COMMIT}}

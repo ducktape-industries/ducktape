@@ -778,7 +778,10 @@ one up for another network.
   its commit's code. It registers its labels, follows `ducktape changes
   actions` as the mac relay does (once per height it prints, again at once
   after a follow that heard something, else after `FOLLOW_PAUSE`), and
-  claims the oldest queued check its labels cover.
+  claims the oldest queued check its labels cover, passing over one whose
+  job's `runners` does not name it: that refusal is final for the check,
+  so it asks once, logs it once, and forgets the id when actions no longer
+  queues it.
 - A signing check's `steps` is one operation's name from the config's
   `tools`: `developer-id`, `testflight` or `release-manifest`. Before any
   tool runs it checks, from the network alone, that the check's commit is
@@ -788,8 +791,8 @@ one up for another network.
   `CHANNEL` names: stable from `main`, nightly from `main` or `dev`, chief's
   ruling), that every job it needs (`Query::Needs`) was met by a passed
   check of the same run and commit reported by a builder the config
-  trusts (`mac`, account 44, and `actions-pods`, 38), whose `Outputs` that
-  builder recorded, and that each blob it fetches hashes to its id and
+  trusts (`mac`, account 44, and `actions-pods`, 38) or by the signer's
+  own account, whose `Outputs` that builder recorded, and that each blob it fetches hashes to its id and
   holds the size its row says. Anything else errs the check, saying which,
   and signs nothing.
 - The tool runs as `<tool…> <inputs> <out>`: the needed outputs at
@@ -801,8 +804,29 @@ one up for another network.
   fails it, saying only its exit code: what a tool prints may hold a
   secret, so it stays in `logs/<check>.log` in the signer's home, never on
   the network. The tool sees `SIGNER_REPO`, `SIGNER_COMMIT`,
-  `SIGNER_BRANCH`, `SIGNER_CHECK` and the job's `env` as `SIGNER_ENV_<NAME>`,
-  never the signer's duckpond key. An Outputs or Report that did not send
+  `SIGNER_BRANCH`, `SIGNER_CHECK`, `SIGNER_INPUTS` (a JSON file naming each
+  input's job, check, path, blob id and sha256) and the job's `env` as
+  `SIGNER_ENV_<NAME>`, never the signer's duckpond key. A tool that writes
+  `publish.json` in `out` asks the signer to publish with its own key
+  before it reports, within what the config's `publish` allows for that
+  repo and operation (`files`, a files root, and `tags`, a tag-name
+  prefix; an operation with neither publishes nothing): `files` (each
+  `{path, from}`, an absolute files path under the root and a file under
+  the check's work dir, committed in one files commit, made again on a
+  head that moved) and `tag` (`{name, message, time}`: an annotated tag
+  on the check's commit in the check's repo, its name under the prefix and
+  one forge takes as a ref, tagged by the signer's account at that unix
+  time, pushed as a one-object pack with forge `Push` and read back with
+  `RefNames`, since forge applies a push whose ref it refuses and says so
+  only in its report). Everything is checked, and the tag computed and
+  read, before anything is written, so a refused publish writes nothing.
+  The same tag already there is done; another one errs the check with
+  both oids: keep the tag that is there, or let the repo delete it,
+  delete it and rerun. A tool's tag name, message and time come from the
+  check (its commit, its committer time, its inputs), never the clock, so
+  a rerun after a lost receipt makes the same tag. `publish.json` is not
+  an output; what was published (each file's path and sha256, the tag's
+  name and oid) is in `signed.json`'s `published`. An Outputs or Report that did not send
   is kept in `pending.json` and sent before anything else is claimed; its
   first failure is logged with its reason, and its sending with the
   attempts it took. The check it is about to claim is in `claimed.json`
@@ -832,7 +856,8 @@ one up for another network.
    "repos": {"app": {"developer-id": ["main", "dev"], "testflight": ["main", "dev"],
                      "release-manifest": {"stable": ["main"], "nightly": ["main", "dev"]}}},
    "tools": {"developer-id": ["/path/to/developer-id"], "testflight": ["/path/to/testflight"],
-             "release-manifest": ["/path/to/release-manifest"]}}
+             "release-manifest": ["/path/to/release-manifest"]},
+   "publish": {"app": {"release-manifest": {"files": "/shared/releases/app/", "tags": "release/"}}}}
   ```
 
   Every answer the signer checks, blobs included, comes from the node in

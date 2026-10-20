@@ -13,11 +13,17 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
 ACTIONS = "actions"
 FORGE = "forge"
+FILES = "files"
 IDENTITY = "identity"
+CHUNK = "chunk"
+CHUNK_SIZE = 1 << 20
+PACK = "pack"
+PUBLISH = "publish.json"
 USER_KEY = "ducktape-user-key-v1:"
 USER_KEY_LEN = 16 + 12 + 24 + 32 + 32 + 16
 PUBKEY_AT = 16 + 12 + 24
@@ -120,6 +126,72 @@ def public_key(line):
     if len(blob) != USER_KEY_LEN:
         raise Refused(f"the key is not a {USER_KEY} key")
     return blob[PUBKEY_AT : PUBKEY_AT + 32]
+
+
+def forge_ref_names(repo, prefix):
+    return u8(16) + borsh_text(repo) + borsh_text(prefix) + b"\x00\x00"
+
+
+def forge_push(repo, request, pack):
+    return u8(4) + borsh_text(repo) + borsh_bytes(request) + borsh_option(pack, blob_id)
+
+
+def files_head():
+    return u8(0)
+
+
+def files_commit(base, message, files):
+    puts = [
+        u8(0) + borsh_text(path) + u8(0) + u32(0) + u8(1) + u64(size) + borsh_vec([blob_id(chunk) for chunk in chunks])
+        for path, size, chunks in files
+    ]
+    return u8(1) + borsh_option(base, blob_id) + borsh_text(message) + borsh_vec(puts)
+
+
+def git_hash(commit):
+    return hashlib.sha1 if len(commit) == 40 else hashlib.sha256
+
+
+def tag_object(commit, name, tagger, time_s, message):
+    head = f"object {commit}\ntype commit\ntag {name}\ntagger {tagger} {time_s} +0000\n\n"
+    return (head + message.rstrip("\n") + "\n").encode()
+
+
+def tag_oid(commit, body):
+    return git_hash(commit)(f"tag {len(body)}\0".encode() + body).hexdigest()
+
+
+def one_object_pack(commit, body):
+    size, header = len(body), []
+    first = (4 << 4) | (size & 0x0F)
+    size >>= 4
+    while size:
+        header.append(first | 0x80)
+        first = size & 0x7F
+        size >>= 7
+    header.append(first)
+    pack = b"PACK" + u32be(2) + u32be(1) + bytes(header) + zlib.compress(body)
+    return pack + git_hash(commit)(pack).digest()
+
+
+def valid_ref_name(name):
+    rest = name.removeprefix("refs/")
+    if rest == name or not rest:
+        return False
+    if any(byte < 0x20 or byte == 0x7F or byte in b" ~^:?*[\\" for byte in name.encode()):
+        return False
+    if ".." in name or "@{" in name or name.endswith(("/", ".")):
+        return False
+    return all(part and not part.startswith(".") and not part.endswith(".lock") for part in rest.split("/"))
+
+
+def u32be(value):
+    return value.to_bytes(4, "big")
+
+
+def pkt_line(text):
+    data = text.encode()
+    return f"{len(data) + 4:04x}".encode() + data
 
 
 def forge_compare(repo, commit, branch):
@@ -270,6 +342,7 @@ class Signer:
         self.builders = set(config["builders"])
         self.repos = config["repos"]
         self.tools = config["tools"]
+        self.publishing = config.get("publish", {})
         self.account = None
         self.home = home
         self.pending = home / "pending.json"
@@ -511,11 +584,12 @@ class Signer:
             same = built is not None and (built["commit"], built["run"]) == (check["commit"], check["run"])
             if not same or built["state"] != "passed":
                 raise Refused(f"`{job}`'s check {met} is not a passed check of this run at {check['commit']}")
-            if built["reporter"] not in self.builders:
+            trusted = self.builders | {self.account}
+            if built["reporter"] not in trusted:
                 raise Refused(f"`{job}`'s check {met} was reported by account {built['reporter']}, no builder this signer trusts")
             reader = self.asked(ACTIONS, actions_outputs_of(met), "Outputs", 7)
             row = reader.option(lambda: (reader.u64(), reader.vec(lambda: (reader.text(), reader.blob(), reader.u64()))))
-            if row is None or row[0] not in self.builders:
+            if row is None or row[0] not in trusted:
                 raise Refused(f"`{job}`'s check {met} has no outputs a trusted builder recorded")
             for path, blob, size in row[1]:
                 parts = path.split("/")
@@ -551,12 +625,21 @@ class Signer:
         out.mkdir(parents=True)
         env = {name: value for name, value in os.environ.items() if not name.startswith("SIGNER_ENV_")}
         env.update({f"SIGNER_ENV_{name}": value for name, value in check["job"]["env"].items() if ENV_NAME.fullmatch(name)})
+        (work / "inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
         env.update(SIGNER_REPO=check["repo"], SIGNER_COMMIT=check["commit"], SIGNER_BRANCH=branch, SIGNER_CHECK=str(check["id"]))
+        env.update(SIGNER_INPUTS=str(work / "inputs.json"))
         tool = run([*self.tools[operation], str(work / "inputs"), str(out)], env=env)
         self.logs.mkdir(parents=True, exist_ok=True)
         (self.logs / f"{check['id']}.log").write_bytes(tool.out + tool.err.encode())
         if tool.code != 0:
             self.report(check["id"], "failed", f"{operation} exited {tool.code}; what it said is in the signer's own log")
+            shutil.rmtree(work, ignore_errors=True)
+            return
+        try:
+            published = self.publish(check, operation, work, out / PUBLISH)
+        except Refused as refusal:
+            say("signer_unpublished", check=check["id"], detail=json.dumps(refusal.sentence))
+            self.report(check["id"], "errored", refusal.sentence)
             shutil.rmtree(work, ignore_errors=True)
             return
         made = sorted(path for path in out.rglob("*") if path.is_file())
@@ -570,6 +653,7 @@ class Signer:
             "branch": branch,
             "check": check["id"],
             "inputs": inputs,
+            "published": published,
             "outputs": [{"path": path.relative_to(out).as_posix(), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in made],
         }
         (out / "signed.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -582,6 +666,123 @@ class Signer:
             files = [(path.relative_to(out).as_posix(), blob, path.stat().st_size) for path, blob in zip(made, ids)]
             self.report(check["id"], "passed", f"{operation} for {check['repo']} at {check['commit']} ({branch})", files)
         shutil.rmtree(work, ignore_errors=True)
+
+    def publish(self, check, operation, work, asked):
+        if not asked.exists():
+            return {}
+        try:
+            wanted = json.loads(asked.read_text())
+        except ValueError as error:
+            raise Refused(f"the tool's {PUBLISH} does not parse: {error}") from None
+        asked.unlink()
+        bounds = self.publishing.get(check["repo"], {}).get(operation)
+        if bounds is None:
+            raise Refused(f"this signer publishes nothing for {operation} in {check['repo']}")
+        if not isinstance(wanted, dict) or not set(wanted) <= {"files", "tag"}:
+            raise Refused(f"the tool's {PUBLISH} is an object of files and tag")
+        placed = self.placed(check, operation, work, wanted.get("files", []), bounds.get("files"))
+        tag = self.tagged(check, operation, wanted.get("tag"), bounds.get("tags"))
+        published = {}
+        if placed:
+            published["files"] = self.commit_files(check, placed)
+        if tag is not None:
+            published["tag"] = self.push_tag(check, *tag)
+        return published
+
+    def placed(self, check, operation, work, files, root):
+        if not isinstance(files, list) or not all(isinstance(item, dict) for item in files):
+            raise Refused(f"the tool's files are a list of {{path, from}}")
+        if files and root is None:
+            raise Refused(f"this signer publishes no files for {operation} in {check['repo']}")
+        root = root if root is None or root.endswith("/") else f"{root}/"
+        placed = []
+        for item in files:
+            path, given = item.get("path"), item.get("from")
+            if not isinstance(path, str) or not isinstance(given, str):
+                raise Refused("each of the tool's files names its path and from as text")
+            if not path.startswith("/") or any(part in ("", ".", "..") for part in path[1:].split("/")):
+                raise Refused(f"the tool asked to write {path!r}, which is not an absolute files path")
+            if not path.startswith(root):
+                raise Refused(f"the tool asked to write {path!r}, outside {root}, where this signer publishes {operation}'s files")
+            source = (work / given).resolve()
+            if work.resolve() not in source.parents or not source.is_file():
+                raise Refused(f"the tool asked to write {given!r}, which is no file of this check's work")
+            placed.append((path, source.read_bytes()))
+        return placed
+
+    def tagged(self, check, operation, tag, prefix):
+        if tag is None:
+            return None
+        if prefix is None:
+            raise Refused(f"this signer pushes no tags for {operation} in {check['repo']}")
+        if not isinstance(tag, dict):
+            raise Refused("the tool's tag is an object of name, message and time")
+        name, message, time_s = tag.get("name"), tag.get("message"), tag.get("time")
+        if not isinstance(name, str) or not isinstance(message, str) or type(time_s) is not int:
+            raise Refused("the tool's tag names its name and message as text and its time as a whole unix time")
+        ref = f"refs/tags/{name}"
+        if not name.startswith(prefix):
+            raise Refused(f"the tool asked for tag {name!r}, outside {prefix}, where this signer tags for {operation}")
+        if not valid_ref_name(ref):
+            raise Refused(f"the tool asked for tag {name!r}, which is no ref name forge takes")
+        commit = check["commit"]
+        body = tag_object(commit, name, f"signer {self.account} <{self.account}@duckpond>", time_s, message)
+        oid = tag_oid(commit, body)
+        held = self.tag_target(check["repo"], ref)
+        if held is not None and held != oid:
+            raise Refused(f"{check['repo']} already has {ref} at {held}, another record than this one ({oid})")
+        return name, ref, oid, body, held == oid
+
+    def commit_files(self, check, placed):
+        pieces = [(path, data[start : start + CHUNK_SIZE]) for path, data in placed for start in range(0, len(data), CHUNK_SIZE)]
+        chunks = {path: [] for path, _ in placed}
+        with tempfile.TemporaryDirectory() as temp:
+            names = [Path(temp) / f"chunk-{index}" for index in range(len(pieces))]
+            for name, (_, piece) in zip(names, pieces):
+                name.write_bytes(piece)
+            put = self.network.put(names, CHUNK) if names else Ran(0, b"", "")
+        ids = [line.strip() for line in put.out.decode(errors="replace").splitlines()[: len(pieces)]] if put.code == 0 else []
+        if len(ids) != len(pieces):
+            raise Refused(f"the files' chunks were not put: {failed(put)}")
+        for (path, _), blob in zip(pieces, ids):
+            chunks[path].append(blob)
+        message = f"signer: check {check['id']} of {check['repo']} at {check['commit'][:12]}"
+        while True:
+            head = self.asked(FILES, files_head(), "its head", 0)
+            base = head.option(head.blob)
+            outcome, reason, sentence = receipt(self.network.submit(FILES, files_commit(base, message, [(path, len(data), chunks[path]) for path, data in placed])))
+            if outcome == "applied":
+                return [{"path": path, "sha256": hashlib.sha256(data).hexdigest()} for path, data in placed]
+            moved = reason == "stale" or (reason == "not_found" and "minted no snapshot" in sentence)
+            if outcome == "rejected" and moved:
+                continue
+            raise Refused(f"files did not take the write: {reason or outcome}: {sentence}")
+
+    def push_tag(self, check, name, ref, oid, body, done):
+        if done:
+            return {"name": name, "oid": oid}
+        repo, commit = check["repo"], check["commit"]
+        with tempfile.TemporaryDirectory() as temp:
+            pack = Path(temp) / "tag.pack"
+            pack.write_bytes(one_object_pack(commit, body))
+            put = self.network.put([pack], PACK)
+        blob = put.out.decode(errors="replace").strip().splitlines()[:1] if put.code == 0 else []
+        if not blob:
+            raise Refused(f"the tag's pack was not put: {failed(put)}")
+        zero = "0" * len(commit)
+        request = pkt_line(f"{zero} {oid} {ref}\0report-status") + b"0000"
+        outcome, reason, sentence = receipt(self.network.submit(FORGE, forge_push(repo, request, blob[0])))
+        if outcome != "applied":
+            raise Refused(f"forge did not take the tag: {reason or outcome}: {sentence}")
+        if self.tag_target(repo, ref) != oid:
+            raise Refused(f"forge took the push, but {ref} does not name {oid}")
+        return {"name": name, "oid": oid}
+
+    def tag_target(self, repo, ref):
+        reader = self.asked(FORGE, forge_ref_names(repo, ref), "RefNames", 14)
+        reader.u64()
+        items, _ = reader.page(lambda: (reader.text(), reader.text()))
+        return next((target for name, target in items if name == ref), None)
 
 
 def main():
