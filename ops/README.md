@@ -64,6 +64,49 @@ scripts back a `make` target; see the repository `Makefile`.
   kubectl -n NETWORK create secret generic tunnel --from-literal=token="$(cloudflared tunnel token NETWORK)"
   ```
 
+- `k8s/memory-low/` holds BYTES of the node pod's memory against reclaim
+  on the host that runs it. `node-memory-low.sh install NETWORK BYTES
+  KUBECONFIG`, run as root on that host, finds the network's running node
+  pod with the kubeconfig at KUBECONFIG and does three things. It writes a
+  drop-in `50-memory-low.conf` setting `MemoryLow` on `kubepods.slice` and
+  on the pod's QoS-class slice, so both keep it across a host restart. It
+  sets `MemoryLow` at once on those two slices and on the pod's own slice.
+  It installs, enables and starts `node-memory-low.service`. The unit
+  (bound to `k3s.service`, where the kubelet runs, so it starts and stops
+  with k3s) sets the same three again for each node pod that turns
+  Running, since the pod's slice is named by its uid, and on each
+  `NodeAllocatableEnforced` event, which the kubelet records once its
+  cgroups are set up as it starts. Each write is read back against BYTES
+  rounded down to whole pages, as the kernel holds it. A slice that reads
+  otherwise is logged in the unit's journal and the watch goes on, so a
+  mismatch can't restart the unit in a loop. k3s.service is `Type=notify`,
+  so the unit starts only once k3s says it is ready, apiserver included. A
+  watch that ends while k3s runs (the apiserver closes a watch after its
+  request timeout) ends the unit, and systemd starts it again, which lists
+  the pods afresh. Restarts that come faster than systemd's default start
+  limit mean the apiserver refuses while k3s runs, a real fault: the unit
+  then stays failed until k3s starts again. Its health check, on the host
+  with the operator's other host reads and at every node roll, is
+  `systemctl is-active node-memory-low` and
+  `/usr/local/libexec/node-memory-low.sh check NETWORK BYTES KUBECONFIG`,
+  which reads the three slices' `memory.low` back without setting anything
+  and exits nonzero unless each holds BYTES in whole pages: a hold the
+  unit could not make is only a journal line, and the unit stays active.
+  The pod's own slice needs the value: under `memory_recursiveprot`, a
+  child with no `memory.low` of its own gets its parent's unclaimed
+  protection only in proportion to its share of its siblings' usage, and
+  the node pod's siblings are every agents pod. duckpond runs it with
+  BYTES 6992134144 and KUBECONFIG `/etc/rancher/k3s/k3s.yaml`, k3s's own.
+  The unit runs as root on the host, which already holds everything that
+  file grants, so a narrower token would only add a Secret to keep. Root
+  on fabrics-1 is a throwaway privileged pod (hostPID, user 0, pinned to
+  the host), so the install goes through it:
+
+  ```sh
+  tar -C ops/k8s/memory-low -c . | kubectl exec -i root -- nsenter -t 1 -m -u -i -n -p -- \
+    bash -c 'd=$(mktemp -d) && tar -x -C "$d" && "$d/node-memory-low.sh" install "$@"' install NETWORK BYTES KUBECONFIG
+  ```
+
 - The node's pod is the only writer of `home`: the deployment replaces it,
   never runs two. Reach the node with
   `kubectl -n NETWORK exec deploy/node -c node -- ducktape <verb>`.

@@ -1,0 +1,13 @@
+# Holds memory.low on NETWORK's node pod and its parent slices, set again as each node pod comes up and as the kubelet starts.
+[Unit]
+Description=memory.low for the NETWORK node pod
+After=k3s.service
+BindsTo=k3s.service
+
+[Service]
+Environment=KUBECONFIG=KUBECONFIG_PATH
+ExecStart=/usr/local/libexec/node-memory-low.sh watch NETWORK BYTES
+Restart=always
+
+[Install]
+WantedBy=k3s.service
