@@ -2230,6 +2230,7 @@ class ForgeRefs(unittest.TestCase):
 
 UP = {"runner": "desktop", "up": True, "state": "running", "started": "2026-10-19T16:00:00Z", "busy": [], "busy_exit": 0, "heavy_runs": 1}
 BUILD = server.BUILD_SH
+NONE_AHEAD = ran(b"ahead heavy 0\n")
 
 
 class Gate:
@@ -2251,6 +2252,8 @@ class Gate:
         self.calls.append((host, words, argv))
         if host in self.down:
             return ran(code=255, err=f"ssh: connect to host {host} port 22: No route to host")
+        if words[:2] == ["exec", "ahead"] and host not in self.cut and host not in self.said:
+            return self.answers.get("ahead", NONE_AHEAD)
         if host in self.cut or (words[1:2] and words[0] == "exec" and set(words) & self.cut_words):
             return ran(self.cut_said, code=255, err=f"Connection to {host} closed by remote host.")
         if host in self.said:
@@ -2551,15 +2554,38 @@ class Builds(Streamed):
         status, answer = self.built("JOB=j-1", "programs", "dev", "gates")
         self.assertEqual((status, answer["stdout"]), (200, "run desktop:r1\nread it with: build.sh status r1\n"))
         self.assertTrue(answer["stderr"].startswith("builds: on desktop"))
-        self.assertEqual(self.gate.words(), [["ping"], ["exec", "JOB=j-1", "programs", "dev", "gates"]])
+        self.assertEqual(self.gate.words(), [["ping"], ["exec", "ahead", "JOB=j-1", "programs", "dev", "gates"], ["exec", "JOB=j-1", "programs", "dev", "gates"]])
         self.assertEqual(self.warm_execs(), [])
 
-    def test_a_desktop_holding_its_heavy_runs_sends_the_run_to_the_warm_pod(self):
-        self.gate.answers["ping"] = ran({**UP, "busy": [HEAVY]})
-        status, answer = self.built("programs", "dev", "gates")
+    def test_a_run_goes_where_its_lane_waits_least(self):
+        self.gate.answers["ahead"] = ran(b"ahead quick 1\n")
+        self.kube.answer("exec", ran(b"ahead quick 0\n"), ran(b"run w1\nread it with: build.sh status w1\n"))
+        status, answer = self.built("programs", "dev", "quick", "-p", "chat")
         self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"))
-        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "programs", "dev", "gates"])])
-        self.assertEqual(self.gate.words(), [["ping"]])
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "ahead", "programs", "dev", "quick", "-p", "chat"]), (WARM, None, ["sh", BUILD, "programs", "dev", "quick", "-p", "chat"])])
+        self.assertEqual(self.gate.words(), [["ping"], ["exec", "ahead", "programs", "dev", "quick", "-p", "chat"]])
+
+    def test_an_equal_wait_goes_to_the_desktop(self):
+        self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")
+        self.kube.answer("exec", ran(b"ahead heavy 2\n"))
+        self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "ahead", "programs", "dev", "gates"])])
+
+    def test_a_desktop_that_cannot_say_its_wait_sends_the_run_to_the_warm_pod_and_logs_none_of_its_words(self):
+        self.gate.answers["ahead"] = ran(code=2, err="build.sh: a repo is a forge repository name, not /home/x/secret.sh")
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"))
+        said.assert_any_call("pods_routed", to="warm", reason="desktop_unasked", detail=json.dumps("build.sh ahead on pod desktop answered exit 2 with no ahead line"))
+        self.assertNotIn("secret.sh", repr(said.call_args_list))
+
+    def test_a_warm_pod_that_cannot_say_its_wait_leaves_the_run_on_the_desktop(self):
+        self.gate.answers["ahead"] = ran(b"ahead heavy 3\n")
+        self.kube.answer("exec", ran(code=2, err="build.sh: usage"))
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
+        said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=json.dumps(f"build.sh ahead on pod {WARM} answered exit 2 with no ahead line"))
 
     def test_a_desktop_that_is_down_sends_the_run_to_the_warm_pod(self):
         self.gate.answers["ping"] = ran(code=69, err="gate: runner_down")
@@ -2591,8 +2617,8 @@ class Builds(Streamed):
             {**UP, "busy": [quiet]},
             {**UP, "busy_exit": 1},
             {**UP, "busy": HEAVY},
-            {**UP, "heavy_runs": "1"},
-            {**UP, "heavy_runs": True},
+            {**UP, "busy_exit": "0"},
+            {**UP, "busy_exit": True},
             {**UP, "busy": [stray]},
             {**UP, "busy": ["programs r bogus j-1 [1m] programs dev gates"]},
             {**UP, "busy": ["programs r"]},
@@ -2605,10 +2631,11 @@ class Builds(Streamed):
         self.assertEqual(self.built("programs", "dev", "gates", request=70)[1]["stdout"].splitlines()[0], "run desktop:r1")
 
     def test_routing_logs_a_token_and_its_sentence_apart(self):
-        self.gate.answers["ping"] = ran({**UP, "busy": [HEAVY]})
+        self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")
+        self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\n"))
         with unittest.mock.patch.object(server, "say") as said:
             self.built("programs", "dev", "gates")
-        said.assert_any_call("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps("the desktop holds 1 heavy runs of its 1"))
+        said.assert_any_call("pods_routed", to="warm", reason="shorter_wait", detail=json.dumps(f"heavy: 2 ahead on pod desktop, 0 on pod {WARM}"))
 
     def test_a_ping_that_does_not_read_logs_its_field_and_type_not_its_lines(self):
         self.gate.answers["ping"] = ran({**UP, "busy": "programs r1 heavy j-1 [1m] programs dev apply /home/x/secret.sh"})
@@ -2691,9 +2718,22 @@ class Builds(Streamed):
             self.assertIn(words, answer["error"])
         self.assertEqual(self.gate.calls, [])
 
-    def test_with_no_warm_pod_named_a_busy_desktop_answers_503(self):
+    def test_with_no_warm_pod_named_a_desktop_with_a_wait_takes_the_run(self):
         self.service.warm_pod = None
         self.gate.answers["ping"] = ran({**UP, "busy": [HEAVY]})
+        self.gate.answers["ahead"] = ran(b"ahead heavy 1\n")
+        self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+
+    def test_with_no_warm_pod_named_a_desktop_that_cannot_say_its_wait_takes_the_run(self):
+        self.service.warm_pod = None
+        self.gate.answers["ahead"] = ran(code=2, err="build.sh: a repo is a forge repository name, not Bad")
+        with unittest.mock.patch.object(server, "say") as said:
+            self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+        said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=unittest.mock.ANY)
+
+    def test_with_no_warm_pod_named_a_desktop_that_is_down_answers_503(self):
+        self.service.warm_pod = None
+        self.gate.answers["ping"] = ran(code=69, err="gate: runner_down")
         self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "programs", "dev", "gates"]}, 503, ["PODS_WARM_POD"])
 
     def test_it_is_no_pod_to_read(self):

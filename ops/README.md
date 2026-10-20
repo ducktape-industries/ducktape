@@ -148,12 +148,16 @@ one up for another network.
   line is posted as `desktop · <line>` in its channel, as `pods` with no
   mention, where the channel exists, is not archived and is open to anyone
   (a desktop run has no requester to vouch for a members-only room).
-- The reserved pod `builds` routes a build.sh call to the first free machine:
-  `desktop` when its `ping` says it is up, its `busy` reads (a list of
-  `build.sh busy` lines, `busy_exit` 0, `heavy_runs` a number), no quiet run
-  or stray lock holder is among them, and it holds fewer heavy runs than its
-  `heavy_runs`, else the warm pod the files path `PODS_WARM_POD` names
-  (duckpond: `/shared/tools/warm-pod`). Its exec takes build.sh's words as
+- The reserved pod `builds` routes a build.sh call to the machine where it
+  waits least: `desktop` when its `ping` says it is up, its `busy` reads (a
+  list of `build.sh busy` lines, `busy_exit` 0) and
+  no quiet run or stray lock holder is among them, and its `build.sh ahead
+  <the call's words>` (`ahead <lane> <n>`: the lane the call runs in and how
+  many runs in flight there it would wait for) is 0, or no more than the
+  warm pod's (the warm pod the files path `PODS_WARM_POD` names, duckpond:
+  `/shared/tools/warm-pod`), else the warm pod. A machine that can't say
+  its wait leaves the run to the other, and a desktop that can't say its
+  wait keeps the run when the warm pod can't be named. Its exec takes build.sh's words as
   `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
   stderr starts `builds: on <machine>`. `status`, `log`, `stop`, `wait` and
   `requeue` name their run as `<machine>:<run>` and go to that machine, or
@@ -172,7 +176,8 @@ one up for another network.
   parked: 502 naming its run (`desktop:<id>`, when the run had started) and
   `build.sh status` of it to read once the desktop answers, before calling
   it again, and the event `pods_parked`. Routing logs `pods_routed` with a
-  token (`desktop_unready`, `desktop_busy`, `desktop_lost`) and the
+  token (`desktop_unready`, `desktop_busy`, `desktop_lost`,
+  `desktop_unasked`, `warm_unasked`, `shorter_wait`) and the
   sentence in `detail`. `GET pods/builds` is refused: it is no pod.
 
   ```sh

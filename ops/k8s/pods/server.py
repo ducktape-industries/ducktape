@@ -199,10 +199,10 @@ DESKTOP = "desktop"
 BUILDS = "builds"
 ADDRESSED = frozenset({"status", "log", "stop", "wait", "requeue"})
 MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-targets", "queue-out", "queue-in", "self-update", "worktree", "measure"})
-HOLDING = frozenset({"heavy", "quiet"})
 WEIGHTS = frozenset({"heavy", "light", "quiet", "lane", "quick"})
 READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
 STARTED = re.compile(rb"^run (\S+)$", re.M)
+AHEAD = re.compile(rb"ahead (heavy|lane|quick|light) ([0-9]+)")
 DESKTOP_KEYS = "/desktop"
 DESKTOP_FILES = ("id_ed25519", "known_hosts", "hosts", "user")
 BUILD_SH = "/var/tmp/warm/build.sh"
@@ -711,12 +711,11 @@ def desktop_view(said):
 
 
 def desktop_free(said):
-    busy, ran, most = said.get("busy"), said.get("busy_exit"), said.get("heavy_runs")
+    busy, ran = said.get("busy"), said.get("busy_exit")
     if not isinstance(busy, list) or not all(isinstance(line, str) for line in busy):
         return False, f"the desktop's ping has busy as a {type(busy).__name__}, not a list of lines"
-    for field, value in (("busy_exit", ran), ("heavy_runs", most)):
-        if type(value) is not int:
-            return False, f"the desktop's ping has {field} as a {type(value).__name__}, not a number"
+    if type(ran) is not int:
+        return False, f"the desktop's ping has busy_exit as a {type(ran).__name__}, not a number"
     if ran != 0:
         return False, f"the desktop's build.sh busy exited {ran}"
     kinds = ["stray" if line.startswith("stray ") else (line.split()[2:3] or [""])[0] for line in busy]
@@ -726,9 +725,6 @@ def desktop_free(said):
         return False, "a process no run started holds one of the desktop's build locks"
     if "quiet" in kinds:
         return False, "a quiet run holds every heavy slot of the desktop"
-    holding = sum(1 for kind in kinds if kind in HOLDING)
-    if holding >= most:
-        return False, f"the desktop holds {holding} heavy runs of its {most}"
     return True, None
 
 
@@ -2028,17 +2024,51 @@ class Service:
             raise Refused(502, f"{self.warm_pod} names no warm pod")
         return name
 
-    def pick(self):
+    def pick(self, asked, words, alive):
         try:
             said = self.desktop.state()
         except Refused as refused:
             say("pods_routed", to="warm", reason="desktop_unready", detail=json.dumps(refused.sentence))
             return self.warm()
         free, why = desktop_free(said)
-        if free:
+        if not free:
+            say("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps(why))
+            return self.warm()
+        here, why = self.ahead(asked, DESKTOP, words, alive)
+        if here is None:
+            try:
+                warm = self.warm()
+            except Refused as refused:
+                say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(refused.sentence))
+                return DESKTOP
+            say("pods_routed", to="warm", reason="desktop_unasked", detail=json.dumps(why))
+            return warm
+        if here[1] == 0:
             return DESKTOP
-        say("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps(why))
-        return self.warm()
+        try:
+            warm = self.warm()
+        except Refused as refused:
+            say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(refused.sentence))
+            return DESKTOP
+        there, why = self.ahead(asked, warm, words, alive)
+        if there is None:
+            say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(why))
+            return DESKTOP
+        if there[1] >= here[1]:
+            return DESKTOP
+        say("pods_routed", to="warm", reason="shorter_wait", detail=json.dumps(f"{here[0]}: {here[1]} ahead on pod {DESKTOP}, {there[1]} on pod {warm}"))
+        return warm
+
+    def ahead(self, asked, machine, words, alive):
+        command = ["sh", BUILD_SH, "ahead", *words]
+        try:
+            ran = self.desktop.ran(command, alive) if machine == DESKTOP else self.executed(asked, machine, None, command, alive=alive)
+        except Refused as refused:
+            return None, refused.sentence
+        found = AHEAD.fullmatch(ran.out.strip()) if ran.code == 0 else None
+        if found is None:
+            return None, f"build.sh ahead on pod {machine} answered exit {ran.code} with no ahead line"
+        return (found.group(1).decode(), int(found.group(2))), None
 
     def on(self, asked, machine, words, alive):
         if machine == DESKTOP and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in words):
@@ -2067,7 +2097,7 @@ class Service:
                     return on_machine(machine, looked, started=False)
             return on_machine(machine, self.on(asked, machine, [*settings, first, run, *called[2:]], alive), started=first == "requeue")
         verb = first if first == "apply" else (called[2] if len(called) > 2 else first)
-        machine = self.pick()
+        machine = self.pick(asked, words, alive)
         try:
             ran = self.on(asked, machine, words, alive)
         except Refused as refused:
@@ -2110,7 +2140,7 @@ class Service:
 
     def status(self, name):
         if name == BUILDS:
-            raise Refused(400, f"pod {BUILDS} routes build.sh to the first free machine and is no pod itself: read pod {DESKTOP} or the warm pod")
+            raise Refused(400, f"pod {BUILDS} routes build.sh to the machine where it waits least and is no pod itself: read pod {DESKTOP} or the warm pod")
         if name == DESKTOP:
             return 200, {"pod": desktop_view(self.desktop.state())}
         return 200, {"pod": view(self.pod(name))}
