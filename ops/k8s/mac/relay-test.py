@@ -441,6 +441,7 @@ class ActionsSigner(Signer):
         self.outputs = {}
         self.blobs = {}
         self.follows = []
+        self.unnamed = set()
 
     def query(self, program, request):
         if program != relay.ACTIONS:
@@ -471,6 +472,8 @@ class ActionsSigner(Signer):
             self.submits.append((program, payload))
             if check in self.taken:
                 return ran(b"preconfirmed rejected wrong_state: check is running, not queued")
+            if check in self.unnamed:
+                return ran(b"preconfirmed rejected unauthorized: check's job names its runners in its workflow, and this account is not one")
             self.taken.add(check)
             return ran(b"preconfirmed applied 0a")
         return super().submit(program, payload)
@@ -590,6 +593,23 @@ class Checks(unittest.TestCase):
         self.assertEqual(self.event(answer), ("forget", {"id": "check-4"}))
         self.assertEqual(self.actions(4), [relay.actions_report(4, "errored", "its run was deleted on the mac relay", None)])
         self.assertNotIn("check-4", self.service.runs)
+        connection.close()
+
+    def test_a_check_whose_job_names_other_runners_is_passed_over_for_the_next(self):
+        self.signer.queue = [(3, {}), (4, {})]
+        self.signer.queue = [(3, {})]
+        self.signer.unnamed = {3}
+        connection, answer = self.work()
+        self.service.pull()
+        self.assertEqual([int.from_bytes(claim[1:9], "little") for claim in self.actions(3)], [3], "a check whose job names other runners is asked once")
+        self.signer.queue.append((4, {}))
+        self.service.pull()
+        self.assertEqual(self.event(answer)[1]["run"]["id"], "check-4")
+        self.assertEqual([int.from_bytes(claim[1:9], "little") for claim in self.actions(3)], [3, 4])
+        self.mac("POST", "/v1/mac/runs/check-4/state", {"state": "succeeded"})
+        self.signer.queue = []
+        self.service.pull()
+        self.assertEqual(self.service.unnamed, set(), "forgotten once actions no longer queues it")
         connection.close()
 
     def test_deleting_the_run_that_held_the_mac_takes_the_next_check(self):

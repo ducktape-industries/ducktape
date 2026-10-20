@@ -662,7 +662,10 @@ one up for another network.
 - With `MAC_LABELS` (mac.yaml: `mac macos-aarch64`), the relay is also an
   actions runner for the Mac, as account `mac`: it registers those labels,
   follows `ducktape changes actions`, and while the Mac is connected and
-  holds no run claims the oldest queued check whose `runs-on` they cover.
+  holds no run claims the oldest queued check whose `runs-on` they cover
+  (passing over one another runner took, or whose job's `runners` does not
+  name `mac`: that refusal is final for the check, so the relay asks once,
+  logs it once, and forgets the id when actions no longer queues it).
   The check becomes a run `check-<id>`: the Mac runs the job's steps with
   `sh -c` in a worktree of its commit, with `OUT` (what it keeps) and
   `NEEDS` (what the jobs it needs produced, at `NEEDS/<job>/<path>`, read

@@ -279,6 +279,7 @@ class Signer:
         self.pause = time.sleep
         self.unsent = 0
         self.unpulled = 0
+        self.unnamed = set()
 
     def asked(self, program, request, what, tag):
         ran = self.network.query(program, request)
@@ -429,7 +430,8 @@ class Signer:
             if self.unpulled:
                 say("signer_pulled", attempts=self.unpulled + 1)
                 self.unpulled = 0
-            covered = [check for check in queued if set(check["job"]["runs_on"]) <= set(self.labels)]
+            self.unnamed &= {check["id"] for check in queued}
+            covered = [check for check in queued if set(check["job"]["runs_on"]) <= set(self.labels) and check["id"] not in self.unnamed]
             for check in sorted(covered, key=lambda check: check["id"]):
                 self.written(self.claimed, json.dumps(check["id"]))
                 outcome, reason, sentence = receipt(self.network.submit(ACTIONS, actions_claim(check["id"])))
@@ -442,6 +444,9 @@ class Signer:
                     say("signer_unclaimed", check=check["id"], reason=outcome, detail=json.dumps(sentence))
                     return
                 self.claimed.unlink(missing_ok=True)
+                if reason == "unauthorized":
+                    self.unnamed.add(check["id"])
+                    say("signer_unnamed", check=check["id"], detail=json.dumps(sentence))
                 if reason not in ("wrong_state", "unauthorized"):
                     say("signer_unclaimed", check=check["id"], reason=reason or outcome, detail=json.dumps(sentence))
                     return

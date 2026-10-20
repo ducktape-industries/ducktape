@@ -194,6 +194,12 @@ class Signing(unittest.TestCase):
         self.asks(5, env=(("MODE", "dist"), ("bad-name", "x")))
         self.signer.pull()
         self.assertEqual([int.from_bytes(claim[1:9], "little") for claim in self.sent(3)], [4, 5], "only the checks its labels cover, past one whose job names other runners")
+        self.signer.pull()
+        self.assertEqual([int.from_bytes(claim[1:9], "little") for claim in self.sent(3)], [4, 5], "a check whose job names other runners is asked once")
+        self.assertEqual([event for event, _ in SAID].count("signer_unnamed"), 1)
+        self.fake.queue = [(id, fields) for id, fields in self.fake.queue if id != 4]
+        self.signer.pull()
+        self.assertEqual(self.signer.unnamed, set(), "forgotten once actions no longer queues it")
         self.assertEqual(self.ended(5), ("passed", f"developer-id for app at {COMMIT} (main)"))
         [(kind, files)] = self.fake.puts
         self.assertEqual(kind, "output")

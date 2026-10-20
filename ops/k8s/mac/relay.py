@@ -696,6 +696,7 @@ class Service:
         self.pause = time.sleep
         self.following = False
         self.pulling = False
+        self.unnamed = set()
         self.store = store
         self.forge = forge
         self.token = token
@@ -795,14 +796,18 @@ class Service:
                 return
             self.pulling = True
         try:
-            covered = [check for check in self.queued() if set(check["job"]["runs_on"]) <= set(self.labels)]
+            queued = self.queued()
+            self.unnamed &= {check["id"] for check in queued}
+            covered = [check for check in queued if set(check["job"]["runs_on"]) <= set(self.labels) and check["id"] not in self.unnamed]
             for check in sorted(covered, key=lambda check: check["id"]):
                 outcome, reason, sentence = receipt(self.signer.submit(ACTIONS, actions_claim(check["id"])))
                 if outcome == "applied":
                     self.checked(check)
                     return
                 say("mac_unclaimed", check=check["id"], reason=reason or outcome, detail=json.dumps(sentence))
-                if reason != "wrong_state":
+                if reason == "unauthorized":
+                    self.unnamed.add(check["id"])
+                if reason not in ("wrong_state", "unauthorized"):
                     return
         except Refused as refusal:
             say("mac_unpulled", detail=json.dumps(refusal.sentence))
