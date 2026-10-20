@@ -5,11 +5,12 @@ set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 tunnel_port=35313
-tag=$(sha256sum "$here/Containerfile" | cut -c1-12)
 
 stage=$(mktemp -d)
 socket="$stage.ssh"
 trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
+duck_release=$("$here/../git-remote-duck" "$stage/git-remote-duck")
+tag=$(cat "$here/Containerfile" <(echo "$duck_release") | sha256sum | cut -c1-12)
 podman build --file "$here/Containerfile" --tag "localhost:$tunnel_port/toolchain:$tag" "$stage"
 ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
 podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/toolchain:$tag"

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Fetches the pinned git-remote-duck release from duckpond's public node as one blob, checks its sha256 and prints the release's name.
+# Usage: ops/k8s/git-remote-duck DEST, where DUCK_NODE overrides the node it reads from.
+set -euo pipefail
+release=git-remote-duck-d6cf451a
+blob=a9b1927b7414ae5a995a2e2fbff9c6c156accb908c45828bae6d1030d0dc804d
+sha256=9003244702c0caa4daad91103724d6b7d3d205adfb0593fcbcda10adf35468e5
+node=${DUCK_NODE:-https://duckpond.ducktape.industries}
+dest=${1:?usage: ops/k8s/git-remote-duck DEST}
+python3 - "$node" "$blob" "$sha256" "$dest" <<'PY'
+import hashlib
+import os
+import struct
+import sys
+import urllib.request
+
+node, blob, sha256, dest = sys.argv[1:]
+ask = urllib.request.Request(
+    f"{node}/v1/blob/get",
+    data=b"\x00" + bytes.fromhex(blob),
+    method="POST",
+    headers={"User-Agent": "ops/k8s/git-remote-duck"},
+)
+with urllib.request.urlopen(ask) as answered:
+    answer = answered.read()
+if answer[:1] != b"\x01":
+    sys.exit(f"{node} holds no blob {blob}")
+(length,) = struct.unpack_from("<I", answer, 1)
+framed = answer[5 : 5 + length]
+_, nul, body = framed.partition(b"\0")
+if len(framed) != length or not nul:
+    sys.exit(f"{node} answered blob {blob} cut short")
+if hashlib.sha256(body).hexdigest() != sha256:
+    sys.exit(f"{node}'s blob {blob} does not hash to {sha256}")
+part = f"{dest}.part"
+with open(part, "wb") as out:
+    out.write(body)
+os.chmod(part, 0o755)
+os.replace(part, dest)
+PY
+echo "$release"

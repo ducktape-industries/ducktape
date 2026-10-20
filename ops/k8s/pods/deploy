@@ -40,8 +40,6 @@ limits=$(hardcap)
 read -r agents_cpu agents_memory <<<"$limits"
 echo "hardcap: requests.cpu $agents_cpu, requests.memory $agents_memory"
 kubectl_version=v1.36.5
-duck_release=git-remote-duck-628d7c1
-duck_sha256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7
 tunnel_port=35312
 
 stage=$(mktemp -d)
@@ -51,10 +49,8 @@ mkdir "$stage/src"
 git -C "$(git -C "$here" rev-parse --show-toplevel)" archive "$commit" | tar -x -C "$stage/src"
 curl -fsSL -o "$stage/kubectl" "https://dl.k8s.io/release/$kubectl_version/bin/linux/amd64/kubectl"
 echo "$(curl -fsSL "https://dl.k8s.io/release/$kubectl_version/bin/linux/amd64/kubectl.sha256")  $stage/kubectl" | sha256sum --check --quiet
-curl -fsSL -o "$stage/git-remote-duck" \
-  "https://github.com/ducktape-industries/ducktape/releases/download/$duck_release/git-remote-duck-x86_64-unknown-linux-gnu"
-echo "$duck_sha256  $stage/git-remote-duck" | sha256sum --check --quiet
-chmod +x "$stage/kubectl" "$stage/git-remote-duck"
+duck_release=$("$here/../git-remote-duck" "$stage/git-remote-duck")
+chmod +x "$stage/kubectl"
 cp "$here/server.py" "$stage/server.py"
 tag=$(cat "$here/Containerfile" "$stage/server.py" <(echo "$commit $kubectl_version $duck_release") | sha256sum | cut -c1-12)
 nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \

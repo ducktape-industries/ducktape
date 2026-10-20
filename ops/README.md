@@ -394,6 +394,15 @@ one up for another network.
 - `k8s/toolchain/deploy` builds `k8s/toolchain/Containerfile`, the image
   agents build ducktape, programs and the app with, pushes it to the
   cluster node's registry and prints its reference.
+- `k8s/git-remote-duck DEST` is the one pin of git-remote-duck that every
+  image takes (toolchain, pods, mac, forge-mirror): a release name, the
+  network blob that holds its x86_64 Linux binary and that binary's sha256.
+  It reads the blob from duckpond's public node (`/v1/blob/get`, or the node
+  `DUCK_NODE` names), checks the sha256 and writes the binary to `DEST`. The
+  same bytes, with a `SHA256SUMS`, are in files at
+  `/shared/releases/git-remote-duck/<commit>/`. A new release is built from
+  qa's `feat/duck-push` at that commit, put as a blob (pods `/blob`) and
+  copied there, and this file names it.
 
 ## duckpond's recovery daemon
 

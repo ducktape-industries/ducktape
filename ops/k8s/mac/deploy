@@ -9,8 +9,6 @@ forge=${2:?$usage}
 commit=$(git -C "$here" rev-parse --verify "${3:?$usage}^{commit}")
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 context=${DEPLOY_CONTEXT:-fabrics-1}
-duck_release=git-remote-duck-628d7c1
-duck_sha256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7
 tunnel_port=35313
 
 stage=$(mktemp -d)
@@ -18,10 +16,7 @@ socket="$stage.ssh"
 trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
 mkdir "$stage/src"
 git -C "$(git -C "$here" rev-parse --show-toplevel)" archive "$commit" | tar -x -C "$stage/src"
-curl -fsSL -o "$stage/git-remote-duck" \
-  "https://github.com/ducktape-industries/ducktape/releases/download/$duck_release/git-remote-duck-x86_64-unknown-linux-gnu"
-echo "$duck_sha256  $stage/git-remote-duck" | sha256sum --check --quiet
-chmod +x "$stage/git-remote-duck"
+duck_release=$("$here/../git-remote-duck" "$stage/git-remote-duck")
 cp "$here/relay.py" "$stage/relay.py"
 tag=$(cat "$here/Containerfile" "$stage/relay.py" <(echo "$commit $duck_release") | sha256sum | cut -c1-12)
 nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \
