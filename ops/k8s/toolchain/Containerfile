@@ -7,9 +7,6 @@ ARG BINARYEN_VERSION=132
 ARG BINARYEN_SHA256=195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572
 ARG WASM_TOOLS_VERSION=1.262.0
 ARG CARGO_DENY_VERSION=0.20.2
-ARG GIT_REMOTE_DUCK_RELEASE=git-remote-duck-628d7c1
-ARG GIT_REMOTE_DUCK_SHA256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7
-ARG CEF_DLL_SYS_VERSION=154.5.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates clang cmake curl git libclang-dev make perl pkg-config python3 python3-zstandard xz-utils zstd \
       libasound2-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
@@ -33,12 +30,8 @@ RUN curl -fsSL -o /tmp/binaryen.tar.gz \
 RUN cargo install --locked wasm-tools --version "$WASM_TOOLS_VERSION" \
     && cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION" \
     && rm -rf /opt/cargo/registry /opt/cargo/git
-RUN curl -fsSL -o /usr/local/bin/git-remote-duck \
-      "https://github.com/ducktape-industries/ducktape/releases/download/$GIT_REMOTE_DUCK_RELEASE/git-remote-duck-x86_64-unknown-linux-gnu" \
-    && echo "$GIT_REMOTE_DUCK_SHA256  /usr/local/bin/git-remote-duck" | sha256sum --check \
-    && chmod +x /usr/local/bin/git-remote-duck \
-    && git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
 ENV CEF_PATH=/opt/cef
+ARG CEF_DLL_SYS_VERSION=154.5.0
 RUN mkdir -p /opt/cef /tmp/cef-fetch/src && cd /tmp/cef-fetch \
     && printf '[package]\nname = "cef-fetch"\nversion = "0.0.0"\nedition = "2024"\n\n[dependencies]\ncef-dll-sys = { version = "=%s", default-features = false }\n' "$CEF_DLL_SYS_VERSION" > Cargo.toml \
     && echo 'fn main() {}' > src/main.rs \
@@ -46,5 +39,12 @@ RUN mkdir -p /opt/cef /tmp/cef-fetch/src && cd /tmp/cef-fetch \
     && test -f /opt/cef/*/cef_linux_x86_64/archive.json \
     && rm -f /opt/cef/*/*.tar.bz2 \
     && cd / && rm -rf /tmp/cef-fetch /opt/cargo/registry /opt/cargo/git
+ARG GIT_REMOTE_DUCK_RELEASE=git-remote-duck-628d7c1
+ARG GIT_REMOTE_DUCK_SHA256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7
+RUN curl -fsSL -o /usr/local/bin/git-remote-duck \
+      "https://github.com/ducktape-industries/ducktape/releases/download/$GIT_REMOTE_DUCK_RELEASE/git-remote-duck-x86_64-unknown-linux-gnu" \
+    && echo "$GIT_REMOTE_DUCK_SHA256  /usr/local/bin/git-remote-duck" | sha256sum --check \
+    && chmod +x /usr/local/bin/git-remote-duck \
+    && git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
 ENV DUCKTAPE_DEVICE_KEY_STORE=file
 WORKDIR /work
