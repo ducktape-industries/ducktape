@@ -1,4 +1,4 @@
-# The agents' build image: Rust 1.96.1 with wasm32, binaryen 132, wasm-tools, cargo-deny, git-remote-duck for duckpond's forge, zstd (CLI and python binding), and the native packages ducktape, programs and the app build with.
+# The agents' build image: Rust 1.96.1 with wasm32, binaryen 132, wasm-tools, cargo-deny, git-remote-duck for duckpond's forge, zstd (CLI and python binding), the native packages ducktape, programs and the app build with, and the CEF the app's web build links (CEF_PATH) with the libraries it loads.
 # Built and pushed to the cluster node's registry by ops/k8s/toolchain/deploy; an agent names it as a pod's image.
 FROM docker.io/library/debian:trixie-slim
 ARG RUSTUP_VERSION=1.29.1
@@ -9,10 +9,13 @@ ARG WASM_TOOLS_VERSION=1.262.0
 ARG CARGO_DENY_VERSION=0.20.2
 ARG GIT_REMOTE_DUCK_RELEASE=git-remote-duck-628d7c1
 ARG GIT_REMOTE_DUCK_SHA256=5a3da69177916f45770eda7c1878e27639dcf5b50811281ac1092317d1e1f7c7
+ARG CEF_DLL_SYS_VERSION=154.5.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates clang cmake curl git libclang-dev make perl pkg-config python3 python3-zstandard xz-utils zstd \
       libasound2-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
       mesa-vulkan-drivers libvulkan1 \
+      libglib2.0-dev libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 libcups2t64 libdbus-1-3 libgbm1 \
+      libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
     && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:/opt/binaryen/bin:$PATH
 RUN curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/x86_64-unknown-linux-gnu/rustup-init" \
@@ -35,5 +38,13 @@ RUN curl -fsSL -o /usr/local/bin/git-remote-duck \
     && echo "$GIT_REMOTE_DUCK_SHA256  /usr/local/bin/git-remote-duck" | sha256sum --check \
     && chmod +x /usr/local/bin/git-remote-duck \
     && git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
+ENV CEF_PATH=/opt/cef
+RUN mkdir -p /opt/cef /tmp/cef-fetch/src && cd /tmp/cef-fetch \
+    && printf '[package]\nname = "cef-fetch"\nversion = "0.0.0"\nedition = "2024"\n\n[dependencies]\ncef-dll-sys = { version = "=%s", default-features = false }\n' "$CEF_DLL_SYS_VERSION" > Cargo.toml \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build \
+    && test -f /opt/cef/*/cef_linux_x86_64/archive.json \
+    && rm -f /opt/cef/*/*.tar.bz2 \
+    && cd / && rm -rf /tmp/cef-fetch /opt/cargo/registry /opt/cargo/git
 ENV DUCKTAPE_DEVICE_KEY_STORE=file
 WORKDIR /work
