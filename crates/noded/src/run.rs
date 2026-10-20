@@ -1203,7 +1203,7 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
     drop(commands);
     membership.stop().await;
     drop(tracker);
-    let synced = node.sync().await;
+    let synced = node.close().await;
     let closed = synced
         .map_err(Error::from)
         .and_then(|()| Ok(node.tip()?.height));

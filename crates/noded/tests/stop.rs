@@ -205,6 +205,11 @@ fn a_node_stopped_while_it_serves_state_sync_and_compacts_logs_no_error_and_open
         }
     });
 
+    let founded = state::Storage::open(&workspace.dir().join("state"))
+        .unwrap()
+        .pending()
+        .unwrap();
+    assert_eq!(founded, None, "a founded workspace holds no pending row");
     let Started {
         http,
         daemon,
@@ -263,6 +268,11 @@ fn a_node_stopped_while_it_serves_state_sync_and_compacts_logs_no_error_and_open
     });
     drop(daemon);
     thread.join().unwrap();
+    let pending = state::Storage::open(&workspace.dir().join("state"))
+        .unwrap()
+        .pending()
+        .unwrap();
+    assert_eq!(pending, None, "a clean stop leaves no pending row");
 
     let logs = Logs::install("info").unwrap();
     let lines = logs.lines();

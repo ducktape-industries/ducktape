@@ -118,6 +118,12 @@ impl Storage {
         Ok(self.db().flush()?)
     }
 
+    pub fn clear_pending(&self) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete(PENDING);
+        Ok(self.db().write(batch)?)
+    }
+
     /// Deletes every key under `program`: a dropped program leaves no
     /// storage for one admitted again under its id to read.
     pub fn clear(&self, program: &str) -> Result<()> {

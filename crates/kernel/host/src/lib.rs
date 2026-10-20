@@ -462,7 +462,7 @@ where
                 Vec::new(),
             )
             .await?;
-        host.sync().await?;
+        host.close().await?;
         Ok((host, applied))
     }
 
@@ -647,8 +647,9 @@ where
         self.source().missing_blobs()
     }
 
-    pub async fn sync(&mut self) -> Result<()> {
-        Ok(self.store.sync().await?)
+    pub async fn close(&mut self) -> Result<()> {
+        let dropped = dropped_in(self.store.storage())?;
+        Ok(self.store.close(&dropped).await?)
     }
 
     pub fn install(&mut self, id: BlobId, framed: &[u8]) -> Result<()> {

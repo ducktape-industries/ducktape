@@ -377,6 +377,16 @@ where
         Ok(())
     }
 
+    pub async fn close(&mut self, dropped: &[ProgramId]) -> Result<()> {
+        self.reconcile().await?;
+        for program in dropped {
+            self.remove_program(program).await?;
+        }
+        self.sync().await?;
+        self.storage.clear_pending()?;
+        self.storage.flush()
+    }
+
     pub async fn commit(&mut self, height: u64, writes: Writes) -> Result<()> {
         let unknown = writes
             .programs
