@@ -11,7 +11,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::{Clock, Spawner};
 use commonware_storage::Context;
 
-pub use commitment::{Commitment, Db, Family, Op, SyncTarget, Tuning, codec_config, digest};
+pub use commitment::{
+    Commitment, Db, Family, Op, SyncTarget, Tuning, codec_config, digest, partition_prefix,
+};
 pub use holds::{Hold, Holds};
 pub use overlay::{Checkpoint, Overlay, Slot};
 pub use storage::{RESERVED_PREFIX, Reads, Storage, reserved, valid_program_id};

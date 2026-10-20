@@ -72,7 +72,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tower-http = "0.6"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
-rustix = { version = "1", features = ["process", "thread"] }
+rustix = { version = "1", features = ["fs", "process", "thread"] }
 arc-swap = "1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).

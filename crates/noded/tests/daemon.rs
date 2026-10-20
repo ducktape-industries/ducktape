@@ -1479,6 +1479,90 @@ fn a_resident_follows_at_the_tip() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn clones(dir: &Path) -> bool {
+    let source = dir.join("clone-probe");
+    std::fs::write(&source, b"probe").unwrap();
+    let copy = std::fs::File::create_new(dir.join("clone-probe-copy")).unwrap();
+    let source = std::fs::File::open(&source).unwrap();
+    rustix::fs::ioctl_ficlone(&copy, &source).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_resident_snapshots_each_epoch_where_its_directory_clones_and_a_validator_never_tries() {
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let mut resident = Seat::new(root.path(), "n1");
+    resident.address = None;
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let runtime = client_runtime();
+    resident.join(&client);
+    let follower = resident.start();
+    let closing = runtime.block_on(async {
+        let joined = follower.client.status().await.unwrap().height;
+        let closing = (joined / EPOCH_LENGTH + 1) * EPOCH_LENGTH - 1;
+        reach(&follower.client, closing + EPOCH_LENGTH + 1).await;
+        seat.admin(&client, Admin::Shutdown).await;
+        resident.admin(&follower.client, Admin::Shutdown).await;
+        closing
+    });
+    live.thread.join().unwrap();
+    follower.thread.join().unwrap();
+
+    assert!(!seat.workspace.dir().join("snapshots").exists());
+    let snapshots = resident.workspace.dir().join("snapshots");
+    assert!(snapshots.exists(), "the resident never tried a snapshot");
+    let kept: Vec<String> = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    if !clones(root.path()) {
+        println!(
+            "{} does not clone: the resident tried a snapshot, cleared snapshots/ and followed \
+             past the next epoch",
+            root.path().display()
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+        return;
+    }
+    println!(
+        "{} clones: the resident keeps its newest snapshot",
+        root.path().display()
+    );
+    let [newest] = kept.as_slice() else {
+        panic!("the resident keeps one whole snapshot: {kept:?}");
+    };
+    let height: u64 = newest.parse().unwrap();
+    assert!(
+        height >= closing && (height + 1).is_multiple_of(EPOCH_LENGTH),
+        "{height} after {closing}"
+    );
+    let snapshot = snapshots.join(newest);
+    let manifest: statesync::Manifest =
+        abi::decode(&std::fs::read(snapshot.join("manifest")).unwrap()).unwrap();
+    assert_eq!(manifest.tip.height, height);
+    assert!(
+        manifest.targets.contains_key("valset"),
+        "{:?}",
+        manifest.targets.keys()
+    );
+    let (opened, targets) = runner(&snapshot.join("runtime")).start(|context| async move {
+        let mut opened = BTreeMap::new();
+        for program in manifest.targets.keys() {
+            let context = context.child("snapshot").with_attribute("program", program);
+            let name = state::commitment_name(NETWORK, program);
+            let commitment = state::Commitment::open(context, &name, 0).await.unwrap();
+            opened.insert(program.clone(), commitment.target().unwrap().unwrap());
+        }
+        (opened, manifest.targets)
+    });
+    assert_eq!(opened, targets);
+}
+
 /// Three validators, and the valset drops the third. Once the chain is in
 /// the epoch that seats two, the third node is shut down: the set of three
 /// needed all three, so the two finalize on only because the shrink took

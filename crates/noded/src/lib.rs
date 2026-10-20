@@ -19,6 +19,7 @@ mod pool;
 mod relay;
 mod run;
 mod server;
+mod snapshot;
 mod transport;
 mod view;
 pub mod wire;

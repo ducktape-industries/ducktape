@@ -31,35 +31,75 @@ pub struct Head {
     pub targets: BTreeMap<ProgramId, SyncTarget>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Manifest {
+    pub tip: Tip,
+    pub targets: BTreeMap<ProgramId, SyncTarget>,
+}
+
 impl BorshSerialize for Head {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        self.tip.height.serialize(writer)?;
-        self.tip.id.serialize(writer)?;
+        write_tip(&self.tip, writer)?;
         self.anchor.serialize(writer)?;
-        let targets: Vec<(&ProgramId, Vec<u8>)> = self
-            .targets
-            .iter()
-            .map(|(program, target)| (program, codec(target)))
-            .collect();
-        targets.serialize(writer)
+        write_targets(&self.targets, writer)
     }
 }
 
 impl BorshDeserialize for Head {
     fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Head> {
-        let height = u64::deserialize_reader(reader)?;
-        let id = <[u8; 32]>::deserialize_reader(reader)?;
+        let tip = read_tip(reader)?;
         let anchor = Anchor::deserialize_reader(reader)?;
-        let targets = Vec::<(ProgramId, Vec<u8>)>::deserialize_reader(reader)?
-            .into_iter()
-            .map(|(program, target)| Ok((program, decoded(&target, &())?)))
-            .collect::<io::Result<_>>()?;
+        let targets = read_targets(reader)?;
         Ok(Head {
-            tip: Tip { height, id },
+            tip,
             anchor,
             targets,
         })
     }
+}
+
+impl BorshSerialize for Manifest {
+    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        write_tip(&self.tip, writer)?;
+        write_targets(&self.targets, writer)
+    }
+}
+
+impl BorshDeserialize for Manifest {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Manifest> {
+        let tip = read_tip(reader)?;
+        let targets = read_targets(reader)?;
+        Ok(Manifest { tip, targets })
+    }
+}
+
+fn write_tip<W: io::Write>(tip: &Tip, writer: &mut W) -> io::Result<()> {
+    tip.height.serialize(writer)?;
+    tip.id.serialize(writer)
+}
+
+fn read_tip<R: io::Read>(reader: &mut R) -> io::Result<Tip> {
+    let height = u64::deserialize_reader(reader)?;
+    let id = <[u8; 32]>::deserialize_reader(reader)?;
+    Ok(Tip { height, id })
+}
+
+fn write_targets<W: io::Write>(
+    targets: &BTreeMap<ProgramId, SyncTarget>,
+    writer: &mut W,
+) -> io::Result<()> {
+    let targets: Vec<(&ProgramId, Vec<u8>)> = targets
+        .iter()
+        .map(|(program, target)| (program, codec(target)))
+        .collect();
+    targets.serialize(writer)
+}
+
+fn read_targets<R: io::Read>(reader: &mut R) -> io::Result<BTreeMap<ProgramId, SyncTarget>> {
+    Vec::<(ProgramId, Vec<u8>)>::deserialize_reader(reader)?
+        .into_iter()
+        .map(|(program, target)| Ok((program, decoded(&target, &())?)))
+        .collect()
 }
 
 fn codec<T: Encode>(value: &T) -> Vec<u8> {

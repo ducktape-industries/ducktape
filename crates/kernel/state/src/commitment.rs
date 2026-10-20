@@ -68,13 +68,18 @@ pub fn codec_config() -> ((), (RangeCfg<usize>, ())) {
     ((), (RangeCfg::from(..), ()))
 }
 
+pub fn partition_prefix(name: &str) -> String {
+    format!("commitment-{name}-")
+}
+
 pub fn config<E: Context>(context: &E, name: &str, live_keys: usize) -> Config {
     let tuning = Tuning::default();
+    let prefix = partition_prefix(name);
     let page_cache = CacheRef::from_pooler(context, tuning.page_size, tuning.page_cache_pages);
     VariableConfig {
         merkle_config: merkle::full::Config {
-            journal_partition: format!("commitment-{name}-merkle-journal"),
-            metadata_partition: format!("commitment-{name}-merkle-meta"),
+            journal_partition: format!("{prefix}merkle-journal"),
+            metadata_partition: format!("{prefix}merkle-meta"),
             items_per_blob: tuning.items_per_blob,
             write_buffer: tuning.write_buffer,
             replay_buffer: tuning.replay_buffer,
@@ -82,7 +87,7 @@ pub fn config<E: Context>(context: &E, name: &str, live_keys: usize) -> Config {
             page_cache: page_cache.clone(),
         },
         journal_config: journal::contiguous::variable::Config {
-            partition: format!("commitment-{name}-log"),
+            partition: format!("{prefix}log"),
             items_per_section: tuning.items_per_section,
             write_buffer: tuning.write_buffer,
             replay_buffer: tuning.replay_buffer,

@@ -10,7 +10,7 @@ use node::Node;
 use state::Hold;
 
 use crate::Anchor;
-use crate::wire::{Head, Request, Response};
+use crate::wire::{Head, Manifest, Request, Response};
 use crate::{Context, SyncRequest, SyncTarget};
 
 pub trait Anchors: Send + Sync {
@@ -89,6 +89,14 @@ fn head<E: Context>(node: &Node<E>) -> Served {
         tip,
         targets: targets(node),
     }
+}
+
+pub fn manifest<E: Context>(node: &Node<E>) -> Result<Manifest, Refusal> {
+    let tip = node
+        .tip()
+        .map_err(|error| Refusal::new(reason::NOT_FOUND, error.to_string()))?;
+    let targets = targets(node)?;
+    Ok(Manifest { tip, targets })
 }
 
 fn targets<E: Context>(node: &Node<E>) -> Result<BTreeMap<ProgramId, SyncTarget>, Refusal> {

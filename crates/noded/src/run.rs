@@ -480,6 +480,10 @@ async fn start<E: Context>(
         from: tip.height,
         epoch: network.epoch_length,
     };
+    let snapshot_removals = crate::cores::beside_blocks(rpc_cpus.clone(), {
+        let dir = workspace.dir().join(crate::snapshot::DIR);
+        move || crate::snapshot::Removals::start(dir)
+    })??;
     let activity = crate::cores::beside_blocks(rpc_cpus, move || {
         crate::activity::Index::open(&indexed, lag, move || seed_of(&seeding))
     })??;
@@ -545,9 +549,11 @@ async fn start<E: Context>(
         tips.subscribe(),
     )?;
     let (inbox, deliveries) = mpsc::unbounded();
+    let (finalized, known) = watch::channel(tip.height);
     let chain = Participant {
         pool: pooling.clone(),
         inbox,
+        finalized: Arc::new(finalized),
     };
     let marshal = Marshal::start(
         context.child("marshal"),
@@ -651,6 +657,14 @@ async fn start<E: Context>(
             membership,
             tracker,
             tally,
+            snapshots: crate::snapshot::Snapshots::new(
+                workspace.dir().join(crate::snapshot::DIR),
+                workspace.runtime_dir(),
+                crate::snapshot::reflink,
+                snapshot_removals,
+                known,
+                daemon.network.epoch_length,
+            ),
         };
         move |_| write(writing, deliveries)
     });
@@ -879,6 +893,7 @@ fn recorded_epochs<E: Context>(
 pub struct Participant<E: Context> {
     pool: Pooling<E>,
     inbox: mpsc::UnboundedSender<Delivery>,
+    finalized: Arc<watch::Sender<u64>>,
 }
 
 impl<E: Context> Clone for Participant<E> {
@@ -886,6 +901,7 @@ impl<E: Context> Clone for Participant<E> {
         Participant {
             pool: self.pool.clone(),
             inbox: self.inbox.clone(),
+            finalized: self.finalized.clone(),
         }
     }
 }
@@ -905,6 +921,10 @@ impl<E: Context> Chain for Participant<E> {
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
         let _ = self.inbox.unbounded_send((block, ack));
     }
+
+    fn finalized(&mut self, height: u64) {
+        self.finalized.send_replace(height);
+    }
 }
 
 struct Writing<E: Context> {
@@ -914,6 +934,7 @@ struct Writing<E: Context> {
     membership: Seating<E>,
     tracker: Tracker,
     tally: Tally,
+    snapshots: crate::snapshot::Snapshots,
 }
 
 struct Tally {
@@ -988,6 +1009,7 @@ struct Phases {
     keeping: Duration,
     receipting: Duration,
     seating: Duration,
+    snapshotting: Duration,
 }
 
 impl Phases {
@@ -1030,6 +1052,7 @@ fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
         history_ms = ms(phases.keeping),
         receipting_ms = ms(phases.receipting),
         seating_ms = ms(phases.seating),
+        snapshot_ms = ms(phases.snapshotting),
         reason = "block_time_exceeded",
         "the writer took longer than a block time to apply a block"
     );
@@ -1313,6 +1336,7 @@ async fn applied<E: Context>(
         node,
         membership,
         tracker,
+        snapshots,
         ..
     } = writing;
     let daemon: &Daemon<E> = daemon;
@@ -1400,6 +1424,11 @@ async fn applied<E: Context>(
     tracker.track(epoch, &members);
     membership.seat(block.tip(), &validators).await?;
     phases.seating = lap.lap();
+    let follows = !validators.contains(&daemon.identity);
+    if follows {
+        snapshots.take(node, block.height);
+        phases.snapshotting = lap.lap();
+    }
     Ok(Flow::Writing)
 }
 

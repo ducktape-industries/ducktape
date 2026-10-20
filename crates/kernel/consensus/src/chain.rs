@@ -26,6 +26,7 @@ pub trait Chain: Clone + Send + Sync + 'static {
         time: u64,
     ) -> impl Future<Output = Option<Block>> + Send;
     fn deliver(&mut self, block: Arc<Block>, ack: Exact);
+    fn finalized(&mut self, _height: u64) {}
 }
 
 pub async fn unapplied(
@@ -126,7 +127,7 @@ where
     fn report(&mut self, update: Update<Block>) -> Feedback {
         match update {
             Update::Block(block, ack) => self.chain.deliver(block, ack),
-            Update::Tip(..) => {}
+            Update::Tip(_, height, _) => self.chain.finalized(height.get()),
         }
         Feedback::Ok
     }

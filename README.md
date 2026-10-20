@@ -249,6 +249,25 @@ and position did not apply) answered by a `Reply`. An index opens at
 the node's tip, seeded from the `activity` program's tables where the network
 still runs that program, so a node's history starts where its index did.
 
+A node that is no validator of the epoch a block opens, and whose data
+directory takes a reflink, keeps a snapshot of its state in
+`snapshots/<height>/`; a validator makes none, since the clone holds its
+writer up. At the last block of each epoch, after that block's commit and
+the next epoch's seating, and before the next block's commit, the writer
+clones every program's
+commitment files (every runtime partition under `state::partition_prefix`)
+into the snapshot's `runtime/` and
+writes its `manifest`, a borsh `statesync::Manifest`: the tip and each
+program's sync target, the root and op range its copy opens at. The snapshot
+appears whole by a rename; then a thread of its own, off the block CPUs,
+removes every older one, so a node holds one (a stop waits for that thread).
+A node that already knows a later epoch's last block is finalized (it is
+catching up) skips the snapshot, since the next one replaces it; marshal's
+finalized tip reaches the writer through `Chain::finalized`.
+A node whose filesystem refuses the clone logs `snapshot_unsupported` once,
+clears `snapshots/` and makes none until it restarts; a snapshot that fails
+logs `snapshot_failed` and leaves the one before it.
+
 ```sh
 make -C programs wasm-founding                      # a programs checkout; a hosted network's is at a forge dev commit
 tar xzf programs/target/wasm32-unknown-unknown/release/founding.tar.gz
