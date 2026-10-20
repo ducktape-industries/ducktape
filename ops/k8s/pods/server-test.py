@@ -2846,8 +2846,6 @@ class Builds(Streamed):
             {**UP, "busy_exit": "0"},
             {**UP, "busy_exit": True},
             {**UP, "busy": [stray]},
-            {**UP, "busy": ["programs r bogus j-1 [1m] programs dev gates"]},
-            {**UP, "busy": ["programs r"]},
         ]
         for request, ping in enumerate(pings, start=60):
             self.gate.answers["ping"] = ran(ping)
@@ -2856,6 +2854,21 @@ class Builds(Streamed):
             self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"), ping)
         self.gate.answers["ping"] = ran({**UP, "busy": [light]})
         self.assertEqual(self.built("programs", "dev", "gates", request=70)[1]["stdout"].splitlines()[0], "run desktop:r1")
+
+    def test_a_busy_line_that_names_no_weight_is_skipped(self):
+        split = ["programs 20261020-1 light j-126 [1m] programs 1a246b60 sh cat > /tmp/x.py <<'PY'", "    s.sendall(f\"GET {path} HTTP/1.1", "Host: {HOST}", "", "\".encode())", "PY"]
+        for request, busy in enumerate((split, ["programs r bogus j-1 [1m] programs dev gates"], ["programs r"], [""]), start=80):
+            self.gate.answers["ping"] = ran({**UP, "busy": busy})
+            self.assertEqual(self.built("programs", "dev", "gates", request=request)[1]["stdout"].splitlines()[0], "run desktop:r1", busy)
+        self.assertEqual(self.warm_execs(), [])
+
+    def test_skipped_busy_lines_beside_a_quiet_run_or_a_stray_holder_still_send_the_run_to_the_warm_pod(self):
+        split = ["programs 20261020-1 light j-126 [1m] programs 1a246b60 sh cat > /tmp/x.py <<'PY'", "Host: {HOST}", "", "PY"]
+        beside = ("programs 20261019-2 quiet j-1 [1m] programs dev sh measure", "stray 412 holds /var/tmp/warm/heavy.lock: sleep")
+        for request, line in enumerate(beside, start=90):
+            self.gate.answers["ping"] = ran({**UP, "busy": [*split, line]})
+            self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\nread it with: build.sh status w1\n"))
+            self.assertEqual(self.built("programs", "dev", "gates", request=request)[1]["stdout"].splitlines()[0], f"run {WARM}:w1", line)
 
     def test_routing_logs_a_token_and_its_sentence_apart(self):
         self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")

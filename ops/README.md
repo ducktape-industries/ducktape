@@ -188,7 +188,9 @@ one up for another network.
 - The reserved pod `builds` routes a build.sh call to the machine where it
   waits least: `desktop` when its `ping` says it is up, its `busy` reads (a
   list of `build.sh busy` lines, `busy_exit` 0) and
-  no quiet run or stray lock holder is among them, and its `build.sh ahead
+  no quiet run or stray lock holder is among them (a line naming no weight
+  build.sh prints, such as a piece of a call whose words hold a line
+  break, is skipped), and its `build.sh ahead
   <the call's words>` (`ahead <lane> <n>`: the lane the call runs in and how
   many runs in flight there it would wait for) is 0, or no more than the
   warm pod's (the warm pod the files path `PODS_WARM_POD` names, duckpond:

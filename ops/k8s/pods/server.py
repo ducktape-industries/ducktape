@@ -205,7 +205,6 @@ ADDRESSED = frozenset({"status", "log", "stop", "wait", "requeue"})
 MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-targets", "queue-out", "queue-in", "self-update", "worktree", "measure", "claim", "ended", "holds"})
 COMMIT_ID = re.compile(r"[0-9a-f]{7,40}")
 APPLY_VALUED = frozenset({"-m", "-F", "--onto", "--base"})
-WEIGHTS = frozenset({"heavy", "light", "quiet", "lane", "quick"})
 READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
 STARTED = re.compile(rb"^run (\S+)$", re.M)
 GO_TIME = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))? ([+-]\d{4})(?: \S+)?")
@@ -774,8 +773,6 @@ def desktop_free(said):
     if ran != 0:
         return False, f"the desktop's build.sh busy exited {ran}"
     kinds = ["stray" if line.startswith("stray ") else (line.split()[2:3] or [""])[0] for line in busy]
-    if any(kind not in WEIGHTS | {"stray"} for kind in kinds):
-        return False, "a line of the desktop's busy names no weight build.sh prints"
     if "stray" in kinds:
         return False, "a process no run started holds one of the desktop's build locks"
     if "quiet" in kinds:
