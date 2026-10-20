@@ -8,6 +8,7 @@ abi = { workspace = true }
 async-trait = { workspace = true }
 borsh = { workspace = true }
 futures = { workspace = true }
+rustix = { workspace = true, features = ["mm", "param"] }
 tokio = { workspace = true, features = ["sync"] }
 wasmtime = { workspace = true }
 zstd = { workspace = true }

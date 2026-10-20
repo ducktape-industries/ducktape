@@ -1,4 +1,5 @@
 mod image;
+mod stacks;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -113,7 +114,8 @@ impl Runtime {
             .wasm_threads(false)
             .wasm_gc(false)
             .wasm_tail_call(false)
-            .wasm_multi_memory(false);
+            .wasm_multi_memory(false)
+            .with_host_stack(Arc::new(stacks::Stacks::default()));
         Runtime {
             engine: Engine::new(&config).expect("a fixed wasmtime configuration"),
             limits,

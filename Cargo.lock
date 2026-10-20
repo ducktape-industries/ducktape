@@ -4220,6 +4220,7 @@ dependencies = [
  "fixture-probe",
  "fixture-wasm",
  "futures",
+ "rustix",
  "sha2 0.10.9",
  "tokio",
  "wasmtime",

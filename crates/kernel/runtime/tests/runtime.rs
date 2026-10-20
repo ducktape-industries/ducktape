@@ -319,3 +319,31 @@ async fn bytes_that_are_not_a_program_do_not_load() {
         .await;
     assert!(matches!(verdict, Err(Fault::Load(_))), "{verdict:?}");
 }
+
+const RECURSES: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) i32.const 0)
+  (func $deeper (param i32) (result i64) (call $deeper (local.get 0)))
+  (func (export "call") (param i32 i32) (result i64) (call $deeper (local.get 0))))
+"#;
+
+#[tokio::test]
+async fn a_run_on_a_reused_stack_overflows_as_one_on_a_fresh_stack_does() {
+    let runtime = Runtime::new(Limits::default());
+    let code = runtime.load(&wat::parse_str(RECURSES).unwrap()).unwrap();
+    for _ in 0..2 {
+        let verdict = runtime
+            .run(
+                &code,
+                invocation(ProgramCall::Execute(Vec::new())),
+                &mut Bench::default(),
+                &mut None,
+            )
+            .await;
+        let Err(Fault::Trap(sentence)) = verdict else {
+            panic!("the recursing run did not trap");
+        };
+        assert_eq!(sentence, "the run trapped: call stack exhausted");
+    }
+}
