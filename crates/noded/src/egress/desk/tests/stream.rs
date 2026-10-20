@@ -12,8 +12,9 @@ use futures::channel::mpsc;
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::egress::call::{self, Caller, Clients};
+use crate::egress::call::{self, Caller, Clients, Unretried};
 use crate::egress::config::{Config, Reach};
+use crate::egress::station::Serving;
 
 type Chunks = mpsc::UnboundedSender<std::io::Result<Bytes>>;
 
@@ -79,6 +80,7 @@ fn call(row: &RequestRow) -> mpsc::UnboundedReceiver<Called> {
             services: BTreeMap::new(),
         };
         let clients = Clients::new(config.reach).unwrap();
+        let serving = Serving { config, clients };
         let caller = Caller {
             chain: "dognet-b5b6ea90",
             program: "harness",
@@ -86,13 +88,14 @@ fn call(row: &RequestRow) -> mpsc::UnboundedReceiver<Called> {
         };
         let event = |data| called.unbounded_send(Called::Event(data)).unwrap();
         let (request, delivery) = (&row.request, &row.delivery);
+        let mut blocks = Unretried;
         let ended = call::answer(
-            &clients,
-            &config,
+            &serving,
             &caller,
             request,
             delivery,
             Vec::new(),
+            &mut blocks,
             event,
         )
         .await;

@@ -1,6 +1,6 @@
 //! One egress request answered by this node: a relay, a public `http` request, or a registered
-//! service's request at its configured base, its reply whole or as a stream of events. Used by the
-//! egress worker in `mod.rs`.
+//! service's request at its configured base, its reply whole or as a stream of events; a service's
+//! refused connection is tried again each block until its request's expiry. Used by `mod.rs`.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,10 +13,44 @@ use url::Url;
 
 use crate::egress::config::{Config, Reach, Refused, Upstream};
 use crate::egress::desk::Called;
+use crate::egress::station::Serving;
 use crate::egress::stream::Splitter;
 use crate::wire::Reached;
 
 const EVENT_STREAM: &str = "text/event-stream";
+
+pub trait Blocks {
+    fn tip(&mut self) -> u64;
+    fn expiry(&mut self) -> impl Future<Output = Option<u64>> + Send;
+    fn changed(&mut self) -> impl Future<Output = bool> + Send;
+}
+
+pub struct Unretried;
+
+impl Blocks for Unretried {
+    fn tip(&mut self) -> u64 {
+        0
+    }
+
+    async fn expiry(&mut self) -> Option<u64> {
+        None
+    }
+
+    async fn changed(&mut self) -> bool {
+        false
+    }
+}
+
+async fn again(blocks: &mut impl Blocks) -> bool {
+    let Some(expiry) = blocks.expiry().await else {
+        return false;
+    };
+    let answer_lands = blocks.tip().saturating_add(1);
+    if answer_lands.saturating_add(1) >= expiry {
+        return false;
+    }
+    blocks.changed().await
+}
 
 pub struct Clients {
     internet: reqwest::Client,
@@ -149,6 +183,18 @@ fn unreached(url: &Url, error: reqwest::Error) -> String {
     format!("the target was not reached: {}", causes.join(": "))
 }
 
+fn refused(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(cause) = source {
+        let io = cause.downcast_ref::<std::io::Error>();
+        if io.is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused) {
+            return error.is_connect();
+        }
+        source = cause.source();
+    }
+    false
+}
+
 pub struct Caller<'a> {
     pub chain: &'a str,
     pub program: &'a str,
@@ -166,19 +212,20 @@ impl Caller<'_> {
 }
 
 pub async fn answer(
-    clients: &Clients,
-    config: &Config,
+    serving: &Serving,
     caller: &Caller<'_>,
     request: &Request,
     delivery: &Delivery,
     body: Vec<u8>,
+    blocks: &mut impl Blocks,
     event: impl FnMut(Vec<u8>),
 ) -> Called {
+    let Serving { config, clients } = serving;
     let sent = match request {
         Request::Relay { .. } => return Called::Whole(relay(config)),
         Request::Http { service, head, .. } => match service.as_str() {
             HTTP => to_internet(clients, config, head, body).await,
-            named => to_service(clients, config, caller, named, head, body).await,
+            named => to_service(clients, config, caller, named, head, body, blocks).await,
         },
     };
     let response = match sent {
@@ -276,7 +323,8 @@ async fn to_internet(
     if config.reach == Reach::Public && private_literal {
         return Err(format!("{url} is not a public address"));
     }
-    send(&clients.internet, head, url, head.headers.clone(), body).await
+    let headers = head.headers.clone();
+    send(&clients.internet, head, url, headers, body, &mut Unretried).await
 }
 
 fn join(base: &Url, target: &str) -> Result<Url, String> {
@@ -300,6 +348,7 @@ async fn to_service(
     name: &str,
     head: &Head,
     body: Vec<u8>,
+    blocks: &mut impl Blocks,
 ) -> Result<reqwest::Response, String> {
     let Some(Upstream { base, secrets }) = config.services.get(name) else {
         return Err(format!("this node does not serve {name}"));
@@ -320,7 +369,7 @@ async fn to_service(
         .cloned()
         .chain(caller.headers())
         .collect();
-    send(&clients.services, head, url, headers, body).await
+    send(&clients.services, head, url, headers, body, blocks).await
 }
 
 async fn send(
@@ -329,17 +378,28 @@ async fn send(
     url: Url,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    blocks: &mut impl Blocks,
 ) -> Result<reqwest::Response, String> {
     let method = reqwest::Method::from_bytes(head.method.as_str().as_bytes())
         .map_err(|error| error.to_string())?;
-    let mut request = client.request(method, url.clone());
-    for (name, value) in end_to_end(headers) {
-        request = request.header(name, value);
+    let headers = end_to_end(headers);
+    let body = bytes::Bytes::from(body);
+    loop {
+        let mut request = client.request(method.clone(), url.clone());
+        for (name, value) in &headers {
+            request = request.header(name, value);
+        }
+        if !body.is_empty() {
+            request = request.body(body.clone());
+        }
+        let error = match request.send().await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        if !refused(&error) || !again(blocks).await {
+            return Err(unreached(&url, error));
+        }
     }
-    if !body.is_empty() {
-        request = request.body(body);
-    }
-    request.send().await.map_err(|error| unreached(&url, error))
 }
 
 #[cfg(test)]

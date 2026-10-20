@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::TcpListener as Bound;
 
 use abi::role::egress::RELAY;
 use abi::role::egress::http::Method;
@@ -73,6 +74,11 @@ fn config(base: &str, reach: Reach) -> Config {
     }
 }
 
+fn served(config: Config) -> Serving {
+    let clients = Clients::new(config.reach).unwrap();
+    Serving { config, clients }
+}
+
 const CALLER: Caller<'static> = Caller {
     chain: "dognet-b5b6ea90",
     program: "harness",
@@ -94,16 +100,25 @@ fn post(service: &str, target: &str, headers: Vec<(&str, &str)>) -> Request {
     }
 }
 
-async fn ask(clients: &Clients, config: &Config, request: &Request, body: &[u8]) -> Answer {
+async fn ask(serving: &Serving, request: &Request, body: &[u8]) -> Answer {
+    ask_at(serving, request, body, &mut Unretried).await
+}
+
+async fn ask_at(
+    serving: &Serving,
+    request: &Request,
+    body: &[u8],
+    blocks: &mut impl Blocks,
+) -> Answer {
     let delivery = Delivery::Whole;
     let unstreamed = |data| panic!("a whole request streamed {data:?}");
     let called = answer(
-        clients,
-        config,
+        serving,
         &CALLER,
         request,
         &delivery,
         body.to_vec(),
+        blocks,
         unstreamed,
     )
     .await;
@@ -128,9 +143,9 @@ fn text(response: Response) -> String {
 async fn a_service_request_reaches_its_base_with_the_secret_and_who_asked() {
     let base = target().await;
     let config = config(&format!("{base}/api"), Reach::Public);
-    let clients = Clients::new(config.reach).unwrap();
+    let serving = served(config);
     let request = post("ccs", "/v1/messages?beta=true", Vec::new());
-    let response = output(ask(&clients, &config, &request, b"{\"a\":1}").await);
+    let response = output(ask(&serving, &request, b"{\"a\":1}").await);
     assert_eq!(response.status, 200);
     assert!(response.headers.contains(&("x-seen".into(), "yes".into())));
     assert_eq!(
@@ -143,7 +158,7 @@ async fn a_service_request_reaches_its_base_with_the_secret_and_who_asked() {
 async fn a_service_request_that_climbs_out_sets_a_secret_or_names_an_unserved_service_fails() {
     let base = target().await;
     let config = config(&format!("{base}/api"), Reach::Public);
-    let clients = Clients::new(config.reach).unwrap();
+    let serving = served(config);
     let failures = [
         post("ccs", "/%2e%2e/admin", Vec::new()),
         post("ccs", "/v1/messages", vec![("x-api-key", "theirs")]),
@@ -151,7 +166,7 @@ async fn a_service_request_that_climbs_out_sets_a_secret_or_names_an_unserved_se
         post(RELAY, "/", Vec::new()),
     ];
     for request in failures {
-        let failed = ask(&clients, &config, &request, b"").await;
+        let failed = ask(&serving, &request, b"").await;
         assert!(
             matches!(failed, Answer::Failed(_)),
             "{request:?}: {failed:?}"
@@ -163,20 +178,16 @@ async fn a_service_request_that_climbs_out_sets_a_secret_or_names_an_unserved_se
 #[tokio::test]
 async fn the_relay_answers_empty_and_a_node_answers_only_what_it_serves() {
     let base = target().await;
-    let mut config = config(&base, Reach::Private);
-    let clients = Clients::new(config.reach).unwrap();
+    let mut serving = served(config(&base, Reach::Private));
     let relay = Request::Relay {
         note: b"toolu_1".to_vec(),
     };
-    assert_eq!(
-        ask(&clients, &config, &relay, b"").await,
-        Answer::Output(Vec::new())
-    );
-    config.relay = false;
-    config.http = false;
+    assert_eq!(ask(&serving, &relay, b"").await, Answer::Output(Vec::new()));
+    serving.config.relay = false;
+    serving.config.http = false;
     let internet = post(HTTP, &format!("{base}/v1/messages"), Vec::new());
     for request in [relay, internet] {
-        let unserved = ask(&clients, &config, &request, b"").await;
+        let unserved = ask(&serving, &request, b"").await;
         assert!(matches!(unserved, Answer::Failed(_)), "{unserved:?}");
     }
 }
@@ -185,12 +196,12 @@ async fn the_relay_answers_empty_and_a_node_answers_only_what_it_serves() {
 async fn an_internet_request_gets_no_secret_and_its_redirect_comes_back_unfollowed() {
     let base = target().await;
     let config = config(&base, Reach::Private);
-    let clients = Clients::new(config.reach).unwrap();
+    let serving = served(config);
     let request = post(HTTP, &format!("{base}/v1/messages"), Vec::new());
-    let response = output(ask(&clients, &config, &request, b"").await);
+    let response = output(ask(&serving, &request, b"").await);
     assert_eq!(text(response), "POST /v1/messages - - - - ");
     let moved = post(HTTP, &format!("{base}/moved"), Vec::new());
-    let response = output(ask(&clients, &config, &moved, b"").await);
+    let response = output(ask(&serving, &moved, b"").await);
     assert_eq!(response.status, 307);
 }
 
@@ -198,7 +209,7 @@ async fn an_internet_request_gets_no_secret_and_its_redirect_comes_back_unfollow
 async fn the_node_forwards_end_to_end_headers_only_as_a_proxy_does() {
     let base = target().await;
     let config = config(&base, Reach::Private);
-    let clients = Clients::new(config.reach).unwrap();
+    let serving = served(config);
     let hops = vec![
         ("keep-alive", "1"),
         ("te", "trailers"),
@@ -207,7 +218,7 @@ async fn the_node_forwards_end_to_end_headers_only_as_a_proxy_does() {
         ("x-end", "1"),
     ];
     let request = post(HTTP, &format!("{base}/names"), hops);
-    let response = output(ask(&clients, &config, &request, b"").await);
+    let response = output(ask(&serving, &request, b"").await);
     let names: Vec<&str> = response
         .headers
         .iter()
@@ -230,14 +241,14 @@ async fn a_public_node_refuses_a_private_address_by_literal_or_by_name() {
     let base = target().await;
     let port = base.rsplit(':').next().unwrap();
     let config = config(&base, Reach::Public);
-    let clients = Clients::new(config.reach).unwrap();
+    let serving = served(config);
     for url in [
         format!("{base}/v1/messages"),
         format!("http://[::1]:{port}/v1/messages"),
         format!("http://localhost:{port}/v1/messages"),
         "http://169.254.169.254/latest/meta-data/".to_owned(),
     ] {
-        let refused = ask(&clients, &config, &post(HTTP, &url, Vec::new()), b"").await;
+        let refused = ask(&serving, &post(HTTP, &url, Vec::new()), b"").await;
         let Answer::Failed(sentence) = refused else {
             panic!("{url}: {refused:?}");
         };
@@ -272,6 +283,102 @@ fn only_a_routable_unicast_address_is_public() {
     ] {
         assert!(!public(address.parse().unwrap()), "{address}");
     }
+}
+
+struct Chain {
+    tip: u64,
+    expiry: u64,
+    listens: Option<(u64, SocketAddr)>,
+}
+
+impl Blocks for Chain {
+    fn tip(&mut self) -> u64 {
+        self.tip
+    }
+
+    async fn expiry(&mut self) -> Option<u64> {
+        Some(self.expiry)
+    }
+
+    async fn changed(&mut self) -> bool {
+        self.tip += 1;
+        if let Some((height, address)) = self.listens
+            && height == self.tip
+        {
+            let listener = TcpListener::bind(address).await.unwrap();
+            let app = Router::new().fallback(any(echo));
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        }
+        true
+    }
+}
+
+fn closed() -> SocketAddr {
+    Bound::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_tried_again_at_each_block_until_the_service_listens() {
+    let address = closed();
+    let config = config(&format!("http://{address}/api"), Reach::Private);
+    let serving = served(config);
+    let request = post("ccs", "/v1/messages", Vec::new());
+    let mut blocks = Chain {
+        tip: 10,
+        expiry: 74,
+        listens: Some((13, address)),
+    };
+    let answered = ask_at(&serving, &request, b"{}", &mut blocks).await;
+    assert_eq!(blocks.tip, 13);
+    assert_eq!(
+        text(output(answered)),
+        "POST /api/v1/messages gateway-key dognet-b5b6ea90 harness 7 {}"
+    );
+}
+
+#[tokio::test]
+async fn a_service_that_never_listens_fails_with_the_refusal_in_the_last_block_before_its_expiry() {
+    let address = closed();
+    let serving = served(config(&format!("http://{address}"), Reach::Private));
+    let request = post("ccs", "/v1/messages", Vec::new());
+    let mut blocks = Chain {
+        tip: 10,
+        expiry: 74,
+        listens: None,
+    };
+    let Answer::Failed(why) = ask_at(&serving, &request, b"", &mut blocks).await else {
+        panic!("a closed port answered");
+    };
+    assert!(why.contains("refused"), "{why}");
+    assert_eq!(blocks.tip + 1, blocks.expiry - 1);
+}
+
+#[tokio::test]
+async fn a_public_url_to_a_closed_port_fails_at_once() {
+    let address = closed();
+    let serving = served(config(&format!("http://{address}"), Reach::Private));
+    let request = post(HTTP, &format!("http://{address}/v1/messages"), Vec::new());
+    let mut blocks = Chain {
+        tip: 10,
+        expiry: 74,
+        listens: Some((11, address)),
+    };
+    let Answer::Failed(why) = ask_at(&serving, &request, b"", &mut blocks).await else {
+        panic!("a closed port answered");
+    };
+    assert!(why.contains("refused"), "{why}");
+    assert_eq!(blocks.tip, 10);
+}
+
+#[tokio::test]
+async fn a_refused_service_whose_expiry_is_unknown_fails_at_once() {
+    let address = closed();
+    let serving = served(config(&format!("http://{address}"), Reach::Private));
+    let request = post("ccs", "/v1/messages", Vec::new());
+    let Answer::Failed(why) = ask(&serving, &request, b"").await else {
+        panic!("a closed port answered");
+    };
+    assert!(why.contains("refused"), "{why}");
 }
 
 #[tokio::test]

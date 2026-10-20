@@ -680,10 +680,19 @@ impl<W: AsyncWrite + Unpin + Send> Window for Remote<'_, W> {
                         program: &row.requester,
                         id,
                     };
-                    let Serving { config, clients } = serving.as_ref();
                     let request = &row.request;
                     let delivery = &row.delivery;
-                    call::answer(clients, config, &caller, request, delivery, body, event).await
+                    let unretried = &mut call::Unretried;
+                    call::answer(
+                        serving.as_ref(),
+                        &caller,
+                        request,
+                        delivery,
+                        body,
+                        unretried,
+                        event,
+                    )
+                    .await
                 }
                 Some(Err(reason)) => Called::Whole(Answer::Failed(reason)),
                 None => Called::Whole(Answer::Failed(

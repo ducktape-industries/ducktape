@@ -11,12 +11,14 @@ mod stream;
 use std::sync::Arc;
 
 use abi::role::egress::{Answer, Op, Query, Reply, RequestRow};
+use abi::role::scheduler;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{Layer, Tip};
 use node::{Frame, Preconfirm, Source, Taken};
+use tokio::sync::watch;
 
 pub use config::{Config, Refused, Withheld, withheld};
 pub use station::{Planned, Station, Tally};
@@ -24,7 +26,6 @@ pub use station::{Planned, Station, Tally};
 use crate::egress::call::Caller;
 use crate::egress::calls::{Call, Calls};
 use crate::egress::desk::{Called, Desk, Purpose, Reading, Sent, Step};
-use crate::egress::station::Serving;
 use crate::{Context, Daemon, Error, Result};
 
 const TARGET: &str = "ducktape::egress";
@@ -345,10 +346,24 @@ impl<E: Context> Window for Worker<E> {
                             program: &row.requester,
                             id,
                         };
-                        let Serving { config, clients } = serving.as_ref();
                         let request = &row.request;
                         let delivery = &row.delivery;
-                        call::answer(clients, config, &caller, request, delivery, body, event).await
+                        let mut blocks = Until {
+                            tips: daemon.tips.subscribe(),
+                            daemon: daemon.clone(),
+                            expiry: row.expiry,
+                        };
+                        let blocks = &mut blocks;
+                        call::answer(
+                            serving.as_ref(),
+                            &caller,
+                            request,
+                            delivery,
+                            body,
+                            blocks,
+                            event,
+                        )
+                        .await
                     }
                     Err(reason) => Called::Whole(Answer::Failed(reason)),
                 };
@@ -395,6 +410,39 @@ impl<E: Context> Window for Worker<E> {
             waited_ms = waited.as_millis() as u64,
         );
         sent
+    }
+}
+
+struct Until<E: Context> {
+    tips: watch::Receiver<u64>,
+    daemon: Arc<Daemon<E>>,
+    expiry: scheduler::EntryId,
+}
+
+impl<E: Context> call::Blocks for Until<E> {
+    fn tip(&mut self) -> u64 {
+        *self.tips.borrow_and_update()
+    }
+
+    async fn expiry(&mut self) -> Option<u64> {
+        let view = self.daemon.view().ok()?;
+        let source = view.source();
+        let scheduler = source.roles().get(role::SCHEDULER).cloned()?;
+        let query = abi::encode(&scheduler::Query::Entry { id: self.expiry });
+        let now = self.daemon.now();
+        let answer = source
+            .query(Layer::Confirmed, now, Origin::System, &scheduler, query)
+            .await
+            .ok()?
+            .ok()?;
+        match abi::decode(&answer).ok()? {
+            scheduler::Reply::Entry(entry) => entry.map(|entry| entry.height),
+            scheduler::Reply::Due { .. } => None,
+        }
+    }
+
+    async fn changed(&mut self) -> bool {
+        self.tips.changed().await.is_ok()
     }
 }
 
