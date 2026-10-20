@@ -3873,6 +3873,15 @@ class Builds(Streamed):
         self.assertIn("keep w1 pod desktop failed: build.sh: a commit or branch name, not x", answer["stdout"])
         self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "movable"])])
 
+    def test_reroute_keeps_on_the_warm_pod_a_run_whose_commit_the_desktop_lacks(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\nmove w2 heavy 4 d29yZHMy\n"), ran(b"w1: moved to run desktop:r1\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\nlacks c4ccf325: this machine's clone of programs lacks it after a fetch of forge's branches, so it stays where it was made\n")
+        lines = self.built("reroute")[1]["stdout"].splitlines()
+        self.assertIn("keep w2 pod desktop lacks c4ccf325: this machine's clone of programs lacks it after a fetch of forge's branches, so it stays where it was made", lines)
+        self.assertIn("w1: moved to run desktop:r1", lines)
+        self.assertEqual(self.warm_execs()[1:], [(WARM, None, ["sh", BUILD, "moved", "w1", "desktop:r1"])])
+
     def test_a_call_that_finds_the_desktop_idle_reroutes_once_it_is_sent(self):
         del self.service.reroute_after
         done = threading.Event()

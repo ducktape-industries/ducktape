@@ -286,7 +286,10 @@ one up for another network.
   read-only verbs, and an `sh` or `shot` whose call set `MOVABLE=1`), the
   desktop's `build.sh lanes`, one desktop `build.sh take` of every run it
   moves (after following the desktop's log when a moved run names NOTIFY,
-  so its end posts), and one warm `build.sh moved` ending each there and
+  so its end posts; a run naming a commit the desktop's clone lacks after
+  one fetch of forge's branches, such as an apply made on the warm pod and
+  never pushed, is not started there: take answers `lacks <commit>: …` and
+  the run stays queued on the warm pod, kept with that line), and one warm `build.sh moved` ending each there and
   naming its replacement, asked once more for the runs its answer leaves
   out. A run that started meanwhile stays, and its desktop copy ends with
   `build.sh yield`, posting no end. A handful of execs, however many runs,
