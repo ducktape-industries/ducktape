@@ -181,7 +181,24 @@ one up for another network.
   only a desktop that is down then leaves a call nowhere to run (503, or
   the file's 502). A desktop run whose session was cut while no warm pod
   is named answers 502 with both reasons, naming the run when it started
-  (`pods_unrouted`). Its exec takes build.sh's words as
+  (`pods_unrouted`). `reroute` (build.sh's
+  words `reroute` alone) moves the warm pod's queued runs to the desktop
+  while the desktop would start them sooner: the warm pod's `build.sh
+  movable` (the queued runs another machine may take, in lane order: the
+  read-only verbs, and an `sh` or `shot` whose call set `MOVABLE=1`), the
+  desktop's `build.sh lanes`, one desktop `build.sh take` of every run it
+  moves (after following the desktop's log when a moved run names NOTIFY,
+  so its end posts), and one warm `build.sh moved` ending each there and
+  naming its replacement, asked once more for the runs its answer leaves
+  out. A run that started meanwhile stays, and its desktop copy ends with
+  `build.sh yield`, posting no end. A handful of execs, however many runs,
+  and one line per run moved or kept with why: `unknown` names both runs
+  and why when the warm pod never says, `unstopped` a copy yield did not
+  end, a copy that had already ended is named so (both runs then post an
+  end), and
+  a take cut mid-call answers 502 naming the runs it may have started. A builds call that finds the desktop's lane free reroutes
+  once it is sent, one reroute at a time (`pods_rerouted`, or
+  `pods_reroute_failed` with its sentence). Its exec takes build.sh's words as
   `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
   stderr starts `builds: on <machine>`. `status`, `log`, `stop`, `wait` and
   `requeue` name their run as `<machine>:<run>` and go to that machine, or

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, posts when work ends or a notified pod prints a `ducktape-notify` line, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
+import base64
+import binascii
 import copy
 import decimal
 import hashlib
@@ -159,6 +161,7 @@ UNREACHED = (
     "error from server (timeout)",
 )
 CUT = ("websocket: close 1006", "abnormal closure")
+ENDED_ALREADY = "ended already"
 UNSTARTED = re.compile(r'container not found \("([^"]+)"\)')
 UNPLACED = "does not have a host assigned"
 REQUEST_NUMBER = re.compile(r"[0-9]+")
@@ -203,6 +206,9 @@ WEIGHTS = frozenset({"heavy", "light", "quiet", "lane", "quick"})
 READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
 STARTED = re.compile(rb"^run (\S+)$", re.M)
 AHEAD = re.compile(rb"ahead (heavy|lane|quick|light) ([0-9]+)")
+MOVABLE_RUN = re.compile(r"move (\S+) (heavy|lane|quick:\S+) ([0-9]+) (\S+)")
+LANE_WAIT = re.compile(r"(heavy|lane|quick:\S+) ([0-9]+)")
+REROUTE = "reroute"
 DESKTOP_KEYS = "/desktop"
 DESKTOP_FILES = ("id_ed25519", "known_hosts", "hosts", "user")
 BUILD_SH = "/var/tmp/warm/build.sh"
@@ -726,6 +732,14 @@ def desktop_free(said):
     if "quiet" in kinds:
         return False, "a quiet run holds every heavy slot of the desktop"
     return True, None
+
+
+def notifies(words):
+    try:
+        said = base64.b64decode(words, validate=True).split(b"\0")
+    except (binascii.Error, ValueError):
+        return False
+    return any(word.startswith(b"NOTIFY=") and word != b"NOTIFY=" for word in said)
 
 
 def on_machine(machine, ran, started=True):
@@ -1844,6 +1858,7 @@ class Service:
         self.execs = {}
         self.lock = threading.Lock()
         self.swept = threading.Event()
+        self.rerouting = threading.Lock()
 
     def pod(self, name):
         ran = self.kube.get(name)
@@ -2029,44 +2044,155 @@ class Service:
             said = self.desktop.state()
         except Refused as refused:
             say("pods_routed", to="warm", reason="desktop_unready", detail=json.dumps(refused.sentence))
-            return self.warm()
+            return self.warm(), False
         free, why = desktop_free(said)
         if not free:
             try:
                 warm = self.warm()
             except Refused as refused:
                 say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(f"{why}; {refused.sentence}"))
-                return DESKTOP
+                return DESKTOP, False
             there, unasked = self.ahead(asked, warm, words, alive)
             if there is None:
                 say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(f"{why}; {unasked}"))
-                return DESKTOP
+                return DESKTOP, False
             say("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps(why))
-            return warm
+            return warm, False
         here, why = self.ahead(asked, DESKTOP, words, alive)
         if here is None:
             try:
                 warm = self.warm()
             except Refused as refused:
                 say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(refused.sentence))
-                return DESKTOP
+                return DESKTOP, False
             say("pods_routed", to="warm", reason="desktop_unasked", detail=json.dumps(why))
-            return warm
+            return warm, False
         if here[1] == 0:
-            return DESKTOP
+            return DESKTOP, True
         try:
             warm = self.warm()
         except Refused as refused:
             say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(refused.sentence))
-            return DESKTOP
+            return DESKTOP, False
         there, why = self.ahead(asked, warm, words, alive)
         if there is None:
             say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(why))
-            return DESKTOP
+            return DESKTOP, False
         if there[1] >= here[1]:
-            return DESKTOP
+            return DESKTOP, False
         say("pods_routed", to="warm", reason="shorter_wait", detail=json.dumps(f"{here[0]}: {here[1]} ahead on pod {DESKTOP}, {there[1]} on pod {warm}"))
-        return warm
+        return warm, False
+
+    def reroute(self, asked, alive):
+        with self.rerouting:
+            return self.rerouted(asked, alive)
+
+    def reroute_after(self, asked):
+        if not self.rerouting.acquire(blocking=False):
+            return
+
+        def run():
+            try:
+                self.rerouted(asked, None)
+            except Exception as error:
+                say("pods_reroute_failed", detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+            finally:
+                self.rerouting.release()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def rerouted(self, asked, alive):
+        warm = self.warm()
+        listed = self.executed(asked, warm, None, ["sh", BUILD_SH, "movable"], alive=alive)
+        if listed.code != 0:
+            raise Refused(502, f"build.sh movable on pod {warm} answered exit {listed.code}")
+        lanes = self.desktop.ran(["sh", BUILD_SH, "lanes"], alive)
+        if lanes.code != 0:
+            raise Refused(502, f"build.sh lanes on pod {DESKTOP} answered exit {lanes.code}")
+        waits = {found.group(1): int(found.group(2)) for found in map(LANE_WAIT.fullmatch, lanes.out.decode(errors="replace").splitlines()) if found}
+        said, chosen, moved_ahead = [], [], {}
+        candidates = []
+        for line in listed.out.decode(errors="replace").splitlines():
+            found = MOVABLE_RUN.fullmatch(line)
+            if found:
+                candidates.append((found.group(2), int(found.group(3)), found.group(1), found.group(4)))
+            elif line.startswith("keep "):
+                said.append(line)
+        for lane, ahead, run, words in sorted(candidates):
+            here, there = waits.get(lane, 0), ahead - moved_ahead.get(lane, 0)
+            if here < there:
+                chosen.append((run, words))
+                waits[lane] = here + 1
+                moved_ahead[lane] = moved_ahead.get(lane, 0) + 1
+            else:
+                said.append(f"keep {run} the {lane} lane waits for {here} runs on pod {DESKTOP} and {there} here")
+        if chosen:
+            said += self.carried(asked, warm, chosen, alive)
+        moved = sum(1 for line in said if ": moved to run " in line)
+        say("pods_rerouted", moved=moved, kept=len(said) - moved)
+        return "\n".join(said) + "\n" if said else f"nothing queued on pod {warm} to move\n"
+
+    def carried(self, asked, warm, chosen, alive):
+        if any(notifies(words) for _, words in chosen):
+            self.follow_desktop()
+        try:
+            took = self.desktop.ran(["sh", BUILD_SH, "take", *[words for _, words in chosen]], alive)
+        except Refused as refused:
+            raise Refused(502, f"{refused.sentence}; build.sh take on pod {DESKTOP} may have started some of these runs, each still queued on pod {warm} ({', '.join(run for run, _ in chosen)}): read build.sh busy on pod {DESKTOP} before calling reroute again") from refused
+        lines = took.out.decode(errors="replace").splitlines()
+        said, pairs = [], {}
+        for index, (run, _) in enumerate(chosen):
+            line = lines[index] if index < len(lines) else f"failed: build.sh take answered exit {took.code} and said nothing of it"
+            if line.startswith("run "):
+                pairs[run] = f"{DESKTOP}:{line[4:]}"
+            else:
+                said.append(f"keep {run} pod {DESKTOP} {line}")
+        if not pairs:
+            return said
+        answers, why = self.warm_moved(asked, warm, pairs, alive)
+        unread = {run: copy for run, copy in pairs.items() if run not in answers}
+        if unread:
+            more, why = self.warm_moved(asked, warm, unread, alive)
+            answers.update(more)
+        stays = {}
+        for run, copy in pairs.items():
+            line = answers.get(run)
+            if line is None:
+                said.append(f"unknown {run}: pod {warm} never said whether it ended ({why}), so {copy} may run beside it")
+            elif "so it stays here" in line:
+                stays[run] = copy
+            else:
+                said.append(line)
+        if stays:
+            said += self.yielded(warm, stays, alive)
+        return said
+
+    def warm_moved(self, asked, warm, pairs, alive):
+        try:
+            ran = self.executed(asked, warm, None, ["sh", BUILD_SH, "moved", *itertools.chain.from_iterable(pairs.items())], alive=alive)
+        except Refused as refused:
+            return {}, refused.sentence
+        lines = (line.split(": ", 1) for line in ran.out.decode(errors="replace").splitlines() if ": " in line)
+        return {run: f"{run}: {rest}" for run, rest in lines if run in pairs}, f"build.sh moved on pod {warm} answered exit {ran.code} without a line for it"
+
+    def yielded(self, warm, stays, alive):
+        words = [word for run, copy in stays.items() for word in (copy.partition(":")[2], f"{warm}:{run}")]
+        try:
+            ran = self.desktop.ran(["sh", BUILD_SH, "yield", *words], alive)
+            answers = dict(line.split(": ", 1) for line in ran.out.decode(errors="replace").splitlines() if ": " in line)
+            why = f"build.sh yield answered exit {ran.code}"
+        except Refused as refused:
+            answers, why = {}, refused.sentence
+        said = []
+        for run, copy in stays.items():
+            answer = answers.get(copy.partition(":")[2], "")
+            if answer.startswith("yielded to run "):
+                said.append(f"{run}: started before it moved, so it stays on pod {warm}; its copy {copy} yielded to it")
+            elif answer.startswith(ENDED_ALREADY):
+                said.append(f"{run}: started before it moved, so it stays on pod {warm}; its copy {copy} had already ended {answer[len(ENDED_ALREADY):].strip()}, so each of the two posts its own end")
+            else:
+                said.append(f"unstopped {copy}: it runs beside {warm}:{run}, which stays ({why}); stop it")
+        return said
 
     def ahead(self, asked, machine, words, alive):
         command = ["sh", BUILD_SH, "ahead", *words]
@@ -2092,6 +2218,8 @@ class Service:
         settings = list(itertools.takewhile(SETTING.fullmatch, words))
         called = words[len(settings) :]
         first = called[0] if called else ""
+        if first == REROUTE and len(called) == 1:
+            return Ran(0, self.reroute(asked, alive).encode(), f"{BUILDS}: reroute")
         if first in MACHINE_WIDE:
             raise Refused(400, f"build.sh {first} acts on one machine, so name it (pod {DESKTOP}, or the warm pod) rather than pod {BUILDS}")
         if first in ADDRESSED:
@@ -2106,9 +2234,11 @@ class Service:
                     return on_machine(machine, looked, started=False)
             return on_machine(machine, self.on(asked, machine, [*settings, first, run, *called[2:]], alive), started=first == "requeue")
         verb = first if first == "apply" else (called[2] if len(called) > 2 else first)
-        machine = self.pick(asked, words, alive)
+        machine, idle = self.pick(asked, words, alive)
         try:
             ran = self.on(asked, machine, words, alive)
+            if idle:
+                self.reroute_after(asked)
         except Refused as refused:
             if machine != DESKTOP:
                 raise

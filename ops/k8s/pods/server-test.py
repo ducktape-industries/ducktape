@@ -1,4 +1,5 @@
 """Exercise the pods service over real HTTP against a recording kubectl, ducktape and kubelet, and its input fetcher against a recording runner; run by `make test`."""
+import base64
 import contextlib
 import http.client
 import socket
@@ -2254,6 +2255,8 @@ class Gate:
             return ran(code=255, err=f"ssh: connect to host {host} port 22: No route to host")
         if words[:2] == ["exec", "ahead"] and host not in self.cut and host not in self.said:
             return self.answers.get("ahead", NONE_AHEAD)
+        if len(words) > 1 and words[0] == "exec" and f"exec {words[1]}" in self.answers and host not in self.cut and host not in self.said:
+            return self.answers[f"exec {words[1]}"]
         if host in self.cut or (words[1:2] and words[0] == "exec" and set(words) & self.cut_words):
             return ran(self.cut_said, code=255, err=f"Connection to {host} closed by remote host.")
         if host in self.said:
@@ -2543,6 +2546,7 @@ class Builds(Streamed):
         self.signer.head = ran(files_answer(f"{WARM}\n".encode()))
         self.gate.answers["exec"] = ran(b"run r1\nread it with: build.sh status r1\n")
         self.kube.answer("exec", ran(b"run w1\nread it with: build.sh status w1\n"))
+        self.service.reroute_after = lambda asked: None
 
     def built(self, *words, request=41):
         return self.call("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, *words]}, headers=asked(request))
@@ -2719,6 +2723,107 @@ class Builds(Streamed):
             self.assertEqual(status, 400, answer)
             self.assertIn(words, answer["error"])
         self.assertEqual(self.gate.calls, [])
+
+    def test_reroute_moves_each_queued_run_the_desktop_would_start_sooner(self):
+        self.kube.answer("exec", ran(b"move w2 heavy 4 d29yZHMy\nmove w1 heavy 3 d29yZHMx\nkeep w3 a pack holds its result on this machine\n"), ran(b"w1: moved to run desktop:r1\nw2: moved to run desktop:r2\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 1\nlane 0\nquick:programs 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\nrun r2\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("reroute")
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(answer["stdout"].splitlines(), ["keep w3 a pack holds its result on this machine", "w1: moved to run desktop:r1", "w2: moved to run desktop:r2"])
+        self.assertEqual(self.gate.words(), [["exec", "lanes"], ["exec", "take", "d29yZHMx", "d29yZHMy"]])
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "movable"]), (WARM, None, ["sh", BUILD, "moved", "w1", "desktop:r1", "w2", "desktop:r2"])])
+        said.assert_any_call("pods_rerouted", moved=2, kept=1)
+
+    def test_reroute_keeps_a_run_the_desktop_would_not_start_sooner(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 2 d29yZHMx\nmove w4 quick:chat 1 d29yZHM0\n"), ran(b"w4: moved to run desktop:r4\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 2\nlane 0\n")
+        self.gate.answers["exec take"] = ran(b"run r4\n")
+        answer = self.built("reroute")[1]
+        self.assertIn("keep w1 the heavy lane waits for 2 runs on pod desktop and 2 here", answer["stdout"])
+        self.assertEqual(self.gate.words(), [["exec", "lanes"], ["exec", "take", "d29yZHM0"]])
+
+    def test_reroute_ends_the_desktop_copy_of_a_run_that_started_meanwhile_posting_nothing(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"), ran(b"w1: started or ended, so it stays here, and run desktop:r1 should yield to it\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\n")
+        self.gate.answers["exec yield"] = ran(f"r1: yielded to run {WARM}:w1\n".encode())
+        answer = self.built("reroute")[1]
+        self.assertEqual(self.gate.words()[-1], ["exec", "yield", "r1", f"{WARM}:w1"])
+        self.assertEqual(answer["stdout"].splitlines(), [f"w1: started before it moved, so it stays on pod {WARM}; its copy desktop:r1 yielded to it"])
+
+    def test_reroute_names_a_copy_that_ended_before_yield_came_as_ended_not_running(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"), ran(b"w1: started or ended, so it stays here, and run desktop:r1 should yield to it\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\n")
+        self.gate.answers["exec yield"] = ran(b"r1: ended already (exit 1)\n")
+        lines = self.built("reroute")[1]["stdout"].splitlines()
+        self.assertEqual(lines, [f"w1: started before it moved, so it stays on pod {WARM}; its copy desktop:r1 had already ended (exit 1), so each of the two posts its own end"])
+
+    def test_reroute_names_a_copy_it_could_not_end(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"), ran(b"w1: started or ended, so it stays here, and run desktop:r1 should yield to it\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\n")
+        self.gate.answers["exec yield"] = ran(code=2, err="build.sh: usage")
+        self.assertIn(f"unstopped desktop:r1: it runs beside {WARM}:w1, which stays (build.sh yield answered exit 2); stop it", self.built("reroute")[1]["stdout"])
+
+    def test_reroute_reads_again_a_move_the_warm_pod_did_not_answer_and_names_both_runs_when_it_never_does(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\nmove w2 heavy 4 d29yZHMy\n"), ran(code=2), ran(b"w1: moved to run desktop:r1\n"), ran(code=2))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\nrun r2\n")
+        lines = self.built("reroute")[1]["stdout"].splitlines()
+        self.assertIn("w1: moved to run desktop:r1", lines)
+        self.assertIn(f"unknown w2: pod {WARM} never said whether it ended (build.sh moved on pod {WARM} answered exit 0 without a line for it), so desktop:r2 may run beside it", lines)
+        moves = [call for call in self.warm_execs() if call[2][2] == "moved"]
+        self.assertEqual([call[2][3:] for call in moves], [["w1", "desktop:r1", "w2", "desktop:r2"], ["w1", "desktop:r1", "w2", "desktop:r2"], ["w2", "desktop:r2"]][: len(moves)])
+
+    def test_reroute_says_why_the_warm_pod_never_said_a_move_ended(self):
+        lost = ran(code=1, err="error: websocket: close 1006 (abnormal closure): unexpected EOF")
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"), lost, lost)
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\n")
+        lines = self.built("reroute")[1]["stdout"].splitlines()
+        self.assertEqual(lines, [f"unknown w1: pod {WARM} never said whether it ended (apiserver unavailable: the exec's connection to pod {WARM} was cut while it ran (error: websocket: close 1006 (abnormal closure): unexpected EOF); its command may still be running there, so it was not run again), so desktop:r1 may run beside it"])
+
+    def test_a_take_cut_mid_call_names_the_runs_it_may_have_started(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.cut_words = {"take"}
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "reroute"]}, 502, ["may have started some of these runs", f"each still queued on pod {WARM} (w1)", "build.sh busy on pod desktop"])
+
+    def test_reroute_follows_the_desktop_log_before_it_moves_a_run_that_notifies(self):
+        notifying = base64.b64encode(b"JOB=j-1\0NOTIFY=j-1\0programs\0dev\0gates\0").decode()
+        self.kube.answer("exec", ran(f"move w1 heavy 3 {notifying}\n".encode()), ran(b"w1: moved to run desktop:r1\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\n")
+        with unittest.mock.patch.object(self.service, "follow_desktop") as followed:
+            self.built("reroute")
+        followed.assert_called_once_with()
+
+    def test_reroute_keeps_a_second_run_once_the_first_move_fills_the_desktops_lane(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 1 d29yZHMx\nmove w2 heavy 2 d29yZHMy\n"), ran(b"w1: moved to run desktop:r1\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"run r1\n")
+        answer = self.built("reroute")[1]
+        self.assertIn("keep w2 the heavy lane waits for 1 runs on pod desktop and 1 here", answer["stdout"])
+        self.assertEqual(self.gate.words()[-1], ["exec", "take", "d29yZHMx"])
+
+    def test_reroute_keeps_a_run_the_desktop_did_not_take(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"))
+        self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
+        self.gate.answers["exec take"] = ran(b"failed: build.sh: a commit or branch name, not x\n")
+        answer = self.built("reroute")[1]
+        self.assertIn("keep w1 pod desktop failed: build.sh: a commit or branch name, not x", answer["stdout"])
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "movable"])])
+
+    def test_a_call_that_finds_the_desktop_idle_reroutes_once_it_is_sent(self):
+        del self.service.reroute_after
+        done = threading.Event()
+        with unittest.mock.patch.object(self.service, "rerouted", side_effect=lambda *_: done.set()):
+            self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+            done.wait()
+        self.assertEqual(self.gate.words()[-1], ["exec", "programs", "dev", "gates"])
 
     def test_with_no_warm_pod_named_a_desktop_with_a_wait_takes_the_run(self):
         self.service.warm_pod = None
