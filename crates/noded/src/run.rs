@@ -1016,7 +1016,30 @@ impl<'a, C: Clock> Lap<'a, C> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Slowest {
+    spent: Duration,
+    program: String,
+    position: u32,
+    tx: String,
+}
+
+fn slowest_of(
+    spent: Option<host::Slowest>,
+    receipts: &[abi::Receipt],
+    carried: &[node::Carried],
+) -> Option<Slowest> {
+    let spent = spent?;
+    let at = spent.position as usize;
+    Some(Slowest {
+        spent: spent.spent,
+        program: receipts.get(at)?.program.clone(),
+        position: spent.position,
+        tx: hex::encode(carried.get(at)?.id),
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Phases {
     total: Duration,
     behind: Duration,
@@ -1030,6 +1053,7 @@ struct Phases {
     receipting: Duration,
     seating: Duration,
     snapshotting: Duration,
+    slowest: Option<Slowest>,
 }
 
 impl Phases {
@@ -1073,6 +1097,10 @@ fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
         receipting_ms = ms(phases.receipting),
         seating_ms = ms(phases.seating),
         snapshot_ms = ms(phases.snapshotting),
+        slowest_ms = phases.slowest.as_ref().map(|slowest| ms(slowest.spent)),
+        slowest_program = phases.slowest.as_ref().map(|slowest| slowest.program.as_str()),
+        slowest_position = phases.slowest.as_ref().map(|slowest| slowest.position),
+        slowest_tx = phases.slowest.as_ref().map(|slowest| slowest.tx.as_str()),
         reason = "block_time_exceeded",
         "the writer took longer than a block time to apply a block"
     );
@@ -1335,6 +1363,7 @@ async fn applied<E: Context>(
             let spent = node.host().spent();
             phases.executing = spent.executing;
             phases.committing = spent.committing;
+            phases.slowest = slowest_of(spent.slowest, &receipts, &carried);
             let records = std::mem::take(&mut applied.records);
             let refused = crate::activity::refused(&records, &receipts);
             let recorded = daemon.record(node, block, ran, Some(receipts)).await?;
@@ -1417,7 +1446,9 @@ mod tests {
 
     use futures::channel::mpsc;
 
-    use super::{Event, Phases, listing, next, rewrites};
+    use abi::Outcome;
+
+    use super::{Event, Phases, Slowest, listing, next, rewrites, slowest_of};
 
     #[test]
     fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {
@@ -1470,6 +1501,41 @@ mod tests {
             ..Phases::default()
         };
         assert_eq!(replayed.verifying(), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_slowest_frame_is_named_by_its_receipt_and_its_carried_id() {
+        let receipt = |program: &str| abi::Receipt {
+            program: program.into(),
+            outcome: Outcome::Applied { output: Vec::new() },
+            events: Vec::new(),
+            nested: Vec::new(),
+        };
+        let receipts = [receipt("chat"), receipt("probe")];
+        let carried = [
+            node::Carried {
+                frame: 0,
+                id: [1; 32],
+            },
+            node::Carried {
+                frame: 2,
+                id: [2; 32],
+            },
+        ];
+        let slowest = host::Slowest {
+            position: 1,
+            spent: Duration::from_millis(7),
+        };
+        assert_eq!(
+            slowest_of(Some(slowest), &receipts, &carried),
+            Some(Slowest {
+                spent: Duration::from_millis(7),
+                program: "probe".into(),
+                position: 1,
+                tx: hex::encode([2; 32]),
+            })
+        );
+        assert_eq!(slowest_of(None, &receipts, &carried), None);
     }
 
     #[test]

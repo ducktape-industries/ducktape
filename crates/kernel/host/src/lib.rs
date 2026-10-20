@@ -171,6 +171,13 @@ pub struct Applied {
 pub struct Spent {
     pub executing: Duration,
     pub committing: Duration,
+    pub slowest: Option<Slowest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slowest {
+    pub position: u32,
+    pub spent: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -789,7 +796,9 @@ where
             .await?;
         let mut submissions = Vec::new();
         let mut records = Vec::new();
+        let mut slowest: Option<Slowest> = None;
         for (position, submission) in block.submissions.into_iter().enumerate() {
+            let began = self.store.clock().current();
             let signer = submission.signer.clone();
             let target = submission.target.clone();
             let submitted = self
@@ -821,6 +830,18 @@ where
                 }
             };
             submissions.push(receipt);
+            let spent = self
+                .store
+                .clock()
+                .current()
+                .duration_since(began)
+                .unwrap_or_default();
+            if slowest.is_none_or(|slowest| spent > slowest.spent) {
+                slowest = Some(Slowest {
+                    position: position as u32,
+                    spent,
+                });
+            }
         }
         self.log_hooks(block.height, hooks);
         let refusals = self
@@ -852,6 +873,7 @@ where
         self.spent = Spent {
             executing: executed.duration_since(started).unwrap_or_default(),
             committing: committed.duration_since(executed).unwrap_or_default(),
+            slowest,
         };
         let applied = applied?;
         self.unlink(&applied.writes, block.time).await;
