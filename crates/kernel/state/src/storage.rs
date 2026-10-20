@@ -1,5 +1,8 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+
+use abi::ProgramId;
 
 use fluent31::{Db, Options, Snapshot, WriteBatch};
 
@@ -136,6 +139,25 @@ impl Storage {
         for entry in self.db().iter(None, None, false)? {
             let (key, _) = entry?;
             batch.delete(key);
+        }
+        stage(&mut batch, writes);
+        batch.put(HEIGHT, abi::encode(&height));
+        batch.delete(PENDING);
+        Ok(self.db().write(batch)?)
+    }
+
+    pub fn advance(
+        &self,
+        height: u64,
+        writes: &Writes,
+        replaced: &BTreeSet<ProgramId>,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        for program in replaced {
+            for entry in self.iter(program, b"", None, false)? {
+                let (key, _) = entry?;
+                batch.delete(namespaced(program, &key));
+            }
         }
         stage(&mut batch, writes);
         batch.put(HEIGHT, abi::encode(&height));

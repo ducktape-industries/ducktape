@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use abi::{Entry, Scan};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use state::{Commitment, Overlay, Storage, Store, Writes, commitment_name};
+use state::{Adoption, Commitment, Overlay, Storage, Store, Writes, commitment_name};
 
 const APP: &str = "app";
 
@@ -375,5 +375,71 @@ fn a_program_admitted_over_a_left_commitment_starts_empty() {
             .unwrap();
         empty.add_program(APP).await.unwrap();
         assert_eq!(store.root(APP).unwrap(), empty.root(APP).unwrap());
+    });
+}
+
+#[test]
+fn a_second_adoption_writes_only_what_changed_since_the_first() {
+    deterministic::Runner::default().start(|context| async move {
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let mut upstream = Store::open(
+            context.child("upstream"),
+            "s",
+            storage(&upstream_dir),
+            [APP.to_owned(), "other".to_owned()],
+        )
+        .await
+        .unwrap();
+        let mut first = writes(APP, &[(b"a", Some(b"1")), (b"b", Some(b"2"))]);
+        first.programs.insert(
+            "other".to_owned(),
+            [(b"o".to_vec(), Some(b"9".to_vec()))].into(),
+        );
+        upstream.commit(0, first).await.unwrap();
+        let (_, commitments) = upstream.into_parts();
+        let dir = tempfile::tempdir().unwrap();
+        let mut adoption = Adoption::default();
+        let joiner = Store::adopt_from(
+            context.child("joiner"),
+            "s",
+            storage(&dir),
+            0,
+            commitments,
+            &mut adoption,
+        )
+        .await
+        .unwrap();
+        assert_eq!(adoption.replaced().len(), 2);
+
+        let (storage, mut commitments) = joiner.into_parts();
+        let mut app = commitments.remove(APP).unwrap();
+        let next = writes(
+            APP,
+            &[(b"a", None), (b"b", Some(b"22")), (b"c", Some(b"3"))],
+        );
+        app.apply(1, &next.programs[APP]).await.unwrap();
+        let expected_root = app.root().unwrap();
+        let joiner = Store::adopt_from(
+            context.child("again"),
+            "s",
+            storage,
+            1,
+            BTreeMap::from([(APP.to_owned(), app)]),
+            &mut adoption,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            adoption.replaced().iter().collect::<Vec<_>>(),
+            ["other"],
+            "APP wrote only what changed; other is gone"
+        );
+        assert_eq!(joiner.height().unwrap(), Some(1));
+        assert_eq!(joiner.root(APP).unwrap().unwrap(), expected_root);
+        assert_eq!(
+            joiner.view(vec![]).scan(APP, &Scan::prefix(b"")).unwrap(),
+            vec![entry(b"b", b"22"), entry(b"c", b"3")]
+        );
+        assert_eq!(joiner.view(vec![]).get("other", b"o").unwrap(), None);
     });
 }

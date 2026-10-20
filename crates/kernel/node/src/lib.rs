@@ -149,12 +149,24 @@ where
     }
 
     pub async fn adopt(context: E, name: &str, dir: &Path, synced: Synced<E>) -> Result<Node<E>> {
-        let host = Host::adopt(
+        let mut adoption = state::Adoption::default();
+        Node::adopt_from(context, name, dir, synced, &mut adoption).await
+    }
+
+    pub async fn adopt_from(
+        context: E,
+        name: &str,
+        dir: &Path,
+        synced: Synced<E>,
+        adoption: &mut state::Adoption,
+    ) -> Result<Node<E>> {
+        let host = Host::adopt_from(
             context.child("host"),
             name,
             dir,
             synced.height,
             synced.commitments,
+            adoption,
         )
         .await?;
         Node::over(context, host)

@@ -1256,6 +1256,142 @@ fn a_join_the_source_prunes_past_reads_the_head_again_and_adopts_the_later_root(
     });
 }
 
+type Churn = fn(usize, &[BlobId]) -> Vec<Vec<Step>>;
+
+#[derive(Clone)]
+struct Churning {
+    source: Loopback,
+    keys: Vec<ed25519::PrivateKey>,
+    members: Vec<validators::Member>,
+    churn: Churn,
+    asked: Arc<Mutex<Vec<Vec<BlobId>>>>,
+}
+
+impl Exchange for Churning {
+    type Error = Infallible;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
+        self.source.exchange(request).await
+    }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        let round = {
+            let mut asked = self.asked.lock().unwrap();
+            asked.push(ids.clone());
+            asked.len() - 1
+        };
+        let blocks: Vec<Vec<u8>> = (self.churn)(round, &ids)
+            .into_iter()
+            .enumerate()
+            .map(|(n, steps)| {
+                let mut unique = vec![set(format!("churn-{round}-{n}").as_bytes(), b"1")];
+                unique.extend(steps);
+                frame(&key(11), unique)
+            })
+            .collect();
+        let blocks = Arc::new(blocks);
+        let churning = self.clone();
+        futures::stream::iter(ids.into_iter().enumerate()).then(move |(nth, id)| {
+            let churning = churning.clone();
+            let blocks = blocks.clone();
+            async move {
+                let node = churning.source.0.node.lock().await;
+                let framed = node.host().blob(&id, node.now()).await.unwrap();
+                drop(node);
+                if nth == 0 {
+                    for block in blocks.iter() {
+                        let frames = vec![block.clone()];
+                        advance(
+                            &churning.source.0,
+                            &churning.keys,
+                            &churning.members,
+                            frames,
+                        )
+                        .await;
+                    }
+                }
+                Ok(framed)
+            }
+        })
+    }
+}
+
+fn put_part(body: &[u8]) -> Step {
+    Step::Op(HostOp::BlobPut {
+        hash: abi::HashKind::Sha256,
+        kind: "part".into(),
+        body: body.to_vec(),
+    })
+}
+
+const SHARED: &[u8] = b"the part every call shares";
+const CHURNING_ROUNDS: usize = 3;
+
+fn released_and_put_again(round: usize, asked: &[BlobId]) -> Vec<Vec<Step>> {
+    if round >= CHURNING_ROUNDS {
+        return Vec::new();
+    }
+    let released = asked
+        .iter()
+        .map(|id| Step::Op(HostOp::BlobRelease(*id)))
+        .collect();
+    let first = format!("the request of call {round}");
+    let second = format!("the answer of call {round}");
+    let put = vec![
+        put_part(SHARED),
+        put_part(first.as_bytes()),
+        put_part(second.as_bytes()),
+    ];
+    vec![released, put]
+}
+
+#[test]
+fn a_join_whose_parts_are_released_and_put_again_while_it_streams_finishes() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let parts = vec![put_part(SHARED), put_part(b"a"), put_part(b"b")];
+        let adopted = network.advance(vec![frame(&key(11), parts)]).await;
+        let churning = Churning {
+            source: network.exchange(),
+            keys: network.keys.clone(),
+            members: network.members.clone(),
+            churn: released_and_put_again,
+            asked: Arc::new(Mutex::new(Vec::new())),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            churning.clone(),
+        )
+        .await
+        .unwrap();
+
+        let asked = churning.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), CHURNING_ROUNDS + 1, "{asked:?}");
+        let source = network.source.node.lock().await;
+        let tip = source.tip().unwrap();
+        assert!(tip.height > adopted.height);
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(
+            joined.node.host().root().unwrap(),
+            source.host().root().unwrap()
+        );
+        assert!(joined.node.host().missing_blobs().unwrap().is_empty());
+        let now = joined.node.now();
+        for id in asked.iter().flatten() {
+            let named = joined.node.host().readable(id, now).await.unwrap();
+            assert_eq!(joined.node.host().blobs().has(id), named, "{id:?}");
+        }
+    });
+}
+
 const PAUSE: Duration = Duration::from_secs(1);
 
 const ASKED_WHILE_DOWN: usize = 3;

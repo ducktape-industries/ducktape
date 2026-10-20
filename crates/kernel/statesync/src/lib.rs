@@ -2,7 +2,7 @@ mod remote;
 mod serve;
 mod wire;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::path::Path;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use commonware_storage::qmdb::sync;
 use consensus::{Certificate, validators_of};
 use futures::{Stream, StreamExt as _};
 use node::{Digest, Node, Synced};
-use state::{Commitment, SyncFailure, SyncTarget, commitment_name};
+use state::{Adoption, Commitment, SyncFailure, SyncTarget, commitment_name};
 
 pub use consensus::Anchor;
 pub use consensus::Context;
@@ -109,28 +109,56 @@ pub async fn join<E: Context, X: Exchange>(
         exchange,
         pause,
     };
-    let (head, commitments) = adopted_head(&context, name, &asking).await?;
-    let synced = Synced {
-        height: head.tip.height,
-        commitments,
-    };
-    let mut node = Node::adopt(context.child("node"), name, dir, synced).await?;
-    let state_names_this_network = node.network() == network;
-    if !state_names_this_network {
-        return Err(Error::Network);
+    let mut retargets: u64 = 0;
+    let mut adoption = Adoption::default();
+    let mut fetched = BTreeSet::new();
+    loop {
+        let (head, commitments) = adopted_head(&context, name, &asking).await?;
+        let synced = Synced {
+            height: head.tip.height,
+            commitments,
+        };
+        let mut node =
+            Node::adopt_from(context.child("node"), name, dir, synced, &mut adoption).await?;
+        let state_names_this_network = node.network() == network;
+        if !state_names_this_network {
+            return Err(Error::Network);
+        }
+        let state_records_the_tip = node.tip()? == head.tip;
+        if !state_records_the_tip {
+            return Err(Error::Head);
+        }
+        if let Anchor::Finalized(certificate) = &head.anchor {
+            verified(&mut context, &network, &node, certificate)?;
+        }
+        let unserved = installed(&asking, &mut node, &mut fetched).await?;
+        let Some(&blob) = unserved.first() else {
+            if retargets > 0 {
+                node.host().drop_unnamed(&fetched, node.now()).await?;
+            }
+            return Ok(Joined {
+                node,
+                anchor: head.anchor,
+            });
+        };
+        let now = crate::head(&asking).await?;
+        let source_moved = now.tip != head.tip;
+        if !source_moved {
+            return Err(Error::Blob(blob));
+        }
+        drop(node);
+        retargets += 1;
+        tracing::info!(
+            target: "ducktape::sync",
+            event = "join_retargeted",
+            reason = "blob_released",
+            height = head.tip.height,
+            unserved = unserved.len(),
+            rewritten = adoption.replaced().len(),
+            retargets,
+            "the source no longer serves blobs the adopted state names; it reads the head again"
+        );
     }
-    let state_records_the_tip = node.tip()? == head.tip;
-    if !state_records_the_tip {
-        return Err(Error::Head);
-    }
-    if let Anchor::Finalized(certificate) = &head.anchor {
-        verified(&mut context, &network, &node, certificate)?;
-    }
-    installed(&asking, &mut node).await?;
-    Ok(Joined {
-        node,
-        anchor: head.anchor,
-    })
 }
 
 async fn adopted_head<E: Context, X: Exchange>(
@@ -236,7 +264,8 @@ async fn head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<Head> {
 async fn installed<E: Context, X: Exchange>(
     asking: &Asking<E, X>,
     node: &mut Node<E>,
-) -> Result<()> {
+    fetched: &mut BTreeSet<BlobId>,
+) -> Result<Vec<BlobId>> {
     let mut missing = node.host().missing_blobs()?;
     tracing::info!(
         target: "ducktape::sync",
@@ -249,14 +278,17 @@ async fn installed<E: Context, X: Exchange>(
         blobs: missing.len(),
         installed: 0,
     };
+    let mut unserved = Vec::new();
     while !missing.is_empty() {
         let streamed = streamed(&asking.exchange, node, &missing, &mut progress).await?;
-        missing.drain(..streamed.installed);
+        missing.drain(..streamed.answered);
+        fetched.extend(streamed.installed);
+        unserved.extend(streamed.unserved);
         if let Some(error) = streamed.cut {
             asking.again(error, &mut attempts).await?;
         }
     }
-    Ok(())
+    Ok(unserved)
 }
 
 struct Progress {
@@ -284,7 +316,9 @@ impl Progress {
 }
 
 struct Streamed<F> {
-    installed: usize,
+    answered: usize,
+    installed: Vec<BlobId>,
+    unserved: Vec<BlobId>,
     cut: Option<F>,
 }
 
@@ -295,39 +329,43 @@ async fn streamed<E: Context, X: Exchange>(
     progress: &mut Progress,
 ) -> Result<Streamed<X::Error>> {
     let mut answers = std::pin::pin!(exchange.stream_blobs(missing.to_vec()));
-    let mut installed = 0;
+    let mut streamed = Streamed {
+        answered: 0,
+        installed: Vec::new(),
+        unserved: Vec::new(),
+        cut: None,
+    };
     while let Some(answer) = answers.next().await {
         let framed = match answer {
             Ok(framed) => framed,
             Err(error) => {
-                return Ok(Streamed {
-                    installed,
-                    cut: Some(error),
-                });
+                streamed.cut = Some(error);
+                return Ok(streamed);
             }
         };
-        let Some(&id) = missing.get(installed) else {
+        let Some(&id) = missing.get(streamed.answered) else {
             return Err(Error::Blobs {
                 asked: missing.len(),
-                answered: installed + 1,
+                answered: streamed.answered + 1,
             });
         };
-        let framed = framed.ok_or(Error::Blob(id))?;
+        streamed.answered += 1;
+        let Some(framed) = framed else {
+            streamed.unserved.push(id);
+            continue;
+        };
         node.install(id, &framed)?;
+        streamed.installed.push(id);
         progress.installed();
-        installed += 1;
     }
-    let answered_every_blob = installed == missing.len();
+    let answered_every_blob = streamed.answered == missing.len();
     if !answered_every_blob {
         return Err(Error::Blobs {
             asked: missing.len(),
-            answered: installed,
+            answered: streamed.answered,
         });
     }
-    Ok(Streamed {
-        installed,
-        cut: None,
-    })
+    Ok(streamed)
 }
 
 struct Asking<E, X> {

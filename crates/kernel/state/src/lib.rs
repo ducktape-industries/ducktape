@@ -3,7 +3,7 @@ mod overlay;
 mod storage;
 mod view;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use abi::{ProgramId, Root};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -62,6 +62,23 @@ pub fn commitment_name(store: &str, program: &str) -> String {
         abi::hex(store.as_bytes()),
         abi::hex(program.as_bytes())
     )
+}
+
+#[derive(Default)]
+pub struct Adoption {
+    adopted: BTreeMap<ProgramId, Adopted>,
+    replaced: BTreeSet<ProgramId>,
+}
+
+struct Adopted {
+    end: commonware_storage::merkle::Location<Family>,
+    names: HashMap<commonware_cryptography::sha256::Digest, Vec<u8>>,
+}
+
+impl Adoption {
+    pub fn replaced(&self) -> &BTreeSet<ProgramId> {
+        &self.replaced
+    }
 }
 
 pub struct Store<E>
@@ -149,17 +166,50 @@ where
         height: u64,
         commitments: BTreeMap<ProgramId, Commitment<E>>,
     ) -> Result<Store<E>> {
+        let mut adoption = Adoption::default();
+        Store::adopt_from(context, name, storage, height, commitments, &mut adoption).await
+    }
+
+    pub async fn adopt_from(
+        context: E,
+        name: &str,
+        storage: Storage,
+        height: u64,
+        commitments: BTreeMap<ProgramId, Commitment<E>>,
+        adoption: &mut Adoption,
+    ) -> Result<Store<E>> {
+        let first = adoption.adopted.is_empty();
+        let mut earlier = std::mem::take(&mut adoption.adopted);
         let mut writes = Writes::default();
+        let mut replaced = BTreeSet::new();
         for (program, commitment) in &commitments {
-            let keys = commitment
-                .entries()
-                .await?
-                .into_iter()
-                .map(|(key, value)| (key, Some(value)))
-                .collect();
+            let changed = match earlier.remove(program) {
+                Some(Adopted { end, mut names }) => commitment
+                    .changes(end, &mut names)
+                    .await?
+                    .map(|keys| (keys, names)),
+                None => None,
+            };
+            let (keys, names) = match changed {
+                Some(changed) => changed,
+                None => {
+                    replaced.insert(program.clone());
+                    commitment.indexed().await?
+                }
+            };
             writes.programs.insert(program.clone(), keys);
+            let end = commitment.end()?;
+            adoption
+                .adopted
+                .insert(program.clone(), Adopted { end, names });
         }
-        storage.install(height, &writes)?;
+        replaced.extend(earlier.into_keys());
+        if first {
+            storage.install(height, &writes)?;
+        } else {
+            storage.advance(height, &writes, &replaced)?;
+        }
+        adoption.replaced = replaced;
         Ok(Store {
             context,
             name: name.to_owned(),

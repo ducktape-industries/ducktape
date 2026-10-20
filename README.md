@@ -655,7 +655,18 @@ receipted a bundle, the blobs program marks it held, and stops listing who
 receipted. `--wait` follows the blobs program's confirmed writes until then.
 Consensus never waits on a blob: a program reads a blob that a program put
 or a held bundle names (`ctx.blob_get`), and a node that lacks one when a
-block reads it fetches it over halo before it applies the block. New program
+block reads it fetches it over halo before it applies the block. A blob's roster row
+names the programs that put it, and a program lets go of its own hold with the
+host op `BlobRelease`. Once no program holds it, the row goes, and after that
+block commits the node deletes the blob's file, unless a held bundle names it
+or a program runs it as code. A row written before rows named their holders
+names none, and nothing releases it. A joiner streams every blob its adopted
+state names and notes the ones its source no longer serves. If any are noted
+and the source's head has moved, it syncs to the new head, writes only the
+keys that changed since it last adopted, and fetches only what it still
+lacks. Once it has every blob, it deletes each one it fetched that the state it
+ends at no longer names. A source that refuses a blob its own tip names ends
+the join. New program
 code is a bundle of kind `program`: the programs role schedules only code the
 blobs program reports held.
 

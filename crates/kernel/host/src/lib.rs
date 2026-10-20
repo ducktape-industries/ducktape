@@ -493,8 +493,21 @@ where
         height: u64,
         commitments: BTreeMap<ProgramId, Commitment<E>>,
     ) -> Result<Host<E>> {
+        let mut adoption = state::Adoption::default();
+        Host::adopt_from(context, name, dir, height, commitments, &mut adoption).await
+    }
+
+    pub async fn adopt_from(
+        context: E,
+        name: &str,
+        dir: &Path,
+        height: u64,
+        commitments: BTreeMap<ProgramId, Commitment<E>>,
+        adoption: &mut state::Adoption,
+    ) -> Result<Host<E>> {
         let storage = Storage::open(&dir.join(STATE_DIR))?;
-        let store = Store::adopt(context, name, storage, height, commitments).await?;
+        let store =
+            Store::adopt_from(context, name, storage, height, commitments, adoption).await?;
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
         Host::assemble(store, blobs)
     }
@@ -838,7 +851,9 @@ where
             executing: executed.duration_since(started).unwrap_or_default(),
             committing: committed.duration_since(executed).unwrap_or_default(),
         };
-        applied
+        let applied = applied?;
+        self.unlink(&applied.writes, block.time).await;
+        Ok(applied)
     }
 }
 
@@ -1948,6 +1963,60 @@ where
         })
     }
 
+    pub async fn drop_unnamed(&self, ids: &BTreeSet<BlobId>, time: u64) -> Result<()> {
+        let running: BTreeSet<BlobId> = self.programs()?.into_values().collect();
+        for id in ids {
+            let named = running.contains(id) || self.readable(id, time).await?;
+            if !named {
+                self.blobs.remove(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn unlink(&self, writes: &Writes, time: u64) {
+        let Some(roster) = writes.programs.get(BLOBS) else {
+            return;
+        };
+        let dropped: Vec<&Vec<u8>> = roster
+            .iter()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(key, _)| key)
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        let running: BTreeSet<BlobId> = match self.programs() {
+            Ok(programs) => programs.into_values().collect(),
+            Err(error) => return kept_on_disk("running_unread", None, &error.to_string()),
+        };
+        for key in dropped {
+            let id = match abi::decode::<BlobId>(key) {
+                Ok(id) => id,
+                Err(refusal) => {
+                    kept_on_disk("roster_key", None, &refusal.sentence);
+                    continue;
+                }
+            };
+            if running.contains(&id) {
+                continue;
+            }
+            let still_read = match self.readable(&id, time).await {
+                Ok(readable) => readable,
+                Err(error) => {
+                    kept_on_disk("readable_unread", Some(id), &error.to_string());
+                    continue;
+                }
+            };
+            if still_read {
+                continue;
+            }
+            if let Err(error) = self.blobs.remove(&id) {
+                kept_on_disk("remove_failed", Some(id), &error.to_string());
+            }
+        }
+    }
+
     fn forget(&self, height: u64, overlay: &mut Overlay) -> Result<()> {
         let key = namespace::height(height);
         let spent = self
@@ -1960,6 +2029,17 @@ where
         overlay.delete(RECENT, key);
         Ok(())
     }
+}
+
+fn kept_on_disk(reason: &'static str, blob: Option<BlobId>, error: &str) {
+    tracing::warn!(
+        target: "ducktape::blobs",
+        event = "blob_unlink_failed",
+        reason,
+        blob = ?blob,
+        error,
+        "a blob its block released stays on disk; the block is applied"
+    );
 }
 
 fn gated<'c>(call: &'c ProgramCall, env: &Env) -> Option<&'c [u8]> {
