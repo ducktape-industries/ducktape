@@ -8,8 +8,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use futures::future::{Either, select};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 use wasmtime::{
-    Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
-    WasmBacktraceDetails,
+    Caller, Config, Engine, InstancePre, Linker, Memory, Module, Store, StoreLimits,
+    StoreLimitsBuilder, WasmBacktraceDetails,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -54,6 +54,7 @@ pub use image::{Codec, Image, PACK_LEVEL, PAGE_BYTES, Packed, Page};
 #[derive(Clone)]
 pub struct Code {
     module: Module,
+    linked: Option<InstancePre<Data>>,
     fresh: Arc<OnceCell<Vec<u8>>>,
 }
 
@@ -125,8 +126,12 @@ impl Runtime {
 
     pub fn load(&self, bytes: &[u8]) -> Result<Code, Fault> {
         let module = Module::new(&self.engine, bytes).map_err(load)?;
+        let linked = linker(&self.engine)
+            .ok()
+            .and_then(|linker| linker.instantiate_pre(&module).ok());
         Ok(Code {
             module,
+            linked,
             fresh: Arc::new(OnceCell::new()),
         })
     }
@@ -229,10 +234,13 @@ impl Runtime {
         if let Some(fuel) = *fuel {
             store.set_fuel(fuel).map_err(load)?;
         }
-        let instance = linker(&self.engine)?
-            .instantiate_async(&mut store, &code.module)
-            .await
-            .map_err(load);
+        let instance = match &code.linked {
+            Some(linked) => linked.instantiate_async(&mut store).await.map_err(load),
+            None => linker(&self.engine)?
+                .instantiate_async(&mut store, &code.module)
+                .await
+                .map_err(load),
+        };
         if fuel.is_some() {
             *fuel = Some(store.get_fuel().map_err(load)?);
         }
