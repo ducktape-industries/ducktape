@@ -58,7 +58,13 @@ pub struct Marshal {
     actor: Handle<()>,
     broadcast: Handle<()>,
     backfill: Handle<()>,
+    fed: Option<Fed>,
 }
+
+type Fed = (
+    buffered::Mailbox<PublicKey, Block>,
+    backfill::Mailbox<Digest, PublicKey>,
+);
 
 impl Drop for Marshal {
     fn drop(&mut self) {
@@ -199,6 +205,7 @@ impl Marshal {
             },
         )
         .await;
+        let fed = Some((buffer.clone(), resolver.1.clone()));
         let actor = actor.start(App::<E, C>::new(chain, cadence), buffer, resolver);
         let marshal = Marshal {
             mailbox,
@@ -206,6 +213,7 @@ impl Marshal {
             actor,
             broadcast,
             backfill,
+            fed,
         };
         let span = span_of(&summaries.blocks).map(Arc::new);
         let summaries = Summaries {
@@ -224,10 +232,13 @@ impl Marshal {
     }
 
     pub async fn stop(mut self) {
+        self.broadcast.abort();
+        let _ = (&mut self.broadcast).await;
         self.backfill.abort();
         let _ = (&mut self.backfill).await;
         self.actor.abort();
-        self.broadcast.abort();
+        let _ = (&mut self.actor).await;
+        drop(self.fed.take());
     }
 
     pub async fn processed(&self) -> Option<u64> {
