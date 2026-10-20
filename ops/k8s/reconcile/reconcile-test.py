@@ -45,8 +45,13 @@ class FakeNode:
         self.down = set()
         self.refuse = None
         self.sets = []
+        self.silent = False
+        self.lose = 0
+        self.cut = rc.Unread
 
     def egress_set(self, text, dry):
+        if self.silent:
+            raise rc.Unread("error sending request: connection refused")
         if self.refuse:
             raise rc.Refused(self.refuse)
         document = rc.tomllib.loads(text)
@@ -56,6 +61,9 @@ class FakeNode:
         if not dry:
             self.sets.append(text)
             self.text = text
+            if self.lose:
+                self.lose -= 1
+                raise self.cut("the node's answer broke off")
         return {"tally": tally, "reach": reach}
 
 
@@ -234,6 +242,24 @@ class RealForge(unittest.TestCase):
             forge.changes[9] = "3" * 40
             reconcile.tick()
             self.assertTrue(forge.verdicts[0][2])
+
+
+class RealCli(unittest.TestCase):
+    def cli(self, answer):
+        temp = tempfile.TemporaryDirectory()
+        keys = pathlib.Path(temp.name)
+        (keys / "password").write_text("p")
+        return rc.Cli(["ducktape"], "http://node", keys, keys, lambda argv, capture_output, env: answer), temp
+
+    def test_a_node_that_does_not_answer_a_set_is_unread_and_a_refusal_is_refused(self):
+        cli, temp = self.cli(Ran(1, stderr=b"error sending request for url (http://node/v1/egress/set): connection refused"))
+        with temp:
+            with self.assertRaises(rc.Unread):
+                cli.egress_set(LIVE, dry=True)
+        cli, temp = self.cli(Ran(1, stderr=b"refused: invalid_input: echo carries secrets"))
+        with temp:
+            with self.assertRaises(rc.Refused):
+                cli.egress_set(LIVE, dry=True)
 
 
 class Answer(io.BytesIO):
@@ -556,6 +582,86 @@ class Main(unittest.TestCase):
             reconcile.tick()
             self.assertEqual(node.text, LIVE)
             self.assertIn("refused", cli.posts[0])
+
+    def test_a_main_merged_while_the_node_does_not_answer_applies_once_it_answers(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            reconcile.tick()
+            forge.merge("e" * 40, {PATH: WITH_MAC})
+            node.silent = True
+            reconcile.tick()
+            self.assertEqual((node.sets, cli.posts), ([], []))
+            node.silent = False
+            reconcile.tick()
+            self.assertEqual(node.sets, [WITH_MAC])
+            self.assertIn("egress applied (3 served: 1 added", cli.posts[0])
+
+    def test_a_set_whose_answer_was_lost_is_sent_again_and_then_reported(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            reconcile.tick()
+            forge.merge("e" * 40, {PATH: WITH_MAC})
+            node.lose = 1
+            reconcile.tick()
+            self.assertEqual((node.sets, cli.posts), ([WITH_MAC], []))
+            reconcile.tick()
+            reconcile.tick()
+            self.assertEqual(node.sets, [WITH_MAC, WITH_MAC])
+            self.assertEqual(len(cli.posts), 1)
+            self.assertIn("egress applied (3 served: 1 added", cli.posts[0])
+            self.assertEqual(reconcile.state["proving"]["commit"], "e" * 40)
+
+    def test_a_reconcile_killed_right_after_its_set_sends_it_again_at_the_restart_and_reports_it_once(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            reconcile.tick()
+            forge.merge("e" * 40, {PATH: WITH_MAC})
+            node.lose, node.cut = 1, RuntimeError
+            with self.assertRaises(RuntimeError):
+                reconcile.tick()
+            again = rc.Reconcile("act", "fabrics-1", KEY, "infra", cli, forge, rc.Store(reconcile.store.path), kube, PROBER)
+            again.tick()
+            again.tick()
+            self.assertEqual(node.sets, [WITH_MAC, WITH_MAC])
+            self.assertEqual(len(cli.posts), 1)
+            self.assertIn("egress applied (3 served: 1 added", cli.posts[0])
+            self.assertEqual(again.state["proving"]["commit"], "e" * 40)
+
+    def test_a_resend_whose_base_stops_answering_after_it_rolls_back_to_the_file_the_first_send_replaced(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            reconcile.tick()
+            forge.merge("e" * 40, {PATH: WITH_MAC})
+            steps = ["answer", "unread", "answer", "down"]
+            real = node.egress_set
+
+            def scripted(text, dry):
+                step = steps.pop(0) if dry and steps else "answer"
+                if step == "unread":
+                    raise rc.Unread("the node's answer broke off")
+                if step == "down":
+                    node.down.add("mac")
+                return real(text, dry)
+
+            cli.egress_set = scripted
+            reconcile.tick()
+            reconcile.tick()
+            self.assertEqual(node.sets, [WITH_MAC, WITH_MAC, LIVE])
+            self.assertEqual(reconcile.state["applied"]["text"], LIVE)
+            self.assertIn("serves aaaaaaaaaaaa again", cli.posts[0])
+
+    def test_a_lost_set_whose_base_then_stops_answering_rolls_back_to_the_file_it_replaced(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            reconcile.tick()
+            forge.merge("e" * 40, {PATH: WITH_MAC})
+            node.lose = 1
+            reconcile.tick()
+            node.down.add("mac")
+            reconcile.tick()
+            self.assertEqual(node.sets, [WITH_MAC, LIVE])
+            self.assertEqual(reconcile.state["applied"]["text"], LIVE)
+            self.assertIn("serves aaaaaaaaaaaa again", cli.posts[0])
 
     def test_a_main_without_the_file_reports_and_touches_nothing(self):
         node, cli, forge, kube, reconcile, temp = world()

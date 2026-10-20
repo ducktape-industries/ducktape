@@ -119,7 +119,10 @@ class Cli:
             path.write_text(text)
             done = self.run("egress", "set", str(path), *(["--dry"] if dry else []))
         if done.returncode != 0:
-            raise Refused(done.stderr.decode(errors="replace").strip() or f"ducktape exited {done.returncode}")
+            said = done.stderr.decode(errors="replace").strip() or f"ducktape exited {done.returncode}"
+            if refusal_reason(said) is None:
+                raise Unread(said)
+            raise Refused(said)
         return json.loads(done.stdout)
 
 
@@ -457,7 +460,7 @@ def fresh_pods():
 
 
 def fresh_state():
-    return {"seen_tip": None, "main_text": None, "applied": None, "proving": None, "judged": [], "outbox": [], "pods": fresh_pods()}
+    return {"seen_tip": None, "main_text": None, "applied": None, "setting": None, "proving": None, "judged": [], "outbox": [], "pods": fresh_pods()}
 
 
 class Reconcile:
@@ -508,24 +511,30 @@ class Reconcile:
     def apply(self, tip, text):
         short = tip[:12]
         found = plan(text, self.cli)
+        setting = self.state.get("setting")
+        resend = setting is not None and setting["commit"] == tip
+        if found.problems and resend and setting["before"] is not None:
+            return self.roll_back(short, setting["before"], found.problems)
         if found.problems:
             return self.report(f"refused-{short}", [f"infra main {short}: egress not applied, the node keeps what it serves.", *found.problems])
-        if not any(found.dry["tally"][part] for part in ("added", "removed", "changed")):
+        if not resend and not any(found.dry["tally"][part] for part in ("added", "removed", "changed")):
             self.state["applied"] = {"commit": tip, "text": text}
             return say("unchanged", commit=tip)
         if self.mode == "report":
             return self.report(f"would-apply-{short}", [f"infra main {short}: would apply egress ({tally_line(found.dry['tally'])}). Report mode, so the node is unchanged."])
+        before, planned = (setting["before"], setting["tally"]) if resend else (self.state["applied"], found.dry["tally"])
+        self.state["setting"] = {"commit": tip, "before": before, "tally": planned}
+        self.store.save(self.state)
         try:
-            tally = self.cli.egress_set(text, dry=False)["tally"]
+            self.cli.egress_set(text, dry=False)
         except Refused as refused:
             return self.report(f"refused-{short}", [f"infra main {short}: the node refused egress, and keeps what it serves: {refused}"])
-        before = self.state["applied"]
         self.state["applied"] = {"commit": tip, "text": text}
         after = plan(text, self.cli)
         if after.problems and before is not None:
             return self.roll_back(short, before, after.problems)
         self.state["proving"] = {"commit": tip, "served": served(tomllib.loads(text))}
-        self.report(f"applied-{short}", [f"infra main {short}: egress applied ({tally_line(tally)}). Proven once the chain's record of what the node serves matches."])
+        self.report(f"applied-{short}", [f"infra main {short}: egress applied ({tally_line(planned)}). Proven once the chain's record of what the node serves matches."])
 
     def roll_back(self, short, before, problems):
         try:
@@ -657,12 +666,13 @@ class Reconcile:
         tip = self.forge.tip()
         if tip != self.state["seen_tip"]:
             text = self.forge.file(tip, self.path)
-            self.state["seen_tip"] = tip
             self.state["main_text"] = text
             if text is None:
                 self.report(f"absent-{tip[:12]}", [f"infra main {tip[:12]} holds no {self.path}; egress is left as it is."])
             else:
                 self.apply(tip, text)
+            self.state["setting"] = None
+            self.state["seen_tip"] = tip
         if tip != self.state["pods"]["seen_tip"]:
             self.follow_pods(tip, self.forge.file(tip, PODS_PATH))
 

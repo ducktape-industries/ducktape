@@ -655,7 +655,11 @@ one up for another network.
   answers puts back the file it applied before. It posts each outcome to
   chat channel `infra`: applied, refused, rolled back, and proven when the
   egress program's row for the node lists what the file serves. It never
-  sends a refused file again; a new `main` is a new try. With
+  sends a refused file again; a new `main` is a new try. A node that does
+  not answer (the CLI says no `refused: <reason>:`) is no refusal: the
+  `main` stays unseen and the next tick plans it again. A set whose answer
+  was lost is sent again, the same file twice, before it posts applied, and
+  rolls back to the file it replaced if a base no longer answers. With
   `RECONCILE_MODE=report` it does all of this except the set that is not
   dry: it posts what it would apply and leaves the node as it is. A start
   in another mode than its state was saved in follows `main` again, so a
