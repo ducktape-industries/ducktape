@@ -462,6 +462,7 @@ where
                 Vec::new(),
             )
             .await?;
+        host.sync().await?;
         Ok((host, applied))
     }
 

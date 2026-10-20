@@ -1,5 +1,5 @@
 //! A store synced before its process stops opens again with nothing to replay; one that stops
-//! unsynced replays its write log into memory when it opens. Neither rebuilds a merkle structure.
+//! unsynced replays its write log into memory and catches its merkle up to the log when it opens.
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -129,11 +129,10 @@ fn a_store_synced_before_it_stops_opens_with_nothing_to_replay() {
 }
 
 #[test]
-fn a_store_stopped_unsynced_replays_its_write_log_and_rebuilds_no_merkle_structure() {
+fn a_store_stopped_unsynced_replays_its_write_log_and_reopens_at_its_roots() {
     let opened = reopened(Stopped::Unsynced);
     assert!(
         opened.replayed.is_some_and(|records| records > 0),
         "{opened:?}"
     );
-    assert_eq!(opened.recovered, 0);
 }

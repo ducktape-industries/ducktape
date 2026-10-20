@@ -351,13 +351,24 @@ where
     }
 
     pub async fn commit(&mut self, height: u64, writes: Writes) -> Result<()> {
-        self.storage.commit(height, &writes)?;
-        for (program, keys) in &writes.programs {
-            let commitment = self.commitments.get_mut(program).ok_or_else(|| {
-                Error::Corrupt(format!("a write reached the unknown program {program}"))
-            })?;
-            commitment.apply(height, keys).await?;
+        let unknown = writes
+            .programs
+            .keys()
+            .find(|program| !self.commitments.contains_key(*program));
+        if let Some(program) = unknown {
+            return Err(Error::Corrupt(format!(
+                "a write reached the unknown program {program}"
+            )));
         }
+        self.storage.commit(height, &writes)?;
+        let applies = self
+            .commitments
+            .iter_mut()
+            .filter_map(|(program, commitment)| {
+                let keys = writes.programs.get(program)?;
+                Some(commitment.apply(height, keys))
+            });
+        futures::future::try_join_all(applies).await?;
         Ok(())
     }
 }

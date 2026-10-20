@@ -263,6 +263,11 @@ where
     async fn pruned(&self, db: Db<E>) -> Result<Db<E>> {
         let floor = db.sync_boundary();
         let from = db.bounds().start;
+        let section = Tuning::default().items_per_section.get();
+        let drops_a_section = *floor / section > *from / section;
+        if !drops_a_section {
+            return Ok(db);
+        }
         let db = db.prune(floor).await?;
         tracing::debug!(
             target: "ducktape::state",

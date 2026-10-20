@@ -4645,6 +4645,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "fluent31",
+ "futures",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
