@@ -48,6 +48,7 @@ const EVERY_KEY: &str = "listen = \"127.0.0.1:9000\"\n\
                          live_lane_backlog = 4\n\
                          live_lane_per_sender = 16\n\
                          live_linger_ms = 700\n\
+                         egress_lane_backlog = 2\n\
                          [consensus]\n\
                          leader_timeout_ms = 4000\n\
                          certification_timeout_ms = 6000\n\
@@ -76,6 +77,7 @@ fn every_key() -> Settings {
             live_lane_backlog: Some(count(4)),
             live_lane_per_sender: Some(count(16)),
             live_linger_ms: NonZeroU64::new(700),
+            egress_lane_backlog: Some(count(2)),
         },
         consensus: ConsensusSettings {
             leader_timeout_ms: Some(4000),
@@ -126,6 +128,7 @@ fn a_count_the_file_names_must_be_nonzero_and_fit_a_tokio_semaphore() {
         "halo_datagrams",
         "blob_serves_in_flight",
         "blob_backlog",
+        "egress_lane_backlog",
     ] {
         assert!(
             Settings::parse(&format!("[load]\n{key} = 0\n")).is_err(),
@@ -187,6 +190,7 @@ fn file_only_settings_reach_the_config() {
             live_lane_backlog: count(4),
             live_lane_per_sender: count(16),
             live_linger: Duration::from_millis(700),
+            egress_lane_backlog: count(2),
             rpc_cpus: None,
             rpc_blocking_threads: None,
         }

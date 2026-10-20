@@ -4,6 +4,7 @@ mod call;
 mod calls;
 mod config;
 mod desk;
+pub mod lane;
 mod station;
 mod stream;
 
@@ -21,7 +22,7 @@ pub use config::{Config, Refused, Withheld, withheld};
 pub use station::{Planned, Station, Tally};
 
 use crate::egress::call::Caller;
-use crate::egress::calls::Calls;
+use crate::egress::calls::{Call, Calls};
 use crate::egress::desk::{Called, Desk, Purpose, Reading, Sent, Step};
 use crate::egress::station::Serving;
 use crate::{Context, Daemon, Error, Result};
@@ -55,7 +56,7 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
                 if changed.is_err() {
                     return;
                 }
-                let read = match worker.read().await {
+                let read = match read_for(&daemon, daemon.identity.clone()).await {
                     Ok(read) => read,
                     Err(error) => {
                         unread += 1;
@@ -74,7 +75,7 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
                 };
                 unread = 0;
                 let (role, reading) = match read {
-                    Some(read) => read,
+                    Some((role, _, reading)) => (role, reading),
                     None => {
                         let serving = daemon.egress.current();
                         if bound.unbound(&serving.config) {
@@ -87,7 +88,7 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
                     calls.renew(&mut desk, daemon.egress.current().config.served());
                 }
                 for step in desk.read(reading) {
-                    worker.execute(&mut desk, &mut calls, step, &role).await;
+                    execute(&worker, &mut desk, &mut calls, step, &role).await;
                 }
             }
             Some((id, called)) = answered.next() => {
@@ -99,7 +100,7 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
                     desk.called(id, called);
                 }
                 for step in desk.launch() {
-                    worker.execute(&mut desk, &mut calls, step, role).await;
+                    execute(&worker, &mut desk, &mut calls, step, role).await;
                 }
             }
             reloaded = reloads.changed() => {
@@ -166,98 +167,160 @@ impl Bound {
     }
 }
 
-impl<E: Context> Worker<E> {
-    /// The egress role at the node's tip, if the network binds one.
-    fn role(source: &host::Source<'_, E>) -> Option<ProgramId> {
-        source.roles().get(role::EGRESS).cloned()
-    }
+fn role<E: Context>(source: &host::Source<'_, E>) -> Option<ProgramId> {
+    source.roles().get(role::EGRESS).cloned()
+}
 
-    async fn ask(
-        &self,
-        source: &host::Source<'_, E>,
-        role: &ProgramId,
-        query: &Query,
-    ) -> Result<Reply> {
-        let now = self.daemon.now();
-        let answer = source
-            .query(
-                Layer::Confirmed,
-                now,
-                Origin::System,
-                role,
-                abi::encode(query),
-            )
-            .await?
-            .map_err(Error::Refused)?;
-        abi::decode(&answer).map_err(Error::Decode)
-    }
+async fn ask<E: Context>(
+    daemon: &Daemon<E>,
+    source: &host::Source<'_, E>,
+    role: &ProgramId,
+    query: &Query,
+) -> Result<Reply> {
+    let now = daemon.now();
+    let answer = source
+        .query(
+            Layer::Confirmed,
+            now,
+            Origin::System,
+            role,
+            abi::encode(query),
+        )
+        .await?
+        .map_err(Error::Refused)?;
+    abi::decode(&answer).map_err(Error::Decode)
+}
 
-    async fn requests(
-        &self,
-        source: &host::Source<'_, E>,
-        role: &ProgramId,
-        query: &Query,
-    ) -> Result<Vec<RequestRow>> {
-        match self.ask(source, role, query).await? {
-            Reply::Requests(rows) => Ok(rows),
-            Reply::Node(_) | Reply::Serving(_) => Err(Error::Corrupt(
-                "the egress program answered a request listing with something else".into(),
-            )),
-        }
+async fn requests<E: Context>(
+    daemon: &Daemon<E>,
+    source: &host::Source<'_, E>,
+    role: &ProgramId,
+    query: &Query,
+) -> Result<Vec<RequestRow>> {
+    match ask(daemon, source, role, query).await? {
+        Reply::Requests(rows) => Ok(rows),
+        Reply::Node(_) | Reply::Serving(_) => Err(Error::Corrupt(
+            "the egress program answered a request listing with something else".into(),
+        )),
     }
+}
 
-    /// The egress role and what it holds for this node at the tip; `None` when the network
-    /// binds no egress role there.
-    async fn read(&self) -> Result<Option<(ProgramId, Reading)>> {
-        let view = self.daemon.view()?;
-        let source = view.source();
-        let Some(role) = Self::role(&source) else {
-            return Ok(None);
-        };
-        let key = self.daemon.identity.clone();
-        let assigned = self
-            .requests(&source, &role, &Query::Assigned { key: key.clone() })
-            .await?;
-        let Reply::Node(row) = self
-            .ask(&source, &role, &Query::Node { key: key.clone() })
-            .await?
-        else {
-            return Err(Error::Corrupt(
-                "the egress program answered a node with something else".into(),
-            ));
-        };
-        let epoch = self.daemon.network.epoch_after(view.tip().height);
-        let member = source
-            .epoch_members(epoch)?
-            .is_some_and(|members| members.iter().any(|member| member.key == key));
-        let mut serving = row.map(|row| row.services).unwrap_or_default();
-        serving.sort();
-        let reading = Reading {
-            assigned,
-            serving,
-            member,
-        };
-        Ok(Some((role, reading)))
-    }
+async fn read_for<E: Context>(
+    daemon: &Daemon<E>,
+    key: Vec<u8>,
+) -> Result<Option<(ProgramId, Tip, Reading)>> {
+    let view = daemon.view()?;
+    let source = view.source();
+    let Some(role) = role(&source) else {
+        return Ok(None);
+    };
+    let assigned = requests(
+        daemon,
+        &source,
+        &role,
+        &Query::Assigned { key: key.clone() },
+    )
+    .await?;
+    let Reply::Node(row) = ask(daemon, &source, &role, &Query::Node { key: key.clone() }).await?
+    else {
+        return Err(Error::Corrupt(
+            "the egress program answered a node with something else".into(),
+        ));
+    };
+    let epoch = daemon.network.epoch_after(view.tip().height);
+    let member = source
+        .epoch_members(epoch)?
+        .is_some_and(|members| members.iter().any(|member| member.key == key));
+    let mut serving = row.map(|row| row.services).unwrap_or_default();
+    serving.sort();
+    let reading = Reading {
+        assigned,
+        serving,
+        member,
+    };
+    Ok(Some((role, view.tip(), reading)))
+}
 
-    async fn execute(&self, desk: &mut Desk, calls: &mut Calls, step: Step, role: &ProgramId) {
-        let mut next = Some(step);
-        while let Some(step) = next {
-            next = match step {
-                Step::Call(row) => self.call(row, calls),
-                Step::Abandon(id) => {
-                    if calls.abandon(id) {
-                        tracing::debug!(target: TARGET, event = "egress_abandoned", id);
-                    }
-                    None
+trait Window {
+    type Call: Call;
+    fn call(&self, row: RequestRow) -> Self::Call;
+    fn sign(&self, op: &Op, role: &ProgramId) -> Result<Vec<u8>>;
+    fn submit(&self, frame: Vec<u8>) -> impl Future<Output = Sent> + Send;
+}
+
+async fn execute<W: Window>(
+    window: &W,
+    desk: &mut Desk,
+    calls: &mut Calls<W::Call>,
+    step: Step,
+    role: &ProgramId,
+) {
+    let mut next = Some(step);
+    while let Some(step) = next {
+        next = match step {
+            Step::Call(row) => {
+                let id = row.id;
+                calls.started(id, window.call(row));
+                None
+            }
+            Step::Abandon(id) => {
+                if calls.abandon(id) {
+                    tracing::debug!(target: TARGET, event = "egress_abandoned", id);
                 }
-                Step::Send(purpose) => self.send(desk, purpose, role).await,
-            };
-        }
+                None
+            }
+            Step::Send(purpose) => send(window, desk, purpose, role).await,
+        };
     }
+}
 
-    fn call(&self, row: RequestRow, calls: &mut Calls) -> Option<Step> {
-        let id = row.id;
+async fn send(
+    window: &impl Window,
+    desk: &mut Desk,
+    purpose: Purpose,
+    role: &ProgramId,
+) -> Option<Step> {
+    let frame = match desk.frame(&purpose) {
+        Some(frame) => frame.to_vec(),
+        None => match window.sign(&desk.op(&purpose)?, role) {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::debug!(
+                    target: TARGET,
+                    event = "egress_unsigned",
+                    ?purpose,
+                    reason = "node_stopped",
+                    %error,
+                    "the egress worker could not anchor a frame"
+                );
+                return None;
+            }
+        },
+    };
+    let sent = window.submit(frame).await;
+    tracing::trace!(
+        target: TARGET,
+        event = "egress_submitted",
+        ?purpose,
+        sent = sent.kind(),
+    );
+    if let Sent::Refused(refusal) = &sent {
+        tracing::warn!(
+            target: TARGET,
+            event = "egress_refused",
+            ?purpose,
+            reason = %refusal.reason,
+            sentence = %refusal.sentence,
+            "the node refused an egress frame of its own"
+        );
+    }
+    desk.sent(&purpose, sent)
+}
+
+impl<E: Context> Window for Worker<E> {
+    type Call = Handle<()>;
+
+    fn call(&self, row: RequestRow) -> Handle<()> {
         let daemon = self.daemon.clone();
         let serving = self.daemon.egress.current();
         let answers = self.answers.clone();
@@ -267,8 +330,7 @@ impl<E: Context> Worker<E> {
             id = row.id,
             service = row.request.service(),
         );
-        let call = self
-            .daemon
+        self.daemon
             .context
             .child("egress_call")
             .spawn(move |_| async move {
@@ -297,35 +359,25 @@ impl<E: Context> Worker<E> {
                     ending = called.ending(),
                 );
                 let _ = answers.unbounded_send((id, called));
-            });
-        calls.started(id, call);
-        None
+            })
     }
 
-    async fn send(&self, desk: &mut Desk, purpose: Purpose, role: &ProgramId) -> Option<Step> {
-        let unsent = match desk.frame(&purpose) {
-            Some(frame) => Unsent::Signed(frame.to_vec()),
-            None => Unsent::Op(desk.op(&purpose)?),
-        };
-        let frame = match unsent {
-            Unsent::Signed(frame) => frame,
-            Unsent::Op(op) => match self.daemon.view() {
-                Ok(view) => self.sign(view.tip(), &op, role),
-                Err(error) => {
-                    tracing::debug!(
-                        target: TARGET,
-                        event = "egress_unsigned",
-                        ?purpose,
-                        reason = "node_stopped",
-                        %error,
-                        "the egress worker could not anchor a frame"
-                    );
-                    return None;
-                }
-            },
-        };
+    fn sign(&self, op: &Op, role: &ProgramId) -> Result<Vec<u8>> {
+        let view = self.daemon.view()?;
+        let frame = Frame::sign(
+            &self.daemon.key,
+            &self.daemon.descriptor.id(),
+            view.tip(),
+            None,
+            role,
+            abi::encode(op),
+        );
+        Ok(frame.encode())
+    }
+
+    async fn submit(&self, frame: Vec<u8>) -> Sent {
         let asked = self.daemon.context.current();
-        let taken = self
+        let submitted = self
             .daemon
             .submit(frame.clone(), Source::Client, Preconfirm::Off)
             .await;
@@ -335,79 +387,64 @@ impl<E: Context> Worker<E> {
             .current()
             .duration_since(asked)
             .unwrap_or_default();
-        let sent = self.taken(taken, frame);
+        let sent = taken(&self.daemon, submitted, frame);
         tracing::trace!(
             target: TARGET,
-            event = "egress_submitted",
-            ?purpose,
+            event = "egress_pooled",
             sent = sent.kind(),
             waited_ms = waited.as_millis() as u64,
         );
-        if let Sent::Refused(refusal) = &sent {
-            tracing::warn!(
-                target: TARGET,
-                event = "egress_refused",
-                ?purpose,
-                reason = %refusal.reason,
-                sentence = %refusal.sentence,
-                "the node refused an egress frame of its own"
-            );
-        }
-        desk.sent(&purpose, sent)
-    }
-
-    fn sign(&self, anchor: Tip, op: &Op, role: &ProgramId) -> Vec<u8> {
-        Frame::sign(
-            &self.daemon.key,
-            &self.daemon.descriptor.id(),
-            anchor,
-            None,
-            role,
-            abi::encode(op),
-        )
-        .encode()
-    }
-
-    fn taken(&self, taken: Result<std::result::Result<Taken, Refusal>>, frame: Vec<u8>) -> Sent {
-        match taken {
-            Ok(Ok(Taken::New(_))) => {
-                self.daemon.relay.send([frame.as_slice()]);
-                Sent::Pending(frame)
-            }
-            Ok(Ok(Taken::Held(_))) => Sent::Pending(frame),
-            Ok(Err(refusal)) => match refusal.reason.as_str() {
-                reason::ANCHOR => Sent::Stale,
-                reason::DUPLICATE => Sent::Carried,
-                _ => Sent::Refused(refusal),
-            },
-            Err(error) => {
-                tracing::warn!(
-                    target: TARGET,
-                    event = "egress_unsubmitted",
-                    reason = "node_failed",
-                    %error,
-                    "the node failed to take an egress frame; it is sent again next block"
-                );
-                Sent::Untaken
-            }
-        }
+        sent
     }
 }
 
-enum Unsent {
-    Signed(Vec<u8>),
-    Op(Op),
+fn taken<E: Context>(
+    daemon: &Daemon<E>,
+    taken: Result<std::result::Result<Taken, Refusal>>,
+    frame: Vec<u8>,
+) -> Sent {
+    match taken {
+        Ok(Ok(Taken::New(_))) => {
+            daemon.relay.send([frame.as_slice()]);
+            Sent::Pending(frame)
+        }
+        Ok(Ok(Taken::Held(_))) => Sent::Pending(frame),
+        Ok(Err(refusal)) => match refusal.reason.as_str() {
+            reason::ANCHOR => Sent::Stale,
+            reason::DUPLICATE => Sent::Carried,
+            _ => Sent::Refused(refusal),
+        },
+        Err(error) => {
+            tracing::warn!(
+                target: TARGET,
+                event = "egress_unsubmitted",
+                reason = "node_failed",
+                %error,
+                "the node failed to take an egress frame; it is sent again next block"
+            );
+            Sent::Untaken
+        }
+    }
 }
 
 async fn body<E: Context>(
     daemon: &Daemon<E>,
     parts: &[BlobId],
 ) -> std::result::Result<Vec<u8>, String> {
-    let mut body = Vec::new();
     for part in parts {
         if !daemon.blobs.store().has(part) {
             daemon.blobs.fetch(*part, halo::Class::Client).await;
         }
+    }
+    stored(daemon, parts)
+}
+
+fn stored<E: Context>(
+    daemon: &Daemon<E>,
+    parts: &[BlobId],
+) -> std::result::Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    for part in parts {
         let blob = daemon
             .blobs
             .store()

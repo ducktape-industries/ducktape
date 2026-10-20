@@ -78,6 +78,24 @@ enum Verb {
         )]
         invite: Option<String>,
     },
+    #[command(
+        about = "enroll this workspace's key as a resident member that runs no node, such as a \
+                 box serving egress over halo with `egress serve`; nothing is synced"
+    )]
+    Enroll {
+        source: String,
+        #[arg(
+            long,
+            value_parser = registered_halo,
+            help = "host:port where members reach this key over halo (QUIC on UDP)"
+        )]
+        halo: String,
+        #[arg(
+            long,
+            help = "a validator's invite, in hex; none when the door is open"
+        )]
+        invite: Option<String>,
+    },
     #[command(about = "run the node; a flag overrides the workspace's node.toml")]
     Run(Box<RunArgs>),
     #[command(
@@ -369,6 +387,16 @@ struct RunArgs {
     live_linger_ms: Option<NonZeroU64>,
     #[arg(
         long,
+        value_parser = permits,
+        help = defaulted(
+            "the egress lane streams boxes opened that wait for this node to take them",
+            "load.egress_lane_backlog",
+            LoadConfig::default().egress_lane_backlog
+        )
+    )]
+    egress_lane_backlog: Option<NonZeroUsize>,
+    #[arg(
+        long,
         help = defaulted(
             "how long a view waits for its leader's proposal",
             "consensus.leader_timeout_ms",
@@ -420,6 +448,7 @@ impl RunArgs {
                 live_lane_backlog: self.live_lane_backlog,
                 live_lane_per_sender: self.live_lane_per_sender,
                 live_linger_ms: self.live_linger_ms,
+                egress_lane_backlog: self.egress_lane_backlog,
             },
             consensus: ConsensusSettings {
                 leader_timeout_ms: self.leader_timeout_ms,
@@ -476,6 +505,19 @@ enum EgressVerb {
         dry: bool,
         #[arg(long)]
         node_key: bool,
+    },
+    #[command(
+        about = "serve what this workspace's egress.toml names with its member key and no node: \
+                 hear assigned requests from the validators' nodes over the ducktape/egress halo \
+                 lane and answer through them; --node names the node whose HTTP gives the \
+                 members and the lane table"
+    )]
+    Serve {
+        #[arg(
+            long,
+            help = "the local UDP address halo binds; enroll registers the host:port that reaches it"
+        )]
+        halo: std::net::SocketAddr,
     },
 }
 
@@ -608,6 +650,30 @@ fn execute(cli: Cli) -> Result<(), String> {
                 )
                 .await
                 .sentence()
+            })
+        }
+        Verb::Enroll {
+            source,
+            halo,
+            invite,
+        } => {
+            let invite = invite.map(|hex| decode_invite(&hex)).transpose()?;
+            Runner::new(runtime_config(&workspace)).start(|context| async move {
+                noded::enroll(context, &workspace, Client::new(source), halo, invite)
+                    .await
+                    .sentence()
+            })
+        }
+        Verb::Egress(EgressVerb::Serve { halo }) => {
+            let client = client(&workspace, cli.node)?;
+            let udp = std::net::UdpSocket::bind(halo).sentence()?;
+            let log = workspace.settings().sentence()?.log;
+            let log = log.unwrap_or_else(|| noded::DEFAULT_LOG.to_string());
+            Runner::new(runtime_config(&workspace)).start(|context| async move {
+                Logs::install(&log)?;
+                noded::serve_box(&context, workspace, &client, udp)
+                    .await
+                    .sentence()
             })
         }
         Verb::Run(args) => {
@@ -1006,6 +1072,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Identity
         | Verb::Init { .. }
         | Verb::Join { .. }
+        | Verb::Enroll { .. }
+        | Verb::Egress(EgressVerb::Serve { .. })
         | Verb::Run(_)
         | Verb::RestoreArchives
         | Verb::Wallet(_) => unreachable!("handled before the client is built"),
@@ -1431,6 +1499,7 @@ mod tests {
             "--live-peer-queue",
             "--live-lane-backlog",
             "--live-lane-per-sender",
+            "--egress-lane-backlog",
         ] {
             assert!(run(&[flag, "0"]).is_err(), "{flag}");
             assert!(run(&[flag, &past_tokio]).is_err(), "{flag}");
@@ -1489,6 +1558,8 @@ mod tests {
             "16",
             "--live-linger-ms",
             "700",
+            "--egress-lane-backlog",
+            "2",
             "--leader-timeout-ms",
             "4000",
             "--certification-timeout-ms",
@@ -1522,6 +1593,7 @@ mod tests {
                     live_lane_backlog: Some(count(4)),
                     live_lane_per_sender: Some(count(16)),
                     live_linger_ms: NonZeroU64::new(700),
+                    egress_lane_backlog: Some(count(2)),
                 },
                 consensus: ConsensusSettings {
                     leader_timeout_ms: Some(4000),

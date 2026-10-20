@@ -133,6 +133,7 @@ pub struct LoadConfig {
     pub live_lane_backlog: NonZeroUsize,
     pub live_lane_per_sender: NonZeroUsize,
     pub live_linger: Duration,
+    pub egress_lane_backlog: NonZeroUsize,
     pub rpc_cpus: Option<Vec<usize>>,
     pub rpc_blocking_threads: Option<NonZeroUsize>,
 }
@@ -152,6 +153,7 @@ impl Default for LoadConfig {
             live_lane_backlog: live.lane_backlog,
             live_lane_per_sender: live.lane_per_sender,
             live_linger: live.linger,
+            egress_lane_backlog: live.lane_backlog,
             rpc_cpus: None,
             rpc_blocking_threads: None,
         }
@@ -272,6 +274,19 @@ pub fn join<'a, E: Context>(
     Box::pin(adopt(context, workspace, source, address, halo, invite))
 }
 
+pub fn enroll<'a, E: Context>(
+    mut context: E,
+    workspace: &'a Workspace,
+    source: Client,
+    halo: String,
+    invite: Option<Invite>,
+) -> Boxed<'a, Result<()>> {
+    Box::pin(async move {
+        enrolled(&mut context, workspace, &source, None, halo, invite).await?;
+        Ok(())
+    })
+}
+
 pub fn invite(identity: &PrivateKey, grant: Grant) -> Invite {
     let signature = identity.sign(INVITE_NAMESPACE, &grant.preimage());
     Invite {
@@ -341,10 +356,39 @@ async fn adopt<E: Context>(
     halo: String,
     invite: Option<Invite>,
 ) -> Result<()> {
+    let status = enrolled(&mut context, workspace, &source, address, halo, invite).await?;
+    let descriptor = Descriptor {
+        network: status.network,
+        time: status.time,
+        block_time_ms: status.block_time_ms,
+    };
+    let base = source.base().to_owned();
+    let joined = statesync::join(
+        context.child("join"),
+        &descriptor.network,
+        workspace.dir(),
+        descriptor.id(),
+        Duration::from_millis(descriptor.block_time_ms),
+        source,
+    )
+    .await?;
+    workspace.write_source(&base)?;
+    workspace.write_descriptor(&descriptor)?;
+    workspace.write_anchor(&joined.anchor)
+}
+
+async fn enrolled<E: Context>(
+    context: &mut E,
+    workspace: &Workspace,
+    source: &Client,
+    address: Option<Endpoint>,
+    halo: String,
+    invite: Option<Invite>,
+) -> Result<crate::Status> {
     let halo = crate::workspace::halo_address(&halo)?;
     let status = source.status().await?;
-    let identity = workspace.identity_or_create(&mut context)?;
-    let salt = rand_core::Rng::next_u64(&mut context);
+    let identity = workspace.identity_or_create(&mut *context)?;
+    let salt = rand_core::Rng::next_u64(&mut *context);
     let enroll = Op::Enroll {
         address: address.as_ref().map(Endpoint::to_string),
         halo,
@@ -365,25 +409,8 @@ async fn adopt<E: Context>(
     if let Outcome::Rejected(refusal) = receipt.outcome {
         return Err(Error::Refused(refusal));
     }
-    seated(&source, identity.public_key().as_ref()).await?;
-    let descriptor = Descriptor {
-        network: status.network,
-        time: status.time,
-        block_time_ms: status.block_time_ms,
-    };
-    let base = source.base().to_owned();
-    let joined = statesync::join(
-        context.child("join"),
-        &descriptor.network,
-        workspace.dir(),
-        descriptor.id(),
-        Duration::from_millis(descriptor.block_time_ms),
-        source,
-    )
-    .await?;
-    workspace.write_source(&base)?;
-    workspace.write_descriptor(&descriptor)?;
-    workspace.write_anchor(&joined.anchor)
+    seated(source, identity.public_key().as_ref()).await?;
+    Ok(status)
 }
 
 async fn seated(source: &Client, key: &[u8]) -> Result<()> {
@@ -689,6 +716,9 @@ async fn start<E: Context>(
     )?;
     if let (Some(source), Some(handle)) = (workspace.source()?, rpc.handle()) {
         handle.spawn(crate::fill::fill(daemon.clone(), Client::new(source)));
+    }
+    if let Some(handle) = rpc.handle() {
+        crate::egress::lane::spawn(daemon.clone(), handle, load.egress_lane_backlog)?;
     }
     let egressing = crate::egress::spawn(daemon.clone());
     let mut tasks = vec![pump, relayed, egressing];

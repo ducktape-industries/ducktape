@@ -289,7 +289,9 @@ prune past a slow join. A join whose hold dropped learns it from the next
 sync the source refuses as pruned, and reads the head again under a new hold. `run` fetches every other blob the state names
 afterwards (see the blobs below). A stranger joins as a resident: it follows the
 chain and never votes or proposes. A validator named in the file joins the
-same way and keeps its seat.
+same way and keeps its seat. `ducktape enroll` takes the same source, `--halo` and
+`--invite` and sends only the enrollment, with nothing synced, for a key that
+runs no node (an egress box, below).
 
 ```sh
 ducktape join https://a.example.org --halo b.example.org:9100 --invite <hex>
@@ -376,6 +378,34 @@ halves, in order. An answer larger than a block carries goes out as a
 failure; one event or an end larger than a block carries ends the stream `Cut`
 (`event_too_large`, `end_too_large`) and the node drops the rest. On a network that binds no egress
 role the node does none of this.
+
+A member key with no node of its own serves egress the same way over halo's
+lane `ducktape/egress`, which the validators' vote opens. The box enrolls with
+`ducktape enroll`, then runs `ducktape egress serve --halo <bind>`: it reads
+the members and halo's lane table from a node over HTTP (`--node`), seats the
+validators and opens the lane to one of them. That node, its relay, sends it
+after each block the tip, the requests egress assigned to the box's key with
+their bodies, and the box's service row. The box decides and calls as a node
+does, from its own `egress.toml`, signs each frame with its own key at the
+relay's tip, and sends it over the lane; the relay pools and relays it as its
+own and answers whether it took it. The relay gathers each body apart from
+its push, asking every member once for a part it lacks; a part no member
+gives fails only its own request, and the box hears of a request only once
+its body is sent. A request that leaves the assigned list ends its call, and
+a role change, `Unbound` or the box's end ends every call, as on a node. The
+box trusts every validator with its upstream: it calls what a relay lists,
+unchecked against the chain. When the relay goes, the box keeps what
+it holds and opens the lane to the next validator: a frame not yet taken is
+signed again at the new relay's tip, and one a block already carried counts
+as done. A frame no block carries is refused on the box itself with the
+refusal a node's pool gives, so an answer larger than a block carries goes
+out as a failure here too. The relay runs each box's session on its RPC
+runtime, beside the block threads. While the box's lane table does not list
+the lane enabled (before the vote opens it, or after a vote pauses or closes
+it), the box waits for the next change to the halo program and reads again.
+With no validator reachable it waits until one links; after a round in which
+every relay it reached dropped it, it waits for the next block; when it
+reaches every one and none serves the lane, it stops with an error.
 
 ```toml
 # $DUCKTAPE_HOME/egress.toml: read when the node starts and on `ducktape egress reload`;
@@ -477,6 +507,7 @@ live_peer_queue = 1024        # --live-peer-queue
 live_lane_backlog = 64        # --live-lane-backlog
 live_lane_per_sender = 256    # --live-lane-per-sender
 live_linger_ms = 5000         # --live-linger-ms
+egress_lane_backlog = 64      # --egress-lane-backlog
 
 [consensus]
 leader_timeout_ms = 1000          # --leader-timeout-ms; default one block time
@@ -571,7 +602,8 @@ it the group is dropped short), `--live-peer-queue`, `--live-lane-backlog` and
 peers' streams waiting to be taken and the datagrams waiting per peer.
 `--live-linger-ms` is how long a
 closed session's last message gets to reach the client before the connection
-is closed under it. `ducktape run --help` shows each default and its
+is closed under it. `--egress-lane-backlog` is how many streams egress boxes
+opened wait for the node to take them. `ducktape run --help` shows each default and its
 `node.toml` key.
 
 Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). The halo
@@ -584,7 +616,8 @@ id, sets a lane's class or pauses it, or closes one; an id is never handed out t
 vote pauses or closes a pinned lane. Pin `ducktape/blobs`: a node fetches the blobs a block
 reads over it, so a vote that paused it would cut a node off from the very block that undoes
 the vote. A stream is served at the lower of the class it asks and its lane's cap. A stream
-already open when its lane is paused or closed runs on.
+already open when its lane is paused or closed runs on. Every node binds `ducktape/egress` at
+start, for egress boxes (above); it carries streams once a vote opens it.
 
 Live tracks: the relay in every node (`crates/noded/src/live/`) lets a desktop
 client publish and subscribe to tracks of a room off consensus, in what the

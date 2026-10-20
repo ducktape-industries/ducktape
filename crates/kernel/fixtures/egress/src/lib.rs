@@ -1,9 +1,12 @@
 //! An egress program for the node's tests: a key's `Serve` records what it serves, a request goes to
-//! the first node serving its service, and that node's `Answer` is kept under `answer_key`.
+//! the first node serving its service, which answers it whole or streams it, and from its expiry
+//! height (`made` plus its wait) anyone's `Expire` drops it and keeps a failed answer.
 pub const NODE: &[u8] = b"node/";
 pub const REQUEST: &[u8] = b"request/";
 pub const ANSWER: &[u8] = b"answer/";
 pub const NEXT: &[u8] = b"next";
+pub const EVENT: &[u8] = b"event/";
+pub const END: &[u8] = b"end/";
 
 pub fn node_key(key: &[u8]) -> Vec<u8> {
     [NODE, key].concat()
@@ -17,16 +20,25 @@ pub fn answer_key(id: u64) -> Vec<u8> {
     [ANSWER, &id.to_be_bytes()].concat()
 }
 
+pub fn event_key(id: u64, seq: u64) -> Vec<u8> {
+    [EVENT, &id.to_be_bytes(), &seq.to_be_bytes()].concat()
+}
+
+pub fn end_key(id: u64) -> Vec<u8> {
+    [END, &id.to_be_bytes()].concat()
+}
+
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::role::access::{Need, Resource};
     use abi::role::egress::{
-        Answer, Delivery, NodeRow, Op, Query as Ask, Reply, Request, RequestRow,
+        Answer, DEFAULT_WAIT, Delivery, Event, NodeRow, Op, Query as Ask, Reply, Request,
+        RequestRow, StreamEnd,
     };
     use abi::{Env, Origin, Refusal, Scan, reason};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{NEXT, NODE, REQUEST, answer_key, node_key, request_key};
+    use crate::{NEXT, NODE, REQUEST, answer_key, end_key, event_key, node_key, request_key};
 
     struct Egress;
 
@@ -55,6 +67,7 @@ mod program {
         env: &Env,
         request: Request,
         delivery: Delivery,
+        wait: Option<u64>,
     ) -> Result<(), Refusal> {
         let service = request.service().to_owned();
         let nodes: Vec<(Vec<u8>, NodeRow)> = ctx.records(Scan::prefix(NODE))?;
@@ -79,7 +92,7 @@ mod program {
             delivery,
             node: serving.key,
             made: env.height,
-            expiry: 0,
+            expiry: env.height + wait.unwrap_or(DEFAULT_WAIT),
         };
         ctx.put(request_key(id), &row);
         ctx.put(NEXT, &(id + 1));
@@ -87,18 +100,62 @@ mod program {
         Ok(())
     }
 
-    fn answer(ctx: &mut Execute, env: &Env, id: u64, answer: Answer) -> Result<(), Refusal> {
+    fn open(ctx: &mut Execute, id: u64) -> Result<RequestRow, Refusal> {
         let Some(row) = ctx.record::<RequestRow>(request_key(id))? else {
             return Err(Refusal::new(reason::NOT_FOUND, format!("no request {id}")));
         };
+        Ok(row)
+    }
+
+    fn owned(ctx: &mut Execute, env: &Env, id: u64) -> Result<(), Refusal> {
+        let row = open(ctx, id)?;
         if signer(env)? != row.node.as_slice() {
             return Err(Refusal::new(
                 reason::UNAUTHORIZED,
                 format!("request {id} is another node's"),
             ));
         }
+        Ok(())
+    }
+
+    fn answer(ctx: &mut Execute, env: &Env, id: u64, answer: Answer) -> Result<(), Refusal> {
+        owned(ctx, env, id)?;
         ctx.delete(request_key(id));
         ctx.put(answer_key(id), &answer);
+        Ok(())
+    }
+
+    fn streamed(ctx: &mut Execute, env: &Env, events: Vec<Event>) -> Result<(), Refusal> {
+        for event in events {
+            owned(ctx, env, event.id)?;
+            ctx.put(event_key(event.id, event.seq), &event.data);
+        }
+        Ok(())
+    }
+
+    fn ended(
+        ctx: &mut Execute,
+        env: &Env,
+        id: u64,
+        events: u64,
+        end: StreamEnd,
+    ) -> Result<(), Refusal> {
+        owned(ctx, env, id)?;
+        ctx.delete(request_key(id));
+        ctx.put(end_key(id), &(events, end));
+        Ok(())
+    }
+
+    fn expire(ctx: &mut Execute, env: &Env, id: u64) -> Result<(), Refusal> {
+        let row = open(ctx, id)?;
+        if env.height < row.expiry {
+            return Err(Refusal::new(
+                reason::INVALID_INPUT,
+                format!("request {id} expires at {}", row.expiry),
+            ));
+        }
+        ctx.delete(request_key(id));
+        ctx.put(answer_key(id), &Answer::Failed("expired".to_owned()));
         Ok(())
     }
 
@@ -109,16 +166,15 @@ mod program {
                 Op::Request {
                     request: asked,
                     delivery,
-                    ..
-                } => request(ctx, env, asked, delivery),
+                    wait,
+                } => request(ctx, env, asked, delivery, wait),
                 Op::Answer { id, answer: given } => answer(ctx, env, id, given),
-                Op::Register { .. }
-                | Op::Assign { .. }
-                | Op::Events(_)
-                | Op::EndStream { .. }
-                | Op::Expire { .. } => Err(Refusal::new(
+                Op::Events(events) => streamed(ctx, env, events),
+                Op::EndStream { id, events, end } => ended(ctx, env, id, events, end),
+                Op::Expire { id } => expire(ctx, env, id),
+                Op::Register { .. } | Op::Assign { .. } => Err(Refusal::new(
                     reason::UNSUPPORTED,
-                    "this fixture serves, requests and answers",
+                    "this fixture serves, requests, answers, streams and expires",
                 )),
             }
         }

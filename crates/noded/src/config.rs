@@ -60,6 +60,8 @@ pub struct LoadSettings {
     #[serde(default, deserialize_with = "held_permits")]
     pub live_lane_per_sender: Option<NonZeroUsize>,
     pub live_linger_ms: Option<NonZeroU64>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub egress_lane_backlog: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -161,6 +163,7 @@ impl LoadSettings {
             live_lane_backlog: self.live_lane_backlog.or(under.live_lane_backlog),
             live_lane_per_sender: self.live_lane_per_sender.or(under.live_lane_per_sender),
             live_linger_ms: self.live_linger_ms.or(under.live_linger_ms),
+            egress_lane_backlog: self.egress_lane_backlog.or(under.egress_lane_backlog),
         }
     }
 
@@ -196,6 +199,9 @@ impl LoadSettings {
             live_linger: self
                 .live_linger_ms
                 .map_or(default.live_linger, |ms| Duration::from_millis(ms.get())),
+            egress_lane_backlog: self
+                .egress_lane_backlog
+                .unwrap_or(default.egress_lane_backlog),
             rpc_cpus: None,
             rpc_blocking_threads: None,
         }

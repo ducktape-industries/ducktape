@@ -40,11 +40,12 @@ pub use config::{
     ConsensusSettings, DEFAULT_HTTP, DEFAULT_LOG, LoadSettings, NodeConfig, Settings, permits,
 };
 pub use cores::{CpuList, pin_block_threads};
+pub use egress::lane::{LANE as EGRESS_LANE, Seating, seating, serve_box};
 pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
 pub use run::{
-    HaloConfig, Listen, Listeners, LoadConfig, Running, init, invite, join, run, run_on,
+    HaloConfig, Listen, Listeners, LoadConfig, Running, enroll, init, invite, join, run, run_on,
 };
 pub use view::{View, Views};
 pub use wire::{NODE_CONTRACT, Status};
@@ -133,6 +134,8 @@ pub enum Error {
     Offloaded(String),
     #[error("egress: {0}")]
     Egress(#[from] egress::Refused),
+    #[error("no relay node serves the egress lane")]
+    Unrelayed,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {

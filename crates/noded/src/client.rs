@@ -514,7 +514,8 @@ impl Fault for Error {
             | Error::Unlanded
             | Error::Stopped
             | Error::Offloaded(_)
-            | Error::Egress(_) => Failure::Definite,
+            | Error::Egress(_)
+            | Error::Unrelayed => Failure::Definite,
         }
     }
 }
