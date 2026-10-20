@@ -175,7 +175,13 @@ one up for another network.
   warm pod's (the warm pod the files path `PODS_WARM_POD` names, duckpond:
   `/shared/tools/warm-pod`), else the warm pod. A machine that can't say
   its wait leaves the run to the other, and a desktop that can't say its
-  wait keeps the run when the warm pod can't be named. Its exec takes build.sh's words as
+  wait, or that its ping finds busy, keeps the run when the warm pod can't
+  be named (an empty or unread warm-pod file, as while the warm pod is
+  recreated) or can't say its own wait (a name of a pod that is gone):
+  only a desktop that is down then leaves a call nowhere to run (503, or
+  the file's 502). A desktop run whose session was cut while no warm pod
+  is named answers 502 with both reasons, naming the run when it started
+  (`pods_unrouted`). Its exec takes build.sh's words as
   `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
   stderr starts `builds: on <machine>`. `status`, `log`, `stop`, `wait` and
   `requeue` name their run as `<machine>:<run>` and go to that machine, or

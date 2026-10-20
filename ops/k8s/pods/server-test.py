@@ -2625,6 +2625,7 @@ class Builds(Streamed):
         ]
         for request, ping in enumerate(pings, start=60):
             self.gate.answers["ping"] = ran(ping)
+            self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\nread it with: build.sh status w1\n"))
             status, answer = self.built("programs", "dev", "gates", request=request)
             self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"), ping)
         self.gate.answers["ping"] = ran({**UP, "busy": [light]})
@@ -2639,6 +2640,7 @@ class Builds(Streamed):
 
     def test_a_ping_that_does_not_read_logs_its_field_and_type_not_its_lines(self):
         self.gate.answers["ping"] = ran({**UP, "busy": "programs r1 heavy j-1 [1m] programs dev apply /home/x/secret.sh"})
+        self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\n"))
         with unittest.mock.patch.object(server, "say") as said:
             self.built("programs", "dev", "gates")
         said.assert_any_call("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps("the desktop's ping has busy as a str, not a list of lines"))
@@ -2730,6 +2732,33 @@ class Builds(Streamed):
         with unittest.mock.patch.object(server, "say") as said:
             self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
         said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=unittest.mock.ANY)
+
+    def test_an_empty_warm_pod_file_sends_a_run_the_desktop_judges_busy_to_the_desktop(self):
+        self.signer.head = ran(files_answer(b""))
+        self.gate.answers["ping"] = ran({**UP, "busy": ["stray 412 holds /var/tmp/warm/heavy.lock: sleep"]})
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("programs", "dev", "show", "README.md")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
+        said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=json.dumps("a process no run started holds one of the desktop's build locks; /shared/tools/warm-pod names no warm pod"))
+
+    def test_a_warm_pod_file_naming_a_gone_pod_sends_a_run_the_desktop_judges_busy_to_the_desktop(self):
+        self.gate.answers["ping"] = ran({**UP, "busy": ["stray 412 holds /var/tmp/warm/heavy.lock: sleep"]})
+        self.kube.answer("exec", ran(code=1, err=f'Error from server (NotFound): pods "{WARM}" not found'))
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "ahead", "programs", "dev", "gates"])])
+        said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=unittest.mock.ANY)
+
+    def test_a_cut_desktop_run_with_no_warm_pod_named_names_its_run_and_both_reasons(self):
+        self.signer.head = ran(files_answer(b""))
+        self.gate.cut_words = {"gates"}
+        self.gate.cut_said = b"run r7\n"
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "WAIT=1", "programs", "dev", "gates"]}, 502, ["as run desktop:r7, which may still run there", "/shared/tools/warm-pod names no warm pod", "build.sh status desktop:r7"])
+
+    def test_an_empty_warm_pod_file_sends_a_light_call_to_an_idle_desktop(self):
+        self.signer.head = ran(files_answer(b""))
+        self.assertEqual(self.built("programs", "dev", "show", "README.md")[1]["stdout"].splitlines()[0], "run desktop:r1")
 
     def test_with_no_warm_pod_named_a_desktop_that_is_down_answers_503(self):
         self.service.warm_pod = None

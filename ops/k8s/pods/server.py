@@ -2032,8 +2032,17 @@ class Service:
             return self.warm()
         free, why = desktop_free(said)
         if not free:
+            try:
+                warm = self.warm()
+            except Refused as refused:
+                say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(f"{why}; {refused.sentence}"))
+                return DESKTOP
+            there, unasked = self.ahead(asked, warm, words, alive)
+            if there is None:
+                say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(f"{why}; {unasked}"))
+                return DESKTOP
             say("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps(why))
-            return self.warm()
+            return warm
         here, why = self.ahead(asked, DESKTOP, words, alive)
         if here is None:
             try:
@@ -2109,8 +2118,14 @@ class Service:
                 say("pods_parked", verb=json.dumps(verb), run=run or "unstarted", detail=json.dumps(refused.sentence))
                 where = f"build.sh status {run}" if run else f"build.sh busy on pod {DESKTOP}"
                 raise Refused(502, f"{refused.sentence}; build.sh {verb} changes things, so it is parked rather than run on another machine{f' as run {run}' if run else ''}: once pod {DESKTOP} answers, read {where} before calling it again") from refused
+            try:
+                machine = self.warm()
+            except Refused as unnamed:
+                started = STARTED.search(refused.out) if isinstance(refused, Cut) else None
+                run = f" as run {DESKTOP}:{started.group(1).decode(errors='replace')}, which may still run there" if started else ""
+                say("pods_unrouted", reason="desktop_lost", detail=json.dumps(f"{refused.sentence}; {unnamed.sentence}"))
+                raise Refused(502, f"{refused.sentence}{run}; it was not run elsewhere, since {unnamed.sentence}: once pod {DESKTOP} answers, read build.sh {'status ' + DESKTOP + ':' + started.group(1).decode(errors='replace') if started else 'busy on pod ' + DESKTOP} before calling it again") from refused
             say("pods_routed", to="warm", reason="desktop_lost", detail=json.dumps(refused.sentence))
-            machine = self.warm()
             ran = self.on(asked, machine, words, alive)
         return on_machine(machine, ran)
 
