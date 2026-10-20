@@ -2547,6 +2547,7 @@ class Builds(Streamed):
         self.gate.answers["exec"] = ran(b"run r1\nread it with: build.sh status r1\n")
         self.kube.answer("exec", ran(b"run w1\nread it with: build.sh status w1\n"))
         self.service.reroute_after = lambda asked: None
+        self.service.claim = lambda asked, settings, words, alive: None
 
     def built(self, *words, request=41):
         return self.call("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, *words]}, headers=asked(request))
@@ -2599,7 +2600,8 @@ class Builds(Streamed):
         self.gate.cut_words = {"gates"}
         status, answer = self.built("WAIT=1", "programs", "dev", "gates")
         self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"))
-        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "WAIT=1", "programs", "dev", "gates"])])
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "programs", "dev", "gates"]), (WARM, None, ["sh", BUILD, "wait", "w1"])])
+        self.assertEqual(self.service.launched, {("WAIT=1", "programs", "dev", "gates"): (WARM, "w1")})
 
     def test_a_run_that_changes_things_whose_desktop_session_broke_is_parked_with_its_run(self):
         self.gate.cut_words = {"apply"}
@@ -2723,6 +2725,135 @@ class Builds(Streamed):
             self.assertEqual(status, 400, answer)
             self.assertIn(words, answer["error"])
         self.assertEqual(self.gate.calls, [])
+
+    def test_a_call_whose_request_is_gone_before_build_sh_is_called_runs_nothing(self):
+        self.signer.request = ran(GONE)
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "programs", "dev", "gates"]}, 502, ["is gone, so build.sh was not called on pod desktop: nothing ran"])
+        self.assertNotIn(["exec", "programs", "dev", "gates"], self.gate.words())
+
+    def test_a_call_whose_request_egress_cannot_be_asked_about_runs_and_says_so(self):
+        self.signer.request = ran(code=1, err="egress: no such query")
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
+        said.assert_any_call("pods_request_unchecked", request="41", detail=json.dumps("egress was not asked whether request 41 still waits: egress: no such query"))
+
+    def test_a_retry_whose_first_answer_never_came_gets_the_run_its_call_started(self):
+        del self.service.claim
+        self.built("JOB=j-1", "programs", "dev", "gates")
+        self.gate.answers["exec claim"] = ran(b"same r1\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("JOB=j-1", "programs", "dev", "gates", request=42)
+        self.assertEqual((status, answer["stdout"]), (200, "run desktop:r1\nread it with: build.sh status r1\n"))
+        self.assertIn("it is still queued or running there, so this call gets that run rather than a second one", answer["stderr"])
+        runs = [words for words in self.gate.words() if words[:1] == ["exec"] and words[1:2] not in (["ahead"], ["claim"])]
+        self.assertEqual(runs, [["exec", "JOB=j-1", "programs", "dev", "gates"]])
+        self.assertEqual(self.gate.words()[-1], ["exec", "claim", "r1", "JOB=j-1", "programs", "dev", "gates"])
+        said.assert_any_call("pods_run_claimed", run=json.dumps("desktop:r1"), request="42")
+
+    def test_a_held_retry_waits_on_the_run_its_call_started(self):
+        del self.service.claim
+        self.built("WAIT=1", "programs", "dev", "check")
+        self.gate.answers["exec claim"] = ran(b"same r1\n")
+        self.gate.answers["exec wait"] = ran(b"run r1: programs dev, check\nGATES ok\n")
+        status, answer = self.built("WAIT=1", "programs", "dev", "check", request=42)
+        self.assertEqual((status, answer["stdout"]), (200, "run desktop:r1\nrun r1: programs dev, check\nGATES ok\n"))
+        self.assertEqual(self.gate.words()[-1], ["exec", "wait", "r1"])
+
+    def test_a_retry_follows_a_run_reroute_moved_to_the_run_that_stands_for_it(self):
+        del self.service.claim
+        self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")
+        self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\nread it with: build.sh status w1\n"), ran(b"moved desktop:r9\n"))
+        self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], f"run {WARM}:w1")
+        self.gate.answers["exec claim"] = ran(b"same r9\n")
+        status, answer = self.built("programs", "dev", "gates", request=42)
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r9"))
+        self.assertEqual(self.warm_execs()[-1], (WARM, None, ["sh", BUILD, "claim", "w1", "programs", "dev", "gates"]))
+        self.assertEqual(self.gate.words()[-1], ["exec", "claim", "r9", "programs", "dev", "gates"])
+        self.assertEqual(self.service.launched[("programs", "dev", "gates")], ("desktop", "r9"))
+
+    def test_a_retry_whose_run_cannot_be_checked_gets_that_run_and_never_a_second(self):
+        del self.service.claim
+        self.built("programs", "dev", "gates")
+        self.gate.down = {"lan", "tail", "wifi"}
+        status, answer = self.built("programs", "dev", "gates", request=42)
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
+        self.assertIn("it was not checked there", answer["stderr"])
+        self.assertEqual(self.warm_execs(), [])
+        self.assertEqual(self.service.launched[("programs", "dev", "gates")], ("desktop", "r1"))
+
+    def test_a_retry_whose_run_is_not_the_one_its_words_make_now_starts_its_own(self):
+        del self.service.claim
+        self.built("programs", "j/x", "gates")
+        self.gate.answers["exec claim"] = ran(b"other r1 took aa, and j/x is at bb now\n", code=1)
+        self.gate.answers["exec"] = ran(b"run r2\nread it with: build.sh status r2\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("programs", "j/x", "gates", request=42)
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r2"))
+        self.assertEqual(self.service.launched[("programs", "j/x", "gates")], ("desktop", "r2"))
+        said.assert_any_call("pods_run_unclaimed", run=json.dumps("desktop:r1"), reason=json.dumps("other"))
+
+    def test_a_held_call_records_its_run_before_it_holds_on_it(self):
+        seen = []
+        asked_on = self.service.asked_on
+
+        def watching(asked, machine, words, alive):
+            if words[:1] == ["wait"]:
+                seen.append(dict(self.service.launched))
+            return asked_on(asked, machine, words, alive)
+
+        self.service.asked_on = watching
+        self.gate.answers["exec wait"] = ran(b"run r1: programs dev, check\nGATES ok\n")
+        status, answer = self.built("WAIT=1", "programs", "dev", "check")
+        self.assertEqual((status, answer["stdout"]), (200, "run desktop:r1\nrun r1: programs dev, check\nGATES ok\n"))
+        self.assertEqual(seen, [{("WAIT=1", "programs", "dev", "check"): ("desktop", "r1")}])
+        self.assertEqual([words for words in self.gate.words() if words[:1] == ["exec"] and words[1:2] != ["ahead"]], [["exec", "programs", "dev", "check"], ["exec", "wait", "r1"]])
+
+    def test_a_held_call_whose_desktop_session_broke_mid_wait_is_parked_with_its_run(self):
+        self.gate.cut_words = {"wait"}
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "WAIT=1", "apply", "programs", "dev", "/home/x/edit.sh"]}, 502, ["parked", "as run desktop:r1"])
+        self.assertEqual(self.service.launched[("WAIT=1", "apply", "programs", "dev", "/home/x/edit.sh")], ("desktop", "r1"))
+
+    def test_a_cut_desktop_session_that_printed_its_run_is_recorded(self):
+        self.gate.cut_words = {"apply"}
+        self.gate.cut_said = b"run r7\n"
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "apply", "programs", "dev", "/home/x/edit.sh"]}, 502, ["as run desktop:r7"])
+        self.assertEqual(self.service.launched, {("apply", "programs", "dev", "/home/x/edit.sh"): ("desktop", "r7")})
+
+    def test_a_run_the_desktop_lost_and_the_warm_pod_ran_is_recorded_there(self):
+        self.gate.cut_words = {"gates"}
+        self.built("programs", "dev", "gates")
+        self.assertEqual(self.service.launched, {("programs", "dev", "gates"): (WARM, "w1")})
+
+    def test_a_retry_whose_branch_forge_cannot_place_gets_that_run_and_keeps_its_record(self):
+        del self.service.claim
+        self.built("programs", "dev", "gates")
+        self.gate.answers["exec claim"] = ran(b"unknown forge did not say where programs dev points\n", code=3)
+        status, answer = self.built("programs", "dev", "gates", request=42)
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
+        self.assertIn("it was not checked there (forge did not say where programs dev points)", answer["stderr"])
+        self.assertEqual(self.service.launched[("programs", "dev", "gates")], ("desktop", "r1"))
+        self.assertEqual([words for words in self.gate.words() if words[:1] == ["exec"] and words[1:2] not in (["ahead"], ["claim"])], [["exec", "programs", "dev", "gates"]])
+
+    def test_the_sweep_drops_ended_runs_follows_moved_ones_and_keeps_those_it_cannot_ask(self):
+        self.built("programs", "dev", "gates")
+        self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")
+        self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\nread it with: build.sh status w1\n"))
+        self.built("programs", "dev", "check", request=42)
+        self.service.launched[("core", "dev", "gates")] = ("desktop", "r3")
+        self.gate.answers["exec ended"] = ran(b"ended r1\n")
+        self.kube.answer("exec", ran(b"moved w1 desktop:r5\n"))
+        self.service.sweep()
+        self.assertEqual(self.service.launched, {("programs", "dev", "check"): ("desktop", "r5"), ("core", "dev", "gates"): ("desktop", "r3")})
+        self.assertIn(["exec", "ended", "r1", "r3"], self.gate.words())
+        self.assertEqual(self.warm_execs()[-1], (WARM, None, ["sh", BUILD, "ended", "w1"]))
+        self.gate.down = {"lan", "tail", "wifi"}
+        self.service.sweep()
+        self.assertEqual(len(self.service.launched), 2)
+        self.service.launched = {("programs", "dev", "check"): (WARM, "w1")}
+        self.kube.answer("exec", ran(code=1, err=f'Error from server (NotFound): pods "{WARM}" not found'))
+        self.service.sweep()
+        self.assertEqual(self.service.launched, {})
 
     def test_reroute_moves_each_queued_run_the_desktop_would_start_sooner(self):
         self.kube.answer("exec", ran(b"move w2 heavy 4 d29yZHMy\nmove w1 heavy 3 d29yZHMx\nkeep w3 a pack holds its result on this machine\n"), ran(b"w1: moved to run desktop:r1\nw2: moved to run desktop:r2\n"))

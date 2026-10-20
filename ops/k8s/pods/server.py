@@ -201,7 +201,7 @@ SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 DESKTOP = "desktop"
 BUILDS = "builds"
 ADDRESSED = frozenset({"status", "log", "stop", "wait", "requeue"})
-MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-targets", "queue-out", "queue-in", "self-update", "worktree", "measure"})
+MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-targets", "queue-out", "queue-in", "self-update", "worktree", "measure", "claim", "ended"})
 WEIGHTS = frozenset({"heavy", "light", "quiet", "lane", "quick"})
 READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
 STARTED = re.compile(rb"^run (\S+)$", re.M)
@@ -1859,6 +1859,7 @@ class Service:
         self.lock = threading.Lock()
         self.swept = threading.Event()
         self.rerouting = threading.Lock()
+        self.launched = {}
 
     def pod(self, name):
         ran = self.kube.get(name)
@@ -1919,6 +1920,37 @@ class Service:
             if not self.still_waits(run):
                 with self.lock:
                     self.execs.pop(key, None)
+        self.sweep_started()
+
+    def sweep_started(self):
+        with self.lock:
+            places = {}
+            for machine, run in self.launched.values():
+                places.setdefault(machine, set()).add(run)
+        for machine, runs in places.items():
+            command = ["sh", BUILD_SH, "ended", *sorted(runs)]
+            try:
+                ran = self.desktop.ran(command, None) if machine == DESKTOP else self.kube.exec(machine, None, command)
+            except Refused:
+                continue
+            gone = ran.code != 0 and "(NotFound)" in ran.err
+            if ran.code != 0 and not gone:
+                continue
+            ended, moved = set(), {}
+            for line in ran.out.decode(errors="replace").splitlines():
+                said = line.split()
+                if len(said) == 2 and said[0] == "ended":
+                    ended.add(said[1])
+                elif len(said) == 3 and said[0] == "moved" and ":" in said[2]:
+                    moved[said[1]] = tuple(said[2].split(":", 1))
+            with self.lock:
+                for key, place in list(self.launched.items()):
+                    if place[0] != machine:
+                        continue
+                    if gone or place[1] in ended:
+                        del self.launched[key]
+                    elif place[1] in moved:
+                        self.launched[key] = moved[place[1]]
 
     def still_waits(self, run):
         try:
@@ -2194,10 +2226,13 @@ class Service:
                 said.append(f"unstopped {copy}: it runs beside {warm}:{run}, which stays ({why}); stop it")
         return said
 
+    def asked_on(self, asked, machine, words, alive):
+        command = ["sh", BUILD_SH, *words]
+        return self.desktop.ran(command, alive) if machine == DESKTOP else self.executed(asked, machine, None, command, alive=alive)
+
     def ahead(self, asked, machine, words, alive):
-        command = ["sh", BUILD_SH, "ahead", *words]
         try:
-            ran = self.desktop.ran(command, alive) if machine == DESKTOP else self.executed(asked, machine, None, command, alive=alive)
+            ran = self.asked_on(asked, machine, ["ahead", *words], alive)
         except Refused as refused:
             return None, refused.sentence
         found = AHEAD.fullmatch(ran.out.strip()) if ran.code == 0 else None
@@ -2234,14 +2269,21 @@ class Service:
                     return on_machine(machine, looked, started=False)
             return on_machine(machine, self.on(asked, machine, [*settings, first, run, *called[2:]], alive), started=first == "requeue")
         verb = first if first == "apply" else (called[2] if len(called) > 2 else first)
+        claimed = self.claim(asked, settings, words, alive)
+        if claimed is not None:
+            return claimed
         machine, idle = self.pick(asked, words, alive)
+        if not self.still_open(asked):
+            raise Refused(502, f"request {asked['request']}, which asked for this, is gone, so build.sh was not called on pod {machine}: nothing ran")
         try:
-            ran = self.on(asked, machine, words, alive)
+            ran = self.launched_on(asked, machine, settings, words, alive)
             if idle:
                 self.reroute_after(asked)
         except Refused as refused:
             if machine != DESKTOP:
                 raise
+            if isinstance(refused, Cut):
+                self.record(words, DESKTOP, refused.out)
             if isinstance(refused, Cut) and verb not in READ_ONLY:
                 started = STARTED.search(refused.out)
                 run = f"{DESKTOP}:{started.group(1).decode(errors='replace')}" if started else None
@@ -2256,8 +2298,80 @@ class Service:
                 say("pods_unrouted", reason="desktop_lost", detail=json.dumps(f"{refused.sentence}; {unnamed.sentence}"))
                 raise Refused(502, f"{refused.sentence}{run}; it was not run elsewhere, since {unnamed.sentence}: once pod {DESKTOP} answers, read build.sh {'status ' + DESKTOP + ':' + started.group(1).decode(errors='replace') if started else 'busy on pod ' + DESKTOP} before calling it again") from refused
             say("pods_routed", to="warm", reason="desktop_lost", detail=json.dumps(refused.sentence))
-            ran = self.on(asked, machine, words, alive)
+            ran = self.launched_on(asked, machine, settings, words, alive)
         return on_machine(machine, ran)
+
+    def launched_on(self, asked, machine, settings, words, alive):
+        if "WAIT=1" not in settings:
+            ran = self.on(asked, machine, words, alive)
+            self.record(words, machine, ran.out)
+            return ran
+        unheld = [word for word in settings if word != "WAIT=1"] + words[len(settings) :]
+        ran = self.on(asked, machine, unheld, alive)
+        self.record(words, machine, ran.out)
+        started = STARTED.search(ran.out)
+        if started is None:
+            return ran
+        run = started.group(1).decode(errors="replace")
+        try:
+            held = self.asked_on(asked, machine, ["wait", run], alive)
+        except Cut as cut:
+            raise Cut(cut.sentence, f"run {run}\n".encode() + cut.out) from cut
+        return Ran(held.code, f"run {run}\n".encode() + held.out, held.err)
+
+    def still_open(self, asked):
+        try:
+            return self.waiting(asked)
+        except Refused as refused:
+            say("pods_request_unchecked", request=asked["request"], detail=json.dumps(refused.sentence))
+            return True
+
+    def record(self, words, machine, out):
+        started = STARTED.search(out)
+        if started is not None:
+            with self.lock:
+                self.launched[tuple(words)] = (machine, started.group(1).decode(errors="replace"))
+
+    def claim(self, asked, settings, words, alive):
+        key = tuple(words)
+        with self.lock:
+            place = self.launched.get(key)
+        seen = []
+        while place is not None and place not in seen:
+            seen.append(place)
+            machine, run = place
+            try:
+                ran = self.asked_on(asked, machine, ["claim", run, *words], alive)
+            except Refused as refused:
+                return self.claimed(asked, settings, key, place, f"it was not checked there ({refused.sentence})", alive)
+            said = ran.out.decode(errors="replace").strip()
+            if ran.code == 0 and said.startswith("same "):
+                return self.claimed(asked, settings, key, (machine, said[5:].strip()), "it is still queued or running there", alive)
+            if ran.code == 0 and said.startswith("moved ") and ":" in said:
+                place = tuple(said[6:].strip().split(":", 1))
+                continue
+            if ran.code == 3 and said.startswith("unknown "):
+                return self.claimed(asked, settings, key, place, f"it was not checked there ({said[8:]})", alive)
+            with self.lock:
+                if self.launched.get(key) in seen:
+                    del self.launched[key]
+            say("pods_run_unclaimed", run=json.dumps(f"{machine}:{run}"), reason=json.dumps(said.split()[0] if said else f"exit {ran.code}"))
+            return None
+        return None
+
+    def claimed(self, asked, settings, key, place, why, alive):
+        machine, run = place
+        with self.lock:
+            self.launched[key] = place
+        say("pods_run_claimed", run=json.dumps(f"{machine}:{run}"), request=asked["request"])
+        note = f"the same call started run {machine}:{run} for an earlier request, and {why}, so this call gets that run rather than a second one"
+        if "WAIT=1" in settings:
+            try:
+                ran = self.asked_on(asked, machine, ["wait", run], alive)
+                return on_machine(machine, Ran(ran.code, f"run {run}\n".encode() + ran.out, f"{note}\n{ran.err}".rstrip("\n")))
+            except Refused as refused:
+                note = f"{note}; its wait was not held ({refused.sentence})"
+        return on_machine(machine, Ran(0, f"run {run}\nread it with: build.sh status {run}\n".encode(), note))
 
     def holder(self, asked, run, alive):
         unasked, lacking = [], []

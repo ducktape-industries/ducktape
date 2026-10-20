@@ -198,7 +198,7 @@ one up for another network.
   end), and
   a take cut mid-call answers 502 naming the runs it may have started. A builds call that finds the desktop's lane free reroutes
   once it is sent, one reroute at a time (`pods_rerouted`, or
-  `pods_reroute_failed` with its sentence). Its exec takes build.sh's words as
+  `pods_reroute_failed` with its sentence). A call whose request egress says is gone runs nothing (502), and one egress can't be asked about runs and logs `pods_request_unchecked`. builds keeps each run it starts under the call's words (settings included), so a later call of the same words (a retry whose answer never came back) gets that run while the run's machine's `build.sh claim` says `same` (queued or running, the same call and JOB, and a branch it names still at the run's commit), following `moved` to the run that stands for it, and also while that machine can't be asked or forge can't say (`pods_run_claimed`; a `WAIT=1` call then waits on it); otherwise it starts its own (`pods_run_unclaimed`). As exec starts and ends wake the sweeper, one `build.sh ended` per machine holding such runs drops each that ended and follows each moved, keeping those of a machine it can't ask, and dropping those of a pod that is gone. Its exec takes build.sh's words as
   `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
   stderr starts `builds: on <machine>`. `status`, `log`, `stop`, `wait` and
   `requeue` name their run as `<machine>:<run>` and go to that machine, or
