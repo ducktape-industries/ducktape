@@ -80,13 +80,14 @@ fn every_handler_takes_the_request_context_and_none_takes_the_daemon() {
     );
 }
 
-const DISPATCHES: [(&str, &str); 6] = [
+const DISPATCHES: [(&str, &str); 7] = [
     ("live/table.rs", "match event {"),
     ("pool.rs", "let flow = match event {"),
     ("changes.rs", "let flow = match event {"),
     ("run.rs", "let flow = match event {"),
     ("run.rs", "match command {"),
     ("activity.rs", "let flow = match event {"),
+    ("server.rs", "match heard {"),
 ];
 
 fn body_after(text: &str, head: &str) -> String {

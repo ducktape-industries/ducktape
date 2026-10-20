@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -39,6 +38,7 @@ impl Rpc {
         daemon: Arc<Daemon<E>>,
         listener: std::net::TcpListener,
         fanout: Fanout,
+        answers: tokio::sync::mpsc::UnboundedReceiver<Answered>,
         rpc_cpus: Option<Vec<usize>>,
         blocking_threads: Option<std::num::NonZeroUsize>,
     ) -> crate::Result<Rpc> {
@@ -61,9 +61,8 @@ impl Rpc {
         }
         let runtime = builder.build()?;
         let block_time = Duration::from_millis(daemon.network.cadence.block_time_ms());
-        let timing = Arc::new(Timing::new(block_time));
-        let router = router(daemon.clone(), timing.clone());
-        runtime.spawn(slow_lines(timing, daemon.tips.subscribe()));
+        let router = router(daemon.clone());
+        runtime.spawn(slow_lines(block_time, answers, daemon.tips.subscribe()));
         runtime.spawn(changes::fan(fanout));
         for _ in 0..threads {
             let door = listener.try_clone()?;
@@ -131,9 +130,9 @@ impl Drop for Rpc {
     }
 }
 
-struct Timing {
-    slow: Duration,
-    window: std::sync::Mutex<Slowed>,
+pub(crate) struct Answered {
+    route: String,
+    spent: Duration,
 }
 
 #[derive(Default)]
@@ -143,35 +142,27 @@ struct Slowed {
     slowest: String,
 }
 
-impl Timing {
-    fn new(slow: Duration) -> Timing {
-        Timing {
-            slow,
-            window: std::sync::Mutex::default(),
-        }
-    }
-
-    fn observe(&self, spent: Duration, route: &str) {
-        if spent <= self.slow {
+impl Slowed {
+    fn observe(&mut self, answered: Answered, slow: Duration) {
+        if answered.spent <= slow {
             return;
         }
-        let elapsed_ms = spent.as_millis() as u64;
-        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
-        window.count += 1;
-        if elapsed_ms >= window.max_ms {
-            window.max_ms = elapsed_ms;
-            window.slowest = route.to_owned();
+        let elapsed_ms = answered.spent.as_millis() as u64;
+        self.count += 1;
+        if elapsed_ms >= self.max_ms {
+            self.max_ms = elapsed_ms;
+            self.slowest = answered.route;
         }
-    }
-
-    fn closed(&self) -> Option<Slowed> {
-        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
-        let slowed = std::mem::take(&mut *window);
-        (slowed.count > 0).then_some(slowed)
     }
 }
 
-fn router<E: Context>(daemon: Arc<Daemon<E>>, timing: Arc<Timing>) -> Router {
+enum Heard {
+    Tip,
+    Answered(Answered),
+    Ended,
+}
+
+fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
     Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
@@ -201,12 +192,15 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>, timing: Arc<Timing>) -> Router {
         )
         .route(route::P2P, get(p2p::<E>))
         .route(live_wire::ROUTE, get(live_socket::<E>))
-        .layer(axum::middleware::from_fn_with_state(timing, timed))
+        .layer(axum::middleware::from_fn_with_state(
+            daemon.clone(),
+            timed::<E>,
+        ))
         .with_state(daemon)
 }
 
-async fn timed(
-    axum::extract::State(timing): axum::extract::State<Arc<Timing>>,
+async fn timed<E: Context>(
+    ctx: Ctx<E>,
     request: Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -229,16 +223,47 @@ async fn timed(
         elapsed_ms,
         "a request answered its head"
     );
-    timing.observe(spent, route);
+    ctx.answered(Answered {
+        route: route.to_owned(),
+        spent,
+    });
     response
 }
 
-async fn slow_lines(timing: Arc<Timing>, mut tips: tokio::sync::watch::Receiver<u64>) {
-    while tips.changed().await.is_ok() {
-        let height = *tips.borrow_and_update();
-        let Some(slowed) = timing.closed() else {
-            continue;
+async fn slow_lines(
+    slow: Duration,
+    mut answers: tokio::sync::mpsc::UnboundedReceiver<Answered>,
+    mut tips: tokio::sync::watch::Receiver<u64>,
+) {
+    let mut window = Slowed::default();
+    loop {
+        let heard = tokio::select! {
+            biased;
+            changed = tips.changed() => match changed {
+                Ok(()) => Heard::Tip,
+                Err(_) => Heard::Ended,
+            },
+            Some(answered) = answers.recv() => Heard::Answered(answered),
         };
+        match heard {
+            Heard::Tip => window = closed(window, slow, &mut answers, *tips.borrow_and_update()),
+            Heard::Answered(answered) => window.observe(answered, slow),
+            Heard::Ended => return,
+        }
+    }
+}
+
+fn closed(
+    mut window: Slowed,
+    slow: Duration,
+    answers: &mut tokio::sync::mpsc::UnboundedReceiver<Answered>,
+    height: u64,
+) -> Slowed {
+    while let Ok(answered) = answers.try_recv() {
+        window.observe(answered, slow);
+    }
+    if window.count > 0 {
+        let slowed = window;
         tracing::warn!(
             target: "ducktape::http",
             event = "request_slow",
@@ -246,11 +271,12 @@ async fn slow_lines(timing: Arc<Timing>, mut tips: tokio::sync::watch::Receiver<
             count = slowed.count,
             max_ms = slowed.max_ms,
             slowest = slowed.slowest,
-            block_time_ms = timing.slow.as_millis() as u64,
+            block_time_ms = slow.as_millis() as u64,
             reason = "block_time_exceeded",
             "requests took longer than a block time to answer their heads since the block before"
         );
     }
+    Slowed::default()
 }
 
 struct Whole(Bytes);
@@ -1043,13 +1069,19 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let timing = Arc::new(Timing::new(BLOCK));
+                let (answered, answers) = tokio::sync::mpsc::unbounded_channel();
                 let (tips, tipped) = tokio::sync::watch::channel(0);
-                let lining = tokio::spawn(slow_lines(timing.clone(), tipped));
-                timing.observe(BLOCK * 2, "/v1/query");
-                timing.observe(BLOCK * 5, "/v1/tx");
-                timing.observe(BLOCK * 3, "/v1/query");
-                timing.observe(BLOCK, "/v1/status");
+                let lining = tokio::spawn(slow_lines(BLOCK, answers, tipped));
+                let requests = [
+                    (BLOCK * 2, "/v1/query"),
+                    (BLOCK * 5, "/v1/tx"),
+                    (BLOCK * 3, "/v1/query"),
+                    (BLOCK, "/v1/status"),
+                ];
+                for (spent, route) in requests {
+                    let route = route.to_owned();
+                    answered.send(Answered { route, spent }).unwrap();
+                }
                 tips.send_replace(1);
                 let line = lines.recv().await.unwrap();
                 assert_eq!(line["height"], "1");

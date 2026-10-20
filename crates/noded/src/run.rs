@@ -594,6 +594,7 @@ async fn start<E: Context>(
     let tally = Tally::registered(&writing);
     let (writer, commands) = Writer::new(tally.queued.clone());
     let (changes, fanout) = Changes::new(network.clone(), tip.height);
+    let (answered, answers) = tokio::sync::mpsc::unbounded_channel();
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         current,
@@ -617,6 +618,7 @@ async fn start<E: Context>(
         halo,
         live,
         egress,
+        answered,
         key: identity.clone(),
         mesh: transport::loopback(p2p),
     });
@@ -665,6 +667,7 @@ async fn start<E: Context>(
         daemon.clone(),
         listeners.http,
         fanout,
+        answers,
         load.rpc_cpus,
         load.rpc_blocking_threads,
     )?;

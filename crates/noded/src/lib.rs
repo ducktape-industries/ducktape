@@ -164,6 +164,7 @@ pub struct Daemon<E: Context> {
     halo: Arc<halo::Halo>,
     pub live: Arc<live::Relay<E>>,
     egress: egress::Station,
+    answered: tokio::sync::mpsc::UnboundedSender<server::Answered>,
     key: commonware_cryptography::ed25519::PrivateKey,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).

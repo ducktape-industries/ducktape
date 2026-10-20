@@ -206,6 +206,10 @@ impl<E: Context> Ctx<E> {
         self.daemon.live.clone()
     }
 
+    pub(crate) fn answered(&self, answered: crate::server::Answered) {
+        let _ = self.daemon.answered.send(answered);
+    }
+
     pub(crate) fn live_port(&self) -> Option<u16> {
         self.daemon.live.port()
     }
