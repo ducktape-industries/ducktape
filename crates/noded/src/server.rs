@@ -262,15 +262,24 @@ async fn slow_lines(
             Some(answered) = answers.recv() => Heard::Answered(answered),
         };
         match heard {
-            Heard::Tip => {
-                let height = *tips.borrow_and_update();
-                window = closed(window, slow, &mut answers, height);
-                holds_closed(&holds_ended, height);
-            }
+            Heard::Tip => window = tipped(window, slow, &mut answers, &mut tips, &holds_ended),
             Heard::Answered(answered) => window.observe(answered, slow),
             Heard::Ended => return,
         }
     }
+}
+
+fn tipped(
+    window: Slowed,
+    slow: Duration,
+    answers: &mut tokio::sync::mpsc::UnboundedReceiver<Answered>,
+    tips: &mut tokio::sync::watch::Receiver<u64>,
+    holds_ended: &AtomicU64,
+) -> Slowed {
+    let height = *tips.borrow_and_update();
+    let window = closed(window, slow, answers, height);
+    holds_closed(holds_ended, height);
+    window
 }
 
 fn closed(
