@@ -202,7 +202,9 @@ SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 DESKTOP = "desktop"
 BUILDS = "builds"
 ADDRESSED = frozenset({"status", "log", "stop", "wait", "requeue"})
-MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-targets", "queue-out", "queue-in", "self-update", "worktree", "measure", "claim", "ended"})
+MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-targets", "queue-out", "queue-in", "self-update", "worktree", "measure", "claim", "ended", "holds"})
+COMMIT_ID = re.compile(r"[0-9a-f]{7,40}")
+APPLY_VALUED = frozenset({"-m", "-F", "--onto", "--base"})
 WEIGHTS = frozenset({"heavy", "light", "quiet", "lane", "quick"})
 READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
 STARTED = re.compile(rb"^run (\S+)$", re.M)
@@ -796,6 +798,21 @@ def go_time(text):
     clock, fraction, offset = found.groups()
     whole = datetime.datetime.strptime(f"{clock} {offset}", "%Y-%m-%d %H:%M:%S %z").timestamp()
     return whole + int((fraction or "0").ljust(9, "0")) / 1e9
+
+
+def named_commit(called):
+    if called[:1] == ["apply"]:
+        rest, places = called[1:], []
+        while rest:
+            word, rest = rest[0], rest[1:]
+            if word in APPLY_VALUED:
+                rest = rest[1:]
+            elif not word.startswith("-"):
+                places.append(word)
+        repo, ref = (places + ["", ""])[:2]
+    else:
+        repo, ref = (called + ["", ""])[:2]
+    return (repo, ref) if repo and COMMIT_ID.fullmatch(ref) else None
 
 
 def on_machine(machine, ran, started=True):
@@ -2374,6 +2391,11 @@ class Service:
         if claimed is not None:
             return claimed
         machine, idle = self.pick(asked, words, alive)
+        named = named_commit(called)
+        if named is not None:
+            held = self.holding(asked, machine, *named, alive)
+            idle = idle and held == machine
+            machine = held
         if not self.still_open(asked):
             raise Refused(502, f"request {asked['request']}, which asked for this, is gone, so build.sh was not called on pod {machine}: nothing ran")
         try:
@@ -2419,6 +2441,33 @@ class Service:
         except Cut as cut:
             raise Cut(cut.sentence, f"run {run}\n".encode() + cut.out) from cut
         return Ran(held.code, f"run {run}\n".encode() + held.out, held.err)
+
+    def holding(self, asked, machine, repo, commit, alive):
+        if self.holds(asked, machine, repo, commit, alive) is not False:
+            return machine
+        if machine == DESKTOP:
+            try:
+                other = self.warm()
+            except Refused:
+                return machine
+        else:
+            other = DESKTOP
+        if self.holds(asked, other, repo, commit, alive) is not True:
+            return machine
+        say("pods_routed", to=DESKTOP if other == DESKTOP else "warm", reason="holds_commit", detail=json.dumps(f"{repo} {commit} is in pod {other}'s clone and not in pod {machine}'s"))
+        return other
+
+    def holds(self, asked, machine, repo, commit, alive):
+        try:
+            ran = self.asked_on(asked, machine, ["holds", repo, commit], alive)
+        except Refused:
+            return None
+        said = ran.out.decode(errors="replace").strip()
+        if ran.code == 0 and said.startswith("holds "):
+            return True
+        if ran.code == 1 and said.startswith("lacks "):
+            return False
+        return None
 
     def still_open(self, asked):
         try:

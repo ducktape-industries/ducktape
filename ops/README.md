@@ -200,7 +200,14 @@ one up for another network.
   only a desktop that is down then leaves a call nowhere to run (503, or
   the file's 502). A desktop run whose session was cut while no warm pod
   is named answers 502 with both reasons, naming the run when it started
-  (`pods_unrouted`). `reroute` (build.sh's
+  (`pods_unrouted`). A call naming a commit id (7 to 40 hex digits, an
+  apply's base too) asks the picked machine's `build.sh holds <repo>
+  <commit>` (its clone, no fetch); when that machine lacks it and the other
+  holds it, the run goes to the other (`pods_routed reason=holds_commit`), so
+  a commit made on one machine (an apply not pushed yet) builds where it
+  is; when neither holds it the run goes where it waits least and fetches
+  it from forge, and a commit forge lacks too ends saying to push it
+  first. `reroute` (build.sh's
   words `reroute` alone) moves the warm pod's queued runs to the desktop
   while the desktop would start them sooner: the warm pod's `build.sh
   movable` (the queued runs another machine may take, in lane order: the

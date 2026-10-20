@@ -3046,6 +3046,62 @@ class Builds(Streamed):
         self.service.sweep()
         self.assertEqual(self.service.launched, {})
 
+    def test_a_commit_only_the_desktop_holds_runs_there_though_the_warm_pod_waits_less(self):
+        made = "f1916715" + "0" * 32
+        self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")
+        self.gate.answers["exec holds"] = ran(f"holds {made}\n".encode())
+        self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(f"lacks {made}\n".encode(), code=1), ran(b"run w1\n"))
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("JOB=j-1", "programs", made, "lane")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "ahead", "JOB=j-1", "programs", made, "lane"]), (WARM, None, ["sh", BUILD, "holds", "programs", made])])
+        self.assertEqual(self.gate.words()[-2:], [["exec", "holds", "programs", made], ["exec", "JOB=j-1", "programs", made, "lane"]])
+        said.assert_any_call("pods_routed", to="desktop", reason="holds_commit", detail=json.dumps(f"programs {made} is in pod desktop's clone and not in pod {WARM}'s"))
+
+    def test_an_unpushed_apply_base_the_warm_pod_holds_goes_there(self):
+        made = "abc1234"
+        self.gate.answers["exec holds"] = ran(f"lacks {made}\n".encode(), code=1)
+        self.kube.answer("exec", ran(f"holds {made}{'0' * 33}\n".encode()), ran(b"run w1\n"))
+        status, answer = self.built("apply", "--no-gate", "programs", made, "/home/x/edit.sh", "-m", "a subject")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"))
+        self.assertEqual(self.warm_execs()[0], (WARM, None, ["sh", BUILD, "holds", "programs", made]))
+
+    def test_a_commit_the_picked_machine_holds_asks_no_other(self):
+        made = "f1916715" + "0" * 32
+        self.gate.answers["exec holds"] = ran(f"holds {made}\n".encode())
+        self.assertEqual(self.built("programs", made, "lane")[1]["stdout"].splitlines()[0], "run desktop:r1")
+        self.assertEqual(self.warm_execs(), [])
+
+    def test_a_commit_no_clone_holds_runs_where_it_waits_least_and_fetches_it(self):
+        made = "f1916715" + "0" * 32
+        self.gate.answers["exec holds"] = ran(f"lacks {made}\n".encode(), code=1)
+        self.kube.answer("exec", ran(f"lacks {made}\n".encode(), code=1))
+        self.assertEqual(self.built("programs", made, "lane")[1]["stdout"].splitlines()[0], "run desktop:r1")
+        self.assertEqual(self.gate.words()[-1], ["exec", "programs", made, "lane"])
+
+    def test_a_holds_that_fails_on_the_picked_machine_keeps_the_pick_and_asks_no_other(self):
+        made = "f1916715" + "0" * 32
+        self.gate.answers["exec holds"] = ran(code=2, err="build.sh: usage: build.sh holds <repo> <commit>")
+        self.assertEqual(self.built("programs", made, "lane")[1]["stdout"].splitlines()[0], "run desktop:r1")
+        self.assertEqual(self.warm_execs(), [])
+
+    def test_an_answer_from_the_other_machine_that_is_neither_holds_nor_lacks_keeps_the_pick(self):
+        made = "f1916715" + "0" * 32
+        self.gate.answers["ahead"] = ran(b"ahead heavy 2\n")
+        self.gate.answers["exec holds"] = ran(b"run r9\nread it with: build.sh status r9\n")
+        self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(f"lacks {made}\n".encode(), code=1), ran(b"run w1\n"))
+        self.assertEqual(self.built("programs", made, "lane")[1]["stdout"].splitlines()[0], f"run {WARM}:w1")
+        self.assertNotIn(["exec", "programs", made, "lane"], self.gate.words())
+
+    def test_an_apply_flag_value_that_looks_like_a_commit_is_not_its_base(self):
+        self.built("apply", "programs", "-m", "abc1234", "dev", "/home/x/edit.sh")
+        self.assertNotIn("holds", [words[1] for words in self.gate.words() if len(words) > 1])
+        self.assertNotIn("holds", [call[2][2] for call in self.warm_execs() if len(call[2]) > 2])
+
+    def test_a_branch_is_never_asked_after(self):
+        self.built("programs", "dev", "lane")
+        self.assertNotIn("holds", [words[1] for words in self.gate.words() if len(words) > 1])
+
     def test_reroute_moves_each_queued_run_the_desktop_would_start_sooner(self):
         self.kube.answer("exec", ran(b"move w2 heavy 4 d29yZHMy\nmove w1 heavy 3 d29yZHMx\nkeep w3 a pack holds its result on this machine\n"), ran(b"w1: moved to run desktop:r1\nw2: moved to run desktop:r2\n"))
         self.gate.answers["exec lanes"] = ran(b"heavy 1\nlane 0\nquick:programs 0\n")
