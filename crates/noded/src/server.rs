@@ -1,12 +1,14 @@
 use std::sync::Arc;
+use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use abi::Receipt;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
-use axum::extract::{FromRequest, Path, RawQuery, Request};
+use axum::extract::{FromRequest, MatchedPath, Path, RawQuery, Request};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -58,7 +60,10 @@ impl Rpc {
             builder.max_blocking_threads(blocking.get());
         }
         let runtime = builder.build()?;
-        let router = router(daemon.clone());
+        let block_time = Duration::from_millis(daemon.network.cadence.block_time_ms());
+        let timing = Arc::new(Timing::new(block_time));
+        let router = router(daemon.clone(), timing.clone());
+        runtime.spawn(slow_lines(timing, daemon.tips.subscribe()));
         runtime.spawn(changes::fan(fanout));
         for _ in 0..threads {
             let door = listener.try_clone()?;
@@ -126,7 +131,47 @@ impl Drop for Rpc {
     }
 }
 
-pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
+struct Timing {
+    slow: Duration,
+    window: std::sync::Mutex<Slowed>,
+}
+
+#[derive(Default)]
+struct Slowed {
+    count: u64,
+    max_ms: u64,
+    slowest: String,
+}
+
+impl Timing {
+    fn new(slow: Duration) -> Timing {
+        Timing {
+            slow,
+            window: std::sync::Mutex::default(),
+        }
+    }
+
+    fn observe(&self, spent: Duration, route: &str) {
+        if spent <= self.slow {
+            return;
+        }
+        let elapsed_ms = spent.as_millis() as u64;
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+        window.count += 1;
+        if elapsed_ms >= window.max_ms {
+            window.max_ms = elapsed_ms;
+            window.slowest = route.to_owned();
+        }
+    }
+
+    fn closed(&self) -> Option<Slowed> {
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+        let slowed = std::mem::take(&mut *window);
+        (slowed.count > 0).then_some(slowed)
+    }
+}
+
+fn router<E: Context>(daemon: Arc<Daemon<E>>, timing: Arc<Timing>) -> Router {
     Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
@@ -157,7 +202,56 @@ pub fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         )
         .route(route::P2P, get(p2p::<E>))
         .route(live_wire::ROUTE, get(live_socket::<E>))
+        .layer(axum::middleware::from_fn_with_state(timing, timed))
         .with_state(daemon)
+}
+
+async fn timed(
+    axum::extract::State(timing): axum::extract::State<Arc<Timing>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned());
+    let method = request.method().clone();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let spent = started.elapsed();
+    let route = route.as_deref().unwrap_or("unrouted");
+    let status = response.status().as_u16();
+    let elapsed_ms = spent.as_millis() as u64;
+    tracing::debug!(
+        target: "ducktape::http",
+        route,
+        %method,
+        status,
+        elapsed_ms,
+        "a request answered its head"
+    );
+    timing.observe(spent, route);
+    response
+}
+
+async fn slow_lines(timing: Arc<Timing>, mut tips: tokio::sync::watch::Receiver<u64>) {
+    while tips.changed().await.is_ok() {
+        let height = *tips.borrow_and_update();
+        let Some(slowed) = timing.closed() else {
+            continue;
+        };
+        tracing::warn!(
+            target: "ducktape::http",
+            event = "request_slow",
+            height,
+            count = slowed.count,
+            max_ms = slowed.max_ms,
+            slowest = slowed.slowest,
+            block_time_ms = timing.slow.as_millis() as u64,
+            reason = "block_time_exceeded",
+            "requests took longer than a block time to answer their heads since the block before"
+        );
+    }
 }
 
 struct Whole(Bytes);
@@ -847,6 +941,8 @@ async fn live_socket<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Resp
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use axum::body::Body;
 
     use super::*;
@@ -906,5 +1002,77 @@ mod tests {
         assert_eq!(response.status().as_u16(), 200);
         let read = response.text().await.unwrap();
         assert_eq!(read, PAST_AXUM_DEFAULT_LIMIT.to_string());
+    }
+
+    struct Caught(tokio::sync::mpsc::UnboundedSender<BTreeMap<String, String>>);
+
+    struct Fields(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Fields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Caught {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            let slow = fields
+                .0
+                .get("event")
+                .is_some_and(|event| event == "request_slow");
+            if slow {
+                let _ = self.0.send(fields.0);
+            }
+        }
+    }
+
+    const BLOCK: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn slow_requests_in_one_block_make_one_line_with_their_count_and_a_quiet_block_none() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (caught, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = tracing_subscriber::registry().with(Caught(caught));
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let timing = Arc::new(Timing::new(BLOCK));
+                let (tips, tipped) = tokio::sync::watch::channel(0);
+                let lining = tokio::spawn(slow_lines(timing.clone(), tipped));
+                timing.observe(BLOCK * 2, "/v1/query");
+                timing.observe(BLOCK * 5, "/v1/tx");
+                timing.observe(BLOCK * 3, "/v1/query");
+                timing.observe(BLOCK, "/v1/status");
+                tips.send_replace(1);
+                let line = lines.recv().await.unwrap();
+                assert_eq!(line["height"], "1");
+                assert_eq!(line["count"], "3");
+                assert_eq!(line["max_ms"], (BLOCK * 5).as_millis().to_string());
+                assert_eq!(line["slowest"], "/v1/tx");
+                tips.send_replace(2);
+                drop(tips);
+                lining.await.unwrap();
+                assert!(
+                    lines.try_recv().is_err(),
+                    "a block with no slow request writes nothing"
+                );
+            });
+        });
     }
 }
