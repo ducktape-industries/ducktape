@@ -3075,6 +3075,27 @@ class Service:
                 raise Refused(404, f"{method} {parts.path} is not a route")
 
 
+POD_ROUTES = ("logs", "wait", "exec", "blob", "file", "push")
+
+
+def route_of(target):
+    match [segment for segment in urlsplit(target).path.split("/") if segment]:
+        case ["v1", ("pods" | "manifests" | "usage") as route]:
+            return route
+        case ["v1", "pods", _]:
+            return "pods/NAME"
+        case ["v1", "pods", _, action] if action in POD_ROUTES:
+            return f"pods/NAME/{action}"
+        case ["v1", "manifests", _]:
+            return "manifests/KIND"
+        case ["v1", "manifests", _, _]:
+            return "manifests/KIND/NAME"
+        case ["v1", "k8s", *_]:
+            return "k8s"
+        case _:
+            return "unknown"
+
+
 def parsed(body):
     try:
         return json.loads(body or b"{}")
@@ -3150,9 +3171,8 @@ def handler(service):
             self.respond("PATCH")
 
         def log_message(self, form, *args):
-            route = urlsplit(self.path).path
             status = args[1] if len(args) > 1 else ""
-            say("pods_request", method=self.command, route=route, status=status)
+            say("pods_request", method=self.command, route=route_of(self.path), status=status)
 
     return Handler
 

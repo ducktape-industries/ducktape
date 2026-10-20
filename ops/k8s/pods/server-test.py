@@ -1645,6 +1645,34 @@ class Passthrough(Served):
         self.assertEqual(self.kube.calls, [])
 
 
+class Logged(Served):
+    def test_a_request_is_logged_by_its_route_never_by_its_path(self):
+        loud = server.ThreadingHTTPServer(("127.0.0.1", 0), server.handler(self.service))
+        threading.Thread(target=loud.serve_forever, daemon=True).start()
+        self.addCleanup(loud.server_close)
+        self.addCleanup(loud.shutdown)
+        said = []
+        paths = {
+            "/v1/pods": "pods",
+            "/v1/pods/duckpond-41/logs?tail=5": "pods/NAME/logs",
+            "/v1/manifests/deployment/web": "manifests/KIND/NAME",
+            "/v1/k8s/api/v1/namespaces/kube-system/secrets/token?watch=1": "k8s",
+            "/v1/pods/duckpond-41/token": "unknown",
+            "/v1/nowhere/token": "unknown",
+        }
+        with unittest.mock.patch.object(server, "say", lambda event, **fields: said.append((event, fields))):
+            for path in paths:
+                connection = http.client.HTTPConnection(*loud.server_address)
+                connection.request("GET", path, headers=ASKED)
+                connection.getresponse().read()
+                connection.close()
+        logged = [fields for event, fields in said if event == "pods_request"]
+        self.assertEqual([fields["route"] for fields in logged], list(paths.values()))
+        for fields in logged:
+            for secret in ("duckpond-41", "deployment", "web", "kube-system", "token", "tail", "watch"):
+                self.assertNotIn(secret, " ".join(map(str, fields.values())))
+
+
 class Usage(Served):
     def test_usage_reports_the_quota_and_each_requesters_share_and_measure(self):
         building = pod_json(name="b", phase="Running", requester="15")
