@@ -85,25 +85,26 @@ fn programs() -> [String; 2] {
 
 fn reopened(stopped: Stopped) -> Opened {
     let dir = tempfile::tempdir().unwrap();
-    let (roots, checkpoint) = deterministic::Runner::default().start_and_recover(|context| {
-        let dir = &dir;
-        async move {
-            let storage = Storage::open(dir.path()).unwrap();
-            let mut store = Store::open(context.child("store"), "s", storage, programs())
-                .await
-                .unwrap();
-            for height in 0..BLOCKS {
-                store.commit(height, block(height)).await.unwrap();
-            }
-            if let Stopped::Synced = stopped {
-                store.sync().await.unwrap();
-            }
-            store.roots().unwrap()
-        }
-    });
     let watch = Watch::default();
     let subscriber = tracing_subscriber::registry().with(watch.clone());
     tracing::subscriber::with_default(subscriber, || {
+        let (roots, checkpoint) = deterministic::Runner::default().start_and_recover(|context| {
+            let dir = &dir;
+            async move {
+                let storage = Storage::open(dir.path()).unwrap();
+                let mut store = Store::open(context.child("store"), "s", storage, programs())
+                    .await
+                    .unwrap();
+                for height in 0..BLOCKS {
+                    store.commit(height, block(height)).await.unwrap();
+                }
+                if let Stopped::Synced = stopped {
+                    store.sync().await.unwrap();
+                }
+                store.roots().unwrap()
+            }
+        });
+        std::mem::take(&mut *watch.0.lock().unwrap());
         deterministic::Runner::from(checkpoint).start(|context| async move {
             let storage = Storage::open(dir.path()).unwrap();
             let store = Store::open(context.child("reopened"), "s", storage, programs())
