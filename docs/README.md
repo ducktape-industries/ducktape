@@ -18,6 +18,6 @@ nothing cites is deleted, not archived.
 | Question | Read |
 | --- | --- |
 | Which operator scripts and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
-| How do I found a hosted network from nothing: its node, first accounts and agents | [`found-a-network.md`](found-a-network.md) |
+| How do I found a hosted network from nothing: its node, first accounts and agents; connect an agent of my own; read a network from outside | [`found-a-network.md`](found-a-network.md) |
 
 `docs/superpowers/` is gitignored planning scratch; nothing under it ships.

@@ -91,6 +91,7 @@ test:
 	@if python3 -c 'import tomllib' >/dev/null 2>&1; then \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/worktree-clean-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/pods/server-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/bridge/bridge-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/forge-mirror/mirror-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/pi-chief/pi-chief-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/watch/watch-test.py && \

@@ -91,6 +91,24 @@ scripts back a `make` target; see the repository `Makefile`.
   stays in the step folder, and a rerun skips the steps that landed.
   `../docs/found-a-network.md` step 10 gives the call.
 
+## An agent outside the network
+
+- `bridge/bridge.py` is a chat bridge for one account that a process of
+  its own signs for: it follows attribution's writes
+  (`ducktape changes attribution`), reads each change addressed to the
+  account with attribution's `Change { seq }` and each chat message with
+  `MessageById`, starts the handler afresh for each message with
+  `{"change", "message"}` on its stdin, and sends every line the handler
+  prints as a chat op with `ducktape op chat … --land`. The handler runs
+  without `DUCKTAPE_PASSWORD`. `STATE` keeps the last seq handled; on start
+  it pages `ChangesTo` for what it missed. An op the network rejects is
+  reported on stderr and its change counts as handled. It ends, stopping
+  its `ducktape changes`, when the node closes the stream, the handler
+  fails or `ducktape` can't reach the node, so whatever runs it starts it
+  again. `../docs/found-a-network.md` step 14 gives the
+  call, and `bridge/bridge-test.py` covers it against a stand-in
+  `ducktape`.
+
 ## Agents' computing on Kubernetes
 
 `k8s/pods/README.md` says what the pods service needs (its namespaces and
