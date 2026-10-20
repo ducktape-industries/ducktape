@@ -626,10 +626,19 @@ receipted. `--wait` follows the blobs program's confirmed writes until then.
 Consensus never waits on a blob: a program reads a blob that a program put
 or a held bundle names (`ctx.blob_get`), and a node that lacks one when a
 block reads it fetches it over halo before it applies the block. A blob's roster row
-names the programs that put it, and a program lets go of its own hold with the
-host op `BlobRelease`. Once no program holds it, the row goes, and after that
-block commits the node deletes the blob's file, unless a held bundle names it
-or a program runs it as code. A row written before rows named their holders
+names the programs that hold it. A put holds its blob on a line the program
+names (`BlobKeep { hash, kind, body, line }`: a path, a slot, or for a one-off
+the blob's own id) until a newer put by that program on the same line, or
+until the program lets go with the host op `BlobRelease`. `BlobPut { hash,
+kind, body }` holds a blob on its own line, until released, and so does every
+row written before lines existed. A program that holds one blob on several
+lines holds it while any of them does, and `BlobRelease` lets go of it on all of
+them. The roster row keeps only how many lines hold a blob; each line that holds
+it is a key of its own, so a put rewrites one small row however many paths share
+the blob. Once no program holds it, the row goes, and after that block commits the
+node deletes the blob's file, unless a held bundle names it or a program runs it
+as code. Every node does this, so a read of a released blob that no held bundle
+names answers no blob, the same as a read of an id nobody put. A row written before rows named their holders
 names none, and nothing releases it. A joiner streams only the programs' code
 and notes any its source no longer serves. If any is noted and the source's
 head has moved, it syncs to the new head, holding it as it holds the first,

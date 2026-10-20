@@ -146,10 +146,10 @@ halo = { path = "crates/networking/halo" }
 # publish and subscribe to tracks; a client links this and nothing of the node.
 live-wire = { path = "crates/networking/live-wire" }
 blob = { path = "crates/blob", default-features = false }
-borsh-json = { git = "https://github.com/ducktape-industries/programs", rev = "53d4f2f654746d3ce51d73d4a378045dddb3a3fe" }
-identity = { git = "https://github.com/ducktape-industries/programs", rev = "53d4f2f654746d3ce51d73d4a378045dddb3a3fe" }
-programs-sdk = { package = "program", git = "https://github.com/ducktape-industries/programs", rev = "53d4f2f654746d3ce51d73d4a378045dddb3a3fe" }
-store = { git = "https://github.com/ducktape-industries/programs", rev = "53d4f2f654746d3ce51d73d4a378045dddb3a3fe" }
+borsh-json = { git = "https://github.com/ducktape-industries/programs", rev = "be93219606bb5dd33acd5b714ac97b71b88fcd98" }
+identity = { git = "https://github.com/ducktape-industries/programs", rev = "be93219606bb5dd33acd5b714ac97b71b88fcd98" }
+programs-sdk = { package = "program", git = "https://github.com/ducktape-industries/programs", rev = "be93219606bb5dd33acd5b714ac97b71b88fcd98" }
+store = { git = "https://github.com/ducktape-industries/programs", rev = "be93219606bb5dd33acd5b714ac97b71b88fcd98" }
 
 # the rng bounds commonware-runtime 2026.9.0 depends on (a different
 # semver-major would be a different trait).

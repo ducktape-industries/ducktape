@@ -1978,7 +1978,7 @@ where
         };
         let dropped: Vec<&Vec<u8>> = roster
             .iter()
-            .filter(|(_, slot)| slot.is_none())
+            .filter(|(key, slot)| slot.is_none() && !namespace::is_index(key))
             .map(|(key, _)| key)
             .collect();
         if dropped.is_empty() {

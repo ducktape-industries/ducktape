@@ -3492,11 +3492,8 @@ fn a_blob_is_released_once_no_program_that_put_it_holds_it() {
         };
         let holders = |host: &Host<Ctx>, id: &BlobId| {
             row(host, id).map(|value| {
-                let held: BTreeMap<String, abi::Retention> = abi::decode(&value).unwrap();
-                assert!(
-                    held.values()
-                        .all(|kept| *kept == abi::Retention::Referenced)
-                );
+                let held: BTreeMap<String, u8> = abi::decode(&value).unwrap();
+                assert!(held.values().all(|alone| *alone == 0));
                 held.into_keys().collect::<Vec<_>>()
             })
         };
@@ -3597,6 +3594,262 @@ fn a_blob_is_released_once_no_program_that_put_it_holds_it() {
         assert_eq!(row(&host, &bundled), None);
         assert!(host.blobs().has(&bundled));
         assert!(host.readable(&bundled, TIME).await.unwrap());
+    });
+}
+
+#[test]
+fn a_put_holds_its_blob_on_its_line_until_a_newer_put_there_lets_it_go() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let founded = genesis(vec![
+            founding("probe", PROBE, script(Vec::new())),
+            founding("other", PROBE, script(Vec::new())),
+        ]);
+        let mut host = found(context, "net", dir.path(), founded).await;
+        let run = |program: &str, steps: Vec<Step>, salt: u64| Submission {
+            salt: Some(salt),
+            ..submit(program, script(steps))
+        };
+        let kept = |host: &Host<Ctx>, body: &[u8]| {
+            let id = blob_id("file", body);
+            let rostered = host
+                .view(Layer::Confirmed)
+                .get(BLOBS, &abi::encode(&id))
+                .unwrap()
+                .is_some();
+            assert_eq!(rostered, host.blobs().has(&id), "{body:?}");
+            rostered
+        };
+        let keep = |body: &[u8], line: &[u8]| {
+            op(HostOp::put(
+                HashKind::Sha256,
+                "file".to_owned(),
+                body.to_vec(),
+                Some(line.to_vec()),
+            ))
+        };
+
+        host.apply(block(1, vec![run("probe", vec![keep(b"v1", b"a")], 1)]))
+            .await
+            .unwrap();
+        assert!(kept(&host, b"v1"));
+        host.apply(block(2, vec![run("probe", vec![keep(b"v2", b"a")], 2)]))
+            .await
+            .unwrap();
+        assert_eq!((kept(&host, b"v1"), kept(&host, b"v2")), (false, true));
+        let indexed = |host: &Host<Ctx>, prefix: &[u8]| {
+            host.view(Layer::Confirmed)
+                .scan(BLOBS, &abi::Scan::prefix(prefix))
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            (indexed(&host, b"line/"), indexed(&host, b"on/")),
+            (1, 1),
+            "a newer put leaves no index key for the blob it let go of"
+        );
+
+        host.apply(block(3, vec![run("probe", vec![keep(b"v2", b"b")], 3)]))
+            .await
+            .unwrap();
+        host.apply(block(4, vec![run("probe", vec![keep(b"v3", b"a")], 4)]))
+            .await
+            .unwrap();
+        assert!(
+            kept(&host, b"v2"),
+            "line b still holds what line a let go of"
+        );
+        host.apply(block(5, vec![run("probe", vec![keep(b"v4", b"b")], 5)]))
+            .await
+            .unwrap();
+        assert!(!kept(&host, b"v2"));
+
+        host.apply(block(
+            6,
+            vec![run("other", vec![put_blob("file", b"v3")], 6)],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(7, vec![run("probe", vec![keep(b"v5", b"a")], 7)]))
+            .await
+            .unwrap();
+        assert!(kept(&host, b"v3"), "other still holds it");
+
+        host.apply(block(8, vec![run("probe", vec![keep(b"w1", b"c")], 8)]))
+            .await
+            .unwrap();
+        let applied = host
+            .apply(block(9, vec![run("probe", vec![keep(b"w1", b"c")], 9)]))
+            .await
+            .unwrap();
+        assert!(!applied.writes.programs.contains_key(BLOBS));
+        assert!(kept(&host, b"w1"));
+
+        assert_eq!(
+            ask(&host, Layer::Confirmed, "probe", vec![keep(b"w2", b"c")]).await,
+            vec![Reply::Host(HostReply::Refused(Refusal::new(
+                reason::UNSUPPORTED,
+                "a query does not write"
+            )))]
+        );
+    });
+}
+
+#[test]
+fn a_blob_held_for_several_reasons_stays_until_the_last_one_goes_or_a_release() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let founded = genesis(vec![founding("probe", PROBE, script(Vec::new()))]);
+        let mut host = found(context, "net", dir.path(), founded).await;
+        let run = |steps: Vec<Step>, salt: u64| Submission {
+            salt: Some(salt),
+            ..submit("probe", script(steps))
+        };
+        let kept = |host: &Host<Ctx>, body: &[u8]| {
+            let id = blob_id("file", body);
+            let rostered = host
+                .view(Layer::Confirmed)
+                .get(BLOBS, &abi::encode(&id))
+                .unwrap()
+                .is_some();
+            assert_eq!(rostered, host.blobs().has(&id), "{body:?}");
+            rostered
+        };
+        let keep = |body: &[u8], line: &[u8]| {
+            op(HostOp::put(
+                HashKind::Sha256,
+                "file".to_owned(),
+                body.to_vec(),
+                Some(line.to_vec()),
+            ))
+        };
+        let release = |body: &[u8]| op(HostOp::BlobRelease(blob_id("file", body)));
+
+        host.apply(block(
+            1,
+            vec![run(vec![keep(b"x", b"a"), keep(b"x", b"b")], 1)],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(2, vec![run(vec![keep(b"x2", b"a")], 2)]))
+            .await
+            .unwrap();
+        assert!(
+            kept(&host, b"x"),
+            "line b still holds what line a let go of"
+        );
+        assert!(host.missing_blobs().unwrap().is_empty());
+        host.apply(block(3, vec![run(vec![keep(b"x3", b"b")], 3)]))
+            .await
+            .unwrap();
+        assert!(!kept(&host, b"x"));
+
+        host.apply(block(
+            4,
+            vec![run(vec![put_blob("file", b"y"), keep(b"y", b"c")], 4)],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(5, vec![run(vec![keep(b"y2", b"c")], 5)]))
+            .await
+            .unwrap();
+        assert!(
+            kept(&host, b"y"),
+            "its own line still holds what line c let go of"
+        );
+        host.apply(block(6, vec![run(vec![release(b"y")], 6)]))
+            .await
+            .unwrap();
+        assert!(!kept(&host, b"y"));
+
+        host.apply(block(
+            7,
+            vec![run(
+                vec![keep(b"z", b"d"), keep(b"z", b"e"), put_blob("file", b"z")],
+                7,
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(8, vec![run(vec![release(b"z")], 8)]))
+            .await
+            .unwrap();
+        assert!(!kept(&host, b"z"), "a release lets go on every line");
+        assert!(host.missing_blobs().unwrap().is_empty());
+        host.apply(block(9, vec![run(vec![keep(b"z2", b"d")], 9)]))
+            .await
+            .unwrap();
+        assert!(kept(&host, b"z2"));
+        host.apply(block(10, vec![run(vec![keep(b"z", b"d")], 10)]))
+            .await
+            .unwrap();
+        assert_eq!((kept(&host, b"z"), kept(&host, b"z2")), (true, false));
+    });
+}
+
+#[test]
+fn a_release_leaves_no_line_behind_and_a_put_keeps_a_blobs_lines() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let founded = genesis(vec![founding("probe", PROBE, script(Vec::new()))]);
+        let mut host = found(context, "net", dir.path(), founded).await;
+        let run = |steps: Vec<Step>, salt: u64| Submission {
+            salt: Some(salt),
+            ..submit("probe", script(steps))
+        };
+        let keep = |body: &[u8], line: &[u8]| {
+            op(HostOp::put(
+                HashKind::Sha256,
+                "file".to_owned(),
+                body.to_vec(),
+                Some(line.to_vec()),
+            ))
+        };
+        let id = blob_id("file", b"x");
+        let indexed = |host: &Host<Ctx>| {
+            let view = host.view(Layer::Confirmed);
+            let lines = view.scan(BLOBS, &abi::Scan::prefix(b"line/")).unwrap();
+            let on = view.scan(BLOBS, &abi::Scan::prefix(b"on/")).unwrap();
+            lines.len() + on.len()
+        };
+
+        host.apply(block(
+            1,
+            vec![run(
+                vec![keep(b"x", b"a"), keep(b"x", b"b"), put_blob("file", b"x")],
+                1,
+            )],
+        ))
+        .await
+        .unwrap();
+        let row = host
+            .view(Layer::Confirmed)
+            .get(BLOBS, &abi::encode(&id))
+            .unwrap()
+            .unwrap();
+        let held: BTreeMap<String, (u8, bool, u32)> = abi::decode(&row).unwrap();
+        assert_eq!(
+            held,
+            BTreeMap::from([("probe".to_owned(), (1, true, 2))]),
+            "a put alone keeps the blob's two lines"
+        );
+        assert_eq!(indexed(&host), 4);
+
+        host.apply(block(2, vec![run(vec![op(HostOp::BlobRelease(id))], 2)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            host.view(Layer::Confirmed)
+                .get(BLOBS, &abi::encode(&id))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            indexed(&host),
+            0,
+            "a release leaves no line row or index key"
+        );
+        assert!(!host.blobs().has(&id));
     });
 }
 

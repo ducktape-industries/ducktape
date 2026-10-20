@@ -284,6 +284,7 @@ where
             | HostOp::Delete(_)
             | HostOp::BlobPut { .. }
             | HostOp::BlobRelease(_)
+            | HostOp::BlobKeep { .. }
             | HostOp::Emit(_)
             | HostOp::Event(_)
             | HostOp::Output(_)
@@ -627,23 +628,66 @@ where
             Ok(id) => id,
             Err(refusal) => return Ok(HostReply::Refused(refusal)),
         };
-        let key = namespace::blob(&id);
-        let row = self.roster(&key)?;
-        if let Some(value) = namespace::put_by(row.as_deref(), &self.env.me)? {
-            self.overlay.set(namespace::BLOBS, key, value);
+        self.change(&id, namespace::Change::Alone)?;
+        Ok(HostReply::BlobId(id))
+    }
+
+    fn keep(
+        &mut self,
+        hash: abi::HashKind,
+        kind: &str,
+        body: &[u8],
+        line: &[u8],
+    ) -> Result<HostReply> {
+        let id = match self.stage.put(hash, kind, body) {
+            Ok(id) => id,
+            Err(refusal) => return Ok(HostReply::Refused(refusal)),
+        };
+        let me = self.env.me.clone();
+        let key = namespace::line(&me, line);
+        let before = namespace::latest(self.roster(&key)?.as_deref())?;
+        if before == Some(id) {
+            return Ok(HostReply::BlobId(id));
+        }
+        self.overlay
+            .set(namespace::BLOBS, key, namespace::blob(&id));
+        self.overlay
+            .set(namespace::BLOBS, namespace::on(&id, &me, line), Vec::new());
+        self.change(&id, namespace::Change::List)?;
+        if let Some(old) = before {
+            self.overlay
+                .delete(namespace::BLOBS, namespace::on(&old, &me, line));
+            self.change(&old, namespace::Change::Unlist)?;
         }
         Ok(HostReply::BlobId(id))
     }
 
     fn release(&mut self, id: &BlobId) -> Result<HostReply> {
+        let me = self.env.me.clone();
+        let prefix = namespace::on_lines(id, &me);
+        let held_on = View::new(self.world.store.reads(), vec![&*self.overlay])
+            .scan(namespace::BLOBS, &abi::Scan::prefix(&prefix))?;
+        for entry in held_on {
+            let line = namespace::line_on(&entry.key, &prefix)?;
+            self.overlay.delete(namespace::BLOBS, entry.key);
+            let key = namespace::line(&me, &line);
+            if namespace::latest(self.roster(&key)?.as_deref())? == Some(*id) {
+                self.overlay.delete(namespace::BLOBS, key);
+            }
+        }
+        self.change(id, namespace::Change::Release)?;
+        Ok(HostReply::Done)
+    }
+
+    fn change(&mut self, id: &BlobId, change: namespace::Change) -> Result<()> {
         let key = namespace::blob(id);
         let row = self.roster(&key)?;
-        match namespace::released_by(row.as_deref(), &self.env.me)? {
-            namespace::Released::Kept => {}
-            namespace::Released::Held(value) => self.overlay.set(namespace::BLOBS, key, value),
-            namespace::Released::Dropped => self.overlay.delete(namespace::BLOBS, key),
+        match namespace::changed(row.as_deref(), &self.env.me, change)? {
+            namespace::Roster::Unchanged => {}
+            namespace::Roster::Written(value) => self.overlay.set(namespace::BLOBS, key, value),
+            namespace::Roster::Dropped => self.overlay.delete(namespace::BLOBS, key),
         }
-        Ok(HostReply::Done)
+        Ok(())
     }
 
     fn roster(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -741,6 +785,12 @@ where
             }),
             HostOp::BlobPut { hash, kind, body } => self.put(hash, &kind, &body),
             HostOp::BlobRelease(id) => self.release(&id),
+            HostOp::BlobKeep {
+                hash,
+                kind,
+                body,
+                line,
+            } => self.keep(hash, &kind, &body, &line),
             HostOp::Emit(message) => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
                 Ok(self.emit(message))

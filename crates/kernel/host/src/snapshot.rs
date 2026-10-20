@@ -139,6 +139,9 @@ where
         let view = self.committed.view(Vec::new());
         let mut named = BTreeSet::new();
         for entry in view.scan(BLOBS, &Scan::prefix(b""))? {
+            if namespace::is_index(&entry.key) {
+                continue;
+            }
             named.insert(abi::decode::<BlobId>(&entry.key).map_err(corrupt)?);
         }
         named.extend(programs_of(&view)?.into_values());

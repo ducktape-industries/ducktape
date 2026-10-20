@@ -387,11 +387,6 @@ pub enum CryptoReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum Retention {
-    Referenced,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum HostOp {
     Get(Vec<u8>),
     Set {
@@ -445,6 +440,78 @@ pub enum HostOp {
         kind: String,
     },
     BlobRelease(BlobId),
+    BlobKeep {
+        hash: HashKind,
+        kind: String,
+        body: Vec<u8>,
+        line: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Put<'a> {
+    pub hash: HashKind,
+    pub kind: &'a str,
+    pub body: &'a [u8],
+    pub line: Option<&'a [u8]>,
+}
+
+impl HostOp {
+    pub fn put(hash: HashKind, kind: String, body: Vec<u8>, line: Option<Vec<u8>>) -> HostOp {
+        match line {
+            None => HostOp::BlobPut { hash, kind, body },
+            Some(line) => HostOp::BlobKeep {
+                hash,
+                kind,
+                body,
+                line,
+            },
+        }
+    }
+
+    pub fn as_put(&self) -> Option<Put<'_>> {
+        match self {
+            HostOp::BlobPut { hash, kind, body } => Some(Put {
+                hash: *hash,
+                kind,
+                body,
+                line: None,
+            }),
+            HostOp::BlobKeep {
+                hash,
+                kind,
+                body,
+                line,
+            } => Some(Put {
+                hash: *hash,
+                kind,
+                body,
+                line: Some(line),
+            }),
+            HostOp::Get(_)
+            | HostOp::Set { .. }
+            | HostOp::Delete(_)
+            | HostOp::Scan(_)
+            | HostOp::CommittedGet(_)
+            | HostOp::CommittedScan(_)
+            | HostOp::BlobGet(_)
+            | HostOp::BlobStat(_)
+            | HostOp::BlobRead { .. }
+            | HostOp::Root(_)
+            | HostOp::Query { .. }
+            | HostOp::Emit(_)
+            | HostOp::Event(_)
+            | HostOp::Output(_)
+            | HostOp::Respond(_)
+            | HostOp::Crypto(_)
+            | HostOp::Await { .. }
+            | HostOp::Defer
+            | HostOp::Resume { .. }
+            | HostOp::Resource { .. }
+            | HostOp::SetOwned { .. }
+            | HostOp::BlobRelease(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -2039,6 +2106,30 @@ mod tests {
         });
         assert_eq!(encode(&guard)[0], 0);
         assert_eq!(decode::<Op>(&encode(&guard)).unwrap(), guard);
+    }
+
+    #[test]
+    fn a_blob_held_on_a_line_takes_the_tag_after_blob_release() {
+        let line = HostOp::put(
+            HashKind::Sha256,
+            "part".into(),
+            vec![1],
+            Some(b"a".to_vec()),
+        );
+        let alone = HostOp::put(HashKind::Sha256, "part".into(), vec![1], None);
+        let release = HostOp::BlobRelease(BlobId::Sha256([0; 32]));
+        assert_eq!(
+            (encode(&alone)[0], encode(&release)[0], encode(&line)[0]),
+            (6, 22, 23)
+        );
+        assert_eq!(decode::<HostOp>(&encode(&line)).unwrap(), line);
+        let put = line.as_put().unwrap();
+        assert_eq!(
+            (put.kind, put.body, put.line),
+            ("part", &[1][..], Some(&b"a"[..]))
+        );
+        assert_eq!(alone.as_put().unwrap().line, None);
+        assert_eq!(release.as_put(), None);
     }
 
     #[test]
