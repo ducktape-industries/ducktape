@@ -136,19 +136,6 @@ It carries no `secrets`. So `ducktape egress set` can also send it to the
 running node. That verb refuses any file whose services carry secrets (README
 § Answer calls outside the chain).
 
-Instead of the NetworkPolicy entry, a network can borrow the service from a
-network that fronts it (README § Answer calls outside the chain, lending). Your node's key makes an account on the
-lending network, the service's owner there names that account in the access
-list on egress `lend/<service>`, and your node's `egress.toml` names the
-lending node:
-
-```toml
-relay = true
-
-[services.anthropic]
-lent = "https://duckpond.ducktape.industries"
-```
-
 ## 6. Found the network into its claim
 
 ```sh

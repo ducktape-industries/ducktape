@@ -188,7 +188,6 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>, timing: Arc<Timing>) -> Router {
         .route(route::LOGS, get(logs::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::EGRESS_SET, post(egress_set::<E>))
-        .route(route::EGRESS_LEND, get(egress_lend::<E>))
         .route(route::SYNC, post(sync::<E>))
         .route(route::SYNC_HOLD, post(sync_hold::<E>))
         .route(route::METRICS, get(metrics::<E>))
@@ -867,14 +866,6 @@ fn refused_for(signer: &EgressSigner, withheld: &crate::egress::Withheld) -> boo
         (crate::egress::Withheld::Private, EgressSigner::Granted) => true,
         (crate::egress::Withheld::Private, EgressSigner::Node | EgressSigner::Stranger) => false,
     }
-}
-
-async fn egress_lend<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
-    let daemon = ctx.daemon();
-    upgrade
-        .max_message_size(usize::MAX)
-        .max_frame_size(usize::MAX)
-        .on_upgrade(move |socket| crate::egress::lend_to(daemon, socket))
 }
 
 async fn sync<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<statesync::Response> {

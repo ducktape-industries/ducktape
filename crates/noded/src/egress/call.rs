@@ -153,17 +153,15 @@ pub struct Caller<'a> {
     pub chain: &'a str,
     pub program: &'a str,
     pub id: u64,
-    pub lent: &'a [(String, String)],
 }
 
 impl Caller<'_> {
-    fn headers(&self) -> impl Iterator<Item = (String, String)> + '_ {
-        let own = [
+    fn headers(&self) -> [(String, String); 3] {
+        [
             ("ducktape-chain".to_owned(), self.chain.to_owned()),
             ("ducktape-program".to_owned(), self.program.to_owned()),
             ("ducktape-request".to_owned(), self.id.to_string()),
-        ];
-        own.into_iter().chain(self.lent.iter().cloned())
+        ]
     }
 }
 
@@ -303,7 +301,7 @@ async fn to_service(
     head: &Head,
     body: Vec<u8>,
 ) -> Result<reqwest::Response, String> {
-    let Some(Upstream { base, secrets, .. }) = config.services.get(name) else {
+    let Some(Upstream { base, secrets }) = config.services.get(name) else {
         return Err(format!("this node does not serve {name}"));
     };
     head.check_path().map_err(|refusal| refusal.sentence)?;

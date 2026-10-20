@@ -206,10 +206,6 @@ impl<E: Context> Ctx<E> {
         self.daemon.live.clone()
     }
 
-    pub(crate) fn daemon(self) -> Arc<Daemon<E>> {
-        self.daemon
-    }
-
     pub(crate) fn live_port(&self) -> Option<u16> {
         self.daemon.live.port()
     }

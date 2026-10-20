@@ -49,7 +49,6 @@ url = "2"
 rustix = { workspace = true }
 
 [dev-dependencies]
-fixture-access = { path = "../kernel/fixtures/access" }
 fixture-awaiter = { path = "../kernel/fixtures/awaiter" }
 fixture-egress = { path = "../kernel/fixtures/egress" }
 fixture-oracle = { path = "../kernel/fixtures/oracle" }

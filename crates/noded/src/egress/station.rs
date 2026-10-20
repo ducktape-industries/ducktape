@@ -34,14 +34,14 @@ pub struct Planned {
 impl Planned {
     pub async fn reach(&self, wait: Duration) -> Vec<(String, Reached)> {
         let clients = &self.serving.clients;
-        let config = &self.serving.config;
-        let fronted = config
+        let calls = self
+            .serving
+            .config
             .services
             .iter()
-            .map(|(name, upstream)| (name, &upstream.base));
-        let calls = fronted
-            .chain(&config.lent)
-            .map(|(name, base)| async move { (name.clone(), clients.reach(base, wait).await) });
+            .map(|(name, upstream)| async move {
+                (name.clone(), clients.reach(&upstream.base, wait).await)
+            });
         futures::future::join_all(calls).await
     }
 }
@@ -162,20 +162,11 @@ impl Tally {
                     .is_some_and(|earlier| earlier != *upstream)
             })
             .count();
-        let moved = now
-            .lent
-            .iter()
-            .filter(|(name, lender)| {
-                was.lent
-                    .get(*name)
-                    .is_some_and(|earlier| earlier != *lender)
-            })
-            .count();
         Tally {
             served: after.len(),
             added: after.difference(&before).count(),
             removed: before.difference(&after).count(),
-            changed: changed + moved,
+            changed,
         }
     }
 }
