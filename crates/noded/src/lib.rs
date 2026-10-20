@@ -154,6 +154,8 @@ pub struct Daemon<E: Context> {
     pub network: Network,
     pub identity: Vec<u8>,
     pub anchors: MarshalMailbox,
+    holds: statesync::Holds<E>,
+    holds_ended: Arc<std::sync::atomic::AtomicU64>,
     history: history::History,
     recent: blocks::Recent,
     activity: activity::Index,
@@ -170,6 +172,11 @@ pub struct Daemon<E: Context> {
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
+}
+
+pub struct HeldHead {
+    pub height: u64,
+    pub hold: statesync::Holding,
 }
 
 impl<E: Context> Daemon<E> {
@@ -228,13 +235,20 @@ impl<E: Context> Daemon<E> {
         self.writer.hold().await
     }
 
-    pub async fn held_head(&self) -> Result<(statesync::Response, Option<state::Hold>)> {
-        let (served, hold) = self.writer.held_head().await?;
-        Ok((statesync::anchored(served, &self.anchors).await, hold))
+    pub async fn held_head(&self) -> Result<(statesync::Response, Option<HeldHead>)> {
+        let view = self.view()?;
+        let height = view.sync().tip().height;
+        let (served, hold) = statesync::held(view.sync().clone(), &self.holds);
+        let held = hold.map(|hold| HeldHead {
+            height,
+            hold: Box::new(hold),
+        });
+        Ok((statesync::anchored(served, &self.anchors).await, held))
     }
 
     pub async fn sync(&self, request: statesync::Request) -> Result<statesync::Response> {
-        let served = self.writer.sync(request).await?;
+        let view = self.view()?;
+        let served = statesync::serve(view.sync(), &self.holds, request).await;
         Ok(statesync::anchored(served, &self.anchors).await)
     }
 

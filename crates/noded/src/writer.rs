@@ -1,6 +1,6 @@
-// The node's one writer: the task that owns the node applies each block and serves what callers
-// ask of it, in order. RPC handlers reach it through `Writer` and await its answer; nothing else
-// holds the node.
+// The node's one writer: the task that owns the node applies each block, in order, and takes the
+// few commands that need the node itself. RPC handlers reach it through `Writer`; reads, state sync
+// included, are served from what it publishes, and nothing else holds the node.
 
 use commonware_runtime::telemetry::metrics::Gauge;
 use futures::channel::{mpsc, oneshot};
@@ -8,19 +8,8 @@ use futures::channel::{mpsc, oneshot};
 use crate::{Error, Result};
 
 pub(crate) enum Command {
-    Sync(Sync),
     Hold(Hold),
     Close(oneshot::Sender<Result<u64>>),
-    Head(Head),
-}
-
-pub(crate) struct Sync {
-    pub(crate) request: statesync::Request,
-    pub(crate) reply: oneshot::Sender<statesync::Served>,
-}
-
-pub(crate) struct Head {
-    pub(crate) reply: oneshot::Sender<(statesync::Served, Option<state::Hold>)>,
 }
 
 pub(crate) struct Hold {
@@ -55,17 +44,6 @@ impl Writer {
             return Err(Error::Stopped);
         }
         answer.await.map_err(|_| Error::Stopped)
-    }
-
-    pub(crate) async fn sync(&self, request: statesync::Request) -> Result<statesync::Served> {
-        let (reply, answer) = oneshot::channel();
-        self.ask(Command::Sync(Sync { request, reply }), answer)
-            .await
-    }
-
-    pub(crate) async fn held_head(&self) -> Result<(statesync::Served, Option<state::Hold>)> {
-        let (reply, answer) = oneshot::channel();
-        self.ask(Command::Head(Head { reply }), answer).await
     }
 
     pub(crate) async fn hold(&self) -> Result<Held> {

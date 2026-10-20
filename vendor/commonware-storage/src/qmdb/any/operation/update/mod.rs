@@ -1,0 +1,140 @@
+use crate::qmdb::{any::value::ValueEncoding, operation::Key};
+use commonware_codec::CodecShared;
+use std::fmt;
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+mod ordered;
+pub use ordered::Update as Ordered;
+
+mod unordered;
+pub use unordered::Update as Unordered;
+
+/// An operation that updates a key-value pair.
+pub trait Update: sealed::Sealed + Clone + Send + Sync + 'static {
+    /// The key type.
+    type Key: Key;
+
+    /// The value type.
+    type Value: CodecShared + Clone;
+
+    /// The value encoding (fixed or variable).
+    type ValueEncoding: ValueEncoding<Value = Self::Value>;
+
+    /// Payload cached alongside the resolved location of a batch read, consumed by merkleize.
+    type Cached: Send + Sync;
+
+    /// Whether merkleize may emit a staged delete directly at its read-resolved location.
+    /// When false, staged deletes fall back to normal mutations.
+    const STAGES_DELETES: bool;
+
+    /// Whether merkleize may stage a read that resolved in an uncommitted ancestor's diff.
+    /// `Some` supplies the cached payload recorded for such a read. `None` leaves those
+    /// slots unresolved, so their updates fall back to normal mutations.
+    const STAGES_ANCESTORS: Option<Self::Cached>;
+
+    /// The updated key.
+    fn key(&self) -> &Self::Key;
+
+    /// Consumes the update and returns its owned key.
+    fn into_key(self) -> Self::Key;
+
+    /// The updated value.
+    fn value(&self) -> &Self::Value;
+
+    /// Build the cached payload from a resolved update.
+    fn cached(&self) -> Self::Cached;
+
+    /// Format the update for display.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ordered::Update as OrderedUpdate;
+    use crate::qmdb::any::{
+        unordered::Update as UnorderedUpdate,
+        value::{FixedEncoding, VariableEncoding},
+    };
+    use commonware_codec::{Codec, RangeCfg, Read};
+    use commonware_utils::sequence::FixedBytes;
+    use std::fmt;
+
+    fn roundtrip<T>(value: &T, cfg: &<T as Read>::Cfg)
+    where
+        T: Codec + PartialEq + fmt::Debug,
+    {
+        let encoded = value.encode();
+        let decoded = T::decode_cfg(encoded.clone(), cfg).expect("decode");
+        assert_eq!(decoded, *value);
+        let encoded2 = decoded.encode();
+        assert_eq!(encoded, encoded2);
+    }
+
+    #[test]
+    fn ordered_update_fixed_roundtrip() {
+        type K = FixedBytes<4>;
+        type V = u64;
+
+        let upd = OrderedUpdate::<K, FixedEncoding<V>> {
+            key: FixedBytes::from([1, 2, 3, 4]),
+            value: 0xdead_beef_u64,
+            next_key: FixedBytes::from([4, 3, 2, 1]),
+        };
+
+        roundtrip(&upd, &());
+    }
+
+    #[test]
+    fn ordered_update_variable_roundtrip() {
+        type K = FixedBytes<4>;
+        type V = Vec<u8>;
+
+        let upd = OrderedUpdate::<K, VariableEncoding<V>> {
+            key: FixedBytes::from([1, 2, 3, 4]),
+            value: vec![1, 2, 3, 4, 5],
+            next_key: FixedBytes::from([4, 3, 2, 1]),
+        };
+
+        roundtrip(&upd, &((), (RangeCfg::from(..), ())));
+    }
+
+    #[test]
+    fn unordered_update_fixed_roundtrip() {
+        type K = FixedBytes<4>;
+        type V = u64;
+
+        let upd = UnorderedUpdate::<K, FixedEncoding<V>>(FixedBytes::from([7, 7, 7, 7]), 42u64);
+
+        roundtrip(&upd, &());
+    }
+
+    #[test]
+    fn unordered_update_variable_roundtrip() {
+        type K = FixedBytes<4>;
+        type V = Vec<u8>;
+
+        let upd = UnorderedUpdate::<K, VariableEncoding<V>>(
+            FixedBytes::from([0, 1, 2, 3]),
+            vec![10, 11, 12, 13],
+        );
+
+        roundtrip(&upd, &((), (RangeCfg::from(..), ())));
+    }
+
+    #[cfg(feature = "arbitrary")]
+    mod conformance {
+        use super::*;
+        use commonware_codec::conformance::CodecConformance;
+        use commonware_utils::sequence::U64;
+
+        commonware_conformance::conformance_tests! {
+            CodecConformance<OrderedUpdate<U64, FixedEncoding<U64>>>,
+            CodecConformance<OrderedUpdate<U64, VariableEncoding<Vec<u8>>>>,
+            CodecConformance<UnorderedUpdate<U64, FixedEncoding<U64>>>,
+            CodecConformance<UnorderedUpdate<U64, VariableEncoding<Vec<u8>>>>,
+        }
+    }
+}

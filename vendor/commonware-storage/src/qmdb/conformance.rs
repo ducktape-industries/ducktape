@@ -1,0 +1,1361 @@
+//! Root stability and order-independence tests for all QMDB database variants.
+//!
+//! **Conformance tests** hash the Merkle root produced by a deterministic workload across 200
+//! seeds. Any change to the root computation algorithm will cause the stored hash to diverge.
+//!
+//! **Order-independence tests** verify that the insertion order of operations within a single
+//! batch does not affect the resulting root. Each test applies the same set of mutations in
+//! forward and reverse order to two separate databases and asserts root equality.
+
+use crate::{
+    journal::contiguous::{fixed::Config as FConfig, variable::Config as VConfig},
+    merkle::{Family, full::Config as MerkleConfig, mmb, mmr},
+    qmdb::{
+        any::{
+            self,
+            traits::{DbAny, UnmerkleizedBatch as _},
+        },
+        current, immutable,
+    },
+    translator::{OneCap, TwoCap},
+};
+use commonware_cryptography::{Hasher as _, Sha256, sha256::Digest};
+use commonware_macros::boxed;
+use commonware_parallel::Sequential;
+use commonware_runtime::{
+    BufferPooler, Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+};
+use commonware_utils::{NZU16, NZU64, NZUsize};
+use std::num::{NonZeroU16, NonZeroUsize};
+
+// Type aliases
+
+type Ctx = deterministic::Context;
+
+type AnyMmrUnorderedFixed =
+    any::unordered::fixed::Db<mmr::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+type AnyMmrUnorderedVariable =
+    any::unordered::variable::Db<mmr::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+type AnyMmrOrderedFixed =
+    any::ordered::fixed::Db<mmr::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+type AnyMmrOrderedVariable =
+    any::ordered::variable::Db<mmr::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+
+type AnyMmbUnorderedFixed =
+    any::unordered::fixed::Db<mmb::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+type AnyMmbUnorderedVariable =
+    any::unordered::variable::Db<mmb::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+type AnyMmbOrderedFixed =
+    any::ordered::fixed::Db<mmb::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+type AnyMmbOrderedVariable =
+    any::ordered::variable::Db<mmb::Family, Ctx, Digest, Digest, Sha256, OneCap, Sequential>;
+
+type CurrentMmrUnorderedFixed =
+    current::unordered::fixed::Db<mmr::Family, Ctx, Digest, Digest, Sha256, OneCap, 32, Sequential>;
+type CurrentMmrUnorderedVariable = current::unordered::variable::Db<
+    mmr::Family,
+    Ctx,
+    Digest,
+    Digest,
+    Sha256,
+    OneCap,
+    32,
+    Sequential,
+>;
+type CurrentMmrOrderedFixed =
+    current::ordered::fixed::Db<mmr::Family, Ctx, Digest, Digest, Sha256, OneCap, 32, Sequential>;
+type CurrentMmrOrderedVariable = current::ordered::variable::Db<
+    mmr::Family,
+    Ctx,
+    Digest,
+    Digest,
+    Sha256,
+    OneCap,
+    32,
+    Sequential,
+>;
+
+type CurrentMmbUnorderedFixed =
+    current::unordered::fixed::Db<mmb::Family, Ctx, Digest, Digest, Sha256, OneCap, 32, Sequential>;
+type CurrentMmbUnorderedVariable = current::unordered::variable::Db<
+    mmb::Family,
+    Ctx,
+    Digest,
+    Digest,
+    Sha256,
+    OneCap,
+    32,
+    Sequential,
+>;
+type CurrentMmbOrderedFixed =
+    current::ordered::fixed::Db<mmb::Family, Ctx, Digest, Digest, Sha256, OneCap, 32, Sequential>;
+type CurrentMmbOrderedVariable = current::ordered::variable::Db<
+    mmb::Family,
+    Ctx,
+    Digest,
+    Digest,
+    Sha256,
+    OneCap,
+    32,
+    Sequential,
+>;
+
+type ImmutableMmrFixed =
+    immutable::fixed::Db<mmr::Family, Ctx, Digest, Digest, Sha256, TwoCap, Sequential>;
+type ImmutableMmbFixed =
+    immutable::fixed::Db<mmb::Family, Ctx, Digest, Digest, Sha256, TwoCap, Sequential>;
+type ImmutableMmrVariable =
+    immutable::variable::Db<mmr::Family, Ctx, Digest, Digest, Sha256, TwoCap, Sequential>;
+type ImmutableMmbVariable =
+    immutable::variable::Db<mmb::Family, Ctx, Digest, Digest, Sha256, TwoCap, Sequential>;
+
+type ImmutableMmrCompactFixed =
+    immutable::fixed::CompactDb<mmr::Family, Ctx, Digest, Digest, Sha256, Sequential>;
+type ImmutableMmbCompactFixed =
+    immutable::fixed::CompactDb<mmb::Family, Ctx, Digest, Digest, Sha256, Sequential>;
+type ImmutableMmrCompactVariable =
+    immutable::variable::CompactDb<mmr::Family, Ctx, Digest, Digest, Sha256, ((), ()), Sequential>;
+type ImmutableMmbCompactVariable =
+    immutable::variable::CompactDb<mmb::Family, Ctx, Digest, Digest, Sha256, ((), ()), Sequential>;
+
+// Config constructors
+
+const PAGE_SIZE: NonZeroU16 = NZU16!(101);
+const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(11);
+
+fn merkle_config(suffix: &str, page_cache: &CacheRef) -> MerkleConfig<Sequential> {
+    MerkleConfig {
+        journal_partition: format!("{suffix}-mj"),
+        metadata_partition: format!("{suffix}-mm"),
+        items_per_blob: NZU64!(11),
+        write_buffer: NZUsize!(1024),
+        replay_buffer: NZUsize!(1024),
+        strategy: Sequential,
+        page_cache: page_cache.clone(),
+    }
+}
+
+fn fixed_log_config(suffix: &str, page_cache: CacheRef) -> FConfig {
+    FConfig {
+        partition: format!("{suffix}-log"),
+        items_per_blob: NZU64!(7),
+        page_cache,
+        write_buffer: NZUsize!(1024),
+        replay_buffer: NZUsize!(1024),
+    }
+}
+
+fn variable_log_config<C>(suffix: &str, page_cache: CacheRef, codec_config: C) -> VConfig<C> {
+    VConfig {
+        partition: format!("{suffix}-log"),
+        items_per_section: NZU64!(7),
+        compression: None,
+        codec_config,
+        page_cache,
+        write_buffer: NZUsize!(1024),
+        replay_buffer: NZUsize!(1024),
+    }
+}
+
+fn any_fixed_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> any::FixedConfig<OneCap, Sequential> {
+    let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+    any::Config {
+        merkle_config: merkle_config(suffix, &pc),
+        journal_config: fixed_log_config(suffix, pc),
+        translator: OneCap,
+        init_cache_size: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+fn any_variable_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> any::VariableConfig<OneCap, ((), ()), Sequential> {
+    let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+    any::Config {
+        merkle_config: merkle_config(suffix, &pc),
+        journal_config: variable_log_config(suffix, pc, ((), ())),
+        translator: OneCap,
+        init_cache_size: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+fn current_fixed_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> current::FixedConfig<OneCap, Sequential> {
+    let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+    current::Config {
+        merkle_config: merkle_config(suffix, &pc),
+        journal_config: fixed_log_config(suffix, pc),
+        grafted_metadata_partition: format!("{suffix}-graft"),
+        translator: OneCap,
+        init_cache_size: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+fn current_variable_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> current::VariableConfig<OneCap, ((), ()), Sequential> {
+    let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+    current::Config {
+        merkle_config: merkle_config(suffix, &pc),
+        journal_config: variable_log_config(suffix, pc, ((), ())),
+        grafted_metadata_partition: format!("{suffix}-graft"),
+        translator: OneCap,
+        init_cache_size: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
+    }
+}
+
+fn immutable_fixed_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> immutable::fixed::Config<TwoCap, Sequential> {
+    let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+    immutable::Config {
+        merkle_config: merkle_config(suffix, &pc),
+        log: fixed_log_config(suffix, pc),
+        translator: TwoCap,
+        init_buffer: NZUsize!(1 << 21),
+    }
+}
+
+fn immutable_variable_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> immutable::variable::Config<TwoCap, ((), ()), Sequential> {
+    let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+    immutable::Config {
+        merkle_config: merkle_config(suffix, &pc),
+        log: variable_log_config(suffix, pc, ((), ())),
+        translator: TwoCap,
+        init_buffer: NZUsize!(1 << 21),
+    }
+}
+
+fn compact_witness_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> crate::journal::contiguous::variable::Config<()> {
+    crate::journal::contiguous::variable::Config {
+        partition: format!("{suffix}-compact-witness"),
+        items_per_section: NZU64!(64),
+        compression: None,
+        codec_config: (),
+        page_cache: CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE),
+        write_buffer: NZUsize!(1024),
+        replay_buffer: NZUsize!(1024),
+    }
+}
+
+fn immutable_fixed_compact_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> immutable::fixed::CompactConfig<Sequential> {
+    immutable::CompactConfig {
+        strategy: Sequential,
+        witness: compact_witness_config(suffix, pooler),
+        commit_codec_config: (),
+    }
+}
+
+fn immutable_variable_compact_config(
+    suffix: &str,
+    pooler: &impl BufferPooler,
+) -> immutable::variable::CompactConfig<((), ()), Sequential> {
+    immutable::CompactConfig {
+        strategy: Sequential,
+        witness: compact_witness_config(suffix, pooler),
+        commit_codec_config: ((), ()),
+    }
+}
+
+// Workloads
+
+fn to_digest(i: u64) -> Digest {
+    Sha256::hash(&[&i.to_be_bytes()])
+}
+
+fn to_val(i: u64, salt: u64) -> Digest {
+    Sha256::hash(&[&i.to_be_bytes(), &salt.wrapping_add(1).to_be_bytes()])
+}
+
+/// Digest whose first byte is `prefix`, guaranteeing translator collisions under OneCap.
+fn colliding_digest(prefix: u8, suffix: u64) -> Digest {
+    crate::qmdb::any::test::colliding_digest(prefix, suffix)
+}
+
+/// Apply a batch of keyed writes (creates, updates, or deletes) to the database.
+async fn apply_writes<F: Family, D: DbAny<F, Key = Digest, Value = Digest>>(
+    db: D,
+    writes: Vec<(Digest, Option<Digest>)>,
+) -> D {
+    let mut batch = db.new_batch();
+    for (k, v) in writes {
+        batch = batch.write(k, v);
+    }
+    let merkleized = batch.merkleize(&db, None).await.unwrap();
+    let (db, _) = db.apply_batch(merkleized).await.unwrap();
+    db
+}
+
+#[cfg(feature = "arbitrary")]
+mod tests {
+    use super::*;
+    use crate::qmdb::keyless;
+    use commonware_conformance::{Conformance, conformance_tests};
+    use commonware_runtime::conformance::{StorageConformance, StorageWorkload};
+    use commonware_utils::sequence::U64;
+
+    type KeylessMmrFixed = keyless::fixed::Db<mmr::Family, Ctx, U64, Sha256, Sequential>;
+    type KeylessMmbFixed = keyless::fixed::Db<mmb::Family, Ctx, U64, Sha256, Sequential>;
+    type KeylessMmrVariable = keyless::variable::Db<mmr::Family, Ctx, Vec<u8>, Sha256, Sequential>;
+    type KeylessMmbVariable = keyless::variable::Db<mmb::Family, Ctx, Vec<u8>, Sha256, Sequential>;
+
+    type KeylessMmrCompactFixed =
+        keyless::fixed::CompactDb<mmr::Family, Ctx, U64, Sha256, Sequential>;
+    type KeylessMmbCompactFixed =
+        keyless::fixed::CompactDb<mmb::Family, Ctx, U64, Sha256, Sequential>;
+    type KeylessMmrCompactVariable = keyless::variable::CompactDb<
+        mmr::Family,
+        Ctx,
+        Vec<u8>,
+        Sha256,
+        (commonware_codec::RangeCfg<usize>, ()),
+        Sequential,
+    >;
+    type KeylessMmbCompactVariable = keyless::variable::CompactDb<
+        mmb::Family,
+        Ctx,
+        Vec<u8>,
+        Sha256,
+        (commonware_codec::RangeCfg<usize>, ()),
+        Sequential,
+    >;
+
+    fn keyless_fixed_config(
+        suffix: &str,
+        pooler: &impl BufferPooler,
+    ) -> keyless::fixed::Config<Sequential> {
+        let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+        keyless::Config {
+            merkle: merkle_config(suffix, &pc),
+            log: fixed_log_config(suffix, pc),
+        }
+    }
+
+    fn keyless_variable_config(
+        suffix: &str,
+        pooler: &impl BufferPooler,
+    ) -> keyless::variable::Config<(commonware_codec::RangeCfg<usize>, ()), Sequential> {
+        let pc = CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE);
+        keyless::Config {
+            merkle: merkle_config(suffix, &pc),
+            log: variable_log_config(suffix, pc, ((0..=10000).into(), ())),
+        }
+    }
+
+    fn keyless_fixed_compact_config(
+        suffix: &str,
+        pooler: &impl BufferPooler,
+    ) -> keyless::fixed::CompactConfig<Sequential> {
+        keyless::CompactConfig {
+            strategy: Sequential,
+            witness: compact_witness_config(suffix, pooler),
+            commit_codec_config: (),
+        }
+    }
+
+    fn keyless_variable_compact_config(
+        suffix: &str,
+        pooler: &impl BufferPooler,
+    ) -> keyless::variable::CompactConfig<(commonware_codec::RangeCfg<usize>, ()), Sequential> {
+        keyless::CompactConfig {
+            strategy: Sequential,
+            witness: compact_witness_config(suffix, pooler),
+            commit_codec_config: ((0..=10000usize).into(), ()),
+        }
+    }
+
+    /// Deterministically select ~20% of keys for deletion. XOR with the seed ensures
+    /// the set of deleted indices varies across seeds.
+    const fn is_deleted(seed: u64, i: u64) -> bool {
+        (seed ^ i).is_multiple_of(5)
+    }
+
+    /// Apply a batch of immutable sets to the database.
+    macro_rules! apply_sets {
+        ($db:ident, $ops:expr) => {{
+            let floor = $db.inactivity_floor_loc();
+            let mut batch = $db.new_batch();
+            for (k, v) in $ops {
+                batch = batch.set(k, v);
+            }
+            let merkleized = batch.merkleize(&$db, None, floor).await;
+            ($db, _) = $db.apply_batch(merkleized).await.unwrap();
+        }};
+    }
+
+    /// Apply a batch of keyless appends to the database.
+    macro_rules! apply_appends {
+        ($db:ident, $vals:expr) => {{
+            let floor = $db.inactivity_floor_loc();
+            let mut batch = $db.new_batch();
+            for v in $vals {
+                batch = batch.append(v);
+            }
+            let merkleized = batch.merkleize(&$db, None, floor).await;
+            ($db, _) = $db.apply_batch(merkleized).await.unwrap();
+        }};
+    }
+
+    /// 4-batch keyed workload exercising every mutation type.
+    ///
+    /// 1. Create n keys with initial values.
+    /// 2. Delete ~20% of keys, update the rest.
+    /// 3. Recreate the deleted keys alongside new keys that collide under the translator.
+    /// 4. Update original keys; delete odd-indexed colliding keys, update even-indexed ones.
+    async fn keyed_root<F: Family, D: DbAny<F, Key = Digest, Value = Digest>>(
+        db: D,
+        seed: u64,
+    ) -> (D, Vec<u8>) {
+        let n = seed % 50 + 5;
+
+        // Choose a translator bucket for colliding keys (varies per seed).
+        let prefix = (seed % 256) as u8;
+
+        // 1. Create n keys.
+        let writes: Vec<_> = (0..n).map(|i| (to_digest(i), Some(to_val(i, 1)))).collect();
+        let db = apply_writes(db, writes).await;
+
+        // 2. Delete ~20% of keys, update the rest with new values.
+        let writes: Vec<_> = (0..n)
+            .map(|i| {
+                let key = to_digest(i);
+                if is_deleted(seed, i) {
+                    (key, None)
+                } else {
+                    (key, Some(to_val(i, 2)))
+                }
+            })
+            .collect();
+        let db = apply_writes(db, writes).await;
+
+        // 3. Recreate every deleted key, and introduce new keys that share a translator
+        //    bucket (offset by 10000 to avoid overlapping with the original key range).
+        let mut writes = Vec::new();
+        for i in 0..n {
+            if is_deleted(seed, i) {
+                writes.push((to_digest(i), Some(to_val(i, 3))));
+            }
+        }
+        for i in 0..n / 2 {
+            writes.push((colliding_digest(prefix, 10000 + i), Some(to_val(i, 4))));
+        }
+        let db = apply_writes(db, writes).await;
+
+        // 4. Update original keys; delete odd-indexed colliding keys, update even-indexed.
+        let mut writes = Vec::new();
+        for i in 0..n {
+            writes.push((to_digest(i), Some(to_val(i, 5))));
+        }
+        for i in 0..n / 2 {
+            let key = colliding_digest(prefix, 10000 + i);
+            if i % 2 == 1 {
+                writes.push((key, None));
+            } else {
+                writes.push((key, Some(to_val(i, 6))));
+            }
+        }
+        let db = apply_writes(db, writes).await;
+
+        let root = db.root().to_vec();
+        (db, root)
+    }
+
+    /// 3-batch immutable workload. Each batch inserts a disjoint set of keys (immutable
+    /// databases are write-once). Macro because the Db types share no common trait.
+    ///
+    /// 1. Insert n hash-distributed keys.
+    /// 2. Insert n more hash-distributed keys (disjoint range).
+    /// 3. Insert keys that share a translator bucket.
+    macro_rules! immutable_root {
+        ($db:ident, $seed:ident) => {{
+            let n = $seed % 30 + 5;
+            let prefix = ($seed % 256) as u8;
+
+            // 1. Keys 0..n.
+            apply_sets!($db, (0..n).map(|i| (to_digest(i), to_val(i, 1))));
+
+            // 2. Keys n..2n (disjoint from batch 1).
+            apply_sets!($db, (n..2 * n).map(|i| (to_digest(i), to_val(i, 2))));
+
+            // 3. Colliding keys (offset by 10000 to avoid overlap).
+            apply_sets!(
+                $db,
+                (0..n / 2).map(|i| (colliding_digest(prefix, 10000 + i), to_val(i, 3)))
+            );
+
+            $db.root().to_vec()
+        }};
+    }
+
+    /// 3-batch keyless workload. The `$make_val` expression converts a `u64` into the
+    /// appropriate value type (`U64` for fixed, `Vec<u8>` for variable).
+    ///
+    /// 1. Append n values.
+    /// 2. Append n more values.
+    /// 3. Append n/2 values derived from a different base.
+    macro_rules! keyless_root {
+        ($db:ident, $seed:ident, |$x:ident| $make_val:expr) => {{
+            let n = $seed % 30 + 5;
+
+            // 1.
+            apply_appends!(
+                $db,
+                (0..n).map(|i| {
+                    let $x = $seed.wrapping_add(i);
+                    $make_val
+                })
+            );
+
+            // 2.
+            apply_appends!(
+                $db,
+                (0..n).map(|i| {
+                    let $x = $seed.wrapping_add(n + i);
+                    $make_val
+                })
+            );
+
+            // 3. Different base to avoid repeating batch 1 values.
+            apply_appends!(
+                $db,
+                (0..n / 2).map(|i| {
+                    let $x = (!$seed).wrapping_add(i);
+                    $make_val
+                })
+            );
+
+            $db.root().to_vec()
+        }};
+    }
+
+    macro_rules! db_conformance {
+        ($name:ident, $db:ty, $cfg_fn:expr, |$d:ident, $s:ident| $body:expr) => {
+            struct $name;
+            impl Conformance for $name {
+                async fn commit($s: u64) -> Vec<u8> {
+                    deterministic::Runner::seeded($s).start(|ctx| async move {
+                        let mut $d = <$db>::init(ctx.child("db"), ($cfg_fn)("cf", &ctx))
+                            .await
+                            .unwrap();
+                        let root = $body;
+                        $d.destroy().await.unwrap();
+                        root
+                    })
+                }
+            }
+        };
+    }
+
+    macro_rules! keyed_conformance {
+        ($name:ident, $db:ty, $cfg_fn:expr) => {
+            db_conformance!($name, $db, $cfg_fn, |db, seed| {
+                let (d, root) = keyed_root(db, seed).await;
+                db = d;
+                root
+            });
+        };
+    }
+
+    macro_rules! immutable_conformance {
+        ($name:ident, $db:ty, $cfg_fn:expr) => {
+            db_conformance!($name, $db, $cfg_fn, |db, seed| immutable_root!(db, seed));
+        };
+    }
+
+    macro_rules! storage_audit_conformance {
+        ($name:ident, $family:ty, $db:ty, $cfg_fn:expr, |$d:ident, $s:ident| $body:expr) => {
+            struct $name;
+
+            impl StorageWorkload for $name {
+                type Error = crate::qmdb::Error<$family>;
+
+                async fn run(context: Ctx, $s: u64) -> Result<(), Self::Error> {
+                    let suffix = format!("{}-{}", stringify!($name), $s);
+                    let mut $d =
+                        <$db>::init(context.child("db"), ($cfg_fn)(&suffix, &context)).await?;
+                    let _root = $body;
+                    $d.sync().await?;
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    macro_rules! keyed_storage_audit {
+        ($name:ident, $family:ty, $db:ty, $cfg_fn:expr) => {
+            storage_audit_conformance!($name, $family, $db, $cfg_fn, |db, seed| {
+                let (d, root) = keyed_root(db, seed).await;
+                db = d;
+                root
+            });
+        };
+    }
+
+    macro_rules! immutable_storage_audit {
+        ($name:ident, $family:ty, $db:ty, $cfg_fn:expr) => {
+            storage_audit_conformance!($name, $family, $db, $cfg_fn, |db, seed| {
+                immutable_root!(db, seed)
+            });
+        };
+    }
+
+    keyed_conformance!(
+        AnyMmrUnorderedFixedConf,
+        AnyMmrUnorderedFixed,
+        any_fixed_config
+    );
+    keyed_conformance!(
+        AnyMmrUnorderedVariableConf,
+        AnyMmrUnorderedVariable,
+        any_variable_config
+    );
+    keyed_conformance!(AnyMmrOrderedFixedConf, AnyMmrOrderedFixed, any_fixed_config);
+    keyed_conformance!(
+        AnyMmrOrderedVariableConf,
+        AnyMmrOrderedVariable,
+        any_variable_config
+    );
+    keyed_conformance!(
+        AnyMmbUnorderedFixedConf,
+        AnyMmbUnorderedFixed,
+        any_fixed_config
+    );
+    keyed_conformance!(
+        AnyMmbUnorderedVariableConf,
+        AnyMmbUnorderedVariable,
+        any_variable_config
+    );
+    keyed_conformance!(AnyMmbOrderedFixedConf, AnyMmbOrderedFixed, any_fixed_config);
+    keyed_conformance!(
+        AnyMmbOrderedVariableConf,
+        AnyMmbOrderedVariable,
+        any_variable_config
+    );
+    keyed_conformance!(
+        CurrentMmrUnorderedFixedConf,
+        CurrentMmrUnorderedFixed,
+        current_fixed_config
+    );
+    keyed_conformance!(
+        CurrentMmrUnorderedVariableConf,
+        CurrentMmrUnorderedVariable,
+        current_variable_config
+    );
+    keyed_conformance!(
+        CurrentMmrOrderedFixedConf,
+        CurrentMmrOrderedFixed,
+        current_fixed_config
+    );
+    keyed_conformance!(
+        CurrentMmrOrderedVariableConf,
+        CurrentMmrOrderedVariable,
+        current_variable_config
+    );
+    keyed_conformance!(
+        CurrentMmbUnorderedFixedConf,
+        CurrentMmbUnorderedFixed,
+        current_fixed_config
+    );
+    keyed_conformance!(
+        CurrentMmbUnorderedVariableConf,
+        CurrentMmbUnorderedVariable,
+        current_variable_config
+    );
+    keyed_conformance!(
+        CurrentMmbOrderedFixedConf,
+        CurrentMmbOrderedFixed,
+        current_fixed_config
+    );
+    keyed_conformance!(
+        CurrentMmbOrderedVariableConf,
+        CurrentMmbOrderedVariable,
+        current_variable_config
+    );
+
+    immutable_conformance!(
+        ImmutableMmrFixedConf,
+        ImmutableMmrFixed,
+        immutable_fixed_config
+    );
+    immutable_conformance!(
+        ImmutableMmbFixedConf,
+        ImmutableMmbFixed,
+        immutable_fixed_config
+    );
+    immutable_conformance!(
+        ImmutableMmrVariableConf,
+        ImmutableMmrVariable,
+        immutable_variable_config
+    );
+    immutable_conformance!(
+        ImmutableMmbVariableConf,
+        ImmutableMmbVariable,
+        immutable_variable_config
+    );
+
+    db_conformance!(
+        KeylessMmrFixedConf,
+        KeylessMmrFixed,
+        keyless_fixed_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    db_conformance!(
+        KeylessMmbFixedConf,
+        KeylessMmbFixed,
+        keyless_fixed_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    db_conformance!(
+        KeylessMmrVariableConf,
+        KeylessMmrVariable,
+        keyless_variable_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+    db_conformance!(
+        KeylessMmbVariableConf,
+        KeylessMmbVariable,
+        keyless_variable_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+
+    immutable_conformance!(
+        ImmutableMmrCompactFixedConf,
+        ImmutableMmrCompactFixed,
+        immutable_fixed_compact_config
+    );
+    immutable_conformance!(
+        ImmutableMmbCompactFixedConf,
+        ImmutableMmbCompactFixed,
+        immutable_fixed_compact_config
+    );
+    immutable_conformance!(
+        ImmutableMmrCompactVariableConf,
+        ImmutableMmrCompactVariable,
+        immutable_variable_compact_config
+    );
+    immutable_conformance!(
+        ImmutableMmbCompactVariableConf,
+        ImmutableMmbCompactVariable,
+        immutable_variable_compact_config
+    );
+
+    db_conformance!(
+        KeylessMmrCompactFixedConf,
+        KeylessMmrCompactFixed,
+        keyless_fixed_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    db_conformance!(
+        KeylessMmbCompactFixedConf,
+        KeylessMmbCompactFixed,
+        keyless_fixed_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    db_conformance!(
+        KeylessMmrCompactVariableConf,
+        KeylessMmrCompactVariable,
+        keyless_variable_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+    db_conformance!(
+        KeylessMmbCompactVariableConf,
+        KeylessMmbCompactVariable,
+        keyless_variable_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+
+    keyed_storage_audit!(
+        AnyMmrUnorderedFixedStorage,
+        mmr::Family,
+        AnyMmrUnorderedFixed,
+        any_fixed_config
+    );
+    keyed_storage_audit!(
+        AnyMmrUnorderedVariableStorage,
+        mmr::Family,
+        AnyMmrUnorderedVariable,
+        any_variable_config
+    );
+    keyed_storage_audit!(
+        AnyMmrOrderedFixedStorage,
+        mmr::Family,
+        AnyMmrOrderedFixed,
+        any_fixed_config
+    );
+    keyed_storage_audit!(
+        AnyMmrOrderedVariableStorage,
+        mmr::Family,
+        AnyMmrOrderedVariable,
+        any_variable_config
+    );
+    keyed_storage_audit!(
+        AnyMmbUnorderedFixedStorage,
+        mmb::Family,
+        AnyMmbUnorderedFixed,
+        any_fixed_config
+    );
+    keyed_storage_audit!(
+        AnyMmbUnorderedVariableStorage,
+        mmb::Family,
+        AnyMmbUnorderedVariable,
+        any_variable_config
+    );
+    keyed_storage_audit!(
+        AnyMmbOrderedFixedStorage,
+        mmb::Family,
+        AnyMmbOrderedFixed,
+        any_fixed_config
+    );
+    keyed_storage_audit!(
+        AnyMmbOrderedVariableStorage,
+        mmb::Family,
+        AnyMmbOrderedVariable,
+        any_variable_config
+    );
+    keyed_storage_audit!(
+        CurrentMmrUnorderedFixedStorage,
+        mmr::Family,
+        CurrentMmrUnorderedFixed,
+        current_fixed_config
+    );
+    keyed_storage_audit!(
+        CurrentMmrUnorderedVariableStorage,
+        mmr::Family,
+        CurrentMmrUnorderedVariable,
+        current_variable_config
+    );
+    keyed_storage_audit!(
+        CurrentMmrOrderedFixedStorage,
+        mmr::Family,
+        CurrentMmrOrderedFixed,
+        current_fixed_config
+    );
+    keyed_storage_audit!(
+        CurrentMmrOrderedVariableStorage,
+        mmr::Family,
+        CurrentMmrOrderedVariable,
+        current_variable_config
+    );
+    keyed_storage_audit!(
+        CurrentMmbUnorderedFixedStorage,
+        mmb::Family,
+        CurrentMmbUnorderedFixed,
+        current_fixed_config
+    );
+    keyed_storage_audit!(
+        CurrentMmbUnorderedVariableStorage,
+        mmb::Family,
+        CurrentMmbUnorderedVariable,
+        current_variable_config
+    );
+    keyed_storage_audit!(
+        CurrentMmbOrderedFixedStorage,
+        mmb::Family,
+        CurrentMmbOrderedFixed,
+        current_fixed_config
+    );
+    keyed_storage_audit!(
+        CurrentMmbOrderedVariableStorage,
+        mmb::Family,
+        CurrentMmbOrderedVariable,
+        current_variable_config
+    );
+
+    immutable_storage_audit!(
+        ImmutableMmrFixedStorage,
+        mmr::Family,
+        ImmutableMmrFixed,
+        immutable_fixed_config
+    );
+    immutable_storage_audit!(
+        ImmutableMmbFixedStorage,
+        mmb::Family,
+        ImmutableMmbFixed,
+        immutable_fixed_config
+    );
+    immutable_storage_audit!(
+        ImmutableMmrVariableStorage,
+        mmr::Family,
+        ImmutableMmrVariable,
+        immutable_variable_config
+    );
+    immutable_storage_audit!(
+        ImmutableMmbVariableStorage,
+        mmb::Family,
+        ImmutableMmbVariable,
+        immutable_variable_config
+    );
+
+    storage_audit_conformance!(
+        KeylessMmrFixedStorage,
+        mmr::Family,
+        KeylessMmrFixed,
+        keyless_fixed_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    storage_audit_conformance!(
+        KeylessMmbFixedStorage,
+        mmb::Family,
+        KeylessMmbFixed,
+        keyless_fixed_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    storage_audit_conformance!(
+        KeylessMmrVariableStorage,
+        mmr::Family,
+        KeylessMmrVariable,
+        keyless_variable_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+    storage_audit_conformance!(
+        KeylessMmbVariableStorage,
+        mmb::Family,
+        KeylessMmbVariable,
+        keyless_variable_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+
+    immutable_storage_audit!(
+        ImmutableMmrCompactFixedStorage,
+        mmr::Family,
+        ImmutableMmrCompactFixed,
+        immutable_fixed_compact_config
+    );
+    immutable_storage_audit!(
+        ImmutableMmbCompactFixedStorage,
+        mmb::Family,
+        ImmutableMmbCompactFixed,
+        immutable_fixed_compact_config
+    );
+    immutable_storage_audit!(
+        ImmutableMmrCompactVariableStorage,
+        mmr::Family,
+        ImmutableMmrCompactVariable,
+        immutable_variable_compact_config
+    );
+    immutable_storage_audit!(
+        ImmutableMmbCompactVariableStorage,
+        mmb::Family,
+        ImmutableMmbCompactVariable,
+        immutable_variable_compact_config
+    );
+
+    storage_audit_conformance!(
+        KeylessMmrCompactFixedStorage,
+        mmr::Family,
+        KeylessMmrCompactFixed,
+        keyless_fixed_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    storage_audit_conformance!(
+        KeylessMmbCompactFixedStorage,
+        mmb::Family,
+        KeylessMmbCompactFixed,
+        keyless_fixed_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| U64::new(x)) }
+    );
+    storage_audit_conformance!(
+        KeylessMmrCompactVariableStorage,
+        mmr::Family,
+        KeylessMmrCompactVariable,
+        keyless_variable_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+    storage_audit_conformance!(
+        KeylessMmbCompactVariableStorage,
+        mmb::Family,
+        KeylessMmbCompactVariable,
+        keyless_variable_compact_config,
+        |db, seed| { keyless_root!(db, seed, |x| x.to_be_bytes().to_vec()) }
+    );
+
+    conformance_tests! {
+        AnyMmrUnorderedFixedConf => 200,
+        AnyMmrUnorderedVariableConf => 200,
+        AnyMmrOrderedFixedConf => 200,
+        AnyMmrOrderedVariableConf => 200,
+        AnyMmbUnorderedFixedConf => 200,
+        AnyMmbUnorderedVariableConf => 200,
+        AnyMmbOrderedFixedConf => 200,
+        AnyMmbOrderedVariableConf => 200,
+        CurrentMmrUnorderedFixedConf => 200,
+        CurrentMmrUnorderedVariableConf => 200,
+        CurrentMmrOrderedFixedConf => 200,
+        CurrentMmrOrderedVariableConf => 200,
+        CurrentMmbUnorderedFixedConf => 200,
+        CurrentMmbUnorderedVariableConf => 200,
+        CurrentMmbOrderedFixedConf => 200,
+        CurrentMmbOrderedVariableConf => 200,
+        ImmutableMmrFixedConf => 200,
+        ImmutableMmbFixedConf => 200,
+        ImmutableMmrVariableConf => 200,
+        ImmutableMmbVariableConf => 200,
+        KeylessMmrFixedConf => 200,
+        KeylessMmbFixedConf => 200,
+        KeylessMmrVariableConf => 200,
+        KeylessMmbVariableConf => 200,
+        ImmutableMmrCompactFixedConf => 200,
+        ImmutableMmbCompactFixedConf => 200,
+        ImmutableMmrCompactVariableConf => 200,
+        ImmutableMmbCompactVariableConf => 200,
+        KeylessMmrCompactFixedConf => 200,
+        KeylessMmbCompactFixedConf => 200,
+        KeylessMmrCompactVariableConf => 200,
+        KeylessMmbCompactVariableConf => 200,
+        StorageConformance<AnyMmrUnorderedFixedStorage> => 64,
+        StorageConformance<AnyMmrUnorderedVariableStorage> => 64,
+        StorageConformance<AnyMmrOrderedFixedStorage> => 64,
+        StorageConformance<AnyMmrOrderedVariableStorage> => 64,
+        StorageConformance<AnyMmbUnorderedFixedStorage> => 64,
+        StorageConformance<AnyMmbUnorderedVariableStorage> => 64,
+        StorageConformance<AnyMmbOrderedFixedStorage> => 64,
+        StorageConformance<AnyMmbOrderedVariableStorage> => 64,
+        StorageConformance<CurrentMmrUnorderedFixedStorage> => 64,
+        StorageConformance<CurrentMmrUnorderedVariableStorage> => 64,
+        StorageConformance<CurrentMmrOrderedFixedStorage> => 64,
+        StorageConformance<CurrentMmrOrderedVariableStorage> => 64,
+        StorageConformance<CurrentMmbUnorderedFixedStorage> => 64,
+        StorageConformance<CurrentMmbUnorderedVariableStorage> => 64,
+        StorageConformance<CurrentMmbOrderedFixedStorage> => 64,
+        StorageConformance<CurrentMmbOrderedVariableStorage> => 64,
+        StorageConformance<ImmutableMmrFixedStorage> => 64,
+        StorageConformance<ImmutableMmbFixedStorage> => 64,
+        StorageConformance<ImmutableMmrVariableStorage> => 64,
+        StorageConformance<ImmutableMmbVariableStorage> => 64,
+        StorageConformance<KeylessMmrFixedStorage> => 64,
+        StorageConformance<KeylessMmbFixedStorage> => 64,
+        StorageConformance<KeylessMmrVariableStorage> => 64,
+        StorageConformance<KeylessMmbVariableStorage> => 64,
+        StorageConformance<ImmutableMmrCompactFixedStorage> => 64,
+        StorageConformance<ImmutableMmbCompactFixedStorage> => 64,
+        StorageConformance<ImmutableMmrCompactVariableStorage> => 64,
+        StorageConformance<ImmutableMmbCompactVariableStorage> => 64,
+        StorageConformance<KeylessMmrCompactFixedStorage> => 64,
+        StorageConformance<KeylessMmbCompactFixedStorage> => 64,
+        StorageConformance<KeylessMmrCompactVariableStorage> => 64,
+        StorageConformance<KeylessMmbCompactVariableStorage> => 64,
+    }
+}
+
+// Order-independence tests (run via `just test`, unlike the conformance tests above)
+//
+// Within a single batch, the insertion order of operations must not affect the root.
+// Keyed and immutable variants sort operations internally (BTreeMap for keys, sorted
+// locations for existing entries). Keyless variants preserve append order, so they
+// are intentionally excluded.
+//
+// Each test creates two databases (`fwd` and `rev`) and applies the same set of
+// operations in forward and reverse order, then asserts the roots are equal.
+
+async fn apply_both_orders<F: Family, D: DbAny<F, Key = Digest, Value = Digest>>(
+    fwd: D,
+    rev: D,
+    ops: Vec<(Digest, Option<Digest>)>,
+    msg: &str,
+) -> (D, D) {
+    let fwd = apply_writes(fwd, ops.clone()).await;
+    let mut reversed = ops;
+    reversed.reverse();
+    let rev = apply_writes(rev, reversed).await;
+    assert_eq!(fwd.root().to_vec(), rev.root().to_vec(), "{msg}");
+    (fwd, rev)
+}
+
+#[boxed]
+async fn assert_keyed_order_independent<F: Family, D: DbAny<F, Key = Digest, Value = Digest>>(
+    fwd: D,
+    rev: D,
+) -> (D, D) {
+    let mut creates: Vec<_> = (0..20)
+        .map(|i| (to_digest(i), Some(to_val(i, 0))))
+        .collect();
+    for i in 0..8u64 {
+        creates.push((colliding_digest(0xAB, i), Some(to_val(i, 100))));
+    }
+    let (fwd, rev) =
+        apply_both_orders(fwd, rev, creates, "create order must not affect root").await;
+
+    let mut mixed: Vec<_> = (0..20)
+        .map(|i| {
+            if i % 2 == 1 {
+                (to_digest(i), None)
+            } else {
+                (to_digest(i), Some(to_val(i, 200)))
+            }
+        })
+        .collect();
+    for i in 0..8u64 {
+        mixed.push((colliding_digest(0xAB, i), Some(to_val(i, 300))));
+    }
+    let (fwd, rev) =
+        apply_both_orders(fwd, rev, mixed, "delete+update order must not affect root").await;
+
+    let mut recreates: Vec<_> = (0..20)
+        .filter(|i| i % 2 == 1)
+        .map(|i| (to_digest(i), Some(to_val(i, 400))))
+        .collect();
+    for i in 8..16u64 {
+        recreates.push((colliding_digest(0xAB, i), Some(to_val(i, 500))));
+    }
+    let (fwd, rev) = apply_both_orders(
+        fwd,
+        rev,
+        recreates,
+        "recreate-after-delete order must not affect root",
+    )
+    .await;
+    (fwd, rev)
+}
+
+// Macro rather than a generic function because immutable Db types don't implement DbAny.
+macro_rules! assert_immutable_order_independent {
+    ($fwd:ident, $rev:ident) => {{
+        let mut ops: Vec<_> = (0..20).map(|i| (to_digest(i), to_val(i, 0))).collect();
+        for i in 0..8u64 {
+            ops.push((colliding_digest(0xCD, i), to_val(i, 100)));
+        }
+
+        let fwd_floor = $fwd.inactivity_floor_loc();
+        let mut batch = $fwd.new_batch();
+        for &(k, v) in &ops {
+            batch = batch.set(k, v);
+        }
+        let merkleized = batch.merkleize(&$fwd, None, fwd_floor).await;
+        ($fwd, _) = $fwd.apply_batch(merkleized).await.unwrap();
+
+        let rev_floor = $rev.inactivity_floor_loc();
+        let mut batch = $rev.new_batch();
+        for &(k, v) in ops.iter().rev() {
+            batch = batch.set(k, v);
+        }
+        let merkleized = batch.merkleize(&$rev, None, rev_floor).await;
+        ($rev, _) = $rev.apply_batch(merkleized).await.unwrap();
+
+        assert_eq!(
+            $fwd.root().to_vec(),
+            $rev.root().to_vec(),
+            "immutable set order must not affect root"
+        );
+    }};
+}
+
+macro_rules! order_test {
+    ($name:ident, $db:ty, $cfg_fn:expr, |$fwd:ident, $rev:ident| $body:expr) => {
+        #[test]
+        fn $name() {
+            deterministic::Runner::default().start(|ctx| async move {
+                let mut $fwd = <$db>::init(ctx.child("fwd"), ($cfg_fn)("fwd", &ctx))
+                    .await
+                    .unwrap();
+                let mut $rev = <$db>::init(ctx.child("rev"), ($cfg_fn)("rev", &ctx))
+                    .await
+                    .unwrap();
+                $body;
+                $fwd.destroy().await.unwrap();
+                $rev.destroy().await.unwrap();
+            });
+        }
+    };
+}
+
+order_test!(
+    test_order_any_mmr_unordered_fixed,
+    AnyMmrUnorderedFixed,
+    any_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_any_mmr_unordered_variable,
+    AnyMmrUnorderedVariable,
+    any_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_any_mmr_ordered_fixed,
+    AnyMmrOrderedFixed,
+    any_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_any_mmr_ordered_variable,
+    AnyMmrOrderedVariable,
+    any_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_any_mmb_unordered_fixed,
+    AnyMmbUnorderedFixed,
+    any_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_any_mmb_unordered_variable,
+    AnyMmbUnorderedVariable,
+    any_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_any_mmb_ordered_fixed,
+    AnyMmbOrderedFixed,
+    any_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_any_mmb_ordered_variable,
+    AnyMmbOrderedVariable,
+    any_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmr_unordered_fixed,
+    CurrentMmrUnorderedFixed,
+    current_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmr_unordered_variable,
+    CurrentMmrUnorderedVariable,
+    current_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmr_ordered_fixed,
+    CurrentMmrOrderedFixed,
+    current_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmr_ordered_variable,
+    CurrentMmrOrderedVariable,
+    current_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmb_unordered_fixed,
+    CurrentMmbUnorderedFixed,
+    current_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmb_unordered_variable,
+    CurrentMmbUnorderedVariable,
+    current_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmb_ordered_fixed,
+    CurrentMmbOrderedFixed,
+    current_fixed_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_cur_mmb_ordered_variable,
+    CurrentMmbOrderedVariable,
+    current_variable_config,
+    |fwd, rev| {
+        (fwd, rev) = assert_keyed_order_independent(fwd, rev).await;
+    }
+);
+order_test!(
+    test_order_immutable_mmr_fixed,
+    ImmutableMmrFixed,
+    immutable_fixed_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);
+order_test!(
+    test_order_immutable_mmr_variable,
+    ImmutableMmrVariable,
+    immutable_variable_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);
+order_test!(
+    test_order_immutable_mmb_fixed,
+    ImmutableMmbFixed,
+    immutable_fixed_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);
+order_test!(
+    test_order_immutable_mmb_variable,
+    ImmutableMmbVariable,
+    immutable_variable_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);
+order_test!(
+    test_order_immutable_mmr_compact_fixed,
+    ImmutableMmrCompactFixed,
+    immutable_fixed_compact_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);
+order_test!(
+    test_order_immutable_mmb_compact_fixed,
+    ImmutableMmbCompactFixed,
+    immutable_fixed_compact_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);
+order_test!(
+    test_order_immutable_mmr_compact_variable,
+    ImmutableMmrCompactVariable,
+    immutable_variable_compact_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);
+order_test!(
+    test_order_immutable_mmb_compact_variable,
+    ImmutableMmbCompactVariable,
+    immutable_variable_compact_config,
+    |fwd, rev| assert_immutable_order_independent!(fwd, rev)
+);

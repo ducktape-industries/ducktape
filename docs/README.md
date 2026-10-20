@@ -12,6 +12,7 @@ nothing cites is deleted, not archived.
 | --- | --- |
 | What is this, how is the tree laid out, how do I build, test and run it | [`../README.md`](../README.md) |
 | What rules bind an assistant working in this repo | [`../AGENTS.md`](../AGENTS.md) |
+| Which third-party crate is vendored, what our copy patches, and when the copy goes | [`../vendor/README.md`](../vendor/README.md) |
 
 ## Operate
 

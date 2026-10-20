@@ -102,7 +102,7 @@ impl<E: Context> Ctx<E> {
         self.daemon.sync(request).await
     }
 
-    pub(crate) async fn held_head(&self) -> Result<(statesync::Response, Option<state::Hold>)> {
+    pub(crate) async fn held_head(&self) -> Result<(statesync::Response, Option<crate::HeldHead>)> {
         self.daemon.held_head().await
     }
 
@@ -208,6 +208,10 @@ impl<E: Context> Ctx<E> {
 
     pub(crate) fn answered(&self, answered: crate::server::Answered) {
         let _ = self.daemon.answered.send(answered);
+    }
+
+    pub(crate) fn holds_ended(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.daemon.holds_ended.clone()
     }
 
     pub(crate) fn live_port(&self) -> Option<u16> {

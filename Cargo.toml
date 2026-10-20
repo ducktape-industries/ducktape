@@ -155,6 +155,9 @@ store = { git = "https://github.com/ducktape-industries/programs", rev = "1a246b
 # semver-major would be a different trait).
 rand_core = "0.10.1"
 
+[patch.crates-io]
+commonware-storage = { path = "vendor/commonware-storage" }
+
 [patch."https://github.com/ducktape-industries/ducktape"]
 abi = { path = "crates/kernel/abi" }
 blob = { path = "crates/blob" }

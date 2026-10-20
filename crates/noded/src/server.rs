@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use abi::Receipt;
@@ -63,7 +63,12 @@ impl Rpc {
         let runtime = builder.build()?;
         let block_time = Duration::from_millis(daemon.network.cadence.block_time_ms());
         let router = router(daemon.clone());
-        runtime.spawn(slow_lines(block_time, answers, daemon.tips.subscribe()));
+        runtime.spawn(slow_lines(
+            block_time,
+            answers,
+            daemon.tips.subscribe(),
+            daemon.holds_ended.clone(),
+        ));
         runtime.spawn(changes::fan(fanout));
         for _ in 0..threads {
             let door = listener.try_clone()?;
@@ -244,6 +249,7 @@ async fn slow_lines(
     slow: Duration,
     mut answers: tokio::sync::mpsc::UnboundedReceiver<Answered>,
     mut tips: tokio::sync::watch::Receiver<u64>,
+    holds_ended: Arc<AtomicU64>,
 ) {
     let mut window = Slowed::default();
     loop {
@@ -256,7 +262,11 @@ async fn slow_lines(
             Some(answered) = answers.recv() => Heard::Answered(answered),
         };
         match heard {
-            Heard::Tip => window = closed(window, slow, &mut answers, *tips.borrow_and_update()),
+            Heard::Tip => {
+                let height = *tips.borrow_and_update();
+                window = closed(window, slow, &mut answers, height);
+                holds_closed(&holds_ended, height);
+            }
             Heard::Answered(answered) => window.observe(answered, slow),
             Heard::Ended => return,
         }
@@ -287,6 +297,19 @@ fn closed(
         );
     }
     Slowed::default()
+}
+
+fn holds_closed(ended: &AtomicU64, height: u64) {
+    let count = ended.swap(0, Ordering::Relaxed);
+    if count > 0 {
+        tracing::info!(
+            target: "ducktape::sync",
+            event = "sync_holds_ended",
+            height,
+            count,
+            "joins' holds on this node's state ended since the block before"
+        );
+    }
 }
 
 struct Whole(Bytes);
@@ -985,27 +1008,72 @@ async fn sync<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<statesync::R
     }
 }
 
-type Open = (tokio::sync::watch::Receiver<u64>, state::Hold);
+struct Open {
+    tips: tokio::sync::watch::Receiver<u64>,
+    held: Held,
+}
+
+struct Held {
+    _hold: statesync::Holding,
+    height: u64,
+    opened: Instant,
+    ended: &'static str,
+    tally: Arc<AtomicU64>,
+}
+
+impl Held {
+    fn new(held: crate::HeldHead, opened: Instant, tally: Arc<AtomicU64>) -> Held {
+        Held {
+            _hold: held.hold,
+            height: held.height,
+            opened,
+            ended: "connection_ended",
+            tally,
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        tracing::debug!(
+            target: "ducktape::sync",
+            event = "sync_hold_ended",
+            height = self.height,
+            open_ms = self.opened.elapsed().as_millis() as u64,
+            reason = self.ended,
+            "a join's hold on this node's state ended"
+        );
+        self.tally.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 async fn sync_hold<E: Context>(ctx: Ctx<E>) -> Response {
-    let (head, hold) = match ctx.held_head().await {
+    let opened = Instant::now();
+    let (head, held) = match ctx.held_head().await {
         Ok(held) => held,
         Err(error) => return failed::<()>(error).into_response(),
     };
     let head = Bytes::from(length_framed(&abi::encode(&head)));
-    let Some(hold) = hold else {
+    let Some(held) = held else {
         return (StatusCode::OK, head).into_response();
     };
-    let heights = futures::stream::unfold((ctx.tips(), hold), applied);
+    let open = Open {
+        tips: ctx.tips(),
+        held: Held::new(held, opened, ctx.holds_ended()),
+    };
+    let heights = futures::stream::unfold(open, applied);
     let answer = futures::stream::once(async move { Ok::<_, std::io::Error>(head) }).chain(heights);
     (StatusCode::OK, Body::from_stream(answer)).into_response()
 }
 
-async fn applied((mut tips, hold): Open) -> Option<(std::io::Result<Bytes>, Open)> {
-    tips.changed().await.ok()?;
-    let height = *tips.borrow_and_update();
+async fn applied(mut open: Open) -> Option<(std::io::Result<Bytes>, Open)> {
+    if open.tips.changed().await.is_err() {
+        open.held.ended = "node_stopped";
+        return None;
+    }
+    let height = *open.tips.borrow_and_update();
     let line = Bytes::from(length_framed(&height.to_le_bytes()));
-    Some((Ok(line), (tips, hold)))
+    Some((Ok(line), open))
 }
 
 fn length_framed(bytes: &[u8]) -> Vec<u8> {
@@ -1101,7 +1169,10 @@ mod tests {
         assert_eq!(read, PAST_AXUM_DEFAULT_LIMIT.to_string());
     }
 
-    struct Caught(tokio::sync::mpsc::UnboundedSender<BTreeMap<String, String>>);
+    struct Caught(
+        &'static str,
+        tokio::sync::mpsc::UnboundedSender<BTreeMap<String, String>>,
+    );
 
     struct Fields(BTreeMap<String, String>);
 
@@ -1127,12 +1198,12 @@ mod tests {
         ) {
             let mut fields = Fields(BTreeMap::new());
             event.record(&mut fields);
-            let slow = fields
+            fields
                 .0
-                .get("event")
-                .is_some_and(|event| event == "request_slow");
-            if slow {
-                let _ = self.0.send(fields.0);
+                .insert("level".to_owned(), event.metadata().level().to_string());
+            let named = fields.0.get("event").is_some_and(|event| event == self.0);
+            if named {
+                let _ = self.1.send(fields.0);
             }
         }
     }
@@ -1143,7 +1214,7 @@ mod tests {
     fn slow_requests_in_one_block_make_one_line_with_their_count_and_a_quiet_block_none() {
         use tracing_subscriber::layer::SubscriberExt as _;
         let (caught, mut lines) = tokio::sync::mpsc::unbounded_channel();
-        let subscriber = tracing_subscriber::registry().with(Caught(caught));
+        let subscriber = tracing_subscriber::registry().with(Caught("request_slow", caught));
         tracing::subscriber::with_default(subscriber, || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -1151,7 +1222,7 @@ mod tests {
             runtime.block_on(async {
                 let (answered, answers) = tokio::sync::mpsc::unbounded_channel();
                 let (tips, tipped) = tokio::sync::watch::channel(0);
-                let lining = tokio::spawn(slow_lines(BLOCK, answers, tipped));
+                let lining = tokio::spawn(slow_lines(BLOCK, answers, tipped, Arc::default()));
                 let requests = [
                     (BLOCK * 2, "/v1/query"),
                     (BLOCK * 5, "/v1/tx"),
@@ -1176,6 +1247,79 @@ mod tests {
                     "a block with no slow request writes nothing"
                 );
             });
+        });
+    }
+
+    fn open(tips: tokio::sync::watch::Receiver<u64>, height: u64, tally: &Arc<AtomicU64>) -> Open {
+        let held = crate::HeldHead {
+            height,
+            hold: Box::new(()),
+        };
+        Open {
+            tips,
+            held: Held::new(held, Instant::now(), tally.clone()),
+        }
+    }
+
+    #[test]
+    fn a_hold_says_once_when_it_ends_at_which_height_and_why() {
+        use futures::StreamExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (caught, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = tracing_subscriber::registry().with(Caught("sync_hold_ended", caught));
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let tally: Arc<AtomicU64> = Arc::default();
+                let (tips, _) = tokio::sync::watch::channel(7);
+                let mut heights = Box::pin(futures::stream::unfold(
+                    open(tips.subscribe(), 7, &tally),
+                    applied,
+                ));
+                tips.send_replace(8);
+                assert!(heights.next().await.is_some());
+                assert!(lines.try_recv().is_err(), "an open hold says nothing");
+                drop(heights);
+                let line = lines.recv().await.unwrap();
+                assert_eq!(line["level"], "DEBUG");
+                assert_eq!(line["height"], "7");
+                assert_eq!(line["reason"], "connection_ended");
+                assert!(line.contains_key("open_ms"));
+                let heights = futures::stream::unfold(open(tips.subscribe(), 8, &tally), applied);
+                drop(tips);
+                assert_eq!(heights.count().await, 0);
+                let line = lines.recv().await.unwrap();
+                assert_eq!(line["height"], "8");
+                assert_eq!(line["reason"], "node_stopped");
+                assert!(lines.try_recv().is_err(), "each hold says it once");
+                assert_eq!(tally.load(Ordering::Relaxed), 2);
+            });
+        });
+    }
+
+    #[test]
+    fn holds_ended_in_one_block_make_one_info_line_with_their_count_and_a_quiet_block_none() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (caught, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = tracing_subscriber::registry().with(Caught("sync_holds_ended", caught));
+        tracing::subscriber::with_default(subscriber, || {
+            let (tips, _) = tokio::sync::watch::channel(0);
+            let tally: Arc<AtomicU64> = Arc::default();
+            for height in 0..3 {
+                drop(open(tips.subscribe(), height, &tally));
+            }
+            holds_closed(&tally, 5);
+            let line = lines.try_recv().unwrap();
+            assert_eq!(line["level"], "INFO");
+            assert_eq!(line["height"], "5");
+            assert_eq!(line["count"], "3");
+            holds_closed(&tally, 6);
+            assert!(
+                lines.try_recv().is_err(),
+                "a block with no ended hold writes nothing"
+            );
         });
     }
 }

@@ -1,6 +1,6 @@
 // The node's read views: its state pinned after the last block it applied, with that moment's
-// status encoded once, and the pool's preconfirmed layer over it. The writer and the pool publish
-// fresh ones by swap; every reader loads the newest without waiting.
+// status encoded once, its commitments' sync readers, and the pool's preconfirmed layer over it.
+// The writer and the pool publish fresh ones by swap; every reader loads the newest without waiting.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -24,6 +24,7 @@ pub struct View<E: Context> {
     tip: Tip,
     status: Bytes,
     programs: OnceLock<Bytes>,
+    sync: Arc<statesync::Published<E>>,
     _reader: watch::Receiver<()>,
 }
 
@@ -58,6 +59,7 @@ impl<E: Context> View<E> {
             tip,
             status: Bytes::from(abi::encode(&status)),
             programs: OnceLock::new(),
+            sync: Arc::new(statesync::Published::of(node)?),
             _reader: facts.readers.subscribe(),
         })
     }
@@ -72,6 +74,10 @@ impl<E: Context> View<E> {
 
     pub fn tip(&self) -> Tip {
         self.tip
+    }
+
+    pub(crate) fn sync(&self) -> &Arc<statesync::Published<E>> {
+        &self.sync
     }
 
     pub fn status(&self) -> Bytes {

@@ -1,0 +1,3875 @@
+//! Authenticated journal implementation.
+//!
+//! An authenticated journal maintains a contiguous journal of items alongside a Merkle-family
+//! structure. The item at index i in the journal corresponds to the leaf at Location i in the
+//! Merkle structure. This structure enables efficient proofs that an item is included in the
+//! journal at a specific location.
+//!
+//! # Ownership
+//!
+//! Mutating methods take the journal by value and return it on success. If a mutating
+//! method returns an error, or its future is dropped before it finishes, the journal is
+//! gone: state that was not yet durable is discarded, but everything already on disk stays
+//! recoverable.
+
+use crate::{
+    Context,
+    journal::{
+        Error as JournalError,
+        contiguous::{Contiguous, Many, Mutable, Snapshottable},
+    },
+    merkle::{
+        self, Bagging, Family, Location, Position, Proof, Readable, batch, full::Merkle,
+        hasher::Standard as StandardHasher, mem::Mem,
+    },
+};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use commonware_codec::{Encode, EncodeShared};
+use commonware_cryptography::{Digest, Hasher};
+use commonware_macros::boxed;
+use commonware_parallel::Strategy;
+use commonware_runtime::{Handle, ReadOptions};
+use core::{
+    num::{NonZeroU64, NonZeroUsize},
+    ops::Range,
+};
+use futures::{Stream, TryFutureExt as _, try_join};
+use thiserror::Error;
+use tracing::{debug, warn};
+
+/// Errors that can occur when interacting with an authenticated journal.
+#[derive(Error, Debug)]
+pub enum Error<F: Family> {
+    #[error("merkle error: {0}")]
+    Merkle(#[from] merkle::Error<F>),
+
+    #[error("journal error: {0}")]
+    Journal(#[from] super::Error),
+}
+
+/// Strong ref to an ancestor [`MerkleizedBatch`] in the journal-batch chain.
+type MerkleizedParent<F, H, Item, S> = Arc<MerkleizedBatch<F, <H as Hasher>::Digest, Item, S>>;
+
+/// A speculative batch whose root digest has not yet been computed,
+/// in contrast to [`MerkleizedBatch`].
+pub struct UnmerkleizedBatch<F: Family, H: Hasher, Item: Send + Sync, S: Strategy> {
+    // The inner batch of Merkle leaf digests.
+    inner: batch::UnmerkleizedBatch<F, H::Digest, S>,
+    // The hasher to use for hashing the items.
+    hasher: StandardHasher<H>,
+    // The items to append from this batch.
+    items: Vec<Item>,
+    // This batch's parent, or None if the parent is the journal itself.
+    parent: Option<MerkleizedParent<F, H, Item, S>>,
+}
+
+type MerkleizedBatchArc<F, H, Item, S> = Arc<MerkleizedBatch<F, <H as Hasher>::Digest, Item, S>>;
+
+impl<F: Family, H: Hasher, Item: Encode + Send + Sync, S: Strategy>
+    UnmerkleizedBatch<F, H, Item, S>
+{
+    /// Add an item to the batch.
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(mut self, item: Item) -> Self {
+        let encoded = item.encode();
+        self.inner = self.inner.add(&self.hasher, &encoded);
+        self.items.push(item);
+        self
+    }
+
+    /// Collect ancestor items and the leaf count before the oldest retained ancestor.
+    fn collect_ancestor_items(
+        parent: &MerkleizedParent<F, H, Item, S>,
+    ) -> (u64, Vec<Arc<Vec<Item>>>) {
+        let mut items = Vec::new();
+        let mut base_leaves = parent.as_ref().size() - parent.items.len() as u64;
+        if !parent.items.is_empty() {
+            items.push(Arc::clone(&parent.items));
+        }
+        let mut current = parent.parent.as_ref().and_then(Weak::upgrade);
+        while let Some(batch) = current {
+            base_leaves = batch.as_ref().size() - batch.items.len() as u64;
+            if !batch.items.is_empty() {
+                items.push(Arc::clone(&batch.items));
+            }
+            current = batch.parent.as_ref().and_then(Weak::upgrade);
+        }
+        items.reverse();
+        (base_leaves, items)
+    }
+
+    /// Merkleize the batch.
+    /// `base` provides committed node data as fallback during hash computation.
+    pub fn merkleize(self, base: &Mem<F, H::Digest>) -> MerkleizedBatchArc<F, H, Item, S> {
+        let Self {
+            inner,
+            hasher,
+            items,
+            parent,
+        } = self;
+
+        let (ancestor_base_leaves, ancestor_items) = parent.as_ref().map_or_else(
+            || (*inner.leaves() - items.len() as u64, Vec::new()),
+            Self::collect_ancestor_items,
+        );
+        let items = Arc::new(items);
+        let merkle = inner.merkleize(base, &hasher);
+        Arc::new(MerkleizedBatch {
+            inner: merkle,
+            bagging: hasher.root_bagging(),
+            items,
+            parent: parent.as_ref().map(Arc::downgrade),
+            ancestor_base_leaves,
+            ancestor_items,
+        })
+    }
+
+    /// Add caller-supplied items to the batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if items were previously added via [`add`](Self::add).
+    pub(crate) fn add_many(mut self, items: Vec<Item>) -> Self {
+        assert!(
+            self.items.is_empty(),
+            "add_many expects no items added via add"
+        );
+
+        self.inner = self.inner.add_many(&self.hasher, &items);
+        self.items = items;
+        self
+    }
+}
+
+/// A speculative batch whose root digest has been computed, in contrast to [`UnmerkleizedBatch`].
+#[derive(Clone, Debug)]
+pub struct MerkleizedBatch<F: Family, D: Digest, Item: Send + Sync, S: Strategy> {
+    /// The inner batch of Merkle leaf digests.
+    pub(crate) inner: Arc<batch::MerkleizedBatch<F, D, S>>,
+    /// The peak bagging policy inherited from the parent journal or batch.
+    bagging: Bagging,
+    /// The items to append from this batch.
+    items: Arc<Vec<Item>>,
+    /// This batch's parent, or None if the parent is the journal itself.
+    parent: Option<Weak<Self>>,
+    /// Number of leaves before the oldest retained ancestor batch.
+    pub(crate) ancestor_base_leaves: u64,
+    /// Ancestor item batches collected at merkleize time (root-to-tip order).
+    pub(crate) ancestor_items: Vec<Arc<Vec<Item>>>,
+}
+
+impl<F: Family, D: Digest, Item: Send + Sync, S: Strategy> MerkleizedBatch<F, D, Item, S> {
+    /// The number of items visible through this batch, including ancestors.
+    pub(crate) fn size(&self) -> u64 {
+        *self.inner.leaves()
+    }
+
+    /// Compute the root digest after this batch is applied using `inactive_peaks` and the bagging
+    /// carried by `hasher`.
+    ///
+    /// This recomputes the root rather than reading a cache.
+    pub fn root(
+        &self,
+        base: &Mem<F, D>,
+        hasher: &impl merkle::hasher::Hasher<F, Digest = D>,
+        inactive_peaks: usize,
+    ) -> Result<D, merkle::Error<F>> {
+        self.inner.root(base, hasher, inactive_peaks)
+    }
+
+    /// Inclusion proof for the element at `loc`.
+    pub fn proof(
+        &self,
+        base: &Mem<F, D>,
+        hasher: &impl merkle::hasher::Hasher<F, Digest = D>,
+        loc: Location<F>,
+        inactive_peaks: usize,
+    ) -> Result<Proof<F, D>, merkle::Error<F>> {
+        self.inner.proof(base, hasher, loc, inactive_peaks)
+    }
+
+    /// Inclusion proof for all elements in `range`.
+    pub fn range_proof(
+        &self,
+        base: &Mem<F, D>,
+        hasher: &impl merkle::hasher::Hasher<F, Digest = D>,
+        range: core::ops::Range<Location<F>>,
+        inactive_peaks: usize,
+    ) -> Result<Proof<F, D>, merkle::Error<F>> {
+        self.inner.range_proof(base, hasher, range, inactive_peaks)
+    }
+
+    /// The items added in this batch.
+    pub(crate) const fn items(&self) -> &Arc<Vec<Item>> {
+        &self.items
+    }
+
+    /// Create a new speculative batch of operations with this batch as its parent.
+    ///
+    /// The batch becomes invalid if any ancestor is dropped before being applied, or a sibling
+    /// fork has been applied.
+    pub fn new_batch<H: Hasher<Digest = D>>(self: &Arc<Self>) -> UnmerkleizedBatch<F, H, Item, S>
+    where
+        Item: Encode,
+    {
+        UnmerkleizedBatch {
+            inner: self.inner.new_batch(),
+            hasher: StandardHasher::new(self.bagging),
+            items: Vec::new(),
+            parent: Some(Arc::clone(self)),
+        }
+    }
+}
+
+impl<F: Family, D: Digest, Item: Send + Sync, S: Strategy> Readable
+    for MerkleizedBatch<F, D, Item, S>
+{
+    type Family = F;
+    type Digest = D;
+
+    fn size(&self) -> Position<F> {
+        self.inner.size()
+    }
+
+    fn get_node(&self, pos: Position<F>) -> Option<D> {
+        self.inner.get_node(pos)
+    }
+}
+
+/// An append-only data structure that maintains a sequential journal of items alongside a
+/// Merkle-family structure. The item at index i in the journal corresponds to the leaf at Location
+/// i in the Merkle structure. This structure enables efficient proofs that an item is included in
+/// the journal at a specific location.
+pub struct Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Merkle structure where each leaf is an item digest.
+    /// Invariant: leaf i corresponds to item i in the journal.
+    pub(crate) merkle: Merkle<F, E, H::Digest, S>,
+
+    /// Journal of items.
+    /// Invariant: item i corresponds to leaf i in the Merkle structure.
+    pub(crate) journal: C,
+
+    pub(crate) hasher: StandardHasher<H>,
+}
+
+impl<F, E, C, H, S> core::fmt::Debug for Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Journal")
+            .field("size", &self.size())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Returns the Location of the next item appended to the journal.
+    pub fn size(&self) -> Location<F> {
+        Location::new(self.journal.bounds().end)
+    }
+
+    /// Compute the root of the Merkle structure using `inactive_peaks` and the bagging carried by
+    /// the journal's hasher.
+    pub fn root(&self, inactive_peaks: usize) -> Result<H::Digest, Error<F>> {
+        self.merkle
+            .root(&self.hasher, inactive_peaks)
+            .map_err(Into::into)
+    }
+
+    /// Convert authenticated-journal errors to the contiguous journal trait error type.
+    fn map_error(error: Error<F>) -> JournalError {
+        match error {
+            Error::Journal(inner) => inner,
+            Error::Merkle(inner) => JournalError::Merkle(anyhow::Error::from(inner)),
+        }
+    }
+
+    /// Return a reference to the merkleization strategy.
+    pub const fn strategy(&self) -> &S {
+        self.merkle.strategy()
+    }
+
+    /// Create a speculative batch atop this journal.
+    pub fn new_batch(&self) -> UnmerkleizedBatch<F, H, C::Item, S>
+    where
+        C::Item: Encode,
+    {
+        let root = self.merkle.to_batch();
+        UnmerkleizedBatch {
+            inner: root.new_batch(),
+            hasher: StandardHasher::new(self.hasher.root_bagging()),
+            items: Vec::new(),
+            parent: None,
+        }
+    }
+
+    /// Add `items` to `batch`, merkleize, and compute the post-apply root, all as one CPU-bound job
+    /// submitted through [`Strategy::spawn`].
+    ///
+    /// The job hashes against an immutable snapshot of the committed Merkle state, so a parallel
+    /// strategy can host the batch's dominant CPU phase on its own pool instead of occupying the
+    /// calling task. If the job's caller is cancelled, the job still runs to completion
+    /// against its snapshot and the result is discarded.
+    pub(crate) async fn merkleize(
+        &self,
+        batch: UnmerkleizedBatch<F, H, C::Item, S>,
+        items: Vec<C::Item>,
+        inactive_peaks: usize,
+    ) -> Result<(MerkleizedBatchArc<F, H, C::Item, S>, H::Digest), merkle::Error<F>>
+    where
+        C::Item: 'static,
+    {
+        let ancestors = batch.inner.retain_ancestors();
+        let mem = self.merkle.snapshot();
+        let hasher = self.hasher.clone();
+        let strategy = self.strategy().clone();
+        strategy
+            .spawn(items.len(), move |_| {
+                let merkleized = batch.add_many(items).merkleize(&mem);
+                let root = merkleized.root(&mem, &hasher, inactive_peaks)?;
+                drop(ancestors);
+                Ok((merkleized, root))
+            })
+            .await
+    }
+
+    /// Create an owned [`MerkleizedBatch`] representing the current committed state.
+    ///
+    /// The batch has no items (the committed items are on disk, not in memory).
+    /// This is the starting point for building owned batch chains.
+    pub(crate) fn to_merkleized_batch(&self) -> Arc<MerkleizedBatch<F, H::Digest, C::Item, S>> {
+        Arc::new(MerkleizedBatch {
+            inner: self.merkle.to_batch(),
+            bagging: self.hasher.root_bagging(),
+            items: Arc::new(Vec::new()),
+            parent: None,
+            ancestor_base_leaves: *self.size(),
+            ancestor_items: Vec::new(),
+        })
+    }
+}
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Mutable<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Begin durably persisting the journal.
+    ///
+    /// Awaiting the returned [Handle] provides the same durability guarantee as [Self::commit].
+    /// Also tries to advance the recovery watermarks to bound startup recovery. Use
+    /// [Self::sync] to guarantee no recovery is needed.
+    pub async fn start_sync(mut self) -> Result<(Self, Handle<()>), Error<F>> {
+        let (journal_handle, merkle_handle);
+        ((self.journal, journal_handle), (self.merkle, merkle_handle)) = try_join!(
+            self.journal.start_sync().map_err(Error::Journal),
+            self.merkle.start_sync().map_err(Error::Merkle)
+        )?;
+
+        let handle =
+            Handle::from_future(
+                async move { try_join!(journal_handle, merkle_handle).map(|_| ()) },
+            );
+        Ok((self, handle))
+    }
+
+    /// Durably persist the journal. This is faster than `sync()` but does not guarantee that the
+    /// Merkle structure is durably persisted, meaning recovery may be required on startup in the
+    /// event of a crash.
+    pub async fn commit(mut self) -> Result<Self, Error<F>> {
+        // Though not necessary for recovery, we flush the merkle structure (without syncing it) to
+        // limit memory bloat.
+        (self.journal, self.merkle) = try_join!(
+            self.journal.commit().map_err(Error::Journal),
+            self.merkle.flush().map_err(Error::Merkle)
+        )?;
+
+        Ok(self)
+    }
+}
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Mutable<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Create a new [Journal] from the given components after aligning the Merkle structure with
+    /// the journal.
+    #[boxed]
+    pub async fn from_components(
+        merkle: Merkle<F, E, H::Digest, S>,
+        journal: C,
+        hasher: StandardHasher<H>,
+        apply_batch_size: u64,
+    ) -> Result<Self, Error<F>> {
+        let merkle = Self::align(merkle, &journal, &hasher, apply_batch_size).await?;
+
+        // Sync the Merkle structure to disk to avoid having to repeat any recovery that may have
+        // been performed on next startup.
+        let merkle = merkle.sync().await?;
+
+        Ok(Self {
+            merkle,
+            journal,
+            hasher,
+        })
+    }
+
+    /// Align the Merkle structure to be consistent with the journal. Any items in the structure
+    /// that are not in the journal are popped, and any items in the journal that are not in the
+    /// structure are added. Items are added in batches of size `apply_batch_size` to bound peak
+    /// memory use: each batch's items are buffered in memory so their leaves can be hashed
+    /// across the strategy.
+    async fn align(
+        mut merkle: Merkle<F, E, H::Digest, S>,
+        journal: &C,
+        hasher: &StandardHasher<H>,
+        apply_batch_size: u64,
+    ) -> Result<Merkle<F, E, H::Digest, S>, Error<F>> {
+        // Rewind Merkle structure elements that are ahead of the journal.
+        let journal_size = journal.bounds().end;
+        let mut merkle_leaves = merkle.leaves();
+        if merkle_leaves > journal_size {
+            let rewind_count = merkle_leaves - journal_size;
+            warn!(
+                journal_size,
+                ?rewind_count,
+                "rewinding Merkle structure to match journal"
+            );
+            merkle = merkle.rewind(*rewind_count as usize).await?;
+            merkle_leaves = Location::new(journal_size);
+        }
+
+        // If the Merkle structure is behind, replay journal items to catch up.
+        if merkle_leaves < journal_size {
+            let replay_count = journal_size - *merkle_leaves;
+            warn!(
+                ?journal_size,
+                replay_count, "Merkle structure lags behind journal, replaying journal to catch up"
+            );
+
+            while merkle_leaves < journal_size {
+                let count = apply_batch_size.min(journal_size - *merkle_leaves);
+                let mut items = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    items.push(journal.read(*merkle_leaves).await?);
+                    merkle_leaves += 1;
+                }
+
+                let batch = merkle.new_batch().add_many(hasher, &items);
+                let batch = merkle.with_mem(|mem| batch.merkleize(mem, hasher));
+                merkle = merkle.apply_batch(&batch)?;
+            }
+            return Ok(merkle);
+        }
+
+        // At this point the Merkle structure and journal should be consistent.
+        assert_eq!(journal.bounds().end, *merkle.leaves());
+
+        Ok(merkle)
+    }
+
+    /// Append an item to the journal and update the Merkle structure.
+    pub async fn append(mut self, item: &C::Item) -> Result<(Self, Location<F>), Error<F>> {
+        let encoded_item = item.encode();
+
+        // Append item to the journal, then update the Merkle structure state.
+        let loc;
+        (self.journal, loc) = self.journal.append(item).await?;
+        let unmerkleized_batch = self.merkle.new_batch().add(&self.hasher, &encoded_item);
+        let batch = self
+            .merkle
+            .with_mem(|mem| unmerkleized_batch.merkleize(mem, &self.hasher));
+        self.merkle = self.merkle.apply_batch(&batch)?;
+
+        Ok((self, Location::new(loc)))
+    }
+
+    /// Apply a batch to the journal.
+    ///
+    /// A batch is valid if the journal has not been modified since the batch
+    /// chain was created, or if only ancestors of this batch have been applied.
+    /// Already-committed ancestors are skipped automatically.
+    /// Applying a batch from a different fork returns an error.
+    pub async fn apply_batch(
+        mut self,
+        batch: &MerkleizedBatch<F, H::Digest, C::Item, S>,
+    ) -> Result<Self, Error<F>> {
+        let merkle_size = self.merkle.size();
+        let base_size = batch.inner.base_size();
+
+        // Determine whether ancestors have already been committed.
+        // `base_size` is the merkle size when the batch chain was forked.
+        // If the merkle has advanced past the fork point, ancestors are
+        // already on disk; check that the current size is reachable from
+        // the batch chain before skipping them.
+        let skip_ancestors = if merkle_size == base_size {
+            false
+        } else if merkle_size > base_size && merkle_size < batch.inner.size() {
+            true
+        } else {
+            // Merkle is at an incompatible position (a sibling or unrelated
+            // fork was committed). Eagerly reject to avoid mutating the journal.
+            return Err(merkle::Error::StaleBatch {
+                expected: base_size,
+                actual: merkle_size,
+            }
+            .into());
+        };
+
+        // Apply ancestor item batches in root-to-tip order. Already-committed
+        // batches are skipped by tracking cumulative leaf count.
+        // Batches are collected into a single append_many call to acquire the
+        // journal's write lock once instead of per-batch.
+        let committed_leaves = self.journal.bounds().end;
+        if committed_leaves < batch.ancestor_base_leaves {
+            return Err(merkle::Error::AncestorDropped {
+                expected: batch.inner.size(),
+                actual: merkle_size,
+            }
+            .into());
+        }
+
+        let mut batch_leaf_end = batch.ancestor_base_leaves;
+        let mut batches: Vec<&[C::Item]> = Vec::with_capacity(batch.ancestor_items.len() + 1);
+        for ancestor in &batch.ancestor_items {
+            batch_leaf_end += ancestor.len() as u64;
+            if skip_ancestors && batch_leaf_end <= committed_leaves {
+                continue;
+            }
+            batches.push(ancestor);
+        }
+        if !batch.items.is_empty() {
+            batches.push(&batch.items);
+        }
+        if !batches.is_empty() {
+            (self.journal, _) = self.journal.append_many(Many::Nested(&batches)).await?;
+        }
+
+        self.merkle = self.merkle.apply_batch(&batch.inner)?;
+        assert_eq!(*self.merkle.leaves(), self.journal.bounds().end);
+        Ok(self)
+    }
+
+    /// Rewind the journal and Merkle structure.
+    #[boxed]
+    pub async fn rewind(mut self, size: u64) -> Result<Self, Error<F>> {
+        self.journal = self.journal.rewind(size).await?;
+
+        let leaves = *self.merkle.leaves();
+        if leaves > size {
+            self.merkle = self.merkle.rewind((leaves - size) as usize).await?;
+        }
+
+        Ok(self)
+    }
+
+    /// Prune both the Merkle structure and journal to the given location.
+    ///
+    /// # Returns
+    /// The new pruning boundary, which may be less than the requested `prune_loc`.
+    #[boxed]
+    pub async fn prune(self, prune_loc: Location<F>) -> Result<(Self, Location<F>), Error<F>> {
+        let (journal, boundary, _) = self.prune_inner(prune_loc).await?;
+        Ok((journal, boundary))
+    }
+
+    async fn prune_inner(
+        mut self,
+        prune_loc: Location<F>,
+    ) -> Result<(Self, Location<F>, bool), Error<F>> {
+        if self.merkle.size() == 0 {
+            // DB is empty, nothing to prune.
+            let boundary = Location::new(self.journal.bounds().start);
+            return Ok((self, boundary, false));
+        }
+
+        // Sync the Merkle structure before pruning the journal, otherwise its last element could
+        // end up behind the journal's first element after a crash, and there would be no way to
+        // replay the items between the structure's last element and the journal's first element.
+        // Commit the journal alongside: the prune target may be justified by a buffered append
+        // (e.g. a commit operation), and pruning does not guarantee buffered appends are durable.
+        (self.journal, self.merkle) = try_join!(
+            self.journal.commit().map_err(Error::Journal),
+            self.merkle.sync().map_err(Error::Merkle)
+        )?;
+
+        let journal_pruned;
+        (self.journal, journal_pruned) = self.journal.prune(*prune_loc).await?;
+        let bounds = self.journal.bounds();
+        let boundary = Location::new(bounds.start);
+        let merkle_boundary = self.merkle.bounds().start;
+
+        if boundary > merkle_boundary {
+            debug!(size = ?bounds.end, ?prune_loc, boundary = ?bounds.start, "pruned inactive ops");
+            self.merkle = self.merkle.prune(boundary).await?;
+        }
+
+        Ok((self, boundary, journal_pruned || boundary > merkle_boundary))
+    }
+}
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Generate a proof of inclusion for items starting at `start_loc`.
+    ///
+    /// Returns a proof and the items corresponding to the leaves in the range `start_loc..end_loc`,
+    /// where `end_loc` is the minimum of the current item count and `start_loc + max_ops`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [Error::Merkle] with [merkle::Error::LocationOverflow] if `start_loc` >
+    ///   [Family::MAX_LEAVES].
+    /// - Returns [Error::Merkle] with [merkle::Error::RangeOutOfBounds] if `start_loc` >= current
+    ///   item count.
+    /// - Returns [Error::Journal] with [crate::journal::Error::ItemPruned] if `start_loc` has been
+    ///   pruned.
+    pub async fn proof(
+        &self,
+        start_loc: Location<F>,
+        max_ops: NonZeroU64,
+        inactive_peaks: usize,
+    ) -> Result<(Proof<F, H::Digest>, Vec<C::Item>), Error<F>> {
+        self.historical_proof(self.size(), start_loc, max_ops, inactive_peaks)
+            .await
+    }
+
+    /// Inclusion proof for the items `batch` appends, anchored at the batch's speculative tip.
+    ///
+    /// Nodes below the batch chain are read from this journal's
+    /// [Merkle store][crate::merkle::mem::Mem], which retains them at least until
+    /// the batch's changes are flushed.
+    pub fn speculative_proof(
+        &self,
+        batch: &MerkleizedBatch<F, H::Digest, C::Item, S>,
+        inactive_peaks: usize,
+    ) -> Result<Proof<F, H::Digest>, Error<F>> {
+        let end = batch.size();
+        let start = Location::new(end - batch.items().len() as u64);
+        self.merkle
+            .with_mem(|mem| {
+                batch.range_proof(mem, &self.hasher, start..Location::new(end), inactive_peaks)
+            })
+            .map_err(Error::Merkle)
+    }
+
+    /// Merkle frontier at the first item `batch` appends ([`Family::nodes_to_pin`]).
+    ///
+    /// Nodes below the batch chain are read from this journal's
+    /// [Merkle store][crate::merkle::mem::Mem], which retains them at least until
+    /// the batch's changes are flushed.
+    pub fn speculative_pinned_nodes(
+        &self,
+        batch: &MerkleizedBatch<F, H::Digest, C::Item, S>,
+    ) -> Result<Vec<H::Digest>, Error<F>> {
+        let start = Location::new(batch.size() - batch.items().len() as u64);
+        self.merkle
+            .with_mem(|mem| {
+                F::nodes_to_pin(start)
+                    .map(|pos| {
+                        batch
+                            .get_node(pos)
+                            .or_else(|| mem.get_node(pos))
+                            .ok_or(merkle::Error::ElementPruned(pos))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(Error::Merkle)
+    }
+
+    /// Generate a historical proof with respect to the state of the Merkle structure when it had
+    /// `historical_leaves` leaves.
+    ///
+    /// Returns a proof and the items corresponding to the leaves in the range `start_loc..end_loc`,
+    /// where `end_loc` is the minimum of `historical_leaves` and `start_loc + max_ops`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [Error::Merkle] with [merkle::Error::RangeOutOfBounds] if `start_loc` >=
+    ///   `historical_leaves` or `historical_leaves` > number of items in the journal.
+    /// - Returns [Error::Journal] with [crate::journal::Error::ItemPruned] if `start_loc` has been
+    ///   pruned.
+    pub async fn historical_proof(
+        &self,
+        historical_leaves: Location<F>,
+        start_loc: Location<F>,
+        max_ops: NonZeroU64,
+        inactive_peaks: usize,
+    ) -> Result<(Proof<F, H::Digest>, Vec<C::Item>), Error<F>> {
+        let range = proof_range(
+            self.journal.bounds().end,
+            historical_leaves,
+            start_loc,
+            max_ops,
+        )?;
+        let proof = self
+            .merkle
+            .historical_range_proof(
+                &self.hasher,
+                historical_leaves,
+                range.clone(),
+                inactive_peaks,
+            )
+            .await?;
+        let positions: Vec<u64> = (*range.start..*range.end).collect();
+        let ops = self.journal.read_many(&positions).await?;
+
+        Ok((proof, ops))
+    }
+}
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Mutable<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Destroy the authenticated journal, removing all data from disk.
+    #[boxed]
+    pub async fn destroy(self) -> Result<(), Error<F>> {
+        // `try_join!` contains an await boundary, so destructure first to avoid
+        // stack growth from retaining the entire `self` in the future.
+        let Self {
+            journal, merkle, ..
+        } = self;
+        try_join!(
+            journal.destroy().map_err(Error::Journal),
+            merkle.destroy().map_err(Error::Merkle),
+        )?;
+
+        Ok(())
+    }
+
+    /// Durably persist the journal, ensuring no recovery is required on startup.
+    pub async fn sync(mut self) -> Result<Self, Error<F>> {
+        (self.journal, self.merkle) = try_join!(
+            self.journal.sync().map_err(Error::Journal),
+            self.merkle.sync().map_err(Error::Merkle)
+        )?;
+
+        Ok(self)
+    }
+}
+
+/// The number of items to apply to the Merkle structure in a single batch.
+const APPLY_BATCH_SIZE: u64 = 1 << 16;
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Backing<E, Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Create a new authenticated [Journal].
+    ///
+    /// The backing journal will be rewound to the last item matching `rewind_predicate`,
+    /// and the merkle structure will be aligned to match.
+    #[boxed]
+    pub async fn new(
+        context: E,
+        merkle_cfg: merkle::full::Config<S>,
+        journal_cfg: C::Config,
+        rewind_predicate: fn(&C::Item) -> bool,
+        bagging: merkle::Bagging,
+    ) -> Result<Self, Error<F>> {
+        let journal = C::init(context.child("journal"), journal_cfg).await?;
+        let (journal, _) = journal.rewind_to(rewind_predicate).await?;
+
+        let hasher = StandardHasher::<H>::new(bagging);
+        let merkle = Merkle::init(context.child("merkle"), &hasher, merkle_cfg).await?;
+        let merkle = Self::align(merkle, &journal, &hasher, APPLY_BATCH_SIZE).await?;
+
+        let journal = journal.sync().await?;
+        let merkle = merkle.sync().await?;
+
+        Ok(Self {
+            merkle,
+            journal,
+            hasher,
+        })
+    }
+}
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    /// Like [`Contiguous::read_many`], but returns the items partitioned into the shards the
+    /// probe ran with. Concatenating the shards yields the items in `positions` order.
+    ///
+    /// Large batches shard the page-cache probe across the strategy pool. Each shard
+    /// assembles its own hits while they are still cache-hot on the probing worker, so bulk
+    /// callers that can consume partitioned results (e.g. the floor raise, which classifies
+    /// candidates in chunks) skip the serial reassembly a flat result would require.
+    pub(crate) async fn read_many_sharded(
+        &self,
+        positions: &[u64],
+    ) -> Result<Vec<Vec<C::Item>>, JournalError> {
+        // An empty batch cannot shard: the parallel arm's chunk math needs a non-zero chunk
+        // size, and the policy may explore that arm at any batch size.
+        if positions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Probe page-cache hits synchronously and complete the misses with one batched read.
+        // The strategy policy decides per batch size whether the probe runs on the calling
+        // thread or sharded across the pool (one scratch buffer per shard and one cache-lock
+        // acquisition per blob a shard touches). The sortedness assert keeps contract
+        // violations deterministic: past it, a non-increasing batch would only trip per-shard
+        // validation when an inversion lands inside a single shard.
+        assert!(
+            positions.is_sorted_by(|a, b| a < b),
+            "positions must be strictly increasing"
+        );
+        let strategy = self.strategy();
+        let journal = &self.journal;
+
+        // Each shard yields its hits densely plus the shard-local indices it declined.
+        let probe = |positions: &[u64]| -> (Vec<C::Item>, Vec<usize>) {
+            let probed = journal.try_read_many_sync(positions);
+            let mut hits = Vec::with_capacity(probed.len());
+            let mut missed = Vec::new();
+            for (idx, item) in probed.into_iter().enumerate() {
+                match item {
+                    Some(item) => hits.push(item),
+                    None => missed.push(idx),
+                }
+            }
+            (hits, missed)
+        };
+        let shards: Vec<(Vec<C::Item>, Vec<usize>)> = strategy.run(
+            positions.len(),
+            || vec![probe(positions)],
+            || {
+                let manual = strategy.manual();
+                let shard_len = positions.len().div_ceil(manual.parallelism());
+                manual.map_collect_vec(positions.chunks(shard_len).collect::<Vec<_>>(), &probe)
+            },
+        );
+
+        // The declined positions are a strictly increasing subsequence of `positions`, so one
+        // batched read serves them all. Each shard covers the slice of `positions` starting
+        // at the previous shards' total item count, whatever geometry the probe ran with.
+        let mut misses: Vec<u64> = Vec::new();
+        let mut offset = 0;
+        for (hits, missed) in &shards {
+            misses.extend(missed.iter().map(|idx| positions[offset + idx]));
+            offset += hits.len() + missed.len();
+        }
+        if misses.is_empty() {
+            return Ok(shards.into_iter().map(|(hits, _)| hits).collect());
+        }
+        let mut fetched = journal.read_many(&misses).await?.into_iter();
+
+        // Weave the fetched items back into each shard that declined positions.
+        let mut result = Vec::with_capacity(shards.len());
+        for (hits, missed) in shards {
+            if missed.is_empty() {
+                result.push(hits);
+                continue;
+            }
+            let total = hits.len() + missed.len();
+            let mut woven = Vec::with_capacity(total);
+            let mut hits = hits.into_iter();
+            let mut missed = missed.into_iter().peekable();
+            for idx in 0..total {
+                if missed.next_if_eq(&idx).is_some() {
+                    woven.push(fetched.next().expect("one fetched item per miss"));
+                } else {
+                    woven.push(hits.next().expect("one probed item per hit"));
+                }
+            }
+            result.push(woven);
+        }
+        Ok(result)
+    }
+}
+
+fn proof_range<F: Family>(
+    end: u64,
+    historical_leaves: Location<F>,
+    start_loc: Location<F>,
+    max_ops: NonZeroU64,
+) -> Result<Range<Location<F>>, Error<F>> {
+    if *historical_leaves > end {
+        return Err(merkle::Error::RangeOutOfBounds(Location::new(end)).into());
+    }
+    if start_loc >= historical_leaves {
+        return Err(merkle::Error::RangeOutOfBounds(start_loc).into());
+    }
+    let end_loc = core::cmp::min(historical_leaves, start_loc.saturating_add(max_ops.get()));
+    Ok(start_loc..end_loc)
+}
+
+impl<F, E, C, H, S> Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Snapshottable<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    pub async fn reader(mut self) -> Result<(Self, Reader<F, E, C::Reader, H>), Error<F>> {
+        let (merkle, nodes) = self.merkle.reader().await?;
+        self.merkle = merkle;
+        let (journal, items) = self.journal.snapshot().await?;
+        self.journal = journal;
+        let reader = Reader {
+            merkle: nodes,
+            journal: items,
+            hasher: self.hasher.clone(),
+        };
+        Ok((self, reader))
+    }
+}
+
+pub struct Reader<F: Family, E: Context, R: Contiguous, H: Hasher> {
+    merkle: merkle::full::Reader<F, E, H::Digest>,
+    journal: R,
+    hasher: StandardHasher<H>,
+}
+
+impl<F, E, R, H> Reader<F, E, R, H>
+where
+    F: Family,
+    E: Context,
+    R: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+{
+    pub fn size(&self) -> Location<F> {
+        Location::new(self.journal.bounds().end)
+    }
+
+    pub async fn historical_proof(
+        &self,
+        historical_leaves: Location<F>,
+        start_loc: Location<F>,
+        max_ops: NonZeroU64,
+        inactive_peaks: usize,
+    ) -> Result<(Proof<F, H::Digest>, Vec<R::Item>), Error<F>> {
+        let range = proof_range(
+            self.journal.bounds().end,
+            historical_leaves,
+            start_loc,
+            max_ops,
+        )?;
+        let proof = self
+            .merkle
+            .historical_range_proof(
+                &self.hasher,
+                historical_leaves,
+                range.clone(),
+                inactive_peaks,
+            )
+            .await?;
+        let positions: Vec<u64> = (*range.start..*range.end).collect();
+        let ops = self.journal.read_many(&positions).await?;
+
+        Ok((proof, ops))
+    }
+
+    pub async fn pinned_nodes_at(&self, loc: Location<F>) -> Result<Vec<H::Digest>, Error<F>> {
+        self.merkle.pinned_nodes_at(loc).await.map_err(Into::into)
+    }
+}
+
+impl<F, E, R, H> Contiguous for Reader<F, E, R, H>
+where
+    F: Family,
+    E: Context,
+    R: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+{
+    type Item = R::Item;
+
+    fn bounds(&self) -> Range<u64> {
+        self.journal.bounds()
+    }
+
+    async fn read(&self, position: u64) -> Result<R::Item, JournalError> {
+        self.journal.read(position).await
+    }
+
+    async fn read_many(&self, positions: &[u64]) -> Result<Vec<R::Item>, JournalError> {
+        self.journal.read_many(positions).await
+    }
+
+    fn try_read_sync(&self, position: u64) -> Option<R::Item> {
+        self.journal.try_read_sync(position)
+    }
+
+    fn try_read_many_sync(&self, positions: &[u64]) -> Vec<Option<R::Item>> {
+        self.journal.try_read_many_sync(positions)
+    }
+
+    async fn replay(
+        &self,
+        start_pos: u64,
+        buffer: NonZeroUsize,
+        read_options: ReadOptions,
+    ) -> Result<impl Stream<Item = Result<(u64, R::Item), JournalError>> + Send, JournalError> {
+        self.journal.replay(start_pos, buffer, read_options).await
+    }
+}
+
+impl<F, E, C, H, S> Contiguous for Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Contiguous<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    type Item = C::Item;
+
+    fn bounds(&self) -> Range<u64> {
+        self.journal.bounds()
+    }
+
+    async fn read(&self, position: u64) -> Result<C::Item, JournalError> {
+        self.journal.read(position).await
+    }
+
+    async fn read_many(&self, positions: &[u64]) -> Result<Vec<C::Item>, JournalError> {
+        let mut shards = self.read_many_sharded(positions).await?;
+        if shards.len() == 1 {
+            return Ok(shards.pop().expect("length checked"));
+        }
+        let mut items = Vec::with_capacity(positions.len());
+        for shard in shards {
+            items.extend(shard);
+        }
+        Ok(items)
+    }
+
+    fn try_read_sync(&self, position: u64) -> Option<C::Item> {
+        self.journal.try_read_sync(position)
+    }
+
+    fn try_read_many_sync(&self, positions: &[u64]) -> Vec<Option<C::Item>> {
+        self.journal.try_read_many_sync(positions)
+    }
+
+    async fn replay(
+        &self,
+        start_pos: u64,
+        buffer: NonZeroUsize,
+        read_options: ReadOptions,
+    ) -> Result<impl Stream<Item = Result<(u64, C::Item), JournalError>> + Send, JournalError> {
+        self.journal.replay(start_pos, buffer, read_options).await
+    }
+}
+
+impl<F, E, C, H, S> Mutable for Journal<F, E, C, H, S>
+where
+    F: Family,
+    E: Context,
+    C: Mutable<Item: EncodeShared>,
+    H: Hasher,
+    S: Strategy,
+{
+    async fn append(self, item: &Self::Item) -> Result<(Self, u64), JournalError> {
+        let (journal, loc) = Self::append(self, item).await.map_err(Self::map_error)?;
+
+        Ok((journal, *loc))
+    }
+
+    async fn append_many(
+        mut self,
+        items: Many<'_, Self::Item>,
+    ) -> Result<(Self, u64), JournalError> {
+        // The per-item loop below never reaches the backing journal's shared empty check, so the
+        // trait's EmptyAppend contract must be enforced here.
+        if items.is_empty() {
+            return Err(JournalError::EmptyAppend);
+        }
+
+        // Every append must also update the Merkle structure, so items append one at a time.
+        // Batched appends of already-merkleized items go through `apply_batch`, which batches
+        // the backing journal writes instead.
+        let mut last_pos = self.journal.bounds().end;
+        match items {
+            Many::Flat(items) => {
+                for item in items {
+                    let (journal, loc) = Self::append(self, item).await.map_err(Self::map_error)?;
+                    self = journal;
+                    last_pos = *loc;
+                }
+            }
+            Many::Nested(nested_items) => {
+                for items in nested_items {
+                    for item in *items {
+                        let (journal, loc) =
+                            Self::append(self, item).await.map_err(Self::map_error)?;
+                        self = journal;
+                        last_pos = *loc;
+                    }
+                }
+            }
+        }
+        Ok((self, last_pos))
+    }
+
+    async fn prune(self, min_position: u64) -> Result<(Self, bool), JournalError> {
+        let prune_to = {
+            let bounds = self.journal.bounds();
+            min_position.min(bounds.end)
+        };
+
+        let (journal, _, pruned) = self
+            .prune_inner(Location::new(prune_to))
+            .await
+            .map_err(Self::map_error)?;
+        Ok((journal, pruned))
+    }
+
+    async fn rewind(self, size: u64) -> Result<Self, JournalError> {
+        Self::rewind(self, size).await.map_err(Self::map_error)
+    }
+
+    async fn start_sync(self) -> Result<(Self, Handle<()>), JournalError> {
+        Self::start_sync(self).await.map_err(Self::map_error)
+    }
+
+    async fn commit(self) -> Result<Self, JournalError> {
+        Self::commit(self).await.map_err(Self::map_error)
+    }
+
+    async fn sync(self) -> Result<Self, JournalError> {
+        Self::sync(self).await.map_err(Self::map_error)
+    }
+
+    async fn destroy(self) -> Result<(), JournalError> {
+        Self::destroy(self).await.map_err(Self::map_error)
+    }
+}
+
+/// A [Mutable] journal that can back an authenticated [Journal].
+pub trait Backing<E: Context>: Mutable {
+    /// The configuration needed to initialize this journal.
+    type Config: Clone + Send;
+
+    /// Initialize the journal from its configuration.
+    fn init(
+        context: E,
+        cfg: Self::Config,
+    ) -> impl core::future::Future<Output = Result<Self, JournalError>> + Send
+    where
+        Self: Sized;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        journal::contiguous::fixed::{Config as JConfig, Journal as ContiguousJournal},
+        merkle::{
+            Bagging::{BackwardFold, ForwardFold},
+            full::{Config as MerkleConfig, Merkle},
+            mmb, mmr,
+        },
+        qmdb::{
+            any::{
+                operation::{Unordered as Op, update::Unordered as Update},
+                value::FixedEncoding,
+            },
+            operation::Committable,
+        },
+        utils::detached::{DropMonitor, block_strategy},
+    };
+    use commonware_codec::Encode;
+    use commonware_cryptography::{Sha256, sha256::Digest};
+    use commonware_macros::test_traced;
+    use commonware_parallel::{Manual, Rayon, Sequential};
+    use commonware_runtime::{
+        BufferPooler, Runner as _, Spawner as _, Strategizer as _, Supervisor as _,
+        buffer::paged::CacheRef,
+        deterministic::{self, Context},
+        mocks::{
+            DelayedSyncContext, PendingSyncs, RecordingContext, drive_pending_syncs,
+            fail_pending_syncs, next_pending_sync,
+        },
+        reschedule,
+    };
+    use commonware_utils::{NZU16, NZU64, NZUsize};
+    use futures::StreamExt as _;
+    use std::{
+        future::Future,
+        num::{NonZeroU16, NonZeroUsize},
+        time::Duration,
+    };
+
+    const PAGE_SIZE: NonZeroU16 = NZU16!(101);
+    const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(11);
+
+    /// Generic operation type for testing, parameterized by Merkle family.
+    type TestOp<F> = Op<F, Digest, FixedEncoding<Digest>>;
+
+    /// Generic authenticated journal type for testing, parameterized by Merkle family.
+    type TestJournal<F> = Journal<
+        F,
+        deterministic::Context,
+        ContiguousJournal<deterministic::Context, TestOp<F>>,
+        Sha256,
+        Sequential,
+    >;
+
+    type RecordingTestJournal<F> = Journal<
+        F,
+        RecordingContext<deterministic::Context>,
+        ContiguousJournal<RecordingContext<deterministic::Context>, TestOp<F>>,
+        Sha256,
+        Sequential,
+    >;
+
+    fn journal_root<F: Family>(journal: &TestJournal<F>) -> Digest {
+        journal.root(0).unwrap()
+    }
+
+    fn batch_root<F: Family>(
+        journal: &TestJournal<F>,
+        batch: &MerkleizedBatch<F, Digest, TestOp<F>, Sequential>,
+    ) -> Digest {
+        journal
+            .merkle
+            .with_mem(|mem| batch.root(mem, &journal.hasher, 0))
+            .unwrap()
+    }
+
+    fn merkleize_with<F: Family + PartialEq>(
+        batch: UnmerkleizedBatch<F, Sha256, TestOp<F>, Sequential>,
+        base: &Mem<F, Digest>,
+        items: Vec<TestOp<F>>,
+    ) -> MerkleizedBatchArc<F, Sha256, TestOp<F>, Sequential> {
+        batch.add_many(items).merkleize(base)
+    }
+
+    /// Create Merkle configuration for tests with the given strategy.
+    fn merkle_config_with<S: Strategy>(
+        suffix: &str,
+        pooler: &impl BufferPooler,
+        strategy: S,
+    ) -> MerkleConfig<S> {
+        MerkleConfig {
+            journal_partition: format!("mmr-journal-{suffix}"),
+            metadata_partition: format!("mmr-metadata-{suffix}"),
+            items_per_blob: NZU64!(11),
+            write_buffer: NZUsize!(1024),
+            replay_buffer: NZUsize!(1024),
+            strategy,
+            page_cache: CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE),
+        }
+    }
+
+    /// Create Merkle configuration for tests.
+    fn merkle_config(suffix: &str, pooler: &impl BufferPooler) -> MerkleConfig<Sequential> {
+        merkle_config_with(suffix, pooler, Sequential)
+    }
+
+    /// Create journal configuration for tests.
+    fn journal_config(suffix: &str, pooler: &impl BufferPooler) -> JConfig {
+        JConfig {
+            partition: format!("journal-{suffix}"),
+            items_per_blob: NZU64!(7),
+            write_buffer: NZUsize!(1024),
+            replay_buffer: NZUsize!(1024),
+            page_cache: CacheRef::from_pooler(pooler, PAGE_SIZE, PAGE_CACHE_SIZE),
+        }
+    }
+
+    /// Create a new empty authenticated journal.
+    async fn create_empty_journal<F: Family + PartialEq>(
+        context: Context,
+        suffix: &str,
+    ) -> TestJournal<F> {
+        let merkle_cfg = merkle_config(suffix, &context);
+        let journal_cfg = journal_config(suffix, &context);
+        TestJournal::<F>::new(
+            context,
+            merkle_cfg,
+            journal_cfg,
+            |op: &TestOp<F>| op.is_commit(),
+            ForwardFold,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn test_batches_inherit_journal_bagging() {
+        deterministic::Runner::default().start(|context| async move {
+            let merkle_cfg = merkle_config("batch-bagging", &context);
+            let journal_cfg = journal_config("batch-bagging", &context);
+            let journal = TestJournal::<mmr::Family>::new(
+                context,
+                merkle_cfg,
+                journal_cfg,
+                |op: &TestOp<mmr::Family>| op.is_commit(),
+                BackwardFold,
+            )
+            .await
+            .unwrap();
+
+            let batch = journal.new_batch();
+            assert_eq!(batch.hasher.root_bagging(), BackwardFold);
+
+            let merkleized = journal.merkle.with_mem(|mem| batch.merkleize(mem));
+            let child: UnmerkleizedBatch<mmr::Family, Sha256, TestOp<mmr::Family>, Sequential> =
+                merkleized.new_batch();
+            assert_eq!(child.hasher.root_bagging(), BackwardFold);
+        });
+    }
+
+    /// Large batched reads shard across the strategy pool and match per-position reads.
+    #[test]
+    fn test_read_many_shards_across_strategy_pool() {
+        deterministic::Runner::default().start(|context| async move {
+            // A parallelism > 1 strategy with more positions than the shard threshold
+            // exercises the sharded sync path. The tiny test page cache pushes most
+            // positions through the batched miss fallback while the write buffer serves
+            // the tail synchronously.
+            let strategy = context.strategy(NZUsize!(2));
+            let merkle_cfg = merkle_config_with("shard", &context, strategy);
+            let journal_cfg = journal_config("shard", &context);
+            type RayonJournal = Journal<
+                mmr::Family,
+                Context,
+                ContiguousJournal<Context, TestOp<mmr::Family>>,
+                Sha256,
+                Rayon,
+            >;
+            let mut journal = RayonJournal::new(
+                context,
+                merkle_cfg,
+                journal_cfg,
+                |op: &TestOp<mmr::Family>| op.is_commit(),
+                ForwardFold,
+            )
+            .await
+            .unwrap();
+
+            let count = 4200u64;
+            for i in 0..count {
+                let op = create_operation::<mmr::Family>((i % 251) as u8);
+                (journal, _) = journal.append(&op).await.unwrap();
+            }
+            let journal = journal.sync().await.unwrap();
+
+            let positions: Vec<u64> = (0..count).collect();
+            let batch = Contiguous::read_many(&journal, &positions).await.unwrap();
+            assert_eq!(batch.len(), positions.len());
+            for &pos in &positions {
+                let single = Contiguous::read(&journal, pos).await.unwrap();
+                assert_eq!(batch[pos as usize], single);
+            }
+
+            // An empty batch is a no-op, even with a multi-threaded strategy.
+            assert!(
+                Contiguous::read_many(&journal, &[])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    /// A non-increasing batch panics deterministically, even when fully cached.
+    #[test]
+    #[should_panic(expected = "positions must be strictly increasing")]
+    fn test_read_many_rejects_unsorted_positions() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut journal = create_empty_journal::<mmr::Family>(context, "unsorted").await;
+            for i in 0..2u8 {
+                let op = create_operation::<mmr::Family>(i);
+                (journal, _) = journal.append(&op).await.unwrap();
+            }
+            let journal = journal.sync().await.unwrap();
+
+            let _ = Contiguous::read_many(&journal, &[1, 0]).await;
+        });
+    }
+
+    /// Create a test operation with predictable values based on index.
+    fn create_operation<F: Family + PartialEq>(index: u8) -> TestOp<F> {
+        TestOp::<F>::Update(Update(
+            Sha256::fill(index),
+            Sha256::fill(index.wrapping_add(1)),
+        ))
+    }
+
+    /// Create an authenticated journal with N committed operations.
+    ///
+    /// Operations are added and then synced to ensure they are committed.
+    async fn create_journal_with_ops<F: Family + PartialEq>(
+        context: Context,
+        suffix: &str,
+        count: usize,
+    ) -> TestJournal<F> {
+        let mut journal = create_empty_journal::<F>(context, suffix).await;
+
+        for i in 0..count {
+            let op = create_operation::<F>(i as u8);
+            let loc;
+            (journal, loc) = journal.append(&op).await.unwrap();
+            assert_eq!(loc, Location::<F>::new(i as u64));
+        }
+
+        journal = journal.sync().await.unwrap();
+        journal
+    }
+
+    /// Create separate Merkle and journal components for testing alignment.
+    ///
+    /// These components are created independently and can be manipulated separately to test
+    /// scenarios where the Merkle structure and journal are out of sync (e.g., one ahead of the
+    /// other).
+    async fn create_components<F: Family + PartialEq>(
+        context: Context,
+        suffix: &str,
+    ) -> (
+        Merkle<F, deterministic::Context, Digest, Sequential>,
+        ContiguousJournal<deterministic::Context, TestOp<F>>,
+        StandardHasher<Sha256>,
+    ) {
+        let hasher = StandardHasher::new(ForwardFold);
+        let merkle = Merkle::<F, _, Digest, Sequential>::init(
+            context.child("mmr"),
+            &hasher,
+            merkle_config(suffix, &context),
+        )
+        .await
+        .unwrap();
+        let journal =
+            ContiguousJournal::init(context.child("journal"), journal_config(suffix, &context))
+                .await
+                .unwrap();
+        (merkle, journal, hasher)
+    }
+
+    /// Verify that a proof correctly proves the given operations are included in the Merkle
+    /// structure.
+    fn verify_proof<F: Family + PartialEq>(
+        proof: &Proof<F, <Sha256 as commonware_cryptography::Hasher>::Digest>,
+        operations: &[TestOp<F>],
+        start_loc: Location<F>,
+        root: &<Sha256 as commonware_cryptography::Hasher>::Digest,
+        hasher: &StandardHasher<Sha256>,
+    ) -> bool {
+        let encoded_ops: Vec<_> = operations.iter().map(|op| op.encode()).collect();
+        proof.verify_range_inclusion(hasher, &encoded_ops, start_loc, root)
+    }
+
+    /// Verify that new() creates an empty authenticated journal.
+    async fn test_new_creates_empty_journal_inner<F: Family + PartialEq>(context: Context) {
+        let journal = create_empty_journal::<F>(context, "new-empty").await;
+
+        let bounds = journal.bounds();
+        assert_eq!(bounds.end, 0);
+        assert_eq!(bounds.start, 0);
+        assert!(bounds.is_empty());
+    }
+
+    #[test_traced("INFO")]
+    fn test_new_creates_empty_journal_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_new_creates_empty_journal_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_new_creates_empty_journal_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_new_creates_empty_journal_inner::<mmb::Family>);
+    }
+
+    /// Verify that align() correctly handles empty Merkle and journal components.
+    async fn test_align_with_empty_mmr_and_journal_inner<F: Family + PartialEq>(context: Context) {
+        let (merkle, journal, hasher) = create_components::<F>(context, "align-empty").await;
+
+        let merkle = TestJournal::<F>::align(merkle, &journal, &hasher, APPLY_BATCH_SIZE)
+            .await
+            .unwrap();
+
+        assert_eq!(merkle.leaves(), Location::<F>::new(0));
+        assert_eq!(journal.size(), 0);
+    }
+
+    #[test_traced("INFO")]
+    fn test_align_with_empty_mmr_and_journal_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_with_empty_mmr_and_journal_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_align_with_empty_mmr_and_journal_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_with_empty_mmr_and_journal_inner::<mmb::Family>);
+    }
+
+    /// Verify that align() pops Merkle elements when Merkle is ahead of the journal.
+    async fn test_align_when_mmr_ahead_inner<F: Family + PartialEq>(context: Context) {
+        let (mut merkle, mut journal, hasher) = create_components::<F>(context, "mmr-ahead").await;
+
+        // Add 20 operations to both Merkle and journal
+        {
+            let batch = {
+                let mut batch = merkle.new_batch();
+                for i in 0..20 {
+                    let op = create_operation::<F>(i as u8);
+                    let encoded = op.encode();
+                    batch = batch.add(&hasher, &encoded);
+                    (journal, _) = journal.append(&op).await.unwrap();
+                }
+                batch
+            };
+            let batch = merkle.with_mem(|mem| batch.merkleize(mem, &hasher));
+            merkle = merkle.apply_batch(&batch).unwrap();
+        }
+
+        // Add commit operation to journal only (making journal ahead)
+        let commit_op = TestOp::<F>::CommitFloor(None, Location::<F>::new(0));
+        let (journal, _) = journal.append(&commit_op).await.unwrap();
+        let journal = journal.sync().await.unwrap();
+
+        // Merkle has 20 leaves, journal has 21 operations (20 ops + 1 commit)
+        let merkle = TestJournal::<F>::align(merkle, &journal, &hasher, APPLY_BATCH_SIZE)
+            .await
+            .unwrap();
+
+        // Merkle should have been aligned to match journal
+        assert_eq!(merkle.leaves(), Location::<F>::new(21));
+        assert_eq!(journal.size(), 21);
+    }
+
+    #[test_traced("WARN")]
+    fn test_align_when_mmr_ahead_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_when_mmr_ahead_inner::<mmr::Family>);
+    }
+
+    #[test_traced("WARN")]
+    fn test_align_when_mmr_ahead_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_when_mmr_ahead_inner::<mmb::Family>);
+    }
+
+    /// Verify that align() replays journal operations when journal is ahead of Merkle.
+    async fn test_align_when_journal_ahead_inner<F: Family + PartialEq>(context: Context) {
+        let (merkle, mut journal, hasher) = create_components::<F>(context, "journal-ahead").await;
+
+        // Add 20 operations to journal only
+        for i in 0..20 {
+            let op = create_operation::<F>(i as u8);
+            (journal, _) = journal.append(&op).await.unwrap();
+        }
+
+        // Add commit
+        let commit_op = TestOp::<F>::CommitFloor(None, Location::<F>::new(0));
+        let (journal, _) = journal.append(&commit_op).await.unwrap();
+        let journal = journal.sync().await.unwrap();
+
+        // Journal has 21 operations, Merkle has 0 leaves
+        let merkle = TestJournal::<F>::align(merkle, &journal, &hasher, APPLY_BATCH_SIZE)
+            .await
+            .unwrap();
+
+        // Merkle should have been replayed to match journal
+        assert_eq!(merkle.leaves(), Location::<F>::new(21));
+        assert_eq!(journal.size(), 21);
+    }
+
+    #[test_traced("WARN")]
+    fn test_align_when_journal_ahead_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_when_journal_ahead_inner::<mmr::Family>);
+    }
+
+    #[test_traced("WARN")]
+    fn test_align_when_journal_ahead_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_when_journal_ahead_inner::<mmb::Family>);
+    }
+
+    /// Verify that align()'s parallel replay produces the same Merkle state as the serial path.
+    async fn test_align_replay_parallel_matches_serial_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        type ParallelJournal<F> = Journal<
+            F,
+            deterministic::Context,
+            ContiguousJournal<deterministic::Context, TestOp<F>>,
+            Sha256,
+            Manual<Rayon>,
+        >;
+
+        // Build a journal that is ahead of both Merkle structures.
+        let mut journal = ContiguousJournal::init(
+            context.child("journal"),
+            journal_config("replay-strategies", &context),
+        )
+        .await
+        .unwrap();
+        for i in 0..20 {
+            (journal, _) = journal
+                .append(&create_operation::<F>(i as u8))
+                .await
+                .unwrap();
+        }
+        let commit_op = TestOp::<F>::CommitFloor(None, Location::<F>::new(0));
+        let (journal, _) = journal.append(&commit_op).await.unwrap();
+        let journal = journal.sync().await.unwrap();
+
+        // Replay with a batch size that forces multiple batches on each side. `Sequential`
+        // hashes each batch serially, and a `Manual`-wrapped strategy runs the batch hashing
+        // across its pool without any adaptive policy, so the two replays deterministically
+        // exercise both the serial and parallel hashing paths.
+        let hasher = StandardHasher::<Sha256>::new(ForwardFold);
+        let serial = Merkle::<F, _, Digest, Sequential>::init(
+            context.child("mmr_serial"),
+            &hasher,
+            merkle_config("replay-serial", &context),
+        )
+        .await
+        .unwrap();
+        let serial = TestJournal::<F>::align(serial, &journal, &hasher, 7)
+            .await
+            .unwrap();
+
+        let parallel = Merkle::<F, _, Digest, Manual<Rayon>>::init(
+            context.child("mmr_parallel"),
+            &hasher,
+            merkle_config_with(
+                "replay-parallel",
+                &context,
+                Rayon::new(NZUsize!(2)).unwrap().manual(),
+            ),
+        )
+        .await
+        .unwrap();
+        let parallel = ParallelJournal::<F>::align(parallel, &journal, &hasher, 7)
+            .await
+            .unwrap();
+
+        assert_eq!(serial.leaves(), Location::<F>::new(21));
+        assert_eq!(parallel.leaves(), Location::<F>::new(21));
+        assert_eq!(
+            serial.root(&hasher, 0).unwrap(),
+            parallel.root(&hasher, 0).unwrap()
+        );
+    }
+
+    #[test_traced("WARN")]
+    fn test_align_replay_parallel_matches_serial_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_replay_parallel_matches_serial_inner::<mmr::Family>);
+    }
+
+    #[test_traced("WARN")]
+    fn test_align_replay_parallel_matches_serial_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_align_replay_parallel_matches_serial_inner::<mmb::Family>);
+    }
+
+    /// Verify that align() discards uncommitted operations.
+    async fn test_align_with_mismatched_committed_ops_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let mut journal = create_empty_journal::<F>(context.child("first"), "mismatched").await;
+
+        // Add 20 uncommitted operations
+        for i in 0..20 {
+            let loc;
+            (journal, loc) = journal
+                .append(&create_operation::<F>(i as u8))
+                .await
+                .unwrap();
+            assert_eq!(loc, Location::<F>::new(i as u64));
+        }
+
+        // Don't sync - these are uncommitted
+        // After alignment, they should be discarded
+        let size_before = journal.size();
+        assert_eq!(size_before, 20);
+
+        // Drop and recreate to simulate restart (which calls align internally)
+        journal.sync().await.unwrap();
+        let journal = create_empty_journal::<F>(context.child("second"), "mismatched").await;
+
+        // Uncommitted operations should be gone
+        assert_eq!(journal.size(), 0);
+    }
+
+    #[test_traced("INFO")]
+    fn test_align_with_mismatched_committed_ops_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_align_with_mismatched_committed_ops_inner::<mmr::Family>(context)
+        });
+    }
+
+    #[test_traced("INFO")]
+    fn test_align_with_mismatched_committed_ops_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_align_with_mismatched_committed_ops_inner::<mmb::Family>(context)
+        });
+    }
+
+    async fn test_rewind_inner<F: Family + PartialEq>(context: Context) {
+        // Test 1: Matching operation is kept
+        {
+            let mut journal = ContiguousJournal::init(
+                context.child("rewind_match"),
+                journal_config("rewind-match", &context),
+            )
+            .await
+            .unwrap();
+
+            // Add operations where operation 3 is a commit
+            for i in 0..3 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            (journal, _) = journal
+                .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(0)))
+                .await
+                .unwrap();
+            for i in 4..7 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+
+            // Rewind to last commit
+            let final_size;
+            (journal, final_size) = journal.rewind_to(|op| op.is_commit()).await.unwrap();
+            assert_eq!(final_size, 4);
+            assert_eq!(journal.size(), 4);
+
+            // Verify the commit operation is still there
+            let op = journal.read(3).await.unwrap();
+            assert!(op.is_commit());
+        }
+
+        // Test 2: Last matching operation is chosen when multiple match
+        {
+            let mut journal = ContiguousJournal::init(
+                context.child("rewind_multiple"),
+                journal_config("rewind-multiple", &context),
+            )
+            .await
+            .unwrap();
+
+            // Add multiple commits
+            (journal, _) = journal.append(&create_operation::<F>(0)).await.unwrap();
+            (journal, _) = journal
+                .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(0)))
+                .await
+                .unwrap(); // pos 1
+            (journal, _) = journal.append(&create_operation::<F>(2)).await.unwrap();
+            (journal, _) = journal
+                .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(1)))
+                .await
+                .unwrap(); // pos 3
+            (journal, _) = journal.append(&create_operation::<F>(4)).await.unwrap();
+
+            // Should rewind to last commit (pos 3)
+            let final_size;
+            (journal, final_size) = journal.rewind_to(|op| op.is_commit()).await.unwrap();
+            assert_eq!(final_size, 4);
+
+            // Verify the last commit is still there
+            let op = journal.read(3).await.unwrap();
+            assert!(op.is_commit());
+
+            // Verify we can't read pos 4
+            assert!(journal.read(4).await.is_err());
+        }
+
+        // Test 3: Rewind to pruning boundary when no match
+        {
+            let mut journal = ContiguousJournal::init(
+                context.child("rewind_no_match"),
+                journal_config("rewind-no-match", &context),
+            )
+            .await
+            .unwrap();
+
+            // Add operations with no commits
+            for i in 0..10 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+
+            // Rewind should go to pruning boundary (0 for unpruned)
+            let final_size;
+            (journal, final_size) = journal.rewind_to(|op| op.is_commit()).await.unwrap();
+            assert_eq!(final_size, 0, "Should rewind to pruning boundary (0)");
+            assert_eq!(journal.size(), 0);
+        }
+
+        // Test 4: Rewind with existing pruning boundary
+        {
+            let mut journal = ContiguousJournal::init(
+                context.child("rewind_with_pruning"),
+                journal_config("rewind-with-pruning", &context),
+            )
+            .await
+            .unwrap();
+
+            // Add operations and a commit at position 10 (past first section boundary of 7)
+            for i in 0..10 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            (journal, _) = journal
+                .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(0)))
+                .await
+                .unwrap(); // pos 10
+            for i in 11..15 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            journal = journal.sync().await.unwrap();
+
+            // Prune up to position 8 (this will prune section 0, items 0-6, keeping 7+)
+            (journal, _) = journal.prune(8).await.unwrap();
+            assert_eq!(journal.bounds().start, 7);
+
+            // Add more uncommitted operations
+            for i in 15..20 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+
+            // Rewind should keep the commit at position 10
+            let final_size;
+            (journal, final_size) = journal.rewind_to(|op| op.is_commit()).await.unwrap();
+            assert_eq!(final_size, 11);
+
+            // Verify commit is still there
+            let op = journal.read(10).await.unwrap();
+            assert!(op.is_commit());
+        }
+
+        // Test 5: Rewind with no matches after pruning boundary
+        {
+            let mut journal = ContiguousJournal::init(
+                context.child("rewind_no_match_pruned"),
+                journal_config("rewind-no-match-pruned", &context),
+            )
+            .await
+            .unwrap();
+
+            // Add operations with a commit at position 5 (in section 0: 0-6)
+            for i in 0..5 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            (journal, _) = journal
+                .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(0)))
+                .await
+                .unwrap(); // pos 5
+            for i in 6..10 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            journal = journal.sync().await.unwrap();
+
+            // Prune up to position 8 (this prunes section 0, including the commit at pos 5)
+            // Pruning boundary will be at position 7 (start of section 1)
+            (journal, _) = journal.prune(8).await.unwrap();
+            assert_eq!(journal.bounds().start, 7);
+
+            // Add uncommitted operations with no commits (in section 1: 7-13)
+            for i in 10..14 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+
+            // Rewind with no matching commits after the pruning boundary
+            // Should rewind to the pruning boundary at position 7
+            let (_, final_size) = journal.rewind_to(|op| op.is_commit()).await.unwrap();
+            assert_eq!(final_size, 7);
+        }
+
+        // Test 6: Empty journal
+        {
+            let mut journal = ContiguousJournal::init(
+                context.child("rewind_empty"),
+                journal_config("rewind-empty", &context),
+            )
+            .await
+            .unwrap();
+
+            // Rewind empty journal should be no-op
+            let final_size;
+            (journal, final_size) = journal
+                .rewind_to(|op: &TestOp<F>| op.is_commit())
+                .await
+                .unwrap();
+            assert_eq!(final_size, 0);
+            assert_eq!(journal.size(), 0);
+        }
+
+        // Test 7: Position based authenticated journal rewind.
+        {
+            let merkle_cfg = merkle_config("rewind", &context);
+            let journal_cfg = journal_config("rewind", &context);
+            let mut journal = TestJournal::<F>::new(
+                context.child("rewind"),
+                merkle_cfg,
+                journal_cfg,
+                |op| op.is_commit(),
+                ForwardFold,
+            )
+            .await
+            .unwrap();
+
+            // Add operations with a commit at position 5 (in section 0: 0-6)
+            for i in 0..5 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            (journal, _) = journal
+                .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(0)))
+                .await
+                .unwrap(); // pos 5
+            for i in 6..10 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            assert_eq!(journal.size(), 10);
+
+            journal = journal.rewind(2).await.unwrap();
+            assert_eq!(journal.size(), 2);
+            assert_eq!(journal.merkle.leaves(), 2);
+            assert_eq!(journal.merkle.size(), 3);
+            let bounds = journal.bounds();
+            assert_eq!(bounds.start, 0);
+            assert!(!bounds.is_empty());
+
+            journal = journal.rewind(0).await.unwrap();
+            assert_eq!(journal.size(), 0);
+            assert_eq!(journal.merkle.leaves(), 0);
+            assert_eq!(journal.merkle.size(), 0);
+            let bounds = journal.bounds();
+            assert_eq!(bounds.start, 0);
+            assert!(bounds.is_empty());
+
+            // Test rewinding after pruning.
+            for i in 0..255 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            (journal, _) = journal.prune(Location::<F>::new(100)).await.unwrap();
+            assert_eq!(journal.bounds().start, 98);
+            journal = journal.rewind(98).await.unwrap();
+            let bounds = journal.bounds();
+            assert_eq!(bounds.end, 98);
+            assert_eq!(journal.merkle.leaves(), 98);
+            assert_eq!(bounds.start, 98);
+            assert!(bounds.is_empty());
+
+            // Rewinding into the pruned region fails.
+            let res = journal.rewind(97).await;
+            assert!(matches!(
+                res,
+                Err(Error::Journal(JournalError::ItemPruned(97)))
+            ));
+        }
+
+        // Test 8: Rewind target beyond current size fails.
+        {
+            let merkle_cfg = merkle_config("rewind-invalid", &context);
+            let journal_cfg = journal_config("rewind-invalid", &context);
+            let mut journal = TestJournal::<F>::new(
+                context,
+                merkle_cfg,
+                journal_cfg,
+                |op| op.is_commit(),
+                ForwardFold,
+            )
+            .await
+            .unwrap();
+
+            for i in 0..2 {
+                (journal, _) = journal.append(&create_operation::<F>(i)).await.unwrap();
+            }
+            assert!(matches!(
+                journal.rewind(3).await,
+                Err(Error::Journal(JournalError::InvalidRewind(_)))
+            ));
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_rewind_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_rewind_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_rewind_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_rewind_inner::<mmb::Family>);
+    }
+
+    /// Verify that append() increments the operation count, returns correct locations, and
+    /// operations can be read back correctly.
+    async fn test_apply_op_and_read_operations_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_empty_journal::<F>(context, "apply_op").await;
+
+        assert_eq!(journal.size(), 0);
+
+        // Add 50 operations
+        let expected_ops: Vec<_> = (0..50).map(|i| create_operation::<F>(i as u8)).collect();
+        for (i, op) in expected_ops.iter().enumerate() {
+            let loc;
+            (journal, loc) = journal.append(op).await.unwrap();
+            assert_eq!(loc, Location::<F>::new(i as u64));
+            assert_eq!(journal.size(), (i + 1) as u64);
+        }
+
+        assert_eq!(journal.size(), 50);
+
+        // Verify all operations can be read back correctly
+        journal = journal.sync().await.unwrap();
+        for (i, expected_op) in expected_ops.iter().enumerate() {
+            let read_op = journal.read(*Location::<F>::new(i as u64)).await.unwrap();
+            assert_eq!(read_op, *expected_op);
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_op_and_read_operations_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_op_and_read_operations_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_op_and_read_operations_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_op_and_read_operations_inner::<mmb::Family>);
+    }
+
+    /// Verify that read() returns correct operations at various positions.
+    async fn test_read_operations_at_various_positions_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let journal = create_journal_with_ops::<F>(context, "read", 50).await;
+
+        // Verify reading first operation
+        let first_op = journal.read(*Location::<F>::new(0)).await.unwrap();
+        assert_eq!(first_op, create_operation::<F>(0));
+
+        // Verify reading middle operation
+        let middle_op = journal.read(*Location::<F>::new(25)).await.unwrap();
+        assert_eq!(middle_op, create_operation::<F>(25));
+
+        // Verify reading last operation
+        let last_op = journal.read(*Location::<F>::new(49)).await.unwrap();
+        assert_eq!(last_op, create_operation::<F>(49));
+
+        // Verify all operations match expected values
+        for i in 0..50 {
+            let op = journal.read(*Location::<F>::new(i)).await.unwrap();
+            assert_eq!(op, create_operation::<F>(i as u8));
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_operations_at_various_positions_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_read_operations_at_various_positions_inner::<mmr::Family>(context)
+        });
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_operations_at_various_positions_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_read_operations_at_various_positions_inner::<mmb::Family>(context)
+        });
+    }
+
+    /// Verify that read() returns an error for pruned operations.
+    async fn test_read_pruned_operation_returns_error_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let mut journal = create_journal_with_ops::<F>(context, "read_pruned", 100).await;
+
+        // Add commit and prune
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(50)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+        let pruned_boundary;
+        (journal, pruned_boundary) = journal.prune(Location::<F>::new(50)).await.unwrap();
+
+        // Try to read an operation before the pruned boundary
+        let read_loc = Location::<F>::new(0);
+        if read_loc < pruned_boundary {
+            let result = journal.read(*read_loc).await;
+            assert!(matches!(result, Err(crate::journal::Error::ItemPruned(_))));
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_pruned_operation_returns_error_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_read_pruned_operation_returns_error_inner::<mmr::Family>(context)
+        });
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_pruned_operation_returns_error_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_read_pruned_operation_returns_error_inner::<mmb::Family>(context)
+        });
+    }
+
+    /// Verify that read() returns an error for out-of-range locations.
+    async fn test_read_out_of_range_returns_error_inner<F: Family + PartialEq>(context: Context) {
+        let journal = create_journal_with_ops::<F>(context, "read_oob", 3).await;
+
+        // Try to read beyond the end
+        let result = journal.read(*Location::<F>::new(10)).await;
+        assert!(matches!(
+            result,
+            Err(crate::journal::Error::ItemOutOfRange(_))
+        ));
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_out_of_range_returns_error_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_read_out_of_range_returns_error_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_out_of_range_returns_error_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_read_out_of_range_returns_error_inner::<mmb::Family>);
+    }
+
+    /// Verify that we can read all operations back correctly.
+    async fn test_read_all_operations_back_correctly_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let journal = create_journal_with_ops::<F>(context, "read_all", 50).await;
+
+        assert_eq!(journal.size(), 50);
+
+        // Verify all operations can be read back and match expected values
+        for i in 0..50 {
+            let op = journal.read(*Location::<F>::new(i)).await.unwrap();
+            assert_eq!(op, create_operation::<F>(i as u8));
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_all_operations_back_correctly_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_read_all_operations_back_correctly_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_read_all_operations_back_correctly_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_read_all_operations_back_correctly_inner::<mmb::Family>);
+    }
+
+    /// Verify that sync() persists operations.
+    async fn test_sync_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_empty_journal::<F>(context.child("first"), "close_pending").await;
+
+        // Add 20 operations
+        let expected_ops: Vec<_> = (0..20).map(|i| create_operation::<F>(i as u8)).collect();
+        for (i, op) in expected_ops.iter().enumerate() {
+            let loc;
+            (journal, loc) = journal.append(op).await.unwrap();
+            assert_eq!(loc, Location::<F>::new(i as u64),);
+        }
+
+        // Add commit operation to commit the operations
+        let commit_loc;
+        (journal, commit_loc) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(0)))
+            .await
+            .unwrap();
+        assert_eq!(
+            commit_loc,
+            Location::<F>::new(20),
+            "commit should be at location 20"
+        );
+        journal.sync().await.unwrap();
+
+        // Reopen and verify the operations persisted
+        let journal = create_empty_journal::<F>(context.child("second"), "close_pending").await;
+        assert_eq!(journal.size(), 21);
+
+        // Verify all operations can be read back
+        for (i, expected_op) in expected_ops.iter().enumerate() {
+            let read_op = journal.read(*Location::<F>::new(i as u64)).await.unwrap();
+            assert_eq!(read_op, *expected_op);
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_sync_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_sync_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_sync_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_sync_inner::<mmb::Family>);
+    }
+
+    /// Awaiting a start_sync handle provides commit-level durability: committed operations
+    /// survive a reopen, with recovery re-aligning the Merkle structure.
+    async fn test_start_sync_durability_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_empty_journal::<F>(context.child("first"), "start_sync").await;
+        let expected_ops: Vec<_> = (0..5).map(|i| create_operation::<F>(i as u8)).collect();
+        for op in expected_ops.iter() {
+            (journal, _) = journal.append(op).await.unwrap();
+        }
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(0)))
+            .await
+            .unwrap();
+
+        let handle;
+        (journal, handle) = journal.start_sync().await.unwrap();
+        handle.await.unwrap();
+        let root = journal_root(&journal);
+        drop(journal);
+
+        let journal = create_empty_journal::<F>(context.child("second"), "start_sync").await;
+        assert_eq!(journal.size(), 6);
+        assert_eq!(journal_root(&journal), root);
+        for (i, expected_op) in expected_ops.iter().enumerate() {
+            let read_op = journal.read(*Location::<F>::new(i as u64)).await.unwrap();
+            assert_eq!(read_op, *expected_op);
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_start_sync_durability_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_start_sync_durability_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_start_sync_durability_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_start_sync_durability_inner::<mmb::Family>);
+    }
+
+    /// Delayed-sync context for exercising in-flight sync handles.
+    type DelayedCtx = DelayedSyncContext<deterministic::Context>;
+
+    /// Authenticated journal over a delayed-sync storage backend.
+    type DelayedTestJournal<F> =
+        Journal<F, DelayedCtx, ContiguousJournal<DelayedCtx, TestOp<F>>, Sha256, Sequential>;
+
+    /// Open an authenticated journal whose blob syncs park on `pending`.
+    ///
+    /// `new` durably persists the recovered journal, so while syncs park the returned future
+    /// must be driven with [drive_pending_syncs] (or the mock unblocked first).
+    fn open_delayed_journal(
+        context: &Context,
+        label: &'static str,
+        suffix: &str,
+        pending: &PendingSyncs,
+    ) -> impl Future<Output = Result<DelayedTestJournal<mmr::Family>, Error<mmr::Family>>> {
+        DelayedTestJournal::<mmr::Family>::new(
+            DelayedCtx {
+                inner: context.child(label),
+                pending: pending.clone(),
+            },
+            merkle_config(suffix, context),
+            journal_config(suffix, context),
+            |op: &TestOp<mmr::Family>| op.is_commit(),
+            ForwardFold,
+        )
+    }
+
+    /// A sync handle must not block journal use while the backend sync is pending.
+    #[test_traced("INFO")]
+    fn test_start_sync_overlaps_work() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let pending = PendingSyncs::default();
+            let open = open_delayed_journal(&context, "first", "start_sync_overlap", &pending);
+            let mut journal = drive_pending_syncs(&pending, open).await.unwrap();
+            for i in 0..4 {
+                (journal, _) = journal
+                    .append(&create_operation::<mmr::Family>(i))
+                    .await
+                    .unwrap();
+            }
+
+            let starts_before = pending.starts();
+            let entered_before = pending.entered();
+            let completions_before = pending.completions();
+            let handle;
+            (journal, handle) = journal.start_sync().await.unwrap();
+            assert!(pending.starts() > starts_before);
+            assert_eq!(pending.completions(), completions_before);
+
+            // Observe the sync while the journal keeps working.
+            let waiter = context
+                .child("await_sync")
+                .spawn(|_| async move { handle.await.unwrap() });
+            while pending.entered() == entered_before {
+                reschedule().await;
+            }
+
+            // Appends and reads complete before the sync does.
+            (journal, _) = journal
+                .append(&create_operation::<mmr::Family>(4))
+                .await
+                .unwrap();
+            let read_op = journal.read(0).await.unwrap();
+            assert_eq!(read_op, create_operation::<mmr::Family>(0));
+            assert_eq!(
+                pending.completions(),
+                completions_before,
+                "the journal made progress while the sync was still in flight"
+            );
+
+            pending.unblock();
+            waiter.await.unwrap();
+
+            // The mid-sync append is durable after the next sync.
+            (journal, _) = journal
+                .append(&TestOp::<mmr::Family>::CommitFloor(None, Location::new(0)))
+                .await
+                .unwrap();
+            let handle;
+            (journal, handle) = journal.start_sync().await.unwrap();
+            handle.await.unwrap();
+            let root = journal.root(0).unwrap();
+            drop(journal);
+
+            let journal = open_delayed_journal(&context, "second", "start_sync_overlap", &pending)
+                .await
+                .unwrap();
+            assert_eq!(journal.size(), 6);
+            assert_eq!(journal.root(0).unwrap(), root);
+        });
+    }
+
+    /// A sync begun by `start_sync` that fails in flight surfaces the error through both the
+    /// returned handle and the next durability operation.
+    #[test_traced("INFO")]
+    fn test_start_sync_failure_propagates() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            // Pass syncs through so opening the journal doesn't park.
+            let pending = PendingSyncs::default();
+            pending.unblock();
+            let mut journal = open_delayed_journal(&context, "first", "start_sync_fail", &pending)
+                .await
+                .unwrap();
+            for i in 0..4 {
+                (journal, _) = journal
+                    .append(&create_operation::<mmr::Family>(i))
+                    .await
+                    .unwrap();
+            }
+
+            // Arm all future syncs to resolve to an injected error.
+            pending.arm_fail();
+
+            let handle;
+            (journal, handle) = journal.start_sync().await.unwrap();
+            assert!(
+                handle.await.is_err(),
+                "the sync handle surfaces the failure"
+            );
+            let starts_before = pending.starts();
+            // A failed mutable method consumes the journal per the failures-are-fatal contract.
+            assert!(
+                matches!(
+                    journal.commit().await,
+                    Err(Error::Journal(JournalError::Runtime(_)))
+                ),
+                "the next durability op surfaces the failed in-flight sync"
+            );
+            assert_eq!(
+                pending.starts(),
+                starts_before,
+                "the surfaced error is the retained failure, not a fresh sync's"
+            );
+        });
+    }
+
+    /// A merkle-only sync failure fails the joined handle even though the operation log's own
+    /// sync succeeded.
+    #[test_traced("INFO")]
+    fn test_start_sync_merkle_failure_fails_handle() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let pending = PendingSyncs::default();
+            let open = open_delayed_journal(&context, "first", "merkle_fail", &pending);
+            let mut journal = drive_pending_syncs(&pending, open).await.unwrap();
+            for i in 0..4 {
+                (journal, _) = journal
+                    .append(&create_operation::<mmr::Family>(i))
+                    .await
+                    .unwrap();
+            }
+
+            // Prove the appends durable, then dirty only the merkle journal: commit syncs the
+            // operation log but merely flushes merkle nodes.
+            let handle;
+            (journal, handle) = journal.start_sync().await.unwrap();
+            drive_pending_syncs(&pending, handle).await.unwrap();
+            for i in 4..6 {
+                (journal, _) = journal
+                    .append(&create_operation::<mmr::Family>(i))
+                    .await
+                    .unwrap();
+            }
+            journal = drive_pending_syncs(&pending, journal.commit())
+                .await
+                .unwrap();
+
+            // The operation log's data is already durable, so its only parked sync is the
+            // watermark advance: release it, then fail the merkle journal's syncs.
+            let handle;
+            (journal, handle) = journal.start_sync().await.unwrap();
+            let ops_watermark = next_pending_sync(&pending);
+            ops_watermark.release.send(Ok(())).unwrap();
+            fail_pending_syncs(&pending);
+            assert!(
+                handle.await.is_err(),
+                "a merkle-only failure surfaces on the joined handle"
+            );
+
+            // The merkle journal retained the failure: the next sync resurfaces it.
+            assert!(drive_pending_syncs(&pending, journal.sync()).await.is_err());
+        });
+    }
+
+    /// Verify that pruning an empty journal returns the boundary.
+    async fn test_prune_empty_journal_inner<F: Family + PartialEq>(context: Context) {
+        let journal = create_empty_journal::<F>(context, "prune_empty").await;
+
+        let (_, boundary) = journal.prune(Location::<F>::new(0)).await.unwrap();
+
+        assert_eq!(boundary, Location::<F>::new(0));
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_empty_journal_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_empty_journal_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_empty_journal_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_empty_journal_inner::<mmb::Family>);
+    }
+
+    /// Verify that pruning to a specific location works correctly.
+    async fn test_prune_to_location_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "prune_to", 100).await;
+
+        // Add commit at position 50
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(50)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+
+        let (_, boundary) = journal.prune(Location::<F>::new(50)).await.unwrap();
+
+        // Boundary should be <= requested location (may align to section boundary)
+        assert!(boundary <= Location::<F>::new(50));
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_to_location_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_to_location_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_to_location_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_to_location_inner::<mmb::Family>);
+    }
+
+    /// Verify that prune() returns the actual boundary (which may differ from requested).
+    async fn test_prune_returns_actual_boundary_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "prune_boundary", 100).await;
+
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(50)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+
+        let requested = Location::<F>::new(50);
+        let (journal, actual) = journal.prune(requested).await.unwrap();
+
+        // Actual boundary should match bounds.start
+        let bounds = journal.bounds();
+        assert!(!bounds.is_empty());
+        assert_eq!(actual, bounds.start);
+
+        // Actual may be <= requested due to section alignment
+        assert!(actual <= requested);
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_returns_actual_boundary_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_returns_actual_boundary_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_returns_actual_boundary_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_returns_actual_boundary_inner::<mmb::Family>);
+    }
+
+    /// Verify that pruning through the Mutable trait also prunes authenticated Merkle state.
+    async fn test_mutable_prune_updates_merkle_boundary_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let mut journal = create_journal_with_ops::<F>(context, "trait_prune", 100).await;
+
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(50)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+
+        let (journal, pruned) = <TestJournal<F> as Mutable>::prune(journal, 50)
+            .await
+            .unwrap();
+        assert!(pruned);
+
+        let item_boundary = journal.bounds().start;
+        let merkle_boundary = journal.merkle.bounds().start;
+        assert_eq!(Location::<F>::new(item_boundary), merkle_boundary);
+        assert!(merkle_boundary > Location::<F>::new(0));
+
+        let (journal, pruned) = <TestJournal<F> as Mutable>::prune(journal, 50)
+            .await
+            .unwrap();
+        assert!(!pruned);
+        assert_eq!(journal.bounds().start, item_boundary);
+        assert_eq!(journal.merkle.bounds().start, merkle_boundary);
+    }
+
+    #[test_traced("INFO")]
+    fn test_mutable_prune_updates_merkle_boundary_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_mutable_prune_updates_merkle_boundary_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_mutable_prune_updates_merkle_boundary_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_mutable_prune_updates_merkle_boundary_inner::<mmb::Family>);
+    }
+
+    /// Verify that pruning doesn't change the operation count.
+    async fn test_prune_preserves_operation_count_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "prune_count", 100).await;
+
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(50)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+
+        let count_before = journal.size();
+        let (journal, _) = journal.prune(Location::<F>::new(50)).await.unwrap();
+        let count_after = journal.size();
+
+        assert_eq!(count_before, count_after);
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_preserves_operation_count_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_preserves_operation_count_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_prune_preserves_operation_count_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_prune_preserves_operation_count_inner::<mmb::Family>);
+    }
+
+    /// Verify bounds() for empty journal, no pruning, and after pruning.
+    async fn test_bounds_empty_and_pruned_inner<F: Family + PartialEq>(context: Context) {
+        // Test empty journal
+        let journal = create_empty_journal::<F>(context.child("empty"), "oldest").await;
+        assert!(journal.bounds().is_empty());
+        journal.destroy().await.unwrap();
+
+        // Test no pruning
+        let journal = create_journal_with_ops::<F>(context.child("no_prune"), "oldest", 100).await;
+        let bounds = journal.bounds();
+        assert!(!bounds.is_empty());
+        assert_eq!(bounds.start, 0);
+        journal.destroy().await.unwrap();
+
+        // Test after pruning
+        let mut journal =
+            create_journal_with_ops::<F>(context.child("pruned"), "oldest", 100).await;
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(50)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+
+        let (journal, pruned_boundary) = journal.prune(Location::<F>::new(50)).await.unwrap();
+
+        // Should match the pruned boundary (may be <= 50 due to section alignment)
+        let bounds = journal.bounds();
+        assert!(!bounds.is_empty());
+        assert_eq!(bounds.start, pruned_boundary);
+        // Should be <= requested location (50)
+        assert!(pruned_boundary <= 50);
+        journal.destroy().await.unwrap();
+    }
+
+    #[test_traced("INFO")]
+    fn test_bounds_empty_and_pruned_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_bounds_empty_and_pruned_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_bounds_empty_and_pruned_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_bounds_empty_and_pruned_inner::<mmb::Family>);
+    }
+
+    /// Verify bounds().start for empty journal, no pruning, and after pruning.
+    async fn test_bounds_start_after_prune_inner<F: Family + PartialEq>(context: Context) {
+        // Test empty journal
+        let journal = create_empty_journal::<F>(context.child("empty"), "boundary").await;
+        assert_eq!(journal.bounds().start, 0);
+
+        // Test no pruning
+        let journal =
+            create_journal_with_ops::<F>(context.child("no_prune"), "boundary", 100).await;
+        assert_eq!(journal.bounds().start, 0);
+
+        // Test after pruning
+        let mut journal =
+            create_journal_with_ops::<F>(context.child("pruned"), "boundary", 100).await;
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(50)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+
+        let (journal, pruned_boundary) = journal.prune(Location::<F>::new(50)).await.unwrap();
+
+        assert_eq!(journal.bounds().start, pruned_boundary);
+    }
+
+    #[test_traced("INFO")]
+    fn test_bounds_start_after_prune_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_bounds_start_after_prune_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_bounds_start_after_prune_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_bounds_start_after_prune_inner::<mmb::Family>);
+    }
+
+    /// Verify that Merkle prunes to the journal's actual boundary, not the requested location.
+    async fn test_mmr_prunes_to_journal_boundary_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "mmr_boundary", 50).await;
+
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(25)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+
+        let (journal, pruned_boundary) = journal.prune(Location::<F>::new(25)).await.unwrap();
+
+        // Verify Merkle and journal remain in sync
+        let bounds = journal.bounds();
+        assert!(!bounds.is_empty());
+        assert_eq!(pruned_boundary, bounds.start);
+
+        // Verify boundary is at or before requested (due to section alignment)
+        assert!(pruned_boundary <= Location::<F>::new(25));
+
+        // Verify operation count is unchanged
+        assert_eq!(journal.size(), 51);
+    }
+
+    #[test_traced("INFO")]
+    fn test_mmr_prunes_to_journal_boundary_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_mmr_prunes_to_journal_boundary_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_mmr_prunes_to_journal_boundary_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_mmr_prunes_to_journal_boundary_inner::<mmb::Family>);
+    }
+
+    /// Verify proof() for multiple operations.
+    async fn test_proof_multiple_operations_inner<F: Family + PartialEq>(context: Context) {
+        let journal = create_journal_with_ops::<F>(context, "proof_multi", 50).await;
+
+        let (proof, ops) = journal
+            .proof(Location::<F>::new(0), NZU64!(50), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(ops.len(), 50);
+        for (i, op) in ops.iter().enumerate() {
+            assert_eq!(*op, create_operation::<F>(i as u8));
+        }
+
+        // Verify the proof is valid
+        let hasher = StandardHasher::new(ForwardFold);
+        let root = journal_root(&journal);
+        assert!(verify_proof(
+            &proof,
+            &ops,
+            Location::<F>::new(0),
+            &root,
+            &hasher
+        ));
+    }
+
+    #[test_traced("INFO")]
+    fn test_proof_multiple_operations_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_proof_multiple_operations_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_proof_multiple_operations_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_proof_multiple_operations_inner::<mmb::Family>);
+    }
+
+    /// Verify that historical_proof() respects the max_ops limit.
+    async fn test_historical_proof_limited_by_max_ops_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let journal = create_journal_with_ops::<F>(context, "proof_limit", 50).await;
+
+        let size = journal.size();
+        let (proof, ops) = journal
+            .historical_proof(size, Location::<F>::new(0), NZU64!(20), 0)
+            .await
+            .unwrap();
+
+        // Should return only 20 operations despite 50 being available
+        assert_eq!(ops.len(), 20);
+        for (i, op) in ops.iter().enumerate() {
+            assert_eq!(*op, create_operation::<F>(i as u8));
+        }
+
+        // Verify the proof is valid
+        let hasher = StandardHasher::new(ForwardFold);
+        let root = journal_root(&journal);
+        assert!(verify_proof(
+            &proof,
+            &ops,
+            Location::<F>::new(0),
+            &root,
+            &hasher
+        ));
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_limited_by_max_ops_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_limited_by_max_ops_inner::<mmr::Family>(context)
+        });
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_limited_by_max_ops_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_limited_by_max_ops_inner::<mmb::Family>(context)
+        });
+    }
+
+    /// Verify historical_proof() at the end of the journal.
+    async fn test_historical_proof_at_end_of_journal_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let journal = create_journal_with_ops::<F>(context, "proof_end", 50).await;
+
+        let size = journal.size();
+        // Request proof starting near the end
+        let (proof, ops) = journal
+            .historical_proof(size, Location::<F>::new(40), NZU64!(20), 0)
+            .await
+            .unwrap();
+
+        // Should return only 10 operations (positions 40-49)
+        assert_eq!(ops.len(), 10);
+        for (i, op) in ops.iter().enumerate() {
+            assert_eq!(*op, create_operation::<F>((40 + i) as u8));
+        }
+
+        // Verify the proof is valid
+        let hasher = StandardHasher::new(ForwardFold);
+        let root = journal_root(&journal);
+        assert!(verify_proof(
+            &proof,
+            &ops,
+            Location::<F>::new(40),
+            &root,
+            &hasher
+        ));
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_at_end_of_journal_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_historical_proof_at_end_of_journal_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_at_end_of_journal_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_historical_proof_at_end_of_journal_inner::<mmb::Family>);
+    }
+
+    /// Verify that historical_proof() returns an error for invalid size.
+    async fn test_historical_proof_out_of_range_returns_error_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let journal = create_journal_with_ops::<F>(context, "proof_oob", 5).await;
+
+        // Request proof with size > actual journal size
+        let result = journal
+            .historical_proof(Location::<F>::new(10), Location::<F>::new(0), NZU64!(1), 0)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::Merkle(merkle::Error::RangeOutOfBounds(_)))
+        ));
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_out_of_range_returns_error_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_out_of_range_returns_error_inner::<mmr::Family>(context)
+        });
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_out_of_range_returns_error_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_out_of_range_returns_error_inner::<mmb::Family>(context)
+        });
+    }
+
+    /// Verify that historical_proof() returns an error when start_loc >= size.
+    async fn test_historical_proof_start_too_large_returns_error_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let journal = create_journal_with_ops::<F>(context, "proof_start_oob", 5).await;
+
+        let size = journal.size();
+        // Request proof starting at size (should fail)
+        let result = journal.historical_proof(size, size, NZU64!(1), 0).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::Merkle(merkle::Error::RangeOutOfBounds(_)))
+        ));
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_start_too_large_returns_error_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_start_too_large_returns_error_inner::<mmr::Family>(context)
+        });
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_start_too_large_returns_error_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_start_too_large_returns_error_inner::<mmb::Family>(context)
+        });
+    }
+
+    /// Verify historical_proof() for a truly historical state (before more operations added).
+    async fn test_historical_proof_truly_historical_inner<F: Family + PartialEq>(context: Context) {
+        // Create journal with initial operations
+        let mut journal = create_journal_with_ops::<F>(context, "proof_historical", 50).await;
+
+        // Capture root at historical state
+        let hasher = StandardHasher::new(ForwardFold);
+        let historical_root = journal_root(&journal);
+        let historical_size = journal.size();
+
+        // Add more operations after the historical state
+        for i in 50..100 {
+            (journal, _) = journal
+                .append(&create_operation::<F>(i as u8))
+                .await
+                .unwrap();
+        }
+        let journal = journal.sync().await.unwrap();
+
+        // Generate proof for the historical state
+        let (proof, ops) = journal
+            .historical_proof(historical_size, Location::<F>::new(0), NZU64!(50), 0)
+            .await
+            .unwrap();
+
+        // Verify operations match expected historical operations
+        assert_eq!(ops.len(), 50);
+        for (i, op) in ops.iter().enumerate() {
+            assert_eq!(*op, create_operation::<F>(i as u8));
+        }
+
+        // Verify the proof is valid against the historical root
+        assert!(verify_proof(
+            &proof,
+            &ops,
+            Location::<F>::new(0),
+            &historical_root,
+            &hasher
+        ));
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_truly_historical_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_historical_proof_truly_historical_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_truly_historical_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_historical_proof_truly_historical_inner::<mmb::Family>);
+    }
+
+    /// Verify that historical_proof() returns an error when start_loc is pruned.
+    async fn test_historical_proof_pruned_location_returns_error_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let mut journal = create_journal_with_ops::<F>(context, "proof_pruned", 50).await;
+
+        (journal, _) = journal
+            .append(&TestOp::<F>::CommitFloor(None, Location::<F>::new(25)))
+            .await
+            .unwrap();
+        journal = journal.sync().await.unwrap();
+        let pruned_boundary;
+        (journal, pruned_boundary) = journal.prune(Location::<F>::new(25)).await.unwrap();
+
+        // Try to get proof starting at a location before the pruned boundary
+        let size = journal.size();
+        let start_loc = Location::<F>::new(0);
+        if start_loc < pruned_boundary {
+            let result = journal
+                .historical_proof(size, start_loc, NZU64!(1), 0)
+                .await;
+
+            // Should fail when trying to read pruned operations
+            assert!(result.is_err());
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_pruned_location_returns_error_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_pruned_location_returns_error_inner::<mmr::Family>(context)
+        });
+    }
+
+    #[test_traced("INFO")]
+    fn test_historical_proof_pruned_location_returns_error_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| {
+            test_historical_proof_pruned_location_returns_error_inner::<mmb::Family>(context)
+        });
+    }
+
+    /// Verify replay() with empty journal and multiple operations.
+    async fn test_replay_operations_inner<F: Family + PartialEq>(context: Context) {
+        // Test empty journal
+        let journal = create_empty_journal::<F>(context.child("empty"), "replay").await;
+        let stream = journal
+            .replay(0, NZUsize!(10), ReadOptions::default())
+            .await
+            .unwrap();
+        futures::pin_mut!(stream);
+        assert!(stream.next().await.is_none());
+
+        // Test replaying all operations
+        let journal = create_journal_with_ops::<F>(context.child("with_ops"), "replay", 50).await;
+        let stream = journal
+            .replay(0, NZUsize!(100), ReadOptions::default())
+            .await
+            .unwrap();
+        futures::pin_mut!(stream);
+
+        for i in 0..50 {
+            let (pos, op) = stream.next().await.unwrap().unwrap();
+            assert_eq!(pos, i);
+            assert_eq!(op, create_operation::<F>(i as u8));
+        }
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[test_traced("INFO")]
+    fn test_replay_operations_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_replay_operations_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_replay_operations_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_replay_operations_inner::<mmb::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_replay_propagates_read_options_to_backing_journal() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (context, recordings) = RecordingContext::new(context);
+            let merkle_cfg = merkle_config("replay-options", &context);
+            let journal_cfg = journal_config("replay-options", &context);
+            let page_cache = journal_cfg.page_cache.clone();
+            let mut journal = RecordingTestJournal::<mmr::Family>::new(
+                context,
+                merkle_cfg,
+                journal_cfg,
+                |op| op.is_commit(),
+                ForwardFold,
+            )
+            .await
+            .unwrap();
+
+            for i in 0..8 {
+                let operation = create_operation::<mmr::Family>(i);
+                (journal, _) = journal.append(&operation).await.unwrap();
+            }
+            journal = journal.sync().await.unwrap();
+
+            // Evict cached pages so the first replay item requires a backing read through the
+            // authenticated wrapper.
+            page_cache.clear();
+            let stream = journal
+                .replay(0, NZUsize!(100), ReadOptions::DONT_CACHE)
+                .await
+                .unwrap();
+            recordings.clear();
+            futures::pin_mut!(stream);
+            let (position, operation) = stream.next().await.unwrap().unwrap();
+            assert_eq!(position, 0);
+            assert_eq!(operation, create_operation::<mmr::Family>(0));
+
+            // The authenticated wrapper forwards DONT_CACHE unchanged to the backing journal.
+            let reads = recordings.snapshot().reads;
+            assert!(!reads.is_empty());
+            assert!(
+                reads
+                    .iter()
+                    .all(|options| *options == ReadOptions::DONT_CACHE)
+            );
+        });
+    }
+
+    /// Verify replay() starting from a middle location.
+    async fn test_replay_from_middle_inner<F: Family + PartialEq>(context: Context) {
+        let journal = create_journal_with_ops::<F>(context, "replay_middle", 50).await;
+        let stream = journal
+            .replay(25, NZUsize!(100), ReadOptions::default())
+            .await
+            .unwrap();
+        futures::pin_mut!(stream);
+
+        let mut count = 0;
+        while let Some(result) = stream.next().await {
+            let (pos, op) = result.unwrap();
+            assert_eq!(pos, 25 + count);
+            assert_eq!(op, create_operation::<F>((25 + count) as u8));
+            count += 1;
+        }
+
+        // Should have replayed positions 25-49 (25 operations)
+        assert_eq!(count, 25);
+    }
+
+    #[test_traced("INFO")]
+    fn test_replay_from_middle_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_replay_from_middle_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_replay_from_middle_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_replay_from_middle_inner::<mmb::Family>);
+    }
+
+    /// Verify the speculative batch API: fork two batches, verify independent roots, apply one.
+    async fn test_speculative_batch_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "speculative_batch", 10).await;
+        let original_root = journal_root(&journal);
+
+        // Fork two independent speculative batches.
+        let b1 = journal.new_batch();
+        let b2 = journal.new_batch();
+
+        // Add different items to each batch.
+        let op_a = create_operation::<F>(100);
+        let op_b = create_operation::<F>(200);
+        let b1 = b1.add(op_a.clone());
+        let b2 = b2.add(op_b);
+
+        // Merkleize and verify independent roots.
+        let m1 = journal.merkle.with_mem(|mem| b1.merkleize(mem));
+        let m2 = journal.merkle.with_mem(|mem| b2.merkleize(mem));
+        assert_ne!(batch_root(&journal, &m1), batch_root(&journal, &m2));
+        assert_ne!(batch_root(&journal, &m1), original_root);
+        assert_ne!(batch_root(&journal, &m2), original_root);
+
+        // Journal root should be unchanged (batches are speculative).
+        assert_eq!(journal_root(&journal), original_root);
+
+        // Apply batch 1.
+        let expected_root = batch_root(&journal, &m1);
+        journal = journal.apply_batch(&m1).await.unwrap();
+
+        // Journal should now match the applied batch's root.
+        assert_eq!(journal_root(&journal), expected_root);
+        assert_eq!(*journal.size(), 11);
+    }
+
+    #[test_traced("INFO")]
+    fn test_speculative_batch_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_speculative_batch_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_speculative_batch_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_speculative_batch_inner::<mmb::Family>);
+    }
+
+    /// Verify stacking: create batch A, merkleize, create batch B from merkleized A,
+    /// merkleize, and apply. Verify root and items.
+    async fn test_speculative_batch_stacking_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "batch_stacking", 10).await;
+
+        let op_a = create_operation::<F>(100);
+        let op_b = create_operation::<F>(200);
+
+        let (merkleized_a, merkleized_b) = {
+            let batch_a = journal.new_batch().add(op_a.clone());
+            let merkleized_a = journal.merkle.with_mem(|mem| batch_a.merkleize(mem));
+
+            let batch_b = merkleized_a.new_batch::<Sha256>().add(op_b.clone());
+            let merkleized_b = journal.merkle.with_mem(|mem| batch_b.merkleize(mem));
+            (merkleized_a, merkleized_b)
+        };
+
+        let expected_root = batch_root(&journal, &merkleized_b);
+        journal = journal.apply_batch(&merkleized_b).await.unwrap();
+        drop(merkleized_a);
+
+        assert_eq!(journal_root(&journal), expected_root);
+        assert_eq!(*journal.size(), 12);
+
+        // Verify both items were appended correctly.
+        let read_a = journal.read(*Location::<F>::new(10)).await.unwrap();
+        assert_eq!(read_a, op_a);
+        let read_b = journal.read(*Location::<F>::new(11)).await.unwrap();
+        assert_eq!(read_b, op_b);
+    }
+
+    #[test_traced("INFO")]
+    fn test_speculative_batch_stacking_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_speculative_batch_stacking_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_speculative_batch_stacking_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_speculative_batch_stacking_inner::<mmb::Family>);
+    }
+
+    /// Verify sequential batch application: apply batch A, then build and apply batch B
+    /// from the committed state. Verify root and items.
+    async fn test_speculative_batch_sequential_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "batch_sequential", 10).await;
+
+        let op_a = create_operation::<F>(100);
+        let op_b = create_operation::<F>(200);
+
+        // Apply batch A.
+        let batch_a = journal.new_batch().add(op_a.clone());
+        let merkleized_a = journal.merkle.with_mem(|mem| batch_a.merkleize(mem));
+        journal = journal.apply_batch(&merkleized_a).await.unwrap();
+        assert_eq!(*journal.size(), 11);
+
+        // Apply batch B (built on top of the committed A).
+        let batch_b = journal.new_batch().add(op_b.clone());
+        let merkleized_b = journal.merkle.with_mem(|mem| batch_b.merkleize(mem));
+        let expected_root = batch_root(&journal, &merkleized_b);
+        journal = journal.apply_batch(&merkleized_b).await.unwrap();
+
+        assert_eq!(journal_root(&journal), expected_root);
+        assert_eq!(*journal.size(), 12);
+
+        // Verify both items were appended correctly.
+        let read_a = journal.read(*Location::<F>::new(10)).await.unwrap();
+        assert_eq!(read_a, op_a);
+        let read_b = journal.read(*Location::<F>::new(11)).await.unwrap();
+        assert_eq!(read_b, op_b);
+    }
+
+    #[test_traced("INFO")]
+    fn test_speculative_batch_sequential_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_speculative_batch_sequential_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_speculative_batch_sequential_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_speculative_batch_sequential_inner::<mmb::Family>);
+    }
+
+    async fn test_stale_batch_sibling_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_empty_journal::<F>(context.child("open"), "stale-sibling").await;
+        let op_a = create_operation::<F>(1);
+        let op_b = create_operation::<F>(2);
+
+        // Create two batches from the same base.
+        let batch_a = journal.new_batch().add(op_a.clone());
+        let merkleized_a = journal.merkle.with_mem(|mem| batch_a.merkleize(mem));
+        let batch_b = journal.new_batch().add(op_b);
+        let merkleized_b = journal.merkle.with_mem(|mem| batch_b.merkleize(mem));
+
+        // Apply A, then commit and sync so the recovered state below includes it (reopen
+        // rewinds to the last commit operation).
+        journal = journal.apply_batch(&merkleized_a).await.unwrap();
+        let commit_op = TestOp::<F>::CommitFloor(None, Location::<F>::new(0));
+        (journal, _) = journal.append(&commit_op).await.unwrap();
+        journal = journal.sync().await.unwrap();
+        let root_a = journal_root(&journal);
+        let size_a = journal.size();
+        let (_, ops) = journal
+            .proof(Location::<F>::new(0), NZU64!(1), 0)
+            .await
+            .unwrap();
+        assert_eq!(ops, vec![op_a.clone()]);
+
+        // Apply B -- should fail (stale).
+        let result = journal.apply_batch(&merkleized_b).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::Error::Merkle(merkle::Error::StaleBatch { .. }))
+            ),
+            "expected StaleBatch, got {result:?}"
+        );
+
+        // The eager reject mutated nothing: reopening recovers exactly A's state.
+        let journal = create_empty_journal::<F>(context.child("reopen"), "stale-sibling").await;
+        assert_eq!(journal_root(&journal), root_a);
+        assert_eq!(journal.size(), size_a);
+        let (_, ops) = journal
+            .proof(Location::<F>::new(0), NZU64!(1), 0)
+            .await
+            .unwrap();
+        assert_eq!(ops, vec![op_a]);
+        journal.destroy().await.unwrap();
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_sibling_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_sibling_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_sibling_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_sibling_inner::<mmb::Family>);
+    }
+
+    async fn test_stale_batch_chained_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "stale-chained", 5).await;
+
+        // Parent batch, then fork two children.
+        let parent_batch = journal.new_batch().add(create_operation::<F>(10));
+        let parent = journal.merkle.with_mem(|mem| parent_batch.merkleize(mem));
+        let batch_a = parent.new_batch::<Sha256>().add(create_operation::<F>(20));
+        let child_a = journal.merkle.with_mem(|mem| batch_a.merkleize(mem));
+        let batch_b = parent.new_batch::<Sha256>().add(create_operation::<F>(30));
+        let child_b = journal.merkle.with_mem(|mem| batch_b.merkleize(mem));
+
+        // Apply child_a, then child_b should be stale.
+        journal = journal.apply_batch(&child_a).await.unwrap();
+        let result = journal.apply_batch(&child_b).await;
+        drop(parent);
+        assert!(
+            matches!(
+                result,
+                Err(super::Error::Merkle(merkle::Error::StaleBatch { .. }))
+            ),
+            "expected StaleBatch for sibling, got {result:?}"
+        );
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_chained_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_chained_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_chained_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_chained_inner::<mmb::Family>);
+    }
+
+    async fn test_stale_batch_parent_before_child_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_empty_journal::<F>(context, "stale-parent-first").await;
+
+        // Create parent, then child.
+        let parent_batch = journal.new_batch().add(create_operation::<F>(1));
+        let parent = journal.merkle.with_mem(|mem| parent_batch.merkleize(mem));
+        let child_batch = parent.new_batch::<Sha256>().add(create_operation::<F>(2));
+        let child = journal.merkle.with_mem(|mem| child_batch.merkleize(mem));
+
+        let expected_root = batch_root(&journal, &child);
+
+        // Apply parent, then child (sequential commit).
+        journal = journal.apply_batch(&parent).await.unwrap();
+        journal = journal.apply_batch(&child).await.unwrap();
+
+        assert_eq!(journal_root(&journal), expected_root);
+        assert_eq!(*journal.size(), 2);
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_parent_before_child_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_parent_before_child_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_parent_before_child_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_parent_before_child_inner::<mmb::Family>);
+    }
+
+    async fn test_stale_batch_child_before_parent_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_empty_journal::<F>(context, "stale-child-first").await;
+
+        // Create parent, then child.
+        let parent_batch = journal.new_batch().add(create_operation::<F>(1));
+        let parent = journal.merkle.with_mem(|mem| parent_batch.merkleize(mem));
+        let child_batch = parent.new_batch::<Sha256>().add(create_operation::<F>(2));
+        let child = journal.merkle.with_mem(|mem| child_batch.merkleize(mem));
+
+        // Apply child first (full chain) -- parent should now be stale.
+        journal = journal.apply_batch(&child).await.unwrap();
+        let result = journal.apply_batch(&parent).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::Error::Merkle(merkle::Error::StaleBatch { .. }))
+            ),
+            "expected StaleBatch for parent after child applied, got {result:?}"
+        );
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_child_before_parent_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_child_before_parent_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_stale_batch_child_before_parent_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_stale_batch_child_before_parent_inner::<mmb::Family>);
+    }
+
+    /// Apply parent then child: child skips already-committed ancestor items.
+    async fn test_apply_batch_skip_ancestor_items_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "rp-skip", 3).await;
+
+        // Parent: 2 items.
+        let parent_batch = journal
+            .new_batch()
+            .add(create_operation::<F>(10))
+            .add(create_operation::<F>(11));
+        let parent = journal.merkle.with_mem(|mem| parent_batch.merkleize(mem));
+
+        // Child: 3 more items.
+        let child_batch = parent
+            .new_batch::<Sha256>()
+            .add(create_operation::<F>(20))
+            .add(create_operation::<F>(21))
+            .add(create_operation::<F>(22));
+        let child = journal.merkle.with_mem(|mem| child_batch.merkleize(mem));
+
+        // Apply parent.
+        journal = journal.apply_batch(&parent).await.unwrap();
+
+        // Apply child (ancestor items already committed, skipped automatically).
+        journal = journal.apply_batch(&child).await.unwrap();
+
+        // Verify all items are present.
+        let (_, ops) = journal
+            .proof(Location::<F>::new(3), NZU64!(5), 0)
+            .await
+            .unwrap();
+        assert_eq!(ops.len(), 5);
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_skip_ancestor_items_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_skip_ancestor_items_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_skip_ancestor_items_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_skip_ancestor_items_inner::<mmb::Family>);
+    }
+
+    /// `apply_batch` works correctly across a 3-level chain.
+    async fn test_apply_batch_cross_batch_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "rp-cross", 2).await;
+
+        // Grandparent: 3 items.
+        let grandparent_batch = journal
+            .new_batch()
+            .add(create_operation::<F>(3))
+            .add(create_operation::<F>(4))
+            .add(create_operation::<F>(5));
+        let grandparent = journal
+            .merkle
+            .with_mem(|mem| grandparent_batch.merkleize(mem));
+
+        // Parent: 2 items.
+        let parent_batch = grandparent
+            .new_batch::<Sha256>()
+            .add(create_operation::<F>(6))
+            .add(create_operation::<F>(7));
+        let parent = journal.merkle.with_mem(|mem| parent_batch.merkleize(mem));
+
+        // Child: 1 item.
+        let child_batch = parent.new_batch::<Sha256>().add(create_operation::<F>(8));
+        let child = journal.merkle.with_mem(|mem| child_batch.merkleize(mem));
+
+        // Apply grandparent, then parent, then child sequentially.
+        journal = journal.apply_batch(&grandparent).await.unwrap();
+
+        // Apply parent (ancestor items already committed, skipped automatically).
+        journal = journal.apply_batch(&parent).await.unwrap();
+
+        // Apply child (ancestor items already committed, skipped automatically).
+        journal = journal.apply_batch(&child).await.unwrap();
+
+        // All 8 items (2 base + 3 + 2 + 1) should be present.
+        assert_eq!(*journal.size(), 8);
+
+        // Verify the actual items at each location.
+        let (_, ops) = journal
+            .proof(Location::<F>::new(2), NZU64!(6), 0)
+            .await
+            .unwrap();
+        for (i, op) in ops.iter().enumerate() {
+            assert_eq!(*op, create_operation::<F>((i + 3) as u8));
+        }
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_cross_batch_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_cross_batch_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_cross_batch_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_cross_batch_inner::<mmb::Family>);
+    }
+
+    /// merkleize_with produces the same root as add + merkleize.
+    async fn test_merkleize_with_matches_add_inner<F: Family + PartialEq>(context: Context) {
+        let journal = create_journal_with_ops::<F>(context, "mw-matches", 5).await;
+
+        let ops = vec![
+            create_operation::<F>(10),
+            create_operation::<F>(11),
+            create_operation::<F>(12),
+        ];
+
+        // add + merkleize
+        let mut batch = journal.new_batch();
+        for op in &ops {
+            batch = batch.add(op.clone());
+        }
+        let expected = journal.merkle.with_mem(|mem| batch.merkleize(mem));
+
+        // merkleize_with
+        let batch = journal.new_batch();
+        let actual = journal
+            .merkle
+            .with_mem(|mem| merkleize_with(batch, mem, ops));
+
+        assert_eq!(
+            batch_root(&journal, &actual),
+            batch_root(&journal, &expected)
+        );
+    }
+
+    #[test_traced("INFO")]
+    fn test_merkleize_with_matches_add_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_merkleize_with_matches_add_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_merkleize_with_matches_add_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_merkleize_with_matches_add_inner::<mmb::Family>);
+    }
+
+    /// merkleize_with items are readable after apply.
+    async fn test_merkleize_with_apply_inner<F: Family + PartialEq>(context: Context) {
+        let mut journal = create_journal_with_ops::<F>(context, "mw-apply", 5).await;
+
+        let ops = vec![create_operation::<F>(10), create_operation::<F>(11)];
+        let batch = journal.new_batch();
+        let merkleized = journal
+            .merkle
+            .with_mem(|mem| merkleize_with(batch, mem, ops.clone()));
+
+        let expected_root = batch_root(&journal, &merkleized);
+        journal = journal.apply_batch(&merkleized).await.unwrap();
+
+        assert_eq!(journal_root(&journal), expected_root);
+        assert_eq!(*journal.size(), 7);
+
+        assert_eq!(journal.read(5).await.unwrap(), ops[0]);
+        assert_eq!(journal.read(6).await.unwrap(), ops[1]);
+    }
+
+    #[test_traced("INFO")]
+    fn test_merkleize_with_apply_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_merkleize_with_apply_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_merkleize_with_apply_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_merkleize_with_apply_inner::<mmb::Family>);
+    }
+
+    /// Apply C (grandchild of A) after only A is committed. B's journal items
+    /// must still be applied -- skip only A's items.
+    async fn test_apply_batch_skips_only_committed_ancestor_items_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let mut journal = create_empty_journal::<F>(context.child("storage"), "skip-partial").await;
+
+        // Build chain: A -> B -> C
+        let a_batch = journal.new_batch().add(create_operation::<F>(1));
+        let a = journal.merkle.with_mem(|mem| a_batch.merkleize(mem));
+        let b_batch = a.new_batch::<Sha256>().add(create_operation::<F>(2));
+        let b = journal.merkle.with_mem(|mem| b_batch.merkleize(mem));
+        let c_batch = b.new_batch::<Sha256>().add(create_operation::<F>(3));
+        let c = journal.merkle.with_mem(|mem| c_batch.merkleize(mem));
+
+        // Apply A, then apply C directly (skipping B's apply_batch).
+        journal = journal.apply_batch(&a).await.unwrap();
+        journal = journal.apply_batch(&c).await.unwrap();
+
+        // All 3 items should be in the journal.
+        assert_eq!(*journal.size(), 3);
+
+        // Build a reference that applies all three sequentially.
+        let mut reference =
+            create_empty_journal::<F>(context.child("ref"), "skip-partial-ref").await;
+        for i in 1..=3u8 {
+            (reference, _) = reference.append(&create_operation::<F>(i)).await.unwrap();
+        }
+        assert_eq!(journal_root(&journal), journal_root(&reference));
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_skips_only_committed_ancestor_items_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_skips_only_committed_ancestor_items_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_skips_only_committed_ancestor_items_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_skips_only_committed_ancestor_items_inner::<mmb::Family>);
+    }
+
+    /// A descendant whose uncommitted ancestor was dropped must fail before
+    /// appending any of its retained journal items.
+    async fn test_apply_batch_detects_dropped_uncommitted_ancestor_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let journal =
+            create_empty_journal::<F>(context.child("storage"), "dropped-uncommitted").await;
+
+        let a_batch = journal.new_batch().add(create_operation::<F>(1));
+        let a = journal.merkle.with_mem(|mem| a_batch.merkleize(mem));
+        let b_batch = a.new_batch::<Sha256>().add(create_operation::<F>(2));
+        let b = journal.merkle.with_mem(|mem| b_batch.merkleize(mem));
+
+        drop(a);
+        let c_batch = b.new_batch::<Sha256>().add(create_operation::<F>(3));
+        let c = journal.merkle.with_mem(|mem| c_batch.merkleize(mem));
+        drop(b);
+
+        assert_eq!(c.ancestor_base_leaves, 1);
+        assert_eq!(c.ancestor_items.len(), 1);
+
+        let result = journal.apply_batch(&c).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::Error::Merkle(merkle::Error::AncestorDropped { expected, .. }))
+                    if expected == c.inner.size()
+            ),
+            "expected AncestorDropped, got {result:?}"
+        );
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_detects_dropped_uncommitted_ancestor_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_detects_dropped_uncommitted_ancestor_inner::<mmb::Family>);
+    }
+
+    /// A dropped committed prefix must not shift the remaining uncommitted
+    /// ancestor items back to the original fork point.
+    async fn test_apply_batch_after_committed_ancestor_dropped_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let mut journal =
+            create_empty_journal::<F>(context.child("storage"), "dropped-committed").await;
+
+        let mut a_batch = journal.new_batch();
+        for i in 0..8u8 {
+            a_batch = a_batch.add(create_operation::<F>(i));
+        }
+        let a = journal.merkle.with_mem(|mem| a_batch.merkleize(mem));
+        let b_batch = a.new_batch::<Sha256>().add(create_operation::<F>(8));
+        let b = journal.merkle.with_mem(|mem| b_batch.merkleize(mem));
+
+        journal = journal.apply_batch(&a).await.unwrap();
+        drop(a);
+
+        let c_batch = b.new_batch::<Sha256>().add(create_operation::<F>(9));
+        let c = journal.merkle.with_mem(|mem| c_batch.merkleize(mem));
+
+        // Only B remains in the retained ancestor suffix.
+        assert_eq!(c.ancestor_items.len(), 1);
+        assert_eq!(c.ancestor_base_leaves, *journal.size());
+        assert_eq!(c.inner.ancestor_base_size, journal.merkle.size());
+
+        drop(b);
+        journal = journal.apply_batch(&c).await.unwrap();
+        assert_eq!(*journal.size(), 10);
+
+        let mut reference =
+            create_empty_journal::<F>(context.child("reference"), "dropped-committed-ref").await;
+        for i in 0..10u8 {
+            (reference, _) = reference.append(&create_operation::<F>(i)).await.unwrap();
+        }
+        assert_eq!(journal_root(&journal), journal_root(&reference));
+    }
+
+    #[test_traced("INFO")]
+    fn test_apply_batch_after_committed_ancestor_dropped_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_apply_batch_after_committed_ancestor_dropped_inner::<mmb::Family>);
+    }
+
+    /// Merkleization retains a speculative suffix after its committed prefix is released.
+    async fn test_merkleize_after_committed_prefix_dropped_inner<F: Family + PartialEq>(
+        context: Context,
+    ) {
+        let mut journal =
+            create_empty_journal::<F>(context.child("storage"), "committed-prefix").await;
+
+        // Build a speculative suffix over a prefix that will be committed independently.
+        let prefix_items = (0..8u8).map(create_operation::<F>).collect();
+        let (prefix, _) = journal
+            .merkleize(journal.new_batch(), prefix_items, 0)
+            .await
+            .unwrap();
+        let pending_items = (8..10u8).map(create_operation::<F>).collect();
+        let (pending, _) = journal
+            .merkleize(prefix.new_batch::<Sha256>(), pending_items, 0)
+            .await
+            .unwrap();
+
+        // Commit and release the prefix. Its Merkle nodes now resolve through the snapshot.
+        journal = journal.apply_batch(&prefix).await.unwrap();
+        drop(prefix);
+
+        // The child batch is the pending suffix's only remaining owner. Merkleization must retain
+        // that suffix through root computation.
+        let child_batch = pending.new_batch::<Sha256>();
+        drop(pending);
+        let (child, expected_root) = journal
+            .merkleize(child_batch, vec![create_operation::<F>(10)], 0)
+            .await
+            .unwrap();
+        journal = journal.apply_batch(&child).await.unwrap();
+
+        assert_eq!(journal_root(&journal), expected_root);
+        assert_eq!(*journal.size(), 11);
+    }
+
+    #[test_traced("INFO")]
+    fn test_merkleize_after_committed_prefix_dropped_mmr() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_merkleize_after_committed_prefix_dropped_inner::<mmr::Family>);
+    }
+
+    #[test_traced("INFO")]
+    fn test_merkleize_after_committed_prefix_dropped_mmb() {
+        let executor = deterministic::Runner::default();
+        executor.start(test_merkleize_after_committed_prefix_dropped_inner::<mmb::Family>);
+    }
+
+    /// A detached merkleization job owns the full ancestor chain after its waiter is dropped.
+    #[test_traced("INFO")]
+    fn test_merkleize_retains_ancestors_after_cancellation() {
+        deterministic::Runner::default().start(|context| async move {
+            let strategy = Rayon::new(NZUsize!(2)).unwrap();
+            let merkle_cfg = merkle_config_with("cancelled-merkleize", &context, strategy);
+            let journal_cfg = journal_config("cancelled-merkleize", &context);
+            type RayonJournal = Journal<
+                mmr::Family,
+                Context,
+                ContiguousJournal<Context, DropMonitor<TestOp<mmr::Family>>>,
+                Sha256,
+                Rayon,
+            >;
+            let journal = RayonJournal::new(
+                context,
+                merkle_cfg,
+                journal_cfg,
+                |_: &DropMonitor<TestOp<mmr::Family>>| false,
+                ForwardFold,
+            )
+            .await
+            .unwrap();
+
+            let a_items = (0..8u8)
+                .map(create_operation::<mmr::Family>)
+                .map(DropMonitor::untracked)
+                .collect();
+            let a_batch = journal.new_batch().add_many(a_items);
+            let a = journal.merkle.with_mem(|mem| a_batch.merkleize(mem));
+            let b_items = (8..10u8)
+                .map(create_operation::<mmr::Family>)
+                .map(DropMonitor::untracked)
+                .collect();
+            let b_batch = a.new_batch::<Sha256>().add_many(b_items);
+            let b = journal.merkle.with_mem(|mem| b_batch.merkleize(mem));
+
+            let ancestor = Arc::downgrade(&a.inner);
+            let c_batch = b.new_batch::<Sha256>();
+            drop(b);
+
+            let release = block_strategy(journal.strategy(), 2);
+            let (item, clean_drop) = DropMonitor::tracked(create_operation::<mmr::Family>(10));
+            let mut merkleize = Box::pin(journal.merkleize(c_batch, vec![item], 0));
+            assert!(futures::poll!(merkleize.as_mut()).is_pending());
+            drop(merkleize);
+            drop(a);
+
+            assert!(ancestor.upgrade().is_some());
+            drop(release);
+            assert!(
+                clean_drop
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("detached merkleization did not finish"),
+                "detached merkleization panicked"
+            );
+            assert!(ancestor.upgrade().is_none());
+        });
+    }
+}

@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 abi = { workspace = true }
+arc-swap = { workspace = true }
 borsh = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-consensus = { workspace = true }

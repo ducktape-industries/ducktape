@@ -218,6 +218,7 @@ struct Source {
     genesis: Block,
     certificates: Mutex<BTreeMap<u64, Certificate>>,
     blocks: Mutex<Vec<Block>>,
+    holds: statesync::Holds<Ctx>,
 }
 
 impl Anchors for Source {
@@ -243,16 +244,18 @@ impl Exchange for Loopback {
     async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
         let request: Request = abi::decode(&abi::encode(&request)).unwrap();
         let node = self.0.node.lock().await;
-        let served = serve(&node, request).await;
+        let published = statesync::Published::of(&node).unwrap();
         drop(node);
+        let served = serve(&published, &self.0.holds, request).await;
         let response = anchored(served, &*self.0).await;
         Ok(abi::decode(&abi::encode(&response)).unwrap())
     }
 
     async fn hold(&self) -> Result<(Response, statesync::Holding), Infallible> {
         let node = self.0.node.lock().await;
-        let (served, hold) = statesync::held(&node);
+        let published = Arc::new(statesync::Published::of(&node).unwrap());
         drop(node);
+        let (served, hold) = statesync::held(published, &self.0.holds);
         let response = anchored(served, &*self.0).await;
         let holding: statesync::Holding = Box::new(hold);
         Ok((abi::decode(&abi::encode(&response)).unwrap(), holding))
@@ -469,6 +472,7 @@ async fn found_as(context: &Ctx, name: &'static str) -> Network {
             genesis,
             certificates: Mutex::new(BTreeMap::new()),
             blocks: Mutex::new(Vec::new()),
+            holds: statesync::Holds::default(),
         }),
         _dir: dir,
     }
@@ -1754,7 +1758,7 @@ fn a_fill_cut_mid_way_asks_for_what_it_lacks_and_installs_each_blob_once() {
 }
 
 #[test]
-fn a_join_holding_its_head_adopts_it_while_the_source_churns_past_its_floor() {
+fn a_join_holding_its_head_adopts_it_while_the_source_prunes_past_it() {
     deterministic::Runner::default().start(|context| async move {
         let mut network = found(&context).await;
         let first = network.advance(churn(CHURN_ROUNDS)).await;
@@ -1781,8 +1785,8 @@ fn a_join_holding_its_head_adopts_it_while_the_source_churns_past_its_floor() {
             "probe's floor {floor} reached past the held {start}"
         );
         assert!(
-            kept <= start,
-            "probe kept from {kept} while {start} was held"
+            kept > start,
+            "probe pruned to {kept}, past the held {start}, and the hold still served it"
         );
 
         network.advance(churn(CHURN_ROUNDS + 1)).await;

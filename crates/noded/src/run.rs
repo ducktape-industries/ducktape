@@ -18,7 +18,7 @@ use commonware_p2p::authenticated::lookup::{Oracle, Receiver};
 use commonware_runtime::Clock;
 use commonware_runtime::Handle;
 use commonware_runtime::telemetry::metrics::histogram::Buckets;
-use commonware_runtime::telemetry::metrics::{Counter, Gauge, Histogram, MetricsExt as _, raw};
+use commonware_runtime::telemetry::metrics::{Gauge, Histogram, MetricsExt as _, raw};
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
@@ -42,7 +42,7 @@ use crate::relay::{self, Relay};
 use crate::transport;
 use crate::view::{Current, Facts, View, Views};
 use crate::workspace::{Descriptor, Founding, Workspace};
-use crate::writer::{Command, Head, Hold, Sync, Writer};
+use crate::writer::{Command, Hold, Writer};
 use crate::{Client, Context, Daemon, Error, Logs, Result, millis};
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -612,6 +612,8 @@ async fn start<E: Context>(
         network,
         identity: identity_key,
         anchors: marshal.mailbox().clone(),
+        holds: statesync::Holds::default(),
+        holds_ended: Default::default(),
         history,
         recent: crate::blocks::Recent::new(),
         activity,
@@ -938,8 +940,6 @@ struct Writing<E: Context> {
 }
 
 struct Tally {
-    served: Counter,
-    abandoned: Counter,
     queued: Gauge,
     applying: Histogram,
     commands: u64,
@@ -949,16 +949,6 @@ struct Tally {
 impl Tally {
     fn registered<E: Context>(context: &E) -> Tally {
         Tally {
-            served: context.register(
-                "sync_served",
-                "state sync requests the writer answered",
-                raw::Counter::default(),
-            ),
-            abandoned: context.register(
-                "sync_abandoned",
-                "state sync requests the writer dropped unserved because their caller had gone",
-                raw::Counter::default(),
-            ),
             queued: context.register(
                 "queued_commands",
                 "commands sent to the writer and not yet taken",
@@ -1154,57 +1144,22 @@ async fn delivered<E: Context>(
 
 async fn commanded<E: Context>(writing: &mut Writing<E>, command: Option<Command>) -> Flow {
     let clock = writing.daemon.clone();
-    asked(
-        &mut writing.node,
-        &mut writing.tally,
-        &clock.context,
-        command,
-    )
-    .await
+    asked(&mut writing.tally, &clock.context, command).await
 }
 
-async fn asked<E: Context>(
-    node: &mut Node<E>,
-    tally: &mut Tally,
-    clock: &E,
-    command: Option<Command>,
-) -> Flow {
+async fn asked<E: Context>(tally: &mut Tally, clock: &E, command: Option<Command>) -> Flow {
     let Some(command) = command else {
         return Flow::Unasked;
     };
     tally.queued.dec();
     let mut lap = Lap::start(clock);
     let flow = match command {
-        Command::Sync(sync) => synced(node, tally, sync).await,
         Command::Hold(hold) => held(hold).await,
         Command::Close(closer) => Flow::Closing(closer),
-        Command::Head(head) => headed(node, tally, head),
     };
     tally.commands += 1;
     tally.commanding += lap.lap();
     flow
-}
-
-async fn synced<E: Context>(node: &mut Node<E>, tally: &Tally, sync: Sync) -> Flow {
-    if sync.reply.is_canceled() {
-        tally.abandoned.inc();
-        return Flow::Writing;
-    }
-    let served = statesync::serve(node, sync.request).await;
-    tally.served.inc();
-    let _ = sync.reply.send(served);
-    Flow::Writing
-}
-
-fn headed<E: Context>(node: &Node<E>, tally: &Tally, head: Head) -> Flow {
-    if head.reply.is_canceled() {
-        tally.abandoned.inc();
-        return Flow::Writing;
-    }
-    let held = statesync::held(node);
-    tally.served.inc();
-    let _ = head.reply.send(held);
-    Flow::Writing
 }
 
 async fn held(hold: Hold) -> Flow {
@@ -1274,14 +1229,7 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
                 () = &mut fetched => break,
                 command = writing.commands.next() => command,
             };
-            match asked(
-                &mut writing.node,
-                &mut writing.tally,
-                &daemon.context,
-                command,
-            )
-            .await
-            {
+            match asked(&mut writing.tally, &daemon.context, command).await {
                 Flow::Writing => {}
                 Flow::Closing(closer) => return Ok(Held::Closing(closer)),
                 Flow::Unasked => return Ok(Held::Unasked),

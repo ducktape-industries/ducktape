@@ -1125,36 +1125,6 @@ fn a_node_answers_reads_from_its_last_applied_block_while_its_writer_is_held() {
 }
 
 #[test]
-fn a_sync_whose_caller_has_gone_is_dropped_unserved_and_the_next_is_answered() {
-    let root = tempfile::tempdir().unwrap();
-    let seat = Seat::new(root.path(), "n0");
-    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
-    seat.init(&founding);
-    let (live, daemon) =
-        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
-    let client = live.client.clone();
-    let runtime = client_runtime();
-
-    runtime.block_on(async {
-        reach(&client, 2).await;
-        let held = daemon.hold().await.unwrap();
-        let mut gone = Box::pin(daemon.sync(statesync::Request::Head));
-        assert!(futures::poll!(gone.as_mut()).is_pending());
-        drop(gone);
-        held.release();
-        let answered = daemon.sync(statesync::Request::Head).await.unwrap();
-        assert!(matches!(answered, statesync::Response::Head(_)));
-        let abandoned = metric(&client, "sync_abandoned").await;
-        let served = metric(&client, "sync_served").await;
-        assert_eq!((abandoned, served), (1, 1));
-    });
-    drop(daemon);
-
-    runtime.block_on(seat.admin(&client, Admin::Shutdown));
-    live.thread.join().unwrap();
-}
-
-#[test]
 fn the_writer_counts_the_commands_waiting_for_it() {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
@@ -1169,15 +1139,57 @@ fn the_writer_counts_the_commands_waiting_for_it() {
         reach(&client, 2).await;
         let held = daemon.hold().await.unwrap();
         assert_eq!(metric(&client, "queued_commands").await, 0);
-        let mut first = Box::pin(daemon.sync(statesync::Request::Head));
-        let mut second = Box::pin(daemon.sync(statesync::Request::Head));
+        let mut first = Box::pin(daemon.hold());
+        let mut second = Box::pin(daemon.hold());
         assert!(futures::poll!(first.as_mut()).is_pending());
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert_eq!(metric(&client, "queued_commands").await, 2);
         held.release();
-        first.await.unwrap();
-        second.await.unwrap();
+        first.await.unwrap().release();
+        second.await.unwrap().release();
         assert_eq!(metric(&client, "queued_commands").await, 0);
+    });
+    drop(daemon);
+
+    runtime.block_on(seat.admin(&client, Admin::Shutdown));
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_sync_is_answered_from_the_last_applied_block_while_the_writer_is_held() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let (live, daemon) =
+        seat.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let client = live.client.clone();
+    let runtime = client_runtime();
+
+    runtime.block_on(async {
+        reach(&client, 2).await;
+        let held = daemon.hold().await.unwrap();
+        let tip = daemon.view().unwrap().tip();
+        let mut head = Box::pin(daemon.sync(statesync::Request::Head));
+        let first = futures::poll!(head.as_mut());
+        assert_eq!(
+            metric(&client, "queued_commands").await,
+            0,
+            "a sync never waits for the writer"
+        );
+        let head = match first {
+            std::task::Poll::Ready(ready) => ready,
+            std::task::Poll::Pending => head.await,
+        }
+        .unwrap();
+        let statesync::Response::Head(answered) = &head else {
+            panic!("a head answers a head: {head:?}");
+        };
+        assert_eq!(answered.tip, tip);
+        let request = first_target(&head).expect("a network has programs to sync");
+        let synced = daemon.sync(request).await.unwrap();
+        assert!(matches!(synced, statesync::Response::Sync(_)), "{synced:?}");
+        held.release();
     });
     drop(daemon);
 
@@ -3039,8 +3051,50 @@ async fn held_under_a_submit_flood(client: &Client, page: &Path) {
     floods.join_all().await;
 }
 
+fn first_target(head: &statesync::Response) -> Option<statesync::Request> {
+    let statesync::Response::Head(head) = head else {
+        return None;
+    };
+    let (program, target) = head.targets.iter().next()?;
+    let request = statesync::SyncRequest::Operations {
+        size: target.range.end(),
+        start: target.range.start(),
+        max_ops: state::Tuning::default().sync_fetch_batch,
+    };
+    Some(statesync::Request::Sync {
+        program: program.clone(),
+        request: commonware_codec::Encode::encode(&request).to_vec(),
+    })
+}
+
+fn sync_flood(
+    client: &Client,
+    stopped: ::tokio::sync::watch::Receiver<bool>,
+    answered: Arc<std::sync::atomic::AtomicU64>,
+) -> ::tokio::task::JoinSet<()> {
+    let mut floods = ::tokio::task::JoinSet::new();
+    for _ in 0..RPC_BLOCKING_THREADS.get() {
+        let client = client.clone();
+        let stopped = stopped.clone();
+        let answered = answered.clone();
+        floods.spawn(async move {
+            while !*stopped.borrow() {
+                let asked = statesync::Exchange::exchange(&client, statesync::Request::Head).await;
+                let Some(request) = asked.ok().as_ref().and_then(first_target) else {
+                    continue;
+                };
+                let synced = statesync::Exchange::exchange(&client, request).await;
+                if matches!(synced, Ok(statesync::Response::Sync(_))) {
+                    answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    floods
+}
+
 #[test]
-fn blocks_finalize_under_a_submit_flood_and_every_rpc_blocking_thread_held_except_v1_sync_which_the_writer_serves()
+fn blocks_finalize_under_a_submit_flood_with_every_rpc_blocking_thread_held_then_under_an_answered_sync_flood()
  {
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
@@ -3082,6 +3136,24 @@ fn blocks_finalize_under_a_submit_flood_and_every_rpc_blocking_thread_held_excep
         }
     });
     drop(held);
+    runtime.block_on(async {
+        let answered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (stop, stopped) = ::tokio::sync::watch::channel(false);
+        let syncs = sync_flood(&client, stopped, answered.clone());
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        let from = client.status().await.unwrap().height;
+        let mut height = from;
+        while height < from + EPOCH_LENGTH {
+            height = blocks.next().await.unwrap().unwrap().height;
+        }
+        let during = answered.load(std::sync::atomic::Ordering::Relaxed);
+        stop.send_replace(true);
+        syncs.join_all().await;
+        assert!(
+            during > 0,
+            "no sync was answered while {EPOCH_LENGTH} blocks finalized"
+        );
+    });
     runtime.block_on(seat.admin(&client, Admin::Shutdown));
     live.thread.join().unwrap();
 }

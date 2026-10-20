@@ -1014,8 +1014,6 @@ dependencies = [
 [[package]]
 name = "commonware-storage"
 version = "2026.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15ec50ba1efad76170c65d8c53baefc49da20eed02df9eedb3aa0754f2ff1d53"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4643,7 +4641,6 @@ name = "state"
 version = "0.1.0"
 dependencies = [
  "abi",
- "arc-swap",
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
@@ -4665,6 +4662,7 @@ name = "statesync"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "arc-swap",
  "blob",
  "borsh",
  "commonware-codec",

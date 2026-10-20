@@ -282,8 +282,8 @@ node's key and sends it to the program in the validators role. Once the
 epoch that seats the node begins, `join` adopts the network's state and
 fetches every program's code, and the node runs like a founder. While it
 syncs the state, `join` holds the head it read open (`POST /v1/sync/hold`):
-the node it joins through prunes nothing that head needs until the hold
-closes: once the state is synced, or when the hold's connection drops (the
+the node it joins through keeps serving that head, past its own prunes, until
+the hold closes: once the state is synced, or when the hold's connection drops (the
 joiner stops, or a proxy between them closes it), so a busy network cannot
 prune past a slow join. A join whose hold dropped learns it from the next
 sync the source refuses as pruned, and reads the head again under a new hold. `run` fetches every other blob the state names

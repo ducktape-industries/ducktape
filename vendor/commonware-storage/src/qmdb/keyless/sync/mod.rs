@@ -1,0 +1,206 @@
+use crate::{
+    Context,
+    journal::{
+        authenticated,
+        contiguous::{Contiguous as _, Mutable},
+    },
+    merkle::{
+        Family, Location,
+        full::{self, Merkle},
+    },
+    qmdb::{
+        self,
+        any::value::ValueEncoding,
+        keyless::{CompactDb, Keyless, Metrics, Operation, operation::Codec},
+        sync,
+    },
+};
+use commonware_codec::{EncodeShared, Read};
+use commonware_cryptography::Hasher;
+use commonware_parallel::Strategy;
+use commonware_utils::range::NonEmptyRange;
+use std::num::NonZeroU64;
+
+impl<F, E, V, C, H, S> sync::Database for Keyless<F, E, V, C, H, S>
+where
+    F: Family,
+    E: Context,
+    V: ValueEncoding + Codec,
+    C: Mutable<Item = Operation<F, V>> + sync::Journal<F, Context = E, Op = Operation<F, V>>,
+    C::Config: Clone + Send,
+    H: Hasher,
+    S: Strategy,
+    Operation<F, V>: EncodeShared,
+{
+    type Family = F;
+    type Op = Operation<F, V>;
+    type Journal = C;
+    type Hasher = H;
+    type Config = super::Config<C::Config, S>;
+    type Digest = H::Digest;
+    type Context = E;
+
+    /// Returns a [Keyless] db initialized from data collected in the sync process.
+    ///
+    /// # Behavior
+    ///
+    /// This method handles different initialization scenarios based on existing data:
+    /// - If the Merkle journal is empty or the last item is before the range start, it creates
+    ///   a fresh Merkle structure from the provided `pinned_nodes`
+    /// - If the Merkle journal has data but is incomplete (has length < range end), missing
+    ///   operations from the log are applied to bring it up to the target state
+    /// - If the Merkle journal has data beyond the range end, it is rewound to match the sync
+    ///   target
+    ///
+    /// # Returns
+    ///
+    /// A [Keyless] db populated with the state from the given range.
+    async fn from_sync_result(
+        context: Self::Context,
+        config: Self::Config,
+        log: Self::Journal,
+        pinned_nodes: Option<Vec<Self::Digest>>,
+        range: NonEmptyRange<Location<F>>,
+        apply_batch_size: NonZeroU64,
+    ) -> Result<Self, qmdb::Error<F>> {
+        let hasher = qmdb::hasher::<H>();
+
+        let merkle = Merkle::<F, _, _, S>::init_sync(
+            context.child("merkle"),
+            full::SyncConfig {
+                config: config.merkle.clone(),
+                range: range.clone(),
+                pinned_nodes,
+            },
+        )
+        .await?;
+
+        let journal = authenticated::Journal::<F, _, _, _, S>::from_components(
+            merkle,
+            log,
+            hasher,
+            apply_batch_size.get(),
+        )
+        .await?;
+
+        let (last_commit_loc, inactivity_floor_loc) = {
+            let bounds = journal.bounds();
+            let loc = bounds
+                .end
+                .checked_sub(1)
+                .ok_or(qmdb::Error::HistoricalFloorPruned(Location::new(
+                    bounds.end,
+                )))?;
+            let floor =
+                qmdb::find_inactivity_floor_at::<F, _>(&journal, Location::new(bounds.end)).await?;
+            (Location::new(loc), floor)
+        };
+        let inactive_peaks = F::inactive_peaks(last_commit_loc + 1, inactivity_floor_loc);
+        let root = journal.root(inactive_peaks)?;
+
+        let metrics = Metrics::new(context);
+        let db = Self {
+            journal,
+            root,
+            last_commit_loc,
+            inactivity_floor_loc,
+            metrics,
+        };
+        db.update_metrics();
+
+        db.sync().await
+    }
+
+    async fn persist_sync_result(self) -> Result<Self, qmdb::Error<F>> {
+        Ok(self)
+    }
+
+    async fn local_pinned_nodes(
+        context: Self::Context,
+        config: &Self::Config,
+        target: &sync::Target<F, Self::Digest>,
+        journal: &Self::Journal,
+    ) -> Result<Option<Vec<Self::Digest>>, qmdb::Error<F>> {
+        if target.range.start() == Location::new(0)
+            || !sync::journal_covers_range(journal.bounds(), &target.range)
+        {
+            return Ok(None);
+        }
+
+        // The inactivity floor is carried by the last commit operation rather than being
+        // the target range's start.
+        let inactivity_floor =
+            qmdb::find_inactivity_floor_at::<F, _>(journal, target.range.end()).await?;
+
+        sync::local_pinned_nodes::<F, _, H, S>(
+            context,
+            config.merkle.clone(),
+            target,
+            inactivity_floor,
+        )
+        .await
+    }
+
+    fn root(&self) -> Self::Digest {
+        self.root()
+    }
+}
+
+impl<F, E, V, H, Cfg, S> sync::Database for CompactDb<F, E, V, H, Cfg, S>
+where
+    F: Family,
+    E: Context,
+    V: ValueEncoding + Codec,
+    H: Hasher,
+    S: Strategy,
+    Operation<F, V>: EncodeShared,
+    Operation<F, V>: Read<Cfg = Cfg>,
+    Cfg: Clone + Send + Sync + 'static,
+{
+    type Family = F;
+    type Op = Operation<F, V>;
+    type Journal = sync::journal::Memory<F, E, Operation<F, V>>;
+    type Config = super::CompactConfig<Cfg, S>;
+    type Digest = H::Digest;
+    type Context = E;
+    type Hasher = H;
+
+    async fn from_sync_result(
+        context: Self::Context,
+        config: Self::Config,
+        log: Self::Journal,
+        pinned_nodes: Option<Vec<Self::Digest>>,
+        range: NonEmptyRange<Location<F>>,
+        _apply_batch_size: NonZeroU64,
+    ) -> Result<Self, qmdb::Error<F>> {
+        crate::qmdb::compact::from_sync_result(
+            context,
+            config,
+            log,
+            pinned_nodes,
+            range,
+            Self::init_from_sync,
+        )
+        .await
+    }
+
+    async fn persist_sync_result(self) -> Result<Self, qmdb::Error<F>> {
+        self.sync().await
+    }
+
+    async fn local_pinned_nodes(
+        _context: Self::Context,
+        _config: &Self::Config,
+        _target: &sync::Target<F, Self::Digest>,
+        _journal: &Self::Journal,
+    ) -> Result<Option<Vec<Self::Digest>>, qmdb::Error<F>> {
+        Ok(None)
+    }
+
+    fn root(&self) -> Self::Digest {
+        self.root()
+    }
+}
+
+#[cfg(test)]
+mod tests;

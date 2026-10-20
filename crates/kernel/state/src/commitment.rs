@@ -33,6 +33,17 @@ pub type Db<E> = Qmdb<Family, E, Digest, Vec<u8>, Sha256, EightCap, Sequential>;
 pub type Op = Operation<Family, Digest, Vec<u8>>;
 pub type SyncTarget = Target<Family, Digest>;
 pub type Config = VariableConfig<EightCap, ((), (RangeCfg<usize>, ())), Sequential>;
+pub type Reader<E> = journal::authenticated::Reader<
+    Family,
+    E,
+    journal::contiguous::variable::Reader<'static, E, Op>,
+    Sha256,
+>;
+
+pub struct Serving<E: Context> {
+    pub target: Option<SyncTarget>,
+    pub reader: Reader<E>,
+}
 
 pub struct Tuning {
     pub items_per_blob: NonZeroU64,
@@ -113,6 +124,7 @@ where
 {
     name: String,
     db: Option<Db<E>>,
+    serving: Arc<Serving<E>>,
 }
 
 impl<E> Commitment<E>
@@ -123,9 +135,11 @@ where
     pub async fn open(context: E, name: &str, live_keys: usize) -> Result<Commitment<E>> {
         let config = config(&context, name, live_keys);
         let db = Db::<E>::init(context, config).await?;
+        let (db, serving) = served(db).await?;
         Ok(Commitment {
             name: name.to_owned(),
             db: Some(db),
+            serving,
         })
     }
 
@@ -187,9 +201,11 @@ where
             first => first,
         };
         let db = outcome.map_err(failure)?;
+        let (db, serving) = served(db).await?;
         Ok(Commitment {
             name: name.to_owned(),
             db: Some(db),
+            serving,
         })
     }
 
@@ -217,23 +233,14 @@ where
     }
 
     pub fn target(&self) -> Result<Option<SyncTarget>> {
-        let db = self.db()?;
-        let bounds = db.bounds();
-        let Ok(range) = NonEmptyRange::new(db.sync_boundary()..bounds.end) else {
-            return Ok(None);
-        };
-        Ok(Some(Target {
-            root: db.root(),
-            range,
-        }))
+        Ok(target_of(self.db()?))
     }
 
-    pub async fn apply(
-        &mut self,
-        height: u64,
-        writes: &BTreeMap<Vec<u8>, Slot>,
-        held: Option<u64>,
-    ) -> Result<()> {
+    pub fn serving(&self) -> Arc<Serving<E>> {
+        self.serving.clone()
+    }
+
+    pub async fn apply(&mut self, height: u64, writes: &BTreeMap<Vec<u8>, Slot>) -> Result<()> {
         let db = self
             .db
             .take()
@@ -257,7 +264,10 @@ where
         };
         let (db, _) = db.apply_batch(batch).await?;
         let db = db.commit().await?;
-        self.db = Some(self.pruned(db, held).await?);
+        let db = self.pruned(db).await?;
+        let (db, serving) = served(db).await?;
+        self.serving = serving;
+        self.db = Some(db);
         Ok(())
     }
 
@@ -270,9 +280,8 @@ where
         Ok(())
     }
 
-    async fn pruned(&self, db: Db<E>, held: Option<u64>) -> Result<Db<E>> {
-        let boundary = db.sync_boundary();
-        let floor = held.map_or(boundary, |held| boundary.min(Location::new(held)));
+    async fn pruned(&self, db: Db<E>) -> Result<Db<E>> {
+        let floor = db.sync_boundary();
         let from = db.bounds().start;
         let section = Tuning::default().items_per_section.get();
         let drops_a_section = *floor / section > *from / section;
@@ -367,6 +376,21 @@ where
         }
         Ok((keys, unnamed))
     }
+}
+
+fn target_of<E: Context>(db: &Db<E>) -> Option<SyncTarget> {
+    let bounds = db.bounds();
+    let range = NonEmptyRange::new(db.sync_boundary()..bounds.end).ok()?;
+    Some(Target {
+        root: db.root(),
+        range,
+    })
+}
+
+async fn served<E: Context + Spawner>(db: Db<E>) -> Result<(Db<E>, Arc<Serving<E>>)> {
+    let target = target_of(&db);
+    let (db, reader) = db.reader().await?;
+    Ok((db, Arc::new(Serving { target, reader })))
 }
 
 fn failure<X>(error: sync::Error<Family, X, Digest>) -> SyncFailure<X>

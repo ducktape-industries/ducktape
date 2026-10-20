@@ -1,0 +1,175 @@
+//! An _ordered_ variant of a [crate::qmdb::current] authenticated database for variable-size values
+//!
+//! This variant maintains the lexicographic-next active key for each active key, enabling exclusion
+//! proofs (proving a key is currently inactive). Use [crate::qmdb::current::unordered::variable] if
+//! exclusion proofs are not needed.
+//!
+//! See [Db] for the main database type and [super::ExclusionProof] for proving key inactivity.
+
+pub use super::db::KeyValueProof;
+use crate::{
+    Context,
+    index::ordered::Index,
+    journal::contiguous::variable::Journal,
+    merkle::{Graftable, Location},
+    qmdb::{
+        Error,
+        any::{VariableValue, ordered::variable::Operation, value::VariableEncoding},
+        current::VariableConfig as Config,
+        operation::Key,
+    },
+    translator::Translator,
+};
+use commonware_codec::Read;
+use commonware_cryptography::Hasher;
+use commonware_parallel::Strategy;
+use commonware_runtime::Spawner;
+
+pub type Db<F, E, K, V, H, T, const N: usize, S> = super::db::Db<
+    F,
+    E,
+    Journal<E, Operation<F, K, V>>,
+    K,
+    VariableEncoding<V>,
+    Index<T, Location<F>>,
+    H,
+    N,
+    S,
+>;
+
+impl<
+    F: Graftable,
+    E: Context + Spawner,
+    K: Key,
+    V: VariableValue,
+    H: Hasher,
+    T: Translator,
+    const N: usize,
+    S: Strategy,
+> Db<F, E, K, V, H, T, N, S>
+where
+    Operation<F, K, V>: Read,
+{
+    /// Initializes a [Db] from the given `config`.
+    /// The configured [`Strategy`] is used to parallelize merkleization.
+    pub async fn init(
+        context: E,
+        config: Config<T, <Operation<F, K, V> as Read>::Cfg, S>,
+    ) -> Result<Self, Error<F>> {
+        crate::qmdb::current::init(context, config).await
+    }
+}
+
+pub mod partitioned {
+    //! A variant of [super] that uses a partitioned index for the snapshot.
+
+    use super::*;
+    use crate::index::partitioned::ordered::Index;
+
+    /// A partitioned variant of [super::Db].
+    ///
+    /// The const generic `P` specifies the number of prefix bytes used for partitioning:
+    /// - `P = 1`: 256 partitions
+    /// - `P = 2`: 65,536 partitions
+    /// - `P = 3`: ~16 million partitions
+    pub type Db<F, E, K, V, H, T, const P: usize, const N: usize, S> =
+        crate::qmdb::current::ordered::db::Db<
+            F,
+            E,
+            Journal<E, Operation<F, K, V>>,
+            K,
+            VariableEncoding<V>,
+            Index<T, Location<F>, P>,
+            H,
+            N,
+            S,
+        >;
+
+    impl<
+        F: Graftable,
+        E: Context + Spawner,
+        K: Key,
+        V: VariableValue,
+        H: Hasher,
+        T: Translator,
+        const P: usize,
+        const N: usize,
+        S: Strategy,
+    > Db<F, E, K, V, H, T, P, N, S>
+    where
+        Operation<F, K, V>: Read,
+    {
+        /// Initializes a [Db] from the given `config`.
+        pub async fn init(
+            context: E,
+            config: Config<T, <Operation<F, K, V> as Read>::Cfg, S, core::num::NonZeroUsize>,
+        ) -> Result<Self, Error<F>> {
+            crate::qmdb::current::init(context, config).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        mmr,
+        qmdb::current::{ordered::tests as shared, tests::variable_config},
+        translator::OneCap,
+    };
+    use commonware_cryptography::{Sha256, sha256::Digest};
+    use commonware_macros::test_traced;
+    use commonware_runtime::deterministic;
+
+    /// A type alias for the concrete [Db] type used in these unit tests.
+    type CurrentTest = super::Db<
+        mmr::Family,
+        deterministic::Context,
+        Digest,
+        Digest,
+        Sha256,
+        OneCap,
+        32,
+        commonware_parallel::Sequential,
+    >;
+
+    #[allow(dead_code)]
+    fn _assert_stream_range_is_send(db: &CurrentTest, start: Digest) {
+        fn require_send<F: core::future::Future + Send>(_: F) {}
+        require_send(async move {
+            let stream = db.stream_range(start).await.unwrap();
+            futures::pin_mut!(stream);
+            let _ = futures::StreamExt::next(&mut stream).await;
+        });
+    }
+
+    /// Return a [Db] database initialized with a variable config.
+    async fn open_db(context: deterministic::Context, partition_prefix: String) -> CurrentTest {
+        let cfg = variable_config::<OneCap>(&partition_prefix, &context);
+        CurrentTest::init(context, cfg).await.unwrap()
+    }
+
+    #[test_traced("DEBUG")]
+    pub fn test_current_db_verify_proof_over_bits_in_uncommitted_chunk() {
+        shared::test_verify_proof_over_bits_in_uncommitted_chunk(open_db);
+    }
+
+    #[test_traced("DEBUG")]
+    pub fn test_current_db_range_proofs() {
+        shared::test_range_proofs(open_db);
+    }
+
+    #[test_traced("DEBUG")]
+    pub fn test_current_db_key_value_proof() {
+        shared::test_key_value_proof(open_db);
+    }
+
+    #[test_traced("WARN")]
+    pub fn test_current_db_proving_repeated_updates() {
+        shared::test_proving_repeated_updates(open_db);
+    }
+
+    #[test_traced("DEBUG")]
+    pub fn test_current_db_exclusion_proofs() {
+        shared::test_exclusion_proofs(open_db);
+    }
+}
