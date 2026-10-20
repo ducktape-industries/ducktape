@@ -40,6 +40,8 @@ another machine, reached by ssh.
 - **Its node's status.** It reads the network's block time from `NODE_URL`'s `/v1/status` as
   it starts, and every retry pause starts there; it stops, saying why, when that node
   doesn't answer.
+- **Optional: the warm pod for `builds`.** `PODS_WARM_POD`, a files path whose one line names
+  the warm pod `builds` falls back to. Unset, `builds` answers 503 when the desktop isn't free.
 - **Optional: the desktop runner.** The Secret `desktop-runner` in namespace `pods` (files
   `id_ed25519`, `id_ed25519.pub`, `known_hosts`, `hosts`, `user`), mounted at `/desktop`.
   Without it, pod `desktop` answers 503.

@@ -196,6 +196,13 @@ having "$new" "$@" | git pack-objects --revs --stdout -q
 WATCH_PAUSE = 1
 SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 DESKTOP = "desktop"
+BUILDS = "builds"
+ADDRESSED = frozenset({"status", "log", "stop", "wait", "requeue"})
+MACHINE_WIDE = frozenset({"busy", "bump", "prune", "jobs", "heavy-runs", "disk-targets", "queue-out", "queue-in", "self-update", "worktree", "measure"})
+HOLDING = frozenset({"heavy", "quiet"})
+WEIGHTS = frozenset({"heavy", "light", "quiet", "lane", "quick"})
+READ_ONLY = frozenset({"gates", "lint", "check", "lane", "lane-test", "test", "show", "grep", "schema-diff"})
+STARTED = re.compile(rb"^run (\S+)$", re.M)
 DESKTOP_KEYS = "/desktop"
 DESKTOP_FILES = ("id_ed25519", "known_hosts", "hosts", "user")
 BUILD_SH = "/var/tmp/warm/build.sh"
@@ -219,6 +226,12 @@ class Refused(Exception):
         super().__init__(sentence)
         self.status = status
         self.sentence = sentence
+
+
+class Cut(Refused):
+    def __init__(self, sentence, out):
+        super().__init__(502, sentence)
+        self.out = out
 
 
 @dataclass
@@ -664,14 +677,14 @@ def plain_words(script):
         return None
 
 
-def desktop_words(command):
+def desktop_words(command, name=DESKTOP):
     words = plain_words(command[2]) if len(command) == 3 and command[:2] == ["sh", "-c"] else command
     settings = list(itertools.takewhile(SETTING.fullmatch, words or []))
     called = (words or [])[len(settings) :]
     if called[:2] != ["sh", BUILD_SH]:
         raise Refused(
             400,
-            f'pod {DESKTOP} runs build.sh alone: the command ["sh", "{BUILD_SH}", ...], or a script of plain words that calls it (KEY=VALUE words first; no expansion, operator or comment outside quotes), not {shlex.join(command)}',
+            f'pod {name} runs build.sh alone: the command ["sh", "{BUILD_SH}", ...], or a script of plain words that calls it (KEY=VALUE words first; no expansion, operator or comment outside quotes), not {shlex.join(command)}',
         )
     return settings + called[2:]
 
@@ -695,6 +708,33 @@ def desktop_view(said):
         "notify": None,
         "runner": said,
     }
+
+
+def desktop_free(said):
+    busy, ran, most = said.get("busy"), said.get("busy_exit"), said.get("heavy_runs")
+    if not isinstance(busy, list) or not all(isinstance(line, str) for line in busy):
+        return False, f"the desktop's ping has busy as a {type(busy).__name__}, not a list of lines"
+    for field, value in (("busy_exit", ran), ("heavy_runs", most)):
+        if type(value) is not int:
+            return False, f"the desktop's ping has {field} as a {type(value).__name__}, not a number"
+    if ran != 0:
+        return False, f"the desktop's build.sh busy exited {ran}"
+    kinds = ["stray" if line.startswith("stray ") else (line.split()[2:3] or [""])[0] for line in busy]
+    if any(kind not in WEIGHTS | {"stray"} for kind in kinds):
+        return False, "a line of the desktop's busy names no weight build.sh prints"
+    if "stray" in kinds:
+        return False, "a process no run started holds one of the desktop's build locks"
+    if "quiet" in kinds:
+        return False, "a quiet run holds every heavy slot of the desktop"
+    holding = sum(1 for kind in kinds if kind in HOLDING)
+    if holding >= most:
+        return False, f"the desktop holds {holding} heavy runs of its {most}"
+    return True, None
+
+
+def on_machine(machine, ran, started=True):
+    out = STARTED.sub(lambda found: b"run " + machine.encode() + b":" + found.group(1), ran.out) if started else ran.out
+    return Ran(ran.code, out, f"{BUILDS}: on {machine}\n{ran.err}".rstrip("\n"))
 
 
 def gate_run(argv):
@@ -751,7 +791,7 @@ class Desktop:
         for host in self.hosts():
             ran = self.runner(self.argv(host, words, alive))
             if ran.code == SSH_FAILED and not again and not ran.err.startswith(UNCONNECTED):
-                raise Refused(502, f"the exec's connection to pod {DESKTOP} at {host} was cut while it ran ({ran.err or 'ssh exited 255'}); its command may still be running there, so it was not run again")
+                raise Cut(f"the exec's connection to pod {DESKTOP} at {host} was cut while it ran ({ran.err or 'ssh exited 255'}); its command may still be running there, so it was not run again", ran.out)
             if ran.code == SSH_FAILED:
                 failures.append(f"{host}: {ran.err or 'ssh exited 255'}")
                 continue
@@ -1790,8 +1830,9 @@ def json_stream(stream):
 
 
 class Service:
-    def __init__(self, kube, signer, fetching, stats, api, desktop=None):
+    def __init__(self, kube, signer, fetching, stats, api, desktop=None, warm_pod=None):
         self.kube = kube
+        self.warm_pod = warm_pod
         self.desktop = desktop or Desktop(Path(DESKTOP_KEYS))
         self.desktop_wanted = threading.Event()
         self.desktop_follower = None
@@ -1890,6 +1931,8 @@ class Service:
     def executed(self, asked, name, container, command, again=False, alive=None):
         if name == DESKTOP:
             return self.desktop.ran(command, alive)
+        if name == BUILDS:
+            return self.routed(asked, command, alive)
 
         def attempt():
             return self.kube.exec(name, container, command)
@@ -1974,7 +2017,70 @@ class Service:
     def list(self):
         return 200, {"pods": [view(pod) for pod in self.items(self.kube.list(), "the pods were not listed")]}
 
+    def warm(self):
+        if not self.warm_pod:
+            raise Refused(503, f"pod {DESKTOP} is not free and this service names no warm pod (PODS_WARM_POD), so pod {BUILDS} has nowhere to run it")
+        reply = self.signer.query(FILES_PROGRAM, files_read(self.warm_pod, None, 0, CHUNK_SIZE))
+        if reply.code != 0:
+            raise Refused(502, f"the warm pod's name was not read from {self.warm_pod}: {failed(reply)}")
+        name = contents_of(reply.out)[3].decode(errors="replace").strip()
+        if not name:
+            raise Refused(502, f"{self.warm_pod} names no warm pod")
+        return name
+
+    def pick(self):
+        try:
+            said = self.desktop.state()
+        except Refused as refused:
+            say("pods_routed", to="warm", reason="desktop_unready", detail=json.dumps(refused.sentence))
+            return self.warm()
+        free, why = desktop_free(said)
+        if free:
+            return DESKTOP
+        say("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps(why))
+        return self.warm()
+
+    def on(self, asked, machine, words, alive):
+        if machine == DESKTOP and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in words):
+            self.follow_desktop()
+        command = ["sh", BUILD_SH, *words]
+        if machine == DESKTOP:
+            return self.desktop.ran(command, alive)
+        return self.executed(asked, machine, None, command, alive=alive)
+
+    def routed(self, asked, command, alive):
+        words = desktop_words(command, BUILDS)
+        settings = list(itertools.takewhile(SETTING.fullmatch, words))
+        called = words[len(settings) :]
+        first = called[0] if called else ""
+        if first in MACHINE_WIDE:
+            raise Refused(400, f"build.sh {first} acts on one machine, so name it (pod {DESKTOP}, or the warm pod) rather than pod {BUILDS}")
+        if first in ADDRESSED:
+            machine, _, run = (called[1] if len(called) > 1 else "").partition(":")
+            if not run:
+                raise Refused(400, f"build.sh {first} on pod {BUILDS} names its run as <machine>:<run>, the way pod {BUILDS} answered it")
+            return on_machine(machine, self.on(asked, machine, [*settings, first, run, *called[2:]], alive), started=first == "requeue")
+        verb = first if first == "apply" else (called[2] if len(called) > 2 else first)
+        machine = self.pick()
+        try:
+            ran = self.on(asked, machine, words, alive)
+        except Refused as refused:
+            if machine != DESKTOP:
+                raise
+            if isinstance(refused, Cut) and verb not in READ_ONLY:
+                started = STARTED.search(refused.out)
+                run = f"{DESKTOP}:{started.group(1).decode(errors='replace')}" if started else None
+                say("pods_parked", verb=json.dumps(verb), run=run or "unstarted", detail=json.dumps(refused.sentence))
+                where = f"build.sh status {run}" if run else f"build.sh busy on pod {DESKTOP}"
+                raise Refused(502, f"{refused.sentence}; build.sh {verb} changes things, so it is parked rather than run on another machine{f' as run {run}' if run else ''}: once pod {DESKTOP} answers, read {where} before calling it again") from refused
+            say("pods_routed", to="warm", reason="desktop_lost", detail=json.dumps(refused.sentence))
+            machine = self.warm()
+            ran = self.on(asked, machine, words, alive)
+        return on_machine(machine, ran)
+
     def status(self, name):
+        if name == BUILDS:
+            raise Refused(400, f"pod {BUILDS} routes build.sh to the first free machine and is no pod itself: read pod {DESKTOP} or the warm pod")
         if name == DESKTOP:
             return 200, {"pod": desktop_view(self.desktop.state())}
         return 200, {"pod": view(self.pod(name))}
@@ -2088,7 +2194,7 @@ class Service:
         if "every" not in asked:
             return 200, exec_answer(name, answered(self.execution(asked_by, name, container, command).get()))
         every = from_one(asked["every"], "every")
-        if name != DESKTOP:
+        if name not in (DESKTOP, BUILDS):
             self.pod(name)
         return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
 
@@ -2579,7 +2685,7 @@ def main():
     kube = Kube(shlex.split(os.environ.get("PODS_KUBECTL", "kubectl")), os.environ.get("PODS_NAMESPACE", "agents"))
     signer = Signer(shlex.split(os.environ.get("PODS_DUCKTAPE", "ducktape")), Path(os.environ.get("PODS_KEYS", "/keys")))
     desktop = Desktop(Path(os.environ.get("PODS_DESKTOP", DESKTOP_KEYS)))
-    service = Service(kube, signer, fetching, Stats(), Api(), desktop)
+    service = Service(kube, signer, fetching, Stats(), Api(), desktop, os.environ.get("PODS_WARM_POD"))
     threading.Thread(target=service.notifier.watch, daemon=True).start()
     threading.Thread(target=service.sweeper, daemon=True).start()
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)

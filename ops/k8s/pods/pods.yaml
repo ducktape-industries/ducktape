@@ -328,6 +328,7 @@ spec:
             - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node @NODE_URL@"}
             - {name: PODS_KEYS, value: /keys}
             - {name: PODS_DESKTOP, value: /desktop}
+            - {name: PODS_WARM_POD, value: /shared/tools/warm-pod}
           ports:
             - {name: http, containerPort: 8080}
           volumeMounts:

@@ -148,6 +148,27 @@ one up for another network.
   line is posted as `desktop · <line>` in its channel, as `pods` with no
   mention, where the channel exists, is not archived and is open to anyone
   (a desktop run has no requester to vouch for a members-only room).
+- The reserved pod `builds` routes a build.sh call to the first free machine:
+  `desktop` when its `ping` says it is up, its `busy` reads (a list of
+  `build.sh busy` lines, `busy_exit` 0, `heavy_runs` a number), no quiet run
+  or stray lock holder is among them, and it holds fewer heavy runs than its
+  `heavy_runs`, else the warm pod the files path `PODS_WARM_POD` names
+  (duckpond: `/shared/tools/warm-pod`). Its exec takes build.sh's words as
+  `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
+  stderr starts `builds: on <machine>`. `status`, `log`, `stop`, `wait` and
+  `requeue` name their run as `<machine>:<run>` and go to that machine;
+  calls that act on one machine (`busy`, `bump`, `prune`, `jobs`,
+  `heavy-runs`, `disk-targets`, `queue-out`, `queue-in`, `self-update`,
+  `worktree`, `measure`) are refused with 400, since they name a machine. A run the
+  desktop never started (unreachable, down) goes to the warm pod. A held run
+  (`WAIT=1`, or a streamed exec) whose desktop session was cut runs again on
+  the warm pod when it only reads (`gates`, `lint`, `check`, `lane`,
+  `lane-test`, `test`, `show`, `grep`, `schema-diff`), and any other is
+  parked: 502 naming its run (`desktop:<id>`, when the run had started) and
+  `build.sh status` of it to read once the desktop answers, before calling
+  it again, and the event `pods_parked`. Routing logs `pods_routed` with a
+  token (`desktop_unready`, `desktop_busy`, `desktop_lost`) and the
+  sentence in `detail`. `GET pods/builds` is refused: it is no pod.
 
   ```sh
   kubectl -n pods create secret generic desktop-runner --from-file=id_ed25519=KEY \
