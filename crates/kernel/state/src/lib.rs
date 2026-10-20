@@ -58,6 +58,25 @@ impl Writes {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Pending {
+    pub height: u64,
+    pub programs: BTreeMap<ProgramId, BTreeSet<Vec<u8>>>,
+}
+
+impl Pending {
+    pub fn of(height: u64, writes: &Writes) -> Pending {
+        Pending {
+            height,
+            programs: writes
+                .programs
+                .iter()
+                .map(|(program, keys)| (program.clone(), keys.keys().cloned().collect()))
+                .collect(),
+        }
+    }
+}
+
 pub fn commitment_name(store: &str, program: &str) -> String {
     format!(
         "{}-{}",
@@ -289,15 +308,16 @@ where
         let Some(pending) = self.storage.pending()? else {
             return Ok(());
         };
-        for (program, writes) in &pending.programs {
+        for (program, keys) in &pending.programs {
             let Some(commitment) = self.commitments.get_mut(program) else {
                 continue;
             };
             let committed = commitment.height().await?;
             let behind = committed.is_none_or(|committed| committed < height);
             if behind {
+                let writes = self.storage.written(program, keys)?;
                 commitment
-                    .apply(height, writes, self.holds.floor(program))
+                    .apply(height, &writes, self.holds.floor(program))
                     .await?;
             }
         }

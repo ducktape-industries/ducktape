@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use abi::ProgramId;
 
 use fluent31::{Db, Options, Snapshot, WriteBatch};
 
-use crate::{Error, Result, Writes};
+use crate::{Error, Pending, Result, Slot, Writes};
 
 const SEPARATOR: u8 = 0;
 const HEIGHT: &[u8] = b"\xffheight";
@@ -45,8 +45,49 @@ impl Reads {
         self.raw(HEIGHT)?.map(|bytes| decode(&bytes)).transpose()
     }
 
-    pub fn pending(&self) -> Result<Option<Writes>> {
-        self.raw(PENDING)?.map(|bytes| decode(&bytes)).transpose()
+    pub fn pending(&self) -> Result<Option<Pending>> {
+        let Some(bytes) = self.raw(PENDING)? else {
+            return Ok(None);
+        };
+        let pending: Pending = abi::decode(&bytes).map_err(|refusal| {
+            Error::Corrupt(format!(
+                "the pending row is not the shape this release writes ({}): the release that wrote it reconciles it when it opens",
+                refusal.sentence
+            ))
+        })?;
+        let height = self.height()?;
+        if height != Some(pending.height) {
+            return Err(Error::Corrupt(format!(
+                "the pending row names block {} and storage is at {height:?}",
+                pending.height
+            )));
+        }
+        Ok(Some(pending))
+    }
+
+    pub fn written(
+        &self,
+        program: &str,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<BTreeMap<Vec<u8>, Slot>> {
+        keys.iter()
+            .map(|key| Ok((key.clone(), self.get(program, key)?)))
+            .collect()
+    }
+
+    pub fn pending_deleted(&self, program: &str) -> Result<Vec<Vec<u8>>> {
+        let Some(pending) = self.pending()? else {
+            return Ok(Vec::new());
+        };
+        let Some(keys) = pending.programs.get(program) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .written(program, keys)?
+            .into_iter()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(key, _)| key)
+            .collect())
     }
 
     pub fn get(&self, program: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -110,7 +151,7 @@ impl Storage {
         let mut batch = WriteBatch::new();
         stage(&mut batch, writes);
         batch.put(HEIGHT, abi::encode(&height));
-        batch.put(PENDING, abi::encode(writes));
+        batch.put(PENDING, abi::encode(&Pending::of(height, writes)));
         Ok(self.db().write(batch)?)
     }
 

@@ -2115,16 +2115,10 @@ fn programs_in(storage: &Reads) -> Result<Vec<ProgramId>> {
 
 /// The programs the last committed block dropped from the roster.
 fn dropped_in(storage: &Reads) -> Result<Vec<ProgramId>> {
-    let Some(pending) = storage.pending()? else {
-        return Ok(Vec::new());
-    };
-    let Some(roster) = pending.programs.get(PROGRAMS) else {
-        return Ok(Vec::new());
-    };
-    roster
-        .iter()
-        .filter(|(_, slot)| slot.is_none())
-        .map(|(key, _)| program_id(key.clone()))
+    storage
+        .pending_deleted(PROGRAMS)?
+        .into_iter()
+        .map(program_id)
         .collect()
 }
 

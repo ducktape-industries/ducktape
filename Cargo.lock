@@ -2431,6 +2431,7 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "commonware-storage",
+ "commonware-utils",
  "fixture-access",
  "fixture-awaiter",
  "fixture-identity",

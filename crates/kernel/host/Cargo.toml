@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+commonware-utils = { workspace = true }
 fixture-access = { path = "../fixtures/access" }
 fixture-awaiter = { path = "../fixtures/awaiter" }
 fixture-identity = { path = "../fixtures/identity" }

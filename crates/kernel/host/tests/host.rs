@@ -15,6 +15,7 @@ use commonware_cryptography::bls12381::primitives::ops;
 use commonware_cryptography::bls12381::primitives::variant::MinPk;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Storage as _, Supervisor as _, deterministic};
+use commonware_utils::probability;
 use fixture_probe::{Reply, Step};
 use fixture_programs::Change;
 use fixture_relay::Script;
@@ -3060,6 +3061,82 @@ fn a_program_admitted_again_under_its_id_starts_empty() {
         .unwrap();
         host.apply(block(6, Vec::new())).await.unwrap();
         assert_eq!(host.view(Layer::Confirmed).get("echo", b"k").unwrap(), None);
+        let entries = host
+            .store()
+            .commitment("echo")
+            .unwrap()
+            .entries()
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
+    });
+}
+
+#[test]
+fn a_block_that_drops_a_program_and_tears_leaves_it_nothing_once_reopened() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = deterministic::Runner::default();
+    let (probe, checkpoint) = runner.start_and_recover(|context| {
+        let dir = &dir;
+        async move {
+            let mut host = found(context.child("found"), "net", dir.path(), standard()).await;
+            let probe = host.programs().unwrap()["probe"];
+            let set = op(HostOp::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            });
+            host.apply(block(
+                1,
+                vec![submit("programs", change("echo", probe, script(vec![set])))],
+            ))
+            .await
+            .unwrap();
+            host.apply(block(2, Vec::new())).await.unwrap();
+            assert_eq!(stored(&host, "echo", b"k"), Some(b"v".to_vec()));
+            host.apply(block(
+                3,
+                vec![submit(
+                    "programs",
+                    abi::encode(&Change::Remove("echo".into())),
+                )],
+            ))
+            .await
+            .unwrap();
+            assert!(host.store().commitment("echo").is_some());
+            *context.storage_fault_config().write() =
+                deterministic::FaultConfig::default().sync(probability!(1.0));
+            let torn = host.apply(block(4, Vec::new())).await;
+            assert!(torn.is_err(), "the drop's block applied whole");
+            assert!(host.store().commitment("echo").is_some());
+            probe
+        }
+    });
+    deterministic::Runner::from(checkpoint).start(|context| async move {
+        *context.storage_fault_config().write() = deterministic::FaultConfig::default();
+        let mut host = Host::open(context.child("reopened"), "net", dir.path())
+            .await
+            .unwrap();
+        assert_eq!(host.store().height().unwrap(), Some(4));
+        assert!(!host.programs().unwrap().contains_key("echo"));
+        assert!(host.store().commitment("echo").is_none());
+        let left = host
+            .store()
+            .storage()
+            .iter("echo", b"", None, false)
+            .unwrap()
+            .count();
+        assert_eq!(left, 0, "the dropped program's keys left storage");
+        host.apply(block(
+            5,
+            vec![submit(
+                "programs",
+                change("echo", probe, script(Vec::new())),
+            )],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(6, Vec::new())).await.unwrap();
+        assert_eq!(stored(&host, "echo", b"k"), None);
         let entries = host
             .store()
             .commitment("echo")
