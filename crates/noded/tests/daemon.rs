@@ -1586,6 +1586,150 @@ fn a_late_validator_joins_by_state_sync_and_follows() {
     }
 }
 
+fn part(body: &[u8]) -> BlobId {
+    blob::id_of(HashKind::Sha256, &blob::frame("part", body).unwrap()).unwrap()
+}
+
+fn put_part(body: &[u8]) -> Step {
+    Step::Op(HostOp::BlobPut {
+        hash: HashKind::Sha256,
+        kind: "part".into(),
+        body: body.to_vec(),
+    })
+}
+
+fn holds_file(dir: &Path, id: &BlobId) -> bool {
+    let name = blob::name_of(id);
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(at) = dirs.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+                continue;
+            }
+            if entry.file_name().to_str() == Some(name.as_str()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+struct Gated {
+    source: Client,
+    read: StdMutex<Option<oneshot::Sender<()>>>,
+    gate: futures::lock::Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+async fn gated_blobs(
+    axum::extract::State(gated): axum::extract::State<Arc<Gated>>,
+    body: axum::body::Bytes,
+) -> Vec<u8> {
+    let ids: Vec<BlobId> = abi::decode(&body).unwrap();
+    let answers = gated.source.blobs(&ids).await.unwrap();
+    if let Some(read) = gated.read.lock().unwrap().take() {
+        read.send(()).unwrap();
+    }
+    if let Some(gate) = gated.gate.lock().await.take() {
+        gate.await.unwrap();
+    }
+    abi::encode(&answers)
+}
+
+async fn filled(client: &Client) -> bool {
+    let logs = client.logs().await.unwrap();
+    logs.iter().any(|line| line.contains("blobs_filled"))
+}
+
+#[test]
+fn a_joined_node_fills_its_blobs_from_its_source_and_keeps_none_released_on_the_way() {
+    let root = tempfile::tempdir().unwrap();
+    let seats: Vec<Seat> = (0..4)
+        .map(|i| Seat::new(root.path(), &format!("n{i}")))
+        .collect();
+    let founding = founding(root.path(), &seats.iter().collect::<Vec<_>>(), EPOCH_LENGTH);
+    for seat in &seats[..3] {
+        seat.init(&founding);
+    }
+    let live: Vec<Live> = seats[..3].iter().map(Seat::start).collect();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let runtime = client_runtime();
+    let (kept, released) = (part(b"kept"), part(b"released"));
+
+    runtime.block_on(async {
+        let mut changes = live[0].client.changes("probe").await.unwrap();
+        let steps = vec![put_part(b"kept"), put_part(b"released"), set(b"put", b"1")];
+        let put = frame(&live[0].client, &alice, steps).await;
+        live[0].client.submit(put, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"put"]).await;
+    });
+
+    seats[3].join(&live[0].client);
+    let (read, served) = oneshot::channel();
+    let (open, gate) = oneshot::channel();
+    let gated = Arc::new(Gated {
+        source: live[0].client.clone(),
+        read: StdMutex::new(Some(read)),
+        gate: futures::lock::Mutex::new(Some(gate)),
+    });
+    let proxy = runtime.block_on(async {
+        let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new()
+            .route(noded::wire::route::BLOBS, axum::routing::post(gated_blobs))
+            .with_state(gated);
+        ::tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        base
+    });
+    seats[3].workspace.write_source(&proxy).unwrap();
+    let joined = seats[3].start();
+
+    runtime.block_on(async {
+        served.await.unwrap();
+        let mut changes = joined.client.changes("probe").await.unwrap();
+        let steps = vec![
+            Step::Op(HostOp::BlobRelease(released)),
+            set(b"released", b"1"),
+        ];
+        let release = frame(&live[1].client, &alice, steps).await;
+        live[1]
+            .client
+            .submit(release, Preconfirm::Off)
+            .await
+            .unwrap();
+        landed(&mut changes, &[b"released"]).await;
+        open.send(()).unwrap();
+        let mut blocks = joined.client.changes(host::RECENT).await.unwrap();
+        while !filled(&joined.client).await {
+            blocks.next().await.unwrap().unwrap();
+        }
+        assert!(joined.client.missing_blobs().await.unwrap().is_empty());
+        assert!(joined.client.blob(kept).await.unwrap().is_some());
+        assert_eq!(joined.client.blob(released).await.unwrap(), None);
+    });
+    let dir = seats[3].workspace.dir();
+    assert!(holds_file(dir, &kept), "the filled part is on disk");
+    assert!(
+        !holds_file(dir, &released),
+        "a part released while it was on its way leaves no file"
+    );
+
+    runtime.block_on(async {
+        for (seat, node) in seats
+            .iter()
+            .zip(live.iter().chain(std::iter::once(&joined)))
+        {
+            seat.admin(&node.client, Admin::Shutdown).await;
+        }
+    });
+    for node in live.into_iter().chain(std::iter::once(joined)) {
+        node.thread.join().unwrap();
+    }
+}
+
 async fn landed(
     changes: &mut (impl futures::Stream<Item = noded::Result<noded::wire::Change>> + Unpin),
     keys: &[&[u8]],

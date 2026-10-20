@@ -261,8 +261,10 @@ epoch that seats the node begins, `join` adopts the network's state and
 fetches every program's code, and the node runs like a founder. While it
 syncs the state, `join` holds the head it read open (`POST /v1/sync/hold`):
 the node it joins through prunes nothing that head needs until the hold
-closes, once the state is synced or the joiner goes away, so a busy network
-cannot prune past a slow join. `run` fetches every other blob the state names
+closes: once the state is synced, or when the hold's connection drops (the
+joiner stops, or a proxy between them closes it), so a busy network cannot
+prune past a slow join. A join whose hold dropped learns it from the next
+sync the source refuses as pruned, and reads the head again under a new hold. `run` fetches every other blob the state names
 afterwards (see the blobs below). A stranger joins as a resident: it follows the
 chain and never votes or proposes. A validator named in the file joins the
 same way and keeps its seat.
