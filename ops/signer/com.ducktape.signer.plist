@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The signer's LaunchAgent: ops/signer/signer.py, started at login and again whenever it fails; it ends cleanly only when identity names no account for its key, and is not restarted then.
+     Replace @CORE@ (this checkout), @PYTHON@ (a python3.11 or later), @PATH@ (where ducktape and the signing tools' own commands are), @NODE@ (duckpond's node URL) and @HOME_DIR@ (config.json, keys/key, keys/password),
+     then: cp com.ducktape.signer.plist ~/Library/LaunchAgents/ && launchctl load -w ~/Library/LaunchAgents/com.ducktape.signer.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ducktape.signer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PYTHON@</string>
+    <string>@CORE@/ops/signer/signer.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+    <key>SIGNER_HOME</key>
+    <string>@HOME_DIR@</string>
+    <key>SIGNER_DUCKTAPE</key>
+    <string>ducktape --workspace @HOME_DIR@/workspace --node @NODE@</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardErrorPath</key>
+  <string>@HOME_DIR@/signer.log</string>
+  <key>StandardOutPath</key>
+  <string>@HOME_DIR@/signer.log</string>
+</dict>
+</plist>

@@ -97,7 +97,8 @@ test:
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/registry-gc/gc-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/reconcile/reconcile-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/mac/relay-test.py && \
-	  PYTHONDONTWRITEBYTECODE=1 python3 ops/mac/mac-test.py; \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/mac/mac-test.py && \
+	  PYTHONDONTWRITEBYTECODE=1 python3 ops/signer/signer-test.py; \
 	else echo "[test] skipped the ops/ script tests — they need python 3.11 (tomllib)" >&2; fi
 # the unified install contract: `make install` delegates to the App pinned in
 # ops/app/APP_REV, and the checkout it pins lives under target/ where this

@@ -725,6 +725,86 @@ one up for another network.
   `mac/mac-test.py` covers it on Linux, against the real relay and git and
   a fake `xcrun`, `make` and `xcodebuild`.
 
+## Signing on a Mac
+
+- `signer/signer.py` is the signer: an actions runner of its own account
+  (`signer-eddy` on eddy's Mac) whose labels are signing capabilities,
+  `sign:<identity>` (`sign:dev.ducktape.app`). Build and sign are separate
+  (eddy, #engineering 1230/1232): the keys stay in that Mac's keychain with
+  the signer's own tools, and the signer never runs a check's commands or
+  its commit's code. It registers its labels, follows `ducktape changes
+  actions` as the mac relay does (once per height it prints, again at once
+  after a follow that heard something, else after `FOLLOW_PAUSE`), and
+  claims the oldest queued check its labels cover.
+- A signing check's `steps` is one operation's name from the config's
+  `tools`: `developer-id`, `testflight` or `release-manifest`. Before any
+  tool runs it checks, from the network alone, that the check's commit is
+  reachable from a branch the config allows for that repo and operation
+  (forge `Compare { from: commit, into: refs/heads/<branch> }` with
+  `ahead` 0; `release-manifest` takes the branches of the channel the job's
+  `CHANNEL` names: stable from `main`, nightly from `main` or `dev`, chief's
+  ruling), that every job it needs (`Query::Needs`) was met by a passed
+  check of the same run and commit reported by a builder the config
+  trusts (`mac`, account 44, and `actions-pods`, 38), whose `Outputs` that
+  builder recorded, and that each blob it fetches hashes to its id and
+  holds the size its row says. Anything else errs the check, saying which,
+  and signs nothing.
+- The tool runs as `<tool…> <inputs> <out>`: the needed outputs at
+  `inputs/<job>/<path>`, and what it writes in `out` is put as blobs of
+  kind `output` in one bundle, recorded with `Outputs`, beside
+  `signed.json` (the signer's account and labels, its own sha256, the
+  operation, repo, commit, branch, check, and each input's and output's
+  sha256; never a tool's command line), and the check is reported passed. A tool that exits non-zero
+  fails it, saying only its exit code: what a tool prints may hold a
+  secret, so it stays in `logs/<check>.log` in the signer's home, never on
+  the network. The tool sees `SIGNER_REPO`, `SIGNER_COMMIT`,
+  `SIGNER_BRANCH`, `SIGNER_CHECK` and the job's `env` as `SIGNER_ENV_<NAME>`,
+  never the signer's duckpond key. An Outputs or Report that did not send
+  is kept in `pending.json` and sent before anything else is claimed; its
+  first failure is logged with its reason, and its sending with the
+  attempts it took. The check it is about to claim is in `claimed.json`
+  until its report is owed: anything that breaks while it holds a check
+  errs that check and clears its work. A claim whose receipt was lost
+  keeps the file and stops the pull. At start and before each claim, a
+  check left there is read back with `Query::Check`: one still running
+  with the signer's `account` as claimant (a reboot mid-tool, a claim that
+  landed after all) is reported errored, and anything else is let go. It pulls once each time a
+  follow starts, so a check queued while the Mac slept is claimed when it
+  wakes. A follow that keeps failing, and pulls that cannot read actions,
+  are each logged once, and their recovery with the attempts it took. `signer-test.py` holds `FOLLOW_PAUSE` equal
+  to the Mac's `RELAY_DOWN_PAUSE`.
+- Its home (`SIGNER_HOME`, by default `~/Library/Application
+  Support/ducktape-signer`) holds `keys/key` and `keys/password` (the
+  account's duckpond key), `config.json` and `signer.log`. A home with no
+  `config.json` ends the signer, saying so, and the LaunchAgent does not
+  start it again; `launchctl kickstart` it once the config is in place. A
+  `config.json` that is there but does not read (caught mid-save) fails
+  the signer, so launchd starts it again and it reads the file again. `SIGNER_DUCKTAPE`
+  is the CLI it runs (the plist: `ducktape --workspace <home>/workspace
+  --node <node>`):
+
+  ```json
+  {"labels": ["sign:dev.ducktape.app"],
+   "builders": [44, 38],
+   "repos": {"app": {"developer-id": ["main", "dev"], "testflight": ["main", "dev"],
+                     "release-manifest": {"stable": ["main"], "nightly": ["main", "dev"]}}},
+   "tools": {"developer-id": ["/path/to/developer-id"], "testflight": ["/path/to/testflight"],
+             "release-manifest": ["/path/to/release-manifest"]}}
+  ```
+
+  Every answer the signer checks, blobs included, comes from the node in
+  `SIGNER_DUCKTAPE`, and the CLI checks it against nothing else: that node
+  URL is what the signer trusts, so its holder sets it to duckpond's own
+  node and nothing in between. At start the signer asks identity `OfKey`
+  for the public key `keys/key` holds in the clear, and is that account:
+  `signed.json` names it first, and the read-back of a lost claim errs
+  only checks it claimed. A key identity names no account for ends the
+  signer, saying so, and the LaunchAgent does not start it again; a node
+  it cannot reach yet is asked again after `FOLLOW_PAUSE`, logged once. The
+  LaunchAgent `signer/com.ducktape.signer.plist` keeps it running.
+  `signer/signer-test.py` covers it against a fake network and a real tool
+  process.
+
 ## Forge and GitHub
 
 - dev and main of ducktape, programs and app are held by duckpond's forge
