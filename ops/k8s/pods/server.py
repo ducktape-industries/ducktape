@@ -1771,6 +1771,23 @@ class Notifier:
         except Refused as refused:
             return "chat_unasked", refused.sentence
 
+    def passed(self, name, said):
+        asked = 0
+        for newest in range(len(said) - 1, -1, -1):
+            channel, line = said[newest]
+            asked += 1
+            try:
+                held = message_held(self.asked(chat_message(notify_id(name, channel, line))))
+            except Refused as refused:
+                return 0, asked, refused.sentence
+            except Unanswered as why:
+                return 0, asked, str(why)
+            if held:
+                with self.lock:
+                    self.posted.setdefault(name, set()).update(notify_id(name, channel, line) for channel, line in said[: newest + 1])
+                return newest + 1, asked, None
+        return 0, asked, None
+
     def lines(self, name, requester, stream, unvouched=False):
         return self.each(name, requester, notify_lines(name, stream), unvouched)
 
@@ -2466,9 +2483,11 @@ class Service:
         reached = False
         pause = self.retry_pause
         while True:
+            asked = self.clock()
             if not reached:
                 since, reached = self.runner_began(since, begun, wall)
-            asked = self.clock()
+                if reached:
+                    self.caught_up(math.ceil(asked - since))
             heard = []
             try:
                 process = self.desktop.tail(math.ceil(asked - since))
@@ -2484,6 +2503,18 @@ class Service:
             if not heard:
                 pause *= 2
             self.desktop_wanted.clear()
+
+    def caught_up(self, window):
+        try:
+            logged = self.desktop.logs([f"--since={window}s"])
+        except Refused as refused:
+            say("pods_uncaught", pod=DESKTOP, detail=json.dumps(refused.sentence))
+            return
+        passed, asked, why = self.notifier.passed(DESKTOP, list(notify_lines(DESKTOP, logged.splitlines(keepends=True))))
+        if why is not None:
+            say("pods_uncaught", pod=DESKTOP, asked=asked, detail=json.dumps(why))
+            return
+        say("pods_caught_up", pod=DESKTOP, already_posted=passed, asked=asked)
 
     def runner_began(self, since, begun, wall):
         try:

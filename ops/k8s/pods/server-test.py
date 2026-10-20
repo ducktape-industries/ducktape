@@ -2382,6 +2382,67 @@ class DesktopRunner(Streamed):
         said.assert_any_call("pods_unfollowed", pod="desktop", code=0, already_posted=1)
         self.assertNotIn(held, repr(said.call_args_list))
 
+    def test_a_pods_start_asks_chat_only_back_to_the_newest_line_it_holds(self):
+        logged = b"[r1] a line\nducktape-notify j-1 r1 ended: exit 0, GATES ok\nducktape-notify j-2 r2 ended: exit 1, GATES FAIL: test\nducktape-notify j-1 r3 ended: exit 0, GATES ok\n"
+        lines = [("j-1", "desktop · r1 ended: exit 0, GATES ok"), ("j-2", "desktop · r2 ended: exit 1, GATES FAIL: test"), ("j-1", "desktop · r3 ended: exit 0, GATES ok")]
+        ids = [server.notify_id("desktop", channel, line) for channel, line in lines]
+        self.signer.messages.update(ids[:2])
+        self.gate.answers["logs"] = ran(logged)
+        self.service.clock = lambda: 1000.0
+        self.service.wall = lambda: RUNNER_STARTED + 599.5
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.follow_desktop()
+            self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=600s")
+            self.gate.followers.put(Followed(0, b"", logged))
+            self.gate.spawned.get(timeout=10)
+        self.assertIn(["logs", "--since=600s"], self.gate.words())
+        self.assertNotIn(server.chat_message(ids[0]), self.signer.asked)
+        self.assertEqual([request for request in self.signer.asked if request in map(server.chat_message, ids)], [server.chat_message(ids[2]), server.chat_message(ids[1]), server.chat_message(ids[2])])
+        self.assertEqual(self.signer.submits, [("chat", server.post_message("j-1", ids[2], None, lines[2][1], None))])
+        said.assert_any_call("pods_caught_up", pod="desktop", already_posted=2, asked=2)
+
+    def test_a_chat_ask_that_fails_mid_walk_marks_nothing_and_each_line_is_asked_as_it_comes(self):
+        self.walk_failing("ducktape: chat could not read its query")
+
+    def test_a_chat_ask_the_node_does_not_answer_mid_walk_marks_nothing_and_each_line_is_asked_as_it_comes(self):
+        self.walk_failing("ducktape: the node failed (502): bad gateway")
+
+    def walk_failing(self, error):
+        logged = b"ducktape-notify j-1 r1 ended: exit 0, GATES ok\nducktape-notify j-1 r2 ended: exit 0, GATES ok\nducktape-notify j-1 r3 ended: exit 0, GATES ok\n"
+        lines = [("j-1", f"desktop · r{n} ended: exit 0, GATES ok") for n in (1, 2, 3)]
+        ids = [server.notify_id("desktop", channel, line) for channel, line in lines]
+        self.signer.messages.update(ids[:2])
+        asking, failed = self.signer.query, []
+
+        def query(program, request):
+            if program == "chat" and request[:1] == server.u8(2) and not failed:
+                failed.append(request)
+                return ran(code=1, err=error)
+            return asking(program, request)
+
+        self.signer.query = query
+        self.gate.answers["logs"] = ran(logged)
+        self.service.clock = lambda: 1000.0
+        self.service.wall = lambda: RUNNER_STARTED + 599.5
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.follow_desktop()
+            self.gate.spawned.get(timeout=10)
+            self.gate.followers.put(Followed(0, b"", logged))
+            self.gate.spawned.get(timeout=10)
+        said.assert_any_call("pods_uncaught", pod="desktop", asked=1, detail=json.dumps(error))
+        self.assertNotIn("pods_caught_up", [call.args[0] for call in said.call_args_list])
+        self.assertEqual([request for request in self.signer.asked if request in map(server.chat_message, ids)], [server.chat_message(id) for id in ids])
+        self.assertEqual(self.signer.submits, [("chat", server.post_message("j-1", ids[2], None, lines[2][1], None))])
+
+    def test_a_backlog_the_gate_does_not_serve_leaves_each_line_to_its_own_check(self):
+        self.gate.answers["logs"] = ran(code=64, err="gate: refused bad_log_option: --since")
+        self.service.clock = lambda: 1000.0
+        self.service.wall = lambda: RUNNER_STARTED + 599.5
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.follow_desktop()
+            self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=600s")
+        said.assert_any_call("pods_uncaught", pod="desktop", detail=json.dumps("the desktop's logs were not read: gate: refused bad_log_option: --since"))
+
     def test_podmans_start_times_read_with_or_without_a_fraction(self):
         self.assertEqual(server.go_time(UP["started"]), RUNNER_STARTED)
         self.assertEqual(server.go_time("2026-10-20 03:58:31 +0000 UTC"), datetime.datetime(2026, 10, 20, 3, 58, 31, tzinfo=datetime.timezone.utc).timestamp())

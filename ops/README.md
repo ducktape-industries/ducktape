@@ -168,7 +168,15 @@ one up for another network.
   digits, offset, zone), so a run that ended while the service was down, rolled
   or restarted still posts its end; before any post, chat is asked for its message id
   (`MessageById`, the line's hash), and one chat already holds is not
-  offered again: each stream's end line (`pods_unfollowed`) counts them
+  offered again. Before that first window is followed, one read of the log
+  over it finds the newest line chat holds, asking from the newest line
+  back, and every line up to it counts as posted with no ask of its own
+  (`pods_caught_up already_posted= asked=`; the follower posts in log order,
+  each line ended before the next, so a held line means every older one was
+  settled; a log it can't read, or a chat ask that fails during the walk,
+  logs `pods_uncaught` with why, marks nothing, and each line is asked as
+  it comes). A line refused for any reason (an archived room, a room or post
+  chat refused) is final: it is not offered again, not even after a restart. Of the rest, each stream's end line (`pods_unfollowed`) counts them
   as `already_posted`, with no line of its own for each. While the ping names no start, or one not in
   that shape, it reads from then on, logs `pods_unresumed` with why, and asks again on the next join. Each `ducktape-notify`
   line is posted as `desktop · <line>` in its channel, as `pods` with no
