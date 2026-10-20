@@ -581,7 +581,7 @@ pub mod role {
     pub const HALO: &str = "halo";
     pub const ACCESS: &str = "access";
     pub const OWNERSHIP: &str = "ownership";
-    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO, ACCESS];
+    pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO];
 
     /// Which code runs at a height.
     pub mod programs {

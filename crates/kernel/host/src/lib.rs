@@ -351,8 +351,8 @@ where
             role::ACCESS,
         ]
         .into_iter()
-        .map(|role| bound(roles, role))
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|role| roles.get(role))
+        .collect::<Vec<_>>();
         let validators_role = bound(roles, role::VALIDATORS)?;
         entries.sort_by_key(|entry| {
             founding_roles
@@ -1264,6 +1264,9 @@ where
         stage: &mut Stage,
         frame: &mut Frame,
     ) -> Result<std::result::Result<(), Refusal>> {
+        let Some(checker) = self.roles.get(role::ACCESS).cloned() else {
+            return Ok(Ok(()));
+        };
         let world = self.world(env.height, env.time);
         let answered = unit::access(
             world,
@@ -1281,10 +1284,6 @@ where
         if needs.is_empty() {
             return Ok(Ok(()));
         }
-        let checker = match self.roles.bound(role::ACCESS) {
-            Ok(checker) => checker.clone(),
-            Err(refusal) => return Ok(Err(refusal)),
-        };
         let check = access::Op::Check {
             program: program.to_owned(),
             actor: actor_of(env),

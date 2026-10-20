@@ -1,12 +1,12 @@
-//! The access gate: before an op runs the kernel asks its target what the op touches, and the
-//! access role checks the acting parties against the lists owners set and the owners and
-//! defaults the target answers for its keys.
+//! The access gate: on a network that binds the access role, before an op runs the kernel asks
+//! its target what the op touches, and that role checks the acting parties against the lists
+//! owners set and the owners and defaults the target answers for its keys.
 use std::path::Path;
 
 use abi::role::access::{Need, Ownership, Party, Resource};
 use abi::role::{self, halo, validators};
 use abi::{HostOp, Message, Outcome, Receipt, Refusal, reason};
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::{NEEDS, Step, resource_key};
 use fixture_wasm::{
     ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET,
@@ -88,6 +88,14 @@ fn genesis(probed: Vec<u8>) -> Genesis {
     }
 }
 
+fn unchecked(probed: Vec<u8>) -> Genesis {
+    let mut genesis = genesis(probed);
+    genesis
+        .programs
+        .retain(|founding| founding.program != "access");
+    genesis
+}
+
 async fn found(context: Ctx, dir: &Path, probed: Vec<u8>) -> Host<Ctx> {
     Host::found(context, "net", dir, block_id(0), genesis(probed))
         .await
@@ -130,6 +138,14 @@ fn set_list(signer: &[u8], salt: u64, key: &str, list: Option<Ownership>) -> Sub
         list,
     };
     signed(signer, salt, "access", abi::encode(&op))
+}
+
+fn fill(salt: u64, program: Option<&str>) -> Submission {
+    let change = fixture_programs::Change::Fill {
+        role: role::ACCESS.to_owned(),
+        program: program.map(str::to_owned),
+    };
+    signed(OWNER, salt, "programs", abi::encode(&change))
 }
 
 async fn apply(host: &mut Host<Ctx>, height: u64, submissions: Vec<Submission>) -> Vec<Receipt> {
@@ -329,5 +345,67 @@ fn a_signed_frame_cannot_send_the_kernels_check_and_an_op_touching_nothing_runs(
         assert_eq!(refusal(&forged[0]).reason, reason::UNAUTHORIZED);
         applied(&forged[1]);
         assert_eq!(written(&host).as_deref(), Some(b"free".as_slice()));
+    });
+}
+
+#[test]
+fn with_no_access_role_bound_the_kernel_asks_no_target_what_an_op_touches() {
+    deterministic::Runner::default().start(|context| async move {
+        let unreadable = script(vec![set(NEEDS, vec![0xff])]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut checked = found(context.child("checked"), dir.path(), unreadable.clone()).await;
+        let refused = apply(&mut checked, 1, vec![write(OTHER, 1, b"checked")]).await;
+        assert!(
+            matches!(refused[0].outcome, Outcome::Rejected(_)),
+            "{refused:?}"
+        );
+        assert_eq!(written(&checked), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let child = context.child("unchecked");
+        let unbound = unchecked(unreadable);
+        let founded = Host::found(child, "net", dir.path(), block_id(0), unbound).await;
+        let (mut host, _) = founded.unwrap();
+        assert_eq!(host.roles().get(role::ACCESS), None);
+        let ran = apply(&mut host, 1, vec![write(OTHER, 1, b"unchecked")]).await;
+        applied(&ran[0]);
+        assert_eq!(written(&host).as_deref(), Some(b"unchecked".as_slice()));
+    });
+}
+
+#[test]
+fn unbinding_access_lifts_every_check_and_binding_it_again_brings_each_list_back() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let probed = probe(vec![Need::write("doc")], vec![("doc", owned_by(1))]);
+        let mut host = found(context, dir.path(), probed).await;
+        let closed = apply(
+            &mut host,
+            1,
+            vec![set_list(OWNER, 1, "doc", Some(Ownership::Owner))],
+        )
+        .await;
+        applied(&closed[0]);
+        let refused = apply(&mut host, 2, vec![write(OTHER, 2, b"other")]).await;
+        assert_eq!(refusal(&refused[0]).reason, reason::UNAUTHORIZED);
+
+        applied(&apply(&mut host, 3, vec![fill(3, None)]).await[0]);
+        apply(&mut host, 4, Vec::new()).await;
+        assert_eq!(host.roles().get(role::ACCESS), None);
+        let open = apply(&mut host, 5, vec![write(OTHER, 5, b"unbound")]).await;
+        applied(&open[0]);
+        assert_eq!(written(&host).as_deref(), Some(b"unbound".as_slice()));
+        assert_eq!(listed(&host, "doc"), Some(abi::encode(&Ownership::Owner)));
+
+        applied(&apply(&mut host, 6, vec![fill(6, Some("access"))]).await[0]);
+        apply(&mut host, 7, Vec::new()).await;
+        assert_eq!(
+            host.roles().get(role::ACCESS).map(String::as_str),
+            Some("access")
+        );
+        let again = apply(&mut host, 8, vec![write(OTHER, 8, b"rebound")]).await;
+        assert_eq!(refusal(&again[0]).reason, reason::UNAUTHORIZED);
+        assert_eq!(written(&host).as_deref(), Some(b"unbound".as_slice()));
     });
 }

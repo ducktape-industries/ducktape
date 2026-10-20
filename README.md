@@ -125,13 +125,13 @@ and on the change that publishes it after. The programs role keeps the table
 and answers it (`programs::Query::Roles`); the kernel reads it each block with
 the roster and keeps it in its own state. Founding refuses a role two programs
 declare and a table missing a role in `abi::role::REQUIRED` (programs,
-validators, identity, blobs, awaits, halo, access), naming the role; a roster
+validators, identity, blobs, awaits, halo), naming the role; a roster
 whose table misses one, or names a program the roster does not run, changes
 nothing. Every frame's env carries the table (`Env.roles`); a program looks a
 role up by name and gets nothing for a role the network does not fill.
 
-Before an op runs, the kernel asks its target program what the op touches
-(`ProgramCall::Access`, answered as `role::access::Need`s: a key in the
+Before an op runs, on a network that binds a program to the access role, the
+kernel asks its target program what the op touches (`ProgramCall::Access`, answered as `role::access::Need`s: a key in the
 program's own space and whether the op writes or deletes it). When the answer
 names anything, the program filling the access role checks it for the parties
 the frame acts as (the account, and the sending program for a message) before
@@ -141,7 +141,10 @@ the owner of a key and the list that holds until one is set are the target
 program's to say (`ProgramCall::Resource`), which the access program asks
 through `HostOp::Resource`. A key shaped like a path answers to the nearest
 list on it or above it, and no list anywhere means anyone may act. A query is
-never checked.
+never checked. With no program bound to the access role, the kernel asks no
+target program and checks no op. A roster that removes a program unbinds every
+role it fills in the same block, so removing the access program lifts the
+per-op check as unbinding the role does.
 
 Every key a program writes is shared unless the program claims it as it
 creates it: `HostOp::SetOwned { key, value, kind }` writes as `Set` does and
