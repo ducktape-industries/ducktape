@@ -1,5 +1,5 @@
 //! The egress worker's decisions after each block and each thing a call reports: which requests to
-//! call, and which answers, events and `Serve` frames to send: a request's next frame as soon as the
+//! call or give up, and which answers, events and `Serve` frames to send: a request's next frame as soon as the
 //! one before is in the pool, carrying every event read since. Pure; `mod.rs` performs them.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -22,6 +22,7 @@ pub enum Purpose {
 pub enum Step {
     Call(RequestRow),
     Send(Purpose),
+    Abandon(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,7 +308,14 @@ impl Desk {
     pub fn read(&mut self, reading: Reading) -> Vec<Step> {
         let mut steps = Vec::new();
         let assigned: BTreeSet<u64> = reading.assigned.iter().map(|row| row.id).collect();
+        let gone: Vec<u64> = self
+            .requests
+            .keys()
+            .filter(|id| !assigned.contains(id))
+            .copied()
+            .collect();
         self.requests.retain(|id, _| assigned.contains(id));
+        steps.extend(gone.into_iter().map(Step::Abandon));
         for row in reading.assigned {
             let id = row.id;
             let Some(outbox) = self.requests.get(&id) else {

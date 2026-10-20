@@ -52,8 +52,25 @@ fn a_new_request_is_called_once_and_its_answer_is_sent_each_block_until_carried(
     assert_eq!(again, [Step::Send(purpose.clone())]);
     desk.sent(&purpose, Sent::Carried);
     assert!(desk.read(reading(&[1], &["relay"], true)).is_empty());
-    assert!(desk.read(reading(&[], &["relay"], true)).is_empty());
+    assert_eq!(
+        desk.read(reading(&[], &["relay"], true)),
+        [Step::Abandon(1)]
+    );
     desk.called(1, Called::Whole(Answer::Output(Vec::new())));
+    assert!(desk.launch().is_empty());
+}
+
+#[test]
+fn a_call_whose_request_left_the_assigned_list_is_given_up_once_and_heard_no_more() {
+    let mut desk = served();
+    desk.read(reading(&[1, 2], &["relay"], true));
+    desk.called(1, Called::Event(b"data: 1".to_vec()));
+    assert_eq!(
+        desk.read(reading(&[2], &["relay"], true)),
+        [Step::Abandon(1)]
+    );
+    assert!(desk.read(reading(&[2], &["relay"], true)).is_empty());
+    desk.called(1, Called::Event(b"data: 2".to_vec()));
     assert!(desk.launch().is_empty());
 }
 

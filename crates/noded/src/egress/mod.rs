@@ -1,6 +1,7 @@
 //! The node's egress worker: after each applied block it reads the program bound to the egress
 //! role and answers and serves through it with the node's key. Spawned by `run.rs`.
 mod call;
+mod calls;
 mod config;
 mod desk;
 mod station;
@@ -20,6 +21,7 @@ pub use config::{Config, Refused, Withheld, withheld};
 pub use station::{Planned, Station, Tally};
 
 use crate::egress::call::Caller;
+use crate::egress::calls::Calls;
 use crate::egress::desk::{Called, Desk, Purpose, Reading, Sent, Step};
 use crate::egress::station::Serving;
 use crate::{Context, Daemon, Error, Result};
@@ -43,6 +45,7 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
         daemon: daemon.clone(),
         answers,
     };
+    let mut calls = Calls::default();
     let mut tips = daemon.tips.subscribe();
     let mut unread: u64 = 0;
     let mut bound = Bound::Unread;
@@ -75,16 +78,16 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
                     None => {
                         let serving = daemon.egress.current();
                         if bound.unbound(&serving.config) {
-                            desk = Desk::new(serving.config.served());
+                            calls.renew(&mut desk, serving.config.served());
                         }
                         continue;
                     }
                 };
                 if bound.bound(&role) {
-                    desk = Desk::new(daemon.egress.current().config.served());
+                    calls.renew(&mut desk, daemon.egress.current().config.served());
                 }
                 for step in desk.read(reading) {
-                    worker.execute(&mut desk, step, &role).await;
+                    worker.execute(&mut desk, &mut calls, step, &role).await;
                 }
             }
             Some((id, called)) = answered.next() => {
@@ -96,7 +99,7 @@ async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
                     desk.called(id, called);
                 }
                 for step in desk.launch() {
-                    worker.execute(&mut desk, step, role).await;
+                    worker.execute(&mut desk, &mut calls, step, role).await;
                 }
             }
             reloaded = reloads.changed() => {
@@ -237,17 +240,24 @@ impl<E: Context> Worker<E> {
         Ok(Some((role, reading)))
     }
 
-    async fn execute(&self, desk: &mut Desk, step: Step, role: &ProgramId) {
+    async fn execute(&self, desk: &mut Desk, calls: &mut Calls, step: Step, role: &ProgramId) {
         let mut next = Some(step);
         while let Some(step) = next {
             next = match step {
-                Step::Call(row) => self.call(row),
+                Step::Call(row) => self.call(row, calls),
+                Step::Abandon(id) => {
+                    if calls.abandon(id) {
+                        tracing::debug!(target: TARGET, event = "egress_abandoned", id);
+                    }
+                    None
+                }
                 Step::Send(purpose) => self.send(desk, purpose, role).await,
             };
         }
     }
 
-    fn call(&self, row: RequestRow) -> Option<Step> {
+    fn call(&self, row: RequestRow, calls: &mut Calls) -> Option<Step> {
+        let id = row.id;
         let daemon = self.daemon.clone();
         let serving = self.daemon.egress.current();
         let answers = self.answers.clone();
@@ -257,7 +267,8 @@ impl<E: Context> Worker<E> {
             id = row.id,
             service = row.request.service(),
         );
-        self.daemon
+        let call = self
+            .daemon
             .context
             .child("egress_call")
             .spawn(move |_| async move {
@@ -287,6 +298,7 @@ impl<E: Context> Worker<E> {
                 );
                 let _ = answers.unbounded_send((id, called));
             });
+        calls.started(id, call);
         None
     }
 
