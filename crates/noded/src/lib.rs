@@ -13,6 +13,7 @@ mod history;
 mod link;
 pub mod live;
 mod logs;
+pub mod machine;
 mod mesh;
 mod network;
 mod pool;
@@ -37,7 +38,8 @@ use tokio::sync::watch;
 pub use carry::{Carry, carry_history, restore_archives, restore_history};
 pub use client::{Client, Upload};
 pub use config::{
-    ConsensusSettings, DEFAULT_HTTP, DEFAULT_LOG, LoadSettings, NodeConfig, Settings, permits,
+    Backend, ConsensusSettings, DEFAULT_HTTP, DEFAULT_LOG, LoadSettings, MachineEntry,
+    MachineSettings, NodeConfig, Settings, memory_quantity, permits,
 };
 pub use cores::{CpuList, pin_block_threads};
 pub use egress::lane::{LANE as EGRESS_LANE, Seating, seating, serve_box};
@@ -136,6 +138,8 @@ pub enum Error {
     Egress(#[from] egress::Refused),
     #[error("no relay node serves the egress lane")]
     Unrelayed,
+    #[error("machine.key is this workspace's identity key: a machine signs with a key of its own")]
+    MachineIsIdentity,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {

@@ -1,4 +1,5 @@
 mod json;
+mod machine;
 mod mcp;
 
 use std::io::{Read as _, Write as _};
@@ -214,6 +215,11 @@ enum Verb {
     },
     #[command(subcommand, about = "the user keys that sign frames")]
     Wallet(WalletVerb),
+    #[command(
+        subcommand,
+        about = "run the work fleet assigns to the machines [machine] names, signed by machine.key"
+    )]
+    Machine(MachineVerb),
 }
 
 #[derive(Args)]
@@ -464,6 +470,7 @@ impl RunArgs {
                 certification_timeout_ms: self.certification_timeout_ms,
                 timeout_retry_ms: self.timeout_retry_ms,
             },
+            machine: None,
         }
     }
 }
@@ -546,6 +553,31 @@ enum VoteVerb {
         about = "send the program bound to a role an op, a file or stdin: `programs` schedules or cancels a program change, `halo` opens, sets or closes a lane"
     )]
     Role { role: String, op: Option<PathBuf> },
+}
+
+#[derive(Subcommand)]
+enum MachineVerb {
+    #[command(
+        about = "print the machine key's public half, minting machine.key if absent; it is never \
+                 the node's identity key"
+    )]
+    Init,
+    #[command(
+        about = "say each machine is ready to fleet, run what fleet assigns it, beat while it holds \
+                 a running run, and report how each run ended once its log and outputs are in files"
+    )]
+    Run {
+        #[arg(
+            long,
+            help = "a file holding [machine] [default: the workspace's node.toml]"
+        )]
+        config: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "run as the node's child, whose CPU set, nice and memory cap the node set already"
+        )]
+        child: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -690,6 +722,16 @@ fn execute(cli: Cli) -> Result<(), String> {
             if let Some(block) = &config.block_cpus {
                 config.load.rpc_cpus = Some(noded::pin_block_threads(block).sentence()?);
             }
+            let machine = config
+                .machine
+                .take()
+                .filter(|machine| machine.on)
+                .map(|machine| {
+                    noded::machine::Limits::of(&machine, config.load.rpc_cpus.as_deref())
+                });
+            if let Some(limits) = &machine {
+                noded::machine::supported(limits).sentence()?;
+            }
             let runtime = runtime_config(&workspace).with_read_write_timeout(config.link_timeout());
             Runner::new(runtime).start(|context| async move {
                 let logs = Logs::install(&config.log)?;
@@ -710,8 +752,25 @@ fn execute(cli: Cli) -> Result<(), String> {
                         return Ok(());
                     }
                 };
+                let keeping = match machine {
+                    Some(limits) => Some(
+                        noded::machine::keep(
+                            &workspace,
+                            running.http,
+                            limits,
+                            running.daemon.tips.subscribe(),
+                            running.daemon.shutdown.subscribe(),
+                        )
+                        .sentence()?,
+                    ),
+                    None => None,
+                };
                 println!("http {}", running.http);
-                running.stopped(signalled).await.sentence()
+                let stopped = running.stopped(signalled).await;
+                if let Some(keeping) = keeping {
+                    let _ = keeping.await;
+                }
+                stopped.sentence()
             })
         }
         Verb::RestoreArchives => {
@@ -721,6 +780,11 @@ fn execute(cli: Cli) -> Result<(), String> {
                 println!("wrote back {blocks} blocks and {summaries} summaries");
                 Ok(())
             })
+        }
+        Verb::Machine(MachineVerb::Init) => machine::init(&workspace),
+        Verb::Machine(MachineVerb::Run { config, child }) => {
+            let client = client(&workspace, cli.node)?;
+            machine::run(&workspace, client, config, child)
         }
         Verb::Wallet(verb) if !matches!(verb, WalletVerb::Consent { .. }) => {
             wallet(&workspace, verb)
@@ -1092,7 +1156,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Egress(EgressVerb::Serve { .. })
         | Verb::Run(_)
         | Verb::RestoreArchives
-        | Verb::Wallet(_) => unreachable!("handled before the client is built"),
+        | Verb::Wallet(_)
+        | Verb::Machine(_) => unreachable!("handled before the client is built"),
     }
 }
 
@@ -1616,6 +1681,7 @@ mod tests {
                     certification_timeout_ms: Some(6000),
                     timeout_retry_ms: Some(2000),
                 },
+                machine: None,
             }
         );
     }

@@ -333,7 +333,7 @@ The workspace (`--workspace`, default `$DUCKTAPE_HOME` else `~/.ducktape`)
 holds `identity.key`, the network descriptor, the anchor the node started
 from, the node a joined node read its state from (`source`), the address its
 HTTP surface bound, the runtime's storage and, when the
-operator writes them, `node.toml`, `egress.toml` and `egress-grants`. Under `schemas/` the
+operator writes them, `node.toml`, `egress.toml`, `egress-grants` and `machine.key`. Under `schemas/` the
 CLI keeps the schema section of each program code it has spoken to in JSON,
 and under `tools/` its tools section (`{}` for a code that carries none),
 each named by the code's id, so `ducktape query`, `ducktape op` and
@@ -533,6 +533,20 @@ egress_lane_backlog = 64      # --egress-lane-backlog
 leader_timeout_ms = 1000          # --leader-timeout-ms; default one block time
 certification_timeout_ms = 30000  # --certification-timeout-ms; default 30 block times
 timeout_retry_ms = 2000           # --timeout-retry-ms; default 2 block times
+
+[machine]                     # no flag; `ducktape machine run` reads it too
+on = false                    # default false: true has `ducktape run` start `ducktape machine run` as its child
+cpus = "6-7"                  # default: the CPUs block_cpus leaves to the rpc runtime, else every CPU
+nice = 10                     # default: the node's own
+memory = "32Gi"               # default none: no cap; a byte count is a number
+work = "/var/lib/ducktape-work"  # default: the workspace's folder name with -machine, beside it; never inside it
+
+[[machine.machines]]
+name = "warm"
+labels = ["warm", "heavy"]
+backend = "shell"             # shell or podman
+slots = 1                     # how many runs it takes at once
+serves = [17]                 # default: a shell machine its account's manager, a podman machine anyone
 ```
 
 The top level says where the node is reached, what it logs and which CPUs
@@ -547,7 +561,9 @@ says how much work the node takes on at once and how fast it sends over
 halo; "Reach a node" describes each of its keys, and `ducktape run --help`
 shows each default. A count in `[load]` is above zero, and every count but
 `blob_gatherers` is at most what a tokio semaphore holds. `[consensus]`
-holds the consensus timeouts.
+holds the consensus timeouts. `[machine]` names the machines this workspace
+runs for fleet ("Run work for fleet") and, with `on`, has the node run them
+as its child.
 
 The block time is the network's, from the founding file, so the defaults
 follow it. A view gives up on its leader after the leader timeout and on
@@ -655,6 +671,110 @@ that long is closed, on either path), and `IDLE_SESSION` for a session holding n
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100   # the tunnel serves https://b.example.org from 127.0.0.1:8844
 ```
 
+## Run work for fleet
+
+fleet is the program that holds what someone asked to run, which machine
+took each run and how it ended. A machine is an account with a key that runs
+that work: `ducktape machine init` mints `machine.key` in the workspace (mode
+0600) and prints its public half, and the account's owner makes the account
+with identity's `CreateAgent` and adds that key with `AddKey`. A
+`machine.key` that is the workspace's `identity.key` is refused.
+
+`ducktape machine run` runs the machines `[machine]` names (`node.toml`, or
+`--config FILE`), against `--node` or the workspace's node, talking to fleet
+in JSON through its schema. Each machine says it is ready (`Ready`: its
+labels, `slots` and whose runs it `serves`). The process follows fleet's
+writes, and when a write touches what a machine holds it reads the machine's
+`Holds`: an assigned run is claimed and started, a run being stopped is
+stopped, and a run held as running that the process does not know (it
+restarted) is reported `Errored`. While a machine holds a running run it
+beats every `DEFAULT_WAIT / 2` blocks (`abi::role::egress::DEFAULT_WAIT`),
+counted on the blocks it follows. When a run ends, its log and every file it
+wrote to `$OUT` (`/out` in a container) go into files as one commit, under
+the workload's `out` or `/shared/fleet/<run>/`, and the machine reports the
+end with that folder and snapshot: exit 0 is `Passed`, any other exit or a
+signal `Failed`, a run it was told to stop `Cancelled`, and one it could not
+start or wait for `Errored`. A run is declined when its machine's backend
+cannot run it (an image on `shell`, none on `podman`, or a forge input with no
+`git-remote-duck` on `PATH`).
+
+`shell` runs the command in a work tree under
+`<work>/<machine>/<run>-<attempt>/`, outside the workspace (`work` in
+`[machine]`, else the workspace's folder name with `-machine`, beside it: a
+workspace at `~/.ducktape` runs in `~/.ducktape-machine`). The machine makes a
+missing `work` with mode 0700 and refuses one that isn't a folder its user
+owns with no access for group or others, or that is a symlink. It then
+resolves both paths and refuses a `work` inside the workspace or holding it.
+`ducktape machine run` runs only on Linux, where it can keep each run private;
+elsewhere it refuses to start. A run's
+inputs sit at their paths inside its folder, it runs in a process group of its
+own under umask 077, and with an environment of only
+`OUT`, `WORK` and the workload's `env`: the command itself is found on the
+machine's `PATH`, but what it starts sees no `PATH` (the shell's own default
+applies), so a workload that needs one declares it in its `env`. It still runs as the node's user and
+can read whatever that user can, the workspace's keys included, so a `shell`
+machine serves only its account's manager unless `serves` lists whom it takes
+runs from. A shell run takes no CPU or memory of its own from the workload's
+asks: it has the machine's. A stop, and the end of the command, ends the whole
+group. `podman` runs `podman run --rm` as
+`ducktape-<genesis>-<account>-p<pid>-<run>-<attempt>`, `<pid>` being the
+machine process's own, with the image, each input
+mounted at its path, `out` at `/out`, and `--cpus` and `--memory` from the
+workload's asks; a podman machine serves anyone unless `serves` lists whom. A
+stop is `podman kill`, and every end `podman rm -f`.
+
+When the machine stops it first stops every run it holds (their folders stay
+under `work`), and when it starts it removes the containers named for its
+account whose machine process is gone, and leaves those of a machine process
+still running. A machine killed outright (SIGKILL) leaves its shell runs' background
+processes behind; fleet hears of each lost run when the machine, started
+again, reports it `Errored`. A run's folder is removed once its outputs are in
+files and its end is reported, and never before: a folder kept because its
+outputs, its report or its start failed is named in the run's summary or the
+machine's `machine_op_failed` warning. An `out` that is a symlink is refused.
+When another commit lands first, the outputs are committed again on the new
+head (`machine_commit_stale`, logged at the first attempt and each power of
+two). The machine starts and ends each run in a task of its own, and the work
+on a run's files that grows with them (making its folder fresh, writing
+inputs, listing, cutting and hashing outputs, removing folders) runs on
+tokio's blocking pool, so neither the network nor that disk work holds back
+the loop that beats. A task that panics is settled: what it started is
+stopped as on the machine's own stop, and fleet hears its run `Errored`.
+
+With `on = true`, `ducktape run` starts `ducktape machine run --child` against
+its own HTTP surface once it is up, on `cpus` (else the CPUs `block_cpus`
+leaves to the rpc runtime) at `nice`, and under `memory`: in a cgroup v2 child
+`machine` of the node's own cgroup (`memory.max`, and `cpuset.cpus` where the
+cpuset controller is there) when the node's cgroup delegates the memory
+controller to its children or lets the node turn it on, otherwise as each
+process's address-space limit, which bounds each process's virtual size, not
+their sum. A node running as a systemd service holds processes in its own
+cgroup, so the kernel refuses to turn the controller on there and the cap is
+the address-space limit. The `machine_limits` event says which (`memory`:
+`cgroup`, `rlimit` or `none`) and why (`reason`: `memory_unset`,
+`cgroup_made`, `cgroup_root`, `cgroup_v1`, `cgroup_unread`,
+`memory_undelegated`, `cgroup_unmade` or `cgroup_unset`). `cpus`, `nice` and
+`memory` are applied only on Linux; elsewhere a node with any of them set
+refuses to start. The machine itself sits in the leaf `machine/agent`, and a
+shell run inherits all of these limits. Podman starts each container outside
+the machine's own processes, so a podman machine hands the limits on: each
+container runs with `--cgroup-parent` set to the `machine` cgroup, so its
+`memory.max` and `cpuset.cpus` bound the containers and the machine together,
+and with `--cpuset-cpus` set to the machine's own CPU set when that is
+narrower than the CPUs online. Every podman call for such a container (its
+run, kill and removal, and the start's sweep) names the `cgroupfs` cgroup
+manager its run was made with. A podman machine with `memory` set runs only
+inside that cgroup: run standalone, or where the node fell back to the
+address-space limit, it refuses to start. `nice` reaches the podman client,
+not its containers. When the
+child exits, the node starts it again at the next block it applies, logging
+the first exit and then each one whose count is a power of two
+(`machine_exited`, with `attempts` and a `reason`); a child that exits
+cleanly (status 0) starts that count again, and a crashing one never does. The node's stop stops it. The
+machine logs to the node's stderr, not to the node's `/v1/logs` ring. Run
+standalone, `ducktape machine run` sets the same CPU set, nice and
+address-space limit on itself.
+
 ## Use a network
 
 ```sh
@@ -673,6 +793,8 @@ ducktape mcp                            # the Model Context Protocol on stdio fo
 ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ducktape blob put code.wasm --kind program --wait  # put a bundle, print its ids, wait until it is held
+ducktape machine init                   # mint machine.key and print its public key
+ducktape machine run                    # run the work fleet assigns to the machines [machine] names
 ```
 
 Reads are open; writes are signed frames. Each frame names a recent block, its

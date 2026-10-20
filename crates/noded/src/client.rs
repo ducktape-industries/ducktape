@@ -552,7 +552,8 @@ impl Fault for Error {
             | Error::Stopped
             | Error::Offloaded(_)
             | Error::Egress(_)
-            | Error::Unrelayed => Failure::Definite,
+            | Error::Unrelayed
+            | Error::MachineIsIdentity => Failure::Definite,
         }
     }
 }

@@ -32,6 +32,7 @@ pub struct Settings {
     pub load: LoadSettings,
     #[serde(default)]
     pub consensus: ConsensusSettings,
+    pub machine: Option<MachineSettings>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -72,6 +73,39 @@ pub struct ConsensusSettings {
     pub timeout_retry_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineSettings {
+    #[serde(default)]
+    pub on: bool,
+    #[serde(default, deserialize_with = "cpu_list")]
+    pub cpus: Option<CpuList>,
+    pub nice: Option<i32>,
+    #[serde(default, deserialize_with = "memory")]
+    pub memory: Option<u64>,
+    pub work: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub machines: Vec<MachineEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineEntry {
+    pub name: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub backend: Backend,
+    pub slots: u64,
+    pub serves: Option<Vec<u64>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    Shell,
+    Podman,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     pub listen: Listen,
@@ -80,6 +114,7 @@ pub struct NodeConfig {
     pub load: LoadConfig,
     pub cadence: Cadence,
     pub block_cpus: Option<CpuList>,
+    pub machine: Option<MachineSettings>,
 }
 
 pub fn permits(count: NonZeroUsize) -> Result<NonZeroUsize> {
@@ -107,6 +142,62 @@ fn cpu_list<'de, D: Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Quantity {
+    Bytes(u64),
+    Text(String),
+}
+
+fn memory<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    let text = match Quantity::deserialize(deserializer)? {
+        Quantity::Bytes(bytes) => return Ok(Some(bytes)),
+        Quantity::Text(text) => text,
+    };
+    memory_quantity(&text).map(Some).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "{text:?} is no memory quantity such as 32Gi, 512Mi or 1G"
+        ))
+    })
+}
+
+pub fn memory_quantity(quantity: &str) -> Option<u64> {
+    const UNITS: [(&str, u64); 12] = [
+        ("Ki", 1 << 10),
+        ("Mi", 1 << 20),
+        ("Gi", 1 << 30),
+        ("Ti", 1 << 40),
+        ("Pi", 1 << 50),
+        ("Ei", 1 << 60),
+        ("k", 1_000),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("E", 1_000_000_000_000_000_000),
+    ];
+    let (number, unit) = UNITS
+        .iter()
+        .find_map(|(suffix, unit)| quantity.strip_suffix(suffix).map(|number| (number, *unit)))
+        .unwrap_or((quantity, 1));
+    let bytes = u128::from(thousandths(number)?) * u128::from(unit) / 1000;
+    u64::try_from(bytes).ok()
+}
+
+fn thousandths(number: &str) -> Option<u64> {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, "0"));
+    let decimal = digits(whole) && digits(fraction) && fraction.len() <= 3;
+    if !decimal {
+        return None;
+    }
+    let whole: u64 = whole.parse().ok()?;
+    let fraction: u64 = format!("{fraction:0<3}").parse().ok()?;
+    whole.checked_mul(1000)?.checked_add(fraction)
+}
+
 impl Settings {
     pub fn parse(text: &str) -> std::result::Result<Settings, String> {
         toml::from_str(text).map_err(|error| refusal(text, &error))
@@ -123,6 +214,7 @@ impl Settings {
             block_cpus: self.block_cpus.or(under.block_cpus),
             load: self.load.over(under.load),
             consensus: self.consensus.over(under.consensus),
+            machine: self.machine.or(under.machine),
         }
     }
 
@@ -143,6 +235,7 @@ impl Settings {
             load: self.load.load(),
             cadence,
             block_cpus: self.block_cpus,
+            machine: self.machine,
         })
     }
 }

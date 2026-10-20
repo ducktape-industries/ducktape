@@ -36,7 +36,7 @@ serde = { workspace = true }
 state = { workspace = true }
 statesync = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "net", "io-util"] }
+tokio = { workspace = true, features = ["fs", "net", "io-util", "process"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -48,7 +48,7 @@ url = "2"
 zstd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 fixture-awaiter = { path = "../kernel/fixtures/awaiter" }

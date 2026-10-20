@@ -5,7 +5,7 @@ use std::time::Duration;
 use abi::role::validators::Member;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::ed25519;
+use commonware_cryptography::{Signer as _, ed25519};
 use consensus::{Anchor, Cadence, CadenceError, Timeouts};
 use host::{Founding as FoundingProgram, FoundingView, Genesis, Limits};
 use node::Block;
@@ -27,6 +27,7 @@ const EGRESS: &str = "egress.toml";
 const EGRESS_FRESH: &str = "egress.toml.fresh";
 const EGRESS_GRANTS: &str = "egress-grants";
 const NODE: &str = "node.toml";
+const MACHINE: &str = "machine.key";
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Descriptor {
@@ -68,22 +69,48 @@ impl Workspace {
     }
 
     pub fn identity(&self) -> Result<ed25519::PrivateKey> {
-        let text = std::fs::read_to_string(self.dir.join(IDENTITY))?;
+        self.key(IDENTITY)
+    }
+
+    pub fn identity_or_create(&self, rng: impl CryptoRng) -> Result<ed25519::PrivateKey> {
+        self.minted(IDENTITY, rng)?;
+        self.identity()
+    }
+
+    pub fn machine_key(&self) -> Result<ed25519::PrivateKey> {
+        let key = self.key(MACHINE)?;
+        let has_identity = self.dir.join(IDENTITY).exists();
+        if !has_identity {
+            return Ok(key);
+        }
+        let shared = self.identity()?.public_key() == key.public_key();
+        if shared {
+            return Err(Error::MachineIsIdentity);
+        }
+        Ok(key)
+    }
+
+    pub fn machine_key_or_create(&self, rng: impl CryptoRng) -> Result<ed25519::PrivateKey> {
+        self.minted(MACHINE, rng)?;
+        self.machine_key()
+    }
+
+    fn key(&self, name: &str) -> Result<ed25519::PrivateKey> {
+        let text = std::fs::read_to_string(self.dir.join(name))?;
         let seed = hex::decode(text.trim()).map_err(|error| Error::Corrupt(error.to_string()))?;
         ed25519::PrivateKey::decode(seed.as_slice())
             .map_err(|error| Error::Corrupt(error.to_string()))
     }
 
-    pub fn identity_or_create(&self, mut rng: impl CryptoRng) -> Result<ed25519::PrivateKey> {
-        let exists = self.dir.join(IDENTITY).exists();
+    fn minted(&self, name: &str, mut rng: impl CryptoRng) -> Result<()> {
+        let exists = self.dir.join(name).exists();
         if exists {
-            return self.identity();
+            return Ok(());
         }
         std::fs::create_dir_all(&self.dir)?;
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
-        write_private(&self.dir.join(IDENTITY), hex::encode(seed).as_bytes())?;
-        self.identity()
+        write_private(&self.dir.join(name), hex::encode(seed).as_bytes())
     }
 
     pub fn descriptor(&self) -> Result<Descriptor> {
@@ -374,7 +401,10 @@ pub fn halo_address(text: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Founding, halo_address};
+    use commonware_cryptography::Signer as _;
+    use commonware_runtime::Runner as _;
+
+    use super::{Founding, Workspace, halo_address};
     use crate::Error;
 
     fn genesis_of(text: &str) -> host::Genesis {
@@ -454,5 +484,38 @@ mod tests {
                     .unwrap();
             refused_for_its_halo(unseated.seat_halo(&[0], unregistrable));
         }
+    }
+
+    #[test]
+    fn a_machine_key_is_private_reads_back_and_is_never_the_identity_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::at(dir.path());
+        commonware_runtime::deterministic::Runner::default().start(|mut context| async move {
+            let identity = workspace.identity_or_create(&mut context).unwrap();
+            let machine = workspace.machine_key_or_create(&mut context).unwrap();
+            assert_ne!(machine.public_key(), identity.public_key());
+            let again = workspace.machine_key_or_create(&mut context).unwrap();
+            assert_eq!(again.public_key(), machine.public_key());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(dir.path().join("machine.key"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            std::fs::copy(
+                dir.path().join("identity.key"),
+                dir.path().join("machine.key"),
+            )
+            .unwrap();
+            assert!(matches!(
+                workspace.machine_key(),
+                Err(Error::MachineIsIdentity)
+            ));
+            let refused = workspace.machine_key_or_create(&mut context);
+            assert!(matches!(refused, Err(Error::MachineIsIdentity)));
+        });
     }
 }

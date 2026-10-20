@@ -84,6 +84,7 @@ fn every_key() -> Settings {
             certification_timeout_ms: Some(6000),
             timeout_retry_ms: Some(2000),
         },
+        machine: None,
     }
 }
 
@@ -405,4 +406,63 @@ fn load_reads_the_file_under_the_flags() {
     assert_eq!(config.load.blob_gatherers, count(9));
     assert_eq!(config.load.blob_backlog, count(40));
     assert_eq!(config.cadence.leader_timeout(), Duration::from_millis(4000));
+}
+
+#[test]
+fn a_machine_table_parses_and_refuses_a_key_or_a_quantity_it_does_not_know() {
+    let text = "[machine]\non = true\ncpus = \"6-7\"\nnice = 10\nmemory = \"32Gi\"\nwork = \"/var/lib/ducktape-work\"\n\
+                [[machine.machines]]\nname = \"warm\"\nlabels = [\"warm\"]\n\
+                backend = \"shell\"\nslots = 2\nserves = [17]\n\
+                [[machine.machines]]\nname = \"fresh\"\nbackend = \"podman\"\nslots = 1\n";
+    let machine = Settings::parse(text).unwrap().machine.unwrap();
+    assert_eq!(
+        machine,
+        MachineSettings {
+            on: true,
+            cpus: Some(CpuList::parse("6-7").unwrap()),
+            nice: Some(10),
+            memory: Some(32 << 30),
+            work: Some("/var/lib/ducktape-work".into()),
+            machines: vec![
+                MachineEntry {
+                    name: "warm".into(),
+                    labels: vec!["warm".into()],
+                    backend: Backend::Shell,
+                    slots: 2,
+                    serves: Some(vec![17]),
+                },
+                MachineEntry {
+                    name: "fresh".into(),
+                    labels: Vec::new(),
+                    backend: Backend::Podman,
+                    slots: 1,
+                    serves: None,
+                },
+            ],
+        }
+    );
+    let unknown = Settings::parse("[machine]\nram = 1\n").unwrap_err();
+    assert!(
+        unknown.starts_with("line 2: unknown field `ram`"),
+        "{unknown}"
+    );
+    assert!(Settings::parse("[machine]\nmemory = \"lots\"\n").is_err());
+    assert!(
+        Settings::parse("[[machine.machines]]\nname = \"a\"\nbackend = \"k8s\"\nslots = 1\n")
+            .is_err()
+    );
+    assert_eq!(Settings::parse("").unwrap().machine, None);
+}
+
+#[test]
+fn a_memory_quantity_reads_as_kubernetes_writes_it() {
+    assert_eq!(memory_quantity("512Mi"), Some(512 << 20));
+    assert_eq!(memory_quantity("1.5G"), Some(1_500_000_000));
+    assert_eq!(memory_quantity("1000"), Some(1000));
+    assert_eq!(memory_quantity("lots"), None);
+    assert_eq!(memory_quantity("1E"), Some(1_000_000_000_000_000_000));
+    assert_eq!(memory_quantity("8Ei"), Some(8 << 60));
+    assert_eq!(memory_quantity("16Ei"), None);
+    let bytes = Settings::parse("[machine]\nmemory = 1073741824\n").unwrap();
+    assert_eq!(bytes.machine.unwrap().memory, Some(1 << 30));
 }
