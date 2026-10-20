@@ -3102,6 +3102,36 @@ class Builds(Streamed):
         self.built("programs", "dev", "lane")
         self.assertNotIn("holds", [words[1] for words in self.gate.words() if len(words) > 1])
 
+    def test_a_call_to_a_pod_that_is_gone_names_the_warm_pod_now(self):
+        self.kube.answer("get", ran(code=1, err='Error from server (NotFound): pods "duckpond-53809" not found'))
+        self.refused("GET", "/v1/pods/duckpond-53809", None, 404, ['pods "duckpond-53809" not found', f"if pod duckpond-53809 was the warm pod, it has been replaced: the warm pod is now {WARM}"])
+
+    def test_a_call_to_the_warm_pod_itself_that_finds_nothing_names_no_other(self):
+        self.kube.answer("get", ran(code=1, err=f'Error from server (NotFound): pods "{WARM}" not found'))
+        status, answer = self.call("GET", f"/v1/pods/{WARM}")
+        self.assertEqual(status, 404)
+        self.assertNotIn("has been replaced", answer["error"])
+
+    def test_a_warm_pod_file_that_cannot_be_read_leaves_the_404_as_it_was(self):
+        self.signer.head = ran(code=1, err="ducktape: files could not read its query")
+        self.kube.answer("get", ran(code=1, err='Error from server (NotFound): pods "duckpond-53809" not found'))
+        status, answer = self.call("GET", "/v1/pods/duckpond-53809")
+        self.assertEqual((status, answer["error"]), (404, 'pod duckpond-53809 was not read: Error from server (NotFound): pods "duckpond-53809" not found'))
+
+    def test_a_404_from_builds_names_no_warm_pod(self):
+        self.gate.answers["exec"] = ran(code=2, err="build.sh: no run r0 in pod orthorymain (a run of an earlier warm pod is gone with it)")
+        self.kube.answer("exec", ran(code=2, err=f"build.sh: no run r0 in pod {WARM} (a run of an earlier warm pod is gone with it)"))
+        status, answer = self.call("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "stop", "r0"]}, headers=asked(90))
+        self.assertEqual(status, 404, answer)
+        self.assertNotIn("has been replaced", answer["error"])
+
+    def test_with_no_warm_pod_named_a_gone_pod_is_a_bare_404(self):
+        self.service.warm_pod = None
+        self.kube.answer("get", ran(code=1, err='Error from server (NotFound): pods "duckpond-53809" not found'))
+        status, answer = self.call("GET", "/v1/pods/duckpond-53809")
+        self.assertEqual(status, 404)
+        self.assertNotIn("has been replaced", answer["error"])
+
     def test_reroute_moves_each_queued_run_the_desktop_would_start_sooner(self):
         self.kube.answer("exec", ran(b"move w2 heavy 4 d29yZHMy\nmove w1 heavy 3 d29yZHMx\nkeep w3 a pack holds its result on this machine\n"), ran(b"w1: moved to run desktop:r1\nw2: moved to run desktop:r2\n"))
         self.gate.answers["exec lanes"] = ran(b"heavy 1\nlane 0\nquick:programs 0\n")

@@ -226,7 +226,11 @@ one up for another network.
   once it is sent, one reroute at a time (`pods_rerouted`, or
   `pods_reroute_failed` with its sentence). A call whose request egress says is gone runs nothing (502), and one egress can't be asked about runs and logs `pods_request_unchecked`. builds keeps each run it starts under the call's words (settings included), so a later call of the same words (a retry whose answer never came back) gets that run while the run's machine's `build.sh claim` says `same` (queued or running, the same call and JOB, and a branch it names still at the run's commit), following `moved` to the run that stands for it, and also while that machine can't be asked or forge can't say (`pods_run_claimed`; a `WAIT=1` call then waits on it); otherwise it starts its own (`pods_run_unclaimed`). As exec starts and ends wake the sweeper, one `build.sh ended` per machine holding such runs drops each that ended and follows each moved, keeping those of a machine it can't ask, and dropping those of a pod that is gone. Its exec takes build.sh's words as
   `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
-  stderr starts `builds: on <machine>`. `status`, `log`, `stop`, `wait` and
+  stderr starts `builds: on <machine>`. A call to any other pod that
+  answers 404 names the warm pod `PODS_WARM_POD` names now, when that is
+  another pod (`if pod X was the warm pod, it has been replaced: the warm
+  pod is now Y`), so a caller holding a replaced warm pod's name learns
+  the new one. `status`, `log`, `stop`, `wait` and
   `requeue` name their run as `<machine>:<run>` and go to that machine, or
   by its bare id (as build.sh's `read it with:` line and NOTIFY name it),
   and go to the first machine, the desktop then the warm pod, whose

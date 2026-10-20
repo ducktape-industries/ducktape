@@ -2927,6 +2927,25 @@ class Service:
         return 200, usage_of(pods, claims, summaries, quotas, self.kube.namespace)
 
     def answer(self, method, target, headers, body):
+        try:
+            return self.route(method, target, headers, body)
+        except Refused as refusal:
+            raise self.replaced(target, refusal) from refusal
+
+    def replaced(self, target, refusal):
+        segments = [segment for segment in urlsplit(target).path.split("/") if segment]
+        if refusal.status != 404 or segments[:2] != ["v1", "pods"] or len(segments) < 3 or segments[2] in (DESKTOP, BUILDS) or not self.warm_pod:
+            return refusal
+        name = segments[2]
+        try:
+            current = self.warm()
+        except Refused:
+            return refusal
+        if current == name:
+            return refusal
+        return Refused(404, f"{refusal.sentence}; if pod {name} was the warm pod, it has been replaced: the warm pod is now {current}")
+
+    def route(self, method, target, headers, body):
         parts = urlsplit(target)
         segments = [segment for segment in parts.path.split("/") if segment]
         query = parse_qs(parts.query, keep_blank_values=True)
