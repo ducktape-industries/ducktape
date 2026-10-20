@@ -568,7 +568,10 @@ one up for another network.
     `/v1/status` at `node-http.duckpond.svc:8844`: bad under 0.7 blocks/s;
     a sample the node does not answer starts the window again;
   - the node's `/v1/status`, and the public one at
-    `duckpond.ducktape.industries` while the node's answers;
+    `duckpond.ducktape.industries` while the node's answers. The node's
+    turns bad on its first failed sample, the public one only on its second
+    in a row: a first logs `bad_held`, and an ok or unread sample ends the
+    row, which its claim `state` keeps across a restart;
   - harness's `Budget`: bad while any account or window has an Anthropic
     status other than `allowed`;
   - ccs, when `WATCH_CCS` names it: bad when `/ccs/status` gets no answer

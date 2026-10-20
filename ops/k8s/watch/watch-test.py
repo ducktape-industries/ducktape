@@ -248,6 +248,28 @@ class Decide(unittest.TestCase):
         self.assertEqual(texts, ["🔴 block rate: value bad", "🟢 block rate is good again: value ok"])
         self.assertEqual([item["id"] for item in state["outbox"]], ["watch-rate-bad-2", "watch-rate-ok-5"])
 
+    def test_the_public_url_turns_bad_on_its_second_failed_sample_in_a_row_and_the_node_on_its_first(self):
+        def public(seen):
+            return watch.Reading("public", "public /v1/status", seen, f"value {seen}")
+
+        state = watch.fresh_state()
+        for at, seen in enumerate((watch.OK, watch.BAD, watch.OK, watch.BAD, watch.UNREAD, watch.BAD)):
+            state = watch.decide(state, [public(seen)], at)
+        self.assertEqual(state["outbox"], [])
+        state = watch.decide(state, [public(watch.BAD)], 6)
+        state = watch.decide(state, [public(watch.BAD)], 7)
+        self.assertEqual([item["id"] for item in state["outbox"]], ["watch-public-bad-6"])
+        state = watch.decide(state, [reading(watch.BAD, "node")], 8)
+        self.assertEqual(state["outbox"][-1]["id"], "watch-node-bad-8")
+
+    def test_a_state_saved_before_streaks_loads_with_none_and_decides(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "state.json"
+            path.write_text(json.dumps({"checks": {}, "unread": [], "outbox": []}))
+            old = watch.Store(path).load()
+        state = watch.decide(old, [watch.Reading("public", "public /v1/status", watch.BAD, "v")], 1)
+        self.assertEqual((state["outbox"], state["streaks"]), ([], {"public": 1}))
+
     def test_a_check_bad_from_the_start_posts(self):
         state = watch.decide(watch.fresh_state(), [reading(watch.BAD, "ccs")], 7)
         self.assertEqual(len(state["outbox"]), 1)
@@ -450,6 +472,26 @@ class Whole(unittest.TestCase):
             self.assertTrue(texts[0].startswith("🔴 block rate: 0.50 blocks/s"))
             self.assertTrue(texts[1].startswith("🟢 block rate is good again"))
             self.assertEqual(json.loads(store.path.read_text())["checks"]["rate"]["seen"], watch.OK)
+
+    def test_one_failed_public_sample_is_silent_and_two_in_a_row_post_across_a_restart(self):
+        config = watch.Config(NODE, PUBLIC, "", "alerts", (), ())
+        up, down = (200, status(1)), watch.Unread("timed out")
+        http = FakeHttp({NODE + "/v1/status": (200, status(1))})
+        cli = FakeCli()
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "state.json"
+
+            def tick(public):
+                http.answers[PUBLIC + "/v1/status"] = public
+                watch.Watch(config, http, ready_kube(), cli, watch.Store(path), watch.Pager([]), Clock()).tick()
+
+            for public in (up, down, up, down):
+                tick(public)
+            self.assertEqual(cli.ops, [])
+            tick(down)
+            tick(up)
+            texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+            self.assertEqual(texts, ["🔴 public /v1/status: no answer: timed out", "🟢 public /v1/status is good again: height 1"])
 
     def test_a_post_that_landed_before_the_pod_stopped_is_not_posted_again(self):
         config = watch.Config(NODE, PUBLIC, "", "alerts", (), ())

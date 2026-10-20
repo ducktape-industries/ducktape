@@ -26,6 +26,7 @@ SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 LEVELS = {"alert_unposted": "warn", "check_unread": "warn", "page_failed": "warn"}
 OK, BAD, UNREAD = "ok", "bad", "unread"
 MARKS = {BAD: "🔴", OK: "🟢"}
+BAD_AFTER = {"public": 2}
 
 
 class Unread(Exception):
@@ -302,7 +303,7 @@ class Config:
 
 
 def fresh_state():
-    return {"checks": {}, "unread": [], "outbox": []}
+    return {"checks": {}, "unread": [], "streaks": {}, "outbox": []}
 
 
 def message_text(reading):
@@ -316,8 +317,11 @@ def message_text(reading):
 def decide(state, readings, now_ms):
     checks = dict(state["checks"])
     unread_now = set(state["unread"])
+    streaks = dict(state["streaks"])
     outbox = list(state["outbox"])
     for reading in readings:
+        if reading.check in BAD_AFTER:
+            streaks[reading.check] = streaks.get(reading.check, 0) + 1 if reading.seen == BAD else 0
         if reading.seen == UNREAD:
             if reading.check not in unread_now:
                 say("check_unread", check=reading.check, detail=reading.value)
@@ -329,12 +333,15 @@ def decide(state, readings, now_ms):
         quiet_start = held is None and reading.seen == OK
         if unchanged:
             continue
+        if reading.seen == BAD and streaks.get(reading.check, 1) < BAD_AFTER.get(reading.check, 1):
+            say("bad_held", check=reading.check, samples=streaks[reading.check], value=reading.value)
+            continue
         checks[reading.check] = {"seen": reading.seen, "since": now_ms, "value": reading.value}
         if quiet_start:
             continue
         say("turned", check=reading.check, seen=reading.seen, value=reading.value)
         outbox.append({"id": f"watch-{reading.check}-{reading.seen}-{now_ms}", "text": message_text(reading), "tried": 0})
-    return {**state, "checks": checks, "unread": sorted(unread_now), "outbox": outbox}
+    return {**state, "checks": checks, "unread": sorted(unread_now), "streaks": streaks, "outbox": outbox}
 
 
 def post_op(channel, item):
@@ -401,7 +408,7 @@ class Store:
         self.path = path
 
     def load(self):
-        return json.loads(self.path.read_text()) if self.path.exists() else fresh_state()
+        return {**fresh_state(), **json.loads(self.path.read_text())} if self.path.exists() else fresh_state()
 
     def save(self, state):
         temp = self.path.with_suffix(".tmp")
