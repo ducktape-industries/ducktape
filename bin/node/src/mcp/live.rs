@@ -1,6 +1,6 @@
 //! The node `ducktape mcp` speaks to: each program's live code and the sections it carries, the
 //! active wallet key's signed queries and ops, and chunk blobs put through the node's upload.
-use abi::role::identity::{Query, Reply};
+use abi::role::identity::{AccountNumber, Query, Reply};
 use abi::{BlobId, Outcome, role};
 use commonware_cryptography::{Signer as _, ed25519};
 use host::Layer;
@@ -17,6 +17,7 @@ pub struct Live<'a> {
     client: &'a Client,
     key: ed25519::PrivateKey,
     whom: String,
+    number: AccountNumber,
 }
 
 impl<'a> Live<'a> {
@@ -30,13 +31,18 @@ impl<'a> Live<'a> {
             client,
             key,
             whom: String::new(),
+            number: 0,
         };
-        live.whom = live.account().await?;
+        (live.whom, live.number) = live.account().await?;
         Ok(live)
     }
 }
 
 impl Live<'_> {
+    pub fn number(&self) -> AccountNumber {
+        self.number
+    }
+
     fn public(&self) -> String {
         hex::encode(self.key.public_key().as_ref())
     }
@@ -85,7 +91,7 @@ impl Live<'_> {
         abi::decode(&answer).map_err(|refusal| refusal.sentence)
     }
 
-    async fn account(&self) -> Result<String, String> {
+    async fn account(&self) -> Result<(String, AccountNumber), String> {
         let status = self.client.status().await.sentence()?;
         let program = status
             .roles
@@ -110,14 +116,15 @@ impl Live<'_> {
             },
         };
         let (profile, manager) = super::agent(&self.public(), profile)?;
-        Ok(format!(
+        let whom = format!(
             "You act on network {} through the node at {} as agent account {} ({}), managed by account {manager}, with the key {}. Every op you send with network_call and every file you write with files_write is that account's, and each program decides what it may do. network_schema with no program lists the programs that run.",
             status.network,
             self.client.base(),
             profile.number,
             profile.name,
             self.public()
-        ))
+        );
+        Ok((whom, profile.number))
     }
 }
 

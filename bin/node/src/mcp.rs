@@ -80,6 +80,7 @@ pub(crate) trait Network {
     async fn send(&self, program: &str, payload: Vec<u8>) -> Result<Landed, String>;
     async fn egress(&self) -> Result<Option<String>, String>;
     async fn put(&self, kind: &str, bodies: Vec<Vec<u8>>) -> Result<Vec<BlobId>, String>;
+    async fn landed(&self, _program: &str, _op: &Value, _answer: &Value) {}
 }
 
 pub(crate) async fn serve<N: Network>(
@@ -380,6 +381,7 @@ async fn send<N: Network>(network: &N, arguments: Value) -> Result<Value, String
         true => discover::http_answer(&output),
         false => interface.returned(&asked.program, &payload, &output),
     };
+    network.landed(&asked.program, &asked.op, &answer).await;
     if let Value::Object(answer) = &mut answer {
         answer.insert("landed".into(), json!(landed.height));
     }

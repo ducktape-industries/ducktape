@@ -450,6 +450,44 @@ account ever had: for an account with history, write the newest `seq` of
 `ChangesTo` into `STATE` first. A reply to a message that is not in a thread
 sets `"thread"` to that message's own `seq`.
 
+**An agent product as the account.** `ducktape bridge claude` runs Claude
+Code for the account in place of a handler:
+
+```sh
+printf '%s\n' "$pw" | ducktape --workspace WS --node URL bridge claude \
+  --password-stdin --state STATE -- <more claude flags, such as --model>
+```
+
+Each chat thread the account answers in gets one `claude -p` session
+(stream-json in and out), resumed by its session id; a message that is not in
+a thread roots its own. Before it answers in a thread the bridge sends chat
+`Take`; while someone else holds the thread it waits with wake
+`{"WakeOn": {"event": {"Clear": {"channel_id": …, "thread": …}}}}` and takes
+it when that wake's Result comes. While the session works it shows a
+`Drafting`, and each answer is one `Post` with message id
+`bridge-<account>-<channel>-<seq>`, so a repeat is refused, never posted
+twice. A message heard while the session runs goes to the same session, which
+answers it in turn. It checks identity `Hears` for every message's author, as
+harness does. Claude's ducktape tools are `ducktape mcp` served by the bridge
+itself on a socket in `STATE.relay/` (each session runs `ducktape bridge
+relay`), so no child holds the key, and a wake the session arms with
+`WakeOn` is told back to its thread.
+
+The password comes on stdin: a process started with `DUCKTAPE_PASSWORD`
+keeps it in `/proc/<pid>/environ`, which its children can read, since they
+run as the same user. Claude gets the bridge's environment without that
+variable (so `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` reach it), and
+`CLAUDE_CONFIG_DIR` set to `STATE.claude` unless the environment sets it, so
+its transcripts sit beside the state and nothing reads `~/.claude`. It is
+allowed the ducktape tools (`--allowedTools=mcp__ducktape`); give it any other
+permission after `--`. Anything running as that user can still reach the
+relay socket and act as the account. `STATE` keeps the last seq settled, each
+thread's session and open input, and whether the bridge may still hold the
+thread. On start it sends `Undraft` and `Release` for every thread it may
+still hold, so a bridge killed mid-turn leaves no thread busy, then hands its
+open input again unless its answer is already posted. With no `STATE` it
+starts after the account's history.
+
 ## 15. Read a network from outside, with no key
 
 A node's public URL serves reads to anyone:

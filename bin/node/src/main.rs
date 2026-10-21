@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod bridge;
 mod json;
 mod machine;
 mod mcp;
@@ -159,6 +161,14 @@ enum Verb {
                  key that acts as no agent account"
     )]
     Mcp,
+    #[cfg(unix)]
+    #[command(
+        subcommand,
+        about = "answer as an agent account from an agent product: hear what attribution tells \
+                 the account, run one product session per chat thread it answers in, and draft \
+                 and post each answer, signed by the active wallet key"
+    )]
+    Bridge(BridgeVerb),
     #[command(about = "print a key's value; the key is hex, the value is raw")]
     Get {
         program: String,
@@ -566,6 +576,39 @@ enum VoteVerb {
     Role { role: String, op: Option<PathBuf> },
 }
 
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum BridgeVerb {
+    #[command(
+        about = "run Claude Code (claude -p, stream-json) for each chat thread the account answers \
+                 in, its ducktape tools this bridge's own MCP; arguments after -- go to every \
+                 claude it starts"
+    )]
+    Claude {
+        #[arg(
+            long,
+            help = "the bridge's state file: the last change it settled, each thread's session \
+                    and open input"
+        )]
+        state: PathBuf,
+        #[arg(long, default_value = "claude", help = "the claude program to run")]
+        claude: PathBuf,
+        #[arg(
+            long,
+            help = "read the wallet password as one line on stdin, never from DUCKTAPE_PASSWORD, \
+                    whose value a child can read in /proc of its parent"
+        )]
+        password_stdin: bool,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    #[command(
+        about = "carry one MCP session between stdin and stdout and a running bridge's socket, \
+                 for the product sessions the bridge starts"
+    )]
+    Relay { socket: PathBuf, place: String },
+}
+
 #[derive(Subcommand)]
 enum MachineVerb {
     #[command(
@@ -797,6 +840,10 @@ fn execute(cli: Cli) -> Result<(), String> {
             let client = client(&workspace, cli.node)?;
             machine::run(&workspace, client, config, child)
         }
+        #[cfg(unix)]
+        Verb::Bridge(BridgeVerb::Relay { socket, place }) => {
+            client_runtime()?.block_on(bridge::relay(socket, place))
+        }
         Verb::Wallet(verb) if !matches!(verb, WalletVerb::Consent { .. }) => {
             wallet(&workspace, verb)
         }
@@ -991,6 +1038,25 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             mcp::serve(&live, input, tokio::io::stdout())
                 .await
                 .sentence()
+        }
+        #[cfg(unix)]
+        Verb::Bridge(BridgeVerb::Claude {
+            state,
+            claude,
+            password_stdin,
+            args,
+        }) => {
+            let key = bridge::key(workspace, password_stdin)?;
+            let asked = bridge::Asked {
+                state,
+                claude,
+                args,
+            };
+            bridge::claude(workspace, client, key, asked).await
+        }
+        #[cfg(unix)]
+        Verb::Bridge(BridgeVerb::Relay { .. }) => {
+            unreachable!("handled before the client is built")
         }
         Verb::Get {
             program,
