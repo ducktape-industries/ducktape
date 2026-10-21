@@ -79,7 +79,6 @@ SPEC = {
     "workdir": str,
     "resources": dict,
     "inputs": list,
-    "requester": int,
     "notify": dict,
 }
 RESOURCES = {"limits": dict, "requests": dict}
@@ -98,7 +97,7 @@ EXEC = {"command": list, "script": str, "container": str, "every": int}
 PUSH = {"path": str, "ref": str, "have": list, "container": str, "branch": str, "heads": list, "allow_stack": bool}
 READ = {"path": str, "offset": int, "length": int, "container": str}
 REPORT = {"report": str, "push": dict}
-APPLY = {"manifests": list, "requester": int}
+APPLY = {"manifests": list}
 DELETE = {"kind": str, "name": str}
 LOGS = {"tail", "since", "container"}
 WAIT = {"every"}
@@ -211,8 +210,6 @@ GO_SPACE = "\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\
 TYPE_FIELDS = {"apiversion": "apiVersion", "kind": "kind"}
 BINARY_SI = ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei")
 DECIMAL_SI = {-9: "n", -6: "u", -3: "m", 0: "", 3: "k", 6: "M", 9: "G", 12: "T", 15: "P", 18: "E"}
-INTEGER = re.compile(r"-?[0-9]+")
-U64_DIGITS = len(str(2**64 - 1))
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SAFE_GIT = "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'\n"
 HAVING = """having() {
@@ -1261,22 +1258,19 @@ def asked_by(headers):
     return asked
 
 
-def requester_for(asked, given):
-    if ASKER not in asked:
-        return given
-    if given is not None:
-        raise Refused(400, f"a call {FLEET_PROGRAM} relays names no requester: its requester is the run's asker, from {FLEET_ASKER}")
-    return asked[ASKER]
+def unrequested(body, what):
+    if isinstance(body, dict) and "requester" in body:
+        raise Refused(400, f"{what} names no requester: pods takes the requester from the account egress says sent the request (a call {FLEET_PROGRAM} relays: its {FLEET_ASKER}), so drop the field")
+    return body
 
 
 def labels_for(asked, requester):
     labels = {NOTE + name: asked[name] for name in ASKED}
-    requester = requester_for(asked, requester)
     if ASKER in asked:
         labels[RUN_LABEL] = asked[FLEET_RUN]
         labels[ATTEMPT_LABEL] = asked[FLEET_ATTEMPT]
     if requester is not None:
-        labels[REQUESTER] = str(number(requester, "requester"))
+        labels[REQUESTER] = str(requester)
     return labels
 
 
@@ -1414,7 +1408,7 @@ def input_volume(index, given, labels):
     return claimed(f"in-{index}", labels)
 
 
-def pod_spec(asked, spec, fetching, namespace):
+def pod_spec(asked, requester, spec, fetching, namespace):
     named(spec, ["image"], "a pod")
     env = spec.get("env", {})
     if not all(isinstance(value, str) for value in env.values()):
@@ -1453,7 +1447,7 @@ def pod_spec(asked, spec, fetching, namespace):
     }
     if "resources" in spec:
         body["resources"] = resources_of(spec["resources"])
-    labels = {**dict([MANAGED]), **labels_for(asked, spec.get("requester"))}
+    labels = {**dict([MANAGED]), **labels_for(asked, requester)}
     body["volumes"] = [claimed(OUT, labels)] + [input_volume(index, given, labels) for index, given in enumerate(inputs)]
     if inputs:
         body["initContainers"] = [fetch_container(inputs, fetching)]
@@ -2595,13 +2589,6 @@ def media_of(kind):
     return media
 
 
-def enveloped(given):
-    held = given.get("requester") if isinstance(given, dict) else None
-    if isinstance(held, Numeral) and INTEGER.fullmatch(held.text) and len(held.text.lstrip("-")) <= U64_DIGITS:
-        return {**given, "requester": int(held.text)}
-    return given
-
-
 def pod_limit(spec, resource):
     stated = ((spec.get("resources") or {}).get("limits") or {}).get(resource)
     if stated is not None:
@@ -3466,8 +3453,8 @@ class Service:
         return ran.out
 
     def create(self, asked, body):
-        spec = checked(body, SPEC, "a pod")
-        pod = pod_spec(asked, spec, self.fetching, self.kube.namespace)
+        spec = checked(unrequested(body, "a pod"), SPEC, "a pod")
+        pod = pod_spec(asked, self.requester(asked), spec, self.fetching, self.kube.namespace)
         ran = self.kube.create(pod)
         if ran.code == 0:
             return 201, warned({"pod": view(json.loads(ran.out))}, spec)
@@ -4079,6 +4066,9 @@ class Service:
             raise Refused(502, f"egress was not asked who sent request {asked['request']}: {why}")
         return sender_of(reply.out)
 
+    def requester(self, asked):
+        return asked[ASKER] if ASKER in asked else self.sender(asked)
+
     def warm_requester(self, name):
         if not self.warm_pod:
             return None
@@ -4329,8 +4319,8 @@ class Service:
                 raise kube_refusal(tried, f"{what} ({manifest['kind']} {manifest['metadata'].get('name', '')})'s pods would be refused")
 
     def apply(self, asked, body):
-        request = named(checked(enveloped(kept(body)), APPLY, "an apply"), ["manifests"], "an apply")
-        labels = labels_for(asked, request.get("requester"))
+        request = named(checked(unrequested(kept(body), "an apply"), APPLY, "an apply"), ["manifests"], "an apply")
+        labels = labels_for(asked, self.requester(asked))
         kinds = self.cluster_kinds()
         namespace = self.kube.namespace
         confined = []

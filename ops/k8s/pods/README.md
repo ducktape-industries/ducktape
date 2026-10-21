@@ -15,10 +15,13 @@ or through a member node's halo forward.
 - `server-test.py` covers the service over real HTTP against a recording kubectl, ducktape
   and kubelet: `python3 ops/k8s/pods/server-test.py` (also part of `make test`).
 - `server.py fetch` is each pod's init container, which fetches its inputs.
+- The requester of what `POST /v1/pods` and `POST /v1/manifests` make is the account egress
+  says sent the request (egress `Sender`, asked once per create), or a fleet call's asker. A
+  body naming a `requester` is refused 400; a create egress could not be asked about is refused
+  502 and makes nothing; a request egress names no account for makes it with no requester.
 - A call fleet relays for a machine (`ducktape-program` is `fleet`) names its run's asker in
   `fleet-asker`, which fleet stamps on every call it relays. The service makes that account the
-  requester of what the call makes, and refuses such a call with no account there or with a
-  `requester` of its own. Such a call reaches only its own run's pod: a pod it makes carries its
+  requester of what the call makes, and refuses such a call with no account there. Such a call reaches only its own run's pod: a pod it makes carries its
   `fleet-run` and `fleet-attempt` as labels, and it may read, wait for, exec in, put the outputs
   of and delete only a pod labelled with both; anything else, a build runner included, is 403.
 - Only the service writes `ducktape.industries/*` labels and annotations, which say whose object

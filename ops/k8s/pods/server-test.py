@@ -692,7 +692,8 @@ class StreamedExec(Streamed):
 class Create(Served):
     def test_a_pod_runs_the_agents_image_confined_at_agents_priority_with_an_out_container(self):
         self.kube.answer("create", ran(pod_json()))
-        spec = {"image": "toolchain", "command": ["make"], "args": ["wasm"], "env": {"A": "1"}, "workdir": "/w", "requester": 17}
+        self.signer.sender = sent_by(17)
+        spec = {"image": "toolchain", "command": ["make"], "args": ["wasm"], "env": {"A": "1"}, "workdir": "/w"}
         status, answer = self.call("POST", "/v1/pods", spec)
         self.assertEqual(status, 201)
         self.assertEqual(answer["pod"]["name"], "duckpond-41")
@@ -974,14 +975,13 @@ class Create(Served):
         self.refused("POST", "/v1/pods", {"command": ["make"]}, 400, ["names its image"])
         self.refused("POST", "/v1/pods", {"image": "t", "args": ["a", 1]}, 400, ["args holds strings"])
         self.refused("POST", "/v1/pods", {"image": "t", "env": {"A": 1}}, 400, ["env maps names to strings"])
-        self.refused("POST", "/v1/pods", {"image": "t", "requester": True}, 400, ["requester"])
-        self.refused("POST", "/v1/pods", {"image": "t", "requester": -1}, 400, ["number from 0"])
+        self.refused("POST", "/v1/pods", {"image": "t", "requester": True}, 400, ["names no requester"])
         self.refused("POST", "/v1/pods", {"image": "t", "notify": {"thread": 3}}, 400, ["names its channel"])
         self.assertNotIn("create", self.kube.verbs())
 
     def test_a_pod_records_where_to_post(self):
         self.kube.answer("create", ran(pod_json()))
-        self.call("POST", "/v1/pods", {"image": "t", "requester": 17, "notify": {"channel": "builds", "thread": 5}})
+        self.call("POST", "/v1/pods", {"image": "t", "notify": {"channel": "builds", "thread": 5}})
         notes = self.created()["metadata"]["annotations"]
         self.assertEqual(notes["ducktape.industries/notify-channel"], "builds")
         self.assertEqual(notes["ducktape.industries/notify-thread"], "5")
@@ -1047,7 +1047,7 @@ class Fleeted(Served):
     def test_a_call_fleet_relays_names_no_requester_of_its_own(self):
         status, answer = self.call("POST", "/v1/pods", {"image": "t", "requester": 15}, FLEETED)
         self.assertEqual(status, 400, answer)
-        self.assertIn("fleet-asker", answer["error"])
+        self.assertIn("names no requester", answer["error"])
         self.assertNotIn("create", self.kube.verbs())
 
     def test_a_call_fleet_relays_with_no_asker_it_reads_is_refused_before_anything_runs(self):
@@ -1061,10 +1061,65 @@ class Fleeted(Served):
                 self.assertIn("fleet-asker", answer["error"])
         self.assertEqual(self.kube.calls, [])
 
-    def test_another_programs_call_keeps_the_requester_its_body_names(self):
+    def test_another_programs_call_naming_a_fleet_asker_is_requested_by_its_sender(self):
         self.kube.answer("create", ran(pod_json()))
-        self.call("POST", "/v1/pods", {"image": "t", "requester": 15}, {**ASKED, "fleet-asker": "17"})
+        self.signer.sender = sent_by(15)
+        self.call("POST", "/v1/pods", {"image": "t"}, {**ASKED, "fleet-asker": "17"})
         self.assertEqual(self.created()["metadata"]["labels"]["ducktape.industries/requester"], "15")
+
+
+def sent_by(account):
+    return ran(server.u8(server.EGRESS_SENDER) + server.u8(1) + server.u64(account))
+
+
+class Requested(Served):
+    def test_a_pods_requester_is_the_account_egress_says_sent_its_request(self):
+        self.kube.answer("create", ran(pod_json()))
+        self.signer.sender = sent_by(21)
+        status, answer = self.call("POST", "/v1/pods", {"image": "t"})
+        self.assertEqual(status, 201, answer)
+        self.assertEqual(self.created()["metadata"]["labels"]["ducktape.industries/requester"], "21")
+        self.assertEqual(self.signer.senders, [server.egress_sender(41)])
+
+    def test_an_applys_requester_is_the_account_egress_says_sent_its_request(self):
+        self.kube.answer("apply", ran({"kind": "List", "items": [{"kind": "Deployment", "metadata": {"name": "web"}}]}))
+        self.signer.sender = sent_by(21)
+        status, answer = self.call("POST", "/v1/manifests", {"manifests": [deployment()]})
+        self.assertEqual(status, 200, answer)
+        (manifest,) = [call for call in self.kube.calls if call[0] == "apply"][0][1]
+        self.assertEqual(manifest["metadata"]["labels"]["ducktape.industries/requester"], "21")
+        self.assertEqual(manifest["spec"]["template"]["metadata"]["labels"]["ducktape.industries/requester"], "21")
+
+    def test_a_body_naming_a_requester_is_refused_whoever_it_names(self):
+        self.signer.sender = sent_by(21)
+        for requester in (17, 21):
+            with self.subTest(requester=requester):
+                self.refused("POST", "/v1/pods", {"image": "t", "requester": requester}, 400, ["names no requester", "egress says sent"])
+                self.refused("POST", "/v1/manifests", {"manifests": [deployment()], "requester": requester}, 400, ["names no requester", "egress says sent"])
+        self.assertNotIn("create", self.kube.verbs())
+        self.assertNotIn("apply", self.kube.verbs())
+
+    def test_a_request_egress_names_no_account_for_makes_a_pod_with_no_requester(self):
+        self.kube.answer("create", ran(pod_json(requester=None)))
+        status, answer = self.call("POST", "/v1/pods", {"image": "t"})
+        self.assertEqual(status, 201, answer)
+        self.assertNotIn("ducktape.industries/requester", self.created()["metadata"]["labels"])
+        self.assertEqual(self.signer.senders, [server.egress_sender(41)])
+
+    def test_a_create_egress_was_not_asked_about_makes_nothing(self):
+        self.signer.sender = ran(code=1, err="egress: no such query")
+        self.refused("POST", "/v1/pods", {"image": "t"}, 502, ["who sent request 41"])
+        self.refused("POST", "/v1/manifests", {"manifests": [deployment()]}, 502, ["who sent request 41"])
+        self.assertNotIn("create", self.kube.verbs())
+        self.assertNotIn("apply", self.kube.verbs())
+
+    def test_a_fleet_call_is_requested_by_its_asker_and_egress_is_not_asked(self):
+        self.kube.answer("create", ran(pod_json()))
+        self.signer.sender = sent_by(21)
+        status, answer = self.call("POST", "/v1/pods", {"image": "t"}, FLEETED)
+        self.assertEqual(status, 201, answer)
+        self.assertEqual(self.created()["metadata"]["labels"]["ducktape.industries/requester"], "17")
+        self.assertEqual(self.signer.senders, [])
 
 
 class Asked(Served):
@@ -1902,7 +1957,8 @@ class Manifests(Served):
         return [call for call in self.kube.calls if call[0] == "apply"]
 
     def test_a_deployment_is_labelled_confined_tried_then_applied(self):
-        status, answer = self.call("POST", "/v1/manifests", {"manifests": [deployment()], "requester": 17})
+        self.signer.sender = sent_by(17)
+        status, answer = self.call("POST", "/v1/manifests", {"manifests": [deployment()]})
         self.assertEqual((status, answer), (200, {"applied": [{"kind": "Deployment", "name": "web"}]}))
         self.assertEqual(self.kube.verbs(), ["cluster_kinds", "trial", "apply", "apply"])
         trial = self.kube.calls[1][1]
@@ -2187,7 +2243,8 @@ class Quantities(Served):
             {"apiVersion": "v1", "kind": "ResourceQuota", "metadata": {"name": "mine"}, "spec": {"hard": {"requests.memory": "0." + SEVENS}}},
             {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m"}, "data": {"zeros": ZEROS}},
         ]
-        body = numbered({"manifests": manifests, "requester": "@requester@"}, {"@cpu@": "1e-10000000", "@requester@": "17"})
+        body = numbered({"manifests": manifests}, {"@cpu@": "1e-10000000"})
+        self.signer.sender = sent_by(17)
         status, answer = self.call("POST", "/v1/manifests", body)
         self.assertEqual(status, 200, answer)
         (_, objects, _), (_, again, _) = [call for call in self.kube.calls if call[0] == "apply"]
