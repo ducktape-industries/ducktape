@@ -66,6 +66,15 @@ impl ReadSet {
         self.wholes.extend(other.wholes);
     }
 
+    pub fn programs(&self) -> impl Iterator<Item = &str> {
+        let pointed = self.points.keys();
+        let spanned = self.spans.keys();
+        pointed
+            .chain(spanned)
+            .chain(self.wholes.iter())
+            .map(String::as_str)
+    }
+
     pub fn touched(&self, written: &Written) -> bool {
         written
             .iter()

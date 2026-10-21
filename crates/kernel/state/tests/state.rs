@@ -443,3 +443,21 @@ fn a_second_adoption_writes_only_what_changed_since_the_first() {
         assert_eq!(joiner.view(vec![]).get("other", b"o").unwrap(), None);
     });
 }
+
+#[test]
+fn an_overlay_counts_every_write_and_a_restore_takes_none_back() {
+    let mut overlay = Overlay::default();
+    let start = overlay.mark();
+    overlay.set(APP, b"k".to_vec(), b"v".to_vec());
+    assert!(overlay.written_since(APP, start));
+    assert!(!overlay.written_since("other", start));
+    let checkpoint = overlay.checkpoint();
+    let before = overlay.mark();
+    overlay.set("other", b"k".to_vec(), b"v".to_vec());
+    overlay.delete(APP, b"k".to_vec());
+    overlay.restore(checkpoint);
+    assert_eq!(overlay.get("other", b"k"), None);
+    assert!(overlay.written_since("other", before));
+    assert!(overlay.written_since(APP, before));
+    assert_eq!(overlay.mark(), before + 2);
+}

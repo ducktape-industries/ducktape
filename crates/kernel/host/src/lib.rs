@@ -31,6 +31,7 @@ use state::{
 
 use crate::parked::Waiter;
 use crate::parking::{Run, Segment, Start, Status};
+use crate::reads::Recorder;
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
 pub use namespace::{BLOBS, INDEXED_AT, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT};
@@ -239,6 +240,27 @@ enum Submitted {
         receipt: Receipt,
         account: Option<identity::AccountNumber>,
     },
+}
+
+#[derive(Default)]
+pub(crate) struct Accounts(BTreeMap<Vec<u8>, Asked>);
+
+struct Asked {
+    code: Option<BlobId>,
+    reply: std::result::Result<Option<identity::AccountNumber>, Refusal>,
+    reads: ReadSet,
+    mark: u64,
+}
+
+impl Asked {
+    fn holds(&self, code: Option<BlobId>, overlay: &Overlay) -> bool {
+        let same_code = self.code == code;
+        let unwritten = self
+            .reads
+            .programs()
+            .all(|program| !overlay.written_since(program, self.mark));
+        same_code && unwritten
+    }
 }
 
 impl Submitted {
@@ -849,6 +871,7 @@ where
         let mut submissions = Vec::new();
         let mut records = Vec::new();
         let mut slowest: Option<Slowest> = None;
+        let mut accounts = Accounts::default();
         for (position, submission) in block.submissions.into_iter().enumerate() {
             let began = self.store.clock().current();
             let signer = submission.signer.clone();
@@ -861,6 +884,7 @@ where
                     block.time,
                     &mut overlay,
                     &mut stage,
+                    &mut accounts,
                 )
                 .await?;
             let receipt = match submitted {
@@ -944,6 +968,7 @@ where
         time: u64,
         overlay: &mut Overlay,
         stage: &mut Stage,
+        accounts: &mut Accounts,
     ) -> Result<Submitted> {
         let id = submission.id();
         let view = self.committed.view(vec![&*overlay]);
@@ -956,9 +981,8 @@ where
         }
         overlay.set(LOCAL, id.to_vec(), Vec::new());
         let asked = identity::Query::Account(submission.signer.clone());
-        let fuel = &mut self.loaded.limits().fuel;
         let account = match self
-            .account(asked, height, time, overlay, stage, fuel)
+            .known(accounts, asked, height, time, overlay, stage)
             .await?
         {
             Ok(account) => account,
@@ -1206,6 +1230,40 @@ where
         }))
     }
 
+    async fn known(
+        &self,
+        accounts: &mut Accounts,
+        asked: identity::Query,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<std::result::Result<Option<identity::AccountNumber>, Refusal>> {
+        let code = self.loaded.code(self.role(role::IDENTITY)?);
+        let key = abi::encode(&asked);
+        if let Some(known) = accounts.0.get(&key)
+            && known.holds(code, overlay)
+        {
+            return Ok(known.reply.clone());
+        }
+        let mark = overlay.mark();
+        let recorder = Recorder::default();
+        let world = World {
+            recorder: Some(&recorder),
+            ..self.world(height, time)
+        };
+        let fuel = &mut self.loaded.limits().fuel;
+        let reply = self.account_in(asked, world, overlay, stage, fuel).await?;
+        let known = Asked {
+            code,
+            reply: reply.clone(),
+            reads: recorder.into_reads(),
+            mark,
+        };
+        accounts.0.insert(key, known);
+        Ok(reply)
+    }
+
     /// The account the identity role says a frame acts as: the one a key
     /// holds (`Account`), or a program's own (`OfProgram`). The role's
     /// refusal, or a reply that is not its interface's, rejects the frame.
@@ -1218,8 +1276,20 @@ where
         stage: &Stage,
         fuel: &mut Option<u64>,
     ) -> Result<std::result::Result<Option<identity::AccountNumber>, Refusal>> {
+        let world = self.world(height, time);
+        self.account_in(asked, world, overlay, stage, fuel).await
+    }
+
+    async fn account_in<'w>(
+        &'w self,
+        asked: identity::Query,
+        world: World<'w, E>,
+        overlay: &'w Overlay,
+        stage: &'w Stage,
+        fuel: &mut Option<u64>,
+    ) -> Result<std::result::Result<Option<identity::AccountNumber>, Refusal>> {
         let reply = unit::query(
-            self.world(height, time),
+            world,
             vec![overlay],
             stage,
             &[],
@@ -2399,7 +2469,32 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use state::{LOCAL, Storage, Writes};
 
-    use super::{SPENT, namespace, rebuild_index};
+    use abi::BlobId;
+    use state::Overlay;
+
+    use super::{Asked, ReadSet, SPENT, namespace, rebuild_index};
+
+    #[test]
+    fn an_asked_account_holds_until_a_program_it_read_is_written_or_its_code_changes() {
+        let code = Some(BlobId::Sha256([1; 32]));
+        let mut overlay = Overlay::default();
+        overlay.set("probe", b"k".to_vec(), b"v".to_vec());
+        let mut reads = ReadSet::default();
+        reads.point("identity", b"signer");
+        let asked = Asked {
+            code,
+            reply: Ok(Some(5)),
+            reads,
+            mark: overlay.mark(),
+        };
+        overlay.set("probe", b"k2".to_vec(), b"v".to_vec());
+        assert!(asked.holds(code, &overlay));
+        assert!(!asked.holds(Some(BlobId::Sha256([2; 32])), &overlay));
+        let checkpoint = overlay.checkpoint();
+        overlay.set("identity", b"other".to_vec(), b"v".to_vec());
+        overlay.restore(checkpoint);
+        assert!(!asked.holds(code, &overlay));
+    }
 
     #[test]
     fn a_rebuild_writes_no_batch_past_its_bound_whatever_one_anchor_holds() {

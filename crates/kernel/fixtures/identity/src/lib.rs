@@ -48,6 +48,12 @@ mod program {
             }
             let (key, account): (Vec<u8>, identity::AccountNumber) = abi::decode(payload)?;
             ctx.set(key, abi::encode(&account));
+            if account == identity::AccountNumber::MAX {
+                return Err(Refusal::new(
+                    reason::INVALID_INPUT,
+                    "no account is numbered so",
+                ));
+            }
             Ok(())
         }
 

@@ -17,8 +17,8 @@ use state::{Committed, Overlay, Pinned, View};
 use crate::reads::{ReadSet, Recorder};
 use crate::unit::{self, Loaded, Runs, World};
 use crate::{
-    BLOBS, Error, Layer, NETWORK, Preconfirmed, RECENT, Result, Submission, Tip, bound, corrupt,
-    fresh, member_cap_of, namespace, programs_of, runnable, sync_code,
+    Accounts, BLOBS, Error, Layer, NETWORK, Preconfirmed, RECENT, Result, Submission, Tip, bound,
+    corrupt, fresh, member_cap_of, namespace, programs_of, runnable, sync_code,
 };
 
 pub struct Source<'a, E>
@@ -408,6 +408,7 @@ where
         preconfirmed: &mut Preconfirmed,
     ) -> Result<Vec<Receipt>> {
         let mut receipts = Vec::new();
+        let mut accounts = Accounts::default();
         for submission in submissions {
             let submitted = self
                 .submit(
@@ -416,6 +417,7 @@ where
                     time,
                     &mut preconfirmed.overlay,
                     &mut preconfirmed.stage,
+                    &mut accounts,
                 )
                 .await?;
             receipts.push(submitted.receipt());

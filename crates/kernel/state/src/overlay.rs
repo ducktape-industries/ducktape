@@ -12,6 +12,8 @@ pub type Slotted<'a> = (&'a [u8], Option<&'a [u8]>);
 pub struct Overlay {
     programs: BTreeMap<ProgramId, BTreeMap<Vec<u8>, Slot>>,
     undo: Vec<Undo>,
+    writes: u64,
+    written: BTreeMap<ProgramId, u64>,
 }
 
 #[derive(Clone)]
@@ -52,6 +54,16 @@ impl Overlay {
             key,
             before,
         });
+        self.writes += 1;
+        self.written.insert(program.to_owned(), self.writes);
+    }
+
+    pub fn mark(&self) -> u64 {
+        self.writes
+    }
+
+    pub fn written_since(&self, program: &str, mark: u64) -> bool {
+        self.written.get(program).is_some_and(|at| *at > mark)
     }
 
     pub fn checkpoint(&self) -> Checkpoint {
