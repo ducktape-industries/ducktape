@@ -44,7 +44,8 @@ fn node(context: &Context, seed: u64, egress: Option<u64>) -> Node {
     let key = identity.public_key();
     let config = Config {
         egress_bytes_per_sec: egress,
-        udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into(),
+        reach: halo::Https::shared(),
         queues: Queues::default(),
     };
     let halo = Arc::new(Halo::start(context, identity, config).unwrap());
@@ -52,6 +53,7 @@ fn node(context: &Context, seed: u64, egress: Option<u64>) -> Node {
     let seat = Seat {
         key: key.clone(),
         halo: format!("localhost:{}", halo.udp().unwrap().port()),
+        https: None,
         validator: true,
     };
     let echo = Arc::new(

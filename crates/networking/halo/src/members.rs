@@ -1,5 +1,5 @@
 //! The current member set halo admits and dials: each member's key, the halo address it
-//! registered on the chain, and whether it votes.
+//! registered on the chain, the HTTPS address it serves if any, and whether it votes.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -10,6 +10,7 @@ use commonware_cryptography::ed25519::PublicKey;
 pub struct Seat {
     pub key: PublicKey,
     pub halo: String,
+    pub https: Option<String>,
     pub validator: bool,
 }
 
@@ -54,6 +55,24 @@ impl Members {
         Some(self.read().get(key)?.halo.clone())
     }
 
+    pub fn https(&self, key: &PublicKey) -> Option<String> {
+        self.read().get(key)?.https.clone()
+    }
+
+    pub fn https_asked(&self, me: &PublicKey) -> Vec<String> {
+        let seats = self.read();
+        let mine = seats.get(me).and_then(|seat| seat.https.clone());
+        let mut others: Vec<(&PublicKey, &String)> = seats
+            .values()
+            .filter(|seat| seat.key != *me)
+            .filter_map(|seat| Some((&seat.key, seat.https.as_ref()?)))
+            .collect();
+        others.sort();
+        mine.into_iter()
+            .chain(others.into_iter().map(|(_, https)| https.clone()))
+            .collect()
+    }
+
     pub fn candidates(&self, me: &PublicKey, first: Option<&PublicKey>) -> Vec<PublicKey> {
         let seats = self.read();
         let mut validators: Vec<&PublicKey> = Vec::new();
@@ -95,6 +114,7 @@ mod tests {
         Seat {
             key: key(seed),
             halo: format!("localhost:{seed}"),
+            https: None,
             validator,
         }
     }
@@ -147,5 +167,24 @@ mod tests {
                 .iter()
                 .all(|k| *k != key(9))
         );
+    }
+
+    #[test]
+    fn a_member_asks_its_own_https_first_then_the_others_in_key_order() {
+        let members = Members::default();
+        let served = |seed: u64| Seat {
+            https: Some(format!("wss://member-{seed}.example")),
+            ..seat(seed, true)
+        };
+        members.seat([served(1), served(2), seat(3, false), served(4)]);
+        let mut others = vec![(key(1), 1), (key(4), 4)];
+        others.sort();
+        let expected: Vec<String> = std::iter::once(2)
+            .chain(others.into_iter().map(|(_, seed)| seed))
+            .map(|seed| format!("wss://member-{seed}.example"))
+            .collect();
+        assert_eq!(members.https_asked(&key(2)), expected);
+        let unserved: Vec<String> = members.https_asked(&key(3));
+        assert_eq!(unserved.len(), 3);
     }
 }

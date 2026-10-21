@@ -169,6 +169,7 @@ impl Node {
         Seat {
             key: self.key.clone(),
             halo: format!("localhost:{}", self.halo.udp().unwrap().port()),
+            https: None,
             validator: true,
         }
     }
@@ -179,7 +180,8 @@ fn node(context: Context, seed: u64, ledger: Arc<Ledger>) -> Node {
     let key = identity.public_key();
     let config = halo::Config {
         egress_bytes_per_sec: Some(1 << 30),
-        udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into(),
+        reach: halo::Https::shared(),
         queues: halo::Queues::default(),
     };
     let halo = Arc::new(Halo::start(&context.child("halo"), identity.clone(), config).unwrap());
@@ -1899,6 +1901,7 @@ fn a_member_that_cannot_be_reached_slows_no_other() {
         let dead = Seat {
             key: PrivateKey::from_seed(3).public_key(),
             halo: format!("localhost:{}", hole.local_addr().unwrap().port()),
+            https: None,
             validator: true,
         };
         for node in [&first, &second] {

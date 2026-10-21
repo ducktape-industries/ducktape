@@ -15,6 +15,7 @@ fn seated(keys: &[&PublicKey]) -> Arc<Members> {
     members.seat(keys.iter().map(|key| Seat {
         key: (*key).clone(),
         halo: "localhost:1".into(),
+        https: None,
         validator: true,
     }));
     members

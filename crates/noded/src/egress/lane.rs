@@ -399,8 +399,9 @@ pub async fn serve_box<E: commonware_runtime::Metrics>(
     let key = workspace.identity()?;
     let config = halo::Config {
         egress_bytes_per_sec: None,
-        udp,
+        udp: udp.into(),
         queues: halo::Queues::default(),
+        reach: halo::Https::shared(),
     };
     let halo = Halo::start(context, key.clone(), config)
         .map_err(|error| Error::Address(format!("--halo: {error}")))?;

@@ -482,7 +482,8 @@ async fn start<E: Context>(
             identity.clone(),
             halo::Config {
                 egress_bytes_per_sec: halo.egress_bytes_per_sec,
-                udp: listeners.halo,
+                udp: listeners.halo.into(),
+                reach: halo::Https::shared(),
                 queues: halo.queues(),
             },
         )
@@ -925,6 +926,7 @@ pub fn seats(members: &[Member], validators: &[Vec<u8>]) -> Vec<Seat> {
             Some(Seat {
                 key,
                 halo: member.halo.clone(),
+                https: None,
                 validator,
             })
         })

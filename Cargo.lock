@@ -2355,6 +2355,7 @@ name = "halo"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "borsh",
  "bytes",
  "commonware-codec",
  "commonware-cryptography",
@@ -2363,9 +2364,11 @@ dependencies = [
  "halo",
  "quinn",
  "rcgen",
+ "reqwest 0.12.28",
  "rustls",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tracing",
  "tracing-subscriber",
  "x509-parser",

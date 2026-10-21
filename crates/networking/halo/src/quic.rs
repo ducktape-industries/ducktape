@@ -44,6 +44,23 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+impl Error {
+    pub fn unanswered(&self) -> bool {
+        matches!(self, Error::Connection(quinn::ConnectionError::TimedOut))
+    }
+}
+
+pub enum Udp {
+    Bound(std::net::UdpSocket),
+    Abstract(Arc<dyn quinn::AsyncUdpSocket>),
+}
+
+impl From<std::net::UdpSocket> for Udp {
+    fn from(socket: std::net::UdpSocket) -> Udp {
+        Udp::Bound(socket)
+    }
+}
+
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -223,38 +240,51 @@ fn transport() -> Arc<quinn::TransportConfig> {
     Arc::new(transport)
 }
 
+fn server(certified: &Certified, members: &Arc<Members>) -> Result<quinn::ServerConfig, Error> {
+    let admit = Admit {
+        members: members.clone(),
+        expected: None,
+        algorithms: provider().signature_verification_algorithms,
+    };
+    let mut crypto = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(Arc::new(admit))
+        .with_single_cert(
+            vec![certified.cert.clone()],
+            PrivateKeyDer::Pkcs8(certified.key.clone_key()),
+        )?;
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    let crypto = QuicServerConfig::try_from(crypto)?;
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    server.transport_config(transport());
+    Ok(server)
+}
+
 pub struct Quic {
     endpoint: quinn::Endpoint,
-    certified: Certified,
+    certified: Arc<Certified>,
     members: Arc<Members>,
 }
 
 impl Quic {
     pub fn bind(
-        socket: std::net::UdpSocket,
+        udp: impl Into<Udp>,
         identity: &PrivateKey,
         members: Arc<Members>,
     ) -> Result<Quic, Error> {
-        let certified = certified(identity)?;
-        let admit = Admit {
-            members: members.clone(),
-            expected: None,
-            algorithms: provider().signature_verification_algorithms,
-        };
-        let mut crypto = rustls::ServerConfig::builder_with_provider(provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_client_cert_verifier(Arc::new(admit))
-            .with_single_cert(
-                vec![certified.cert.clone()],
-                PrivateKeyDer::Pkcs8(certified.key.clone_key()),
-            )?;
-        crypto.alpn_protocols = vec![ALPN.to_vec()];
-        let crypto = QuicServerConfig::try_from(crypto)?;
-        let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        server.transport_config(transport());
+        let certified = Arc::new(certified(identity)?);
+        Quic::on(udp.into(), certified, members)
+    }
+
+    fn on(udp: Udp, certified: Arc<Certified>, members: Arc<Members>) -> Result<Quic, Error> {
+        let server = server(&certified, &members)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| std::io::Error::other("halo runs QUIC on no async runtime"))?;
-        let endpoint = quinn::Endpoint::new(
+        let socket = match udp {
+            Udp::Bound(socket) => runtime.wrap_udp_socket(socket)?,
+            Udp::Abstract(socket) => socket,
+        };
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(server),
             socket,
@@ -265,6 +295,14 @@ impl Quic {
             certified,
             members,
         })
+    }
+
+    pub(crate) fn beside(&self, socket: Arc<dyn quinn::AsyncUdpSocket>) -> Result<Quic, Error> {
+        Quic::on(
+            Udp::Abstract(socket),
+            self.certified.clone(),
+            self.members.clone(),
+        )
     }
 
     pub fn endpoint(&self) -> &quinn::Endpoint {

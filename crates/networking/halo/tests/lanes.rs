@@ -26,6 +26,7 @@ fn pair() -> Pair {
     members.seat([server.clone(), client.clone()].map(|key| Seat {
         key,
         halo: "localhost:1".into(),
+        https: None,
         validator: true,
     }));
     let net = SimNet::new();
