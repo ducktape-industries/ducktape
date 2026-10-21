@@ -13,6 +13,8 @@ scripts back a `make` target; see the repository `Makefile`.
 
 ## A network's node on Kubernetes
 
+A roll to a new node contract follows `node-roll/README.md`: who is told, what is staged, and the order that keeps the app and the node on one contract.
+
 - `k8s/deploy NETWORK COMMIT [--found]` builds `k8s/Containerfile`: its
   first stage builds ducktape from `git archive COMMIT` with Rust 1.96.1 on
   Debian trixie, and the image runs that binary on trixie. Cargo.toml pins
