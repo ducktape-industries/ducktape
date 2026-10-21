@@ -21,6 +21,12 @@ or through a member node's halo forward.
   `requester` of its own. Such a call reaches only its own run's pod: a pod it makes carries its
   `fleet-run` and `fleet-attempt` as labels, and it may read, wait for, exec in, put the outputs
   of and delete only a pod labelled with both; anything else, a build runner included, is 403.
+- Only the service writes `ducktape.industries/*` labels and annotations, which say whose object
+  it is. A `/v1/manifests` manifest or a `/v1/k8s/` POST that names one is refused 403. A
+  `/v1/k8s/` PUT must name exactly those the object holds, read from the same path first, and a
+  PATCH of any type is judged by its dry run against that read. Both cover the object, its pod
+  template and its claim templates. The write is then sent held to the `resourceVersion` it was
+  judged at, so a write that lands in between makes Kubernetes refuse it 409.
 - A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and
   never ends (`ducktape-run done <run>`) is posted `run <run> lost with pod <pod>: <why>` in
   its channel, once, when the pod ends, when it is deleted, or when the service finds it gone

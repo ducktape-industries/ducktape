@@ -1608,6 +1608,67 @@ def dry_run(query):
     return "&".join([*([query] if query else []), "dryRun=All"])
 
 
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def listing(value):
+    return value if isinstance(value, list) else []
+
+
+def stamped_places(manifest):
+    places = [("the object", manifest)]
+    for template, spec in pod_specs(manifest) if isinstance(manifest.get("kind", ""), str) else []:
+        if template is not manifest:
+            places.append(("its pod template", template))
+        for volume in listing(mapping(spec).get("volumes")):
+            claim = mapping(mapping(mapping(volume).get("ephemeral")).get("volumeClaimTemplate"))
+            places.append((f"volume {mapping(volume).get('name')}'s claim template", claim))
+    for claim in listing(mapping(manifest.get("spec")).get("volumeClaimTemplates")):
+        places.append((f"claim template {mapping(mapping(claim).get('metadata')).get('name')}", mapping(claim)))
+    return places
+
+
+def stamps(manifest):
+    if not isinstance(manifest, dict):
+        return {}
+    return {
+        (where, field, key): value
+        for where, held in stamped_places(manifest)
+        for field in ("labels", "annotations")
+        for key, value in mapping(mapping(held.get("metadata")).get(field)).items()
+        if key.startswith(NOTE)
+    }
+
+
+def unmoved(before, after, what):
+    moved = sorted(place for place in before.keys() | after.keys() if place not in before or place not in after or before[place] != after[place])
+    if moved:
+        named = ", ".join(f"{field.removesuffix('s')} {key} on {where}" for where, field, key in moved)
+        raise Refused(403, f"{what} would set, change or remove {named}: only the pods service writes {NOTE}* labels and annotations, which say whose object it is")
+
+
+def held_to(body, version, media, what):
+    if version is None:
+        return body
+    if media == JSON_PATCH:
+        return [{"op": "test", "path": "/metadata/resourceVersion", "value": version}, *body]
+    meta = body.get("metadata", {}) if isinstance(body, dict) else None
+    if not isinstance(meta, dict):
+        raise Refused(400, f"{what} or its metadata is not a JSON object, so it could not be held to the object's resourceVersion")
+    named = meta.get("resourceVersion", version)
+    if named != version:
+        shown = named if isinstance(named, str) else written(named)
+        raise Refused(409, f"{what} names resourceVersion {shown}, and the object is at {version}: read it again")
+    return {**body, "metadata": {**meta, "resourceVersion": version}}
+
+
+def confined_as_given(manifest, what, cluster_kinds, namespace, labels):
+    decoded = as_decoded(manifest, what)[0]
+    given = stamps(decoded)
+    return confine_manifest(decoded, what, cluster_kinds, namespace, labels), given
+
+
 def state_of(statuses, name):
     found = [entry for entry in statuses if entry.get("name") == name]
     if not found or not found[0].get("state"):
@@ -4272,7 +4333,11 @@ class Service:
         labels = labels_for(asked, request.get("requester"))
         kinds = self.cluster_kinds()
         namespace = self.kube.namespace
-        confined = [confine_manifest(as_decoded(manifest, f"manifest {index}")[0], f"manifest {index}", kinds, namespace, labels) for index, manifest in enumerate(request["manifests"])]
+        confined = []
+        for index, manifest in enumerate(request["manifests"]):
+            made, given = confined_as_given(manifest, f"manifest {index}", kinds, namespace, labels)
+            unmoved({}, given, f"manifest {index}")
+            confined.append(made)
         reading = self.schemas.reading()
         objects = [reading.object(manifest, f"manifest {index}") for index, manifest in enumerate(confined)]
         for index, manifest in enumerate(objects):
@@ -4317,24 +4382,44 @@ class Service:
             home, operation = reading.operation(segments, method)
             if operation.body:
                 media = media_of(kind)
-                if method in ("POST", "PUT") and whole:
-                    body, kind = self.confined(asked, kept(body), reading), "application/json"
+                if method == "PATCH":
+                    return self.patched(target, query, whole, kind, media, reading.body(home, operation, media, kept(body)))
+                if whole:
+                    made, given = confined_as_given(kept(body), "the object", self.cluster_kinds(), self.kube.namespace, labels_for(asked, None))
+                    made, kind = reading.object(made, "the object"), "application/json"
                 else:
-                    body = written(reading.body(home, operation, media, kept(body))).encode()
-        if method == "PATCH" and whole:
-            tried = self.api.call(method, target.path, dry_run(query), body, kind)
-            refused = not 200 <= tried.status < 300
-            if refused:
-                return tried.status, tried
-            self.patchable(json.loads(tried.body))
+                    made = reading.body(home, operation, media, kept(body))
+                    given = stamps(made)
+                before, version = ({}, None) if method == "POST" else self.current(target.path)
+                unmoved(before, given, "the body")
+                if whole:
+                    self.tried(made, "the object")
+                body = written(held_to(made, version, None, "the body")).encode()
         answered = self.api.call(method, target.path, query, body, kind)
         return answered.status, answered
 
-    def confined(self, asked, manifest, reading):
-        what = "the object"
-        confined = reading.object(confine_manifest(as_decoded(manifest, what)[0], what, self.cluster_kinds(), self.kube.namespace, labels_for(asked, None)), what)
-        self.tried(confined, what)
-        return written(confined).encode()
+    def current(self, path):
+        answered = self.api.call("GET", path, "", b"", None)
+        if answered.status == 404:
+            return {}, None
+        if not 200 <= answered.status < 300:
+            raise Refused(answered.status, f"{path} was not read before the write, so its {NOTE}* labels and annotations could not be held as they are: Kubernetes answered {answered.status}")
+        held = json.loads(answered.body)
+        return stamps(held), mapping(mapping(held).get("metadata")).get("resourceVersion")
+
+    def patched(self, target, query, whole, kind, media, patch):
+        what = "the patch"
+        before, version = self.current(target.path)
+        body = written(held_to(patch, version, media, what)).encode()
+        tried = self.api.call("PATCH", target.path, dry_run(query), body, kind)
+        if not 200 <= tried.status < 300:
+            return tried.status, tried
+        result = json.loads(tried.body)
+        unmoved(before, stamps(result), what)
+        if whole:
+            self.patchable(result)
+        answered = self.api.call("PATCH", target.path, query, body, kind)
+        return answered.status, answered
 
     def patchable(self, result):
         what = "the patched object"
