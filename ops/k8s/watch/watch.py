@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# watch: duckpond's alarms, off the chain and read-only. Each sample reads the block rate, the node's and the public /v1/status, ccs, harness's model budget, the Kubernetes API, the disks and the Deployments duckpond runs on.
+# watch: duckpond's alarms, off the chain and read-only. Each sample reads the block rate, the node's and the public /v1/status, ccs, harness's model budget, the Kubernetes API, the disks, the Deployments duckpond runs on and the run container of the warm pod /shared/tools/warm-pod names.
 # It posts to chat channel `alerts` when a check turns bad and when it is good again, never waiting on a block, and hands an alert that no block carries by the next sample to the pager command `WATCH_PAGER` names.
 # ops/k8s/watch/watch.yaml runs it on fabrics-1, watch-test.py tests it, and `watch.py once` prints one sample.
 import json
@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,9 @@ SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 LEVELS = {"alert_unposted": "warn", "check_unread": "warn", "page_failed": "warn"}
 OK, BAD, UNREAD = "ok", "bad", "unread"
 MARKS = {BAD: "🔴", OK: "🟢"}
-BAD_AFTER = {"public": 2}
+BAD_AFTER = {"public": 2, "warm-pod": 2}
+SHAPE_ERRORS = (AttributeError, KeyError, TypeError, ValueError)
+WARM_POD_RUN = "run"
 
 
 class Unread(Exception):
@@ -239,6 +242,59 @@ def deployment_reading(kube, api, name):
     return judged(check, label, condition["status"] != "True", value)
 
 
+def warm_pod_named(cli, path):
+    stat = cli.query("files", {"Stat": {"at": None, "path": path}})["Stat"]
+    file = (stat["entry"] or {"node": {}})["node"].get("File")
+    holds_no_bytes = file is None or file["size"] == 0
+    if holds_no_bytes:
+        return ""
+    read = {"Read": {"at": stat["snapshot"], "len": file["size"], "offset": 0, "path": path}}
+    return bytes.fromhex(cli.query("files", read)["Contents"]["bytes"]).decode(errors="replace").strip()
+
+
+def run_container_reading(check, label, name, pod):
+    statuses = pod.get("status", {}).get("containerStatuses") or []
+    runs = [status for status in statuses if status["name"] == WARM_POD_RUN]
+    if not runs:
+        return unread(check, label, f"{name} reports no state for its {WARM_POD_RUN} container")
+    state = runs[0].get("state") or {}
+    ended = state.get("terminated")
+    if ended is not None:
+        return judged(check, label, True, f"{name}'s {WARM_POD_RUN} container ended: {ended.get('reason', 'no reason given')}, exit {ended.get('exitCode')}")
+    return judged(check, label, False, f"{name}'s {WARM_POD_RUN} container is {next(iter(state), 'in no state')}")
+
+
+def warm_pod_answer_reading(check, label, path, namespace, name, code, body):
+    match code:
+        case 200:
+            return run_container_reading(check, label, name, json.loads(body))
+        case 404:
+            return judged(check, label, True, f"{path} names {name}, which namespace {namespace} does not hold (404)")
+        case _:
+            return unread(check, label, f"the API answered {code} for pod {namespace}/{name}")
+
+
+def warm_pod_reading(cli, kube, api, path, namespace):
+    check, label = "warm-pod", "warm pod"
+    if api.seen != OK:
+        return unread(check, label, "the Kubernetes API is not ready")
+    try:
+        name = warm_pod_named(cli, path)
+    except Unread as error:
+        return unread(check, label, f"files did not answer: {error}")
+    except SHAPE_ERRORS as error:
+        return unread(check, label, f"files answered {path} in another shape: {error!r}")
+    if not name:
+        return judged(check, label, True, f"{path} names no pod")
+    try:
+        code, body = kube.get(f"/api/v1/namespaces/{namespace}/pods/{urllib.parse.quote(name, safe='')}")
+        return warm_pod_answer_reading(check, label, path, namespace, name, code, body)
+    except Unread as error:
+        return unread(check, label, f"no answer for pod {namespace}/{name}: {error}")
+    except SHAPE_ERRORS as error:
+        return unread(check, label, f"the API answered pod {namespace}/{name} in another shape: {error!r}")
+
+
 class Cli:
     def __init__(self, ducktape, node, workspace, keys, runner=subprocess.run):
         self.ducktape = ducktape
@@ -289,6 +345,8 @@ class Config:
     channel: str
     disks: tuple
     deployments: tuple
+    warm_pod_file: str = ""
+    warm_pod_namespace: str = ""
 
     @staticmethod
     def from_env(env):
@@ -299,6 +357,8 @@ class Config:
             channel=env["WATCH_CHANNEL"],
             disks=tuple(Disk.of(row) for row in json.loads(env["WATCH_DISKS"])),
             deployments=tuple(env["WATCH_DEPLOYMENTS"].split()),
+            warm_pod_file=env["WATCH_WARM_POD_FILE"],
+            warm_pod_namespace=env["WATCH_WARM_POD_NAMESPACE"],
         )
 
 
@@ -437,6 +497,8 @@ class Watch:
         if self.config.ccs:
             readings.append(ccs_reading(self.http, self.config.ccs))
         readings.extend(deployment_reading(self.kube, api, name) for name in self.config.deployments)
+        if self.config.warm_pod_file:
+            readings.append(warm_pod_reading(self.cli, self.kube, api, self.config.warm_pod_file, self.config.warm_pod_namespace))
         readings.extend(disk_read(disk, self.stat) for disk in self.config.disks)
         return readings
 
@@ -448,7 +510,7 @@ class Watch:
         self.store.save(self.state)
 
     def run(self, pause=time.sleep):
-        say("watching", channel=self.config.channel, deployments=list(self.config.deployments), disks=[disk.check for disk in self.config.disks])
+        say("watching", channel=self.config.channel, deployments=list(self.config.deployments), warm_pod=self.config.warm_pod_file, disks=[disk.check for disk in self.config.disks])
         while True:
             began = self.clock()
             self.tick()

@@ -736,6 +736,15 @@ one up for another network.
     condition of Deployments `duckpond/node`, `duckpond/ccs`,
     `duckpond/tunnel`, `pods/pods` and `pi-chief/pi-chief` (not the
     registry: a registry that fails shows as a roll that cannot pull);
+  - while the API is ready, the warm pod `/shared/tools/warm-pod` names:
+    files' `Stat` gives the file's size and snapshot, `Read` reads that
+    many bytes there, and watch gets that pod in namespace `agents`. It
+    is bad when the file is empty or missing, when the API answers 404
+    for the pod, and when the pod's container `run` is terminated, with
+    its reason and exit code: the pod stays Running while `out` lives,
+    and `run`'s restart count and last state stay empty. Like the public
+    URL it turns bad on its second bad sample in a row. A files read or
+    API answer that fails, or that is not a pod, is unread;
   - the node volume's free bytes as `df` counts them (`f_bavail`), in two
     rows: bad under 10 GB and under 6 GB, the node-volume plan's heads-up
     and fallback lines; fabrics-1's root disk, which holds the kubelet's
@@ -778,8 +787,8 @@ one up for another network.
   DUCKTAPE_COMMIT`, pushes it to the cluster node's registry and applies
   `k8s/watch/watch.yaml`: namespace `watch`, service account `watch`, a
   Role in `duckpond`, `pods` and `pi-chief` that may get only
-  those Deployments, the claim, a policy closing every inbound port, and
-  Deployment `watch`. Each DIR is an empty directory made beforehand on
+  those Deployments, one in `agents` that may get pods, the claim, a
+  policy closing every inbound port, and Deployment `watch`. Each DIR is an empty directory made beforehand on
   that filesystem. ccs's NetworkPolicy `duckpond/ccs-node-only` admits only
   the node, so `WATCH_CCS` is set once it also admits namespace `watch`.
 - `watch.py once`, run in its pod, prints one sample's readings and posts

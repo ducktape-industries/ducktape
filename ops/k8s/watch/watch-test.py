@@ -17,6 +17,13 @@ NODE = "http://node"
 PUBLIC = "https://public"
 CCS = "http://ccs"
 Stat = namedtuple("Stat", "f_blocks f_bfree f_bavail f_frsize")
+WARM_FILE = "/shared/tools/warm-pod"
+WARM = "duckpond-warm-20261021"
+WARM_PATH = f"/api/v1/namespaces/agents/pods/{WARM}"
+SNAPSHOT = {"Sha256": "a3cce76a042711ab8d3bad219c9d95a1e32ea3ce754c7d25fe17ff0a24a0c8e3"}
+RUNNING = {"running": {"startedAt": "2026-10-21T07:45:12Z"}}
+OOM = {"terminated": {"exitCode": 137, "reason": "OOMKilled", "startedAt": "2026-10-20T08:02:41Z", "finishedAt": "2026-10-21T07:30:06Z", "containerID": "containerd://5e1c"}}
+NOT_FOUND = json.dumps({"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure", "message": f'pods "{WARM}" not found', "reason": "NotFound", "details": {"name": WARM, "kind": "pods"}, "code": 404}).encode()
 
 
 class Killed(Exception):
@@ -38,6 +45,21 @@ BUDGET = {"accounts": [account("anthropic3-eph", windows=[("5h", "allowed", "0.2
 
 def deployment(ready, reason="MinimumReplicasAvailable"):
     return {"status": {"conditions": [{"type": "Available", "status": "True" if ready else "False", "reason": reason, "message": "m"}]}}
+
+
+def file_entry(path, held):
+    if held is None:
+        return None
+    return {"meta": [], "node": {"File": {"exec": False, "file": {"Sha256": "2fa87f0d297ac133358c60908e6e726948d2c768c35b6bff2ae0627b4d818e6c"}, "size": len(held)}}, "path": path}
+
+
+def warm_pod(run):
+    containers = [
+        {"name": "out", "ready": True, "restartCount": 0, "state": RUNNING, "lastState": {}},
+        {"name": "run", "ready": "running" in run, "restartCount": 0, "state": run, "lastState": {}},
+    ]
+    pod = {"kind": "Pod", "apiVersion": "v1", "metadata": {"name": WARM, "namespace": "agents"}, "status": {"phase": "Running", "containerStatuses": containers}}
+    return json.dumps(pod).encode()
 
 
 class FakeHttp:
@@ -63,8 +85,10 @@ class FakeKube:
 
 
 class FakeCli:
-    def __init__(self, budget=BUDGET):
+    def __init__(self, budget=BUDGET, files=None):
         self.budget = budget
+        self.files = {} if files is None else files
+        self.reads = []
         self.posted = {}
         self.ops = []
         self.failing = False
@@ -77,8 +101,22 @@ class FakeCli:
             if isinstance(self.budget, Exception):
                 raise self.budget
             return {"Budget": self.budget}
+        if program == "files":
+            return self.files_answer(query)
         found = self.posted.get(query["MessageById"]["message_id"])
         return {"Message": None if found is None else {"text": found}}
+
+    def files_answer(self, query):
+        if isinstance(self.files, Exception):
+            raise self.files
+        self.reads.append(query)
+        match query:
+            case {"Stat": {"at": None, "path": path}}:
+                return {"Stat": {"entry": file_entry(path, self.files.get(path)), "snapshot": SNAPSHOT}}
+            case {"Read": {"at": at, "len": length, "offset": offset, "path": path}}:
+                held = self.files[path]
+                part = held[offset : offset + length]
+                return {"Contents": {"bytes": part.hex(), "eof": offset + length >= len(held), "offset": offset, "size": len(held), "snapshot": at}}
 
     def op(self, program, op):
         self.ops.append(op)
@@ -229,6 +267,50 @@ class Deployments(unittest.TestCase):
         api = watch.api_reading(FakeKube({"/readyz": watch.Unread("refused")}))
         self.assertEqual(api.seen, watch.BAD)
         self.assertEqual(watch.deployment_reading(FakeKube({}), api, "pods/pods").seen, watch.UNREAD)
+
+
+API_UP = watch.Reading("kube", "Kubernetes API", watch.OK, "")
+
+
+def warm_read(files, answer, api=API_UP):
+    cli = FakeCli(files=files)
+    return watch.warm_pod_reading(cli, FakeKube({WARM_PATH: answer}), api, WARM_FILE, "agents"), cli
+
+
+class WarmPod(unittest.TestCase):
+    named = {WARM_FILE: f"{WARM}\n".encode()}
+
+    def test_a_running_run_container_is_ok_and_the_file_is_read_at_the_size_and_snapshot_stat_answered(self):
+        reading, cli = warm_read(self.named, (200, warm_pod(RUNNING)))
+        self.assertEqual((reading.check, reading.seen, reading.value), ("warm-pod", watch.OK, f"{WARM}'s run container is running"))
+        self.assertEqual(cli.reads, [{"Stat": {"at": None, "path": WARM_FILE}}, {"Read": {"at": SNAPSHOT, "len": 23, "offset": 0, "path": WARM_FILE}}])
+
+    def test_a_terminated_run_container_is_bad_with_its_reason_and_exit_code_while_out_runs_on(self):
+        reading, _ = warm_read(self.named, (200, warm_pod(OOM)))
+        self.assertEqual((reading.seen, reading.value), (watch.BAD, f"{WARM}'s run container ended: OOMKilled, exit 137"))
+
+    def test_a_named_pod_the_api_answers_404_for_is_bad(self):
+        reading, _ = warm_read(self.named, (404, NOT_FOUND))
+        self.assertEqual((reading.seen, reading.value), (watch.BAD, f"{WARM_FILE} names {WARM}, which namespace agents does not hold (404)"))
+
+    def test_an_empty_or_missing_file_is_bad(self):
+        for files in ({WARM_FILE: b""}, {WARM_FILE: b"\n"}, {}):
+            reading, _ = warm_read(files, watch.Unread("asked for no pod"))
+            self.assertEqual((reading.seen, reading.value), (watch.BAD, f"{WARM_FILE} names no pod"), files)
+
+    def test_a_failed_files_or_api_read_is_unread(self):
+        api_down = watch.Reading("kube", "Kubernetes API", watch.BAD, "")
+        cases = [
+            (watch.Unread("files did not answer"), (200, warm_pod(RUNNING)), API_UP),
+            (self.named, watch.Unread("connection refused"), API_UP),
+            (self.named, (503, b""), API_UP),
+            (self.named, (403, b""), API_UP),
+            (self.named, (200, b"<html>"), API_UP),
+            (self.named, (200, warm_pod(RUNNING)), api_down),
+        ]
+        for files, answer, api in cases:
+            reading, _ = warm_read(files, answer, api)
+            self.assertEqual(reading.seen, watch.UNREAD, (answer, reading.value))
 
 
 def reading(seen, check="rate"):
@@ -507,6 +589,22 @@ class Whole(unittest.TestCase):
             self.assertEqual(len(cli.ops), 1)
             self.assertEqual(json.loads(path.read_text())["outbox"], [])
 
+
+    def test_a_dead_run_container_posts_on_its_second_bad_sample_once_and_good_again_once(self):
+        config = watch.Config(NODE, PUBLIC, "", "alerts", (), (), warm_pod_file=WARM_FILE, warm_pod_namespace="agents")
+        http = FakeHttp({NODE + "/v1/status": (200, status(1)), PUBLIC + "/v1/status": (200, status(1))})
+        cli = FakeCli(files={WARM_FILE: f"{WARM}\n".encode()})
+        kube = ready_kube()
+        posted = []
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = watch.Watch(config, http, kube, cli, watch.Store(pathlib.Path(temp) / "state.json"), watch.Pager([]), Clock())
+            for run in (RUNNING, OOM, OOM, OOM, RUNNING):
+                kube.answers[WARM_PATH] = (200, warm_pod(run))
+                watcher.tick()
+                posted.append(len(cli.ops))
+        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        self.assertEqual(posted, [0, 0, 1, 1, 2])
+        self.assertEqual(texts, [f"🔴 warm pod: {WARM}'s run container ended: OOMKilled, exit 137", f"🟢 warm pod is good again: {WARM}'s run container is running"])
 
 if __name__ == "__main__":
     unittest.main()
