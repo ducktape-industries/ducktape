@@ -1,5 +1,6 @@
 //! Compiles the kernel fixture programs in crates/kernel/fixtures for wasm32, into a target
-//! directory of its own under OUT_DIR, so fixture-wasm hands the test suites fresh bytes.
+//! directory of its own under OUT_DIR, so fixture-wasm hands the test suites fresh bytes that
+//! name no path of the machine or tree they were built in.
 use std::env::{self, VarError};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,7 @@ fn main() -> Result<(), Error> {
 
     let target_dir = out.join("target");
     let status = nested(&cargo)
+        .env("CARGO_ENCODED_RUSTFLAGS", remapped(&fixtures)?)
         .args(BUILD)
         .arg("--manifest-path")
         .arg(&manifest)
@@ -114,6 +116,17 @@ fn source_dirs(cargo: &str, manifest: &Path) -> Result<Vec<PathBuf>, Error> {
         .filter(|package| package.source.is_none());
     let dirs = local.filter_map(|package| package.manifest_path.parent().map(Path::to_path_buf));
     Ok(dirs.collect())
+}
+
+fn remapped(fixtures: &Path) -> Result<String, Error> {
+    let tree = fixtures.join("../../..").canonicalize()?;
+    let home = match env::var_os("CARGO_HOME") {
+        Some(home) => PathBuf::from(home),
+        None => PathBuf::from(var("HOME")?).join(".cargo"),
+    };
+    let flags = [(tree, "/core"), (home, "/cargo")]
+        .map(|(from, to)| format!("--remap-path-prefix={}={to}", from.display()));
+    Ok(flags.join("\x1f"))
 }
 
 fn nested(cargo: &str) -> Command {

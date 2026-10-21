@@ -3,6 +3,7 @@
 macro_rules! fixtures {
     ($($name:ident => $file:literal),* $(,)?) => {
         $(pub const $name: &[u8] = include_bytes!(concat!(env!("FIXTURE_WASM"), "/", $file, ".wasm"));)*
+        pub const ALL: &[(&str, &[u8])] = &[$(($file, $name)),*];
     };
 }
 
