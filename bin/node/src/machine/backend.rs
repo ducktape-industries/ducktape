@@ -13,7 +13,11 @@ use tokio::sync::oneshot;
 
 use super::Talk;
 use super::decide::{End, Ending};
+use super::out::{self, Packed};
+use super::pods::Calls;
 use crate::Sentence as _;
+
+pub const COMMITS: &str = "commits";
 
 const GIT_REMOTE: &str = "git-remote-duck";
 
@@ -48,7 +52,15 @@ pub enum Input {
     Scratch {
         path: String,
         memory: bool,
+        size: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub repo: String,
+    pub commit: String,
+    pub path: String,
 }
 
 impl Input {
@@ -71,6 +83,7 @@ pub struct Forge {
 pub enum Kill {
     Group(Option<u32>),
     Container(Container),
+    Pod { name: String, calls: Calls },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,7 +168,7 @@ fn pair(value: &Value) -> Result<(String, String), String> {
     }
 }
 
-fn variant(value: &Value) -> Result<(&str, &Value), String> {
+pub fn variant(value: &Value) -> Result<(&str, &Value), String> {
     let object = value.as_object().filter(|object| object.len() == 1);
     let named = object.and_then(|object| object.iter().next());
     named
@@ -183,6 +196,7 @@ fn input(value: &Value) -> Result<Input, String> {
         "Scratch" => Ok(Input::Scratch {
             path: text(body, "path")?,
             memory: body["memory"].as_bool().unwrap_or(false),
+            size: optional(&body["size"]),
         }),
         other => Err(format!("an input this machine does not know: {other}")),
     }
@@ -213,11 +227,198 @@ pub fn refuses(backend: Backend, workload: &Workload, git: bool) -> Option<Strin
         (Backend::Podman, None) => {
             return Some("this machine runs work in podman, which needs an image".into());
         }
-        (Backend::Shell, None) | (Backend::Podman, Some(_)) => {}
+        (Backend::Pods, None) => {
+            return Some("this machine runs work on the pods service, which needs an image".into());
+        }
+        (Backend::Shell, None) | (Backend::Podman | Backend::Pods, Some(_)) => {}
+    }
+    if backend == Backend::Pods {
+        let disk = workload
+            .inputs
+            .iter()
+            .any(|input| matches!(input, Input::Scratch { memory: false, .. }));
+        return disk.then(|| {
+            "this machine runs work on the pods service, whose scratch is memory only".into()
+        });
     }
     let unclonable = forges && !git;
     unclonable
         .then(|| format!("{GIT_REMOTE} is not on this machine's PATH, so it clones no forge input"))
+}
+
+fn repo_name(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    let first = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    first && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn object_id(text: &str) -> bool {
+    let sized = text.len() == 40 || text.len() == 64;
+    sized
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn commit_line(line: &str) -> Option<Commit> {
+    let mut words = line.splitn(3, ' ');
+    let (repo, commit, path) = (words.next()?, words.next()?, words.next()?);
+    let read = repo_name(repo) && object_id(commit) && path.starts_with('/');
+    read.then(|| Commit {
+        repo: repo.to_owned(),
+        commit: commit.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
+pub fn commits(text: &str) -> (Vec<Commit>, Vec<String>) {
+    let mut read = Vec::new();
+    let mut refused = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match commit_line(line) {
+            Some(commit) => read.push(commit),
+            None => refused.push(format!(
+                "out/{COMMITS} line {line:?} is no `<repo> <commit> <path>`"
+            )),
+        }
+    }
+    (read, refused)
+}
+
+pub fn git_dir(
+    backend: Backend,
+    dir: &Path,
+    inputs: &[Input],
+    path: &str,
+) -> Result<PathBuf, String> {
+    match backend {
+        Backend::Shell => inside(&dir.join("work"), path),
+        Backend::Podman => mounted(dir, inputs, path),
+        Backend::Pods => Err(format!("{path} is packed in its pod")),
+    }
+}
+
+fn mounted(dir: &Path, inputs: &[Input], path: &str) -> Result<PathBuf, String> {
+    let under = inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| {
+            let rest = Path::new(path).strip_prefix(input.path()).ok()?;
+            Some((index, input, rest))
+        })
+        .max_by_key(|(_, input, _)| input.path().len());
+    let Some((index, input, rest)) = under else {
+        return Err(format!("{path} lies under no input of the run"));
+    };
+    if matches!(input, Input::Scratch { memory: true, .. }) {
+        return Err(format!(
+            "{path} lies in memory scratch, which the machine does not reach"
+        ));
+    }
+    let root = dir.join("mounts").join(index.to_string());
+    inside(&root, &rest.to_string_lossy())
+}
+
+fn repository(
+    backend: Backend,
+    dir: &Path,
+    inputs: &[Input],
+    path: &str,
+) -> Result<PathBuf, String> {
+    let at = git_dir(backend, dir, inputs, path)?;
+    let root = std::fs::canonicalize(dir).sentence()?;
+    let git = std::fs::canonicalize(at.join(".git"))
+        .map_err(|error| format!("{path} holds no git repository: {error}"))?;
+    let held = git.starts_with(&root) && git.is_dir();
+    if !held {
+        return Err(format!("{path}'s repository lies outside the run's folder"));
+    }
+    let shared = std::fs::symlink_metadata(git.join("commondir")).is_ok();
+    if shared {
+        return Err(format!(
+            "{path}'s repository shares another's objects (commondir)"
+        ));
+    }
+    let objects = std::fs::canonicalize(git.join("objects"))
+        .map_err(|error| format!("{path}'s repository holds no objects: {error}"))?;
+    let kept = objects.starts_with(&root) && objects.is_dir();
+    if !kept {
+        return Err(format!("{path}'s objects lie outside the run's folder"));
+    }
+    let borrowed = std::fs::symlink_metadata(objects.join("info").join("alternates")).is_ok();
+    if borrowed {
+        return Err(format!(
+            "{path}'s repository borrows objects from elsewhere (objects/info/alternates)"
+        ));
+    }
+    if let Some(link) = linked(&objects)? {
+        return Err(format!(
+            "{path}'s objects hold a link, {}, which the machine never follows",
+            link.display()
+        ));
+    }
+    Ok(git)
+}
+
+fn linked(dir: &Path) -> Result<Option<PathBuf>, String> {
+    for entry in std::fs::read_dir(dir).sentence()? {
+        let entry = entry.sentence()?;
+        let kind = entry.file_type().sentence()?;
+        if kind.is_symlink() {
+            return Ok(Some(entry.path()));
+        }
+        if kind.is_dir() {
+            let found = linked(&entry.path())?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub fn packs(backend: Backend, dir: &Path, inputs: &[Input]) -> (Vec<Packed>, Vec<String>) {
+    let listed = dir.join("out").join(COMMITS);
+    let plain = match std::fs::symlink_metadata(&listed) {
+        Ok(meta) => meta.file_type().is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!("out/{COMMITS} was not read: {error}")],
+            );
+        }
+    };
+    if !plain {
+        let why = format!("out/{COMMITS} is no plain file, and the machine never follows a link");
+        return (Vec::new(), vec![why]);
+    }
+    let text = match std::fs::read_to_string(&listed) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!("out/{COMMITS} was not read: {error}")],
+            );
+        }
+    };
+    let (lines, mut refused) = commits(&text);
+    let mut packs = Vec::new();
+    for line in lines {
+        match repository(backend, dir, inputs, &line.path) {
+            Ok(git) => packs.push(Packed {
+                git,
+                repo: line.repo,
+                commit: line.commit,
+            }),
+            Err(why) => refused.push(format!("{} {}: {why}", line.repo, line.commit)),
+        }
+    }
+    (packs, refused)
 }
 
 pub fn clones() -> bool {
@@ -296,6 +497,7 @@ fn host(
         (Backend::Podman, Input::Scratch { memory: true, .. }) => Ok(None),
         (Backend::Podman, _) => Ok(Some(dir.join("mounts").join(index.to_string()))),
         (Backend::Shell, input) => inside(&dir.join("work"), input.path()).map(Some),
+        (Backend::Pods, _) => Err("a pods machine places no input on its own disk".into()),
     }
 }
 
@@ -307,7 +509,7 @@ async fn place(
     log: &File,
 ) -> Result<(), String> {
     match input {
-        Input::Forge { repo, commit, .. } => clone(at, repo, commit, forge, log).await,
+        Input::Forge { repo, commit, .. } => clone(at, repo, commit, forge, talk, log).await,
         Input::Files {
             files, snapshot, ..
         } => read_file(at, files, snapshot, talk).await,
@@ -321,6 +523,7 @@ async fn clone(
     repo: &str,
     commit: &str,
     forge: &Forge,
+    talk: &Talk,
     log: &File,
 ) -> Result<(), String> {
     let url = format!("duck://{}/forge/{repo}", forge.chain);
@@ -328,22 +531,53 @@ async fn clone(
     let mut cloning = Command::new("git");
     cloning
         .args(["-c", &node, "clone", "--quiet", &url])
-        .arg(at);
+        .arg(at)
+        .stdin(Stdio::null());
     git(cloning, log, repo).await?;
+    let Err(missing) = git(checkout(at, commit), log, repo).await else {
+        return Ok(());
+    };
+    let pack = out::pack_path(repo, commit);
+    let bytes = read_bytes(&pack, &Value::Null, talk)
+        .await
+        .map_err(|why| format!("{missing}, and no pack at {pack} fills it: {why}"))?;
+    let held = at.with_extension("pack");
+    let kept = held.clone();
+    blocking(move || written(&kept, &bytes)).await?;
+    let filled = filled(at, &held, log, repo).await;
+    let _ = std::fs::remove_file(&held);
+    filled?;
+    git(checkout(at, commit), log, repo).await
+}
+
+fn checkout(at: &Path, commit: &str) -> Command {
     let mut checkout = Command::new("git");
-    checkout.arg("-C").arg(at).args([
-        "-c",
-        "advice.detachedHead=false",
-        "checkout",
-        "--quiet",
-        commit,
-    ]);
-    git(checkout, log, repo).await
+    checkout
+        .arg("-C")
+        .arg(at)
+        .args([
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "--quiet",
+            commit,
+        ])
+        .stdin(Stdio::null());
+    checkout
+}
+
+async fn filled(at: &Path, pack: &Path, log: &File, repo: &str) -> Result<(), String> {
+    let mut index = Command::new("git");
+    index
+        .arg("-C")
+        .arg(at)
+        .args(["index-pack", "--stdin", "--fix-thin"])
+        .stdin(File::open(pack).sentence()?);
+    git(index, log, repo).await
 }
 
 async fn git(mut command: Command, log: &File, repo: &str) -> Result<(), String> {
     command
-        .stdin(Stdio::null())
         .stdout(log.try_clone().sentence()?)
         .stderr(log.try_clone().sentence()?);
     let status = command.status().await.sentence()?;
@@ -354,6 +588,12 @@ async fn git(mut command: Command, log: &File, repo: &str) -> Result<(), String>
 }
 
 async fn read_file(at: &Path, files: &str, snapshot: &Value, talk: &Talk) -> Result<(), String> {
+    let bytes = read_bytes(files, snapshot, talk).await?;
+    let at = at.to_path_buf();
+    blocking(move || written(&at, &bytes)).await
+}
+
+async fn read_bytes(files: &str, snapshot: &Value, talk: &Talk) -> Result<Vec<u8>, String> {
     let stat = json!({ "Stat": { "path": files, "at": snapshot } });
     let stated = talk.files_ask(stat).await?;
     let size = stated["Stat"]["entry"]["node"]["File"]["size"]
@@ -366,9 +606,7 @@ async fn read_file(at: &Path, files: &str, snapshot: &Value, talk: &Talk) -> Res
     if !whole {
         return Err(format!("{files} did not come whole in one answer"));
     }
-    let bytes = hex::decode(contents["bytes"].as_str().unwrap_or_default()).sentence()?;
-    let at = at.to_path_buf();
-    blocking(move || written(&at, &bytes)).await
+    hex::decode(contents["bytes"].as_str().unwrap_or_default()).sentence()
 }
 
 async fn fetch_blob(at: &Path, id: BlobId, talk: &Talk) -> Result<(), String> {
@@ -413,6 +651,7 @@ pub fn launch(
     match backend {
         Backend::Shell => shell(dir, workload, log),
         Backend::Podman => podman(dir, name, workload, log, fence),
+        Backend::Pods => Err("a pods machine starts no process of its own".into()),
     }
 }
 
@@ -569,6 +808,7 @@ async fn killed(kill: &Kill, child: &mut Child) {
         Kill::Group(Some(pid)) => noded::machine::kill_group(*pid).is_ok(),
         Kill::Group(None) => false,
         Kill::Container(container) => podman_quiet(container.args(&["kill"])).await,
+        Kill::Pod { .. } => false,
     };
     if !ended {
         let _ = child.start_kill();
@@ -591,6 +831,7 @@ async fn cleared(kill: &Kill) {
         Kill::Container(container) => {
             podman_quiet(container.args(&["rm", "-f"])).await;
         }
+        Kill::Pod { .. } => {}
     }
 }
 
@@ -942,5 +1183,156 @@ mod tests {
         assert_eq!(cpus("2").unwrap(), "2");
         assert_eq!(cpus("1.5").unwrap(), "1.5");
         assert!(cpus("lots").is_err());
+    }
+
+    #[test]
+    fn a_pods_machine_declines_a_workload_with_no_image_or_a_disk_scratch() {
+        let imaged = Workload {
+            image: Some("toolchain".into()),
+            ..workload(&["make"])
+        };
+        assert!(refuses(Backend::Pods, &workload(&["make"]), true).is_some());
+        assert!(refuses(Backend::Pods, &imaged, false).is_none());
+        let forged = Workload {
+            inputs: vec![Input::Forge {
+                path: "/src".into(),
+                repo: "core".into(),
+                commit: "abc".into(),
+            }],
+            ..imaged.clone()
+        };
+        assert!(refuses(Backend::Pods, &forged, false).is_none());
+        let scratch = |memory| Workload {
+            inputs: vec![Input::Scratch {
+                path: "/w".into(),
+                memory,
+                size: None,
+            }],
+            ..imaged.clone()
+        };
+        let disk = refuses(Backend::Pods, &scratch(false), true).unwrap();
+        assert!(disk.contains("memory"), "{disk}");
+        assert!(refuses(Backend::Pods, &scratch(true), true).is_none());
+    }
+
+    #[test]
+    fn a_runs_commits_list_reads_each_line_and_names_each_it_refuses() {
+        let commit = "ab".repeat(20);
+        let text = format!(
+            "core {commit} /src\n\napp nothex /src\n../x {commit} /src\ncore {commit} relative\n"
+        );
+        let (read, refused) = commits(&text);
+        assert_eq!(
+            read,
+            [Commit {
+                repo: "core".into(),
+                commit: commit.clone(),
+                path: "/src".into(),
+            }]
+        );
+        assert_eq!(refused.len(), 3, "{refused:?}");
+    }
+
+    #[test]
+    fn a_commits_path_maps_to_the_input_it_lies_under_on_the_host() {
+        let dir = Path::new("/w/1-1");
+        let inputs = vec![
+            Input::Forge {
+                path: "/src".into(),
+                repo: "core".into(),
+                commit: "abc".into(),
+            },
+            Input::Forge {
+                path: "/src/app".into(),
+                repo: "app".into(),
+                commit: "abc".into(),
+            },
+            Input::Scratch {
+                path: "/tmp".into(),
+                memory: true,
+                size: None,
+            },
+        ];
+        let podman = |path| git_dir(Backend::Podman, dir, &inputs, path);
+        assert_eq!(podman("/src").unwrap(), Path::new("/w/1-1/mounts/0"));
+        assert_eq!(
+            podman("/src/app/x").unwrap(),
+            Path::new("/w/1-1/mounts/1/x")
+        );
+        assert!(podman("/srcx").is_err());
+        assert!(podman("/tmp/r").is_err());
+        assert!(podman("/src/../etc").is_err());
+        let shell = git_dir(Backend::Shell, dir, &inputs, "/src").unwrap();
+        assert_eq!(shell, Path::new("/w/1-1/work/src"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_is_packed_only_from_a_repository_inside_the_runs_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, made, commit) = out::tests::made_commit(root.path());
+        let dir = root.path().join("run");
+        let work = dir.join("work");
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(&made, work.join("away")).unwrap();
+        let from = made.to_string_lossy().into_owned();
+        out::tests::git_in(&work, &["clone", "--quiet", &from, "src"]);
+        for name in ["linked", "common", "loose"] {
+            out::tests::git_in(&work, &["clone", "--quiet", &from, name]);
+        }
+        let objects = work.join("linked/.git/objects");
+        std::fs::remove_dir_all(&objects).unwrap();
+        std::os::unix::fs::symlink(made.join(".git/objects"), &objects).unwrap();
+        std::fs::write(
+            work.join("common/.git/commondir"),
+            made.join(".git").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            made.join(".git/objects/pack"),
+            work.join("loose/.git/objects/borrowed"),
+        )
+        .unwrap();
+        let lines = format!(
+            "core {commit} /src\ncore {commit} /away\ncore {commit} /linked\ncore {commit} /common\ncore {commit} /loose\n"
+        );
+        std::fs::write(dir.join("out").join(COMMITS), lines).unwrap();
+        let (packs, refused) = packs(Backend::Shell, &dir, &[]);
+        assert_eq!(packs.len(), 1, "{refused:?}");
+        let inside = std::fs::canonicalize(work.join("src/.git")).unwrap();
+        assert_eq!(packs[0].git, inside);
+        assert_eq!(refused.len(), 4, "{refused:?}");
+        assert!(
+            refused[0].contains("/away's repository lies outside"),
+            "{refused:?}"
+        );
+        assert!(
+            refused[1].contains("/linked's objects lie outside"),
+            "{refused:?}"
+        );
+        assert!(
+            refused[2].contains("/common's repository shares"),
+            "{refused:?}"
+        );
+        assert!(
+            refused[3].contains("/loose's objects hold a link"),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forge_input_forge_lacks_is_filled_from_the_pack_the_machines_packer_made() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, made, commit) = out::tests::made_commit(root.path());
+        let pack = root.path().join("made.pack");
+        out::packed(&made.join(".git"), &commit, &pack).unwrap();
+        out::tests::git_in(root.path(), &["clone", "--quiet", "origin", "fresh"]);
+        let fresh = root.path().join("fresh");
+        let log = File::create(root.path().join("log")).unwrap();
+        assert!(git(checkout(&fresh, &commit), &log, "core").await.is_err());
+        filled(&fresh, &pack, &log, "core").await.unwrap();
+        git(checkout(&fresh, &commit), &log, "core").await.unwrap();
+        assert_eq!(std::fs::read_to_string(fresh.join("b")).unwrap(), "b");
     }
 }

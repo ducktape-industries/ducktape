@@ -1,9 +1,10 @@
-//! A run's log and outputs into files as one commit: each file as 1 MiB chunk blobs (files' chunk
-//! size), every chunk put in one bundle, then one Commit that names them, made again on the new
-//! head when another commit to the same paths landed first.
+//! A run's log, outputs and the packs of the commits it made into files as one commit: each file
+//! as 1 MiB chunk blobs (files' chunk size), every chunk put in one bundle, then one Commit that
+//! names them, made again on the new head when another commit to the same paths landed first.
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use abi::{Outcome, role};
 use node::Frame;
@@ -15,7 +16,8 @@ use super::{Landing, Talk};
 use crate::Sentence as _;
 
 const CHUNK: &str = "chunk";
-const CHUNK_SIZE: u64 = 1 << 20;
+pub const CHUNK_SIZE: u64 = 1 << 20;
+const PACKS: &str = "/shared/fleet/packs";
 
 struct Chunked {
     entries: Vec<blob::contract::Entry>,
@@ -23,20 +25,49 @@ struct Chunked {
     changes: Vec<Value>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Packed {
+    pub git: PathBuf,
+    pub repo: String,
+    pub commit: String,
+}
+
+pub fn pack_path(repo: &str, commit: &str) -> String {
+    format!("{PACKS}/{repo}/{commit}.pack")
+}
+
+pub fn put_change(path: String, size: u64, chunks: Vec<Value>) -> Value {
+    let content = json!({ "Chunks": { "size": size, "chunks": chunks } });
+    json!({ "Put": { "path": path, "exec": false, "meta": [], "content": content } })
+}
+
 pub async fn written(
     talk: &Talk,
     dir: &Path,
     folder: &str,
     message: String,
-) -> Result<Value, String> {
+    packs: Vec<Packed>,
+) -> Result<(Value, Vec<String>), String> {
     let root = dir.to_path_buf();
     let into = folder.to_owned();
-    let chunked = blocking(move || gathered(&root, &into)).await?;
+    let (chunked, unpacked) = blocking(move || gathered(&root, &into, &packs)).await?;
     if !chunked.entries.is_empty() {
         put(talk, chunked.entries, chunked.uploads).await?;
     }
-    let pieces = dir.join("chunks");
-    let _ = blocking(move || std::fs::remove_dir_all(pieces).sentence()).await;
+    for made in ["chunks", "packs"] {
+        let made = dir.join(made);
+        let _ = blocking(move || std::fs::remove_dir_all(made).sentence()).await;
+    }
+    let written = committed(talk, chunked.changes, folder, message).await?;
+    Ok((written, unpacked))
+}
+
+pub async fn committed(
+    talk: &Talk,
+    changes: Vec<Value>,
+    folder: &str,
+    message: String,
+) -> Result<Value, String> {
     let mut stale_attempts: u64 = 0;
     loop {
         let head = talk.files_ask(json!("Head")).await?;
@@ -44,7 +75,7 @@ pub async fn written(
         let commit = json!({ "Commit": {
             "base": base,
             "message": message,
-            "changes": chunked.changes,
+            "changes": changes,
         }});
         match talk.files(commit, Landing::Land).await {
             Ok(landed) => {
@@ -71,7 +102,7 @@ pub async fn written(
     }
 }
 
-fn gathered(dir: &Path, folder: &str) -> Result<Chunked, String> {
+fn gathered(dir: &Path, folder: &str, packs: &[Packed]) -> Result<(Chunked, Vec<String>), String> {
     let out = dir.join("out");
     let linked = std::fs::symlink_metadata(&out)
         .sentence()?
@@ -83,22 +114,79 @@ fn gathered(dir: &Path, folder: &str) -> Result<Chunked, String> {
             out.display()
         ));
     }
-    let mut files = vec![(dir.join("log"), "log".to_owned())];
-    listed(&out, "", &mut files)?;
-    chunked(&files, &dir.join("chunks"), folder)
+    let under = |name: &str| format!("{}/{name}", folder.trim_end_matches('/'));
+    let mut files = vec![(dir.join("log"), under("log"))];
+    let mut names = Vec::new();
+    listed(&out, "", &mut names)?;
+    files.extend(names.into_iter().map(|(path, name)| (path, under(&name))));
+    let mut unpacked = Vec::new();
+    for (index, pack) in packs.iter().enumerate() {
+        let into = dir.join("packs").join(format!("{index}.pack"));
+        match packed(&pack.git, &pack.commit, &into) {
+            Ok(()) => files.push((into, pack_path(&pack.repo, &pack.commit))),
+            Err(why) => unpacked.push(format!("{} {}: {why}", pack.repo, pack.commit)),
+        }
+    }
+    Ok((chunked(&files, &dir.join("chunks"))?, unpacked))
+}
+
+fn git(dir: &Path) -> Command {
+    let mut git = Command::new("git");
+    git.args(["-c", "safe.directory=*"])
+        .arg(format!("--git-dir={}", dir.display()))
+        .env("GIT_OBJECT_DIRECTORY", dir.join("objects"))
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+    git
+}
+
+pub fn packed(dir: &Path, commit: &str, into: &Path) -> Result<(), String> {
+    let refs = git(dir)
+        .args(["for-each-ref", "--format=^%(objectname)", "refs/remotes"])
+        .stdin(Stdio::null())
+        .output()
+        .sentence()?;
+    if !refs.status.success() {
+        let why = String::from_utf8_lossy(&refs.stderr);
+        return Err(format!("its remote refs were not read: {}", why.trim()));
+    }
+    let mut revs = format!("{commit}\n").into_bytes();
+    revs.extend(refs.stdout);
+    if let Some(parent) = into.parent() {
+        std::fs::create_dir_all(parent).sentence()?;
+    }
+    let file = File::create(into).sentence()?;
+    let mut packing = git(dir)
+        .args(["pack-objects", "--revs", "--stdout", "-q"])
+        .stdin(Stdio::piped())
+        .stdout(file)
+        .stderr(Stdio::piped())
+        .spawn()
+        .sentence()?;
+    let mut stdin = packing
+        .stdin
+        .take()
+        .ok_or("git pack-objects took no input")?;
+    stdin.write_all(&revs).sentence()?;
+    drop(stdin);
+    let ran = packing.wait_with_output().sentence()?;
+    if !ran.status.success() {
+        let why = String::from_utf8_lossy(&ran.stderr);
+        return Err(format!("git pack-objects failed: {}", why.trim()));
+    }
+    Ok(())
 }
 
 fn stale(error: &str) -> bool {
     error.contains(&format!("rejected {}:", abi::reason::STALE))
 }
 
-fn chunked(files: &[(PathBuf, String)], pieces: &Path, folder: &str) -> Result<Chunked, String> {
+fn chunked(files: &[(PathBuf, String)], pieces: &Path) -> Result<Chunked, String> {
     let mut chunked = Chunked {
         entries: Vec::new(),
         uploads: Vec::new(),
         changes: Vec::new(),
     };
-    for (path, name) in files {
+    for (path, to) in files {
         let size = std::fs::metadata(path).sentence()?.len();
         let parts = match size {
             0 => Vec::new(),
@@ -118,11 +206,7 @@ fn chunked(files: &[(PathBuf, String)], pieces: &Path, folder: &str) -> Result<C
                 });
             }
         }
-        let path = format!("{}/{name}", folder.trim_end_matches('/'));
-        let content = json!({ "Chunks": { "size": size, "chunks": chunks } });
-        chunked.changes.push(json!({
-            "Put": { "path": path, "exec": false, "meta": [], "content": content }
-        }));
+        chunked.changes.push(put_change(to.clone(), size, chunks));
     }
     Ok(chunked)
 }
@@ -164,7 +248,7 @@ fn listed(dir: &Path, under: &str, files: &mut Vec<(PathBuf, String)>) -> Result
     Ok(())
 }
 
-async fn put(
+pub async fn put(
     talk: &Talk,
     entries: Vec<blob::contract::Entry>,
     uploads: Vec<Upload>,
@@ -195,7 +279,7 @@ async fn put(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -221,12 +305,12 @@ mod tests {
         std::fs::write(&large, vec![7u8; (CHUNK_SIZE + 1) as usize]).unwrap();
         std::fs::write(&empty, "").unwrap();
         let files = [
-            (small.clone(), "log".to_owned()),
-            (large, "out/large".to_owned()),
-            (empty, "out/empty".to_owned()),
+            (small.clone(), "/shared/fleet/1/log".to_owned()),
+            (large, "/shared/fleet/1/out/large".to_owned()),
+            (empty, "/shared/fleet/1/out/empty".to_owned()),
         ];
         let pieces = root.path().join("chunks");
-        let made = chunked(&files, &pieces, "/shared/fleet/1/").unwrap();
+        let made = chunked(&files, &pieces).unwrap();
         assert_eq!(made.uploads.len(), 3);
         assert_eq!(made.uploads[0].path, small);
         let counts: Vec<usize> = made
@@ -258,7 +342,77 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         std::fs::write(run.join("log"), "").unwrap();
         std::os::unix::fs::symlink(root.path(), run.join("out")).unwrap();
-        let refused = gathered(&run, "/shared/fleet/1/").err().unwrap();
+        let refused = gathered(&run, "/shared/fleet/1/", &[]).err().unwrap();
         assert!(refused.contains("symlink"), "{refused}");
+    }
+
+    pub fn git_in(dir: &Path, args: &[&str]) -> String {
+        let ran = Command::new("git")
+            .args([
+                "-c",
+                "user.name=machine",
+                "-c",
+                "user.email=machine@fleet",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        String::from_utf8(ran.stdout).unwrap().trim().to_owned()
+    }
+
+    pub fn made_commit(root: &Path) -> (PathBuf, PathBuf, String) {
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "--quiet"]);
+        std::fs::write(origin.join("a"), "a").unwrap();
+        git_in(&origin, &["add", "a"]);
+        git_in(&origin, &["commit", "--quiet", "-m", "a"]);
+        let made = root.join("made");
+        git_in(root, &["clone", "--quiet", "origin", "made"]);
+        std::fs::write(made.join("b"), "b").unwrap();
+        git_in(&made, &["add", "b"]);
+        git_in(&made, &["commit", "--quiet", "-m", "b"]);
+        let commit = git_in(&made, &["rev-parse", "HEAD"]);
+        (origin, made, commit)
+    }
+
+    #[test]
+    fn a_runs_commit_packs_beside_its_outputs_at_its_pack_path_and_a_bad_one_is_named() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, made, commit) = made_commit(root.path());
+        let run = root.path().join("run");
+        std::fs::create_dir_all(run.join("out")).unwrap();
+        std::fs::write(run.join("log"), "ran").unwrap();
+        let packs = [
+            Packed {
+                git: made.join(".git"),
+                repo: "core".into(),
+                commit: commit.clone(),
+            },
+            Packed {
+                git: root.path().join("nowhere"),
+                repo: "app".into(),
+                commit: "ab".repeat(20),
+            },
+        ];
+        let (chunked, unpacked) = gathered(&run, "/shared/fleet/3/", &packs).unwrap();
+        let paths: Vec<&str> = chunked
+            .changes
+            .iter()
+            .map(|change| change["Put"]["path"].as_str().unwrap())
+            .collect();
+        let pack = pack_path("core", &commit);
+        assert_eq!(paths, ["/shared/fleet/3/log", pack.as_str()]);
+        assert_eq!(unpacked.len(), 1);
+        assert!(unpacked[0].starts_with("app "), "{unpacked:?}");
     }
 }

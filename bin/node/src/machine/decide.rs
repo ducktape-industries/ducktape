@@ -147,6 +147,10 @@ pub fn touches(writes: &[(Vec<u8>, Option<Vec<u8>>)]) -> bool {
         .any(|(key, _)| key.starts_with(b"h/") || key.starts_with(b"r/"))
 }
 
+pub fn heard(writes: &[(Vec<u8>, Option<Vec<u8>>)]) -> bool {
+    writes.iter().any(|(key, _)| key.starts_with(b"p/"))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -253,5 +257,8 @@ mod tests {
         assert!(touches(&[(b"h/abc".to_vec(), None)]));
         assert!(touches(&[(b"r/abc".to_vec(), Some(vec![1]))]));
         assert!(!touches(&[(b"b/abc".to_vec(), Some(vec![1]))]));
+        assert!(heard(&[(b"p/abc".to_vec(), Some(vec![1]))]));
+        assert!(!heard(&[(b"h/abc".to_vec(), None)]));
+        assert!(!touches(&[(b"p/abc".to_vec(), Some(vec![1]))]));
     }
 }

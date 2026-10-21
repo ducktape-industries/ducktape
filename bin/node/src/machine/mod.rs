@@ -4,6 +4,7 @@
 mod backend;
 mod decide;
 mod out;
+mod pods;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ use node::{Frame, Preconfirm};
 use noded::wire::Change;
 use noded::{Backend, Client, MachineEntry, MachineSettings, Settings, Workspace};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::{Sentence as _, json as said};
@@ -132,7 +133,32 @@ fn settings(workspace: &Workspace, config: Option<PathBuf>) -> Result<MachineSet
     if machine.machines.is_empty() {
         return Err("[machine] names no machines".into());
     }
+    for entry in &machine.machines {
+        reached(entry)?;
+    }
     Ok(machine)
+}
+
+fn reached(machine: &MachineEntry) -> Result<(), String> {
+    match (machine.backend, &machine.service) {
+        (Backend::Pods, None) => Err(format!(
+            "machine {} runs on the pods service and names no service: name the egress service \
+             this network registered for it",
+            machine.name
+        )),
+        (Backend::Shell | Backend::Podman, Some(service)) => Err(format!(
+            "machine {} names service {service}, which only a pods machine reaches",
+            machine.name
+        )),
+        (Backend::Pods, Some(_)) | (Backend::Shell | Backend::Podman, None) => Ok(()),
+    }
+}
+
+fn unpacked_summary(summary: String, unpacked: &[String]) -> String {
+    if unpacked.is_empty() {
+        return summary;
+    }
+    format!("{summary}; not packed: {}", unpacked.join("; "))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +301,8 @@ struct Shared {
     containers: String,
     process: u32,
     fence: backend::Fence,
+    heard: watch::Sender<u64>,
+    block_ms: u64,
 }
 
 struct Running {
@@ -378,6 +406,8 @@ async fn serve(
         containers,
         process,
         fence,
+        heard: watch::channel(0).0,
+        block_ms: status.block_time_ms,
     });
     let mut changes = follow.changes(FLEET).await.sentence()?;
     let mut blocks = follow.changes(RECENT).await.sentence()?;
@@ -504,6 +534,11 @@ impl Serving {
         let change = change
             .ok_or("the node closed fleet's change stream")?
             .sentence()?;
+        if decide::heard(&change.writes) {
+            self.shared
+                .heard
+                .send_modify(|seen| *seen = seen.wrapping_add(1));
+        }
         if decide::touches(&change.writes) {
             self.reconcile().await;
         }
@@ -684,15 +719,21 @@ impl Serving {
             return;
         };
         let name = running.machine.clone();
-        if let Some(kill) = running.kill.clone() {
-            backend::abandoned(&kill).await;
-        }
-        self.local.remove(&run);
+        let kill = running.kill.clone();
         let machine = self
             .machines
             .iter()
             .find(|machine| machine.name == name)
             .cloned();
+        match (&kill, &machine) {
+            (Some(backend::Kill::Pod { name: pod, calls }), Some(machine)) => {
+                let service = machine.service.as_deref().unwrap_or_default();
+                pods::abandoned(&self.shared.talk, service, run, attempt, pod, calls).await;
+            }
+            (Some(kill), _) => backend::abandoned(kill).await,
+            (None, _) => {}
+        }
+        self.local.remove(&run);
         if let Some(machine) = machine {
             self.settle(&machine, run, attempt, "Errored", decide::LOST);
         }
@@ -749,7 +790,7 @@ fn serves(machine: &MachineEntry, manager: u64) -> Value {
     match (&machine.serves, machine.backend) {
         (Some(accounts), _) => json!({ "Listed": accounts }),
         (None, Backend::Shell) => json!({ "Listed": [manager] }),
-        (None, Backend::Podman) => json!("Anyone"),
+        (None, Backend::Podman | Backend::Pods) => json!("Anyone"),
     }
 }
 
@@ -813,6 +854,9 @@ impl Task {
             .work
             .join(&self.machine.name)
             .join(format!("{run}-{attempt}"));
+        if self.machine.backend == Backend::Pods {
+            return pods::ran(self, &workload, dir, stop).await;
+        }
         let name = format!(
             "{}p{}-{run}-{attempt}",
             self.shared.containers, self.shared.process
@@ -844,10 +888,17 @@ impl Task {
         match ending {
             Ending::Dropped => Ok(()),
             Ending::Running | Ending::Stopped => {
+                let backend = self.machine.backend;
+                let (listed, inputs) = (dir.clone(), workload.inputs.clone());
+                let (packs, unpacked) =
+                    backend::blocking(move || Ok(backend::packs(backend, &listed, &inputs)))
+                        .await
+                        .unwrap_or_else(|error| (Vec::new(), vec![error]));
                 let out = workload
                     .out
                     .unwrap_or_else(|| format!("/shared/fleet/{run}/"));
-                self.told(&dir, &out, decide::state_of(&end, ending)).await
+                let end = decide::state_of(&end, ending);
+                self.told(&dir, &out, end, packs, unpacked).await
             }
         }
     }
@@ -857,6 +908,8 @@ impl Task {
         dir: &std::path::Path,
         out: &str,
         (state, summary): (&'static str, String),
+        packs: Vec<out::Packed>,
+        mut unpacked: Vec<String>,
     ) -> Result<(), Failure> {
         let message = format!(
             "fleet run {} attempt {}: {}",
@@ -864,8 +917,10 @@ impl Task {
             self.attempt,
             state.to_lowercase()
         );
-        match out::written(&self.shared.talk, dir, out, message).await {
-            Ok(written) => {
+        match out::written(&self.shared.talk, dir, out, message, packs).await {
+            Ok((written, refused)) => {
+                unpacked.extend(refused);
+                let summary = unpacked_summary(summary, &unpacked);
                 self.report(state, summary, Some(written))
                     .await
                     .map_err(|(reason, error)| {
@@ -995,6 +1050,7 @@ mod tests {
             backend,
             slots: 1,
             serves,
+            service: None,
         };
         let shell = super::serves(&machine(noded::Backend::Shell, None), 15);
         assert_eq!(shell, json!({ "Listed": [15] }));
@@ -1002,5 +1058,34 @@ mod tests {
         assert_eq!(podman, json!("Anyone"));
         let listed = super::serves(&machine(noded::Backend::Shell, Some(vec![17, 39])), 15);
         assert_eq!(listed, json!({ "Listed": [17, 39] }));
+        let pods = super::serves(&machine(noded::Backend::Pods, None), 15);
+        assert_eq!(pods, json!("Anyone"));
+    }
+
+    #[test]
+    fn a_pods_machine_names_its_service_and_no_other_machine_names_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = noded::Workspace::at(dir.path());
+        let file = dir.path().join("m.toml");
+        let cases = [
+            ("pods", "service = \"pods\"\n", None),
+            ("pods", "", Some("names no service")),
+            ("shell", "service = \"pods\"\n", Some("only a pods machine")),
+            ("podman", "", None),
+        ];
+        for (backend, service, refused) in cases {
+            let text = format!(
+                "[machine]\n[[machine.machines]]\nname = \"m\"\nbackend = \"{backend}\"\nslots = 1\n{service}"
+            );
+            std::fs::write(&file, text).unwrap();
+            let read = super::settings(&workspace, Some(file.clone()));
+            match refused {
+                None => assert!(read.is_ok(), "{backend}: {read:?}"),
+                Some(words) => {
+                    let why = read.unwrap_err();
+                    assert!(why.contains(words), "{backend}: {why}");
+                }
+            }
+        }
     }
 }

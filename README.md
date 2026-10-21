@@ -579,9 +579,10 @@ work = "/var/lib/ducktape-work"  # default: the workspace's folder name with -ma
 [[machine.machines]]
 name = "warm"
 labels = ["warm", "heavy"]
-backend = "shell"             # shell or podman
+backend = "shell"             # shell, podman or pods
 slots = 1                     # how many runs it takes at once
-serves = [17]                 # default: a shell machine its account's manager, a podman machine anyone
+serves = [17]                 # default: a shell machine its account's manager, a podman or pods machine anyone
+service = "pods"              # pods only, and named there: the egress service this network registered for the pods service
 ```
 
 The top level says where the node is reached, what it logs and which CPUs
@@ -787,8 +788,9 @@ the workload's `out` or `/shared/fleet/<run>/`, and the machine reports the
 end with that folder and snapshot: exit 0 is `Passed`, any other exit or a
 signal `Failed`, a run it was told to stop `Cancelled`, and one it could not
 start or wait for `Errored`. A run is declined when its machine's backend
-cannot run it (an image on `shell`, none on `podman`, or a forge input with no
-`git-remote-duck` on `PATH`).
+cannot run it (an image on `shell`, none on `podman` or `pods`, a disk scratch
+on `pods`, or a forge input with no `git-remote-duck` on `PATH` on `shell` or
+`podman`).
 
 `shell` runs the command in a work tree under
 `<work>/<machine>/<run>-<attempt>/`, outside the workspace (`work` in
@@ -814,6 +816,37 @@ machine process's own, with the image, each input
 mounted at its path, `out` at `/out`, and `--cpus` and `--memory` from the
 workload's asks; a podman machine serves anyone unless `serves` lists whom. A
 stop is `podman kill`, and every end `podman rm -f`.
+
+`pods` runs each run as a pod of the pods service, through fleet. Each step is one
+fleet `Call`: fleet sends it to `service` as an egress request of its own, stamped
+with the run (`fleet-run`, `fleet-attempt`, `fleet-asker`, `fleet-machine`), and
+the machine reads the answer from the run's pieces (fleet `Pieces`) when fleet's
+writes touch them, never by polling. The steps are `POST /v1/pods` (the workload's
+image, its command with its output in `/out/.fleet/log`, `OUT=/out`, its inputs
+and its asks as the pod's requests; pods makes the run's asker, from
+`fleet-asker`, the pod's requester, and lets a call reach only the pod labelled
+with its own run and attempt), then `GET /v1/pods/NAME/wait` streamed until
+its `ended` event, beating every half egress wait (`DEFAULT_WAIT` blocks of the
+network's block time, in whole seconds); a wait that ends without one reads the
+pod and waits again while it runs. The pod's `out` container then cuts the log
+and every file in `/out` into 1 MiB pieces, which pods puts in one `/blob` bundle,
+the machine commits them to files as the other backends do, and the pod is
+deleted. A stop deletes the pod and reports `Cancelled`. A pods machine serves
+anyone unless `serves` lists whom: pods' own limits fence the pod.
+
+A run that made commits lists each as a line `<repo> <commit> <path>` in
+`$OUT/commits`, `<path>` being the repository's work tree as the run's inputs
+name it. Each is packed against the repository's remote refs, which forge
+already holds, into `/shared/fleet/packs/<repo>/<commit>.pack` in the run's files
+commit, and a line the machine can't pack is named in the run's summary (`not
+packed: …`). On `shell` and `podman` such a repository and its objects lie
+inside the run's folder, with no link among the objects, no `commondir` and no
+`objects/info/alternates`, so a run never has the machine publish objects from
+elsewhere on its host. A forge input whose commit forge
+lacks is filled from its pack: `shell` and `podman` lay the pack into the clone
+and check the commit out again, and `pods`, once a pod's fetch fails, makes the
+pod once more with that input at its default branch and the pack laid in before
+the command runs.
 
 When the machine stops it first stops every run it holds (their folders stay
 under `work`), and when it starts it removes the containers named for its

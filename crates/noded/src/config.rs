@@ -100,6 +100,7 @@ pub struct MachineEntry {
     pub backend: Backend,
     pub slots: u64,
     pub serves: Option<Vec<u64>>,
+    pub service: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -107,6 +108,7 @@ pub struct MachineEntry {
 pub enum Backend {
     Shell,
     Podman,
+    Pods,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

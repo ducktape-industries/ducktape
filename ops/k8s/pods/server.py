@@ -47,6 +47,13 @@ MANAGED = ("app.kubernetes.io/managed-by", "pods")
 DEFAULT_CONTAINER = "kubectl.kubernetes.io/default-container"
 ASKED = ("chain", "program", "request")
 REQUESTER = NOTE + "requester"
+FLEET_PROGRAM = "fleet"
+FLEET_ASKER = "fleet-asker"
+ASKER = "asker"
+FLEET_RUN = "fleet-run"
+FLEET_ATTEMPT = "fleet-attempt"
+RUN_LABEL = NOTE + FLEET_RUN
+ATTEMPT_LABEL = NOTE + FLEET_ATTEMPT
 NOTIFY_CHANNEL = NOTE + "notify-channel"
 NOTIFY_THREAD = NOTE + "notify-thread"
 NOTIFIED = NOTE + "notified"
@@ -1220,11 +1227,35 @@ def asked_by(headers):
         raise Refused(400, f"this service answers a network's egress calls only, and {', '.join(missing)} is missing")
     if request_number(asked["request"]) is None:
         raise Refused(400, f"ducktape-request {asked['request']!r} is not an egress request number, so this service could not ask egress about it")
+    if asked["program"] == FLEET_PROGRAM:
+        stamped = headers.get(FLEET_ASKER)
+        asker = account_number(stamped or "")
+        if asker is None:
+            raise Refused(400, f"a call {FLEET_PROGRAM} relays names its run's asker in {FLEET_ASKER}, which {FLEET_PROGRAM} stamps on every call it relays, and {FLEET_ASKER} {stamped!r} is no account number")
+        asked[ASKER] = asker
+        for header in (FLEET_RUN, FLEET_ATTEMPT):
+            stamp = headers.get(header)
+            stamped = account_number(stamp or "")
+            if stamped is None:
+                raise Refused(400, f"a call {FLEET_PROGRAM} relays names its run in {FLEET_RUN} and {FLEET_ATTEMPT}, which {FLEET_PROGRAM} stamps on every call it relays, and {header} {stamp!r} is no number")
+            asked[header] = str(stamped)
     return asked
+
+
+def requester_for(asked, given):
+    if ASKER not in asked:
+        return given
+    if given is not None:
+        raise Refused(400, f"a call {FLEET_PROGRAM} relays names no requester: its requester is the run's asker, from {FLEET_ASKER}")
+    return asked[ASKER]
 
 
 def labels_for(asked, requester):
     labels = {NOTE + name: asked[name] for name in ASKED}
+    requester = requester_for(asked, requester)
+    if ASKER in asked:
+        labels[RUN_LABEL] = asked[FLEET_RUN]
+        labels[ATTEMPT_LABEL] = asked[FLEET_ATTEMPT]
     if requester is not None:
         labels[REQUESTER] = str(number(requester, "requester"))
     return labels
@@ -4180,6 +4211,24 @@ class Service:
             return refusal
         return Refused(404, f"{refusal.sentence}; if pod {name} was the warm pod, it has been replaced: the warm pod is now {current}")
 
+    def fleet_scoped(self, asked, method, segments):
+        if ASKER not in asked:
+            return
+        match (method, *segments[1:]):
+            case ("POST", "pods"):
+                return
+            case ("GET" | "DELETE", "pods", name) | ("GET", "pods", name, "wait") | ("POST", "pods", name, "exec" | "blob"):
+                pass
+            case _:
+                raise Refused(403, f"a call {FLEET_PROGRAM} relays makes, reads, waits for, execs in, puts the outputs of and deletes its own run's pod only, not {method} /{'/'.join(segments)}")
+        if name in self.runners or name == BUILDS:
+            raise Refused(403, f"pod {name} is a build runner, which no call {FLEET_PROGRAM} relays reaches")
+        labels = self.pod(name)["metadata"].get("labels") or {}
+        run, attempt = asked[FLEET_RUN], asked[FLEET_ATTEMPT]
+        ours = labels.get(RUN_LABEL) == run and labels.get(ATTEMPT_LABEL) == attempt
+        if not ours:
+            raise Refused(403, f"pod {name} is not the pod of run {run} attempt {attempt}, which this call {FLEET_PROGRAM} relays is for")
+
     def route(self, method, target, headers, body):
         parts = urlsplit(target)
         segments = [segment for segment in parts.path.split("/") if segment]
@@ -4187,6 +4236,7 @@ class Service:
         asked = asked_by(headers)
         if segments[:1] != ["v1"]:
             raise Refused(404, f"{parts.path} is not a route; routes are under /v1")
+        self.fleet_scoped(asked, method, segments)
         match (method, *segments[1:]):
             case ("POST", "pods"):
                 return self.create(asked, parsed(body))

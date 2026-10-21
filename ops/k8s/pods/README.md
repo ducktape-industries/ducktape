@@ -15,6 +15,12 @@ or through a member node's halo forward.
 - `server-test.py` covers the service over real HTTP against a recording kubectl, ducktape
   and kubelet: `python3 ops/k8s/pods/server-test.py` (also part of `make test`).
 - `server.py fetch` is each pod's init container, which fetches its inputs.
+- A call fleet relays for a machine (`ducktape-program` is `fleet`) names its run's asker in
+  `fleet-asker`, which fleet stamps on every call it relays. The service makes that account the
+  requester of what the call makes, and refuses such a call with no account there or with a
+  `requester` of its own. Such a call reaches only its own run's pod: a pod it makes carries its
+  `fleet-run` and `fleet-attempt` as labels, and it may read, wait for, exec in, put the outputs
+  of and delete only a pod labelled with both; anything else, a build runner included, is 403.
 - A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and
   never ends (`ducktape-run done <run>`) is posted `run <run> lost with pod <pod>: <why>` in
   its channel, once, when the pod ends, when it is deleted, or when the service finds it gone

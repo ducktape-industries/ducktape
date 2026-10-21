@@ -437,6 +437,7 @@ fn a_machine_table_parses_and_refuses_a_key_or_a_quantity_it_does_not_know() {
                     backend: Backend::Shell,
                     slots: 2,
                     serves: Some(vec![17]),
+                    service: None,
                 },
                 MachineEntry {
                     name: "fresh".into(),
@@ -444,6 +445,7 @@ fn a_machine_table_parses_and_refuses_a_key_or_a_quantity_it_does_not_know() {
                     backend: Backend::Podman,
                     slots: 1,
                     serves: None,
+                    service: None,
                 },
             ],
         }
@@ -457,6 +459,17 @@ fn a_machine_table_parses_and_refuses_a_key_or_a_quantity_it_does_not_know() {
     assert!(
         Settings::parse("[[machine.machines]]\nname = \"a\"\nbackend = \"k8s\"\nslots = 1\n")
             .is_err()
+    );
+    let pods = Settings::parse(
+        "[[machine.machines]]\nname = \"p\"\nbackend = \"pods\"\nslots = 2\nservice = \"pods\"\n",
+    )
+    .unwrap()
+    .machine
+    .unwrap();
+    let entry = &pods.machines[0];
+    assert_eq!(
+        (entry.backend, entry.service.as_deref()),
+        (Backend::Pods, Some("pods"))
     );
     assert_eq!(Settings::parse("").unwrap().machine, None);
 }

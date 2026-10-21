@@ -973,6 +973,85 @@ class Create(Served):
         self.assertEqual(notes["kubectl.kubernetes.io/default-container"], "run")
 
 
+FLEETED = {**ASKED, "ducktape-program": "fleet", "fleet-run": "7", "fleet-attempt": "1", "fleet-asker": "17", "fleet-machine": "31"}
+
+
+class Fleeted(Served):
+    def test_a_pod_fleet_relays_is_requested_by_the_asker_fleet_stamps(self):
+        self.kube.answer("create", ran(pod_json()))
+        status, answer = self.call("POST", "/v1/pods", {"image": "t"}, FLEETED)
+        self.assertEqual(status, 201, answer)
+        labels = self.created()["metadata"]["labels"]
+        self.assertEqual(labels["ducktape.industries/requester"], "17")
+        self.assertEqual(labels["ducktape.industries/program"], "fleet")
+        self.assertEqual((labels["ducktape.industries/fleet-run"], labels["ducktape.industries/fleet-attempt"]), ("7", "1"))
+
+    def fleet_pod(self, run="7", attempt="1"):
+        pod = pod_json()
+        pod["metadata"]["labels"].update({"ducktape.industries/fleet-run": run, "ducktape.industries/fleet-attempt": attempt})
+        return pod
+
+    def test_a_call_fleet_relays_reaches_its_own_runs_pod(self):
+        self.kube.answer("get", ran(self.fleet_pod()))
+        status, answer = self.call("DELETE", "/v1/pods/duckpond-41", headers=FLEETED)
+        self.assertEqual((status, answer), (200, {"deleted": "duckpond-41"}))
+        self.assertIn("delete", self.kube.verbs())
+
+    def test_a_call_fleet_relays_reaches_no_other_runs_pod(self):
+        routes = (("DELETE", "/v1/pods/duckpond-41", None), ("GET", "/v1/pods/duckpond-41", None), ("GET", "/v1/pods/duckpond-41/wait?every=5", None), ("POST", "/v1/pods/duckpond-41/exec", {"command": ["true"]}), ("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/x", "kind": "chunk"}))
+        for run, attempt in (("6", "1"), ("7", "2"), (None, None)):
+            pod = self.fleet_pod(run, attempt) if run else pod_json()
+            self.kube.answer("get", ran(pod))
+            for method, path, body in routes:
+                with self.subTest(run=run, attempt=attempt, route=path, method=method):
+                    status, answer = self.call(method, path, body, FLEETED)
+                    self.assertEqual(status, 403, answer)
+                    self.assertIn("run 7 attempt 1", answer["error"])
+        self.assertEqual(set(self.kube.verbs()), {"get"})
+
+    def test_a_call_fleet_relays_reaches_no_route_its_backend_does_not_use(self):
+        routes = (("GET", "/v1/pods", None), ("POST", "/v1/pods/duckpond-41/file", {"path": "/out/x", "to": "/shared/x"}), ("POST", "/v1/pods/duckpond-41/read", {"path": "/out/x"}), ("POST", "/v1/pods/duckpond-41/push", {"path": "/work"}), ("GET", "/v1/pods/duckpond-41/logs", None), ("POST", "/v1/manifests", {"manifests": []}), ("GET", "/v1/usage", None), ("GET", "/v1/k8s/api/v1/namespaces/agents/pods", None), ("POST", "/v1/pods/builds/exec", {"command": ["sh", "/var/tmp/warm/build.sh", "busy"]}))
+        for method, path, body in routes:
+            with self.subTest(method=method, route=path):
+                status, answer = self.call(method, path, body, FLEETED)
+                self.assertEqual(status, 403, answer)
+        self.assertEqual(self.kube.calls, [])
+
+    def test_a_call_fleet_relays_without_its_run_is_refused_before_anything_runs(self):
+        for header in ("fleet-run", "fleet-attempt"):
+            for stamp in (None, "", "x"):
+                with self.subTest(header=header, stamp=stamp):
+                    headers = {name: value for name, value in FLEETED.items() if name != header}
+                    if stamp is not None:
+                        headers[header] = stamp
+                    status, answer = self.call("POST", "/v1/pods", {"image": "t"}, headers)
+                    self.assertEqual(status, 400, answer)
+                    self.assertIn(header, answer["error"])
+        self.assertEqual(self.kube.calls, [])
+
+    def test_a_call_fleet_relays_names_no_requester_of_its_own(self):
+        status, answer = self.call("POST", "/v1/pods", {"image": "t", "requester": 15}, FLEETED)
+        self.assertEqual(status, 400, answer)
+        self.assertIn("fleet-asker", answer["error"])
+        self.assertNotIn("create", self.kube.verbs())
+
+    def test_a_call_fleet_relays_with_no_asker_it_reads_is_refused_before_anything_runs(self):
+        for asker in (None, "", "seventeen", "-1"):
+            with self.subTest(asker=asker):
+                headers = {name: value for name, value in FLEETED.items() if name != "fleet-asker"}
+                if asker is not None:
+                    headers["fleet-asker"] = asker
+                status, answer = self.call("GET", "/v1/pods", headers=headers)
+                self.assertEqual(status, 400, answer)
+                self.assertIn("fleet-asker", answer["error"])
+        self.assertEqual(self.kube.calls, [])
+
+    def test_another_programs_call_keeps_the_requester_its_body_names(self):
+        self.kube.answer("create", ran(pod_json()))
+        self.call("POST", "/v1/pods", {"image": "t", "requester": 15}, {**ASKED, "fleet-asker": "17"})
+        self.assertEqual(self.created()["metadata"]["labels"]["ducktape.industries/requester"], "15")
+
+
 class Asked(Served):
     def test_a_call_without_the_nodes_headers_is_refused(self):
         status, answer = self.call("GET", "/v1/pods", headers={"ducktape-chain": "duckpond"})
@@ -3500,6 +3579,12 @@ class DesktopRunner(Streamed):
         self.serve(runners=[desktop])
         self.service.rest = lambda name, pause: self.paused.append(pause)
         self.service.wall = lambda: RUNNER_STARTED
+
+    def test_a_call_fleet_relays_reaches_no_build_runner(self):
+        status, answer = self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "busy"]}, FLEETED)
+        self.assertEqual(status, 403, answer)
+        self.assertIn("build runner", answer["error"])
+        self.assertEqual(self.kube.calls, [])
 
     def notified(self, line):
         self.gate.answers["exec"] = ran(b"run r1\n")
