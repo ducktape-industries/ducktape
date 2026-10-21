@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 SAMPLE_S = 10
@@ -27,7 +27,7 @@ SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 LEVELS = {"alert_unposted": "warn", "check_unread": "warn", "page_failed": "warn"}
 OK, BAD, UNREAD = "ok", "bad", "unread"
 MARKS = {BAD: "🔴", OK: "🟢"}
-BAD_AFTER = {"public": 2, "warm-pod": 2}
+TURN_AFTER = 2
 SHAPE_ERRORS = (AttributeError, KeyError, TypeError, ValueError)
 WARM_POD_RUN = "run"
 
@@ -50,10 +50,11 @@ class Reading:
     label: str
     seen: str
     value: str
+    after: int = 1
 
 
-def judged(check, label, bad, value):
-    return Reading(check, label, BAD if bad else OK, value)
+def judged(check, label, bad, value, after=1):
+    return Reading(check, label, BAD if bad else OK, value, after)
 
 
 def unread(check, label, why):
@@ -107,7 +108,7 @@ def rate_reading(samples, now_ms, height):
     seconds = (now_ms - since) / 1000
     rate = (height - base) / seconds
     value = f"{rate:.2f} blocks/s over the last {seconds:.0f} s (floor {RATE_FLOOR})"
-    return kept, judged("rate", label, rate < RATE_FLOOR, value)
+    return kept, judged("rate", label, rate < RATE_FLOOR, value, TURN_AFTER)
 
 
 def public_reading(http, url, direct):
@@ -115,7 +116,7 @@ def public_reading(http, url, direct):
     if direct.seen != OK:
         return unread("public", label, "the node itself did not answer")
     reading, _ = status_reading("public", label, http, url)
-    return reading
+    return replace(reading, after=TURN_AFTER)
 
 
 def ccs_reading(http, base):
@@ -153,44 +154,65 @@ class Disk:
     path: str
     rule: str
     limit: int
+    clear: int | None = None
 
     @staticmethod
     def of(row):
         if row["rule"] not in RULES:
             raise ValueError(f"disk {row['check']}'s rule is one of {', '.join(RULES)}, not {row['rule']}")
-        return Disk(row["check"], row["label"], row["path"], row["rule"], int(row["limit"]))
+        clear = None if row.get("clear") is None else int(row["clear"])
+        disk = Disk(row["check"], row["label"], row["path"], row["rule"], int(row["limit"]), clear)
+        on_the_bad_side = clear is not None and not past_on_the_good_side(disk.rule, clear, disk.limit)
+        if on_the_bad_side:
+            raise ValueError(f"disk {disk.check}'s clear line {clear} is not past its line {disk.limit} on the good side")
+        return disk
 
 
-def disk_bad(disk, stat):
-    match disk.rule:
+def past_on_the_good_side(rule, clear, limit):
+    return clear < limit if rule == "used_percent_at" else clear > limit
+
+
+def disk_bad(rule, line, stat):
+    match rule:
         case "free_bytes_under":
-            return stat.f_bavail * stat.f_frsize < disk.limit
+            return stat.f_bavail * stat.f_frsize < line
         case "free_percent_under":
-            return stat.f_bavail * 100 < disk.limit * stat.f_blocks
+            return stat.f_bavail * 100 < line * stat.f_blocks
         case "used_percent_at":
-            return 100 - stat.f_bavail * 100 // stat.f_blocks >= disk.limit
+            return 100 - stat.f_bavail * 100 // stat.f_blocks >= line
+
+
+def amount(rule, line):
+    match rule:
+        case "free_bytes_under":
+            return f"{line / GB:g} GB free"
+        case "free_percent_under":
+            return f"{line}% free"
+        case "used_percent_at":
+            return f"{line}% used"
 
 
 def rule_text(disk):
-    match disk.rule:
-        case "free_bytes_under":
-            return f"bad under {disk.limit / GB:g} GB free"
-        case "free_percent_under":
-            return f"bad under {disk.limit}% free"
-        case "used_percent_at":
-            return f"bad at {disk.limit}% used"
+    bad, good = ("bad at", "good again under") if disk.rule == "used_percent_at" else ("bad under", "good again at")
+    text = f"{bad} {amount(disk.rule, disk.limit)}"
+    return text if disk.clear is None else f"{text}, {good} {amount(disk.rule, disk.clear)}"
 
 
-def disk_reading(disk, stat):
+def disk_line(disk, posted):
+    banded = posted == BAD and disk.clear is not None
+    return disk.clear if banded else disk.limit
+
+
+def disk_reading(disk, stat, posted=None):
     free = stat.f_bavail * stat.f_frsize
     capacity = stat.f_blocks * stat.f_frsize
     shown = f"{free / GB:.1f} GB free of {capacity / GB:.1f} GB ({stat.f_bavail * 100 // stat.f_blocks}% free), {rule_text(disk)}"
-    return judged(disk.check, disk.label, disk_bad(disk, stat), shown)
+    return judged(disk.check, disk.label, disk_bad(disk.rule, disk_line(disk, posted), stat), shown, TURN_AFTER)
 
 
-def disk_read(disk, stat=os.statvfs):
+def disk_read(disk, stat=os.statvfs, posted=None):
     try:
-        return disk_reading(disk, stat(disk.path))
+        return disk_reading(disk, stat(disk.path), posted)
     except OSError as error:
         return unread(disk.check, disk.label, f"{disk.path} does not read: {error}")
 
@@ -275,6 +297,10 @@ def warm_pod_answer_reading(check, label, path, namespace, name, code, body):
 
 
 def warm_pod_reading(cli, kube, api, path, namespace):
+    return replace(warm_pod_seen(cli, kube, api, path, namespace), after=TURN_AFTER)
+
+
+def warm_pod_seen(cli, kube, api, path, namespace):
     check, label = "warm-pod", "warm pod"
     if api.seen != OK:
         return unread(check, label, "the Kubernetes API is not ready")
@@ -380,9 +406,8 @@ def decide(state, readings, now_ms):
     streaks = dict(state["streaks"])
     outbox = list(state["outbox"])
     for reading in readings:
-        if reading.check in BAD_AFTER:
-            streaks[reading.check] = streaks.get(reading.check, 0) + 1 if reading.seen == BAD else 0
         if reading.seen == UNREAD:
+            streaks.pop(reading.check, None)
             if reading.check not in unread_now:
                 say("check_unread", check=reading.check, detail=reading.value)
             unread_now.add(reading.check)
@@ -392,10 +417,15 @@ def decide(state, readings, now_ms):
         unchanged = held is not None and held["seen"] == reading.seen
         quiet_start = held is None and reading.seen == OK
         if unchanged:
+            streaks.pop(reading.check, None)
             continue
-        if reading.seen == BAD and streaks.get(reading.check, 1) < BAD_AFTER.get(reading.check, 1):
-            say("bad_held", check=reading.check, samples=streaks[reading.check], value=reading.value)
+        samples = streaks.get(reading.check, 0) + 1
+        waits = samples < reading.after and not quiet_start
+        if waits:
+            streaks[reading.check] = samples
+            say("turn_held", check=reading.check, seen=reading.seen, samples=samples, value=reading.value)
             continue
+        streaks.pop(reading.check, None)
         checks[reading.check] = {"seen": reading.seen, "since": now_ms, "value": reading.value}
         if quiet_start:
             continue
@@ -499,7 +529,7 @@ class Watch:
         readings.extend(deployment_reading(self.kube, api, name) for name in self.config.deployments)
         if self.config.warm_pod_file:
             readings.append(warm_pod_reading(self.cli, self.kube, api, self.config.warm_pod_file, self.config.warm_pod_namespace))
-        readings.extend(disk_read(disk, self.stat) for disk in self.config.disks)
+        readings.extend(disk_read(disk, self.stat, self.state["checks"].get(disk.check, {}).get("seen")) for disk in self.config.disks)
         return readings
 
     def tick(self):

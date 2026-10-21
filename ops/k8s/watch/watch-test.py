@@ -26,6 +26,40 @@ OOM = {"terminated": {"exitCode": 137, "reason": "OOMKilled", "startedAt": "2026
 NOT_FOUND = json.dumps({"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure", "message": f'pods "{WARM}" not found', "reason": "NotFound", "details": {"name": WARM, "kind": "pods"}, "code": 404}).encode()
 
 
+HOVER = [
+    (1792575516746, 9_900_000_000),
+    (1792575526765, 10_300_000_000),
+    (1792578379568, 9_990_000_000),
+    (1792578878133, 10_100_000_000),
+    (1792578938200, 9_900_000_000),
+    (1792578988255, 10_200_000_000),
+    (1792579038288, 9_990_000_000),
+    (1792579148261, 10_200_000_000),
+    (1792579398542, 9_990_000_000),
+    (1792579478625, 10_100_000_000),
+    (1792579658739, 9_990_000_000),
+    (1792579718799, 10_100_000_000),
+    (1792579877985, 9_900_000_000),
+    (1792579928038, 10_100_000_000),
+    (1792579963110, 9_900_000_000),
+    (1792580088243, 10_100_000_000),
+    (1792580278565, 9_900_000_000),
+    (1792580288580, 10_100_000_000),
+    (1792580328619, 9_900_000_000),
+    (1792580348643, 10_100_000_000),
+    (1792580518830, 9_900_000_000),
+    (1792580558874, 10_100_000_000),
+    (1792580658698, 9_990_000_000),
+]
+NODE_LOW = {"check": "disk-node-low", "label": "node volume", "path": "/disks/node", "rule": "free_bytes_under", "limit": 10_000_000_000, "clear": 10_500_000_000}
+
+
+def hover_samples():
+    for (at, free), (until, _) in zip(HOVER, HOVER[1:]):
+        yield from [free] * round((until - at) / (watch.SAMPLE_S * 1000))
+    yield HOVER[-1][1]
+
+
 class Killed(Exception):
     pass
 
@@ -243,6 +277,25 @@ class Disks(unittest.TestCase):
         self.assertEqual(watch.disk_reading(disk, Stat(100, 20, 15, 4096)).seen, watch.BAD)
         self.assertEqual(watch.disk_reading(disk, Stat(100, 20, 16, 4096)).seen, watch.OK)
 
+    def test_a_row_with_a_clear_line_turns_good_only_past_it_and_bad_only_past_its_line(self):
+        disk = watch.Disk.of(NODE_LOW)
+
+        def seen(free, posted):
+            return watch.disk_reading(disk, Stat(29_700_000_000, 0, free, 1), posted).seen
+
+        self.assertEqual([seen(10_200_000_000, posted) for posted in (None, watch.OK, watch.BAD)], [watch.OK, watch.OK, watch.BAD])
+        self.assertEqual([seen(free, watch.BAD) for free in (10_499_999_999, 10_500_000_000)], [watch.BAD, watch.OK])
+        self.assertEqual(seen(9_999_999_999, watch.OK), watch.BAD)
+        self.assertIn("bad under 10 GB free, good again at 10.5 GB free", watch.disk_reading(disk, Stat(29_700_000_000, 0, 1, 1)).value)
+        used = watch.Disk.of({"check": "disk-home", "label": "h", "path": "/disks/home", "rule": "used_percent_at", "limit": 85, "clear": 80})
+        self.assertEqual([watch.disk_reading(used, Stat(100, 0, free, 4096), watch.BAD).seen for free in (19, 21)], [watch.BAD, watch.OK])
+        self.assertIn("bad at 85% used, good again under 80% used", watch.disk_reading(used, Stat(100, 0, 21, 4096)).value)
+
+    def test_a_clear_line_on_the_bad_side_of_its_line_is_refused_at_start(self):
+        for rule, limit, clear in (("free_bytes_under", 10, 9), ("free_bytes_under", 10, 10), ("free_percent_under", 5, 4), ("used_percent_at", 85, 90)):
+            with self.assertRaises(ValueError):
+                watch.Disk.of({"check": "d", "label": "d", "path": "/", "rule": rule, "limit": limit, "clear": clear})
+
     def test_an_unknown_rule_is_refused_at_start(self):
         with self.assertRaises(ValueError):
             watch.Disk.of({"check": "d", "label": "d", "path": "/", "rule": "most", "limit": 1})
@@ -317,6 +370,18 @@ def reading(seen, check="rate"):
     return watch.Reading(check, "block rate", seen, f"value {seen}")
 
 
+class Holds(unittest.TestCase):
+    def test_the_checks_with_a_line_and_the_flaky_ones_wait_turn_after_samples_and_the_rest_one(self):
+        _, rate = watch.rate_reading([(0, 100)], 40_000, 140)
+        disks = [watch.disk_reading(watch.Disk("d", "d", "/d", rule, 5), Stat(100, 20, 5, 4096)) for rule in watch.RULES]
+        public = watch.public_reading(FakeHttp({PUBLIC + "/v1/status": (200, status(1))}), PUBLIC, watch.Reading("node", "node", watch.OK, ""))
+        warm, _ = warm_read({WARM_FILE: f"{WARM}\n".encode()}, (200, warm_pod(RUNNING)))
+        node, _ = watch.status_reading("node", "node", FakeHttp({NODE + "/v1/status": (200, status(1))}), NODE)
+        ccs = watch.ccs_reading(FakeHttp({CCS + "/ccs/status": (200, b"{}")}), CCS)
+        self.assertEqual([held.after for held in (rate, *disks, public, warm)], [watch.TURN_AFTER] * 6)
+        self.assertEqual([at_once.after for at_once in (node, ccs, watch.budget_reading(BUDGET))], [1, 1, 1])
+
+
 class Decide(unittest.TestCase):
     def test_only_transitions_post(self):
         state = watch.fresh_state()
@@ -330,9 +395,9 @@ class Decide(unittest.TestCase):
         self.assertEqual(texts, ["🔴 block rate: value bad", "🟢 block rate is good again: value ok"])
         self.assertEqual([item["id"] for item in state["outbox"]], ["watch-rate-bad-2", "watch-rate-ok-5"])
 
-    def test_the_public_url_turns_bad_on_its_second_failed_sample_in_a_row_and_the_node_on_its_first(self):
+    def test_a_held_check_turns_bad_on_its_second_bad_sample_in_a_row_good_on_its_second_good_one_and_the_node_on_its_first(self):
         def public(seen):
-            return watch.Reading("public", "public /v1/status", seen, f"value {seen}")
+            return watch.Reading("public", "public /v1/status", seen, f"value {seen}", watch.TURN_AFTER)
 
         state = watch.fresh_state()
         for at, seen in enumerate((watch.OK, watch.BAD, watch.OK, watch.BAD, watch.UNREAD, watch.BAD)):
@@ -341,15 +406,20 @@ class Decide(unittest.TestCase):
         state = watch.decide(state, [public(watch.BAD)], 6)
         state = watch.decide(state, [public(watch.BAD)], 7)
         self.assertEqual([item["id"] for item in state["outbox"]], ["watch-public-bad-6"])
-        state = watch.decide(state, [reading(watch.BAD, "node")], 8)
-        self.assertEqual(state["outbox"][-1]["id"], "watch-node-bad-8")
+        for at, seen in enumerate((watch.OK, watch.BAD, watch.OK, watch.UNREAD, watch.OK), start=8):
+            state = watch.decide(state, [public(seen)], at)
+        self.assertEqual([item["id"] for item in state["outbox"]], ["watch-public-bad-6"])
+        state = watch.decide(state, [public(watch.OK)], 13)
+        self.assertEqual([item["id"] for item in state["outbox"]], ["watch-public-bad-6", "watch-public-ok-13"])
+        state = watch.decide(state, [reading(watch.BAD, "node")], 14)
+        self.assertEqual((state["outbox"][-1]["id"], state["streaks"]), ("watch-node-bad-14", {}))
 
     def test_a_state_saved_before_streaks_loads_with_none_and_decides(self):
         with tempfile.TemporaryDirectory() as temp:
             path = pathlib.Path(temp) / "state.json"
             path.write_text(json.dumps({"checks": {}, "unread": [], "outbox": []}))
             old = watch.Store(path).load()
-        state = watch.decide(old, [watch.Reading("public", "public /v1/status", watch.BAD, "v")], 1)
+        state = watch.decide(old, [watch.Reading("public", "public /v1/status", watch.BAD, "v", watch.TURN_AFTER)], 1)
         self.assertEqual((state["outbox"], state["streaks"]), ([], {"public": 1}))
 
     def test_a_check_bad_from_the_start_posts(self):
@@ -551,7 +621,7 @@ class Whole(unittest.TestCase):
                 clock.now += watch.SAMPLE_S
             texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
             self.assertEqual(len(texts), 2)
-            self.assertTrue(texts[0].startswith("🔴 block rate: 0.50 blocks/s"))
+            self.assertTrue(texts[0].startswith("🔴 block rate: 0.25 blocks/s"))
             self.assertTrue(texts[1].startswith("🟢 block rate is good again"))
             self.assertEqual(json.loads(store.path.read_text())["checks"]["rate"]["seen"], watch.OK)
 
@@ -572,6 +642,8 @@ class Whole(unittest.TestCase):
             self.assertEqual(cli.ops, [])
             tick(down)
             tick(up)
+            self.assertEqual(len(cli.ops), 1)
+            tick(up)
             texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
             self.assertEqual(texts, ["🔴 public /v1/status: no answer: timed out", "🟢 public /v1/status is good again: height 1"])
 
@@ -590,7 +662,7 @@ class Whole(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text())["outbox"], [])
 
 
-    def test_a_dead_run_container_posts_on_its_second_bad_sample_once_and_good_again_once(self):
+    def test_a_dead_run_container_posts_on_its_second_bad_sample_and_good_again_on_its_second_good_one(self):
         config = watch.Config(NODE, PUBLIC, "", "alerts", (), (), warm_pod_file=WARM_FILE, warm_pod_namespace="agents")
         http = FakeHttp({NODE + "/v1/status": (200, status(1)), PUBLIC + "/v1/status": (200, status(1))})
         cli = FakeCli(files={WARM_FILE: f"{WARM}\n".encode()})
@@ -598,13 +670,55 @@ class Whole(unittest.TestCase):
         posted = []
         with tempfile.TemporaryDirectory() as temp:
             watcher = watch.Watch(config, http, kube, cli, watch.Store(pathlib.Path(temp) / "state.json"), watch.Pager([]), Clock())
-            for run in (RUNNING, OOM, OOM, OOM, RUNNING):
+            for run in (RUNNING, OOM, OOM, OOM, RUNNING, RUNNING):
                 kube.answers[WARM_PATH] = (200, warm_pod(run))
                 watcher.tick()
                 posted.append(len(cli.ops))
         texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
-        self.assertEqual(posted, [0, 0, 1, 1, 2])
+        self.assertEqual(posted, [0, 0, 1, 1, 1, 2])
         self.assertEqual(texts, [f"🔴 warm pod: {WARM}'s run container ended: OOMKilled, exit 137", f"🟢 warm pod is good again: {WARM}'s run container is running"])
+
+    def test_a_disk_hovering_on_its_line_posts_bad_once_and_good_again_only_after_as_many_good_samples_in_a_row(self):
+        disk = watch.Disk("disk-node-low", "node volume", "/disks/node", "free_bytes_under", 10_000_000_000)
+        config = watch.Config(NODE, PUBLIC, "", "alerts", (disk,), ())
+        http = FakeHttp({NODE + "/v1/status": (200, status(1)), PUBLIC + "/v1/status": (200, status(1))})
+        cli = FakeCli()
+        over, under = Stat(7_250_000, 2_500_000, 2_441_407, 4096), Stat(7_250_000, 2_500_000, 2_441_406, 4096)
+        free = [over]
+        posted = []
+        with tempfile.TemporaryDirectory() as temp:
+            store = watch.Store(pathlib.Path(temp) / "state.json")
+            watcher = watch.Watch(config, http, ready_kube(), cli, store, watch.Pager([]), Clock(), lambda path: free[0])
+            for sample in (over, under, over, under, under, over, under, over, under, over, over):
+                free[0] = sample
+                watcher.tick()
+                posted.append(len(cli.ops))
+        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        self.assertEqual(posted, [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2])
+        shown = "10.0 GB free of 29.7 GB (33% free), bad under 10 GB free"
+        self.assertEqual(texts, [f"🔴 node volume: {shown}", f"🟢 node volume is good again: {shown}"])
+
+    def test_the_node_volume_replaying_its_real_hover_posts_bad_once_and_good_again_once_over_its_clear_line(self):
+        config = watch.Config(NODE, PUBLIC, "", "alerts", (watch.Disk.of(NODE_LOW),), ())
+        http = FakeHttp({PUBLIC + "/v1/status": (200, status(1))})
+        cli = FakeCli()
+        clock = Clock()
+        free = [0]
+        samples = [10_300_000_000, *hover_samples(), 10_600_000_000, 10_600_000_000]
+        posted = []
+        with tempfile.TemporaryDirectory() as temp:
+            store = watch.Store(pathlib.Path(temp) / "state.json")
+            watcher = watch.Watch(config, http, ready_kube(), cli, store, watch.Pager([]), clock, lambda path: Stat(29_700_000_000, 0, free[0], 1))
+            for at, sample in enumerate(samples):
+                free[0] = sample
+                http.answers[NODE + "/v1/status"] = (200, status(at * 10))
+                watcher.tick()
+                clock.now += watch.SAMPLE_S
+                posted.append(len(cli.ops))
+        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        self.assertEqual(posted[-3:], [1, 1, 2])
+        line = "bad under 10 GB free, good again at 10.5 GB free"
+        self.assertEqual(texts, [f"🔴 node volume: 10.0 GB free of 29.7 GB (33% free), {line}", f"🟢 node volume is good again: 10.6 GB free of 29.7 GB (35% free), {line}"])
 
 if __name__ == "__main__":
     unittest.main()

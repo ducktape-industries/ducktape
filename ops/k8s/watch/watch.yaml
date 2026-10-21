@@ -145,7 +145,7 @@ spec:
             - {name: WATCH_WARM_POD_NAMESPACE, value: agents}
             - name: WATCH_DISKS
               value: >-
-                [{"check": "disk-node-low", "label": "node volume", "path": "/disks/node", "rule": "free_bytes_under", "limit": 10000000000},
+                [{"check": "disk-node-low", "label": "node volume", "path": "/disks/node", "rule": "free_bytes_under", "limit": 10000000000, "clear": 10500000000},
                 {"check": "disk-node-fallback", "label": "node volume, at the fallback line", "path": "/disks/node", "rule": "free_bytes_under", "limit": 6000000000},
                 {"check": "disk-root", "label": "fabrics-1 root disk", "path": "/disks/root", "rule": "free_percent_under", "limit": @NODEFS_PERCENT@},
                 {"check": "disk-home", "label": "rlm-home disk", "path": "/disks/home", "rule": "used_percent_at", "limit": @IMAGE_GC_PERCENT@}]

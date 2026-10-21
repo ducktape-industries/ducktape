@@ -719,15 +719,17 @@ one up for another network.
 - `k8s/watch/watch.py` is watch, a read-only daemon off the chain. It
   samples every 10 s and posts to chat channel `alerts` once when a check
   turns bad and once when it is good again, never while a check stays as
-  it was. Its checks:
+  it was. The block rate, the public `/v1/status`, the warm pod and every
+  disk row turn either way only on their second sample in a row that
+  differs from what was posted: a first logs `turn_held`, and an unread
+  sample or one that agrees with what was posted ends the row, which its
+  claim `state` keeps across a restart. The other checks turn on their
+  first. Its checks:
   - the block rate over the last 40 s, from the height in the node's
     `/v1/status` at `node-http.duckpond.svc:8844`: bad under 0.7 blocks/s;
     a sample the node does not answer starts the window again;
   - the node's `/v1/status`, and the public one at
-    `duckpond.ducktape.industries` while the node's answers. The node's
-    turns bad on its first failed sample, the public one only on its second
-    in a row: a first logs `bad_held`, and an ok or unread sample ends the
-    row, which its claim `state` keeps across a restart;
+    `duckpond.ducktape.industries` while the node's answers;
   - harness's `Budget`: bad while any account or window has an Anthropic
     status other than `allowed`;
   - ccs, when `WATCH_CCS` names it: bad when `/ccs/status` gets no answer
@@ -742,8 +744,7 @@ one up for another network.
     is bad when the file is empty or missing, when the API answers 404
     for the pod, and when the pod's container `run` is terminated, with
     its reason and exit code: the pod stays Running while `out` lives,
-    and `run`'s restart count and last state stay empty. Like the public
-    URL it turns bad on its second bad sample in a row. A files read or
+    and `run`'s restart count and last state stay empty. A files read or
     API answer that fails, or that is not a pod, is unread;
   - the node volume's free bytes as `df` counts them (`f_bavail`), in two
     rows: bad under 10 GB and under 6 GB, the node-volume plan's heads-up
@@ -753,6 +754,11 @@ one up for another network.
     filesystem, bad at its `imageGCHighThresholdPercent` as the kubelet
     counts usage. Each is read with `statvfs` on an empty host directory
     on that filesystem, mounted read-only, so the pod sees no file there.
+    A row in `WATCH_DISKS` may name a `clear` line past its `limit` on the
+    good side: once it has posted bad, it is good again only past `clear`,
+    so a disk sitting on its line posts once. The 10 GB node-volume row
+    clears at 10.5 GB, twice the 0.2–0.3 GB it swings while it sits on
+    the line; the other rows have none.
 - A check it cannot read changes nothing, and logs `check_unread` once as
   it turns unread: with the node down, the rate and the public URL are
   unread. It saves what it decided to its claim `state` before it posts,
