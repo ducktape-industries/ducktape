@@ -473,7 +473,13 @@ it when that wake's Result comes. While the session works it shows a
 `bridge-<account>-<channel>-<seq>`, so a repeat is refused, never posted
 twice. A message heard while the session runs goes to the same session, which
 answers it in turn. It checks identity `Hears` for every message's author, as
-harness does. Claude's ducktape tools are `ducktape mcp` served by the bridge
+harness does, and takes a turn for every message that passes. Which messages
+reach it is the account's hearing in chat: a mention, a DM, a reply in a
+thread the account is in, every message in a room it `Listen`s to or
+`Watch`es, and a notice that names it. Whose messages pass is what the account
+answers (identity `Answers`, set by its manager with `SetOwnership`; the
+manager always passes), as for a harness agent. A turn whose reply is empty
+posts nothing. Claude's ducktape tools are `ducktape mcp` served by the bridge
 itself on a socket in `STATE.relay/` (each session runs `ducktape bridge
 relay`), so no child holds the key, and a wake the session arms with
 `WakeOn` is told back to its thread.
