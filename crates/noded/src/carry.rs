@@ -1,5 +1,5 @@
-// The one copy of the block history out of the archives older builds kept, made at each start
-// before marshal runs, and the copy back a rollback makes; each takes only what its target lacks.
+// The one copy of the block history's window out of the archives older builds kept, made at each
+// start before marshal runs, and the copy back a rollback makes; each takes only what its target lacks.
 
 use std::path::Path;
 use std::time::Instant;
@@ -12,6 +12,7 @@ use crate::{Error, Result};
 
 pub struct Carry {
     pub copied: u64,
+    pub forgotten: u64,
     pub unsummarized: Vec<u64>,
 }
 
@@ -28,10 +29,11 @@ pub async fn carry_history<E: consensus::Context>(
         )));
     }
     let history = History::open(dir, Durability::AtClose)?;
+    let floor = window_floor(&archives.heights(), history.span());
     let mut copied = 0;
     let mut unsummarized = Vec::new();
     for (first, last) in archives.heights() {
-        for height in first..=last {
+        for height in first.max(floor)..=last {
             if history.has(height)? {
                 continue;
             }
@@ -48,18 +50,21 @@ pub async fn carry_history<E: consensus::Context>(
             copied += 1;
         }
     }
+    let forgotten = history.forget_below(floor)?;
     history.close()?;
     archives.close().await?;
     tracing::info!(
         target: "ducktape::node",
         event = "history_carried",
         copied,
+        forgotten,
         unsummarized = unsummarized.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "the node copied the block history its archives kept into its history store"
+        "the node copied the window of block history its archives kept into its history store and let go of what it kept below the window"
     );
     Ok(Carry {
         copied,
+        forgotten,
         unsummarized,
     })
 }
@@ -106,6 +111,12 @@ pub async fn restore_archives<E: consensus::Context>(
     restore_history(context, &descriptor.network, &dir).await
 }
 
+fn window_floor(archived: &[(u64, u64)], kept: Option<(u64, u64)>) -> u64 {
+    let archived = archived.iter().map(|(_, last)| *last);
+    let newest = archived.chain(kept.map(|(_, newest)| newest)).max();
+    newest.map_or(0, |newest| newest.saturating_sub(history::WINDOW))
+}
+
 fn unblocked(summarized: &[(u64, u64)], blocks: &[(u64, u64)]) -> Option<u64> {
     for &(first, last) in summarized {
         let mut height = first;
@@ -127,7 +138,8 @@ fn unblocked(summarized: &[(u64, u64)], blocks: &[(u64, u64)]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::unblocked;
+    use super::{unblocked, window_floor};
+    use crate::history::WINDOW;
 
     #[test]
     fn a_summary_with_no_block_is_named_by_its_height() {
@@ -137,5 +149,16 @@ mod tests {
         assert_eq!(unblocked(&[(0, 2), (6, 7)], &[(0, 2), (5, 5)]), Some(6));
         assert_eq!(unblocked(&[(2, 3)], &[]), Some(2));
         assert_eq!(unblocked(&[], &[(0, 1)]), None);
+    }
+
+    #[test]
+    fn the_carry_floor_sits_a_window_below_the_newest_height_either_store_holds() {
+        assert_eq!(window_floor(&[], None), 0);
+        assert_eq!(window_floor(&[(0, 10)], None), 0);
+        assert_eq!(window_floor(&[(0, WINDOW + 10)], None), 10);
+        assert_eq!(
+            window_floor(&[(0, 5), (8, WINDOW + 9)], Some((3, WINDOW + 20))),
+            20
+        );
     }
 }

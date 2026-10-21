@@ -251,21 +251,24 @@ seeds the programs role's list; a running network hooks or unhooks a program
 through the programs role like any other change.
 
 Each node keeps an activity index of its own, in `activity/` under its data
-directory, which no commitment covers and state sync never ships: every frame
-a block carried (its height, position, time, signer, target and whether it
-applied), newest first network-wide, under its signer and under the account it
-acted as, each account's count of frames per program, and the refusal of
-each frame that did not apply. The host returns a
+directory, which no commitment covers and state sync never ships: each frame
+a block carried that acted as an account (its height, position, time, signer,
+target and whether it applied), newest first under that account, each
+account's count of frames per program, and the refusal of each frame that did
+not apply. The host returns a
 block's records with its receipts (`host::Applied`'s `records`), and a thread
 of the node's own writes them after the block, so the index may lag the chain
 but never holds a block up, and logs `activity_lag` when it falls more than
 an epoch behind, once until it has caught up again. `POST /v1/activity` reads it: a borsh
-`noded::wire::activity::Query` (`Acted`, `Signed`, `Used` and `Frames`, each a
-page resumed by its `next`, and `Indexed`, the first height whose frames it
-holds and the newest it has indexed, and `Refusal`, why the frame at a height
-and position did not apply) answered by a `Reply`. An index opens at
+`noded::wire::activity::Query` (`Acted` and `Used`, each a page resumed by its
+`next`, `Indexed`, the first height whose frames it holds and the newest it has
+indexed, and `Refusal`, why the frame at a height and position did not apply)
+answered by a `Reply`; `Frames` and `Signed` answer `unsupported`, since
+`/v1/blocks` lists every frame a block carried. An index opens at
 the node's tip, seeded from the `activity` program's tables where the network
-still runs that program, so a node's history starts where its index did.
+still runs that program, so a node's history starts where its index did. An
+index an older build kept also holds every frame network-wide and by signing
+key: it lets go of those rows once, a block's frames at a time, as it opens.
 
 A node that is no validator of the epoch a block opens, and whose data
 directory takes a reflink, keeps a snapshot of its state in
@@ -1046,13 +1049,17 @@ is not a read, so a query whose answer moves only with time is not run again.
 Pings and the epoch cut are as on `/v1/changes`, and a frame that is not a
 `Watch` ends the socket.
 
-A node keeps its block history (each block's summary, where each transaction
-first landed and the payload of each transaction a block ran) in a store of its
-own under `history/` in the workspace. Only the block writer writes it, and the
+A node keeps the block history of its tip and the 1024 blocks below it (each
+block's summary, where each transaction first landed and the payload of each
+transaction a block ran) in a store of its own under `history/` in the
+workspace: keeping a block lets go of the one 1025 below it, so `/v1/blocks`
+lists from the window's bottom (`listed_from`) and `/v1/block` and `/v1/tx`
+answer not found below it. Only the block writer writes it, and the
 block read routes read it from snapshots, so no read can hold up a block. The
 node keeps its blocks in a compressed archive (zstd's default level). Each start copies
-into both whatever the archives of an older build hold that they lack, and
-refuses to start when a summary names a block the block archive lacks. Before
+into both whatever the archives of an older build hold that they lack, into
+history only inside the window, lets go of what history holds below the window,
+and refuses to start when a summary names a block the block archive lacks. Before
 an older build starts on the same workspace, `ducktape restore-archives`, run
 with the node stopped, writes the history and the blocks back into the archives
 that build reads.

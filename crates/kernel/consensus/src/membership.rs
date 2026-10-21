@@ -11,7 +11,7 @@ use host::Tip;
 use crate::anchor::Anchor;
 use crate::catchup::{self, Signal};
 use crate::chain::Chain;
-use crate::engine::{Engine, Epoch, floor};
+use crate::engine::{Engine, Epoch, floor, sweep};
 use crate::lanes::{EngineMux, Lanes};
 use crate::marshal::{Marshal, MarshalMailbox};
 use crate::roster::{Roster, validators_of};
@@ -45,6 +45,7 @@ pub struct Membership<E, S: Sender, R: Receiver, B, C> {
     chain: C,
     votes: Votes,
     engine: Option<Engine>,
+    swept: u64,
     seats: mpsc::UnboundedSender<Signal>,
     catch_up: Handle<()>,
 }
@@ -94,6 +95,7 @@ where
             chain,
             votes: Votes::default(),
             engine: None,
+            swept: 0,
             seats,
             catch_up,
         }
@@ -139,6 +141,7 @@ where
             .ok_or(Error::Floor { epoch })?;
         let lanes = self.lanes.register(epoch).await;
         self.engine = None;
+        self.swept = sweep(&self.context, &self.partition, self.swept, epoch).await;
         self.votes.seat(scheme.participants());
         self.engine = Some(Engine::start(
             self.context.child("engine").with_attribute("epoch", epoch),

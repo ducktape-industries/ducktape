@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use host::{ANCHOR_WINDOW, Tip};
 
-use super::{Kept, Recent};
+use super::{Kept, Recent, row_of};
+use crate::history::{Durability, History, Row, WINDOW};
 use crate::wire::{Finalized, Tx};
 
 fn tx(hash: u8, anchor: u64) -> Tx {
@@ -79,4 +80,66 @@ fn a_transaction_is_placed_from_the_window_only_when_no_landing_can_precede_it()
     assert_eq!(recent.place([2; 32]), Some((11, 0)));
     assert_eq!(recent.place([1; 32]), None);
     assert_eq!(recent.place([9; 32]), None);
+}
+
+fn landed(height: u64) -> Tx {
+    let mut landed = tx(7, height);
+    landed.hash[..8].copy_from_slice(&height.to_le_bytes());
+    landed
+}
+
+fn summarized(height: u64) -> Row {
+    let kept = kept(height, vec![landed(height)]);
+    let payloads = vec![height.to_le_bytes().to_vec()];
+    row_of(&kept, abi::encode(&*kept), payloads)
+}
+
+fn id_of(height: u64) -> [u8; 32] {
+    kept(height, Vec::new()).block.id
+}
+
+#[test]
+fn history_keeps_its_window_and_lets_go_of_each_block_that_falls_below_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = History::open(dir.path(), Durability::AtClose).unwrap();
+    let newest = WINDOW + 3;
+    for height in 0..=newest {
+        history.keep(summarized(height)).unwrap();
+    }
+    let bottom = newest - WINDOW;
+    assert_eq!(history.span(), Some((bottom, newest)));
+    assert!(history.summary(bottom).unwrap().is_some());
+    assert!(history.summary_by_id(id_of(bottom)).unwrap().is_some());
+    assert_eq!(
+        history.place(landed(bottom).hash).unwrap(),
+        Some((bottom, 0))
+    );
+    assert!(history.payload(bottom, 0).unwrap().is_some());
+    for gone in 0..bottom {
+        assert_eq!(history.summary(gone).unwrap(), None, "{gone}");
+        assert_eq!(history.summary_by_id(id_of(gone)).unwrap(), None, "{gone}");
+        assert_eq!(history.place(landed(gone).hash).unwrap(), None, "{gone}");
+        assert_eq!(history.payload(gone, 0).unwrap(), None, "{gone}");
+    }
+}
+
+#[test]
+fn history_opened_over_older_blocks_lets_go_of_everything_below_the_floor_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = History::open(dir.path(), Durability::AtClose).unwrap();
+    for height in 0..10 {
+        history.keep(summarized(height)).unwrap();
+    }
+    assert_eq!(history.forget_below(6).unwrap(), 6);
+    assert_eq!(history.span(), Some((6, 9)));
+    assert_eq!(history.summary(5).unwrap(), None);
+    assert_eq!(history.place(landed(5).hash).unwrap(), None);
+    assert_eq!(history.payload(5, 0).unwrap(), None);
+    assert!(history.summary(6).unwrap().is_some());
+    assert_eq!(history.place(landed(6).hash).unwrap(), Some((6, 0)));
+    assert_eq!(
+        history.forget_below(6).unwrap(),
+        0,
+        "a floor already reached lets go of nothing"
+    );
 }

@@ -1,5 +1,5 @@
-// The activity index: each frame a block carried, newest first network-wide, under its signer and
-// under its account, and each account's frames per program, in a store of the node's own that no
+// The activity index: each frame a block carried under the account it acted as, newest first, each
+// account's frames per program and why a frame did not apply, in a store of the node's own that no
 // commitment covers. A thread of its own writes it, so it may lag the chain and never holds a block.
 
 use std::collections::BTreeMap;
@@ -26,7 +26,7 @@ const SIGNED: &[u8] = b"k/";
 const ACTED: &[u8] = b"a/";
 const USED: &[u8] = b"u/";
 const REFUSED: &[u8] = b"r/";
-const TABLES: [&[u8]; 4] = [FRAMES, SIGNED, ACTED, USED];
+const TABLES: [&[u8]; 2] = [ACTED, USED];
 const HEIGHT: &[u8] = b"\xffheight";
 const FROM: &[u8] = b"\xfffrom";
 
@@ -187,6 +187,7 @@ impl Writer {
             }
         };
         self.indexed.send_replace(Some(span));
+        self.unframed();
         while let Ok(event) = events.recv() {
             let flow = match event {
                 Event::Block(block) => self.took(block),
@@ -233,6 +234,25 @@ impl Writer {
             ),
         }
         Flow::Indexing
+    }
+
+    fn unframed(&self) {
+        match unframed(&self.db) {
+            Ok(0) => {}
+            Ok(heights) => tracing::info!(
+                target: "ducktape::activity",
+                event = "activity_unframed",
+                heights,
+                "the activity index let go of the frames it kept network-wide and by signing key"
+            ),
+            Err(error) => tracing::warn!(
+                target: "ducktape::activity",
+                event = "activity_unframed",
+                %error,
+                reason = "store_failed",
+                "the activity index did not let go of the frames it kept network-wide and by signing key"
+            ),
+        }
     }
 
     fn closed(&self) -> Flow {
@@ -355,6 +375,9 @@ fn written(db: &Db, block: &Block, span: Indexed) -> Result<()> {
     let mut batch = WriteBatch::new();
     let mut used: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
     for record in &block.records {
+        let Some(account) = record.account else {
+            continue;
+        };
         let frame = Frame {
             height: record.height,
             position: record.position,
@@ -364,16 +387,10 @@ fn written(db: &Db, block: &Block, span: Indexed) -> Result<()> {
             applied: record.applied,
         };
         let at = newest(frame.height, frame.position);
-        let value = abi::encode(&frame);
-        batch.put([FRAMES, &at].concat(), value.clone());
         batch.put(
-            [SIGNED, &escaped(&frame.signer), &at].concat(),
-            value.clone(),
+            [ACTED, &account.to_be_bytes(), &at].concat(),
+            abi::encode(&frame),
         );
-        let Some(account) = record.account else {
-            continue;
-        };
-        batch.put([ACTED, &account.to_be_bytes(), &at].concat(), value);
         let key = used_key(account, &frame.target);
         let frames = match used.remove(&key) {
             Some(frames) => frames,
@@ -391,6 +408,34 @@ fn written(db: &Db, block: &Block, span: Indexed) -> Result<()> {
     batch.put(HEIGHT, abi::encode(&span.height));
     batch.put(FROM, abi::encode(&span.from));
     Ok(db.write(batch)?)
+}
+
+fn unframed(db: &Db) -> Result<u64> {
+    let snapshot = db.snapshot();
+    let end = abi::prefix_end(FRAMES);
+    let mut batch = WriteBatch::new();
+    let mut at: Option<Vec<u8>> = None;
+    let mut heights = 0;
+    for row in db.iter_at(Some(FRAMES), end.as_deref(), false, &snapshot)? {
+        let (key, value) = row?;
+        let newest = key[FRAMES.len()..].to_vec();
+        let height = newest.get(..size_of::<u64>()).map(<[u8]>::to_vec);
+        let moved_on = at.as_ref().is_some_and(|at| Some(at) != height.as_ref());
+        if moved_on {
+            db.write(batch)?;
+            batch = WriteBatch::new();
+            heights += 1;
+        }
+        at = height;
+        let frame: Frame = decoded(&value)?;
+        batch.delete([SIGNED, &escaped(&frame.signer), &newest].concat());
+        batch.delete(key);
+    }
+    if at.is_some() {
+        db.write(batch)?;
+        heights += 1;
+    }
+    Ok(heights)
 }
 
 fn counted(db: &Db, key: &[u8]) -> Result<u64> {
@@ -431,7 +476,8 @@ fn seeded(db: &Db, seed: Seed) -> Result<Indexed> {
 }
 
 fn framed_at(key: &[u8]) -> Option<u64> {
-    let newest = key.strip_prefix(FRAMES)?.get(..size_of::<u64>())?;
+    let acted = key.strip_prefix(ACTED)?.get(size_of::<AccountNumber>()..)?;
+    let newest = acted.get(..size_of::<u64>())?;
     Some(u64::MAX - u64::from_be_bytes(newest.try_into().ok()?))
 }
 
@@ -474,13 +520,22 @@ impl Reads {
             Query::Acted { account, page } => {
                 listing.frames([ACTED, &account.to_be_bytes()].concat(), &page)
             }
-            Query::Signed { key, page } => listing.frames([SIGNED, &escaped(&key)].concat(), &page),
+            Query::Signed { .. } => Ok(Err(unkept("every frame by signing key"))),
             Query::Used { page } => listing.used(&page),
-            Query::Frames { page } => listing.frames(FRAMES.to_vec(), &page),
+            Query::Frames { .. } => Ok(Err(unkept("every frame"))),
             Query::Indexed => Ok(Ok(Reply::Indexed(span))),
             Query::Refusal { height, position } => listing.refusal(height, position),
         }
     }
+}
+
+fn unkept(what: &str) -> Refusal {
+    Refusal::new(
+        reason::UNSUPPORTED,
+        format!(
+            "the activity index no longer keeps {what}: /v1/blocks lists every frame a block carried"
+        ),
+    )
 }
 
 impl Listing<'_> {

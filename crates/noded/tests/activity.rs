@@ -1,5 +1,5 @@
-//! A node indexes every frame its blocks carry, serves the index at `/v1/activity`, and after a
-//! stop opens the index where it left it.
+//! A node indexes why each frame its blocks carry did not apply, serves the index at
+//! `/v1/activity`, and after a stop opens the index where it left it.
 use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -15,6 +15,7 @@ use futures::StreamExt as _;
 use futures::channel::oneshot;
 use host::Layer;
 use node::{Frame, Preconfirm};
+use noded::wire::Blocks;
 use noded::wire::activity::{Indexed, PageRequest, Query, Reply};
 use noded::{Client, Daemon, HaloConfig, Listeners, LoadConfig, Logs, Workspace};
 
@@ -195,21 +196,26 @@ async fn indexed_to(daemon: &Node, height: u64) -> Indexed {
     reached.unwrap()
 }
 
-async fn probed(client: &Client) -> Vec<noded::wire::activity::Frame> {
-    let all = Query::Frames {
-        page: PageRequest::default(),
+async fn probed(client: &Client) -> Vec<(u64, u32)> {
+    let every = Blocks {
+        before: None,
+        limit: u32::MAX,
+        most: 0,
     };
-    let Reply::Frames(page) = client.activity(&all).await.unwrap() else {
-        panic!("Frames answers frames");
-    };
-    page.items
-        .into_iter()
-        .filter(|frame| frame.target == "probe")
+    let page = client.blocks(every).await.unwrap();
+    page.blocks
+        .iter()
+        .flat_map(|block| {
+            let probes = block.txs.iter().enumerate();
+            probes
+                .filter(|(_, tx)| tx.target == "probe")
+                .map(move |(position, _)| (block.height, position as u32))
+        })
         .collect()
 }
 
 #[test]
-fn a_node_indexes_the_frames_its_blocks_carry_and_reopens_its_index_where_it_stopped() {
+fn a_node_indexes_why_its_blocks_frames_did_not_apply_and_reopens_its_index_where_it_stopped() {
     let root = tempfile::tempdir().unwrap();
     let workspace = Workspace::at(root.path().join("n0"));
     let identity = runner(&workspace.runtime_dir()).start({
@@ -264,33 +270,35 @@ fn a_node_indexes_the_frames_its_blocks_carry_and_reopens_its_index_where_it_sto
         "a node founded here indexes from its first block"
     );
     assert_eq!(frames.len() as u64, FRAMES + 1);
-    let refused: Vec<_> = frames.iter().filter(|frame| !frame.applied).collect();
-    assert_eq!(refused.len(), 1, "{frames:?}");
-    let why = |frame: &noded::wire::activity::Frame| Query::Refusal {
-        height: frame.height,
-        position: frame.position,
-    };
-    assert_eq!(
-        runtime.block_on(client.activity(&why(refused[0]))).unwrap(),
-        Reply::Refusal(Some(Refusal::new("probe", "no")))
-    );
-    let landed = frames.iter().find(|frame| frame.applied).unwrap();
-    assert_eq!(
-        runtime.block_on(client.activity(&why(landed))).unwrap(),
-        Reply::Refusal(None)
-    );
-    let newest_first = frames
-        .windows(2)
-        .all(|pair| (pair[0].height, pair[0].position) > (pair[1].height, pair[1].position));
-    assert!(newest_first, "{frames:?}");
-    let signed = Query::Signed {
-        key: frames[0].signer.clone(),
-        page: PageRequest::default(),
-    };
-    let Reply::Frames(by_signer) = runtime.block_on(client.activity(&signed)).unwrap() else {
-        panic!("Signed answers frames");
-    };
-    assert_eq!(by_signer.items, frames);
+    let refusals: Vec<Reply> = frames
+        .iter()
+        .map(|&(height, position)| {
+            let why = Query::Refusal { height, position };
+            runtime.block_on(client.activity(&why)).unwrap()
+        })
+        .collect();
+    let refused: Vec<&Reply> = refusals
+        .iter()
+        .filter(|reply| **reply != Reply::Refusal(None))
+        .collect();
+    let failed = Reply::Refusal(Some(Refusal::new("probe", "no")));
+    assert_eq!(refused, [&failed], "{refusals:?}");
+    let unkept = [
+        Query::Frames {
+            page: PageRequest::default(),
+        },
+        Query::Signed {
+            key: writer.public_key().as_ref().to_vec(),
+            page: PageRequest::default(),
+        },
+    ];
+    for query in unkept {
+        let refusal = match runtime.block_on(client.activity(&query)) {
+            Err(noded::Error::Refused(refusal)) => refusal,
+            other => panic!("{query:?} answered {other:?}"),
+        };
+        assert_eq!(refusal.reason, abi::reason::UNSUPPORTED, "{refusal:?}");
+    }
     first.stopped();
 
     let second = start(&workspace, listeners());

@@ -1,6 +1,6 @@
-// The block history this node keeps of what it applied: each block's summary, where each tx first
-// landed and the payload of each tx a block ran. Only the writer writes it; a read clones a version
-// of the store and drops its lock before any I/O, so no read holds anything the writer needs.
+// The block history this node keeps of its newest blocks, a window back from its tip: each block's
+// summary, where each tx first landed and the payload of each tx a block ran. Only the writer writes
+// it; a read clones a version of the store and drops its lock before any I/O.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -17,6 +17,8 @@ const SUMMARY: &[u8] = b"s/";
 const ID: &[u8] = b"i/";
 const PLACE: &[u8] = b"t/";
 const PAYLOAD: &[u8] = b"p/";
+
+pub(crate) const WINDOW: u64 = 1024;
 
 pub(crate) struct Row {
     pub(crate) height: u64,
@@ -92,13 +94,54 @@ impl History {
         }
         batch.put([ID, id.as_slice()].concat(), height.to_be_bytes());
         batch.put(summary_key(height), summary);
+        let below = height.checked_sub(WINDOW + 1);
+        let forgot = match below {
+            Some(below) => self.forgetting(&mut batch, below)?.then_some(below),
+            None => None,
+        };
         self.db.write(batch)?;
-        let span = match self.span() {
+        let (lowest, newest) = match self.span() {
             Some((lowest, newest)) => (lowest.min(height), newest.max(height)),
             None => (height, height),
         };
-        self.span.store(Some(Arc::new(span)));
+        let lowest = forgot.map_or(lowest, |below| lowest.max(below + 1));
+        self.span.store(Some(Arc::new((lowest, newest))));
         Ok(())
+    }
+
+    pub(crate) fn forget_below(&self, floor: u64) -> Result<u64> {
+        let Some((lowest, _)) = self.span() else {
+            return Ok(0);
+        };
+        let mut forgotten = 0;
+        for height in lowest..floor {
+            let mut batch = WriteBatch::new();
+            if self.forgetting(&mut batch, height)? {
+                self.db.write(batch)?;
+                forgotten += 1;
+            }
+        }
+        if forgotten > 0 {
+            self.span.store(spanned(&self.db)?.map(Arc::new));
+        }
+        Ok(forgotten)
+    }
+
+    fn forgetting(&self, batch: &mut WriteBatch, height: u64) -> Result<bool> {
+        let Some(summary) = self.db.get(&summary_key(height))? else {
+            return Ok(false);
+        };
+        let landed = crate::blocks::places_of(&summary)?;
+        for (hash, position) in landed.places {
+            let placed_here = self.place(hash)? == Some((height, position));
+            if placed_here {
+                batch.delete([PLACE, hash.as_slice()].concat());
+            }
+            batch.delete(payload_key(height, position));
+        }
+        batch.delete([ID, landed.id.as_slice()].concat());
+        batch.delete(summary_key(height));
+        Ok(true)
     }
 
     pub(crate) fn summary(&self, height: u64) -> Result<Option<Vec<u8>>> {

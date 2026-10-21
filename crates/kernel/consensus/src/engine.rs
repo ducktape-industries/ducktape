@@ -10,8 +10,8 @@ use commonware_cryptography::ed25519::PublicKey;
 use commonware_cryptography::sha256;
 use commonware_p2p::{Blocker, Receiver, Sender};
 use commonware_parallel::Sequential;
-use commonware_runtime::Handle;
 use commonware_runtime::buffer::paged::CacheRef;
+use commonware_runtime::{Handle, Storage};
 use commonware_utils::ordered::Set;
 use host::Tip;
 use node::Digest;
@@ -100,7 +100,7 @@ impl Engine {
                 relay: inline,
                 reporter,
                 strategy: Sequential,
-                partition: format!("{partition}-simplex-{}", epoch.number),
+                partition: journal(partition, epoch.number),
                 mailbox_size: MAILBOX,
                 epoch: EpochNumber::new(epoch.number),
                 floor: epoch.floor,
@@ -161,4 +161,59 @@ pub(crate) async fn floor(
     };
     let anchor_names_the_tip = certificate.proposal.payload.0 == tip.id;
     anchor_names_the_tip.then(|| Floor::Finalized(certificate.clone()))
+}
+
+pub(crate) fn journal(partition: &str, epoch: u64) -> String {
+    format!("{partition}-simplex-{epoch}")
+}
+
+pub(crate) async fn sweep<E: Storage>(context: &E, partition: &str, from: u64, epoch: u64) -> u64 {
+    let kept = epoch.saturating_sub(1);
+    for number in from..kept {
+        match context.remove(&journal(partition, number), None).await {
+            Ok(()) | Err(commonware_runtime::Error::PartitionMissing(_)) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::consensus",
+                    event = "journal_unremoved",
+                    epoch = number,
+                    %error,
+                    reason = "store_failed",
+                    "a finished epoch's vote journal was not removed"
+                );
+                return number;
+            }
+        }
+    }
+    kept.max(from)
+}
+
+#[cfg(test)]
+mod tests {
+    use commonware_runtime::{Runner as _, Storage as _, deterministic};
+
+    use super::{journal, sweep};
+
+    async fn held(context: &deterministic::Context, epoch: u64) -> bool {
+        context.scan(&journal("p", epoch)).await.is_ok()
+    }
+
+    #[test]
+    fn starting_an_epoch_removes_the_vote_journals_below_the_one_before_it() {
+        deterministic::Runner::default().start(|context| async move {
+            for epoch in [0, 1, 2, 4, 5, 6] {
+                let _ = context.open(&journal("p", epoch), b"j").await.unwrap();
+            }
+            assert_eq!(sweep(&context, "p", 0, 6).await, 5);
+            for epoch in [0, 1, 2, 4] {
+                assert!(!held(&context, epoch).await, "{epoch}");
+            }
+            for epoch in [5, 6] {
+                assert!(held(&context, epoch).await, "{epoch}");
+            }
+            assert_eq!(sweep(&context, "p", 5, 7).await, 6);
+            assert!(!held(&context, 5).await);
+            assert!(held(&context, 6).await);
+        });
+    }
 }

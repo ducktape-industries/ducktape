@@ -132,15 +132,6 @@ fn asked(index: &Index, query: Query) -> std::result::Result<Reply, Refusal> {
 
 fn queries(page: PageRequest) -> Vec<Query> {
     vec![
-        Query::Frames { page: page.clone() },
-        Query::Signed {
-            key: vec![1, 0, 1],
-            page: page.clone(),
-        },
-        Query::Signed {
-            key: vec![0, 0, 0],
-            page: page.clone(),
-        },
         Query::Acted {
             account: 1,
             page: page.clone(),
@@ -291,7 +282,8 @@ fn a_cursor_stays_in_its_listing() {
     let index = fed(dir.path(), chain());
     let first = asked(
         &index,
-        Query::Frames {
+        Query::Acted {
+            account: 1,
             page: PageRequest {
                 after: None,
                 limit: Some(1),
@@ -306,7 +298,8 @@ fn a_cursor_stays_in_its_listing() {
         },
     };
     assert_eq!(asked(&index, elsewhere).unwrap_err().reason, reason::STALE);
-    let garbage = Query::Frames {
+    let garbage = Query::Acted {
+        account: 1,
         page: PageRequest {
             after: Some(vec![1]),
             limit: None,
@@ -512,4 +505,98 @@ fn a_refused_frame_keeps_why_and_an_applied_one_keeps_nothing() {
     assert_eq!(why(1), Ok(Reply::Refusal(Some(refusal))));
     assert_eq!(why(0), Ok(Reply::Refusal(None)));
     assert_eq!(why(9), Ok(Reply::Refusal(None)));
+}
+
+fn rows_under(index: &Index, prefix: &[u8]) -> usize {
+    let reads = index.reads();
+    let end = abi::prefix_end(prefix);
+    reads
+        .db
+        .iter(Some(prefix), end.as_deref(), false)
+        .unwrap()
+        .count()
+}
+
+#[test]
+fn a_block_keeps_no_frame_network_wide_or_by_signing_key_and_both_listings_name_the_blocks_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = fed(dir.path(), chain());
+    assert_eq!(rows_under(&index, FRAMES), 0);
+    assert_eq!(rows_under(&index, SIGNED), 0);
+    let unkept = [
+        Query::Frames {
+            page: PageRequest::default(),
+        },
+        Query::Signed {
+            key: vec![1, 0, 1],
+            page: PageRequest::default(),
+        },
+    ];
+    for query in unkept {
+        let refused = asked(&index, query).unwrap_err();
+        assert_eq!(refused.reason, reason::UNSUPPORTED, "{refused:?}");
+        assert!(refused.sentence.contains("/v1/blocks"), "{refused:?}");
+    }
+}
+
+#[test]
+fn an_index_opened_over_frames_kept_network_wide_and_by_signing_key_lets_them_go_and_answers_acted()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        wasm_enabled: false,
+        max_key_size: usize::MAX,
+        max_value_size: usize::MAX,
+        max_txn_write_bytes: usize::MAX,
+        ..Options::default()
+    };
+    let db = Db::open(dir.path(), options).unwrap();
+    for block in chain() {
+        let span = Indexed {
+            from: 1,
+            height: block.height,
+        };
+        written(&db, &block, span).unwrap();
+        let mut batch = WriteBatch::new();
+        for record in &block.records {
+            let frame = Frame {
+                height: record.height,
+                position: record.position,
+                time: block.time,
+                signer: record.signer.clone(),
+                target: record.target.clone(),
+                applied: record.applied,
+            };
+            let at = newest(frame.height, frame.position);
+            batch.put(
+                [SIGNED, &escaped(&frame.signer), &at].concat(),
+                abi::encode(&frame),
+            );
+            batch.put([FRAMES, &at].concat(), abi::encode(&frame));
+        }
+        db.write(batch).unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+    let index = opened(dir.path(), || {
+        panic!("an index that holds a height is not seeded")
+    })
+    .unwrap();
+    index.offer(block(5, vec![record(5, 0, 1, Some(1), "chat")]));
+    indexed_to(&index, 5);
+    assert_eq!(rows_under(&index, FRAMES), 0);
+    assert_eq!(rows_under(&index, SIGNED), 0);
+    let acted = Query::Acted {
+        account: 1,
+        page: PageRequest::default(),
+    };
+    let Reply::Frames(acted) = asked(&index, acted).unwrap() else {
+        panic!("Acted answers frames");
+    };
+    let places: Vec<(u64, u32)> = acted
+        .items
+        .iter()
+        .map(|frame| (frame.height, frame.position))
+        .collect();
+    assert_eq!(places, [(5, 0), (4, 5), (2, 1), (1, 2), (1, 0)]);
 }
