@@ -15,12 +15,18 @@ or through a member node's halo forward.
 - `server-test.py` covers the service over real HTTP against a recording kubectl, ducktape
   and kubelet: `python3 ops/k8s/pods/server-test.py` (also part of `make test`).
 - `server.py fetch` is each pod's init container, which fetches its inputs.
+- A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and
+  never ends (`ducktape-run done <run>`) is posted `run <run> lost with pod <pod>: <why>` in
+  its channel, once, when the pod ends, when it is deleted, or when the service finds it gone
+  as its watch starts. The service keeps each open run in the ConfigMap `runs` in namespace
+  `pods` as it reads the line, so a rotated log or a restart of the service loses none.
 
 ## What it needs
 
 - **A Kubernetes namespace and ServiceAccount.** `pods.yaml` makes namespace `pods`, which
   holds the service, and namespace `agents`, where agents' work runs. It also makes the
-  ServiceAccount `pods` with a Role in `agents` (pods, exec, logs, the workload kinds) and
+  ServiceAccount `pods` with a Role in `agents` (pods, exec, logs, the workload kinds), a
+  Role in `pods` for the ConfigMap `runs` (below), and
   a ClusterRole for `nodes/stats` (usage), the PriorityClass `agents`, the admission
   policies, the quota `hardcap`, the LimitRange `defaults` and the NetworkPolicies. The
   policy `node-only` admits callers only from the network's node pod (namespace

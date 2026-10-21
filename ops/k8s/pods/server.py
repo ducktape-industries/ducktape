@@ -57,6 +57,7 @@ ACCOUNT = re.compile(r"[0-9]{1,20}")
 U64_MAX = (1 << 64) - 1
 EGRESS_SENDER = 7
 RUN_LINE = "ducktape-run "
+KEPT = ("pods", "runs")
 SPEC = {
     "image": str,
     "command": list,
@@ -694,9 +695,10 @@ def receipt(ran):
 
 
 class Kube:
-    def __init__(self, kubectl, namespace):
+    def __init__(self, kubectl, namespace, kept=KEPT):
         self.kubectl = kubectl
         self.namespace = namespace
+        self.kept_namespace, self.kept_name = kept
 
     def argv(self, *args):
         return [*self.kubectl, "--namespace", self.namespace, *args]
@@ -760,6 +762,22 @@ class Kube:
     def follow(self, name):
         argv = self.argv("logs", name, "--container", RUN, "--follow")
         return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def kept_call(self, *args):
+        return run([*self.kubectl, "--namespace", self.kept_namespace, *args])
+
+    def kept_load(self):
+        ran = self.kept_call("get", "configmap", self.kept_name, "--output", "json")
+        absent = ran.code != 0 and "(NotFound)" in ran.err
+        if absent:
+            ran = self.kept_call("create", "configmap", self.kept_name, "--output", "json")
+        if ran.code != 0:
+            raise kube_refusal(ran, f"configmap {self.kept_name} in namespace {self.kept_namespace} was not read")
+        return json.loads(ran.out).get("data") or {}
+
+    def kept_change(self, data):
+        patch = json.dumps({"data": data})
+        return self.kept_call("patch", "configmap", self.kept_name, "--type", "merge", "--patch", patch)
 
 
 class Signer:
@@ -1701,21 +1719,25 @@ def reports_of(reply):
     return found, reader.bytes() if reader.u8() == 1 else None
 
 
-def lost_runs(name, stream):
-    armed, done = {}, set()
+def run_lines(stream):
     for raw in stream:
         line = raw.decode(errors="replace").rstrip("\r\n")
         if not line.startswith(RUN_LINE):
             continue
         words = line[len(RUN_LINE):].split(" ", 3)
         if words[0] == "armed" and len(words) >= 3 and words[1] and words[2]:
-            armed[words[2]] = (words[1], words[3].strip() if len(words) > 3 else "")
+            yield "armed", words[2], words[1], words[3].strip() if len(words) > 3 else ""
         elif words[0] == "done" and len(words) >= 2:
-            done.add(words[1].strip())
-    for run, (channel, call) in armed.items():
-        if run not in done:
-            again = f"; call it again: {call}" if call else "; call it again"
-            yield channel, f"run {run}{RUN_LOST}{name}: it ended before the run did, so nothing of it runs now{again}", None
+            yield "done", words[1].strip(), None, None
+
+
+def kept_key(name, run):
+    return hashlib.sha256(f"{name}\n{run}".encode()).hexdigest()
+
+
+def lost_id(name, channel, run):
+    digest = hashlib.sha256(f"{channel}\n{run}".encode()).hexdigest()
+    return f"pods-{name}-lost-{digest}"
 
 
 def line_id(name, channel, text):
@@ -2355,6 +2377,11 @@ class Notifier:
         self.posted = {}
         self.reported = {}
         self.records = None
+        self.open = {}
+        self.done = {}
+        self.deleting = set()
+        self.resumed = False
+        self.keeping = threading.Lock()
         self.lock = threading.Lock()
         self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
         self.pause = time.sleep
@@ -2562,11 +2589,13 @@ class Notifier:
         try:
             ran = self.kube.logs(name, ["--container", RUN])
             if ran.code == 0:
-                self.caught_up(name, ran.out.splitlines(keepends=True))
+                logged = ran.out.splitlines(keepends=True)
+                self.caught_up(name, logged)
+                self.track(name, requester, logged)
             else:
                 say("pods_uncaught", pod=name, detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
             process = self.kube.follow(name)
-            self.lines(name, requester, process.stdout)
+            self.lines(name, requester, self.tracking(name, requester, process.stdout))
             process.wait()
         finally:
             with self.lock:
@@ -2577,7 +2606,7 @@ class Notifier:
         if ran.code == 0:
             logged = ran.out.splitlines(keepends=True)
             self.lines(name, requester, logged)
-            self.each(name, requester, lost_runs(name, logged))
+            self.track(name, requester, logged)
 
     def followed(self, pod):
         meta = pod["metadata"]
@@ -2593,17 +2622,106 @@ class Notifier:
             self.following.add(name)
         self.spawn(self.follow, name, requester_of(meta.get("labels") or {}))
 
+    def track(self, name, requester, logged):
+        with self.keeping:
+            changes = {}
+            with self.lock:
+                runs = self.open.setdefault(name, {})
+                done = self.done.setdefault(name, set())
+                for step, run, channel, call in run_lines(logged):
+                    match step:
+                        case "armed":
+                            known = run in done or run in runs
+                            if known:
+                                continue
+                            runs[run] = {"pod": name, "run": run, "channel": channel, "call": call, "requester": requester}
+                            changes[kept_key(name, run)] = json.dumps(runs[run])
+                        case "done":
+                            done.add(run)
+                            if runs.pop(run, None) is not None:
+                                changes[kept_key(name, run)] = None
+            self.keep(changes)
+
+    def tracking(self, name, requester, stream):
+        for raw in stream:
+            self.track(name, requester, [raw])
+            yield raw
+
+    def keep(self, changes):
+        if not changes:
+            return
+        ran = self.kube.kept_change(changes)
+        if ran.code != 0:
+            say("pods_unkept", reason="kubectl_failed", keys=len(changes), detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
+
+    def lose(self, name, why):
+        with self.lock:
+            runs = self.open.pop(name, {})
+            self.done.pop(name, None)
+        for run, kept in runs.items():
+            again = f"; call it again: {kept['call']}" if kept["call"] else "; call it again"
+            text = f"run {run}{RUN_LOST}{name}: {why}, so nothing of it runs now{again}"
+            said = line_said(name, text, kept["requester"])
+            self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], lost_id(name, kept["channel"], run), said)
+        with self.keeping:
+            self.keep({kept_key(name, run): None for run in runs})
+
+    def resume(self):
+        if not self.resumed:
+            try:
+                kept = self.kube.kept_load()
+            except Refused as refused:
+                say("pods_unkept", reason="unread", detail=json.dumps(refused.sentence))
+                return
+            with self.lock:
+                for value in kept.values():
+                    record = json.loads(value)
+                    self.open.setdefault(record["pod"], {}).setdefault(record["run"], record)
+            self.resumed = True
+        self.sweep()
+
+    def sweep(self):
+        ran = self.kube.list()
+        if ran.code != 0:
+            say("pods_unswept", reason="kubectl_failed", detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
+            return
+        live = {pod["metadata"]["name"] for pod in json.loads(ran.out).get("items", [])}
+        with self.lock:
+            gone = [name for name in self.open if name not in live]
+        for name in gone:
+            self.lose(name, "it was gone when the pods service looked")
+
+    def last_read(self, pod):
+        meta = pod["metadata"]
+        deleting = "deletionTimestamp" in meta and NOTIFY_CHANNEL in (meta.get("annotations") or {})
+        if not deleting:
+            return
+        name = meta["name"]
+        with self.lock:
+            if name in self.deleting:
+                return
+            self.deleting.add(name)
+        ran = self.kube.logs(name, ["--container", RUN])
+        if ran.code == 0:
+            self.track(name, requester_of(meta.get("labels") or {}), ran.out.splitlines(keepends=True))
+
     def seen(self, pod):
         self.followed(pod)
+        self.last_read(pod)
         meta = pod["metadata"]
         notes = meta.get("annotations") or {}
         ended = ended_said(pod)
-        unposted = ended is not None and NOTIFIED not in notes and NOTIFY_CHANNEL in notes
-        if not unposted:
+        watched = ended is not None and NOTIFY_CHANNEL in notes
+        if not watched:
             return
         name = meta["name"]
+        why = f"it ended before the run did, {ended_line(pod).removeprefix(f'pod {name} ended: ')}"
+        if NOTIFIED in notes:
+            self.lose(name, why)
+            return
         requester = requester_of(meta.get("labels") or {})
         self.read(name, requester)
+        self.lose(name, why)
         if self.post(notes, requester, f"pods-{name}-ended", ended):
             self.kube.annotate(name, NOTIFIED, "ended")
             with self.lock:
@@ -2614,13 +2732,17 @@ class Notifier:
         if kind in ("ADDED", "MODIFIED"):
             self.seen(event["object"])
         elif kind == "DELETED":
+            name = event["object"]["metadata"]["name"]
             with self.lock:
-                self.posted.pop(event["object"]["metadata"]["name"], None)
-                self.reported.pop(event["object"]["metadata"]["name"], None)
+                self.posted.pop(name, None)
+                self.reported.pop(name, None)
+                self.deleting.discard(name)
+            self.lose(name, "it was deleted before the run ended")
 
     def watch(self):
         failures = 0
         while True:
+            self.resume()
             process = self.kube.watch()
             for event in json_stream(process.stdout):
                 self.event(event)

@@ -133,6 +133,7 @@ class Kube:
         self.gate = None
         self.follows = []
         self.logs_of = {}
+        self.kept = {}
 
     def answer(self, verb, *answers):
         self.answers[verb] = list(answers)
@@ -198,6 +199,29 @@ class Kube:
     def follow(self, name):
         self.follows.append(name)
         return Log(self.logs_of.get(name, b""))
+
+    def kept_load(self):
+        return dict(self.kept)
+
+    def kept_change(self, data):
+        for key, value in data.items():
+            if value is None:
+                self.kept.pop(key, None)
+            else:
+                self.kept[key] = value
+        return ran()
+
+    def watch(self):
+        raise Unwatched()
+
+
+class Unwatched(Exception):
+    pass
+
+
+def lost_id(channel, run, pod="duckpond-41"):
+    digest = server.hashlib.sha256(f"{channel}\n{run}".encode()).hexdigest()
+    return f"pods-{pod}-lost-{digest}"
 
 
 class Log:
@@ -2653,10 +2677,10 @@ class Posts(unittest.TestCase):
         ))
         self.notifier.seen(pod_json(phase="Failed", reason="NodeShutdown", notes=NOTIFY))
         ended = "duckpond-41 \u00b7 20261019-2 ended: exit 0, GATES ok"
-        lost = "duckpond-41 \u00b7 run 20261019-1 lost with pod duckpond-41: it ended before the run did, so nothing of it runs now; call it again: app b2ae apply /home/tech/work/j-101/snap.sh"
+        lost = "duckpond-41 \u00b7 run 20261019-1 lost with pod duckpond-41: it ended before the run did, NodeShutdown, so nothing of it runs now; call it again: app b2ae apply /home/tech/work/j-101/snap.sh"
         posts = [
             ("chat", notified("j-080", server.notify_id("duckpond-41", "j-080", ended), 17, ended, None)),
-            ("chat", notified("j-101", server.notify_id("duckpond-41", "j-101", lost), 17, lost, None)),
+            ("chat", notified("j-101", lost_id("j-101", "20261019-1"), 17, lost, None)),
         ]
         self.assertEqual(self.signer.submits[:2], posts)
         self.assertEqual(len(self.signer.submits), 3)
@@ -2736,6 +2760,100 @@ class Posts(unittest.TestCase):
         self.signer.keyed = False
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         self.assertEqual((self.signer.submits, self.kube.verbs()), ([], ["logs"]))
+
+
+ARMED = (
+    b"ducktape-run armed j-1 r1 app b2ae gates\n"
+    b"ducktape-run armed j-2 r2 core c0ff sh make check\n"
+    b"ducktape-run armed j-3 r3 programs 1a2b quick -p chat\n"
+    b"ducktape-run done r3\n"
+)
+KILLED = {"terminated": {"exitCode": 137, "reason": "OOMKilled", "startedAt": "s", "finishedAt": "f"}}
+
+
+class Lost(unittest.TestCase):
+    def setUp(self):
+        self.kube = Kube()
+        self.signer = Signer()
+        self.notifier = self.fresh()
+
+    def fresh(self):
+        notifier = server.Notifier(self.kube, self.signer, 1)
+        notifier.pause = lambda pause: None
+        notifier.spawn = lambda target, *args: target(*args)
+        return notifier
+
+    def followed_with_its_armed_lines_rotated_away(self):
+        self.kube.answer("logs", ran(b""), ran(b"[r2] building\n"))
+        self.kube.logs_of["duckpond-41"] = ARMED
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+
+    def lost(self, why):
+        posts = []
+        for channel, run, call in (("j-1", "r1", "app b2ae gates"), ("j-2", "r2", "core c0ff sh make check")):
+            text = f"run {run} lost with pod duckpond-41: {why}, so nothing of it runs now; call it again: {call}"
+            posts.append(("chat", server.notice_message(channel, lost_id(channel, run), None, server.line_said("duckpond-41", text, 17))))
+        return posts
+
+    def test_a_queued_and_a_running_run_are_each_posted_lost_once_when_their_pod_dies_after_its_log_rotated(self):
+        self.followed_with_its_armed_lines_rotated_away()
+        killed = pod_json(state=KILLED, phase="Failed", notes=NOTIFY)
+        self.notifier.seen(killed)
+        ended = server.notice_message("builds", "pods-duckpond-41-ended", None, server.ended_said(killed))
+        self.assertEqual(self.signer.submits, self.lost("it ended before the run did, exit code 137 (OOMKilled)") + [("chat", ended)])
+        self.notifier.seen(pod_json(state=KILLED, phase="Failed", notes={**NOTIFY, server.NOTIFIED: "ended"}))
+        self.notifier.event({"type": "DELETED", "object": killed})
+        self.assertEqual(len(self.signer.submits), 3)
+
+    def test_a_queued_and_a_running_run_are_each_posted_lost_once_when_their_pod_is_deleted(self):
+        self.followed_with_its_armed_lines_rotated_away()
+        running = pod_json(state=RUNNING, phase="Running", notes=NOTIFY)
+        for _ in range(2):
+            self.notifier.event({"type": "DELETED", "object": running})
+        self.assertEqual(self.signer.submits, self.lost("it was deleted before the run ended"))
+
+    def test_a_deleting_pods_log_is_read_once_more_so_runs_carried_away_before_the_delete_are_not_lost(self):
+        self.followed_with_its_armed_lines_rotated_away()
+        self.kube.answer("logs", ran(b"ducktape-run done r1\nducktape-run done r2\n"))
+        deleting = pod_json(state=RUNNING, phase="Running", notes=NOTIFY)
+        deleting["metadata"]["deletionTimestamp"] = "2026-10-21T07:30:00Z"
+        self.notifier.following.add("duckpond-41")
+        self.notifier.event({"type": "MODIFIED", "object": deleting})
+        self.notifier.event({"type": "DELETED", "object": deleting})
+        self.assertEqual(self.signer.submits, [])
+
+    def test_runs_kept_by_a_pods_service_that_restarted_after_their_pod_was_deleted_are_posted_lost_once(self):
+        self.followed_with_its_armed_lines_rotated_away()
+        live = pod_json(name="duckpond-42", state=RUNNING, phase="Running", notes=NOTIFY)
+        self.kube.logs_of["duckpond-42"] = b"ducktape-run armed j-4 r4 app b2ae gates\n"
+        self.notifier.seen(live)
+        self.assertEqual(self.signer.submits, [])
+        self.kube.answer("list", ran({"items": [live]}))
+        for _ in range(2):
+            with self.assertRaises(Unwatched):
+                self.fresh().watch()
+        self.assertEqual(self.signer.submits, self.lost("it was gone when the pods service looked"))
+
+
+class KeptRuns(unittest.TestCase):
+    def test_the_runs_configmap_is_made_when_missing_and_changed_by_merge_patches_in_the_services_namespace(self):
+        kube = server.Kube(["kubectl"], "agents")
+        answers = [server.Ran(1, b"", 'Error from server (NotFound): configmaps "runs" not found'), server.Ran(0, b'{"metadata": {"name": "runs"}}', "")]
+        calls = []
+
+        def ran_kubectl(argv, stdin=None, env=None):
+            calls.append(argv)
+            return answers.pop(0) if answers else server.Ran(0, b"", "")
+
+        with unittest.mock.patch.object(server, "run", ran_kubectl):
+            self.assertEqual(kube.kept_load(), {})
+            kube.kept_change({"k": "v", "gone": None})
+        patch = json.dumps({"data": {"k": "v", "gone": None}})
+        self.assertEqual(calls, [
+            ["kubectl", "--namespace", "pods", "get", "configmap", "runs", "--output", "json"],
+            ["kubectl", "--namespace", "pods", "create", "configmap", "runs", "--output", "json"],
+            ["kubectl", "--namespace", "pods", "patch", "configmap", "runs", "--type", "merge", "--patch", patch],
+        ])
 
 
 class Encodings(unittest.TestCase):
