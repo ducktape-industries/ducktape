@@ -32,6 +32,7 @@ fn block(height: u64) -> Writes {
             .zip(0..)
             .map(|(program, index)| (program, keys(index)))
             .collect(),
+        local: Default::default(),
     }
 }
 

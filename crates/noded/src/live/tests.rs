@@ -137,7 +137,10 @@ fn wrote(program: &str, key: Vec<u8>) -> state::Writes {
     let mut keys = std::collections::BTreeMap::new();
     keys.insert(key, None);
     programs.insert(program.to_owned(), keys);
-    state::Writes { programs }
+    state::Writes {
+        programs,
+        local: Default::default(),
+    }
 }
 
 fn wrote_grants() -> state::Writes {

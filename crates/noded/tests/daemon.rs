@@ -2017,6 +2017,20 @@ async fn landed(
     heights.into_iter().flatten().collect()
 }
 
+async fn spent_in(
+    changes: &mut (impl futures::Stream<Item = noded::Result<noded::wire::Change>> + Unpin),
+    id: &[u8],
+) -> u64 {
+    loop {
+        let change = changes.next().await.unwrap().unwrap();
+        let rows = change.writes.iter().filter_map(|(_, row)| row.as_deref());
+        let mut ids = rows.flat_map(|row| row.chunks(id.len()));
+        if ids.any(|carried| carried == id) {
+            return change.height;
+        }
+    }
+}
+
 #[test]
 fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
     let root = tempfile::tempdir().unwrap();
@@ -2057,9 +2071,9 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
         matches!(predicted.outcome, Outcome::Rejected(_)),
         "{predicted:?}"
     );
-    let carried = host::spent(&submission(&failing));
+    let carried = submission(&failing).id();
     // a frame predicted to fail is relayed and a block carries it
-    runtime.block_on(landed(&mut spent, &[&carried]));
+    runtime.block_on(spent_in(&mut spent, &carried));
     drop(spent);
 
     let nearly_a_block = node::BLOCK_BYTES - (1 << 16);

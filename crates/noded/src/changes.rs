@@ -398,7 +398,10 @@ mod tests {
         Wrote {
             height,
             root: abi::Root([0; 32]),
-            writes: Arc::new(Writes { programs }),
+            writes: Arc::new(Writes {
+                programs,
+                local: Default::default(),
+            }),
             view: None,
         }
     }

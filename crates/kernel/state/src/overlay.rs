@@ -3,7 +3,7 @@ use std::ops::Bound;
 
 use abi::ProgramId;
 
-use crate::Writes;
+use crate::{LOCAL, Writes};
 
 pub type Slot = Option<Vec<u8>>;
 pub type Slotted<'a> = (&'a [u8], Option<&'a [u8]>);
@@ -94,13 +94,15 @@ impl Overlay {
         Box::new(entries)
     }
 
-    pub fn into_writes(self) -> Writes {
+    pub fn into_writes(mut self) -> Writes {
+        let local = self.programs.remove(LOCAL).unwrap_or_default();
         Writes {
             programs: self
                 .programs
                 .into_iter()
                 .filter(|(_, writes)| !writes.is_empty())
                 .collect(),
+            local,
         }
     }
 }

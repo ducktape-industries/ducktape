@@ -1458,6 +1458,7 @@ mod tests {
                 program.to_owned(),
                 BTreeMap::from([(key.to_vec(), Some(vec![1]))]),
             )]),
+            local: Default::default(),
         };
         assert!(rewrites(&writes("halo", b"l/x"), "halo"));
         assert!(rewrites(&writes(host::PROGRAMS, b"halo"), "halo"));

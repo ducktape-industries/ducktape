@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use abi::{BlobId, ProgramId, Refusal, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::{Result, Submission, corrupt};
+use crate::{Error, Result, SubmissionId, corrupt};
 
 pub const BLOBS: &str = "$blobs";
 pub const PROGRAMS: &str = "$programs";
@@ -22,6 +22,21 @@ pub const ROLES: &[u8] = b"roles";
 pub const NEXT_ITEM: &[u8] = b"next_item";
 pub const LINES: &[u8] = b"line/";
 pub const ON: &[u8] = b"on/";
+pub const INDEXED_AT: &[u8] = b"indexed_at";
+
+const UNANNOUNCED: Option<u64> = None;
+const ROWS_FROM: [(&[u8], Option<u64>); 2] =
+    [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
+const HEIGHT_BYTES: usize = size_of::<u64>();
+const ID_BYTES: usize = size_of::<SubmissionId>();
+
+pub fn rows_from(network: &[u8]) -> u64 {
+    match ROWS_FROM.iter().find(|(named, _)| *named == network) {
+        Some((_, Some(height))) => *height,
+        Some((_, None)) => u64::MAX,
+        None => 0,
+    }
+}
 
 pub fn blob(id: &BlobId) -> Vec<u8> {
     abi::encode(id)
@@ -56,8 +71,29 @@ pub fn height(height: u64) -> Vec<u8> {
     height.to_be_bytes().to_vec()
 }
 
-pub fn spent(submission: &Submission) -> Vec<u8> {
-    [height(submission.anchor.height), submission.id().to_vec()].concat()
+pub fn spent(anchor: u64, id: &SubmissionId) -> Vec<u8> {
+    [height(anchor), id.to_vec()].concat()
+}
+
+pub fn ids(row: &[u8]) -> Result<std::slice::ChunksExact<'_, u8>> {
+    let ids = row.chunks_exact(ID_BYTES);
+    if !ids.remainder().is_empty() {
+        return Err(Error::Corrupt(format!(
+            "a spent row of {} bytes is not whole submission ids",
+            row.len()
+        )));
+    }
+    Ok(ids)
+}
+
+pub fn carried<'a>(key: &'a [u8], row: &'a [u8]) -> Result<Vec<&'a [u8]>> {
+    match key.len() {
+        HEIGHT_BYTES => Ok(ids(row)?.collect()),
+        len if len == HEIGHT_BYTES + ID_BYTES => Ok(vec![&key[HEIGHT_BYTES..]]),
+        len => Err(Error::Corrupt(format!(
+            "a spent key of {len} bytes is neither a block's row nor an anchored frame"
+        ))),
+    }
 }
 
 pub fn epoch(number: u64) -> Vec<u8> {

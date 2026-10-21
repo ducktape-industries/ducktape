@@ -33,6 +33,7 @@ fn churn(height: u64) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
 fn block(height: u64) -> Writes {
     Writes {
         programs: BTreeMap::from([(APP.to_owned(), churn(height))]),
+        local: Default::default(),
     }
 }
 

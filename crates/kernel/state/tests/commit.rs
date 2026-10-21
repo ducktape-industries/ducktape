@@ -56,6 +56,7 @@ fn block(height: u64) -> Writes {
             .chain(quiet)
             .map(|program| (program.to_owned(), keys(program)))
             .collect(),
+        local: Default::default(),
     }
 }
 
@@ -184,6 +185,7 @@ fn rostered(height: u64) -> Writes {
                 keys(&[(APP, code()), (GONE, code()), (ROSTER, code())]),
             ),
         ]),
+        local: Default::default(),
     }
 }
 
@@ -207,6 +209,7 @@ fn admitting_and_dropping() -> Writes {
                 keys(&[(GONE, None), (NEW, Some(b"code".to_vec()))]),
             ),
         ]),
+        local: Default::default(),
     }
 }
 

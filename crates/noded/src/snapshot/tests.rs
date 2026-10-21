@@ -50,6 +50,7 @@ fn block(height: u64) -> Writes {
             .into_iter()
             .map(|program| (program, keys()))
             .collect(),
+        local: Default::default(),
     }
 }
 

@@ -33,11 +33,12 @@ use crate::parked::Waiter;
 use crate::parking::{Run, Segment, Start, Status};
 use crate::unit::{Frame, Loaded, World, refusal_of};
 
-pub use namespace::{BLOBS, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT, spent};
+pub use namespace::{BLOBS, INDEXED_AT, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT};
 pub use parking::PAGE_FUEL;
 pub use reads::{ReadSet, Written};
 pub use runtime::{Limits, OUT_OF_FUEL};
 pub use snapshot::{Snapshot, Source};
+pub use state::LOCAL;
 
 const STATE_DIR: &str = "state";
 const BLOBS_DIR: &str = "blobs";
@@ -46,6 +47,7 @@ const CODE_KIND: &str = "program";
 /// each message, or reply, one deeper than the run that emitted it.
 pub const MAX_DEPTH: u32 = 8;
 pub const ANCHOR_WINDOW: u64 = 256;
+pub const BLOCK_BYTES: usize = 16 << 20;
 pub const HOOK_FUEL: u64 = 2_000_000;
 const STREAK_LOG_EVERY: u64 = 64;
 
@@ -201,6 +203,7 @@ where
     scheduler_streak: u64,
     roster_streak: u64,
     spent: Spent,
+    rows_from: u64,
 }
 
 #[derive(Clone, Default)]
@@ -422,6 +425,7 @@ where
         }
         let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
+        let rows_from = namespace::rows_from(&genesis.network);
         let mut host = Host {
             store,
             blobs,
@@ -432,6 +436,7 @@ where
             scheduler_streak: 0,
             roster_streak: 0,
             spent: Spent::default(),
+            rows_from,
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -533,6 +538,7 @@ where
             .get(NETWORK, namespace::ID)?
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
         let roles = roles_of(&store.view(Vec::new()))?;
+        let rows_from = namespace::rows_from(&network);
         let mut host = Host {
             store,
             blobs,
@@ -543,9 +549,40 @@ where
             scheduler_streak: 0,
             roster_streak: 0,
             spent: Spent::default(),
+            rows_from,
         };
         host.sync_code()?;
+        host.index()?;
         Ok(host)
+    }
+
+    fn index(&self) -> Result<()> {
+        let height = self.height()?;
+        let indexed = self
+            .store
+            .view(Vec::new())
+            .get(LOCAL, namespace::INDEXED_AT)?;
+        if indexed == Some(namespace::height(height)) {
+            return Ok(());
+        }
+        let started = self.store.clock().current();
+        let rebuilt = rebuild_index(self.store.storage(), height, BLOCK_BYTES)?;
+        let elapsed = self
+            .store
+            .clock()
+            .current()
+            .duration_since(started)
+            .unwrap_or_default();
+        tracing::info!(
+            target: "ducktape::host",
+            event = "spent_indexed",
+            height,
+            ids = rebuilt.ids,
+            largest_batch = rebuilt.largest,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "the node rebuilt its index of spent frames from the committed spent rows"
+        );
+        Ok(())
     }
 
     fn sync_code(&mut self) -> Result<()> {
@@ -577,11 +614,16 @@ where
             network: &self.network,
             roles: &self.roles,
             preconfirmed: None,
+            rows_from: self.rows_from,
         }
     }
 
     pub fn spent(&self) -> Spent {
         self.spent
+    }
+
+    pub fn set_rows_from(&mut self, height: u64) {
+        self.rows_from = height;
     }
 
     pub fn snapshot(&self) -> Result<Snapshot<E>> {
@@ -592,6 +634,7 @@ where
             network: self.network.clone(),
             roles: self.roles.clone(),
             preconfirmed: Arc::default(),
+            rows_from: self.rows_from,
             context: std::marker::PhantomData,
         })
     }
@@ -895,11 +938,16 @@ where
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Submitted> {
+        let id = submission.id();
         let view = self.committed.view(vec![&*overlay]);
-        if let Err(refusal) = fresh(&view, &submission, height)? {
+        if let Err(refusal) = fresh(&view, &submission, &id, height)? {
             return Ok(Submitted::Stale(rejected(&submission.target, refusal)));
         }
-        overlay.set(SPENT, namespace::spent(&submission), Vec::new());
+        if height < self.rows_from {
+            let anchored = namespace::spent(submission.anchor.height, &id);
+            overlay.set(SPENT, anchored, Vec::new());
+        }
+        overlay.set(LOCAL, id.to_vec(), Vec::new());
         let asked = identity::Query::Account(submission.signer.clone());
         let fuel = &mut self.loaded.limits().fuel;
         let account = match self
@@ -1959,12 +2007,31 @@ where
         records: Vec<hook::Record>,
     ) -> Result<Applied> {
         overlay.set(RECENT, namespace::height(tip.height), abi::encode(&tip.id));
+        if tip.height >= self.rows_from {
+            let row: Vec<u8> = overlay
+                .range(LOCAL, b"", None, false)
+                .flat_map(|(id, _)| id.iter().copied())
+                .collect();
+            if !row.is_empty() {
+                overlay.set(SPENT, namespace::height(tip.height), row);
+            }
+        }
         if let Some(expired) = tip.height.checked_sub(ANCHOR_WINDOW) {
             self.forget(expired, &mut overlay)?;
         }
-        let writes = overlay.into_writes();
+        overlay.set(
+            LOCAL,
+            namespace::INDEXED_AT.to_vec(),
+            namespace::height(tip.height),
+        );
+        let mut writes = overlay.into_writes();
+        let local = std::mem::take(&mut writes.local);
         self.blobs.promote(stage)?;
-        self.store.commit(tip.height, writes.clone()).await?;
+        let committed = Writes {
+            programs: writes.programs.clone(),
+            local,
+        };
+        self.store.commit(tip.height, committed).await?;
         self.roles = roles_of(&self.store.view(Vec::new()))?;
         // a commitment outlives neither its program's drop nor an undone
         // admission: the root is over the programs a reopened node opens
@@ -2040,16 +2107,66 @@ where
 
     fn forget(&self, height: u64, overlay: &mut Overlay) -> Result<()> {
         let key = namespace::height(height);
-        let spent = self
-            .store
-            .view(vec![&*overlay])
-            .scan(SPENT, &Scan::prefix(&key))?;
-        for entry in spent {
-            overlay.delete(SPENT, entry.key);
+        let (rows, ids) = {
+            let view = self.store.view(vec![&*overlay]);
+            if height < self.rows_from {
+                let anchored = view.scan(SPENT, &Scan::prefix(&key))?;
+                let ids: Vec<Vec<u8>> = anchored
+                    .iter()
+                    .map(|entry| entry.key[key.len()..].to_vec())
+                    .collect();
+                (anchored.into_iter().map(|entry| entry.key).collect(), ids)
+            } else {
+                match view.get(SPENT, &key)? {
+                    Some(row) => (
+                        vec![key.clone()],
+                        namespace::ids(&row)?.map(<[u8]>::to_vec).collect(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                }
+            }
+        };
+        for id in ids {
+            overlay.delete(LOCAL, id);
+        }
+        for row in rows {
+            overlay.delete(SPENT, row);
         }
         overlay.delete(RECENT, key);
         Ok(())
     }
+}
+
+struct Rebuilt {
+    ids: usize,
+    largest: usize,
+}
+
+fn rebuild_index(storage: &Storage, height: u64, most_bytes: usize) -> Result<Rebuilt> {
+    storage.clear_local()?;
+    let mut rebuilt = Rebuilt { ids: 0, largest: 0 };
+    let mut batch: Vec<Vec<u8>> = Vec::new();
+    for entry in storage.iter(SPENT, b"", None, false)? {
+        let (key, row) = entry?;
+        for id in namespace::carried(&key, &row)? {
+            let past = (batch.len() + 1) * id.len() > most_bytes;
+            if past {
+                write_ids(storage, &mut batch, &mut rebuilt)?;
+            }
+            batch.push(id.to_vec());
+        }
+    }
+    write_ids(storage, &mut batch, &mut rebuilt)?;
+    let at = namespace::height(height);
+    storage.write_local([(namespace::INDEXED_AT.to_vec(), Some(at))])?;
+    Ok(rebuilt)
+}
+
+fn write_ids(storage: &Storage, batch: &mut Vec<Vec<u8>>, rebuilt: &mut Rebuilt) -> Result<()> {
+    rebuilt.ids += batch.len();
+    rebuilt.largest = rebuilt.largest.max(batch.len());
+    let slots = batch.drain(..).map(|id| (id, Some(Vec::new())));
+    Ok(storage.write_local(slots)?)
 }
 
 fn kept_on_disk(reason: &'static str, blob: Option<BlobId>, error: &str) {
@@ -2164,6 +2281,7 @@ fn program_id(key: Vec<u8>) -> Result<ProgramId> {
 fn fresh(
     view: &View<'_>,
     submission: &Submission,
+    id: &SubmissionId,
     height: u64,
 ) -> Result<std::result::Result<(), Refusal>> {
     let anchor = submission.anchor;
@@ -2177,7 +2295,7 @@ fn fresh(
             ),
         )));
     }
-    let carried = view.get(SPENT, &namespace::spent(submission))?.is_some();
+    let carried = view.get(LOCAL, id)?.is_some();
     if carried {
         return Ok(Err(Refusal::new(
             reason::DUPLICATE,
@@ -2244,4 +2362,52 @@ pub(crate) fn roles_of(view: &View<'_>) -> Result<Roles> {
 
 fn corrupt(refusal: Refusal) -> Error {
     Error::Corrupt(refusal.sentence)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use sha2::{Digest as _, Sha256};
+    use state::{LOCAL, Storage, Writes};
+
+    use super::{SPENT, namespace, rebuild_index};
+
+    #[test]
+    fn a_rebuild_writes_no_batch_past_its_bound_whatever_one_anchor_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let id = |n: u32| -> [u8; 32] { Sha256::digest(n.to_be_bytes()).into() };
+        let anchored = 0..1000;
+        let carried = 1000..1010;
+        let mut spent: BTreeMap<Vec<u8>, Option<Vec<u8>>> = anchored
+            .clone()
+            .map(|n| (namespace::spent(5, &id(n)), Some(Vec::new())))
+            .collect();
+        let row = carried.clone().flat_map(id).collect();
+        spent.insert(namespace::height(7), Some(row));
+        let writes = Writes {
+            programs: BTreeMap::from([(SPENT.to_owned(), spent)]),
+            local: BTreeMap::new(),
+        };
+        storage.commit(7, &writes).unwrap();
+
+        let block = 100 * size_of::<[u8; 32]>();
+        let rebuilt = rebuild_index(&storage, 7, block).unwrap();
+        assert_eq!(rebuilt.ids, 1010);
+        assert_eq!(rebuilt.largest, 100);
+        let indexed: Vec<Vec<u8>> = storage
+            .iter(LOCAL, b"", None, false)
+            .unwrap()
+            .map(|entry| entry.unwrap().0)
+            .filter(|key| key != namespace::INDEXED_AT)
+            .collect();
+        let mut expected: Vec<Vec<u8>> = anchored.chain(carried).map(|n| id(n).to_vec()).collect();
+        expected.sort();
+        assert_eq!(indexed, expected);
+        assert_eq!(
+            storage.get(LOCAL, namespace::INDEXED_AT).unwrap(),
+            Some(namespace::height(7))
+        );
+    }
 }

@@ -349,7 +349,7 @@ fn unseen(node: &TestNode, frame: &[u8]) -> bool {
     let submission = node::verify(frame, NETWORK).unwrap();
     let preconfirmed = node.view(Layer::Preconfirmed);
     let ran = preconfirmed
-        .get(host::SPENT, &host::spent(&submission))
+        .get(host::LOCAL, &submission.id())
         .unwrap()
         .is_some();
     let wrote = preconfirmed.get("probe", b"k").unwrap().is_some();

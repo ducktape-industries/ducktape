@@ -22,6 +22,7 @@ fn block(height: u64) -> Writes {
     };
     Writes {
         programs: BTreeMap::from([(APP.to_owned(), keys(APP)), (OTHER.to_owned(), keys(OTHER))]),
+        local: Default::default(),
     }
 }
 

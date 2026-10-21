@@ -7,7 +7,7 @@ use host::Tip;
 
 pub type Digest = sha256::Digest;
 
-pub const BLOCK_BYTES: usize = 16 << 20;
+pub use host::BLOCK_BYTES;
 const ENVELOPE_BYTES: usize = 1 << 17;
 pub const MESSAGE_BYTES: u32 = (BLOCK_BYTES + ENVELOPE_BYTES) as u32;
 

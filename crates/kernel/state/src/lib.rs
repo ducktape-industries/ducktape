@@ -48,14 +48,17 @@ pub enum SyncFailure<X: std::error::Error + 'static> {
     State(#[from] Error),
 }
 
+pub const LOCAL: &str = "$local";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Writes {
     pub programs: BTreeMap<ProgramId, BTreeMap<Vec<u8>, Slot>>,
+    pub local: BTreeMap<Vec<u8>, Slot>,
 }
 
 impl Writes {
     pub fn is_empty(&self) -> bool {
-        self.programs.is_empty()
+        self.programs.is_empty() && self.local.is_empty()
     }
 }
 

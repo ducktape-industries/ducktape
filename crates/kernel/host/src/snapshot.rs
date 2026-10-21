@@ -31,6 +31,7 @@ where
     pub(crate) network: &'a [u8],
     pub(crate) roles: &'a Roles,
     pub(crate) preconfirmed: Option<&'a Preconfirmed>,
+    pub(crate) rows_from: u64,
 }
 
 impl<'a, E> Source<'a, E>
@@ -110,6 +111,7 @@ where
         fresh(
             &self.view(Layer::Confirmed),
             submission,
+            &submission.id(),
             self.next_height()?,
         )
     }
@@ -297,6 +299,7 @@ pub struct Snapshot<E> {
     pub(crate) network: Vec<u8>,
     pub(crate) roles: Roles,
     pub(crate) preconfirmed: Arc<Preconfirmed>,
+    pub(crate) rows_from: u64,
     pub(crate) context: PhantomData<fn() -> E>,
 }
 
@@ -309,6 +312,7 @@ impl<E> Clone for Snapshot<E> {
             network: self.network.clone(),
             roles: self.roles.clone(),
             preconfirmed: self.preconfirmed.clone(),
+            rows_from: self.rows_from,
             context: PhantomData,
         }
     }
@@ -326,6 +330,7 @@ where
             network: &self.network,
             roles: &self.roles,
             preconfirmed: Some(&self.preconfirmed),
+            rows_from: self.rows_from,
         }
     }
 

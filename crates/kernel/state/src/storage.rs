@@ -6,7 +6,7 @@ use abi::ProgramId;
 
 use fluent31::{Db, Options, Snapshot, WriteBatch};
 
-use crate::{Error, Pending, Result, Slot, Writes};
+use crate::{Error, LOCAL, Pending, Result, Slot, Writes};
 
 const SEPARATOR: u8 = 0;
 const HEIGHT: &[u8] = b"\xffheight";
@@ -193,6 +193,36 @@ impl Storage {
         Ok(self.db().write(batch)?)
     }
 
+    pub fn clear_local(&self) -> Result<()> {
+        for first in 0..=u8::MAX {
+            let lo = [first];
+            let hi = first.checked_add(1).map(|next| [next]);
+            let mut batch = WriteBatch::new();
+            for entry in self.iter(LOCAL, &lo, hi.as_ref().map(<[u8; 1]>::as_slice), false)? {
+                let (key, _) = entry?;
+                batch.delete(namespaced(LOCAL, &key));
+            }
+            if !batch.is_empty() {
+                self.db().write(batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_local(&self, slots: impl IntoIterator<Item = (Vec<u8>, Slot)>) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        for (key, slot) in slots {
+            match slot {
+                Some(value) => batch.put(namespaced(LOCAL, &key), value),
+                None => batch.delete(namespaced(LOCAL, &key)),
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        Ok(self.db().write(batch)?)
+    }
+
     pub fn advance(
         &self,
         height: u64,
@@ -228,6 +258,12 @@ fn stage(batch: &mut WriteBatch, writes: &Writes) {
                 Some(value) => batch.put(namespaced(program, key), value.clone()),
                 None => batch.delete(namespaced(program, key)),
             }
+        }
+    }
+    for (key, slot) in &writes.local {
+        match slot {
+            Some(value) => batch.put(namespaced(LOCAL, key), value.clone()),
+            None => batch.delete(namespaced(LOCAL, key)),
         }
     }
 }
