@@ -3023,6 +3023,120 @@ class Lost(unittest.TestCase):
         self.assertEqual(self.signer.submits, self.lost("it was gone when the pods service looked"))
 
 
+ARGV = {
+    "r1": ["NOTIFY=j-1", "JOB=j-1", "app", "b2ae", "gates"],
+    "r2": ["NOTIFY=j-2", "JOB=j-2", "core", "c0ff", "sh", "make check"],
+}
+
+
+def argv_line(run, words):
+    return f"ducktape-run argv {run} {server.base64.b64encode(chr(0).join(words).encode() + bytes(1)).decode()}\n".encode()
+
+
+class Recalled(unittest.TestCase):
+    def setUp(self):
+        self.kube = Kube()
+        self.signer = Signer()
+        self.recalls = []
+        self.answers = ["desktop:d1", "desktop:d2"]
+        self.notifier = self.fresh()
+
+    def fresh(self):
+        notifier = Lost.fresh(self)
+        notifier.recall = self.recall
+        return notifier
+
+    def recall(self, words):
+        self.recalls.append(words)
+        answer = self.answers.pop(0)
+        if isinstance(answer, server.Refused):
+            raise answer
+        return answer
+
+    def armed(self, argv=ARGV):
+        self.kube.answer("logs", ran(b""), ran(b"[r2] building\n"))
+        self.kube.logs_of["duckpond-41"] = ARMED + b"".join(argv_line(run, words) for run, words in argv.items())
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+
+    def said(self, channel, run, text, message=None):
+        return ("chat", server.notice_message(channel, message or lost_id(channel, run), None, server.line_said("duckpond-41", text, 17)))
+
+    def moved(self, channel, run, new, why, message=None):
+        return self.said(channel, run, f"run {run} is now run {new}: pod duckpond-41 went before it ended ({why}), so the pods service called it again once: wait on that one", message)
+
+    def test_a_run_whose_pod_died_is_called_again_once_with_its_words_and_posted_as_moved_never_as_lost(self):
+        self.armed()
+        self.notifier.event({"type": "DELETED", "object": pod_json(state=RUNNING, phase="Running", notes=NOTIFY)})
+        why = "it was deleted before the run ended"
+        self.assertEqual(self.recalls, [ARGV["r1"], ARGV["r2"]])
+        self.assertEqual(self.signer.submits, [self.moved("j-1", "r1", "desktop:d1", why), self.moved("j-2", "r2", "desktop:d2", why)])
+        self.assertEqual(server.line_status("run r1 is now run desktop:d1: pod duckpond-41 went before it ended (x), so the pods service called it again once: wait on that one"), "note")
+        self.assertEqual(self.kube.kept, {})
+
+    def test_a_run_already_called_again_once_is_posted_lost(self):
+        self.armed({"r1": ["NOTIFY=j-1", "JOB=j-1", "AGAIN=1", "app", "b2ae", "gates"], "r2": ARGV["r2"]})
+        self.notifier.event({"type": "DELETED", "object": pod_json(state=RUNNING, phase="Running", notes=NOTIFY)})
+        why = "it was deleted before the run ended"
+        self.assertEqual(self.recalls, [ARGV["r2"]])
+        lost = self.said("j-1", "r1", f"run r1 lost with pod duckpond-41: {why}, so nothing of it runs now; call it again: app b2ae gates")
+        self.assertEqual(self.signer.submits, [lost, self.moved("j-2", "r2", "desktop:d1", why)])
+
+    def test_a_run_no_runner_takes_waits_kept_and_the_next_builds_call_calls_it_again(self):
+        self.answers = [server.Refused(503, "the desktop is unreachable: lan: refused"), "desktop:d2"]
+        self.armed()
+        self.notifier.event({"type": "DELETED", "object": pod_json(state=RUNNING, phase="Running", notes=NOTIFY)})
+        why = "it was deleted before the run ended"
+        waits = self.said("j-1", "r1", f"run r1 waits to be called again: pod duckpond-41 went before it ended ({why}), and no build machine took it (the desktop is unreachable: lan: refused); the next builds call calls it again")
+        self.assertEqual(self.signer.submits, [waits, self.moved("j-2", "r2", "desktop:d2", why)])
+        self.assertEqual(list(self.kube.kept), [server.pending_key("duckpond-41", "r1")])
+        later = self.fresh()
+        self.kube.answer("list", ran({"items": []}))
+        with self.assertRaises(Unwatched):
+            later.watch()
+        self.assertEqual(list(later.pending), [server.pending_key("duckpond-41", "r1")])
+        later.call_pending(lambda words: (self.recalls.append(words), "duckpond-43:w1")[1])
+        self.assertEqual(self.recalls[-1], ARGV["r1"])
+        self.assertEqual(self.signer.submits[-1], self.moved("j-1", "r1", "duckpond-43:w1", why, server.recalled_id("duckpond-41", "j-1", "r1")))
+        self.assertEqual((self.kube.kept, later.pending), ({}, {}))
+
+    def test_a_pending_run_is_called_again_by_one_builds_call_while_another_runs_beside_it(self):
+        self.answers = [server.Refused(503, "the desktop is unreachable"), "desktop:d2"]
+        self.armed()
+        self.notifier.event({"type": "DELETED", "object": pod_json(state=RUNNING, phase="Running", notes=NOTIFY)})
+        beside = []
+
+        def recall(words):
+            self.notifier.call_pending(lambda again: (beside.append(again), "duckpond-43:w2")[1])
+            return "duckpond-43:w1"
+
+        self.notifier.call_pending(recall)
+        self.assertEqual((beside, self.notifier.pending, self.kube.kept), ([], {}, {}))
+
+    def test_a_pending_run_a_builds_call_could_not_place_stays_pending_for_the_next(self):
+        self.answers = [server.Refused(503, "the desktop is unreachable"), "desktop:d2"]
+        self.armed()
+        self.notifier.event({"type": "DELETED", "object": pod_json(state=RUNNING, phase="Running", notes=NOTIFY)})
+        key = server.pending_key("duckpond-41", "r1")
+
+        def refused(words):
+            raise server.Refused(502, "/shared/tools/warm-pod names no warm pod")
+
+        self.notifier.call_pending(refused)
+        self.assertEqual((list(self.notifier.pending), list(self.kube.kept)), ([key], [key]))
+        self.notifier.call_pending(lambda words: "duckpond-43:w1")
+        self.assertEqual((self.notifier.pending, self.kube.kept), ({}, {}))
+
+    def test_a_run_a_stopped_service_was_calling_again_is_never_called_a_second_time(self):
+        record = {"pod": "duckpond-41", "run": "r1", "channel": "j-1", "call": "app b2ae gates", "requester": 17, "argv": server.base64.b64encode(chr(0).join(ARGV["r1"]).encode()).decode(), "recalling": True}
+        self.kube.kept[server.kept_key("duckpond-41", "r1")] = json.dumps(record)
+        self.kube.answer("list", ran({"items": []}))
+        with self.assertRaises(Unwatched):
+            self.fresh().watch()
+        self.assertEqual(self.recalls, [])
+        text = "run r1 may have been called again by a pods service that stopped before it said so (pod duckpond-41 went before it ended: it was gone when the pods service looked): read build.sh busy on each build machine before calling it again"
+        self.assertEqual(self.signer.submits, [self.said("j-1", "r1", text)])
+
+
 class KeptRuns(unittest.TestCase):
     def test_the_runs_configmap_is_made_when_missing_and_changed_by_merge_patches_in_the_services_namespace(self):
         kube = server.Kube(["kubectl"], "agents")
@@ -3798,6 +3912,11 @@ class Builds(Streamed):
         posted = server.notice_message("j-1", message_id, None, server.line_said("desktop", "r1 ended: exit 0, GATES ok", None))
         self.assertIn(("chat", posted), self.signer.submits)
         said.assert_any_call("pods_unconcerned", pod="desktop", detail=unittest.mock.ANY)
+
+    def test_a_run_called_again_goes_to_a_runner_that_takes_it_with_again_set(self):
+        self.assertEqual(self.service.recalled(["JOB=j-1", "programs", "dev", "gates"], None), "desktop:r1")
+        self.assertEqual(self.gate.words()[-1], ["exec", "JOB=j-1", "AGAIN=1", "programs", "dev", "gates"])
+        self.assertEqual(self.warm_execs(), [])
 
     def test_a_free_desktop_takes_the_run_and_the_answer_names_it(self):
         status, answer = self.built("JOB=j-1", "programs", "dev", "gates")

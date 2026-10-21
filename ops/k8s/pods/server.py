@@ -1739,6 +1739,17 @@ def run_lines(stream):
             yield "armed", words[2], words[1], words[3].strip() if len(words) > 3 else ""
         elif words[0] == "done" and len(words) >= 2:
             yield "done", words[1].strip(), None, None
+        elif words[0] == "argv" and len(words) >= 3:
+            yield "argv", words[1], None, words[2].strip()
+
+
+def pending_key(name, run):
+    return f"pending-{kept_key(name, run)}"
+
+
+def recalled_id(name, channel, run):
+    digest = hashlib.sha256(f"{channel}\n{run}".encode()).hexdigest()
+    return f"pods-{name}-recalled-{digest}"
 
 
 def kept_key(name, run):
@@ -2544,6 +2555,8 @@ class Notifier:
         self.done = {}
         self.deleting = set()
         self.resumed = False
+        self.recall = None
+        self.pending = {}
         self.keeping = threading.Lock()
         self.lock = threading.Lock()
         self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
@@ -2803,6 +2816,10 @@ class Notifier:
                             done.add(run)
                             if runs.pop(run, None) is not None:
                                 changes[kept_key(name, run)] = None
+                        case "argv":
+                            if run in runs and not runs[run].get("argv"):
+                                runs[run]["argv"] = call
+                                changes[kept_key(name, run)] = json.dumps(runs[run])
             self.keep(changes)
 
     def tracking(self, name, requester, stream):
@@ -2822,12 +2839,59 @@ class Notifier:
             runs = self.open.pop(name, {})
             self.done.pop(name, None)
         for run, kept in runs.items():
+            if self.called_again(name, run, kept, why):
+                continue
             again = f"; call it again: {kept['call']}" if kept["call"] else "; call it again"
             text = f"run {run}{RUN_LOST}{name}: {why}, so nothing of it runs now{again}"
             said = line_said(name, text, kept["requester"])
             self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], lost_id(name, kept["channel"], run), said)
         with self.keeping:
             self.keep({kept_key(name, run): None for run in runs})
+
+    def called_again(self, name, run, kept, why):
+        words = unpacked(kept.get("argv") or "")
+        if self.recall is None or not words or "AGAIN=1" in itertools.takewhile(SETTING.fullmatch, words):
+            return False
+        if kept.get("recalling"):
+            text = f"run {run} may have been called again by a pods service that stopped before it said so (pod {name} went before it ended: {why}): read build.sh busy on each build machine before calling it again"
+            self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], lost_id(name, kept["channel"], run), line_said(name, text, kept["requester"]))
+            return True
+        with self.keeping:
+            self.keep({kept_key(name, run): json.dumps({**kept, "recalling": True})})
+        try:
+            new, reason = self.recall(words), None
+        except Refused as refused:
+            new, reason = None, refused.sentence
+        if new is None:
+            with self.lock:
+                self.pending[pending_key(name, run)] = {**kept, "why": why}
+            with self.keeping:
+                self.keep({pending_key(name, run): json.dumps({**kept, "why": why})})
+            text = f"run {run} waits to be called again: pod {name} went before it ended ({why}), and no build machine took it ({reason or 'none takes it'}); the next builds call calls it again"
+        else:
+            text = f"run {run} is now run {new}: pod {name} went before it ended ({why}), so the pods service called it again once: wait on that one"
+        self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], lost_id(name, kept["channel"], run), line_said(name, text, kept["requester"]))
+        return True
+
+    def call_pending(self, recall):
+        with self.lock:
+            keys = list(self.pending)
+        for key in keys:
+            with self.lock:
+                kept = self.pending.pop(key, None)
+            if kept is None:
+                continue
+            try:
+                new = recall(unpacked(kept["argv"]))
+            except Refused as refused:
+                with self.lock:
+                    self.pending[key] = kept
+                say("pods_uncalled", run=kept["run"], detail=json.dumps(refused.sentence))
+                continue
+            with self.keeping:
+                self.keep({key: None})
+            text = f"run {kept['run']} is now run {new}: pod {kept['pod']} went before it ended ({kept['why']}), so the pods service called it again once: wait on that one"
+            self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], recalled_id(kept["pod"], kept["channel"], kept["run"]), line_said(kept["pod"], text, kept["requester"]))
 
     def resume(self):
         if not self.resumed:
@@ -2837,8 +2901,11 @@ class Notifier:
                 say("pods_unkept", reason="unread", detail=json.dumps(refused.sentence))
                 return
             with self.lock:
-                for value in kept.values():
+                for key, value in kept.items():
                     record = json.loads(value)
+                    if "why" in record:
+                        self.pending[key] = record
+                        continue
                     self.open.setdefault(record["pod"], {}).setdefault(record["run"], record)
             self.resumed = True
         self.sweep()
@@ -2954,6 +3021,7 @@ class Service:
         self.schemas = Schemas(api)
         self.notifier = Notifier(kube, signer, self.retry_pause)
         self.notifier.records = self.lane_record
+        self.notifier.recall = lambda words: self.recalled(words, None)
         self.pause = time.sleep
         self.execs = {}
         self.lock = threading.Lock()
@@ -3394,7 +3462,35 @@ class Service:
             return self.runners[machine].ran(command, alive)
         return self.executed(asked, machine, None, command, alive=alive)
 
+    def recalled(self, words, asked):
+        settings = list(itertools.takewhile(SETTING.fullmatch, words))
+        again = [*settings, "AGAIN=1", *words[len(settings) :]]
+        reasons = []
+        for name, runner in self.runners.items():
+            if not runner.takes(again):
+                reasons.append(f"pod {name} takes no build.sh {run_kind(again)}")
+                continue
+            try:
+                ran = self.on(asked, name, again, None)
+            except Refused as refused:
+                reasons.append(refused.sentence)
+                continue
+            started = STARTED.search(ran.out)
+            if started is not None:
+                return f"{name}:{started.group(1).decode(errors='replace')}"
+            reasons.append(f"build.sh on pod {name} answered exit {ran.code} with no run")
+        if asked is not None:
+            warm = self.warm()
+            ran = self.on(asked, warm, again, None)
+            started = STARTED.search(ran.out)
+            if started is not None:
+                return f"{warm}:{started.group(1).decode(errors='replace')}"
+            reasons.append(f"build.sh on pod {warm} answered exit {ran.code} with no run")
+        raise Refused(503, "; ".join(reasons) or "this service names no build runner")
+
     def routed(self, asked, command, alive):
+        if self.notifier.pending:
+            self.notifier.call_pending(lambda words: self.recalled(words, asked))
         words = runner_words(command, BUILDS)
         settings = list(itertools.takewhile(SETTING.fullmatch, words))
         called = words[len(settings) :]

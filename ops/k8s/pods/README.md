@@ -20,6 +20,13 @@ or through a member node's halo forward.
   its channel, once, when the pod ends, when it is deleted, or when the service finds it gone
   as its watch starts. The service keeps each open run in the ConfigMap `runs` in namespace
   `pods` as it reads the line, so a rotated log or a restart of the service loses none.
+- A run whose log also holds `ducktape-run argv <run> <base64>` (its settings and words,
+  NUL-separated) is called again instead, once: on the first build runner that takes it, with
+  `AGAIN=1` added, and its channel is told `run <run> is now run <machine>:<new> …: wait on that
+  one`, never that it failed. A run no runner takes waits in the ConfigMap (`pending-…`) and is
+  called again by the next builds call, which can reach the warm pod too. A run whose words carry
+  `AGAIN=1` is posted lost as above, and a run marked as being called again when the service
+  stopped is posted with a word to read `build.sh busy` before calling it again.
 
 ## What it needs
 
