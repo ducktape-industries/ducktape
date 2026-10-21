@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use abi::{Origin, ProgramId, Refusal, reason};
@@ -59,7 +58,6 @@ enum Next<E: Context> {
     Pulled(Merged<E>),
     Ask { id: u32, frame: Vec<u8> },
     Drop(u32),
-    Pong(Bytes),
     Pinged,
     Malformed,
     Stopping,
@@ -107,7 +105,6 @@ pub(crate) async fn serve<E: Context>(socket: WebSocket, watching: Watching<E>) 
             Next::Pulled(merged) => socket.pulled(merged).await,
             Next::Ask { id, frame } => socket.ask(id, frame).await,
             Next::Drop(id) => socket.dropped(id),
-            Next::Pong(echo) => socket.pong(&echo),
             Next::Pinged => Flow::Watching,
             Next::Malformed => socket.malformed().await,
             Next::Stopping => socket.stop(),
@@ -149,7 +146,7 @@ impl<E: Context> Socket<E> {
         let writes: Vec<(Vec<u8>, Option<Vec<u8>>)> = writes.into_iter().collect();
         let quiet = writes.is_empty() && answers.is_empty();
         if quiet {
-            return pulled_on(self.send(ping(height)).await);
+            return pulled_on(self.send(height, ping(height)).await);
         }
         let block = Pushed::Block {
             height,
@@ -157,12 +154,12 @@ impl<E: Context> Socket<E> {
             writes,
             answers,
         };
-        let sent = self.send(binary(&block)).await;
+        let sent = self.send(height, binary(&block)).await;
         let pings_too = closes && matches!(sent, Flow::Watching);
         if !pings_too {
             return pulled_on(sent);
         }
-        pulled_on(self.send(ping(height)).await)
+        pulled_on(self.send(height, ping(height)).await)
     }
 
     fn land(&mut self, id: u32, height: u64, ran: Ran) -> Option<(u32, Outcome)> {
@@ -190,7 +187,7 @@ impl<E: Context> Socket<E> {
             height,
             outcome,
         };
-        self.send(binary(&answer)).await
+        self.send(height, binary(&answer)).await
     }
 
     fn stand(&mut self, id: u32, height: u64, asked: Asked, ran: Ran) -> Outcome {
@@ -213,15 +210,6 @@ impl<E: Context> Socket<E> {
         Flow::Watching
     }
 
-    fn pong(&self, echo: &[u8]) -> Flow {
-        if let Ok(height) = <[u8; 8]>::try_from(echo) {
-            self.pull
-                .read
-                .fetch_max(u64::from_le_bytes(height), Ordering::Relaxed);
-        }
-        Flow::Watching
-    }
-
     fn stop(&mut self) -> Flow {
         self.stopping = true;
         Flow::Watching
@@ -232,7 +220,8 @@ impl<E: Context> Socket<E> {
             code: close_code::PROTOCOL,
             reason: "a frame that is not a Watch".into(),
         };
-        match self.send(Message::Close(Some(refused))).await {
+        let height = self.daemon.view().map_or(0, |view| view.tip().height);
+        match self.send(height, Message::Close(Some(refused))).await {
             Flow::Watching => Flow::Refused,
             other => other,
         }
@@ -260,12 +249,16 @@ impl<E: Context> Socket<E> {
         }
     }
 
-    async fn send(&mut self, message: Message) -> Flow {
+    async fn send(&mut self, height: u64, message: Message) -> Flow {
+        self.pull.writing.begin(height);
         let send = self.client.send(message);
         pin_mut!(send);
         loop {
             tokio::select! {
-                sent = &mut send => return sent.map_or(Flow::Ended, |()| Flow::Watching),
+                sent = &mut send => {
+                    self.pull.writing.end();
+                    return sent.map_or(Flow::Ended, |()| Flow::Watching);
+                }
                 dropped = &mut self.pull.cut, if !self.stopping => match dropped {
                     Ok(()) => self.stopping = true,
                     Err(_) => return Flow::Ended,
@@ -348,8 +341,7 @@ impl Standing {
 fn heard<E: Context>(frame: Option<Result<Message, axum::Error>>) -> Next<E> {
     match frame {
         Some(Ok(Message::Binary(bytes))) => decoded(&bytes),
-        Some(Ok(Message::Pong(echo))) => Next::Pong(echo),
-        Some(Ok(Message::Ping(_))) => Next::Pinged,
+        Some(Ok(Message::Ping(_) | Message::Pong(_))) => Next::Pinged,
         Some(Ok(Message::Text(_))) => Next::Malformed,
         Some(Ok(Message::Close(_)) | Err(_)) | None => Next::Ended,
     }

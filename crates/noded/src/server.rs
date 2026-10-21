@@ -820,7 +820,7 @@ async fn programs<E: Context>(ctx: Ctx<E>) -> Response {
 /// that re-reads what moved, as the app does, never reads the values). A
 /// block that writes nothing there is a ping, and so is the block that
 /// closes each epoch. Every ping carries its block's height; a client that
-/// answers none of them for a whole epoch is cut (`Daemon::publish`).
+/// stops draining for a whole epoch is cut (`changes::written`).
 async fn changes<E: Context>(
     ctx: Ctx<E>,
     Path(program): Path<ProgramId>,
@@ -854,7 +854,6 @@ async fn heads<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
 
 enum Next {
     Published(Published),
-    Pong(Bytes),
     Frame,
     Stopping,
     Stopped,
@@ -864,7 +863,7 @@ enum Next {
 async fn stream(socket: WebSocket, subscription: Subscription) {
     let Subscription {
         mut changes,
-        read,
+        writing,
         mut cut,
     } = subscription;
     // the node is stopping: what is queued still goes, then the goodbye
@@ -878,25 +877,21 @@ async fn stream(socket: WebSocket, subscription: Subscription) {
             },
             published = changes.next() => published.map_or(Next::Stopped, Next::Published),
             frame = frames.next() => match frame {
-                Some(Ok(Message::Pong(echo))) => Next::Pong(echo),
                 Some(Ok(_)) => Next::Frame,
                 Some(Err(_)) | None => Next::Ended,
             },
         };
-        let message = match next {
+        let (height, message) = match next {
             Next::Published(Published::Change(change)) => {
-                Message::Binary(abi::encode(&change).into())
+                (change.height, Message::Binary(abi::encode(&change).into()))
             }
-            Next::Published(Published::Head(head)) => Message::Binary(abi::encode(&head).into()),
-            Next::Published(Published::Ping(height)) => {
-                Message::Ping(Bytes::copy_from_slice(&height.to_le_bytes()))
+            Next::Published(Published::Head(head)) => {
+                (head.height, Message::Binary(abi::encode(&head).into()))
             }
-            Next::Pong(echo) => {
-                if let Ok(height) = <[u8; 8]>::try_from(echo.as_ref()) {
-                    read.fetch_max(u64::from_le_bytes(height), Ordering::Relaxed);
-                }
-                continue;
-            }
+            Next::Published(Published::Ping(height)) => (
+                height,
+                Message::Ping(Bytes::copy_from_slice(&height.to_le_bytes())),
+            ),
             Next::Stopping => {
                 stopping = true;
                 continue;
@@ -906,6 +901,7 @@ async fn stream(socket: WebSocket, subscription: Subscription) {
             Next::Ended => return,
         };
         // a client that stopped reading holds the send: its cut ends it
+        writing.begin(height);
         let send = client.send(message);
         pin_mut!(send);
         loop {
@@ -920,6 +916,7 @@ async fn stream(socket: WebSocket, subscription: Subscription) {
                 },
             }
         }
+        writing.end();
     }
 }
 

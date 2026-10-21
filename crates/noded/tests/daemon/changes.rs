@@ -90,8 +90,8 @@ fn a_changes_socket_asked_for_keys_carries_none_of_the_values_and_a_quiet_one_is
 }
 
 #[test]
-fn a_changes_socket_that_answers_no_ping_for_a_whole_epoch_is_cut_and_one_that_reads_stays() {
-    use tokio_tungstenite::tungstenite::Message;
+fn a_changes_socket_that_drains_but_answers_no_ping_stays_open() {
+    use ::tokio::io::AsyncReadExt as _;
 
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
@@ -101,43 +101,87 @@ fn a_changes_socket_that_answers_no_ping_for_a_whole_epoch_is_cut_and_one_that_r
     let client = live.client.clone();
 
     client_runtime().block_on(async {
-        let base = format!("ws://{}{}", seat.http, noded::wire::route::CHANGES);
-        let height = |frame: &Message| match frame {
-            Message::Ping(echo) => Some(u64::from_le_bytes(echo[..].try_into().unwrap())),
-            _ => None,
-        };
-        let open =
-            |url: String| async move { tokio_tungstenite::connect_async(url).await.unwrap().0 };
-        // never read until the end, so it answers no ping
-        let mut stalled = open(format!("{base}/probe")).await;
-        let mut reading = open(format!("{base}/probe")).await;
-        let mut busy = open(format!("{base}/{}", host::RECENT)).await;
-        let opened = client.status().await.unwrap().height;
-        // every block writes the kernel's table of recent blocks, so its
-        // pings are the epochs' last blocks alone
-        let ping = loop {
-            if let Some(at) = height(&busy.next().await.unwrap().unwrap()) {
-                break at;
-            }
-        };
-        assert_eq!((ping + 1) % EPOCH_LENGTH, 0, "{ping}");
-        // the stalled socket is cut at the second epoch close after it was
-        // opened at the latest; the one that reads (and so answers each
-        // ping) is still open past it
-        let past = opened + 3 * EPOCH_LENGTH;
-        loop {
-            let frame = reading
-                .next()
-                .await
-                .expect("a socket that reads stays open");
-            if height(&frame.unwrap()).is_some_and(|at| at >= past) {
-                break;
+        let url = format!(
+            "ws://{}{}/{}",
+            seat.http,
+            noded::wire::route::CHANGES,
+            host::RECENT
+        );
+        let (mut draining, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut ticks = client.changes(host::RECENT).await.unwrap();
+        let first = ticks.next().await.unwrap().unwrap().height;
+        let past = first + 3 * EPOCH_LENGTH;
+        let raw = draining.get_mut();
+        let mut bytes = vec![0u8; 1 << 16];
+        let mut height = first;
+        while height < past {
+            ::tokio::select! {
+                read = raw.read(&mut bytes) => {
+                    let read = read.expect("a socket that drains is not reset");
+                    assert!(read > 0, "a socket that drains is not closed");
+                }
+                tick = ticks.next() => height = tick.unwrap().unwrap().height,
             }
         }
-        // what the stalled socket was sent before its cut, then its end
-        while let Some(Ok(frame)) = stalled.next().await {
-            if let Some(at) = height(&frame) {
-                assert!(at < past, "the stalled socket was still sent block {at}");
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+fn kernel_buffer_most(name: &str) -> usize {
+    let path = format!("/proc/sys/net/ipv4/{name}");
+    let read = std::fs::read_to_string(&path).unwrap();
+    read.split_whitespace().last().unwrap().parse().unwrap()
+}
+
+#[test]
+fn a_changes_socket_that_stops_draining_is_cut_an_epoch_after_its_write_stalls() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+
+    client_runtime().block_on(async {
+        let url = format!("ws://{}{}/probe", seat.http, noded::wire::route::CHANGES);
+        let (mut stalled, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut reading = client.changes("probe").await.unwrap();
+        let nearly_a_block = node::BLOCK_BYTES - (1 << 16);
+        let buffered = kernel_buffer_most("tcp_rmem") + kernel_buffer_most("tcp_wmem");
+        let puts = buffered / nearly_a_block + 2;
+        let value = vec![7u8; nearly_a_block];
+        let keys: Vec<Vec<u8>> = (0..puts).map(|n| format!("large{n}").into_bytes()).collect();
+        for key in &keys {
+            let put = frame(&client, &alice, vec![set(key, &value)]).await;
+            client.submit(put, Preconfirm::Off).await.unwrap();
+        }
+        let wanted: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let last_put = landed(&mut reading, &wanted)
+            .await
+            .into_iter()
+            .max()
+            .unwrap();
+        drop(reading);
+        let mut ticks = client.changes(host::RECENT).await.unwrap();
+        let mut height = ticks.next().await.unwrap().unwrap().height;
+        while height < last_put + 2 * EPOCH_LENGTH {
+            height = ticks.next().await.unwrap().unwrap().height;
+        }
+        loop {
+            ::tokio::select! {
+                frame = stalled.next() => match frame {
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                },
+                tick = ticks.next() => {
+                    height = tick.unwrap().unwrap().height;
+                    assert!(
+                        height < last_put + 4 * EPOCH_LENGTH,
+                        "a socket that stopped draining at block {last_put} is still open at {height}"
+                    );
+                }
             }
         }
         seat.admin(&client, Admin::Shutdown).await;

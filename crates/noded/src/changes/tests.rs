@@ -70,7 +70,7 @@ fn heard(subscription: &mut Subscription) -> Vec<String> {
 
 #[test]
 fn a_heads_socket_on_a_node_that_applied_nothing_since_it_started_opens_on_its_tip() {
-    let (changes, mut fanout) = Changes::<E>::new(network(), 7);
+    let (changes, mut fanout) = Changes::<E>::new(network());
     changes.opened(head(7));
     let mut heads = changes.subscribe(Follows::Heads);
     step(&mut fanout);
@@ -85,7 +85,7 @@ fn a_heads_socket_on_a_node_that_applied_nothing_since_it_started_opens_on_its_t
 
 #[test]
 fn a_heads_socket_opens_on_the_newest_head_and_hears_every_block_after() {
-    let (changes, mut fanout) = Changes::<E>::new(network(), 0);
+    let (changes, mut fanout) = Changes::<E>::new(network());
     changes.wrote(wrote(1, None));
     step(&mut fanout);
     let mut heads = changes.subscribe(Follows::Heads);
@@ -102,7 +102,7 @@ fn a_heads_socket_opens_on_the_newest_head_and_hears_every_block_after() {
 
 #[test]
 fn a_program_socket_hears_its_writes_and_a_ping_for_each_other_block() {
-    let (changes, mut fanout) = Changes::<E>::new(network(), 0);
+    let (changes, mut fanout) = Changes::<E>::new(network());
     let program = |keys| Follows::Program {
         program: "chat".to_owned(),
         keys,
@@ -140,7 +140,7 @@ fn a_program_socket_hears_its_writes_and_a_ping_for_each_other_block() {
 
 #[test]
 fn a_program_socket_hears_its_place_under_its_new_id_and_the_old_id_hears_pings() {
-    let (changes, mut fanout) = Changes::<E>::new(network(), 0);
+    let (changes, mut fanout) = Changes::<E>::new(network());
     let program = |program: &str| Follows::Program {
         program: program.to_owned(),
         keys: false,
@@ -164,31 +164,35 @@ fn a_program_socket_hears_its_place_under_its_new_id_and_the_old_id_hears_pings(
 }
 
 #[test]
-fn a_heads_socket_that_answers_no_ping_for_an_epoch_is_cut() {
-    let (changes, mut fanout) = Changes::<E>::new(network(), 0);
-    let mut silent = changes.subscribe(Follows::Heads);
-    let mut answering = changes.subscribe(Follows::Heads);
+fn a_socket_still_writing_a_block_from_before_the_last_close_is_cut_and_one_writing_a_newer_stays()
+{
+    let (changes, mut fanout) = Changes::<E>::new(network());
+    let mut stalled = changes.subscribe(Follows::Heads);
+    let mut slow = changes.subscribe(Follows::Heads);
+    let mut drained = changes.subscribe(Follows::Heads);
     step(&mut fanout);
     for height in 1..=3 {
         changes.wrote(wrote(height, None));
     }
     step(&mut fanout);
-    answering.read.store(3, Ordering::Relaxed);
+    stalled.writing.begin(2);
+    slow.writing.begin(3);
     for height in 4..=7 {
         changes.wrote(wrote(height, None));
     }
     step(&mut fanout);
+    assert_eq!(heard(&mut slow).last().map(String::as_str), Some("ping 7"));
     assert_eq!(
-        heard(&mut answering).last().map(String::as_str),
+        heard(&mut drained).last().map(String::as_str),
         Some("ping 7")
     );
     assert_eq!(
-        heard(&mut silent).last().map(String::as_str),
+        heard(&mut stalled).last().map(String::as_str),
         Some("head 6")
     );
     assert!(
-        matches!(silent.changes.next().now_or_never(), Some(None)),
-        "the silent socket was cut"
+        matches!(stalled.changes.next().now_or_never(), Some(None)),
+        "the stalled socket was cut"
     );
 }
 
@@ -226,7 +230,7 @@ fn a_watch_socket_that_pulls_late_gets_every_block_since_merged_into_one_then_wa
         epoch_length: 1_000,
         cadence,
     };
-    let (changes, fanout) = Changes::<E>::new(network, 0);
+    let (changes, fanout) = Changes::<E>::new(network);
     runtime.spawn(fan(fanout));
     runtime.block_on(async {
         let pull = changes.pull("probe".into(), false);

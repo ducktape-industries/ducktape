@@ -24,9 +24,25 @@ pub(crate) enum Follows {
 pub(crate) struct Subscriber<E: Context> {
     socket: u64,
     delivery: Delivery<E>,
-    since: u64,
-    read: Arc<AtomicU64>,
+    writing: Arc<Writing>,
     cut: cut::Sender<()>,
+}
+
+#[derive(Default)]
+pub(crate) struct Writing(AtomicU64);
+
+impl Writing {
+    pub(crate) fn begin(&self, height: u64) {
+        self.0.store(height.saturating_add(1), Ordering::Relaxed);
+    }
+
+    pub(crate) fn end(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    fn since(&self) -> Option<u64> {
+        self.0.load(Ordering::Relaxed).checked_sub(1)
+    }
 }
 
 enum Delivery<E: Context> {
@@ -46,20 +62,20 @@ struct Pulled<E: Context> {
 
 pub(crate) struct Subscription {
     pub(crate) changes: queue::UnboundedReceiver<Published>,
-    pub(crate) read: Arc<AtomicU64>,
+    pub(crate) writing: Arc<Writing>,
     pub(crate) cut: cut::Receiver<()>,
 }
 
 pub(crate) struct Pull<E: Context> {
     socket: u64,
     changes: Changes<E>,
-    pub(crate) read: Arc<AtomicU64>,
+    pub(crate) writing: Arc<Writing>,
     pub(crate) cut: cut::Receiver<()>,
 }
 
 struct Seated {
     socket: u64,
-    read: Arc<AtomicU64>,
+    writing: Arc<Writing>,
     cut: cut::Receiver<()>,
 }
 
@@ -123,18 +139,16 @@ impl<E: Context> Clone for Changes<E> {
 pub(crate) struct Fanout<E: Context> {
     inbox: mpsc::UnboundedReceiver<Event<E>>,
     network: Network,
-    tip: u64,
     head: Option<Head>,
     subscribers: BTreeMap<u64, Subscriber<E>>,
 }
 
 impl<E: Context> Changes<E> {
-    pub(crate) fn new(network: Network, tip: u64) -> (Changes<E>, Fanout<E>) {
+    pub(crate) fn new(network: Network) -> (Changes<E>, Fanout<E>) {
         let (inbox, events) = mpsc::unbounded_channel();
         let fanout = Fanout {
             inbox: events,
             network,
-            tip,
             head: None,
             subscribers: BTreeMap::new(),
         };
@@ -154,7 +168,7 @@ impl<E: Context> Changes<E> {
         let seated = self.seat(Delivery::Queued { follows, sender });
         Subscription {
             changes,
-            read: seated.read,
+            writing: seated.writing,
             cut: seated.cut,
         }
     }
@@ -170,7 +184,7 @@ impl<E: Context> Changes<E> {
         Pull {
             socket: seated.socket,
             changes: self.clone(),
-            read: seated.read,
+            writing: seated.writing,
             cut: seated.cut,
         }
     }
@@ -178,12 +192,11 @@ impl<E: Context> Changes<E> {
     fn seat(&self, delivery: Delivery<E>) -> Seated {
         let socket = self.sockets.fetch_add(1, Ordering::Relaxed);
         let (cut, dropped) = cut::channel();
-        let read = Arc::new(AtomicU64::new(0));
+        let writing = Arc::new(Writing::default());
         let subscriber = Subscriber {
             socket,
             delivery,
-            since: 0,
-            read: read.clone(),
+            writing: writing.clone(),
             cut,
         };
         if let Err(unsent) = self.inbox.send(Event::Subscribe(subscriber)) {
@@ -191,7 +204,7 @@ impl<E: Context> Changes<E> {
         }
         Seated {
             socket,
-            read,
+            writing,
             cut: dropped,
         }
     }
@@ -246,8 +259,7 @@ pub(crate) async fn fan<E: Context>(mut fanout: Fanout<E>) {
     }
 }
 
-fn subscribed<E: Context>(fanout: &mut Fanout<E>, mut subscriber: Subscriber<E>) -> Flow {
-    subscriber.since = fanout.tip;
+fn subscribed<E: Context>(fanout: &mut Fanout<E>, subscriber: Subscriber<E>) -> Flow {
     if let Delivery::Queued {
         follows: Follows::Heads,
         sender,
@@ -268,18 +280,16 @@ fn opened<E: Context>(fanout: &mut Fanout<E>, head: Head) -> Flow {
 
 fn written<E: Context>(fanout: &mut Fanout<E>, wrote: Wrote<E>) -> Flow {
     let height = wrote.head.height;
-    fanout.tip = height;
     fanout.head = Some(wrote.head);
     let closes = fanout.network.closes_an_epoch(height);
     let last = height
         .checked_sub(fanout.network.epoch_length)
         .filter(|_| closes);
     fanout.subscribers.retain(|_, subscriber| {
-        let unanswered = last.is_some_and(|last| {
-            subscriber.since < last && subscriber.read.load(Ordering::Relaxed) < last
-        });
+        let stalled =
+            last.is_some_and(|last| subscriber.writing.since().is_some_and(|since| since < last));
         let gone = subscriber.cut.is_canceled();
-        if unanswered || gone {
+        if stalled || gone {
             return false;
         }
         match &mut subscriber.delivery {

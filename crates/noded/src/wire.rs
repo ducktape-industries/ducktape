@@ -25,7 +25,7 @@ pub mod route {
     /// `/v1/changes/<program>[?keys]`: a websocket of each block's writes
     /// to the program (`?keys`: the keys alone), a ping carrying the block's
     /// height for a block that wrote nothing there and for each epoch's last
-    /// block. A client that answers no ping for a whole epoch is cut.
+    /// block. A client that stops draining for a whole epoch is cut.
     pub const CHANGES: &str = "/v1/changes";
     pub const WATCH: &str = "/v1/watch";
     pub const HEADS: &str = "/v1/heads";

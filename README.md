@@ -1136,7 +1136,9 @@ needs the chain's height and time without its blocks: one borsh `Head { height,
 id, time }` for each block the node applies. It opens with the newest head the
 node has applied since it started (none before its first block). Like
 `/v1/changes`, it pings with the height at each epoch's last block and cuts a
-client that answers no ping for a whole epoch.
+client that stops draining it: at an epoch's last block, a socket the node is
+still writing a block from before the previous epoch's last block to is cut. A
+client that reads is never cut however late its pongs come.
 
 `ducktape shutdown`, SIGTERM and SIGINT stop `ducktape run` the same way.
 The node stops taking blocks and lets the block it is applying finish. It

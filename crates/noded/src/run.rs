@@ -643,7 +643,7 @@ async fn start<E: Context>(
     let writing = context.child("writer");
     let tally = Tally::registered(&writing);
     let (writer, commands) = Writer::new(tally.queued.clone());
-    let (changes, fanout) = Changes::new(network.clone(), tip.height);
+    let (changes, fanout) = Changes::new(network.clone());
     let (answered, answers) = tokio::sync::mpsc::unbounded_channel();
     let (queried, queries) = tokio::sync::mpsc::unbounded_channel();
     let halo_self = watch::Sender::new(crate::halo_self::first(&halo));
