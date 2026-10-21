@@ -765,11 +765,12 @@ async fn start<E: Context>(
         crate::egress::lane::spawn(daemon.clone(), handle, load.egress_lane_backlog)?;
     }
     let egressing = crate::egress::spawn(daemon.clone());
+    let reading = crate::reads::spawn(daemon.clone());
     let dialing = context.child("halo_self").spawn({
         let daemon = daemon.clone();
         move |_| crate::halo_self::dialing(daemon)
     });
-    let mut tasks = vec![pump, relayed, egressing, dialing];
+    let mut tasks = vec![pump, relayed, egressing, reading, dialing];
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(p2p);
         tasks.push(

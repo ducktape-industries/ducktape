@@ -32,6 +32,7 @@ where
     pub(crate) roles: &'a Roles,
     pub(crate) preconfirmed: Option<&'a Preconfirmed>,
     pub(crate) layout_from: u64,
+    pub(crate) reads_from: u64,
 }
 
 impl<'a, E> Source<'a, E>
@@ -334,6 +335,7 @@ pub struct Snapshot<E> {
     pub(crate) roles: Roles,
     pub(crate) preconfirmed: Arc<Preconfirmed>,
     pub(crate) layout_from: u64,
+    pub(crate) reads_from: u64,
     pub(crate) context: PhantomData<fn() -> E>,
 }
 
@@ -347,6 +349,7 @@ impl<E> Clone for Snapshot<E> {
             roles: self.roles.clone(),
             preconfirmed: self.preconfirmed.clone(),
             layout_from: self.layout_from,
+            reads_from: self.reads_from,
             context: PhantomData,
         }
     }
@@ -365,6 +368,7 @@ where
             roles: &self.roles,
             preconfirmed: Some(&self.preconfirmed),
             layout_from: self.layout_from,
+            reads_from: self.reads_from,
         }
     }
 

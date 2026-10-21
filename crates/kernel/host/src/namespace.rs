@@ -24,15 +24,27 @@ pub const LINES: &[u8] = b"line/";
 pub const ON: &[u8] = b"on/";
 pub const INDEXED_AT: &[u8] = b"indexed_at";
 pub const PLACES: &[u8] = b"place/";
+pub const READ_ROWS: &[u8] = b"read/";
+pub const READS_DUE: &[u8] = b"read-due/";
 
 const UNANNOUNCED: Option<u64> = None;
 const LAYOUT_FROM: [(&[u8], Option<u64>); 2] =
+    [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
+const READS_FROM: [(&[u8], Option<u64>); 2] =
     [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
 const HEIGHT_BYTES: usize = size_of::<u64>();
 const ID_BYTES: usize = size_of::<SubmissionId>();
 
 pub fn layout_from(network: &[u8]) -> u64 {
-    match LAYOUT_FROM.iter().find(|(named, _)| *named == network) {
+    announced(&LAYOUT_FROM, network)
+}
+
+pub fn reads_from(network: &[u8]) -> u64 {
+    announced(&READS_FROM, network)
+}
+
+fn announced(table: &[(&[u8], Option<u64>)], network: &[u8]) -> u64 {
+    match table.iter().find(|(named, _)| *named == network) {
         Some((_, Some(height))) => *height,
         Some((_, None)) => u64::MAX,
         None => 0,

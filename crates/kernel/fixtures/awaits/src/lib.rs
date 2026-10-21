@@ -82,7 +82,9 @@ mod program {
             return Ok(());
         };
         let by_target = env.origin == Origin::Program(row.target.clone());
-        if !by_target {
+        let by_the_kernel = env.origin == Origin::System;
+        let answers = by_target || by_the_kernel;
+        if !answers {
             return Err(Refusal::new(
                 reason::UNAUTHORIZED,
                 format!("only {} answers call {ticket}", row.target),

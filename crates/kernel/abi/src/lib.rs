@@ -1682,6 +1682,84 @@ pub mod role {
             Writers(Writers) = 2,
         }
     }
+
+    pub mod reads {
+        use crate::role::awaits::Ticket;
+        use crate::{
+            BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Refusal, reason,
+        };
+
+        pub const PROGRAM: &str = "$reads";
+        pub const KIND: &str = "read";
+        pub const WAIT: u64 = crate::role::egress::DEFAULT_WAIT;
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Entry {
+            pub id: BlobId,
+            pub len: u64,
+            pub kind: String,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum Op {
+            Read {
+                target: ProgramId,
+                query: Vec<u8>,
+            } = 0,
+            Answer {
+                id: Ticket,
+                at: u64,
+                outcome: Result<Entry, Refusal>,
+            } = 1,
+            Ready {
+                id: Ticket,
+            } = 2,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum State {
+            Asked = 0,
+            Putting { bundle: u64, read: Read } = 1,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Read {
+            pub entry: Entry,
+            pub at: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Row {
+            pub requester: ProgramId,
+            pub target: ProgramId,
+            pub query: Vec<u8>,
+            pub made: u64,
+            pub state: State,
+        }
+
+        pub fn unserved() -> Refusal {
+            Refusal::new(reason::NOT_FOUND, "no member node serves reads")
+        }
+
+        pub fn expired(id: Ticket) -> Refusal {
+            Refusal::new(
+                reason::EXHAUSTED,
+                format!("read {id} found no answer within {WAIT} blocks"),
+            )
+        }
+
+        pub fn assigned(id: Ticket, members: &[Vec<u8>]) -> Option<&[u8]> {
+            let count = u64::try_from(members.len())
+                .ok()
+                .filter(|count| *count > 0)?;
+            let index = usize::try_from(id % count).ok()?;
+            members.get(index).map(Vec::as_slice)
+        }
+    }
 }
 
 /// Who may publish and subscribe to a room's live tracks through a node:

@@ -1,3 +1,4 @@
+mod answering;
 mod crypto;
 mod namespace;
 mod parked;
@@ -212,6 +213,7 @@ where
     rename_streaks: BTreeMap<ProgramId, u64>,
     spent: Spent,
     layout_from: u64,
+    reads_from: u64,
 }
 
 #[derive(Clone, Default)]
@@ -458,6 +460,7 @@ where
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
         let tidier = Tidier::spawn(blobs.clone())?;
         let layout_from = namespace::layout_from(&genesis.network);
+        let reads_from = namespace::reads_from(&genesis.network);
         let mut host = Host {
             store,
             blobs,
@@ -471,6 +474,7 @@ where
             rename_streaks: BTreeMap::new(),
             spent: Spent::default(),
             layout_from,
+            reads_from,
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -573,6 +577,7 @@ where
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
         let roles = roles_of(&store.view(Vec::new()))?;
         let layout_from = namespace::layout_from(&network);
+        let reads_from = namespace::reads_from(&network);
         let tidier = Tidier::spawn(blobs.clone())?;
         let mut host = Host {
             store,
@@ -587,6 +592,7 @@ where
             rename_streaks: BTreeMap::new(),
             spent: Spent::default(),
             layout_from,
+            reads_from,
         };
         host.sync_code()?;
         host.index()?;
@@ -652,6 +658,7 @@ where
             roles: &self.roles,
             preconfirmed: None,
             layout_from: self.layout_from,
+            reads_from: self.reads_from,
         }
     }
 
@@ -667,6 +674,10 @@ where
         self.layout_from = height;
     }
 
+    pub fn set_reads_from(&mut self, height: u64) {
+        self.reads_from = height;
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot<E>> {
         Ok(Snapshot {
             pinned: self.store.pin()?,
@@ -676,6 +687,7 @@ where
             roles: self.roles.clone(),
             preconfirmed: Arc::default(),
             layout_from: self.layout_from,
+            reads_from: self.reads_from,
             context: std::marker::PhantomData,
         })
     }
@@ -946,6 +958,9 @@ where
             .run_scheduled(block.height, block.time, &mut overlay, &mut stage)
             .await?;
         self.log_scheduler(block.height, refusals);
+        self.source()
+            .expire_reads(block.height, block.time, &mut overlay, &mut stage)
+            .await?;
         let epoch_length = self.epoch_length()?;
         let ends_an_epoch = (block.height + 1).is_multiple_of(epoch_length);
         if ends_an_epoch {
@@ -1021,6 +1036,22 @@ where
             }
         };
         let checkpoint = overlay.checkpoint();
+        if self.reads_at(&submission.target, height) {
+            let receipt = self
+                .answer_read(
+                    &submission.signer,
+                    &submission.payload,
+                    height,
+                    time,
+                    overlay,
+                    stage,
+                )
+                .await?;
+            if let Outcome::Rejected(_) = receipt.outcome {
+                overlay.restore(checkpoint);
+            }
+            return Ok(Submitted::Carried { receipt, account });
+        }
         let env = Env {
             network: self.network.to_vec(),
             height,

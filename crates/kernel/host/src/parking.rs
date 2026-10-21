@@ -201,29 +201,33 @@ where
             acting,
         } in calls
         {
-            let sender = self
-                .sender(
-                    program, acting, &caller, env.height, env.time, overlay, stage, frame,
-                )
-                .await?;
-            let ran = match sender {
-                Err(refusal) => Run::finished(rejected(&target, refusal)),
-                Ok(sender) => {
-                    let cause = Cause::Call { ticket };
-                    let env = self.env(&target, program, sender, cause, env.height, env.time);
-                    let call = ProgramCall::Execute(payload);
-                    let waiter = Waiter::Call { ticket };
-                    Box::pin(self.run_frame(
-                        &target,
-                        call,
-                        env,
-                        waiter,
-                        overlay,
-                        stage,
-                        frame,
-                        depth + 1,
-                    ))
-                    .await?
+            let ran = if self.reads_at(&target, env.height) {
+                self.read_call(program, ticket, &payload, env.height, overlay)?
+            } else {
+                let sender = self
+                    .sender(
+                        program, acting, &caller, env.height, env.time, overlay, stage, frame,
+                    )
+                    .await?;
+                match sender {
+                    Err(refusal) => Run::finished(rejected(&target, refusal)),
+                    Ok(sender) => {
+                        let cause = Cause::Call { ticket };
+                        let env = self.env(&target, program, sender, cause, env.height, env.time);
+                        let call = ProgramCall::Execute(payload);
+                        let waiter = Waiter::Call { ticket };
+                        Box::pin(self.run_frame(
+                            &target,
+                            call,
+                            env,
+                            waiter,
+                            overlay,
+                            stage,
+                            frame,
+                            depth + 1,
+                        ))
+                        .await?
+                    }
                 }
             };
             let outcome = ran.receipt.outcome.clone();
@@ -438,7 +442,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn tell_awaits(
+    pub(crate) async fn tell_awaits(
         &self,
         origin: Origin,
         op: awaits::Op,

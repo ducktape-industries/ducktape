@@ -120,6 +120,38 @@ fn renames_ask_at_tag_12_answer_at_tag_9_and_rename_program_takes_identity_tag_1
 }
 
 #[test]
+fn reads_asks_answers_and_readies_at_their_tags() {
+    use abi::role::reads::{self, Entry, Op, State};
+    let read = Op::Read {
+        target: "p".into(),
+        query: vec![7],
+    };
+    assert_eq!(abi::encode(&read), [0, 1, 0, 0, 0, b'p', 1, 0, 0, 0, 7]);
+    let entry = Entry {
+        id: abi::BlobId::Sha256([0; 32]),
+        len: 1,
+        kind: "k".into(),
+    };
+    let answer = Op::Answer {
+        id: 2,
+        at: 3,
+        outcome: Ok(entry.clone()),
+    };
+    assert_eq!(tag(&answer), 1);
+    assert_eq!(
+        abi::encode(&Op::Ready { id: 2 }),
+        [2, 2, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(tag(&State::Asked), 0);
+    let read = reads::Read { entry, at: 3 };
+    assert_eq!(tag(&State::Putting { bundle: 0, read }), 1);
+    let members = [vec![1], vec![2]];
+    assert_eq!(reads::assigned(5, &members), Some([2].as_slice()));
+    assert_eq!(reads::assigned(4, &members), Some([1].as_slice()));
+    assert_eq!(reads::assigned(4, &[]), None);
+}
+
+#[test]
 fn a_program_id_is_one_segment_or_an_owner_and_a_name() {
     assert!(abi::program_id_shaped("chat"));
     assert!(abi::program_id_shaped("ducktape-industries/chat"));
