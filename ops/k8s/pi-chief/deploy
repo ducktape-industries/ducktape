@@ -23,6 +23,7 @@ socket="$stage.ssh"
 trap 'ssh -S "$socket" -O exit "$node" 2>/dev/null; rm -rf "$stage"' EXIT
 mkdir "$stage/src"
 git -C "$(git -C "$here" rev-parse --show-toplevel)" archive "$commit" | tar -x -C "$stage/src"
+duck_release=$("$here/../git-remote-duck" "$stage/git-remote-duck")
 anchor_window=$(sed -n 's/^pub const ANCHOR_WINDOW: u64 = \([0-9]*\);$/\1/p' "$stage/src/crates/kernel/host/src/lib.rs")
 notice=$(git -C "$programs" show "$programs_commit:crates/system/programs/src/lib.rs" | sed -n 's/^pub const NOTICE: u64 = \([0-9]*\);$/\1/p')
 [ -n "$anchor_window" ] || fail "host::ANCHOR_WINDOW is not in the source of $commit"
@@ -33,7 +34,7 @@ case $stamped in
   *) fail "the live programs code $notice_code was built from $stamped, not $programs_commit" ;;
 esac
 cp "$here/pi-chief.py" "$stage/pi-chief.py"
-tag=$(cat "$here/Containerfile" "$stage/pi-chief.py" <(echo "$commit") | sha256sum | cut -c1-12)
+tag=$(cat "$here/Containerfile" "$stage/pi-chief.py" <(echo "$commit $duck_release") | sha256sum | cut -c1-12)
 nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \
   --tag "localhost:$tunnel_port/pi-chief:$tag" "$stage"
 ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"

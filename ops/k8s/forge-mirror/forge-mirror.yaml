@@ -65,9 +65,9 @@ spec:
             - name: FORGE_MIRROR_APP
               value: /keys/github-app
             - name: FORGE_MIRROR_REPOS
-              value: core=ducktape-industries/ducktape programs=ducktape-industries/programs app=ducktape-industries/app
+              value: core=ducktape-industries/ducktape programs=ducktape-industries/programs app=ducktape-industries/app fluent31=ducktape-industries/fluent31
             - name: FORGE_MIRROR_BRANCHES
-              value: dev main
+              value: dev main master
             - name: HOME
               value: /tmp
           securityContext:

@@ -2058,7 +2058,7 @@ dependencies = [
 [[package]]
 name = "fluent31"
 version = "0.1.0"
-source = "git+https://github.com/ducktape-industries/fluent31?rev=823e0459a7f71ea96460e6754635c0c324980412#823e0459a7f71ea96460e6754635c0c324980412"
+source = "git+https://github.com/ducktape-industries/fluent31?rev=e4171bceee712058f772b7725f3fb5871aa1da1e#e4171bceee712058f772b7725f3fb5871aa1da1e"
 dependencies = [
  "crc32fast",
  "crossbeam-skiplist",

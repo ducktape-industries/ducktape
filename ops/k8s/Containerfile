@@ -1,8 +1,11 @@
 # The node image: ducktape built from the source of one forge commit, run on Debian, home at /data.
-# Built by ops/k8s/deploy from a staged context holding `git archive` of that commit under src/.
+# Built by ops/k8s/deploy from a staged context holding `git archive` of that commit under src/ and git-remote-duck.
 FROM docker.io/library/rust:1.96.1-trixie AS build
 WORKDIR /src
 COPY src/ .
+COPY git-remote-duck /usr/local/bin/git-remote-duck
+RUN git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
+RUN git config --system url.duck://duckpond-725bcad1/forge/fluent31.insteadOf https://github.com/ducktape-industries/fluent31
 RUN cargo build --locked --release -p node-bin
 
 FROM docker.io/library/debian:trixie-slim

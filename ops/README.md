@@ -15,7 +15,15 @@ scripts back a `make` target; see the repository `Makefile`.
 
 - `k8s/deploy NETWORK COMMIT [--found]` builds `k8s/Containerfile`: its
   first stage builds ducktape from `git archive COMMIT` with Rust 1.96.1 on
-  Debian trixie, and the image runs that binary on trixie. It pushes it to
+  Debian trixie, and the image runs that binary on trixie. Cargo.toml pins
+  fluent31 by GitHub's URL, so any machine builds core as it is; the build
+  stage rewrites that URL to forge
+  (`url.duck://duckpond-725bcad1/forge/fluent31.insteadOf`) and fetches it
+  with the pinned git-remote-duck (`k8s/git-remote-duck`), so our images
+  take fluent31 from forge. While duckpond is down, build with that one
+  `insteadOf` line taken out of the Containerfile: the stage then fetches
+  the same commit from GitHub, which forge-mirror keeps in step with
+  forge's fluent31 master. It pushes the image to
   the registry on the cluster node (`DEPLOY_NODE`, default
   `fabrics@fabrics-1`, at its `127.0.0.1:5000`), and applies
   `k8s/network.yaml`: the namespace `NETWORK` and the claim `home`, whose
@@ -554,8 +562,10 @@ one up for another network.
   agents build ducktape, programs and the app with, pushes it to the
   cluster node's registry and prints its reference.
 - `k8s/git-remote-duck DEST` is the one pin of git-remote-duck that every
-  image takes (toolchain, pods, mac, forge-mirror): a release name, the
-  network blob that holds its x86_64 Linux binary and that binary's sha256.
+  image takes (toolchain, pods, mac, forge-mirror, and the build stage of
+  every image that builds ducktape, which fetches fluent31 from forge): a
+  release name, the network blob that holds its x86_64 Linux binary and
+  that binary's sha256.
   It reads the blob from duckpond's public node (`/v1/blob/get`, or the node
   `DUCK_NODE` names), checks the sha256 and writes the binary to `DEST`. The
   same bytes, with a `SHA256SUMS`, are in files at
@@ -1055,13 +1065,16 @@ one up for another network.
 
 ## Forge and GitHub
 
-- dev and main of ducktape, programs and app are held by duckpond's forge
-  (repositories `core`, `programs`, `app`). GitHub's
-  `ducktape-industries/ducktape`, `programs` and `app` are a read-only release
-  mirror of them: forge-mirror fast-forwards GitHub's dev and main to forge's,
+- dev and main of ducktape, programs and app, and fluent31's master, are held
+  by duckpond's forge (repositories `core`, `programs`, `app`, `fluent31`).
+  GitHub's `ducktape-industries/ducktape`, `programs`, `app` and `fluent31`
+  are a release mirror of them: forge-mirror fast-forwards GitHub's
+  dev, main and master to forge's (`FORGE_MIRROR_BRANCHES` names branches for
+  every repository in `FORGE_MIRROR_REPOS` at once, so master is followed in
+  each; a branch forge doesn't hold is skipped and GitHub's is left alone),
   GitHub Actions run CI and build releases from the mirrored commits, and the
   ruleset `k8s/forge-mirror/protect` puts on dev and main lets only the App
-  write them.
+  write them (ducktape, programs and app; fluent31's master has no ruleset).
 - `k8s/forge-mirror/mirror.py` is forge-mirror, running on fabrics-1 as
   Deployment `forge-mirror`. It follows duckpond's forge writes over
   `/v1/changes/forge`. A block that moves a followed forge branch starts one
@@ -1082,7 +1095,7 @@ one up for another network.
 - forge-mirror pushes over HTTPS as the GitHub App "ducktape forge-mirror"
   (App ID 5370470), with an installation token it mints from the App's key
   for the repositories `FORGE_MIRROR_REPOS` names, so the token writes only
-  ducktape, programs and app. The Secret `forge-mirror/github-app` holds
+  ducktape, programs, app and fluent31. The Secret `forge-mirror/github-app` holds
   `app_id`, `installation_id` and `private_key`, nothing else.
 - `k8s/forge-mirror/deploy` builds the forge-mirror image around `mirror.py`
   and the pinned git-remote-duck, pushes it to the cluster node's registry, and

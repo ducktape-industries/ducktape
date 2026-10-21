@@ -1,8 +1,11 @@
 # The watch image: Python and the ducktape CLI built from one forge commit, running watch.py as uid 1000.
-# Built by ops/k8s/watch/deploy from a staged context holding `git archive` of that commit under src/ and watch.py.
+# Built by ops/k8s/watch/deploy from a staged context holding `git archive` of that commit under src/, git-remote-duck and watch.py.
 FROM docker.io/library/rust:1.96.1-trixie AS build
 WORKDIR /src
 COPY src/ .
+COPY git-remote-duck /usr/local/bin/git-remote-duck
+RUN git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
+RUN git config --system url.duck://duckpond-725bcad1/forge/fluent31.insteadOf https://github.com/ducktape-industries/fluent31
 RUN cargo build --locked --release -p node-bin
 
 FROM docker.io/library/debian:trixie-slim

@@ -105,7 +105,7 @@ chacha20poly1305 = "0.10"
 zeroize = "1"
 
 # fluent31 — the LSM engine under the state crate's storage.
-fluent31 = { git = "https://github.com/ducktape-industries/fluent31", rev = "823e0459a7f71ea96460e6754635c0c324980412", default-features = false }
+fluent31 = { git = "https://github.com/ducktape-industries/fluent31", rev = "e4171bceee712058f772b7725f3fb5871aa1da1e", default-features = false }
 # borsh — the record codec: the ABI, the wire records and the workspace files
 # share one byte layout with no map ordering games. Its schemas describe a
 # program's ops, queries and replies to a reader with no Rust type for them.
