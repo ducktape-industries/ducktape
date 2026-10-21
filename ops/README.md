@@ -787,7 +787,7 @@ one up for another network.
     a sample the node does not answer starts the window again;
   - the node's `/v1/status`, and the public one at
     `duckpond.ducktape.industries` while the node's answers;
-  - harness's `Budget`: bad while any account or window has an Anthropic
+  - harness's `BudgetFacts`: bad while any account or window has an Anthropic
     status other than `allowed`;
   - ccs, when `WATCH_CCS` names it: bad when `/ccs/status` gets no answer
     or answers 500 or more;

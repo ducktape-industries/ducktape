@@ -435,7 +435,7 @@ class Cli:
 
 def budget_read(cli):
     try:
-        report = cli.query("harness", "Budget")["Budget"]
+        report = cli.query("harness", "BudgetFacts")["BudgetFacts"]["budget"]
     except Unread as error:
         return unread("budget", "model budget", f"harness did not answer: {error}")
     return budget_reading(report)

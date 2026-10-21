@@ -132,6 +132,7 @@ class FakeCli:
         self.budget = budget
         self.files = {} if files is None else files
         self.reads = []
+        self.asked = []
         self.posted = {}
         self.ops = []
         self.failing = False
@@ -141,9 +142,12 @@ class FakeCli:
 
     def query(self, program, query, confirmed=False):
         if program == "harness":
+            self.asked.append(query)
             if isinstance(self.budget, Exception):
                 raise self.budget
-            return {"Budget": self.budget}
+            if query != "BudgetFacts":
+                raise watch.Unread(f"harness: Query did not decode: {query}")
+            return {"BudgetFacts": {"budget": self.budget, "facts": []}}
         if program == "files":
             return self.files_answer(query)
         found = self.posted.get(query["MessageById"]["message_id"])
@@ -261,6 +265,11 @@ class Budget(unittest.TestCase):
         reading = watch.budget_reading(report)
         self.assertEqual(reading.seen, watch.BAD)
         self.assertEqual(reading.value, "ext.5's 7d window is allowed_warning at 0.91; eph is rejected")
+
+    def test_the_budget_is_read_from_harness_budget_facts(self):
+        cli = FakeCli()
+        self.assertEqual(watch.budget_read(cli).seen, watch.OK)
+        self.assertEqual(cli.asked, ["BudgetFacts"])
 
     def test_harness_unanswered_is_unread(self):
         self.assertEqual(watch.budget_read(FakeCli(budget=watch.Unread("no"))).seen, watch.UNREAD)

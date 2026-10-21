@@ -340,10 +340,8 @@ The desktop app's harness view builds the same sequence for an agent
 - identity `{"OfKey": {"key": <chief's key>}}` answers C.
 - egress `{"Serving": {"service": "relay"}}` and the same for `anthropic`
   each list the node's key.
-- `chief` signs harness `"ReadBudgets"`. Once a block carries it, harness
-  `"Budget"` holds ccs's status for every account ccs holds. That proves the
-  path to ccs with no model tokens spent.
-- A message to chief gets an answer.
+- A message to chief gets an answer. Then harness `"BudgetFacts"` holds a
+  row for the ccs account that answered it.
 
 ## 13. Reach it and seed the agents
 
