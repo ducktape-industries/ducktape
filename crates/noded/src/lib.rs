@@ -1,6 +1,7 @@
 mod activity;
 mod blocks;
 mod carry;
+mod census;
 mod changes;
 mod client;
 mod config;
@@ -177,6 +178,7 @@ pub struct Daemon<E: Context> {
     pub live: Arc<live::Relay<E>>,
     egress: egress::Station,
     answered: tokio::sync::mpsc::UnboundedSender<server::Answered>,
+    queried: tokio::sync::mpsc::UnboundedSender<census::Queried>,
     key: commonware_cryptography::ed25519::PrivateKey,
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).

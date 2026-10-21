@@ -180,6 +180,10 @@ where
         &self.host
     }
 
+    pub fn meter_queries(&mut self, fuel: Option<u64>) {
+        self.host.meter_queries(fuel);
+    }
+
     pub fn network(&self) -> &[u8] {
         &self.network
     }

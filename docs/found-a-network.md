@@ -20,7 +20,7 @@ Write these down before you build anything. Two of them are fixed for good.
 | The network's name | the founding file's `network`, the Kubernetes namespace, the chain id every signature names | fixed for good |
 | How it is reached | step 4 | a public name through a Cloudflare tunnel, or only a host address such as a Tailscale IP |
 | Its validators | the founding file's `[[validators]]` | one node is a network; more join later (`ducktape join`) |
-| Its limits | the founding file's `[limits]` | a hosted network with agents founds unmetered, as duckpond does: leave `[limits]` out |
+| Its limits | the founding file's `[limits]` | a hosted network with agents founds unmetered, as duckpond does: leave `[limits]` out (its nodes still meter queries: `load.query_fuel`) |
 | Who manages the first agent | step 8 | fixed for good: identity refuses `SetOwnership` |
 | The model gateway | step 5 | the egress service the provider's route names (`SetRoute`, § 10 step 6) |
 

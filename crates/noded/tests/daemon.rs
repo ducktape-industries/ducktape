@@ -3829,15 +3829,13 @@ where
     }
 }
 
-const METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY: i64 = i64::MAX;
+const METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY: u64 = u64::MAX;
 
-fn metered(founding: &Path) {
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(founding)
-        .unwrap();
-    let fuel = METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY;
-    writeln!(file, "[limits]\nfuel = {fuel}").unwrap();
+fn metered() -> LoadConfig {
+    LoadConfig {
+        query_fuel: std::num::NonZeroU64::new(METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY),
+        ..LoadConfig::default()
+    }
 }
 
 fn aged(frame: &[u8]) -> u64 {
@@ -3898,9 +3896,8 @@ fn a_watched_query_is_answered_at_once_and_again_only_with_a_block_that_writes_w
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
-    metered(&founding);
     seat.init(&founding);
-    let live = seat.start();
+    let live = seat.start_with(metered());
     let client = live.client.clone();
     let alice = ed25519::PrivateKey::from_seed(11);
 

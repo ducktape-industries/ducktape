@@ -37,7 +37,7 @@ pub use namespace::{BLOBS, INDEXED_AT, NETWORK, PARKED, PROGRAMS, RECENT, RESERV
 pub use parking::PAGE_FUEL;
 pub use reads::{ReadSet, Written};
 pub use runtime::{Limits, OUT_OF_FUEL};
-pub use snapshot::{Snapshot, Source};
+pub use snapshot::{Queried, Snapshot, Source};
 pub use state::LOCAL;
 
 const STATE_DIR: &str = "state";
@@ -431,7 +431,7 @@ where
             blobs,
             network: genesis.network,
             roles: roles.clone(),
-            loaded: Loaded::new(genesis.limits),
+            loaded: Loaded::new(genesis.limits, None),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
@@ -544,7 +544,7 @@ where
             blobs,
             network,
             roles,
-            loaded: Loaded::new(limits),
+            loaded: Loaded::new(limits, None),
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
@@ -620,6 +620,10 @@ where
 
     pub fn spent(&self) -> Spent {
         self.spent
+    }
+
+    pub fn meter_queries(&mut self, fuel: Option<u64>) {
+        self.loaded.meter_queries(fuel);
     }
 
     pub fn set_rows_from(&mut self, height: u64) {
@@ -2309,7 +2313,7 @@ pub(crate) fn sync_code(loaded: &mut Loaded, view: &View<'_>, blobs: &Blobs) -> 
     let limits = limits_of(view)?;
     let limits_changed = loaded.limits() != limits;
     if limits_changed {
-        *loaded = Loaded::new(limits);
+        *loaded = Loaded::new(limits, loaded.query_fuel());
     }
     let wanted = programs_of(view)?;
     loaded.sync(&wanted, blobs)

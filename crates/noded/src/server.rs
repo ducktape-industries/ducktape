@@ -40,6 +40,7 @@ impl Rpc {
         listener: std::net::TcpListener,
         fanout: Fanout<E>,
         answers: tokio::sync::mpsc::UnboundedReceiver<Answered>,
+        queries: tokio::sync::mpsc::UnboundedReceiver<crate::census::Queried>,
         rpc_cpus: Option<Vec<usize>>,
         blocking_threads: Option<std::num::NonZeroUsize>,
     ) -> crate::Result<Rpc> {
@@ -70,6 +71,11 @@ impl Rpc {
             daemon.holds_ended.clone(),
         ));
         runtime.spawn(changes::fan(fanout));
+        runtime.spawn(crate::census::census(
+            daemon.network.epoch_length,
+            queries,
+            daemon.tips.subscribe(),
+        ));
         for _ in 0..threads {
             let door = listener.try_clone()?;
             runtime.spawn(accepting(door, router.clone(), daemon.shutdown.subscribe()));
@@ -455,28 +461,48 @@ async fn query<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<u8>> {
             Err(refusal) => return Asked::Unverified(refusal),
         };
         let source = reading.source();
-        let answer = source.query(
+        let program = submission.target;
+        let answer = source.queried(
             query.layer,
             time,
             Origin::External(submission.signer),
-            &submission.target,
+            &program,
             submission.payload,
         );
-        Asked::Answered(tokio::runtime::Handle::current().block_on(answer))
+        let queried = tokio::runtime::Handle::current().block_on(answer);
+        Asked::Answered(queried.map(|queried| (program, queried)))
     })
     .await;
     match asked {
         Ok(Asked::Unverified(refusal)) => Reply::Refused(refusal),
-        Ok(Asked::Answered(Ok(Ok(bytes)))) => Reply::Answered(bytes),
-        Ok(Asked::Answered(Ok(Err(refusal)))) => Reply::Refused(refusal),
+        Ok(Asked::Answered(Ok((program, queried)))) => counted(&ctx, program, queried),
         Ok(Asked::Answered(Err(error))) => failed(error),
         Err(error) => failed(error),
     }
 }
 
+fn counted<E: Context>(ctx: &Ctx<E>, program: ProgramId, queried: host::Queried) -> Reply<Vec<u8>> {
+    tracing::debug!(
+        target: "ducktape::query",
+        %program,
+        fuel = queried.fuel,
+        ran_out = queried.ran_out,
+        "a query ran"
+    );
+    ctx.queried(crate::census::Queried {
+        program,
+        fuel: queried.fuel,
+        ran_out: queried.ran_out,
+    });
+    match queried.answer {
+        Ok(bytes) => Reply::Answered(bytes),
+        Err(refusal) => Reply::Refused(refusal),
+    }
+}
+
 enum Asked {
     Unverified(Refusal),
-    Answered(host::Result<Result<Vec<u8>, Refusal>>),
+    Answered(host::Result<(ProgramId, host::Queried)>),
 }
 
 async fn get_value<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Vec<u8>>> {

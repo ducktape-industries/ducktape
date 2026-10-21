@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::role::identity::AccountNumber;
@@ -19,19 +21,35 @@ use crate::{Error, Result, crypto, namespace, parked};
 #[derive(Clone)]
 pub struct Loaded {
     runtime: Runtime,
+    queries: Runtime,
+    query_fuel: Option<u64>,
     programs: BTreeMap<ProgramId, Slot>,
 }
 
 #[derive(Clone)]
 enum Slot {
-    Running { code: BlobId, module: Code },
-    Awaiting { code: BlobId },
+    Running {
+        code: BlobId,
+        module: Code,
+        metered: Metered,
+    },
+    Awaiting {
+        code: BlobId,
+    },
 }
 
+type Metered = Arc<OnceLock<std::result::Result<Code, Fault>>>;
+
 impl Loaded {
-    pub fn new(limits: Limits) -> Loaded {
+    pub fn new(limits: Limits, query_fuel: Option<u64>) -> Loaded {
+        let metered = Limits {
+            fuel: Some(u64::MAX),
+            ..limits
+        };
         Loaded {
             runtime: Runtime::new(limits),
+            queries: Runtime::new(metered),
+            query_fuel,
             programs: BTreeMap::new(),
         }
     }
@@ -42,6 +60,22 @@ impl Loaded {
 
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
+    }
+
+    pub fn queries(&self) -> &Runtime {
+        &self.queries
+    }
+
+    pub fn query_fuel(&self) -> Option<u64> {
+        self.query_fuel
+    }
+
+    pub fn query_budget(&self) -> u64 {
+        self.query_fuel.unwrap_or(u64::MAX)
+    }
+
+    pub fn meter_queries(&mut self, query_fuel: Option<u64>) {
+        self.query_fuel = query_fuel;
     }
 
     pub fn module(&self, program: &str) -> Option<&Code> {
@@ -84,18 +118,37 @@ impl Loaded {
         blobs: &Layered<'_>,
         id: &BlobId,
     ) -> Result<Option<std::result::Result<Code, Fault>>> {
-        let Some(framed) = blobs.framed(id)? else {
+        compile(&self.runtime, blobs, id)
+    }
+
+    pub fn metered(
+        &self,
+        program: &str,
+        blobs: &Blobs,
+        stage: &Stage,
+    ) -> Result<Option<std::result::Result<Code, Fault>>> {
+        let Some(Slot::Running { code, metered, .. }) = self.programs.get(program) else {
             return Ok(None);
         };
-        let (_, body) = blob::parse(&framed).ok_or_else(|| {
-            Error::Blobs(blob::Error::Corrupt(*id, "the frame does not parse".into()))
-        })?;
-        Ok(Some(self.runtime.load(body)))
+        if let Some(compiled) = metered.get() {
+            return Ok(Some(compiled.clone()));
+        }
+        let layered = Layered { stage, blobs };
+        let compiled =
+            compile(&self.queries, &layered, code)?.ok_or(Error::BlobUnavailable(*code))?;
+        Ok(Some(metered.get_or_init(|| compiled).clone()))
     }
 
     pub fn admit(&mut self, program: ProgramId, code: BlobId, module: Code) {
-        self.programs
-            .insert(program, Slot::Running { code, module });
+        let metered = Metered::default();
+        self.programs.insert(
+            program,
+            Slot::Running {
+                code,
+                module,
+                metered,
+            },
+        );
     }
 
     pub fn unload(&mut self, program: &str) {
@@ -127,12 +180,33 @@ impl Loaded {
                 Some(Ok(module)) => Slot::Running {
                     code: *code,
                     module,
+                    metered: Metered::default(),
                 },
             };
             self.programs.insert(program.clone(), slot);
         }
         Ok(())
     }
+}
+
+fn compile(
+    runtime: &Runtime,
+    blobs: &Layered<'_>,
+    id: &BlobId,
+) -> Result<Option<std::result::Result<Code, Fault>>> {
+    let Some(framed) = blobs.framed(id)? else {
+        return Ok(None);
+    };
+    let (_, body) = blob::parse(&framed).ok_or_else(|| {
+        Error::Blobs(blob::Error::Corrupt(*id, "the frame does not parse".into()))
+    })?;
+    Ok(Some(runtime.load(body)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runs {
+    Chain,
+    Query,
 }
 
 pub struct World<'a, E>
@@ -147,6 +221,7 @@ where
     pub height: u64,
     pub time: u64,
     pub recorder: Option<&'a Recorder>,
+    pub runs: Runs,
 }
 
 impl<E> Clone for World<'_, E>
@@ -491,8 +566,9 @@ where
     E: Context + Spawner,
 {
     world.note(|reads| reads.point(namespace::PROGRAMS, env.me.as_bytes()));
-    let Some(module) = world.loaded.module(&env.me) else {
-        return Ok(Err(unknown(&env.me)));
+    let (runtime, module) = match runner(world, stage, &env.me)? {
+        Ok(runner) => runner,
+        Err(refusal) => return Ok(Err(refusal)),
     };
     let invocation = Invocation {
         env: env.clone(),
@@ -507,11 +583,7 @@ where
         response: Vec::new(),
         fault: None,
     };
-    let verdict = world
-        .loaded
-        .runtime()
-        .run(module, invocation, &mut unit, fuel)
-        .await;
+    let verdict = runtime.run(&module, invocation, &mut unit, fuel).await;
     if let Some(fault) = unit.fault {
         return Err(fault);
     }
@@ -519,6 +591,38 @@ where
         Ok(Ok(())) => Ok(unit.response),
         Ok(Err(refusal)) => Err(refusal),
         Err(fault) => Err(refusal_of(fault)),
+    })
+}
+
+type Runner<'a> = (&'a Runtime, Cow<'a, Code>);
+
+fn runner<'a, E>(
+    world: World<'a, E>,
+    stage: &Stage,
+    program: &str,
+) -> Result<std::result::Result<Runner<'a>, Refusal>>
+where
+    E: Context + Spawner,
+{
+    let loaded = world.loaded;
+    let (runtime, code) = match world.runs {
+        Runs::Chain => (
+            loaded.runtime(),
+            loaded
+                .module(program)
+                .map(|module| Ok(Cow::Borrowed(module))),
+        ),
+        Runs::Query => (
+            loaded.queries(),
+            loaded
+                .metered(program, world.blobs, stage)?
+                .map(|compiled| compiled.map(Cow::Owned)),
+        ),
+    };
+    Ok(match code {
+        None => Err(unknown(program)),
+        Some(Ok(code)) => Ok((runtime, code)),
+        Some(Err(fault)) => Err(refusal_of(fault)),
     })
 }
 

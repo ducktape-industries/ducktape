@@ -213,6 +213,10 @@ impl<E: Context> Ctx<E> {
         let _ = self.daemon.answered.send(answered);
     }
 
+    pub(crate) fn queried(&self, queried: crate::census::Queried) {
+        let _ = self.daemon.queried.send(queried);
+    }
+
     pub(crate) fn holds_ended(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.daemon.holds_ended.clone()
     }

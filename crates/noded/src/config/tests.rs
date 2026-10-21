@@ -49,6 +49,7 @@ const EVERY_KEY: &str = "listen = \"127.0.0.1:9000\"\n\
                          live_lane_per_sender = 16\n\
                          live_linger_ms = 700\n\
                          egress_lane_backlog = 2\n\
+                         query_fuel = 5000000\n\
                          [consensus]\n\
                          leader_timeout_ms = 4000\n\
                          certification_timeout_ms = 6000\n\
@@ -78,6 +79,7 @@ fn every_key() -> Settings {
             live_lane_per_sender: Some(count(16)),
             live_linger_ms: NonZeroU64::new(700),
             egress_lane_backlog: Some(count(2)),
+            query_fuel: NonZeroU64::new(5_000_000),
         },
         consensus: ConsensusSettings {
             leader_timeout_ms: Some(4000),
@@ -194,6 +196,7 @@ fn file_only_settings_reach_the_config() {
             egress_lane_backlog: count(2),
             rpc_cpus: None,
             rpc_blocking_threads: None,
+            query_fuel: NonZeroU64::new(5_000_000),
         }
     );
     assert_eq!(config.block_cpus.unwrap().cpus(), &[0, 1, 2, 3, 4, 5]);

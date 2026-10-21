@@ -413,6 +413,16 @@ struct RunArgs {
     #[arg(
         long,
         help = defaulted(
+            "the fuel one query this node answers off the chain may burn, the queries it makes \
+             included; past it the query is refused as out of fuel. Frames never take it",
+            "load.query_fuel",
+            "no cap: every query is metered and counted"
+        )
+    )]
+    query_fuel: Option<NonZeroU64>,
+    #[arg(
+        long,
+        help = defaulted(
             "how long a view waits for its leader's proposal",
             "consensus.leader_timeout_ms",
             "one block time"
@@ -464,6 +474,7 @@ impl RunArgs {
                 live_lane_per_sender: self.live_lane_per_sender,
                 live_linger_ms: self.live_linger_ms,
                 egress_lane_backlog: self.egress_lane_backlog,
+                query_fuel: self.query_fuel,
             },
             consensus: ConsensusSettings {
                 leader_timeout_ms: self.leader_timeout_ms,
@@ -1641,6 +1652,8 @@ mod tests {
             "700",
             "--egress-lane-backlog",
             "2",
+            "--query-fuel",
+            "5000000",
             "--leader-timeout-ms",
             "4000",
             "--certification-timeout-ms",
@@ -1675,6 +1688,7 @@ mod tests {
                     live_lane_per_sender: Some(count(16)),
                     live_linger_ms: NonZeroU64::new(700),
                     egress_lane_backlog: Some(count(2)),
+                    query_fuel: NonZeroU64::new(5_000_000),
                 },
                 consensus: ConsensusSettings {
                     leader_timeout_ms: Some(4000),

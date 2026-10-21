@@ -112,7 +112,7 @@ id = "ping"
 code = "ping.wasm"
 params = "ping.params"        # optional: the bytes the program's init receives
 
-[limits]                      # optional; absent means unmetered
+[limits]                      # optional; absent means frames run unmetered (queries: load.query_fuel)
 fuel = 1000000000
 memory_bytes = 268435456
 ```
@@ -531,6 +531,7 @@ live_lane_backlog = 64        # --live-lane-backlog
 live_lane_per_sender = 256    # --live-lane-per-sender
 live_linger_ms = 5000         # --live-linger-ms
 egress_lane_backlog = 64      # --egress-lane-backlog
+query_fuel = 1000000000       # --query-fuel; default no cap: every query is metered and counted
 
 [consensus]
 leader_timeout_ms = 1000          # --leader-timeout-ms; default one block time
@@ -642,7 +643,14 @@ peers' streams waiting to be taken and the datagrams waiting per peer.
 `--live-linger-ms` is how long a
 closed session's last message gets to reach the client before the connection
 is closed under it. `--egress-lane-backlog` is how many streams egress boxes
-opened wait for the node to take them. `ducktape run --help` shows each default and its
+opened wait for the node to take them. `--query-fuel` is the fuel one query this node
+answers off the chain may burn (`/v1/query` and the node's own reads), the queries it makes
+included; past it the query is refused as a `trap`, "the run spent its fuel". Frames never
+take it: they run on the network's `[limits]`. Without it every such query is still metered,
+with no cap. As each epoch ends the node logs one `query_fuel` line (`ducktape::query`): how
+many `/v1/query` asks it answered over the epoch, how many ran out, the most fuel one burned
+and its program, and the p50 and p99 as the power of two at or above them, the measure to set
+`query_fuel` from. `ducktape run --help` shows each default and its
 `node.toml` key.
 
 Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). The halo
@@ -907,7 +915,7 @@ sends borsh `Watch` frames: `Ask { id, frame }`, with a query frame signed as
 `/v1/query` takes it, and `Drop { id }`. The node checks the frame and its
 anchor once, runs the query on the confirmed layer as the frame's signer and
 answers `Pushed::Answer { id, height, outcome }`; an ask that is refused does
-not stand. A network whose founding meters no fuel (no `limits.fuel`) refuses
+not stand. A node that caps no query's fuel (no `load.query_fuel`) refuses
 every ask as `unsupported`, since a query there could run forever. While the query runs, the host records what it read: each key it
 got (a missing one too), the range each scan covered (up to the last key when
 the scan filled its limit), each program it read whole (`Root`), what every

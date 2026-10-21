@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -136,6 +136,7 @@ pub struct LoadConfig {
     pub egress_lane_backlog: NonZeroUsize,
     pub rpc_cpus: Option<Vec<usize>>,
     pub rpc_blocking_threads: Option<NonZeroUsize>,
+    pub query_fuel: Option<NonZeroU64>,
 }
 
 impl Default for LoadConfig {
@@ -156,6 +157,7 @@ impl Default for LoadConfig {
             egress_lane_backlog: live.lane_backlog,
             rpc_cpus: None,
             rpc_blocking_threads: None,
+            query_fuel: None,
         }
     }
 }
@@ -440,7 +442,8 @@ async fn start<E: Context>(
     let identity = workspace.identity()?;
     let anchor = workspace.anchor()?;
     let egress = crate::egress::Station::open(workspace.clone())?;
-    let node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
+    let mut node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
+    node.meter_queries(load.query_fuel.map(NonZeroU64::get));
     let network = Network {
         epoch_length: node.epoch_length()?,
         cadence,
@@ -628,6 +631,7 @@ async fn start<E: Context>(
     let (writer, commands) = Writer::new(tally.queued.clone());
     let (changes, fanout) = Changes::new(network.clone(), tip.height);
     let (answered, answers) = tokio::sync::mpsc::unbounded_channel();
+    let (queried, queries) = tokio::sync::mpsc::unbounded_channel();
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         current,
@@ -655,6 +659,7 @@ async fn start<E: Context>(
         live,
         egress,
         answered,
+        queried,
         key: identity.clone(),
         mesh: transport::loopback(p2p),
     });
@@ -712,6 +717,7 @@ async fn start<E: Context>(
         listeners.http,
         fanout,
         answers,
+        queries,
         load.rpc_cpus,
         load.rpc_blocking_threads,
     )?;

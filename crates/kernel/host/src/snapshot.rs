@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use state::{Committed, Overlay, Pinned, View};
 
 use crate::reads::{ReadSet, Recorder};
-use crate::unit::{self, Loaded, World};
+use crate::unit::{self, Loaded, Runs, World};
 use crate::{
     BLOBS, Error, Layer, NETWORK, Preconfirmed, RECENT, Result, Submission, Tip, bound, corrupt,
     fresh, member_cap_of, namespace, programs_of, runnable, sync_code,
@@ -216,6 +216,7 @@ where
             height,
             time,
             recorder: None,
+            runs: Runs::Chain,
         }
     }
 
@@ -230,7 +231,7 @@ where
         if unmetered {
             let refused = Refusal::new(
                 reason::UNSUPPORTED,
-                "this network meters no fuel, so a standing query could run forever",
+                "this node caps no query's fuel (`load.query_fuel`), so a standing query could run forever",
             );
             return Ok((Err(refused), ReadSet::default()));
         }
@@ -240,6 +241,7 @@ where
         let recorder = Recorder::default();
         let world = World {
             recorder: Some(&recorder),
+            runs: Runs::Query,
             ..self.world(self.height()?, time)
         };
         let unstaged = Stage::default();
@@ -258,7 +260,7 @@ where
     }
 
     fn query_fuel(&self) -> Option<u64> {
-        self.loaded.limits().fuel
+        self.loaded.query_fuel()
     }
 
     pub async fn query(
@@ -269,6 +271,20 @@ where
         program: &str,
         request: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, Refusal>> {
+        Ok(self
+            .queried(layer, time, origin, program, request)
+            .await?
+            .answer)
+    }
+
+    pub async fn queried(
+        &self,
+        layer: Layer,
+        time: u64,
+        origin: Origin,
+        program: &str,
+        request: Vec<u8>,
+    ) -> Result<Queried> {
         if let Some(code) = self.loaded.awaiting(program) {
             return Err(Error::BlobUnavailable(code));
         }
@@ -278,18 +294,36 @@ where
             (Layer::Preconfirmed, Some(preconfirmed)) => &preconfirmed.stage,
             (Layer::Preconfirmed, None) | (Layer::Confirmed, _) => &unstaged,
         };
-        unit::query(
-            self.world(height, time),
+        let budget = self.loaded.query_budget();
+        let mut fuel = Some(budget);
+        let world = World {
+            runs: Runs::Query,
+            ..self.world(height, time)
+        };
+        let answer = unit::query(
+            world,
             self.layers(layer),
             stage,
             &[],
             origin,
             program.to_owned(),
             request,
-            &mut self.query_fuel(),
+            &mut fuel,
         )
-        .await
+        .await?;
+        let ran_out = matches!(&answer, Err(refusal) if refusal.reason == abi::reason::TRAP && refusal.sentence == runtime::OUT_OF_FUEL);
+        Ok(Queried {
+            answer,
+            fuel: fuel.map_or(0, |left| budget.saturating_sub(left)),
+            ran_out,
+        })
     }
+}
+
+pub struct Queried {
+    pub answer: std::result::Result<Vec<u8>, Refusal>,
+    pub fuel: u64,
+    pub ran_out: bool,
 }
 
 pub struct Snapshot<E> {

@@ -63,6 +63,7 @@ pub struct LoadSettings {
     pub live_linger_ms: Option<NonZeroU64>,
     #[serde(default, deserialize_with = "held_permits")]
     pub egress_lane_backlog: Option<NonZeroUsize>,
+    pub query_fuel: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -257,6 +258,7 @@ impl LoadSettings {
             live_lane_per_sender: self.live_lane_per_sender.or(under.live_lane_per_sender),
             live_linger_ms: self.live_linger_ms.or(under.live_linger_ms),
             egress_lane_backlog: self.egress_lane_backlog.or(under.egress_lane_backlog),
+            query_fuel: self.query_fuel.or(under.query_fuel),
         }
     }
 
@@ -297,6 +299,7 @@ impl LoadSettings {
                 .unwrap_or(default.egress_lane_backlog),
             rpc_cpus: None,
             rpc_blocking_threads: None,
+            query_fuel: self.query_fuel,
         }
     }
 }

@@ -24,7 +24,7 @@ use fixture_wasm::{
 };
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
-    Limits, NETWORK, RECENT, Roles, SPENT, Snapshot, Submission, Tip,
+    Limits, NETWORK, Queried, RECENT, Roles, SPENT, Snapshot, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -2672,6 +2672,104 @@ fn crypto_verifies_every_scheme() {
     });
 }
 
+async fn queried(host: &Host<Ctx>, steps: Vec<Step>) -> Queried {
+    host.source()
+        .queried(
+            Layer::Confirmed,
+            TIME,
+            Origin::External(SIGNER.to_vec()),
+            "probe",
+            script(steps),
+        )
+        .await
+        .unwrap()
+}
+
+#[test]
+fn a_query_burns_the_node_s_query_fuel_and_a_frame_never_does() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut genesis = standard();
+        genesis
+            .programs
+            .push(founding("other", PROBE, script(Vec::new())));
+        let mut host = found(context, "net", dir.path(), genesis).await;
+        let env = queried(&host, vec![Step::Env]).await;
+        let grown = queried(&host, vec![Step::Grow(16)]).await;
+        assert_eq!(answers(&env.answer.unwrap()).len(), 1);
+        assert!(answers(&grown.answer.unwrap()).is_empty());
+        assert!(
+            env.fuel > 0 && grown.fuel > env.fuel,
+            "env {} grown {}",
+            env.fuel,
+            grown.fuel
+        );
+        assert_eq!(queried(&host, vec![Step::Grow(16)]).await.fuel, grown.fuel);
+        host.meter_queries(Some(env.fuel + (grown.fuel - env.fuel) / 2));
+        let starved = queried(&host, vec![Step::Grow(16)]).await;
+        assert_eq!(starved.answer, Err(spent()));
+        assert!(starved.ran_out);
+        let spin = HostOp::Query {
+            program: "other".into(),
+            request: script(vec![Step::Spin]),
+        };
+        let nested = queried(&host, vec![op(spin)]).await;
+        assert_eq!(nested.answer, Err(spent()));
+        assert!(nested.ran_out);
+        let still = queried(&host, vec![Step::Env]).await;
+        assert!(!still.ran_out);
+        assert_eq!(answers(&still.answer.unwrap()).len(), 1);
+        let applied = host
+            .apply(block(
+                1,
+                vec![submit("probe", script(vec![Step::Grow(16)]))],
+            ))
+            .await
+            .unwrap();
+        assert!(replies(&applied.submissions[0]).is_empty());
+    });
+}
+
+#[test]
+fn a_query_runs_in_the_block_after_its_program_s_code_is_set() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let code = blob::id_of(HashKind::Sha1, &blob::frame("program", PROBE).unwrap()).unwrap();
+        let put = op(HostOp::BlobPutAlone {
+            hash: HashKind::Sha1,
+            kind: "program".into(),
+            body: PROBE.to_vec(),
+        });
+        host.apply(block(
+            1,
+            vec![
+                submit("probe", script(vec![put])),
+                submit("programs", change("fresh", code, script(Vec::new()))),
+            ],
+        ))
+        .await
+        .unwrap();
+        host.apply(block(2, Vec::new())).await.unwrap();
+        assert_eq!(host.programs().unwrap()["fresh"], code);
+        let snapshot = host.snapshot().unwrap();
+        for layer in [Layer::Confirmed, Layer::Preconfirmed] {
+            let queried = snapshot
+                .source()
+                .queried(
+                    layer,
+                    TIME,
+                    Origin::External(SIGNER.to_vec()),
+                    "fresh",
+                    script(vec![Step::Env]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(answers(&queried.answer.unwrap()).len(), 1, "{layer:?}");
+        }
+    });
+}
+
 #[test]
 fn fuel_is_a_network_parameter() {
     deterministic::Runner::default().start(|context| async move {
@@ -4051,11 +4149,11 @@ fn a_watched_query_records_each_key_it_read_each_range_its_scans_covered_and_the
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut genesis = standard();
-        genesis.limits.fuel = Some(METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY);
         genesis
             .programs
             .push(founding("other", PROBE, script(Vec::new())));
         let mut host = found(context, "net", dir.path(), genesis).await;
+        host.meter_queries(Some(METERED_WITH_FUEL_ENOUGH_FOR_ANY_TEST_QUERY));
         let setting = vec![
             set(b"a", b"1"),
             set(b"k/1", b"v"),
@@ -4114,7 +4212,7 @@ fn a_watched_query_records_each_key_it_read_each_range_its_scans_covered_and_the
 }
 
 #[test]
-fn a_network_that_meters_no_fuel_refuses_to_watch_a_query() {
+fn a_node_that_caps_no_query_fuel_refuses_to_watch_a_query() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let host = found(context, "net", dir.path(), standard()).await;
