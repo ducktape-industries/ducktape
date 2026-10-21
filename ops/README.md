@@ -510,7 +510,10 @@ one up for another network.
   of each line's commit, and every line up to the newest it holds counts as
   reported (`pods_reports_caught_up pod= already_reported=`; a failed ask logs
   `pods_uncaught` and marks nothing). So a line echoed in an agent's pod, or
-  by an `sh` run in the warm pod, reports nothing.
+  by an `sh` run in the warm pod, reports nothing. The record is the build
+  machine's own files, so the check trusts anyone who can run commands on the
+  two build machines: it guards against mistakes, not against a forged run
+  directory.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one chat notice there when it ends (chat `Notify`: kind `pod`,
   group and subject the pod, status passed or failed by the run container's
