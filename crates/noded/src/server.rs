@@ -178,6 +178,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
     Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
+        .route(route::HALO_SELF, get(halo_self::<E>))
         .route(route::GET, post(get_value::<E>))
         .route(route::SCAN, post(scan::<E>))
         .route(route::BLOB_GET, post(blob_get::<E>))
@@ -1175,6 +1176,10 @@ async fn p2p<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
 /// The UDP port a client dials for live tracks, `None` when the node runs no QUIC door.
 async fn live_port<E: Context>(ctx: Ctx<E>) -> Reply<Option<u16>> {
     Reply::Answered(ctx.live_port())
+}
+
+async fn halo_self<E: Context>(ctx: Ctx<E>) -> Reply<crate::wire::HaloSelf> {
+    Reply::Answered(ctx.halo_self())
 }
 
 async fn live_socket<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {

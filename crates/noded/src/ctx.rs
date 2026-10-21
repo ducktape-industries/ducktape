@@ -232,4 +232,8 @@ impl<E: Context> Ctx<E> {
     pub(crate) fn live_port(&self) -> Option<u16> {
         self.daemon.live.port()
     }
+
+    pub(crate) fn halo_self(&self) -> crate::wire::HaloSelf {
+        self.daemon.halo_self.borrow().clone()
+    }
 }

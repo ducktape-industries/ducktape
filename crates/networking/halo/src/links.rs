@@ -361,6 +361,16 @@ impl Links {
         self.mine.subscribe()
     }
 
+    pub async fn dial_self(&self, halo: &str) -> Result<(), &'static str> {
+        let Some(at) = resolved(&self.quic, halo).await else {
+            return Err("unresolved");
+        };
+        let connection = self.quic.dial(&self.me, at).await;
+        let connection = connection.map_err(|_| "undialed")?;
+        connection.close(0u32.into(), b"reached itself");
+        Ok(())
+    }
+
     pub fn seated(self: &Arc<Self>, changed: Vec<PublicKey>) {
         let moved = !changed.is_empty();
         for key in changed {
@@ -843,6 +853,10 @@ async fn accepting(links: Weak<Links>, endpoint: quinn::Endpoint) {
                 connection.close(0u32.into(), b"no node key");
                 return;
             };
+            if peer == links.me {
+                connection.close(0u32.into(), b"reached itself");
+                return;
+            }
             links.carry(&peer, connection, Side::Accepted, Path::Direct, None);
         });
     }

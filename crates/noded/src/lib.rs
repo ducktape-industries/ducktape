@@ -10,6 +10,7 @@ mod ctx;
 mod egress;
 mod endpoint;
 mod fill;
+mod halo_self;
 mod history;
 mod link;
 pub mod live;
@@ -189,6 +190,7 @@ pub struct Daemon<E: Context> {
     mesh: std::net::SocketAddr,
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
+    halo_self: watch::Sender<wire::HaloSelf>,
 }
 
 pub struct HeldHead {

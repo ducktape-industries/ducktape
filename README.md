@@ -624,6 +624,14 @@ connection open, and a connection carries streams both ways, so a member
 whose halo address takes no inbound UDP still takes part by dialing out. A
 changed address is dialed from the next block on. A dial to a member that
 never answers ends when QUIC's idle timeout passes, and the node dials again.
+When it starts, and whenever its own registered address changes, a node dials
+that address as a member would. If it does not reach itself, it logs a
+`halo_unreachable` warning with the address and the reason (`unresolved`, or
+`undialed` once QUIC's idle timeout passes): members then reach it relayed or
+punched through rather than directly at that address, and a network that does
+not route a host back to its own public address fails that dial while members
+still reach the node directly. `GET /v1/halo/self` answers `Unregistered`,
+`Dialing { at }`, `Reached { at }` or `Unreachable { at, reason }`.
 `--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
 `--halo-inbound-streams` is how many streams members open to the node wait

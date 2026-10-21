@@ -2820,6 +2820,50 @@ fn a_lane_the_validators_vote_open_is_served_from_its_block() {
     shut_down(&runtime, &[&taker, &gatherer], live);
 }
 
+async fn dialed_self(client: &Client) -> noded::wire::HaloSelf {
+    let mut blocks = client.changes(host::RECENT).await.unwrap();
+    loop {
+        let reach = client.halo_self().await.unwrap();
+        if !matches!(reach, noded::wire::HaloSelf::Dialing { .. }) {
+            return reach;
+        }
+        blocks.next().await.unwrap().unwrap();
+    }
+}
+
+#[test]
+fn a_node_reports_whether_it_reaches_itself_at_its_registered_halo_address() {
+    let root = tempfile::tempdir().unwrap();
+    let reachable = Seat::new(root.path(), "n0");
+    let unreachable = Seat::unreachable(root.path(), "n1");
+    let founding = founding(root.path(), &[&reachable, &unreachable], EPOCH_LENGTH);
+    reachable.init(&founding);
+    unreachable.init(&founding);
+    let live = vec![reachable.start(), unreachable.start()];
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let reached = dialed_self(&live[0].client).await;
+        let at = reachable.halo_address();
+        assert_eq!(reached, noded::wire::HaloSelf::Reached { at });
+        let unreached = dialed_self(&live[1].client).await;
+        let at = unreachable.halo_address();
+        let reason = "undialed".to_string();
+        assert_eq!(unreached, noded::wire::HaloSelf::Unreachable { at, reason });
+        let lines = live[1].client.logs().await.unwrap();
+        let errors = |at: String| {
+            let named = format!("at={at}");
+            lines
+                .iter()
+                .filter(|line| line.contains("halo_unreachable"))
+                .filter(|line| line.split_whitespace().any(|word| word == named))
+                .count()
+        };
+        assert_eq!(errors(unreachable.halo_address()), 1, "{lines:?}");
+        assert_eq!(errors(reachable.halo_address()), 0, "{lines:?}");
+    });
+    shut_down(&runtime, &[&reachable, &unreachable], live);
+}
+
 #[test]
 fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_dials_and_held() {
     let root = tempfile::tempdir().unwrap();

@@ -38,6 +38,7 @@ pub mod route {
     pub const SYNC_HOLD: &str = "/v1/sync/hold";
     pub const SNAPSHOT: &str = "/v1/snapshot";
     pub const NETWORK: &str = "/v1/network";
+    pub const HALO_SELF: &str = "/v1/halo/self";
     pub const P2P: &str = "/v1/p2p";
     pub const METRICS: &str = "/metrics";
 }
@@ -267,6 +268,14 @@ pub struct Network {
 pub struct PeerStatus {
     pub key: Vec<u8>,
     pub signed: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum HaloSelf {
+    Unregistered,
+    Dialing { at: String },
+    Reached { at: String },
+    Unreachable { at: String, reason: String },
 }
 
 pub mod activity {

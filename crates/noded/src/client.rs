@@ -12,8 +12,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
-    Status, Submit, Submitted, TxAsk, activity, route,
+    Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Get, HaloSelf, Located, Network, Page,
+    Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
 };
 use crate::{Error, Result};
 
@@ -44,6 +44,10 @@ impl Client {
     /// for (`wire::PeerStatus`).
     pub async fn network(&self) -> Result<Network> {
         self.fetch(route::NETWORK).await
+    }
+
+    pub async fn halo_self(&self) -> Result<HaloSelf> {
+        self.fetch(route::HALO_SELF).await
     }
 
     /// The UDP port the node's relay takes live tracks at, `None` when it bound none.

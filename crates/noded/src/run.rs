@@ -642,6 +642,7 @@ async fn start<E: Context>(
     let (changes, fanout) = Changes::new(network.clone(), tip.height);
     let (answered, answers) = tokio::sync::mpsc::unbounded_channel();
     let (queried, queries) = tokio::sync::mpsc::unbounded_channel();
+    let halo_self = watch::Sender::new(crate::halo_self::first(&halo));
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         current,
@@ -672,6 +673,7 @@ async fn start<E: Context>(
         queried,
         key: identity.clone(),
         mesh: transport::loopback(p2p),
+        halo_self,
     });
     let founding = tip.height == 0;
     if let Anchor::Genesis(genesis) = marshal.anchor()
@@ -747,7 +749,11 @@ async fn start<E: Context>(
         crate::egress::lane::spawn(daemon.clone(), handle, load.egress_lane_backlog)?;
     }
     let egressing = crate::egress::spawn(daemon.clone());
-    let mut tasks = vec![pump, relayed, egressing];
+    let dialing = context.child("halo_self").spawn({
+        let daemon = daemon.clone();
+        move |_| crate::halo_self::dialing(daemon)
+    });
+    let mut tasks = vec![pump, relayed, egressing, dialing];
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(p2p);
         tasks.push(

@@ -140,4 +140,8 @@ impl Halo {
     pub fn udp(&self) -> std::io::Result<SocketAddr> {
         self.links.udp()
     }
+
+    pub async fn dial_self(&self, at: &str) -> Result<(), &'static str> {
+        self.links.dial_self(at).await
+    }
 }
