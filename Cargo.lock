@@ -417,6 +417,7 @@ dependencies = [
  "borsh",
  "commonware-cryptography",
  "commonware-runtime",
+ "crc32fast",
  "futures",
  "halo",
  "rustix",
@@ -426,6 +427,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

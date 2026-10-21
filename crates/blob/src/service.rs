@@ -13,7 +13,7 @@ use abi::{BlobId, Refusal, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::ed25519::PublicKey;
 use halo::{Class, Halo, Inbound, Links, Paced, Streams};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
@@ -860,7 +860,7 @@ impl Inner {
             let _ = tokio::fs::remove_file(partial).await;
             return Err(reason);
         }
-        self.store.adopt(id, partial).map_err(|_| "unwritten")?;
+        adopted(&self.store, id, partial).await?;
         self.landed.send_modify(|landed| *landed += 1);
         Ok(Pulled::Landed)
     }
@@ -911,7 +911,7 @@ impl Inner {
         if taken_over {
             return Ok(Kept::Elsewhere);
         }
-        self.store.adopt(id, file).map_err(|_| "unwritten")?;
+        adopted(&self.store, id, file).await?;
         self.landed.send_modify(|landed| *landed += 1);
         Ok(Kept::Landed)
     }
@@ -976,6 +976,12 @@ async fn streamed(
         left -= read as u64;
     }
     Ok(true)
+}
+
+async fn adopted(store: &Blobs, id: &BlobId, file: &Path) -> Result<(), &'static str> {
+    let (store, id, file) = (store.clone(), *id, file.to_path_buf());
+    let adopted = tokio::task::spawn_blocking(move || store.adopt(&id, &file)).await;
+    adopted.map_err(|_| "unwritten")?.map_err(|_| "unwritten")
 }
 
 enum Checked {
@@ -1085,25 +1091,32 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
         meta, mut stream, ..
     } = inbound;
     let ask: Ask = abi::decode(&meta).map_err(|_| "malformed")?;
-    let opened = store.file(&ask.id).map_err(|_| "unread")?;
-    let Some(file) = opened else {
+    let (id, offset) = (ask.id, ask.offset);
+    let reading = store.clone();
+    let opened = tokio::task::spawn_blocking(move || reading.reader(&id, offset)).await;
+    let opened = opened.map_err(|_| "unread")?.map_err(|_| "unread")?;
+    let Some(mut reader) = opened else {
         write_answer(&mut stream, &Answer::Lacks).await?;
         return Err("lacks");
     };
-    let mut file = tokio::fs::File::from_std(file);
-    let len = file.metadata().await.map_err(|_| "unread")?.len();
-    if ask.offset > len {
+    let len = reader.framed_len();
+    if offset > len {
         write_answer(&mut stream, &Answer::Lacks).await?;
         return Err("offset_past_end");
     }
     write_answer(&mut stream, &Answer::Have { len }).await?;
-    file.seek(std::io::SeekFrom::Start(ask.offset))
-        .await
-        .map_err(|_| "unread")?;
-    let mut left = (&mut file).take(len - ask.offset);
-    tokio::io::copy(&mut left, &mut stream)
-        .await
-        .map_err(|_| "broken")?;
+    loop {
+        let read = tokio::task::spawn_blocking(move || {
+            let piece = reader.piece();
+            (piece, reader)
+        });
+        let (piece, back) = read.await.map_err(|_| "unread")?;
+        reader = back;
+        let Some(piece) = piece.map_err(|_| "unread")? else {
+            break;
+        };
+        stream.write_all(&piece).await.map_err(|_| "broken")?;
+    }
     stream.shutdown().await.map_err(|_| "broken")
 }
 

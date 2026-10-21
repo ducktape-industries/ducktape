@@ -877,6 +877,7 @@ ducktape mcp                            # the Model Context Protocol on stdio fo
 ducktape programs                       # every program and its code blob
 ducktape blob get sha256:…              # a blob's framed bytes
 ducktape blob put code.wasm --kind program --wait  # put a bundle, print its ids, wait until it is held
+ducktape blob unpack                    # with the node stopped, every blob back as one file, for an older build
 ducktape machine init                   # mint machine.key and print its public key
 ducktape machine run                    # run the work fleet assigns to the machines [machine] names
 ```
@@ -1063,6 +1064,18 @@ and refuses to start when a summary names a block the block archive lacks. Befor
 an older build starts on the same workspace, `ducktape restore-archives`, run
 with the node stopped, writes the history and the blocks back into the archives
 that build reads.
+
+A node keeps its blobs under `blobs/` in the workspace. A blob of up to a
+block's 16 MiB is a zstd record in an append-only segment file (`blobs/seg/`),
+and a release appends a tombstone; a segment whose released bytes reach its
+live ones is copied forward and deleted on the next block. A larger blob is its
+own file (`blobs/big/`) of independent zstd frames of 1 MiB with an index at
+its end, so a range read decodes only the frames it covers. A whole read is
+checked against the blob's id, and a frame against its own checksum. A node
+started on a workspace an older build left reads its one file per blob where it
+lies and moves them into segments, at most 16 MiB of them a block. Before an
+older build starts on the same workspace, `ducktape blob unpack`, run with the
+node stopped, writes every blob back as one framed file.
 
 `/v1/heads` is a WebSocket of the chain's finalized heads, for a client that
 needs the chain's height and time without its blocks: one borsh `Head { height,

@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-store = ["dep:thiserror", "dep:rustix"]
+store = [
+    "dep:thiserror",
+    "dep:rustix",
+    "dep:zstd",
+    "dep:crc32fast",
+    "dep:tracing",
+]
 node = [
     "store",
     "dep:commonware-cryptography",
@@ -17,6 +23,7 @@ node = [
 [dependencies]
 abi = { workspace = true }
 borsh = { workspace = true }
+crc32fast = { workspace = true, optional = true }
 sha1-checked = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true, optional = true }
@@ -25,6 +32,7 @@ futures = { workspace = true, optional = true }
 halo = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tracing = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["fs"], optional = true }

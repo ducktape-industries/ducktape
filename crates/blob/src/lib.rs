@@ -13,7 +13,10 @@ use sha1_checked::CollisionResult;
 use sha2::Digest as _;
 
 #[cfg(feature = "store")]
-pub use store::{Blobs, Error, Layered, Result, Stage, file_entry, names, size_of, window};
+pub use store::{
+    Blobs, Error, FRAME_BYTES, Layered, Reader, Result, SEGMENT_BYTES, Stage, Unpacked, file_entry,
+    names, size_of, window,
+};
 
 pub fn is_kind(kind: &str) -> bool {
     !kind.is_empty() && !kind.contains([' ', '\0'])

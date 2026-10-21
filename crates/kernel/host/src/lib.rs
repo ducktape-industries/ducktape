@@ -49,6 +49,7 @@ const CODE_KIND: &str = "program";
 pub const MAX_DEPTH: u32 = 8;
 pub const ANCHOR_WINDOW: u64 = 256;
 pub const BLOCK_BYTES: usize = 16 << 20;
+const _: () = assert!(blob::SEGMENT_BYTES == BLOCK_BYTES as u64);
 pub const HOOK_FUEL: u64 = 2_000_000;
 const STREAK_LOG_EVERY: u64 = 64;
 
@@ -964,6 +965,7 @@ where
         };
         let applied = applied?;
         self.unlink(&applied.writes, block.time).await;
+        self.tidy();
         Ok(applied)
     }
 }
@@ -2234,6 +2236,17 @@ where
             self.blobs.remove(&id)?;
         }
         Ok(())
+    }
+
+    fn tidy(&self) {
+        if let Err(error) = self.blobs.tidy() {
+            tracing::warn!(
+                target: "ducktape::blobs",
+                event = "blob_tidy_failed",
+                %error,
+                "the blob store kept a worn segment or an old file this block; the block is applied"
+            );
+        }
     }
 
     async fn unlink(&self, writes: &Writes, time: u64) {

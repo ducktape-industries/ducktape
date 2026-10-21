@@ -4271,7 +4271,6 @@ fn a_released_blob_whose_file_will_not_go_leaves_its_block_applied() {
         .await
         .unwrap();
         let file = dir.path().join("blobs").join(blob::name_of(&id));
-        std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
         std::fs::write(file.join("inside"), b"no remove_file takes a directory").unwrap();
 

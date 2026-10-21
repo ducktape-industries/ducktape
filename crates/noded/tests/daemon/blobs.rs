@@ -10,34 +10,6 @@ fn put_part(body: &[u8]) -> Step {
     })
 }
 
-fn holds_file(dir: &Path, id: &BlobId) -> bool {
-    let name = blob::name_of(id);
-    let mut dirs = vec![dir.to_path_buf()];
-    while let Some(at) = dirs.pop() {
-        let entries = match std::fs::read_dir(&at) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => panic!("{}: {error}", at.display()),
-        };
-        for entry in entries {
-            let entry = entry.unwrap();
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => panic!("{}: {error}", entry.path().display()),
-            };
-            if kind.is_dir() {
-                dirs.push(entry.path());
-                continue;
-            }
-            if entry.file_name().to_str() == Some(name.as_str()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 struct Gated {
     source: Client,
     read: StdMutex<Option<oneshot::Sender<()>>>,
@@ -107,7 +79,9 @@ fn a_joined_node_fills_its_blobs_from_its_source_and_keeps_none_released_on_the_
         base
     });
     seats[3].workspace.write_source(&proxy).unwrap();
-    let joined = seats[3].start();
+    let (joined, store) = seats[3].start_handing(LoadConfig::default(), |running| {
+        running.daemon.blobs.store().clone()
+    });
 
     runtime.block_on(async {
         served.await.unwrap();
@@ -132,11 +106,10 @@ fn a_joined_node_fills_its_blobs_from_its_source_and_keeps_none_released_on_the_
         assert!(joined.client.blob(kept).await.unwrap().is_some());
         assert_eq!(joined.client.blob(released).await.unwrap(), None);
     });
-    let dir = seats[3].workspace.dir();
-    assert!(holds_file(dir, &kept), "the filled part is on disk");
+    assert!(store.has(&kept), "the filled part is in the blob store");
     assert!(
-        !holds_file(dir, &released),
-        "a part released while it was on its way leaves no file"
+        !store.has(&released),
+        "a part released while it was on its way leaves nothing in the blob store"
     );
 
     runtime.block_on(async {
@@ -236,7 +209,9 @@ fn a_block_whose_blob_no_member_gives_over_halo_applies_with_the_blob_from_the_j
         base
     });
     resident.workspace.write_source(&proxy).unwrap();
-    let follower = resident.start();
+    let (follower, store) = resident.start_handing(LoadConfig::default(), |running| {
+        running.daemon.blobs.store().clone()
+    });
     let page = root.path().join("page");
     std::fs::write(&page, b"only the source gives it").unwrap();
 
@@ -251,7 +226,7 @@ fn a_block_whose_blob_no_member_gives_over_halo_applies_with_the_blob_from_the_j
         client.submit(read, Preconfirm::Off).await.unwrap();
         landed(&mut changes, &[b"read"]).await;
         assert!(
-            holds_file(resident.workspace.dir(), &id),
+            store.has(&id),
             "the resident applied the block that reads the blob and holds its file"
         );
         let later = frame(&client, &alice, vec![set(b"later", b"1")]).await;
@@ -310,13 +285,12 @@ fn a_blob_a_block_puts_again_after_the_fill_found_it_unnamed_keeps_its_file() {
             rechecked,
             "the view the re-check read is the newest block's"
         );
-        let dir = seat.workspace.dir();
         assert!(
-            holds_file(dir, &again),
+            daemon.blobs.store().has(&again),
             "a blob a block put again after it was found unnamed keeps its file"
         );
         assert!(
-            !holds_file(dir, &gone),
+            !daemon.blobs.store().has(&gone),
             "a blob still unnamed leaves no file"
         );
         assert!(client.blob(again).await.unwrap().is_some());
@@ -339,7 +313,6 @@ fn a_blob_found_unnamed_keeps_its_file_while_the_newest_view_lags_the_tip() {
     let client = live.client.clone();
     let runtime = client_runtime();
     let gone = part(b"gone");
-    let dir = seat.workspace.dir().to_path_buf();
 
     runtime.block_on(async {
         reach(&client, 1).await;
@@ -354,7 +327,7 @@ fn a_blob_found_unnamed_keeps_its_file_while_the_newest_view_lags_the_tip() {
             move || {
                 daemon.tips.send_replace(viewed + 1);
                 let behind = daemon.unnamed_dropped(&held, &ids).unwrap();
-                let kept = holds_file(&dir, &gone);
+                let kept = daemon.blobs.store().has(&gone);
                 daemon.tips.send_replace(viewed);
                 let caught_up = daemon.unnamed_dropped(&held, &ids).unwrap();
                 held.release();
@@ -371,7 +344,7 @@ fn a_blob_found_unnamed_keeps_its_file_while_the_newest_view_lags_the_tip() {
         assert!(caught_up, "the re-check runs once the view is the tip's");
     });
     assert!(
-        !holds_file(seat.workspace.dir(), &gone),
+        !daemon.blobs.store().has(&gone),
         "a blob still unnamed leaves no file"
     );
     drop(daemon);
@@ -437,7 +410,7 @@ fn blocks_finalize_while_dropping_unnamed_blobs_waits_for_an_rpc_blocking_thread
     let rechecked = runtime.block_on(dropping).unwrap().unwrap();
     assert!(rechecked);
     assert!(
-        !holds_file(seat.workspace.dir(), &gone),
+        !daemon.blobs.store().has(&gone),
         "a blob still unnamed leaves no file"
     );
     drop(daemon);

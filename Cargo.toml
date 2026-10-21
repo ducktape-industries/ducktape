@@ -120,6 +120,7 @@ wasmparser = "0.251"
 zstd = "=0.13.3"
 zstd-safe = { version = "=7.2.4", default-features = false }
 zstd-sys = { version = "=2.0.16", default-features = false }
+crc32fast = "1.5"
 
 # internal — kernel crates (the platform). `keyscheme` is the key schemes a
 # frame's signer may use, the one verification path the node and the host

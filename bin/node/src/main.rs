@@ -552,6 +552,11 @@ enum BlobVerb {
     },
     #[command(about = "list the blob ids the state names and the node lacks")]
     Missing,
+    #[command(
+        about = "with the node stopped, write every blob in this workspace's store back as one \
+                 framed file per blob, the layout builds before segments read"
+    )]
+    Unpack,
 }
 
 #[derive(Subcommand)]
@@ -920,6 +925,15 @@ fn execute(cli: Cli) -> Result<(), String> {
         }
         Verb::Wallet(verb) if !matches!(verb, WalletVerb::Consent { .. }) => {
             wallet(&workspace, verb)
+        }
+        Verb::Blob(BlobVerb::Unpack) => {
+            let store = blob::Blobs::open(&workspace.dir().join(host::BLOBS_DIR)).sentence()?;
+            let unpacked = store.unpack().sentence()?;
+            println!(
+                "wrote back {} blobs; {} did not read and are left for the node to fetch again",
+                unpacked.written, unpacked.unread
+            );
+            Ok(())
         }
         verb => {
             let client = client(&workspace, cli.node)?;
@@ -1326,6 +1340,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Egress(EgressVerb::Serve { .. })
         | Verb::Run(_)
         | Verb::RestoreArchives
+        | Verb::Blob(BlobVerb::Unpack)
         | Verb::Roll { .. }
         | Verb::Wallet(_)
         | Verb::Machine(_) => unreachable!("handled before the client is built"),

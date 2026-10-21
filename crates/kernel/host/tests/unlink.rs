@@ -190,7 +190,6 @@ fn a_release_on_a_line_logs_no_blob_unlink_failed() {
             };
             host.apply(block(5, vec![Step::Op(put)])).await.unwrap();
             let file = dir.path().join("blobs").join(blob::name_of(&id));
-            std::fs::remove_file(&file).unwrap();
             std::fs::create_dir(&file).unwrap();
             std::fs::write(file.join("inside"), b"no remove_file takes a directory").unwrap();
             let release = HostOp::BlobRelease(id);
