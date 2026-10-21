@@ -701,6 +701,7 @@ async fn start<E: Context>(
         daemon.changes.opened(head);
     }
 
+    let source = workspace.source()?.map(Client::new);
     let pump = context.child("pump").spawn({
         let writing = Writing {
             daemon: daemon.clone(),
@@ -717,6 +718,7 @@ async fn start<E: Context>(
                 known,
                 daemon.network.epoch_length,
             ),
+            source: source.clone(),
         };
         move |_| write(writing, deliveries)
     });
@@ -738,8 +740,8 @@ async fn start<E: Context>(
         load.rpc_cpus,
         load.rpc_blocking_threads,
     )?;
-    if let (Some(source), Some(handle)) = (workspace.source()?, rpc.handle()) {
-        handle.spawn(crate::fill::fill(daemon.clone(), Client::new(source)));
+    if let (Some(source), Some(handle)) = (source, rpc.handle()) {
+        handle.spawn(crate::fill::fill(daemon.clone(), source));
     }
     if let Some(handle) = rpc.handle() {
         crate::egress::lane::spawn(daemon.clone(), handle, load.egress_lane_backlog)?;
@@ -992,6 +994,7 @@ struct Writing<E: Context> {
     tracker: Tracker,
     tally: Tally,
     snapshots: crate::snapshot::Snapshots,
+    source: Option<Client>,
 }
 
 struct Tally {
@@ -1305,7 +1308,18 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
             "the block reads a blob this node lacks; the node fetches it and applies again"
         );
         let daemon = writing.daemon.clone();
-        let fetched = daemon.blobs.fetch(id, halo::Class::Critical);
+        let source = writing.source.clone();
+        let fetched = async {
+            match &source {
+                Some(source) => {
+                    daemon
+                        .blobs
+                        .fetch_or(id, halo::Class::Critical, source)
+                        .await
+                }
+                None => daemon.blobs.fetch(id, halo::Class::Critical).await,
+            }
+        };
         futures::pin_mut!(fetched);
         loop {
             let command = tokio::select! {

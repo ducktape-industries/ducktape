@@ -12,7 +12,7 @@ use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
 use halo::{Class, Halo, Lane, Queues, Seat};
 
-use super::{Config, Kept, Service, Turn, answer, generation_path, seed};
+use super::{Config, Kept, Service, Source, Turn, answer, generation_path, seed};
 use crate::contract::LANE;
 use crate::{Blobs, frame, id_of};
 
@@ -353,5 +353,102 @@ fn a_keep_leaves_a_blob_another_pull_owns_to_that_pull() {
         assert!(!service.store().has(&id));
         assert_eq!(partials_left(&service), 0);
         drop(pulling);
+    });
+}
+
+struct Offered {
+    framed: Vec<u8>,
+    asked: std::sync::Mutex<Vec<abi::BlobId>>,
+}
+
+impl Source for Offered {
+    async fn blob(&self, id: abi::BlobId) -> Result<Option<Vec<u8>>, &'static str> {
+        self.asked.lock().unwrap().push(id);
+        Ok(Some(self.framed.clone()))
+    }
+}
+
+#[test]
+fn a_fetch_no_member_gives_takes_the_blob_from_its_source_after_one_round() {
+    runtime::Runner::default().start(|context| async move {
+        let (holder, holder_seat) = member(&context.child("holder"), 1);
+        let (asker, asker_seat) = member(&context.child("asker"), 2);
+        for halo in [&holder, &asker] {
+            halo.seat(vec![holder_seat.clone(), asker_seat.clone()]);
+        }
+        let held = tempfile::tempdir().unwrap();
+        let store = Blobs::open(held.path()).unwrap();
+        let framed = frame("part", b"sourced").unwrap();
+        let id = id_of(abi::HashKind::Sha256, &framed).unwrap();
+        let lane = holder
+            .plane()
+            .streams(LANE, Config::default().backlog.get())
+            .unwrap();
+        let fetched = tempfile::tempdir().unwrap();
+        let service = Service::start(
+            asker,
+            Blobs::open(fetched.path()).unwrap(),
+            Vec::new(),
+            Config::default(),
+        )
+        .unwrap();
+        let source = Offered {
+            framed: framed.clone(),
+            asked: std::sync::Mutex::default(),
+        };
+        let lacked = async {
+            let inbound = lane.accept().await.unwrap();
+            assert_eq!(inbound.class, Class::Critical);
+            assert_eq!(answer(&store, inbound).await, Err("lacks"));
+        };
+        tokio::join!(service.fetch_or(id, Class::Critical, &source), lacked);
+        assert_eq!(*source.asked.lock().unwrap(), vec![id]);
+        assert_eq!(service.store().framed(&id).unwrap(), Some(framed));
+        assert_eq!(partials_left(&service), 0);
+    });
+}
+
+#[test]
+fn bytes_a_source_offers_that_do_not_hash_to_the_id_are_refused_and_the_fetch_asks_again() {
+    runtime::Runner::default().start(|context| async move {
+        let (holder, holder_seat) = member(&context.child("holder"), 1);
+        let (asker, asker_seat) = member(&context.child("asker"), 2);
+        for halo in [&holder, &asker] {
+            halo.seat(vec![holder_seat.clone(), asker_seat.clone()]);
+        }
+        let held = tempfile::tempdir().unwrap();
+        let store = Blobs::open(held.path()).unwrap();
+        let framed = frame("part", b"named").unwrap();
+        let id = id_of(abi::HashKind::Sha256, &framed).unwrap();
+        let lane = holder
+            .plane()
+            .streams(LANE, Config::default().backlog.get())
+            .unwrap();
+        let fetched = tempfile::tempdir().unwrap();
+        let service = Service::start(
+            asker,
+            Blobs::open(fetched.path()).unwrap(),
+            Vec::new(),
+            Config::default(),
+        )
+        .unwrap();
+        let source = Offered {
+            framed: frame("part", b"offered").unwrap(),
+            asked: std::sync::Mutex::default(),
+        };
+        let given_on_the_second_round = async {
+            let inbound = lane.accept().await.unwrap();
+            assert_eq!(answer(&store, inbound).await, Err("lacks"));
+            store.write(&id, &framed).unwrap();
+            let inbound = lane.accept().await.unwrap();
+            answer(&store, inbound).await.unwrap();
+        };
+        tokio::join!(
+            service.fetch_or(id, Class::Critical, &source),
+            given_on_the_second_round
+        );
+        assert_eq!(*source.asked.lock().unwrap(), vec![id]);
+        assert_eq!(service.store().framed(&id).unwrap(), Some(framed));
+        assert_eq!(partials_left(&service), 0);
     });
 }

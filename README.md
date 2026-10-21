@@ -873,7 +873,12 @@ receipted a bundle, the blobs program marks it held, and stops listing who
 receipted. `--wait` follows the blobs program's confirmed writes until then.
 Consensus never waits on a blob: a program reads a blob that a program put
 or a held bundle names (`ctx.blob_get`), and a node that lacks one when a
-block reads it fetches it over halo before it applies the block. A read of
+block reads it fetches it over halo before it applies the block. When a round
+over every member brings nothing, a joined node asks the node it joined
+through (the workspace's `source`) for it on `/v1/blobs`, keeps it only if its
+bytes hash to its id, and logs `blob_from_source` as an error once for that
+blob, since halo is not reaching the members. Until one of them gives it, the
+node asks the members and then the source again after each pause. A read of
 such a blob (`/v1/blob/get`, `/v1/blobs`) asks every member once, or none
 when the node already asks in the background: if none gives it, `/v1/blob/get` refuses it as not found and `/v1/blobs` answers it as
 not served and goes on to the next id, while the node keeps asking in the

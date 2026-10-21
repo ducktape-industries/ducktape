@@ -1,12 +1,14 @@
 // After a join, run fetches the blobs the joined state names and this node lacks: one streamed
 // /v1/blobs from the node the join read its state from, on the rpc runtime, beside the blocks.
+// A block that needs a blob no member gives over halo asks that node for it too.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use abi::BlobId;
-use blob::service::{Kept, Service};
+use blob::service::{Kept, Service, Source};
+use statesync::{Failure, Fault as _};
 
 use crate::{Client, Context, Daemon, Error, Result, View, offload};
 
@@ -74,6 +76,22 @@ impl statesync::Install for Held<'_> {
             }
             Ok(Kept::Elsewhere) => Ok(()),
             Err(reason) => Err(statesync::Error::Install(id, reason.into())),
+        }
+    }
+}
+
+impl Source for Client {
+    async fn blob(&self, id: BlobId) -> std::result::Result<Option<Vec<u8>>, &'static str> {
+        let mut answers = self
+            .blobs(&[id])
+            .await
+            .map_err(|error| match error.failure() {
+                Failure::Transient(reason) => reason,
+                Failure::Definite => "source_refused",
+            })?;
+        match answers.as_mut_slice() {
+            [answer] => Ok(answer.take()),
+            _ => Err("source_misanswered"),
         }
     }
 }

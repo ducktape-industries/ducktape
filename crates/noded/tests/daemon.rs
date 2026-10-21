@@ -2256,6 +2256,93 @@ fn a_read_of_a_blob_no_member_gives_is_answered_and_a_stream_goes_on_past_it() {
     live.thread.join().unwrap();
 }
 
+struct Sourced {
+    source: Client,
+    asked: StdMutex<Vec<Vec<BlobId>>>,
+}
+
+async fn sourced_blobs(
+    axum::extract::State(sourced): axum::extract::State<Arc<Sourced>>,
+    body: axum::body::Bytes,
+) -> Vec<u8> {
+    let ids: Vec<BlobId> = abi::decode(&body).unwrap();
+    sourced.asked.lock().unwrap().push(ids.clone());
+    abi::encode(&sourced.source.blobs(&ids).await.unwrap())
+}
+
+#[test]
+fn a_block_whose_blob_no_member_gives_over_halo_applies_with_the_blob_from_the_join_source() {
+    let root = tempfile::tempdir().unwrap();
+    let validator = Seat::unreachable(root.path(), "n0");
+    let mut resident = Seat::unreachable(root.path(), "n1");
+    resident.address = None;
+    let founding = founding(root.path(), &[&validator], EPOCH_LENGTH);
+    validator.init(&founding);
+    let live = validator.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let runtime = client_runtime();
+
+    resident.join(&client);
+    let sourced = Arc::new(Sourced {
+        source: client.clone(),
+        asked: StdMutex::new(Vec::new()),
+    });
+    let proxy = runtime.block_on(async {
+        let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new()
+            .route(
+                noded::wire::route::BLOBS,
+                axum::routing::post(sourced_blobs),
+            )
+            .with_state(sourced.clone());
+        ::tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        base
+    });
+    resident.workspace.write_source(&proxy).unwrap();
+    let follower = resident.start();
+    let page = root.path().join("page");
+    std::fs::write(&page, b"only the source gives it").unwrap();
+
+    runtime.block_on(async {
+        let (id, bundle) = put_page(&client, &page, 1).await;
+        let status = client.status().await.unwrap();
+        let role = status.roles.get(role::BLOBS).unwrap().clone();
+        client.held(&role, bundle).await.unwrap();
+        let mut changes = follower.client.changes("probe").await.unwrap();
+        let steps = vec![Step::Op(HostOp::BlobGet(id)), set(b"read", b"1")];
+        let read = frame(&client, &alice, steps).await;
+        client.submit(read, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"read"]).await;
+        assert!(
+            holds_file(resident.workspace.dir(), &id),
+            "the resident applied the block that reads the blob and holds its file"
+        );
+        let later = frame(&client, &alice, vec![set(b"later", b"1")]).await;
+        client.submit(later, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"later"]).await;
+        let named = format!("{id:?}");
+        let lines: Vec<String> = follower
+            .client
+            .logs()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|line| line.contains("blob_from_source") && line.contains(&named))
+            .collect();
+        assert_eq!(lines.len(), 1, "one error for the gap: {lines:?}");
+        let asked = sourced.asked.lock().unwrap().clone();
+        assert!(asked.contains(&vec![id]), "{asked:?}");
+        validator.admin(&client, Admin::Shutdown).await;
+        resident.admin(&follower.client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+    follower.thread.join().unwrap();
+}
+
 #[test]
 fn a_blob_a_block_puts_again_after_the_fill_found_it_unnamed_keeps_its_file() {
     let root = tempfile::tempdir().unwrap();

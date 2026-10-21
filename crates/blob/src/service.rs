@@ -1,6 +1,6 @@
 // How a node gathers every bundle the blobs program records, serves blobs to members over
 // halo and receipts what it holds. noded starts it, tells it each applied block and asks it
-// for a blob it lacks.
+// for a blob it lacks, from the members and then from a source it names.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -154,6 +154,21 @@ pub enum Kept {
     Elsewhere,
 }
 
+pub trait Source {
+    fn blob(
+        &self,
+        id: BlobId,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, &'static str>> + Send;
+}
+
+enum Nowhere {}
+
+impl Source for Nowhere {
+    async fn blob(&self, _: BlobId) -> Result<Option<Vec<u8>>, &'static str> {
+        match *self {}
+    }
+}
+
 struct Inner {
     halo: Arc<Halo>,
     lane: Streams<Arc<Links>>,
@@ -255,7 +270,11 @@ impl Service {
     }
 
     pub async fn fetch(&self, id: BlobId, class: Class) {
-        self.inner.fetch(id, class).await
+        self.inner.fetch(id, class, None::<&Nowhere>).await
+    }
+
+    pub async fn fetch_or(&self, id: BlobId, class: Class, source: &impl Source) {
+        self.inner.fetch(id, class, Some(source)).await
     }
 
     pub async fn seek(&self, id: BlobId) -> bool {
@@ -263,7 +282,7 @@ impl Service {
     }
 
     pub async fn keep(&self, id: BlobId, framed: Vec<u8>) -> Result<Kept, &'static str> {
-        self.inner.keep(id, framed).await
+        self.inner.keep(id, framed, Class::Client).await
     }
 
     pub async fn stage(
@@ -607,7 +626,7 @@ impl Inner {
         Err(NO_MEMBER_GAVE_IT)
     }
 
-    async fn fetch(self: &Arc<Self>, id: BlobId, class: Class) {
+    async fn fetch(self: &Arc<Self>, id: BlobId, class: Class, source: Option<&impl Source>) {
         let declared = self.declared(&id);
         let mut rounds = 0u32;
         loop {
@@ -619,11 +638,34 @@ impl Inner {
             };
             rounds += 1;
             let worth_a_line = rounds == 1 || rounds.is_multiple_of(10);
+            if let Some(source) = source {
+                match self.sourced(id, class, source).await {
+                    Ok(Kept::Landed) => {
+                        tracing::error!(target: "ducktape::blob", event = "blob_from_source", ?id, attempts = rounds, reason = missed, "no member gave a blob this node needs over halo, so it took the blob from its source: halo does not reach the members");
+                        return;
+                    }
+                    Ok(Kept::Elsewhere) => {}
+                    Err(unsourced) if worth_a_line => {
+                        tracing::warn!(target: "ducktape::blob", event = "blob_unsourced", ?id, attempts = rounds, reason = unsourced, "the source did not give a blob this node needs either; it asks again");
+                    }
+                    Err(_) => {}
+                }
+            }
             if worth_a_line {
                 tracing::warn!(target: "ducktape::blob", event = "blob_unfetched", ?id, attempts = rounds, reason = missed, "no member gave a blob this node needs; it asks again");
             }
             tokio::time::sleep(pause(rounds)).await;
         }
+    }
+
+    async fn sourced(
+        self: &Arc<Self>,
+        id: BlobId,
+        class: Class,
+        source: &impl Source,
+    ) -> Result<Kept, &'static str> {
+        let framed = source.blob(id).await?.ok_or("unserved")?;
+        self.keep(id, framed, class).await
     }
 
     async fn seek(self: &Arc<Self>, id: BlobId) -> bool {
@@ -823,8 +865,13 @@ impl Inner {
         Ok(Pulled::Landed)
     }
 
-    async fn keep(self: &Arc<Self>, id: BlobId, framed: Vec<u8>) -> Result<Kept, &'static str> {
-        let Turn::Mine(mut owning) = self.turn(&id, Class::Client) else {
+    async fn keep(
+        self: &Arc<Self>,
+        id: BlobId,
+        framed: Vec<u8>,
+        class: Class,
+    ) -> Result<Kept, &'static str> {
+        let Turn::Mine(mut owning) = self.turn(&id, class) else {
             return Ok(Kept::Elsewhere);
         };
         if self.store.has(&id) {
