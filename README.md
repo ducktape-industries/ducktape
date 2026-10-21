@@ -190,9 +190,16 @@ asks the identity role `Runs` the same way. When the run ends still waiting,
 the host runs each called program with `Cause::Call { ticket }`.
 A called program that answers in that run, with its output or its refusal,
 resumes the waiting program in the same submission. One that cannot answer
-yet calls `defer` and keeps the ticket. The host then stores the waiting
-program's memory in `$parked`, only the 4 KiB pages that differ from a fresh
-instance, and tells the awaits role which tickets the frame waits on. Later
+yet calls `defer` and keeps the ticket. The host then keeps the waiting
+program's memory, only the 4 KiB pages that differ from a fresh instance,
+packed as one blob of kind `parked` that the holder `$parked` holds on the
+line `frame/<id>` (the row `blob/<id>` in `$parked` names it), and tells the
+awaits role which tickets the frame waits on. Only the blob's id sits in the
+commitment, so a commit never re-copies an image, and a joiner fetches the
+blob as it fetches every blob its state names. On a network whose layout
+height is still ahead (`LAYOUT_FROM`), a frame keeps the packed image in the
+row `image/<id>` instead; one parked that way still wakes, and moves to a
+blob the next time it parks. Later
 the called program sends `resolve`, a message to the awaits role. That role
 checks that the sender is the program the ticket called, and the host
 restores the memory and resumes the program inside the resolver's

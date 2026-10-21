@@ -25,13 +25,13 @@ pub const ON: &[u8] = b"on/";
 pub const INDEXED_AT: &[u8] = b"indexed_at";
 
 const UNANNOUNCED: Option<u64> = None;
-const ROWS_FROM: [(&[u8], Option<u64>); 2] =
+const LAYOUT_FROM: [(&[u8], Option<u64>); 2] =
     [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
 const HEIGHT_BYTES: usize = size_of::<u64>();
 const ID_BYTES: usize = size_of::<SubmissionId>();
 
-pub fn rows_from(network: &[u8]) -> u64 {
-    match ROWS_FROM.iter().find(|(named, _)| *named == network) {
+pub fn layout_from(network: &[u8]) -> u64 {
+    match LAYOUT_FROM.iter().find(|(named, _)| *named == network) {
         Some((_, Some(height))) => *height,
         Some((_, None)) => u64::MAX,
         None => 0,

@@ -300,14 +300,17 @@ fn a_deferred_call_parks_the_frame_until_the_called_program_answers() {
         output(&applied.submissions[0]);
         assert_eq!(frames(&host), 1);
         assert!(stored(&host, "oracle", &owed_key(0)).is_some());
-        let images = host
-            .view(Layer::Confirmed)
-            .scan(PARKED, &Scan::prefix(b"image/"))
-            .unwrap();
-        assert_eq!(
-            images.len(),
-            1,
-            "a parked frame is kept as one packed image"
+        let view = host.view(Layer::Confirmed);
+        let images = view.scan(PARKED, &Scan::prefix(b"image/")).unwrap();
+        assert!(images.is_empty(), "a parked frame keeps no image in a row");
+        let held = view.scan(PARKED, &Scan::prefix(b"blob/")).unwrap();
+        let [held] = held.as_slice() else {
+            panic!("a parked frame names one held image: {held:?}");
+        };
+        let image: BlobId = abi::decode(&held.value).unwrap();
+        assert!(
+            host.blob(&image, TIME).await.unwrap().is_some(),
+            "the image is a blob the node holds"
         );
         let row = ticket(&host, 0).await.expect("the call holds a ticket");
         assert_eq!(
@@ -327,13 +330,54 @@ fn a_deferred_call_parks_the_frame_until_the_called_program_answers() {
         assert_eq!(finished.height, 3);
         assert_eq!(frames(&host), 0);
         assert_eq!(ticket(&host, 1).await, None);
-        for prefix in [b"page/".as_slice(), b"image/".as_slice()] {
+        assert_eq!(host.blob(&image, TIME).await.unwrap(), None);
+        for prefix in [
+            b"page/".as_slice(),
+            b"image/".as_slice(),
+            b"blob/".as_slice(),
+        ] {
             let parked = host
                 .view(Layer::Confirmed)
                 .scan(PARKED, &Scan::prefix(prefix))
                 .unwrap();
             assert!(parked.is_empty());
         }
+    });
+}
+
+#[test]
+fn a_frame_parked_below_the_layout_height_keeps_its_image_row_until_it_parks_again() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), dir.path()).await;
+        host.set_layout_from(2);
+        let kept = |host: &Host<Ctx>| {
+            let view = host.view(Layer::Confirmed);
+            let count = |prefix: &[u8]| view.scan(PARKED, &Scan::prefix(prefix)).unwrap().len();
+            (count(b"image/"), count(b"blob/"))
+        };
+        let asks = vec![later(), later()];
+        apply(
+            &mut host,
+            1,
+            vec![submit("awaiter", plan("oracle", asks, false, false))],
+        )
+        .await;
+        assert_eq!(
+            kept(&host),
+            (1, 0),
+            "parked below the height: one image row"
+        );
+        apply(&mut host, 2, vec![answer(0, b"A")]).await;
+        assert_eq!(
+            kept(&host),
+            (0, 1),
+            "parked again from the height: one held blob"
+        );
+        let applied = apply(&mut host, 3, vec![answer(1, b"B")]).await;
+        let finished = finished_in(&applied.submissions[0], "awaiter");
+        assert_eq!(finished.answers, vec![Ok(b"A".to_vec()), Ok(b"B".to_vec())]);
+        assert_eq!(kept(&host), (0, 0));
     });
 }
 
@@ -609,6 +653,10 @@ fn a_joiner_that_syncs_while_a_frame_waits_resumes_it_as_the_network_does() {
             .scan(BLOBS, &Scan::prefix(b""))
             .unwrap()
         {
+            let index = entry.key.starts_with(b"line/") || entry.key.starts_with(b"on/");
+            if index {
+                continue;
+            }
             let id: BlobId = abi::decode(&entry.key).unwrap();
             framed.insert(id, upstream.blob(&id, TIME).await.unwrap().unwrap());
         }

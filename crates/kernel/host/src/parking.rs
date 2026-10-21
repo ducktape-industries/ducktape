@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use abi::role::awaits::{self, Answer, Call, FrameId, Ticket};
 use abi::{Cause, Env, Origin, Outcome, Principal, ProgramCall, Receipt, Refusal, reason, role};
-use blob::Stage;
+use blob::{Layered, Stage};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use runtime::{Image, OUT_OF_FUEL, Suspended};
@@ -312,7 +312,16 @@ where
             cause: env.cause.clone(),
             waiter: start.waiter,
         };
-        parked::save(self.committed.reads(), overlay, id, record, image)?;
+        let as_blob = env.height >= self.layout_from;
+        parked::save(
+            self.committed.reads(),
+            overlay,
+            stage,
+            id,
+            record,
+            image,
+            as_blob,
+        )?;
         parked::keep_client(self.committed.reads(), overlay, id, frame.client.as_deref())?;
         Ok(Run {
             receipt,
@@ -513,7 +522,11 @@ where
             answer,
         } = resumed;
         let view = self.committed.view(vec![&*overlay]);
-        let Some((record, image)) = parked::load(&view, id)? else {
+        let layered = Layered {
+            stage: &*stage,
+            blobs: self.blobs,
+        };
+        let Some((record, image)) = parked::load(&view, &layered, id)? else {
             let gone = Refusal::new(reason::NOT_FOUND, format!("frame {id} is not parked"));
             return Ok(rejected(self.role(role::AWAITS)?, gone));
         };

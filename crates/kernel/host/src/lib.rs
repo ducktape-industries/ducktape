@@ -206,7 +206,7 @@ where
     scheduler_streak: u64,
     roster_streak: u64,
     spent: Spent,
-    rows_from: u64,
+    layout_from: u64,
 }
 
 #[derive(Clone, Default)]
@@ -451,7 +451,7 @@ where
         }
         let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
-        let rows_from = namespace::rows_from(&genesis.network);
+        let layout_from = namespace::layout_from(&genesis.network);
         let mut host = Host {
             store,
             blobs,
@@ -462,7 +462,7 @@ where
             scheduler_streak: 0,
             roster_streak: 0,
             spent: Spent::default(),
-            rows_from,
+            layout_from,
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -564,7 +564,7 @@ where
             .get(NETWORK, namespace::ID)?
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
         let roles = roles_of(&store.view(Vec::new()))?;
-        let rows_from = namespace::rows_from(&network);
+        let layout_from = namespace::layout_from(&network);
         let mut host = Host {
             store,
             blobs,
@@ -575,7 +575,7 @@ where
             scheduler_streak: 0,
             roster_streak: 0,
             spent: Spent::default(),
-            rows_from,
+            layout_from,
         };
         host.sync_code()?;
         host.index()?;
@@ -640,7 +640,7 @@ where
             network: &self.network,
             roles: &self.roles,
             preconfirmed: None,
-            rows_from: self.rows_from,
+            layout_from: self.layout_from,
         }
     }
 
@@ -652,8 +652,8 @@ where
         self.loaded.meter_queries(fuel);
     }
 
-    pub fn set_rows_from(&mut self, height: u64) {
-        self.rows_from = height;
+    pub fn set_layout_from(&mut self, height: u64) {
+        self.layout_from = height;
     }
 
     pub fn snapshot(&self) -> Result<Snapshot<E>> {
@@ -664,7 +664,7 @@ where
             network: self.network.clone(),
             roles: self.roles.clone(),
             preconfirmed: Arc::default(),
-            rows_from: self.rows_from,
+            layout_from: self.layout_from,
             context: std::marker::PhantomData,
         })
     }
@@ -986,7 +986,7 @@ where
         if let Err(refusal) = fresh(&view, &submission, &id, height)? {
             return Ok(Submitted::Stale(rejected(&submission.target, refusal)));
         }
-        if height < self.rows_from {
+        if height < self.layout_from {
             let anchored = namespace::spent(submission.anchor.height, &id);
             overlay.set(SPENT, anchored, Vec::new());
         }
@@ -2181,7 +2181,7 @@ where
         records: Vec<hook::Record>,
     ) -> Result<Applied> {
         overlay.set(RECENT, namespace::height(tip.height), abi::encode(&tip.id));
-        if tip.height >= self.rows_from {
+        if tip.height >= self.layout_from {
             let row: Vec<u8> = overlay
                 .range(LOCAL, b"", None, false)
                 .flat_map(|(id, _)| id.iter().copied())
@@ -2283,7 +2283,7 @@ where
         let key = namespace::height(height);
         let (rows, ids) = {
             let view = self.store.view(vec![&*overlay]);
-            if height < self.rows_from {
+            if height < self.layout_from {
                 let anchored = view.scan(SPENT, &Scan::prefix(&key))?;
                 let ids: Vec<Vec<u8>> = anchored
                     .iter()

@@ -221,7 +221,7 @@ fn the_spent_root_below_the_switch_is_the_one_the_layout_by_anchor_gave() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), b"net").await;
-        host.set_rows_from(BLOCKS + 1);
+        host.set_layout_from(BLOCKS + 1);
         let outcomes = run(&mut host, 1..=BLOCKS).await;
         let expected = [
             (reason::ANCHOR, 14),
@@ -245,7 +245,7 @@ fn from_the_switch_each_block_is_one_row_and_the_rows_by_anchor_expire_as_before
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), b"net").await;
-        host.set_rows_from(SWITCH);
+        host.set_layout_from(SWITCH);
         run(&mut host, 1..=SWITCH + 1).await;
         let early = frame(SWITCH - 1, 0);
         assert_eq!(refused(&host, &early), reason::DUPLICATE);
@@ -264,7 +264,7 @@ fn an_index_at_another_height_is_rebuilt_and_one_at_the_storage_height_is_kept()
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context.child("found"), "net", dir.path(), b"net").await;
-        host.set_rows_from(SWITCH);
+        host.set_layout_from(SWITCH);
         run(&mut host, 1..=SWITCH + 100).await;
         let before = indexed(&host);
         drop(host);
@@ -273,7 +273,7 @@ fn an_index_at_another_height_is_rebuilt_and_one_at_the_storage_height_is_kept()
         let mut host = Host::open(context.child("rebuilt"), "net", dir.path())
             .await
             .unwrap();
-        host.set_rows_from(SWITCH);
+        host.set_layout_from(SWITCH);
         assert_eq!(indexed(&host), before);
         assert_indexed(&host);
         assert_eq!(refused(&host, &frame(SWITCH - 1, 0)), reason::DUPLICATE);
@@ -295,7 +295,7 @@ fn a_rebuild_cut_before_it_marks_its_height_finishes_at_the_next_open() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context.child("found"), "net", dir.path(), b"net").await;
-        host.set_rows_from(SWITCH);
+        host.set_layout_from(SWITCH);
         run(&mut host, 1..=SWITCH + 100).await;
         let before = indexed(&host);
         let root_before = root(&host);
@@ -307,7 +307,7 @@ fn a_rebuild_cut_before_it_marks_its_height_finishes_at_the_next_open() {
         let mut host = Host::open(context.child("resumed"), "net", dir.path())
             .await
             .unwrap();
-        host.set_rows_from(SWITCH);
+        host.set_layout_from(SWITCH);
         assert_eq!(indexed(&host), before);
         assert_indexed(&host);
         assert_eq!(root(&host), root_before);
@@ -377,7 +377,7 @@ fn a_program_sees_none_of_the_index() {
 }
 
 #[test]
-fn a_network_the_table_names_keeps_rows_by_anchor_until_announced_and_any_other_has_rows_from_genesis()
+fn a_network_the_table_names_keeps_rows_by_anchor_until_announced_and_any_other_has_layout_from_genesis()
  {
     deterministic::Runner::default().start(|context| async move {
         for (name, shape) in [("net", 8), ("duckpond", 40), ("sealpond", 40)] {
@@ -393,10 +393,10 @@ fn a_network_the_table_names_keeps_rows_by_anchor_until_announced_and_any_other_
 #[test]
 fn a_carried_frame_is_a_duplicate_until_its_anchor_leaves_the_window_in_either_layout() {
     deterministic::Runner::default().start(|context| async move {
-        for (name, rows_from) in [("anchored", u64::MAX), ("rows", 0)] {
+        for (name, layout_from) in [("anchored", u64::MAX), ("rows", 0)] {
             let dir = tempfile::tempdir().unwrap();
             let mut host = found(context.child(name), name, dir.path(), b"net").await;
-            host.set_rows_from(rows_from);
+            host.set_layout_from(layout_from);
             let carried = Submission {
                 signer: SIGNER.to_vec(),
                 anchor: Tip {
@@ -467,7 +467,7 @@ fn bench_spent_commit_forget_and_rebuild() {
         .ok()
         .and_then(|frames| frames.parse().ok())
         .unwrap_or(FLOOD);
-    for (layout, rows_from) in [("anchored", u64::MAX), ("rows", 0)] {
+    for (layout, layout_from) in [("anchored", u64::MAX), ("rows", 0)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_owned();
         let config = tokio::Config::new().with_storage_directory(path.join("runtime"));
@@ -476,7 +476,7 @@ fn bench_spent_commit_forget_and_rebuild() {
                 Host::found(context.child("found"), "net", &path, block_id(0), genesis(b"net"))
                     .await
                     .unwrap();
-            host.set_rows_from(rows_from);
+            host.set_layout_from(layout_from);
             let mut filling = Duration::ZERO;
             for height in 1..=ANCHOR_WINDOW {
                 host.apply(flood(height, frames)).await.unwrap();
