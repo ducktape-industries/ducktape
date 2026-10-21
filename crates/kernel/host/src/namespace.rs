@@ -23,6 +23,7 @@ pub const NEXT_ITEM: &[u8] = b"next_item";
 pub const LINES: &[u8] = b"line/";
 pub const ON: &[u8] = b"on/";
 pub const INDEXED_AT: &[u8] = b"indexed_at";
+pub const PLACES: &[u8] = b"place/";
 
 const UNANNOUNCED: Option<u64> = None;
 const LAYOUT_FROM: [(&[u8], Option<u64>); 2] =
@@ -36,6 +37,10 @@ pub fn layout_from(network: &[u8]) -> u64 {
         Some((_, None)) => u64::MAX,
         None => 0,
     }
+}
+
+pub fn place(program: &str) -> Vec<u8> {
+    [PLACES, program.as_bytes()].concat()
 }
 
 pub fn blob(id: &BlobId) -> Vec<u8> {

@@ -40,6 +40,7 @@ pub use reads::{ReadSet, Written};
 pub use runtime::{Limits, OUT_OF_FUEL};
 pub use snapshot::{Queried, Snapshot, Source};
 pub use state::LOCAL;
+pub use unit::Places;
 
 pub const STATE_DIR: &str = "state";
 pub const BLOBS_DIR: &str = "blobs";
@@ -173,6 +174,7 @@ pub struct Applied {
     pub records: Vec<hook::Record>,
     pub writes: Writes,
     pub root: Root,
+    pub places: Arc<Places>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -207,6 +209,7 @@ where
     hook_streaks: BTreeMap<ProgramId, u64>,
     scheduler_streak: u64,
     roster_streak: u64,
+    rename_streaks: BTreeMap<ProgramId, u64>,
     spent: Spent,
     layout_from: u64,
 }
@@ -465,6 +468,7 @@ where
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
+            rename_streaks: BTreeMap::new(),
             spent: Spent::default(),
             layout_from,
         };
@@ -580,6 +584,7 @@ where
             hook_streaks: BTreeMap::new(),
             scheduler_streak: 0,
             roster_streak: 0,
+            rename_streaks: BTreeMap::new(),
             spent: Spent::default(),
             layout_from,
         };
@@ -979,6 +984,10 @@ impl<'a, E> Source<'a, E>
 where
     E: Context + Spawner,
 {
+    pub fn place_of(&self, program: &str) -> Option<String> {
+        self.loaded.places().of(program).map(str::to_owned)
+    }
+
     async fn submit(
         &self,
         submission: Submission,
@@ -1914,12 +1923,38 @@ where
             }
         };
         self.roster_streak = 0;
-        let running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
+        let mut running = programs_of(&View::new(self.store.storage(), vec![&*overlay]))?;
         let mut receipts = Vec::new();
         let mut wanted = BTreeSet::new();
         let mut changed = Vec::new();
+        let asked = self.renames(height, time, overlay, stage).await?;
+        let mut held = BTreeSet::new();
+        let mut accepted = Vec::new();
+        for (from, to) in renaming(asked, &running, &entries) {
+            let receipt = self
+                .rename_account(&from, &to, height, time, overlay, stage)
+                .await?;
+            match &receipt.outcome {
+                Outcome::Applied { .. } => {
+                    self.rename_streaks.remove(&from);
+                    accepted.push((from, to));
+                }
+                Outcome::Rejected(refusal) => {
+                    self.log_rename(height, &from, &to, refusal);
+                    held.insert(from);
+                    held.insert(to);
+                }
+            }
+            receipts.push(receipt);
+        }
+        for (from, to) in accepted {
+            self.rename(&from, &to, &mut running, overlay);
+            changed.push(from);
+        }
         for entry in entries {
-            let admissible = valid_program_id(&entry.program) && !wanted.contains(&entry.program);
+            let admissible = valid_program_id(&entry.program)
+                && !wanted.contains(&entry.program)
+                && !held.contains(&entry.program);
             if !admissible {
                 continue;
             }
@@ -1963,8 +1998,12 @@ where
             }
         }
         for program in running.keys() {
-            if !wanted.contains(program) {
+            let dropped = !wanted.contains(program) && !held.contains(program);
+            if dropped {
                 overlay.delete(PROGRAMS, program.clone().into_bytes());
+                if self.loaded.placed(program) {
+                    overlay.delete(NETWORK, namespace::place(program));
+                }
                 self.loaded.unload(program);
                 changed.push(program.clone());
             }
@@ -2056,6 +2095,76 @@ where
         }
     }
 
+    async fn renames(
+        &self,
+        height: u64,
+        time: u64,
+        overlay: &Overlay,
+        stage: &Stage,
+    ) -> Result<Vec<(ProgramId, ProgramId)>> {
+        let reply = unit::query(
+            self.world(height, time),
+            vec![overlay],
+            stage,
+            &[],
+            Origin::System,
+            self.role(role::PROGRAMS)?.clone(),
+            abi::encode(&programs::Query::Renames(height)),
+            &mut self.loaded.limits().fuel,
+        )
+        .await?;
+        let decoded = reply.map(|bytes| abi::decode::<programs::Reply>(&bytes));
+        Ok(match decoded {
+            Ok(Ok(programs::Reply::Renames(renames))) => renames,
+            _ => Vec::new(),
+        })
+    }
+
+    fn rename(
+        &mut self,
+        from: &str,
+        to: &str,
+        running: &mut BTreeMap<ProgramId, BlobId>,
+        overlay: &mut Overlay,
+    ) {
+        let place = self.loaded.place(from).to_owned();
+        if let Some(code) = running.remove(from) {
+            overlay.delete(PROGRAMS, from.as_bytes().to_vec());
+            overlay.set(PROGRAMS, to.as_bytes().to_vec(), abi::encode(&code));
+            running.insert(to.to_owned(), code);
+        }
+        if self.loaded.placed(from) {
+            overlay.delete(NETWORK, namespace::place(from));
+        }
+        overlay.set(NETWORK, namespace::place(to), place.clone().into_bytes());
+        self.loaded.rename(from, to.to_owned(), place);
+    }
+
+    fn log_rename(&mut self, height: u64, from: &str, to: &str, refusal: &Refusal) {
+        let blocks = self.rename_streaks.entry(from.to_owned()).or_default();
+        *blocks += 1;
+        let due = *blocks == 1 || blocks.is_multiple_of(STREAK_LOG_EVERY);
+        if due {
+            tracing::warn!(
+                target: "ducktape::programs",
+                event = "rename_refused",
+                height,
+                from,
+                to,
+                blocks = *blocks,
+                reason = %refusal.reason,
+                sentence = %refusal.sentence,
+            );
+        }
+    }
+
+    fn place_for(&self, program: &str, height: u64) -> String {
+        match self.loaded.is_place(program) {
+            true => format!("{program}@{height}"),
+            false => program.to_owned(),
+        }
+    }
+
     async fn admit(
         &mut self,
         entry: &programs::Entry,
@@ -2068,7 +2177,12 @@ where
             Ok(module) => module,
             Err(refusal) => return Ok(rejected(&entry.program, refusal)),
         };
+        let place = self.place_for(&entry.program, height);
+        let placed = place != entry.program;
         self.loaded.admit(entry.program.clone(), entry.code, module);
+        if placed {
+            self.loaded.set_place(entry.program.clone(), place.clone());
+        }
         let env = Env {
             network: self.network.clone(),
             height,
@@ -2096,7 +2210,14 @@ where
                     entry.program.clone().into_bytes(),
                     abi::encode(&entry.code),
                 );
-                self.store.add_program(&entry.program).await?;
+                if placed {
+                    overlay.set(
+                        NETWORK,
+                        namespace::place(&entry.program),
+                        place.clone().into_bytes(),
+                    );
+                }
+                self.store.add_program(&place).await?;
             }
             Outcome::Rejected(_) => self.loaded.unload(&entry.program),
         }
@@ -2113,6 +2234,36 @@ where
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Receipt> {
+        let op = identity::Op::RegisterProgram {
+            program: program.to_owned(),
+        };
+        self.tell_identity(op, height, time, overlay, stage).await
+    }
+
+    async fn rename_account(
+        &self,
+        from: &str,
+        to: &str,
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<Receipt> {
+        let op = identity::Op::RenameProgram {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        };
+        self.tell_identity(op, height, time, overlay, stage).await
+    }
+
+    async fn tell_identity(
+        &self,
+        op: identity::Op,
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<Receipt> {
         let identity = self.role(role::IDENTITY)?;
         let env = Env {
             network: self.network.clone(),
@@ -2123,9 +2274,6 @@ where
             sender: Some(Principal::System),
             roles: self.roles.clone(),
             cause: Cause::Direct,
-        };
-        let op = identity::Op::RegisterProgram {
-            program: program.to_owned(),
         };
         self.source()
             .run(
@@ -2233,6 +2381,7 @@ where
             records,
             writes,
             root: self.root()?,
+            places: Arc::new(self.loaded.places().clone()),
         })
     }
 
@@ -2426,20 +2575,55 @@ pub(crate) fn rejected(program: &str, refusal: Refusal) -> Receipt {
 }
 
 fn programs_in(storage: &Reads) -> Result<Vec<ProgramId>> {
+    let places = places_of(&View::new(storage, Vec::new()))?;
     let mut programs: Vec<ProgramId> = RESERVED.map(str::to_owned).to_vec();
     for entry in storage.iter(PROGRAMS, b"", None, false)? {
         let (key, _) = entry?;
-        programs.push(program_id(key)?);
+        let program = program_id(key)?;
+        programs.push(places.place(&program).to_owned());
     }
     Ok(programs)
 }
 
 /// The programs the last committed block dropped from the roster.
 fn dropped_in(storage: &Reads) -> Result<Vec<ProgramId>> {
-    storage
+    let live: BTreeSet<ProgramId> = programs_in(storage)?.into_iter().collect();
+    let dropped: Vec<ProgramId> = storage
         .pending_deleted(PROGRAMS)?
         .into_iter()
         .map(program_id)
+        .collect::<Result<_>>()?;
+    Ok(dropped
+        .into_iter()
+        .filter(|program| !live.contains(program))
+        .collect())
+}
+
+fn places_of(view: &View<'_>) -> Result<Places> {
+    let rows = view.scan(NETWORK, &Scan::prefix(namespace::PLACES))?;
+    let mut places = BTreeMap::new();
+    for entry in rows {
+        let id = entry.key.get(namespace::PLACES.len()..).unwrap_or_default();
+        places.insert(program_id(id.to_vec())?, program_id(entry.value)?);
+    }
+    Ok(Places::new(places))
+}
+
+fn renaming(
+    asked: Vec<(ProgramId, ProgramId)>,
+    running: &BTreeMap<ProgramId, BlobId>,
+    entries: &[programs::Entry],
+) -> Vec<(ProgramId, ProgramId)> {
+    let listed = |program: &str| entries.iter().any(|entry| entry.program == program);
+    let mut froms = BTreeSet::new();
+    let mut tos = BTreeSet::new();
+    asked
+        .into_iter()
+        .filter(|(from, to)| {
+            let runs = running.contains_key(from) && !running.contains_key(to);
+            let moves = listed(to) && !listed(from) && valid_program_id(to);
+            runs && moves && froms.insert(from.clone()) && tos.insert(to.clone())
+        })
         .collect()
 }
 
@@ -2493,6 +2677,7 @@ pub(crate) fn sync_code(loaded: &mut Loaded, view: &View<'_>, blobs: &Blobs) -> 
         *loaded = Loaded::new(limits, loaded.query_fuel());
     }
     let wanted = programs_of(view)?;
+    loaded.set_places(places_of(view)?);
     loaded.sync(&wanted, blobs)
 }
 

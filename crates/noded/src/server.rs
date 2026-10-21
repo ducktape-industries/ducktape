@@ -206,10 +206,13 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::SUBMIT, post(submit::<E>))
         .route(route::BLOB_PUT, post(blob_put::<E>))
         .route(
-            &format!("{}/{{program}}", route::CHANGES),
+            &format!("{}/{{*program}}", route::CHANGES),
             get(changes::<E>),
         )
-        .route(&format!("{}/{{program}}", route::WATCH), get(watching::<E>))
+        .route(
+            &format!("{}/{{*program}}", route::WATCH),
+            get(watching::<E>),
+        )
         .route(route::HEADS, get(heads::<E>))
         .route(route::P2P, get(p2p::<E>))
         .route(live_wire::ROUTE, get(live_socket::<E>))
@@ -506,7 +509,16 @@ async fn get_value<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<
         Ok(reading) => reading,
         Err(error) => return failed(error),
     };
-    answered(offload(move || reading.source().view(get.layer).get(&get.program, &get.key)).await)
+    answered(
+        offload(move || {
+            let source = reading.source();
+            match source.place_of(&get.program) {
+                Some(place) => source.view(get.layer).get(&place, &get.key),
+                None => Ok(None),
+            }
+        })
+        .await,
+    )
 }
 
 async fn scan<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<abi::Entry>> {
@@ -520,10 +532,11 @@ async fn scan<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<abi::Ent
     };
     answered(
         offload(move || {
-            reading
-                .source()
-                .view(range.layer)
-                .scan(&range.program, &range.scan)
+            let source = reading.source();
+            match source.place_of(&range.program) {
+                Some(place) => source.view(range.layer).scan(&place, &range.scan),
+                None => Ok(Vec::new()),
+            }
         })
         .await,
     )

@@ -370,8 +370,8 @@ pub fn reserved(program: &str) -> bool {
 pub fn valid_program_id(program: &str) -> bool {
     let non_empty = !program.is_empty();
     let no_separator = !program.as_bytes().contains(&SEPARATOR);
-    let path_segment = !program.contains('/');
-    non_empty && no_separator && path_segment && !reserved(program)
+    let shaped = abi::program_id_shaped(program);
+    non_empty && no_separator && shaped && !reserved(program)
 }
 
 fn decode<T: borsh::BorshDeserialize>(bytes: &[u8]) -> Result<T> {

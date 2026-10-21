@@ -20,6 +20,19 @@ mod program {
         [b"#program/", program.as_bytes()].concat()
     }
 
+    fn rename(ctx: &mut Execute, from: &str, to: &str) -> Result<(), Refusal> {
+        let closed: Option<u64> = ctx.record([b"#closed/", from.as_bytes()].concat())?;
+        if closed.is_some_and(|number| number != 0) {
+            return Err(Refusal::new("closed", from));
+        }
+        let Some(number) = ctx.get(&program_key(from)) else {
+            return Err(Refusal::new(reason::NOT_FOUND, from));
+        };
+        ctx.delete(program_key(from));
+        ctx.set(program_key(to), number);
+        Ok(())
+    }
+
     struct Identity;
 
     impl Program for Identity {
@@ -33,7 +46,10 @@ mod program {
 
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
             if env.origin == Origin::System {
-                let identity::Op::RegisterProgram { program } = abi::decode(payload)?;
+                let program = match abi::decode(payload)? {
+                    identity::Op::RegisterProgram { program } => program,
+                    identity::Op::RenameProgram { from, to } => return rename(ctx, &from, &to),
+                };
                 let closed: Option<u64> = ctx.record([b"#closed/", program.as_bytes()].concat())?;
                 if closed.is_some_and(|number| number != 0) {
                     return Err(Refusal::new("closed", program));

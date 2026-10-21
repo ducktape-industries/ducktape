@@ -73,6 +73,7 @@ pub(crate) struct Wrote<E: Context> {
     pub(crate) head: Head,
     pub(crate) root: abi::Root,
     pub(crate) writes: Arc<Writes>,
+    pub(crate) places: Arc<host::Places>,
     pub(crate) view: Option<Arc<View<E>>>,
 }
 
@@ -310,7 +311,8 @@ fn word<E: Context>(follows: &Follows, wrote: &Wrote<E>) -> Option<Published> {
     match follows {
         Follows::Heads => Some(Published::Head(wrote.head)),
         Follows::Program { program, keys } => {
-            let writes = wrote.writes.programs.get(program)?;
+            let place = wrote.places.of(program)?;
+            let writes = wrote.writes.programs.get(place)?;
             Some(Published::Change(Change {
                 height: wrote.head.height,
                 root: wrote.root,
@@ -377,7 +379,8 @@ impl<E: Context> Merged<E> {
                 .or_default()
                 .extend(keys_written);
         }
-        let Some(slots) = wrote.writes.programs.get(program) else {
+        let place = wrote.places.of(program);
+        let Some(slots) = place.and_then(|place| wrote.writes.programs.get(place)) else {
             return;
         };
         for (key, slot) in slots {

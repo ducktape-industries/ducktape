@@ -298,6 +298,7 @@ impl<E: Context> Daemon<E> {
             head,
             root: applied.root,
             writes: Arc::new(applied.writes.clone()),
+            places: applied.places.clone(),
             view,
         });
     }

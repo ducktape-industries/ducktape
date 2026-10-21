@@ -11,6 +11,10 @@ pub enum Change {
         role: String,
         program: Option<ProgramId>,
     },
+    Rename {
+        from: ProgramId,
+        to: ProgramId,
+    },
 }
 
 pub const ROLES: &[u8] = b"roles";
@@ -23,13 +27,17 @@ pub fn hook_key(program: &str) -> Vec<u8> {
     format!("h/{program}").into_bytes()
 }
 
+pub fn rename_key(program: &str) -> Vec<u8> {
+    format!("r/{program}").into_bytes()
+}
+
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::role::access::{Need, Resource};
-    use abi::{Env, ProgramId, Refusal, Roles, Scan, role::programs};
+    use abi::{Env, ProgramId, Refusal, Roles, Scan, reason, role::programs};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{Change, ROLES, hook_key, key};
+    use crate::{Change, ROLES, hook_key, key, rename_key};
 
     fn refill(
         ctx: &mut Execute,
@@ -75,6 +83,16 @@ mod program {
                     let row = program.map(|program| (role.clone(), program));
                     refill(ctx, |named, _| named != role, row)?;
                 }
+                Change::Rename { from, to } => {
+                    let Some(bytes) = ctx.get(&key(&from)) else {
+                        return Err(Refusal::new(reason::NOT_FOUND, from));
+                    };
+                    let mut entry: programs::Entry = abi::decode(&bytes)?;
+                    entry.program = to.clone();
+                    ctx.delete(key(&from));
+                    ctx.set(key(&to), abi::encode(&entry));
+                    ctx.set(rename_key(&from), to.into_bytes());
+                }
             }
             Ok(())
         }
@@ -102,6 +120,15 @@ mod program {
                     ctx.scan(Scan::prefix(b"h/"))
                         .into_iter()
                         .map(|entry| String::from_utf8_lossy(&entry.key[2..]).into_owned())
+                        .collect(),
+                ),
+                programs::Query::Renames(_) => programs::Reply::Renames(
+                    ctx.scan(Scan::prefix(b"r/"))
+                        .into_iter()
+                        .map(|entry| {
+                            let from = String::from_utf8_lossy(&entry.key[2..]).into_owned();
+                            (from, String::from_utf8_lossy(&entry.value).into_owned())
+                        })
                         .collect(),
                 ),
             };

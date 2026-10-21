@@ -4,6 +4,16 @@ use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
 pub type ProgramId = String;
 
+pub fn program_id_shaped(id: &str) -> bool {
+    if id.contains('@') {
+        return false;
+    }
+    match id.split_once('/') {
+        None => !id.is_empty(),
+        Some((owner, name)) => !owner.is_empty() && !name.is_empty() && !name.contains('/'),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
 pub struct Root(pub [u8; 32]);
 
@@ -621,6 +631,7 @@ pub mod role {
             At(u64) = 0,
             Roles = 4,
             Hooks(u64) = 5,
+            Renames(u64) = 6,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -630,6 +641,7 @@ pub mod role {
             Programs(Vec<Entry>) = 0,
             Roles(Roles) = 4,
             Hooks(Vec<ProgramId>) = 5,
+            Renames(Vec<(ProgramId, ProgramId)>) = 6,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -851,14 +863,15 @@ pub mod role {
             pub kind: Kind,
         }
 
-        /// The one write the kernel makes: as it admits a program, with the
-        /// `System` origin, it gives the program its account. Registering a
-        /// program that has one changes nothing.
+        /// The writes the kernel makes, with the `System` origin: as it admits
+        /// a program it gives the program its account (one that has one keeps
+        /// it), and as it renames a program the account moves to the new id.
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
         #[borsh(use_discriminant = true)]
         #[repr(u8)]
         pub enum Op {
             RegisterProgram { program: ProgramId } = 0,
+            RenameProgram { from: ProgramId, to: ProgramId } = 12,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

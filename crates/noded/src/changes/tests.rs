@@ -33,6 +33,7 @@ fn wrote(height: u64, program: Option<&str>) -> Wrote<E> {
         head: head(height),
         root: abi::Root([0; 32]),
         writes: Arc::new(writes),
+        places: Arc::default(),
         view: None,
     }
 }
@@ -138,6 +139,31 @@ fn a_program_socket_hears_its_writes_and_a_ping_for_each_other_block() {
 }
 
 #[test]
+fn a_program_socket_hears_its_place_under_its_new_id_and_the_old_id_hears_pings() {
+    let (changes, mut fanout) = Changes::<E>::new(network(), 0);
+    let program = |program: &str| Follows::Program {
+        program: program.to_owned(),
+        keys: false,
+    };
+    let (mut renamed, mut old) = (
+        changes.subscribe(program("owner/chat")),
+        changes.subscribe(program("chat")),
+    );
+    step(&mut fanout);
+    let places = host::Places::new(BTreeMap::from([(
+        "owner/chat".to_owned(),
+        "chat".to_owned(),
+    )]));
+    changes.wrote(Wrote {
+        places: Arc::new(places),
+        ..wrote(1, Some("chat"))
+    });
+    step(&mut fanout);
+    assert_eq!(heard(&mut renamed), ["change 1 keys false"]);
+    assert_eq!(heard(&mut old), ["ping 1"]);
+}
+
+#[test]
 fn a_heads_socket_that_answers_no_ping_for_an_epoch_is_cut() {
     let (changes, mut fanout) = Changes::<E>::new(network(), 0);
     let mut silent = changes.subscribe(Follows::Heads);
@@ -182,6 +208,7 @@ fn wrote_keys(height: u64, writes: &[(&str, &str)]) -> Wrote<E> {
             programs,
             local: Default::default(),
         }),
+        places: Arc::default(),
         view: None,
     }
 }

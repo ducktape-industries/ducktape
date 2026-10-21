@@ -24,6 +24,34 @@ pub struct Loaded {
     queries: Runtime,
     query_fuel: Option<u64>,
     programs: BTreeMap<ProgramId, Slot>,
+    places: Places,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Places(BTreeMap<ProgramId, String>);
+
+impl Places {
+    pub fn new(places: BTreeMap<ProgramId, String>) -> Places {
+        Places(places)
+    }
+
+    pub fn of<'p>(&'p self, program: &'p str) -> Option<&'p str> {
+        match self.0.get(program) {
+            Some(place) => Some(place.as_str()),
+            None => match self.is_place(program) {
+                true => None,
+                false => Some(program),
+            },
+        }
+    }
+
+    pub(crate) fn place<'p>(&'p self, program: &'p str) -> &'p str {
+        self.0.get(program).map_or(program, String::as_str)
+    }
+
+    fn is_place(&self, program: &str) -> bool {
+        self.0.values().any(|place| place == program)
+    }
 }
 
 #[derive(Clone)]
@@ -51,6 +79,7 @@ impl Loaded {
             queries: Runtime::new(metered),
             query_fuel,
             programs: BTreeMap::new(),
+            places: Places::default(),
         }
     }
 
@@ -153,6 +182,39 @@ impl Loaded {
 
     pub fn unload(&mut self, program: &str) {
         self.programs.remove(program);
+        self.places.0.remove(program);
+    }
+
+    pub fn place<'p>(&'p self, program: &'p str) -> &'p str {
+        self.places.place(program)
+    }
+
+    pub fn places(&self) -> &Places {
+        &self.places
+    }
+
+    pub fn placed(&self, program: &str) -> bool {
+        self.places.0.contains_key(program)
+    }
+
+    pub fn is_place(&self, program: &str) -> bool {
+        self.places.is_place(program)
+    }
+
+    pub fn set_place(&mut self, program: ProgramId, place: String) {
+        self.places.0.insert(program, place);
+    }
+
+    pub fn set_places(&mut self, places: Places) {
+        self.places = places;
+    }
+
+    pub fn rename(&mut self, from: &str, to: ProgramId, place: String) {
+        if let Some(slot) = self.programs.remove(from) {
+            self.programs.insert(to.clone(), slot);
+        }
+        self.places.0.remove(from);
+        self.places.0.insert(to, place);
     }
 
     pub fn sync(&mut self, wanted: &BTreeMap<ProgramId, BlobId>, blobs: &Blobs) -> Result<()> {
@@ -321,22 +383,23 @@ where
     }
 
     fn got(&self, view: View<'r>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let me = self.env.me.as_str();
+        let me = self.world.loaded.place(&self.env.me);
         let value = view.get(me, key)?;
         self.world.note(|reads| reads.point(me, key));
         Ok(value)
     }
 
     fn scanned(&self, view: View<'r>, scan: &abi::Scan) -> Result<Vec<abi::Entry>> {
-        let me = self.env.me.as_str();
+        let me = self.world.loaded.place(&self.env.me);
         let entries = view.scan(me, scan)?;
         self.world.note(|reads| reads.scanned(me, scan, &entries));
         Ok(entries)
     }
 
     fn rooted(&self, program: &str) -> Result<Option<abi::Root>> {
-        let root = self.world.store.root(program)?;
-        self.world.note(|reads| reads.whole(program));
+        let place = self.world.loaded.place(program);
+        let root = self.world.store.root(place)?;
+        self.world.note(|reads| reads.whole(place));
         Ok(root)
     }
 
@@ -755,9 +818,13 @@ where
             return Ok(());
         }
         let view = View::new(self.world.store.reads(), vec![&*self.overlay]);
-        let existed = view.get(&self.env.me, key)?.is_some();
+        let existed = view
+            .get(self.world.loaded.place(&self.env.me), key)?
+            .is_some();
         let record = ownership::record_key(&self.env.me, key);
-        let recorded = view.get(guardian, &record)?.is_some();
+        let recorded = view
+            .get(self.world.loaded.place(guardian), &record)?
+            .is_some();
         let touch = Touch {
             existed,
             recorded,
@@ -765,6 +832,10 @@ where
         };
         self.touched.insert(key.to_vec(), touch);
         Ok(())
+    }
+
+    fn place(&self) -> String {
+        self.world.loaded.place(&self.env.me).to_owned()
     }
 
     fn put(&mut self, hash: abi::HashKind, kind: &str, body: &[u8]) -> Result<HostReply> {
@@ -787,7 +858,7 @@ where
             Ok(id) => id,
             Err(refusal) => return Ok(HostReply::Refused(refusal)),
         };
-        let me = self.env.me.clone();
+        let me = self.place();
         let key = namespace::line(&me, line);
         let before = namespace::latest(self.roster(&key)?.as_deref())?;
         if before == Some(id) {
@@ -807,7 +878,7 @@ where
     }
 
     fn release(&mut self, id: &BlobId) -> Result<HostReply> {
-        let me = self.env.me.clone();
+        let me = self.place();
         let prefix = namespace::on_lines(id, &me);
         let held_on = View::new(self.world.store.reads(), vec![&*self.overlay])
             .scan(namespace::BLOBS, &abi::Scan::prefix(&prefix))?;
@@ -824,7 +895,7 @@ where
     }
 
     fn release_lines(&mut self, prefix: &[u8]) -> Result<HostReply> {
-        let me = self.env.me.clone();
+        let me = self.place();
         let mine = namespace::lines(&me);
         let under = [mine.as_slice(), prefix].concat();
         let held = View::new(self.world.store.reads(), vec![&*self.overlay])
@@ -843,7 +914,7 @@ where
     fn change(&mut self, id: &BlobId, change: namespace::Change) -> Result<()> {
         let key = namespace::blob(id);
         let row = self.roster(&key)?;
-        match namespace::changed(row.as_deref(), &self.env.me, change)? {
+        match namespace::changed(row.as_deref(), &self.place(), change)? {
             namespace::Roster::Unchanged => {}
             namespace::Roster::Written(value) => self.overlay.set(namespace::BLOBS, key, value),
             namespace::Roster::Dropped => self.overlay.delete(namespace::BLOBS, key),
@@ -930,18 +1001,18 @@ where
     E: Context + Spawner,
 {
     async fn call(&mut self, op: HostOp, fuel: &mut Option<u64>) -> HostReply {
-        let me = self.env.me.clone();
+        let place = self.place();
         let result = match op {
             HostOp::Set { key, value } => self.note(&key, None).map(|()| {
-                self.overlay.set(&me, key, value);
+                self.overlay.set(&place, key, value);
                 HostReply::Done
             }),
             HostOp::SetOwned { key, value, kind } => self.note(&key, Some(kind)).map(|()| {
-                self.overlay.set(&me, key, value);
+                self.overlay.set(&place, key, value);
                 HostReply::Done
             }),
             HostOp::Delete(key) => self.note(&key, None).map(|()| {
-                self.overlay.delete(&me, key);
+                self.overlay.delete(&place, key);
                 HostReply::Done
             }),
             HostOp::BlobPutAlone { hash, kind, body } => self.put(hash, &kind, &body),
@@ -1091,7 +1162,12 @@ where
     };
     let effects = match &outcome {
         Outcome::Applied { .. } => Effects {
-            writes: written(world.store.reads(), overlay, program, touched)?,
+            writes: written(
+                world.store.reads(),
+                overlay,
+                world.loaded.place(program),
+                touched,
+            )?,
             ..effects
         },
         Outcome::Rejected(_) => {

@@ -1,5 +1,5 @@
 use abi::Origin;
-use abi::role::{access, egress, identity, ownership};
+use abi::role::{access, egress, identity, ownership, programs};
 
 fn tag(value: &impl borsh::BorshSerialize) -> u8 {
     abi::encode(value)[0]
@@ -94,4 +94,36 @@ fn the_egress_role_takes_unregister_after_expire_at_tag_8() {
         service: "s".into(),
     };
     assert_eq!(abi::encode(&unregister), [8, 1, 0, 0, 0, b's']);
+}
+
+#[test]
+fn renames_ask_at_tag_6_and_rename_program_takes_identity_tag_12() {
+    assert_eq!(
+        abi::encode(&programs::Query::Renames(1)),
+        [6, 1, 0, 0, 0, 0, 0, 0, 0]
+    );
+    let renames = programs::Reply::Renames(vec![("a".to_owned(), "o/a".to_owned())]);
+    assert_eq!(
+        abi::encode(&renames),
+        [
+            6, 1, 0, 0, 0, 1, 0, 0, 0, b'a', 3, 0, 0, 0, b'o', b'/', b'a'
+        ]
+    );
+    let rename = identity::Op::RenameProgram {
+        from: "a".into(),
+        to: "o/a".into(),
+    };
+    assert_eq!(
+        abi::encode(&rename),
+        [12, 1, 0, 0, 0, b'a', 3, 0, 0, 0, b'o', b'/', b'a']
+    );
+}
+
+#[test]
+fn a_program_id_is_one_segment_or_an_owner_and_a_name() {
+    assert!(abi::program_id_shaped("chat"));
+    assert!(abi::program_id_shaped("ducktape-industries/chat"));
+    for refused in ["", "/", "a/", "/a", "a/b/c", "a//b", "a@5", "o/a@5"] {
+        assert!(!abi::program_id_shaped(refused), "{refused}");
+    }
 }
