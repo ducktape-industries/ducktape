@@ -193,7 +193,8 @@ pub(crate) mod tests {
     use commonware_cryptography::{Signer as _, ed25519};
     use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
     use consensus::{Network, Timeouts};
-    use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROGRAMS, VALSET};
+    use fixture_probe::Step;
+    use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROBE, PROGRAMS, VALSET};
     use host::{Founding, Genesis, Limits};
     use node::{Mempool, Node};
     use tokio::sync::watch;
@@ -246,6 +247,7 @@ pub(crate) mod tests {
                 founding("awaits", AWAITS, Vec::new(), &[role::AWAITS]),
                 founding("halo", HALO, abi::encode(&lanes), &[role::HALO]),
                 founding("access", ACCESS, Vec::new(), &[role::ACCESS]),
+                founding("probe", PROBE, abi::encode(&Vec::<Step>::new()), &[]),
             ],
             views: Vec::new(),
             hooks: Vec::new(),

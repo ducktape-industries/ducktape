@@ -337,9 +337,12 @@ fn rebase_onto<E: Context>(based: &mut Based<E>, view: Arc<View<E>>) {
     publish(based);
 }
 
-fn caught_up<E: Context>(based: &mut Based<E>) {
+async fn caught_up<E: Context>(based: &mut Based<E>) {
     if let Some(newest) = based.published.views.load_full() {
         rebase_onto(based, newest);
+    }
+    while based.mempool.replaying() {
+        replay_one(based).await;
     }
 }
 
@@ -348,6 +351,11 @@ fn withdrawn() -> Flow {
 }
 
 async fn replayed<E: Context>(based: &mut Based<E>) -> Flow {
+    replay_one(based).await;
+    Flow::Pooling
+}
+
+async fn replay_one<E: Context>(based: &mut Based<E>) {
     if let Err(error) = based.mempool.replay().await {
         tracing::warn!(
             target: TARGET,
@@ -361,7 +369,6 @@ async fn replayed<E: Context>(based: &mut Based<E>) -> Flow {
     if replayed {
         publish(based);
     }
-    Flow::Pooling
 }
 
 async fn submitted<E: Context>(pool: &mut Pool<E>, submit: Submit) -> Flow {
@@ -382,7 +389,7 @@ async fn take<E: Context>(
     source: Source,
     preconfirm: Preconfirm,
 ) -> Answer {
-    caught_up(based);
+    caught_up(based).await;
     let taken = based
         .mempool
         .take(checked, source, preconfirm)
@@ -482,6 +489,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
+    use abi::{HostOp, HostReply, Outcome};
+    use fixture_probe::{Reply, Step};
     use node::{Frame, Preconfirm, Source, Taken};
 
     use super::{Answer, Based, Event, Offer, Receipt, Reposted, Wakes, next, take};
@@ -561,6 +570,62 @@ mod tests {
                 Err(error) => panic!("the pool failed: {error}"),
             }
             assert_eq!(based.base.tip(), anchor);
+        });
+    }
+
+    #[test]
+    fn a_frame_taken_in_the_gap_is_predicted_after_the_frames_the_pool_already_holds() {
+        founded(|founded| async move {
+            let published = Arc::new(Current::new());
+            published.views.store(Some(founded.first.clone()));
+            let mut based = Based {
+                mempool: founded.mempool,
+                base: founded.first.clone(),
+                published: published.clone(),
+                applied: Arc::new(AtomicU64::new(0)),
+            };
+            let script = |op: HostOp| abi::encode(&vec![Step::Op(op)]);
+            let set = HostOp::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            };
+            let held = Frame::sign(
+                &founded.key,
+                NETWORK,
+                founded.first.tip(),
+                None,
+                "probe",
+                script(set),
+            );
+            let checked = node::admissible(held.encode(), NETWORK).unwrap();
+            let first = take(&mut based, checked, Source::Client, Preconfirm::On).await;
+            assert!(matches!(first, Ok(Ok(Taken::New(Some(_))))));
+            published.views.store(Some(founded.next.clone()));
+            let get = HostOp::Get(b"k".to_vec());
+            let reading = Frame::sign(
+                &founded.key,
+                NETWORK,
+                founded.next.tip(),
+                None,
+                "probe",
+                script(get),
+            );
+            let checked = node::admissible(reading.encode(), NETWORK).unwrap();
+            let receipt = match take(&mut based, checked, Source::Client, Preconfirm::On).await {
+                Ok(Ok(Taken::New(Some(receipt)))) => receipt,
+                Ok(Ok(Taken::New(None))) => panic!("a preconfirmed frame came back unpredicted"),
+                Ok(Ok(Taken::Held(_))) => panic!("a frame never sent before was held already"),
+                Ok(Err(refusal)) => panic!("refused: {}: {}", refusal.reason, refusal.sentence),
+                Err(error) => panic!("the pool failed: {error}"),
+            };
+            let read_the_held_write =
+                abi::encode(&vec![Reply::Host(HostReply::Value(Some(b"v".to_vec())))]);
+            assert_eq!(
+                receipt.outcome,
+                Outcome::Applied {
+                    output: read_the_held_write
+                }
+            );
         });
     }
 }
