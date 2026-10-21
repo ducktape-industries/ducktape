@@ -3,8 +3,16 @@
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use super::{Blobs, Result};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tidied {
+    pub copied: u64,
+    pub moved: u64,
+    pub retired: u64,
+}
 
 pub struct Tidier {
     bell: Arc<Bell>,
@@ -40,12 +48,15 @@ impl Bell {
 }
 
 impl Tidier {
-    pub fn spawn(blobs: Blobs) -> Result<Tidier> {
+    pub fn spawn(
+        blobs: Blobs,
+        mut said: impl FnMut(&Tidied, Duration) + Send + 'static,
+    ) -> Result<Tidier> {
         let bell = Arc::new(Bell::default());
         let heard = bell.clone();
         let thread = std::thread::Builder::new()
             .name("blob-tidy".to_owned())
-            .spawn(move || tidying(&blobs, &heard))?;
+            .spawn(move || tidying(&blobs, &heard, &mut said))?;
         Ok(Tidier {
             bell,
             thread: Some(thread),
@@ -77,7 +88,7 @@ impl Drop for Tidier {
     }
 }
 
-fn tidying(blobs: &Blobs, bell: &Bell) {
+fn tidying(blobs: &Blobs, bell: &Bell, said: &mut impl FnMut(&Tidied, Duration)) {
     loop {
         let mut state = bell.state();
         while !state.due && !state.stop {
@@ -93,13 +104,17 @@ fn tidying(blobs: &Blobs, bell: &Bell) {
             state.rounds += 1;
         }
         drop(state);
-        if let Err(error) = blobs.tidy() {
-            tracing::warn!(
+        let began = Instant::now();
+        let round = blobs.tidy();
+        let spent = began.elapsed();
+        match &round {
+            Ok(tidied) => said(tidied, spent),
+            Err(error) => tracing::warn!(
                 target: "ducktape::blobs",
                 event = "blob_tidy_failed",
                 %error,
                 "the blob store kept a worn segment or an old file this round; the next wake tries again"
-            );
+            ),
         }
         #[cfg(test)]
         {
@@ -133,7 +148,12 @@ mod tests {
             fs::write(dir.path().join(name_of(&id)), &framed).unwrap();
         }
         let blobs = Blobs::sized(dir.path(), sizes).unwrap();
-        let tidier = Tidier::spawn(blobs.clone()).unwrap();
+        let rounds = Arc::new(Mutex::new(Vec::new()));
+        let heard = rounds.clone();
+        let tidier = Tidier::spawn(blobs.clone(), move |tidied, _| {
+            heard.lock().unwrap().push(*tidied);
+        })
+        .unwrap();
 
         let held = blobs.gate_copies();
         tidier.wake();
@@ -149,6 +169,11 @@ mod tests {
             tidier.settled(),
             2,
             "five wakes heard while a round ran ask for one more round"
+        );
+        assert_eq!(
+            rounds.lock().unwrap().len(),
+            2,
+            "each round says what it did"
         );
     }
 }

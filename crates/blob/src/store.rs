@@ -20,7 +20,7 @@ use abi::{Blob, BlobHeader, BlobId, HashKind, Refusal, reason};
 use crate::contract::Entry;
 use crate::{Collision, Hasher, frame, header, id_of, is_kind, name_of, parse, parse_header};
 use segments::{Copier, Hit, Log, Plan, Round};
-pub use tidier::Tidier;
+pub use tidier::{Tidied, Tidier};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -355,7 +355,7 @@ impl Blobs {
         self.sync()
     }
 
-    pub fn tidy(&self) -> Result<()> {
+    pub fn tidy(&self) -> Result<Tidied> {
         let whole = self.shared.sizes.segment;
         let mut copier = self
             .shared
@@ -381,6 +381,7 @@ impl Blobs {
         let mut round = Round::default();
         let mut framed = Vec::new();
         let copied = self.copy(plans, batch, &mut copier, &mut round, &mut framed);
+        let written = copier.appended();
         if let Err(error) = copied {
             self.log().strays(round, &mut copier);
             for (_, partial) in framed {
@@ -391,6 +392,7 @@ impl Blobs {
         self.copied();
         let mut log = self.log();
         let landed = log.land(round, &mut copier);
+        let retired = landed.drained.len() as u64;
         let mut unlink = landed.unlink;
         let mut dropped = Vec::new();
         let mut published = Vec::new();
@@ -418,10 +420,15 @@ impl Blobs {
         if !published.is_empty() {
             synced_dir(&self.dir().join(FRAMED))?;
         }
+        let moved = (unlink.len() + published.len()) as u64;
         for path in unlink.into_iter().chain(published) {
             gone(fs::remove_file(path))?;
         }
-        Ok(())
+        Ok(Tidied {
+            copied: written,
+            moved,
+            retired,
+        })
     }
 
     fn copy(
@@ -1897,7 +1904,9 @@ mod tests {
     fn held_mid_copy(blobs: &Blobs) -> (CopyGate, std::thread::JoinHandle<()>) {
         let gate = blobs.gate_copies();
         let tidier = blobs.clone();
-        let round = std::thread::spawn(move || tidier.tidy().unwrap());
+        let round = std::thread::spawn(move || {
+            tidier.tidy().unwrap();
+        });
         gate.reached();
         (gate, round)
     }
@@ -2032,6 +2041,49 @@ mod tests {
         reads_kept(&reopened, &ids, &[]);
         assert_eq!(reopened.get(&after).unwrap().unwrap().body, text(7));
         assert!(!reopened.has(&cut));
+    }
+
+    #[test]
+    fn a_tidy_round_says_what_it_copied_moved_and_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, ids) = worn(dir.path());
+        let bodies = [text(11), text(12), text(13)];
+        for body in &bodies {
+            let framed = frame("page", body).unwrap();
+            let id = id_of(HashKind::Sha256, &framed).unwrap();
+            fs::write(dir.path().join(name_of(&id)), &framed).unwrap();
+        }
+        let before = every_file(&dir.path().join(SEGMENTS));
+        let mut said = Tidied::default();
+        for _ in 0..ids.len() + bodies.len() {
+            let round = blobs.tidy().unwrap();
+            said.copied += round.copied;
+            said.moved += round.moved;
+            said.retired += round.retired;
+        }
+        let after = every_file(&dir.path().join(SEGMENTS));
+        let retired = before
+            .keys()
+            .filter(|path| !after.contains_key(*path))
+            .count() as u64;
+        let copied: u64 = after
+            .iter()
+            .filter(|(path, _)| fs::read(path).unwrap().starts_with(b"dtblobc1"))
+            .map(|(path, len)| len - before.get(path).copied().unwrap_or(8))
+            .sum();
+        assert!(
+            retired > 0 && copied > 0,
+            "the rounds retired {retired} and copied {copied}"
+        );
+        assert_eq!(
+            said,
+            Tidied {
+                copied,
+                moved: bodies.len() as u64,
+                retired
+            }
+        );
+        reads_kept(&blobs, &ids, &[]);
     }
 
     #[test]

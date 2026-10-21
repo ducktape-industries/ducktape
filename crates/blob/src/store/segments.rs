@@ -335,11 +335,16 @@ pub(super) struct Copier {
     touched: BTreeMap<u64, (Arc<fs::File>, u64)>,
     dirty: BTreeSet<u64>,
     made: bool,
+    appended: u64,
 }
 
 impl Copier {
     pub(super) fn active(&self) -> Option<u64> {
         self.active.as_ref().map(|(n, _, _)| *n)
+    }
+
+    pub(super) fn appended(&mut self) -> u64 {
+        std::mem::take(&mut self.appended)
     }
 
     pub(super) fn roll(&mut self) -> Result<()> {
@@ -381,6 +386,7 @@ impl Copier {
         write_at(file, bytes, at)?;
         *len += bytes.len() as u64;
         let (n, file, len) = (*n, file.clone(), *len);
+        self.appended += bytes.len() as u64;
         self.touched.insert(n, (file, len));
         self.dirty.insert(n);
         Ok((n, at))
@@ -507,6 +513,7 @@ impl Log {
             touched: BTreeMap::new(),
             dirty: BTreeSet::new(),
             made: false,
+            appended: 0,
         };
         Ok((log, copier))
     }

@@ -22,6 +22,7 @@ use abi::{
 use blob::{Blobs, Layered, Stage, Tidier};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::Spawner;
+use commonware_runtime::telemetry::metrics::{MetricsExt as _, histogram::Buckets};
 use commonware_storage::Context;
 use runtime::{Fault, Suspended};
 use sha2::{Digest as _, Sha256};
@@ -461,7 +462,7 @@ where
         }
         let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
-        let tidier = Tidier::spawn(blobs.clone())?;
+        let tidier = tidier_of(&store, &blobs)?;
         let namespace::Activations {
             layout_from,
             reads_from,
@@ -619,7 +620,7 @@ where
             layout_from,
             reads_from,
         } = namespace::Activations::of(&network, parent.as_deref());
-        let tidier = Tidier::spawn(blobs.clone())?;
+        let tidier = tidier_of(&store, &blobs)?;
         let mut host = Host {
             store,
             blobs,
@@ -2745,6 +2746,34 @@ fn fresh(
         )));
     }
     Ok(Ok(()))
+}
+
+fn tidier_of<E: Context + Spawner>(store: &Store<E>, blobs: &Blobs) -> Result<Tidier> {
+    let metrics = store.clock();
+    let copied = metrics.counter(
+        "blob_tidy_copied_bytes",
+        "bytes the blob store's tidy rounds wrote into its copy segments",
+    );
+    let moved = metrics.counter(
+        "blob_tidy_moved_files",
+        "files an older build kept one per blob that tidy rounds moved into the store",
+    );
+    let retired = metrics.counter(
+        "blob_tidy_retired_segments",
+        "segments the blob store's tidy rounds emptied and removed",
+    );
+    let rounds = metrics.histogram(
+        "blob_tidy_round_seconds",
+        "how long one blob store tidy round took, on its own thread",
+        Buckets::NETWORK,
+    );
+    let tidier = Tidier::spawn(blobs.clone(), move |tidied, spent| {
+        copied.inc_by(tidied.copied);
+        moved.inc_by(tidied.moved);
+        retired.inc_by(tidied.retired);
+        rounds.observe(spent.as_secs_f64());
+    })?;
+    Ok(tidier)
 }
 
 pub(crate) fn sync_code(loaded: &mut Loaded, view: &View<'_>, blobs: &Blobs) -> Result<()> {

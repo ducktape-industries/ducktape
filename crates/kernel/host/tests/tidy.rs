@@ -2,7 +2,7 @@
 //! free to apply, and the round finishes its move once let go.
 use abi::HashKind;
 use abi::role::{self, halo, validators};
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _, deterministic};
 use fixture_wasm::{ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROGRAMS, VALSET};
 use host::{BLOBS_DIR, Block, BlockId, Founding, Genesis, Host, Limits};
 
@@ -76,6 +76,48 @@ fn block(height: u64) -> Block {
         time: TIME + height,
         submissions: Vec::new(),
     }
+}
+
+#[test]
+fn the_node_counts_what_its_tidy_rounds_did() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = Host::found(
+            context.child("host"),
+            "net",
+            dir.path(),
+            block_id(0),
+            genesis(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let framed = blob::frame("part", b"a file an older build kept").unwrap();
+        let id = blob::id_of(HashKind::Sha256, &framed).unwrap();
+        std::fs::write(dir.path().join(BLOBS_DIR).join(blob::name_of(&id)), &framed).unwrap();
+
+        let first = host.blobs().gate_copies();
+        host.apply(block(1)).await.unwrap();
+        first.reached();
+        let next = host.blobs().gate_copies();
+        host.apply(block(2)).await.unwrap();
+        drop(first);
+        next.reached();
+        let encoded = context.encode();
+        let counted = |line: &str| encoded.lines().any(|seen| seen.ends_with(line));
+        assert!(
+            counted("blob_tidy_moved_files_total 1"),
+            "the round that moved the old file is counted: {encoded}"
+        );
+        assert!(counted("blob_tidy_round_seconds_count 1"), "{encoded}");
+        assert!(counted("blob_tidy_retired_segments_total 0"), "{encoded}");
+        let copied = encoded
+            .lines()
+            .find_map(|line| line.split_once("blob_tidy_copied_bytes_total "))
+            .and_then(|(_, count)| count.parse::<u64>().ok());
+        assert!(copied.is_some_and(|bytes| bytes > 0), "{encoded}");
+        drop(next);
+    });
 }
 
 #[test]
