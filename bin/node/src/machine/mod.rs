@@ -174,7 +174,8 @@ impl Talk {
     ) -> Result<Value, String> {
         let payload = interface.encode_op(&op).sentence()?;
         let status = self.client.status().await.sentence()?;
-        let frame = Frame::sign(
+        let frame = Frame::sign_as(
+            crate::CLIENT,
             &self.key,
             status.network.as_bytes(),
             status.anchor(),

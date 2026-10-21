@@ -71,6 +71,7 @@ fn genesis() -> Genesis {
         epoch_length: 1_000,
         time: TIME,
         member_cap: 16,
+        queries: abi::role::validators::QueryPolicy::Signed,
     }
 }
 
@@ -90,6 +91,7 @@ fn block(height: u64, steps: Vec<Step>) -> Block {
         salt: Some(height),
         target: "probe".to_owned(),
         payload: abi::encode(&steps),
+        client: None,
     };
     Block {
         height,

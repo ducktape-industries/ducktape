@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
-use abi::role::validators::{Grant, Invite, Motion, Op, Voted};
+use abi::role::validators::{Grant, Invite, Motion, Op, QueryPolicy, Voted};
 use abi::{BlobId, HashKind, Outcome, Scan, Scheme, role};
 use clap::{Args, Parser, Subcommand};
 use commonware_cryptography::{Signer as _, ed25519};
@@ -23,6 +23,8 @@ use noded::{
     Client, ConsensusSettings, CpuList, Endpoint, HaloConfig, LoadConfig, LoadSettings, Logs,
     NodeConfig, Settings, Upload, Workspace,
 };
+
+const CLIENT: &str = concat!("ducktape-cli/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Parser)]
 #[command(name = "ducktape", about = "a ducktape node and its client", version)]
@@ -108,6 +110,12 @@ enum Verb {
                  this workspace"
     )]
     RestoreArchives,
+    #[command(
+        about = "carry this stopped workspace across a contract bump that changes how blocks \
+                 decode: at the announced roll height it is stamped for this binary's contract; \
+                 behind it, it state-syncs from its source first; past it, it is refused"
+    )]
+    Roll { height: u64 },
     #[command(about = "print the node's height, tip, root, epoch and identity")]
     Status,
     #[command(
@@ -574,6 +582,8 @@ enum VoteVerb {
         about = "send the program bound to a role an op, a file or stdin: `programs` schedules or cancels a program change, `halo` opens, sets or closes a lane"
     )]
     Role { role: String, op: Option<PathBuf> },
+    #[command(about = "answer unsigned queries too (open), or signed ones only (signed)")]
+    Queries { policy: Queries },
 }
 
 #[cfg(unix)]
@@ -684,6 +694,21 @@ impl From<KeyScheme> for Scheme {
             KeyScheme::Ed25519 => Scheme::Ed25519,
             KeyScheme::Secp256k1 => Scheme::Secp256k1,
             KeyScheme::Secp256r1 => Scheme::Secp256r1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Queries {
+    Signed,
+    Open,
+}
+
+impl From<Queries> for QueryPolicy {
+    fn from(queries: Queries) -> QueryPolicy {
+        match queries {
+            Queries::Signed => QueryPolicy::Signed,
+            Queries::Open => QueryPolicy::Open,
         }
     }
 }
@@ -844,6 +869,33 @@ fn execute(cli: Cli) -> Result<(), String> {
         Verb::Bridge(BridgeVerb::Relay { socket, place }) => {
             client_runtime()?.block_on(bridge::relay(socket, place))
         }
+        Verb::Roll { height } => {
+            let log = workspace.settings().sentence()?.log;
+            let log = log.unwrap_or_else(|| noded::DEFAULT_LOG.to_string());
+            Runner::new(runtime_config(&workspace)).start(|context| async move {
+                Logs::install(&log)?;
+                let rolled = noded::roll(context, &workspace, height).await.sentence()?;
+                match rolled {
+                    noded::Rolled::Already(stamp) => println!(
+                        "already on contract {} from height {}",
+                        stamp.contract, stamp.from
+                    ),
+                    noded::Rolled::Stamped(stamp) => println!(
+                        "stamped contract {} from height {}",
+                        stamp.contract, stamp.from
+                    ),
+                    noded::Rolled::Synced { stamp, aside } => println!(
+                        "synced to height {} and stamped contract {} from height {}; the state \
+                         from before the roll is in {}",
+                        stamp.from - 1,
+                        stamp.contract,
+                        stamp.from,
+                        aside.display()
+                    ),
+                }
+                Ok(())
+            })
+        }
         Verb::Wallet(verb) if !matches!(verb, WalletVerb::Consent { .. }) => {
             wallet(&workspace, verb)
         }
@@ -936,7 +988,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         } => {
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
-            let frame = Frame::sign(
+            let frame = Frame::sign_as(
+                CLIENT,
                 &key,
                 status.network.as_bytes(),
                 status.anchor(),
@@ -986,7 +1039,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             let payload = interface.encode_op(&json::parse(&op, "op")?).sentence()?;
             let status = client.status().await.sentence()?;
             let key = signer(workspace)?;
-            let frame = Frame::sign(
+            let frame = Frame::sign_as(
+                CLIENT,
                 &key,
                 status.network.as_bytes(),
                 status.anchor(),
@@ -1155,7 +1209,8 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
                 false => signer(workspace)?,
             };
             let status = client.status().await.sentence()?;
-            let frame = Frame::sign(
+            let frame = Frame::sign_as(
+                CLIENT,
                 &key,
                 status.network.as_bytes(),
                 status.anchor(),
@@ -1233,6 +1288,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::Egress(EgressVerb::Serve { .. })
         | Verb::Run(_)
         | Verb::RestoreArchives
+        | Verb::Roll { .. }
         | Verb::Wallet(_)
         | Verb::Machine(_) => unreachable!("handled before the client is built"),
     }
@@ -1258,7 +1314,8 @@ async fn put_blobs(
     let put = blob::contract::Op::Put {
         blobs: entries.clone(),
     };
-    let frame = Frame::sign(
+    let frame = Frame::sign_as(
+        CLIENT,
         &key,
         status.network.as_bytes(),
         status.anchor(),
@@ -1337,7 +1394,8 @@ async fn membership(
         .roles
         .bound(role::VALIDATORS)
         .map_err(|refusal| refusal.sentence)?;
-    let frame = Frame::sign(
+    let frame = Frame::sign_as(
+        CLIENT,
         &identity,
         status.network.as_bytes(),
         status.anchor(),
@@ -1366,6 +1424,9 @@ fn motion(verb: VoteVerb) -> Result<Motion, String> {
         VoteVerb::Role { role, op } => Motion::Role {
             role,
             op: bytes(op)?,
+        },
+        VoteVerb::Queries { policy } => Motion::Queries {
+            policy: policy.into(),
         },
     })
 }
@@ -1405,7 +1466,8 @@ fn salt() -> u64 {
 async fn admin(workspace: &Workspace, client: &Client, verb: Admin) -> Result<Vec<u8>, String> {
     let status = client.status().await.sentence()?;
     let identity = workspace.identity().sentence()?;
-    Ok(Frame::sign(
+    Ok(Frame::sign_as(
+        CLIENT,
         &identity,
         status.network.as_bytes(),
         status.anchor(),

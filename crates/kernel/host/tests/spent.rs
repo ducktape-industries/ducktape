@@ -23,7 +23,7 @@ const TIME: u64 = 1_700_000_000;
 const BLOCKS: u64 = ANCHOR_WINDOW + 64;
 const SWITCH: u64 = 40;
 const ACROSS: u64 = SWITCH + ANCHOR_WINDOW + 40;
-const ROOT: &str = "87056b3c89767d2e50d71077bbe44c5d1f57b14ea2592a510cca735290b1f6b9";
+const ROOT: &str = "66ab458d1272326bc34aff98984cbf455abe49a7d8c195f48ba773889b552792";
 const FLOOD: u64 = 70_000;
 const STEADY: [u64; 4] = [
     ANCHOR_WINDOW + 1,
@@ -31,7 +31,7 @@ const STEADY: [u64; 4] = [
     ANCHOR_WINDOW + 3,
     ANCHOR_WINDOW + 4,
 ];
-const ROOT_ACROSS: &str = "2b4852e521ddab2d0276736f112b00090e519da392373e43b47bf72eb4fcb436";
+const ROOT_ACROSS: &str = "148748c1346666c81087f12b640003ba375da4e559cb6879bd794b5049c7c03f";
 
 type Ctx = deterministic::Context;
 
@@ -57,6 +57,7 @@ fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
 fn genesis(network: &[u8]) -> Genesis {
     Genesis {
         network: network.to_vec(),
+        queries: validators::QueryPolicy::Signed,
         validators: vec![validators::Member {
             key: b"v1".to_vec(),
             address: Some("v1:1".into()),
@@ -118,6 +119,7 @@ fn frame(height: u64, n: u64) -> Submission {
         salt: Some(height * 16 + n),
         target: "probe".to_owned(),
         payload: abi::encode(&steps),
+        client: None,
     }
 }
 
@@ -404,6 +406,7 @@ fn a_carried_frame_is_a_duplicate_until_its_anchor_leaves_the_window_in_either_l
                 salt: None,
                 target: "probe".to_owned(),
                 payload: abi::encode(&Vec::<Step>::new()),
+                client: None,
             };
             for height in 1..10 {
                 host.apply(carrying(height, Vec::new())).await.unwrap();
@@ -447,6 +450,7 @@ fn flood(height: u64, frames: u64) -> Block {
             salt: Some(n),
             target: "probe".to_owned(),
             payload: abi::encode(&Vec::<Step>::new()),
+            client: None,
         })
         .collect();
     carrying(height, submissions)

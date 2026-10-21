@@ -219,6 +219,13 @@ mod context {
             }
         }
 
+        fn client(&self) -> Option<String> {
+            match self.host(&HostOp::Client) {
+                HostReply::Client(client) => client,
+                other => protocol("client", other),
+            }
+        }
+
         fn root(&self, program: impl Into<ProgramId>) -> Option<Root> {
             match self.host(&HostOp::Root(program.into())) {
                 HostReply::Root(root) => root,

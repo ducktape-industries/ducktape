@@ -1,24 +1,28 @@
 // A validators program for the kernel's tests: it speaks the role's ops with no rules. Anyone
 // enrolls as a resident, and any one vote enacts a promotion, a demotion or a removal at once,
-// or sends the halo role its op.
+// sends the halo role its op, or sets which queries the network answers.
 
 pub const VALIDATORS: &[u8] = b"validators";
 pub const RESIDENTS: &[u8] = b"residents";
+pub const QUERIES: &[u8] = b"queries";
 
 #[cfg(target_arch = "wasm32")]
 mod program {
     use abi::role::access::{Need, Resource};
-    use abi::role::validators::{Genesis, Member, Motion, Op, Query as Ask, Reply, Voted};
+    use abi::role::validators::{
+        Genesis, Member, Motion, Op, Query as Ask, QueryPolicy, Reply, Voted,
+    };
     use abi::{Env, Origin, Refusal, reason};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{RESIDENTS, VALIDATORS};
+    use crate::{QUERIES, RESIDENTS, VALIDATORS};
 
     struct Valset;
 
     struct Roster {
         validators: Vec<Member>,
         residents: Vec<Member>,
+        queries: QueryPolicy,
     }
 
     impl Roster {
@@ -30,12 +34,14 @@ mod program {
             Ok(Roster {
                 validators: list(VALIDATORS)?,
                 residents: list(RESIDENTS)?,
+                queries: policy(ctx)?,
             })
         }
 
         fn write(&self, ctx: &mut Execute) {
             ctx.set(VALIDATORS, abi::encode(&self.validators));
             ctx.set(RESIDENTS, abi::encode(&self.residents));
+            ctx.set(QUERIES, abi::encode(&self.queries));
         }
 
         fn take(&mut self, key: &[u8]) -> Option<Member> {
@@ -77,6 +83,7 @@ mod program {
                     self.take(&key).ok_or_else(not_a_member)?;
                 }
                 Motion::Role { role, op } => return Ok(Some(Forwarded { role, op })),
+                Motion::Queries { policy } => self.queries = policy,
                 Motion::Door { .. } => {
                     return Err(Refusal::new(
                         reason::UNSUPPORTED,
@@ -86,6 +93,16 @@ mod program {
             }
             Ok(None)
         }
+    }
+
+    fn policy(ctx: &impl Reads) -> Result<QueryPolicy, Refusal> {
+        let held = ctx.get(QUERIES).ok_or_else(|| {
+            Refusal::new(
+                reason::NOT_FOUND,
+                "the fixture valset holds no query policy",
+            )
+        })?;
+        abi::decode(&held)
     }
 
     struct Forwarded {
@@ -101,6 +118,7 @@ mod program {
         fn init(ctx: &mut Execute, _env: &Env, params: &[u8]) -> Result<(), Refusal> {
             let genesis: Genesis = abi::decode(params)?;
             ctx.set(VALIDATORS, abi::encode(&genesis.validators));
+            ctx.set(QUERIES, abi::encode(&genesis.queries));
             Ok(())
         }
 
@@ -156,6 +174,7 @@ mod program {
                         .collect(),
                 ),
                 Ask::Members => Reply::Members([roster.validators, roster.residents].concat()),
+                Ask::QueryPolicy => Reply::QueryPolicy(roster.queries),
             };
             ctx.respond(abi::encode(&reply));
             Ok(())

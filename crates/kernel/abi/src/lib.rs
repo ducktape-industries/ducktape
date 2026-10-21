@@ -94,6 +94,12 @@ pub enum Origin {
     System,
 }
 
+impl Origin {
+    pub fn unsigned() -> Origin {
+        Origin::External(Vec::new())
+    }
+}
+
 /// Who a frame acts as, resolved by the host once per frame through the
 /// identity role: an account (the one a signer's key holds, or the account
 /// of the program that sent a message), or the chain itself.
@@ -449,6 +455,7 @@ pub enum HostOp {
     BlobReleaseLines {
         prefix: Vec<u8>,
     },
+    Client,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,7 +520,8 @@ impl HostOp {
             | HostOp::Resource { .. }
             | HostOp::SetOwned { .. }
             | HostOp::BlobRelease(_)
-            | HostOp::BlobReleaseLines { .. } => None,
+            | HostOp::BlobReleaseLines { .. }
+            | HostOp::Client => None,
         }
     }
 }
@@ -532,6 +540,7 @@ pub enum HostReply {
     Crypto(CryptoReply),
     Refused(Refusal),
     Ticket(role::awaits::Ticket),
+    Client(Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -643,16 +652,30 @@ pub mod role {
             pub halo: String,
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-        pub enum Query {
-            Validators,
-            Members,
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        pub enum QueryPolicy {
+            Signed,
+            Open,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum Query {
+            Validators = 0,
+            Members = 1,
+            QueryPolicy = 6,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
         pub enum Reply {
-            Validators(Vec<Vec<u8>>),
-            Members(Vec<Member>),
+            Validators(Vec<Vec<u8>>) = 0,
+            Members(Vec<Member>) = 1,
+            QueryPolicy(QueryPolicy) = 6,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -661,6 +684,7 @@ pub mod role {
             /// How many members (validators and residents) the network ever holds
             /// at once: 1..=MAX_MEMBERS, fixed at founding.
             pub member_cap: u32,
+            pub queries: QueryPolicy,
         }
 
         pub const INVITE_NAMESPACE: &[u8] = b"ducktape:invite";
@@ -698,6 +722,9 @@ pub mod role {
             Role {
                 role: String,
                 op: Vec<u8>,
+            },
+            Queries {
+                policy: QueryPolicy,
             },
         }
 

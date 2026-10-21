@@ -85,6 +85,7 @@ fn genesis(probed: Vec<u8>) -> Genesis {
         epoch_length: 64,
         time: TIME,
         member_cap: 16,
+        queries: abi::role::validators::QueryPolicy::Signed,
     }
 }
 
@@ -119,6 +120,7 @@ fn signed(signer: &[u8], salt: u64, target: &str, payload: Vec<u8>) -> Submissio
         salt: Some(salt),
         target: target.to_owned(),
         payload,
+        client: None,
     }
 }
 

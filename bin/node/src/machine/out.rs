@@ -175,7 +175,8 @@ async fn put(
         .bound(role::BLOBS)
         .map_err(|refusal| refusal.sentence)?;
     let put = blob::contract::Op::Put { blobs: entries };
-    let frame = Frame::sign(
+    let frame = Frame::sign_as(
+        crate::CLIENT,
         &talk.key,
         status.network.as_bytes(),
         status.anchor(),

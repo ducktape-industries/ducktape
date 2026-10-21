@@ -78,6 +78,7 @@ fn genesis(bound: bool) -> Genesis {
         epoch_length: 1_000,
         time: TIME,
         member_cap: 16,
+        queries: abi::role::validators::QueryPolicy::Signed,
     }
 }
 
@@ -104,6 +105,7 @@ fn submit(target: &str, payload: Vec<u8>) -> Submission {
         salt: None,
         target: target.to_owned(),
         payload,
+        client: None,
     }
 }
 

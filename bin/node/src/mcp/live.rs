@@ -48,7 +48,8 @@ impl Live<'_> {
     }
 
     fn signed(&self, status: &Status, program: &str, payload: Vec<u8>) -> Frame {
-        Frame::sign(
+        Frame::sign_as(
+            crate::CLIENT,
             &self.key,
             status.network.as_bytes(),
             status.anchor(),

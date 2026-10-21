@@ -165,6 +165,7 @@ fn genesis(validators: Vec<validators::Member>) -> Genesis {
         epoch_length: EPOCH_LENGTH,
         time: TIME,
         member_cap: 16,
+        queries: abi::role::validators::QueryPolicy::Signed,
     }
 }
 
@@ -657,6 +658,7 @@ fn a_second_proof_of_one_body_is_the_same_frame() {
             salt: None,
             target: "probe".into(),
             payload: script(vec![set(b"k", b"v")]),
+            client: None,
         };
         let proven = |rp: &str| {
             let proof =
@@ -915,6 +917,75 @@ fn a_frame_is_refused_when_it_names_another_network_lies_about_its_signer_or_out
 }
 
 #[test]
+fn a_frame_signs_the_client_it_names_and_its_submission_carries_it() {
+    let signer = key(7);
+    let named = Frame::sign_as(
+        "ducktape-cli/1",
+        &signer,
+        NETWORK,
+        origin(),
+        None,
+        "probe",
+        vec![1],
+    );
+    let submission = node::verify(&named.encode(), NETWORK).unwrap();
+    assert_eq!(submission.client.as_deref(), Some("ducktape-cli/1"));
+    let unnamed = Frame::sign(&signer, NETWORK, origin(), None, "probe", vec![1]);
+    assert_eq!(
+        node::verify(&unnamed.encode(), NETWORK).unwrap().client,
+        None
+    );
+    assert_ne!(submission.id(), unnamed.body.submission().id());
+    let mut renamed = named.clone();
+    renamed.body.client = Some("ducktape-app/1".into());
+    let refusal = node::verify(&renamed.encode(), NETWORK).unwrap_err();
+    assert_eq!(refusal.reason, reason::INVALID_INPUT);
+    let query = Frame::sign_query_as(
+        "ducktape-cli/1",
+        &signer,
+        NETWORK,
+        origin(),
+        "probe",
+        vec![1],
+    );
+    let asked = node::verify_query(&query.encode(), NETWORK).unwrap();
+    assert_eq!(asked.client.as_deref(), Some("ducktape-cli/1"));
+}
+
+#[test]
+fn a_query_frame_is_refused_as_an_op_and_an_op_frame_as_a_query() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut node, _) = found(context, dir.path()).await;
+        let signer = key(7);
+
+        let query = Frame::sign_query(&signer, NETWORK, origin(), "probe", script(Vec::new()));
+        let query = query.encode();
+        assert!(node::verify_query(&query, NETWORK).is_ok());
+        let refusal = node
+            .submit(query, Source::Client, Preconfirm::On)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.reason, reason::INVALID_INPUT);
+        assert_eq!(node.pending(), 0);
+
+        let op = Frame::sign(
+            &signer,
+            NETWORK,
+            origin(),
+            None,
+            "probe",
+            script(Vec::new()),
+        );
+        let op = op.encode();
+        assert!(node::verify(&op, NETWORK).is_ok());
+        let refusal = node::verify_query(&op, NETWORK).unwrap_err();
+        assert_eq!(refusal.reason, reason::INVALID_INPUT);
+    });
+}
+
+#[test]
 fn a_block_applies_only_the_frames_that_verify() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -1148,6 +1219,7 @@ fn frames_verify_under_every_key_scheme() {
         salt: None,
         target: "probe".into(),
         payload: payload.clone(),
+        client: None,
     };
     let proof = keyscheme::testkit::eth_proof(&wallet, NAMESPACE, &body.preimage());
     let submission = Frame {
@@ -1168,6 +1240,7 @@ fn frames_verify_under_every_key_scheme() {
         salt: None,
         target: "probe".into(),
         payload: payload.clone(),
+        client: None,
     };
     let proof = keyscheme::testkit::passkey_proof(
         &passkey,

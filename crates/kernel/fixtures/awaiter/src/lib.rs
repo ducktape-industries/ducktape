@@ -1,6 +1,6 @@
 //! A program whose execute awaits: it calls `target` with each ask, as itself or as an account it
 //! runs, one after another or all together, keeps each answer, and outputs them with the height it
-//! finished at and the heap it kept.
+//! finished at, the client it read then and the heap it kept.
 use abi::role::awaits::Answer;
 use abi::role::identity::AccountNumber;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -23,6 +23,7 @@ pub struct Finished {
     pub height: u64,
     pub kept: u32,
     pub sum: u8,
+    pub client: Option<String>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -35,8 +36,8 @@ mod program {
     use abi::role::access::{Need, Resource};
     use abi::role::awaits::Answer;
     use abi::{ProgramReply, Refusal, reason};
-    use program::Query;
     use program::awaiting::{AwaitingProgram, Call, Ctx};
+    use program::{Query, Reads as _};
 
     use crate::{ANSWERS, Finished, Plan};
 
@@ -101,6 +102,7 @@ mod program {
             height: ctx.env().height,
             kept: kept.len() as u32,
             sum: kept.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+            client: ctx.client(),
         };
         ctx.output(abi::encode(&finished));
         Ok(())

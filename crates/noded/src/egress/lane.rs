@@ -331,11 +331,10 @@ pub struct Seating {
 
 pub async fn seating(client: &Client, key: &PrivateKey, status: &Status) -> Result<Seating> {
     let ask = |program: &ProgramId, query: Vec<u8>| {
-        Frame::sign(
+        Frame::sign_query(
             key,
             status.network.as_bytes(),
             status.anchor(),
-            None,
             program,
             query,
         )

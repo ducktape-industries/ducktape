@@ -40,6 +40,7 @@ impl Host for Bench {
                 self.output = Some(bytes);
                 HostReply::Done
             }
+            HostOp::Client => HostReply::Client(None),
             other => HostReply::Refused(Refusal::new(
                 reason::UNSUPPORTED,
                 format!("the bench does not serve {other:?}"),
@@ -160,6 +161,7 @@ async fn a_frozen_frame_resumes_on_a_fresh_runtime_at_each_await() {
             height: 14,
             kept: 1000,
             sum,
+            client: None,
         }
     );
 }

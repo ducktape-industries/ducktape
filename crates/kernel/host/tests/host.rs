@@ -126,6 +126,7 @@ fn genesis(programs: Vec<Founding>) -> Genesis {
         epoch_length: EPOCH_LENGTH,
         time: TIME,
         member_cap: 16,
+        queries: abi::role::validators::QueryPolicy::Signed,
     }
 }
 
@@ -181,6 +182,7 @@ fn submit(target: &str, payload: Vec<u8>) -> Submission {
         salt: None,
         target: target.to_owned(),
         payload,
+        client: None,
     }
 }
 
@@ -3566,6 +3568,39 @@ fn founding_refuses_a_hook_it_does_not_found() {
         assert!(
             matches!(&refused, Some(Error::Unhooked(program)) if program == "ghost"),
             "{refused:?}"
+        );
+    });
+}
+
+#[test]
+fn an_op_reads_the_client_its_frame_names_and_a_query_reads_none() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let founded = genesis(vec![founding("probe", PROBE, script(Vec::new()))]);
+        let mut host = found(context, "net", dir.path(), founded).await;
+        let asked = || script(vec![op(HostOp::Client)]);
+        let named = Submission {
+            client: Some("ducktape-cli/1".into()),
+            ..submit("probe", asked())
+        };
+        let unnamed = Submission {
+            salt: Some(1),
+            ..submit("probe", asked())
+        };
+        let applied = host.apply(block(1, vec![named, unnamed])).await.unwrap();
+        assert_eq!(
+            replies(&applied.submissions[0]),
+            vec![Reply::Host(HostReply::Client(Some(
+                "ducktape-cli/1".into()
+            )))]
+        );
+        assert_eq!(
+            replies(&applied.submissions[1]),
+            vec![Reply::Host(HostReply::Client(None))]
+        );
+        assert_eq!(
+            ask(&host, Layer::Confirmed, "probe", vec![op(HostOp::Client)]).await,
+            vec![Reply::Host(HostReply::Client(None))]
         );
     });
 }

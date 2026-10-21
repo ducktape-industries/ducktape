@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    BlockAsk, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
+    Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Get, Located, Network, Page, Query, Range,
     Status, Submit, Submitted, TxAsk, activity, route,
 };
 use crate::{Error, Result};
@@ -108,7 +108,21 @@ impl Client {
     }
 
     pub async fn query(&self, layer: Layer, frame: Vec<u8>) -> Result<Vec<u8>> {
-        self.post(route::QUERY, &Query { layer, frame }).await
+        let ask = Ask::Signed(frame);
+        self.post(route::QUERY, &Query { layer, ask }).await
+    }
+
+    pub async fn query_unsigned(
+        &self,
+        layer: Layer,
+        target: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let ask = Ask::Unsigned {
+            target: target.to_owned(),
+            payload,
+        };
+        self.post(route::QUERY, &Query { layer, ask }).await
     }
 
     pub async fn get(&self, layer: Layer, program: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -554,7 +568,8 @@ impl Fault for Error {
             | Error::Offloaded(_)
             | Error::Egress(_)
             | Error::Unrelayed
-            | Error::MachineIsIdentity => Failure::Definite,
+            | Error::MachineIsIdentity
+            | Error::Unrolled(_) => Failure::Definite,
         }
     }
 }

@@ -40,8 +40,8 @@ pub use runtime::{Limits, OUT_OF_FUEL};
 pub use snapshot::{Queried, Snapshot, Source};
 pub use state::LOCAL;
 
-const STATE_DIR: &str = "state";
-const BLOBS_DIR: &str = "blobs";
+pub const STATE_DIR: &str = "state";
+pub const BLOBS_DIR: &str = "blobs";
 const CODE_KIND: &str = "program";
 /// How deep messages nest in one frame: a submission runs at depth 0 and
 /// each message, or reply, one deeper than the run that emitted it.
@@ -113,6 +113,7 @@ pub struct Genesis {
     /// How many members the network ever holds at once: 1..=MAX_MEMBERS,
     /// fixed here and never rewritten.
     pub member_cap: u32,
+    pub queries: validators::QueryPolicy,
 }
 
 pub struct Founding {
@@ -153,6 +154,7 @@ pub struct Submission {
     pub salt: Option<u64>,
     pub target: ProgramId,
     pub payload: Vec<u8>,
+    pub client: Option<String>,
 }
 
 impl Submission {
@@ -375,6 +377,7 @@ where
         let params = abi::encode(&validators::Genesis {
             validators: genesis.validators,
             member_cap: genesis.member_cap,
+            queries: genesis.queries,
         });
         for entry in entries.iter_mut() {
             if entry.program == *validators_role {
@@ -980,7 +983,8 @@ where
             cause: Cause::Direct,
         };
         let receipt = self
-            .run(
+            .run_from(
+                submission.client,
                 &submission.target,
                 ProgramCall::Execute(submission.payload),
                 env,
@@ -1086,6 +1090,7 @@ where
             fuel: self.loaded.limits().fuel.map(|_| HOOK_FUEL),
             first_item: 0,
             next_item: 0,
+            client: None,
         };
         let invocation = Invocation {
             env,
@@ -1250,7 +1255,20 @@ where
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Receipt> {
-        let mut frame = self.open_frame(self.loaded.limits().fuel, overlay)?;
+        self.run_from(None, program, call, env, overlay, stage)
+            .await
+    }
+
+    async fn run_from(
+        &self,
+        client: Option<String>,
+        program: &str,
+        call: ProgramCall,
+        env: Env,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<Receipt> {
+        let mut frame = self.open_frame(self.loaded.limits().fuel, client, overlay)?;
         let ran = self
             .run_frame(
                 program,
@@ -1267,13 +1285,19 @@ where
         Ok(ran.receipt)
     }
 
-    fn open_frame(&self, fuel: Option<u64>, overlay: &Overlay) -> Result<Frame> {
+    fn open_frame(
+        &self,
+        fuel: Option<u64>,
+        client: Option<String>,
+        overlay: &Overlay,
+    ) -> Result<Frame> {
         let view = self.committed.view(vec![overlay]);
         let next_item = parked::counter(&view, NETWORK, namespace::NEXT_ITEM)?;
         Ok(Frame {
             fuel,
             first_item: next_item,
             next_item,
+            client,
         })
     }
 

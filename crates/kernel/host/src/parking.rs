@@ -313,6 +313,7 @@ where
             waiter: start.waiter,
         };
         parked::save(self.committed.reads(), overlay, id, record, image)?;
+        parked::keep_client(self.committed.reads(), overlay, id, frame.client.as_deref())?;
         Ok(Run {
             receipt,
             status: Status::Parked,
@@ -486,6 +487,26 @@ where
         frame: &mut Frame,
         depth: u32,
     ) -> Result<Receipt> {
+        let client = parked::client(&self.committed.view(vec![&*overlay]), resumed.frame)?;
+        let resumer = std::mem::replace(&mut frame.client, client);
+        let ran = self
+            .resume_segment(resumed, height, time, overlay, stage, frame, depth)
+            .await;
+        frame.client = resumer;
+        ran
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_segment(
+        &self,
+        resumed: Resumed,
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+        frame: &mut Frame,
+        depth: u32,
+    ) -> Result<Receipt> {
         let Resumed {
             frame: id,
             ticket,
@@ -617,7 +638,7 @@ where
                 checkpoint: overlay.checkpoint(),
             };
             let receipt = rejected(program, awaits::cancelled(program));
-            let mut frame = self.open_frame(self.loaded.limits().fuel, overlay)?;
+            let mut frame = self.open_frame(self.loaded.limits().fuel, None, overlay)?;
             let ran = self
                 .finish(
                     program, &env, start, receipt, false, overlay, stage, &mut frame, 0,

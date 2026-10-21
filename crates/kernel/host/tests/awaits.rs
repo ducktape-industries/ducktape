@@ -7,15 +7,18 @@ use std::sync::Arc;
 use abi::Receipt;
 use abi::role::awaits::{self, Answer, Ticket, TicketRow};
 use abi::role::{self, halo, programs, validators};
-use abi::{BlobId, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, reason};
+use abi::{
+    BlobId, HostOp, HostReply, ItemRef, Message, Origin, Outcome, Principal, Refusal, Scan, reason,
+};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Finished, Plan};
 use fixture_oracle::{Ask, Op, owed_key};
+use fixture_probe::{Reply, Step};
 use fixture_programs::Change;
 use fixture_relay::Script;
 use fixture_wasm::{
-    ACCESS, AWAITER, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, ORACLE, PROGRAMS, RELAY,
-    VALSET,
+    ACCESS, AWAITER, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, ORACLE, PROBE, PROGRAMS,
+    RELAY, VALSET,
 };
 use host::{
     Applied, BLOBS, Block, BlockId, Founding, Genesis, Host, Layer, Limits, PARKED, Submission, Tip,
@@ -77,6 +80,7 @@ fn genesis() -> Genesis {
             founding("oracle", ORACLE, Vec::new()),
             founding("echo", RELAY, Vec::new()),
             founding("ping", RELAY, Vec::new()),
+            founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
             founding(
                 "halo",
                 HALO,
@@ -90,6 +94,7 @@ fn genesis() -> Genesis {
         epoch_length: 1_000,
         time: TIME,
         member_cap: 16,
+        queries: abi::role::validators::QueryPolicy::Signed,
     }
 }
 
@@ -120,6 +125,7 @@ fn submit(target: &str, payload: Vec<u8>) -> Submission {
         salt: None,
         target: target.to_owned(),
         payload,
+        client: None,
     }
 }
 
@@ -328,6 +334,69 @@ fn a_deferred_call_parks_the_frame_until_the_called_program_answers() {
                 .unwrap();
             assert!(parked.is_empty());
         }
+    });
+}
+
+#[test]
+fn a_resumed_frame_reads_the_client_of_the_op_that_parked_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), dir.path()).await;
+        let parking = Submission {
+            client: Some("ducktape-app/1".into()),
+            ..submit(
+                "awaiter",
+                plan("oracle", vec![later(), later()], false, false),
+            )
+        };
+        apply(&mut host, 1, vec![parking]).await;
+        assert_eq!(frames(&host), 1);
+
+        let resolve = Op::Answer {
+            ticket: 0,
+            answer: Ok(b"A".to_vec()),
+        };
+        let then_read = vec![Step::Op(HostOp::Client)];
+        let message = |target: &str, payload: Vec<u8>| Message {
+            target: target.into(),
+            payload,
+            reply: false,
+            acting: None,
+        };
+        let resumer = Script::Send(vec![
+            message("oracle", abi::encode(&resolve)),
+            message("probe", abi::encode(&then_read)),
+        ]);
+        let by_another = Submission {
+            signer: b"another".to_vec(),
+            client: Some("ducktape-cli/2".into()),
+            ..submit("ping", abi::encode(&resumer))
+        };
+        let applied = apply(&mut host, 2, vec![by_another]).await;
+        assert_eq!(answers(&host, "awaiter"), vec![Ok(b"A".to_vec())]);
+        let read = find(&applied.submissions[0], "probe");
+        let read: Vec<Reply> = abi::decode(output(read[0])).unwrap();
+        assert_eq!(
+            read,
+            vec![Reply::Host(HostReply::Client(Some(
+                "ducktape-cli/2".into()
+            )))],
+            "the resumer's frame reads its own client again once the resume is done"
+        );
+        assert_eq!(frames(&host), 1);
+
+        let by_an_egress_answer = answer(1, b"B");
+        assert_eq!(by_an_egress_answer.client, None);
+        let applied = apply(&mut host, 3, vec![by_an_egress_answer]).await;
+        let finished = finished_in(&applied.submissions[0], "awaiter");
+        assert_eq!(finished.answers, vec![Ok(b"A".to_vec()), Ok(b"B".to_vec())]);
+        assert_eq!(finished.client.as_deref(), Some("ducktape-app/1"));
+        assert_eq!(frames(&host), 0);
+        let kept = host
+            .view(Layer::Confirmed)
+            .scan(PARKED, &Scan::prefix(b"client/"))
+            .unwrap();
+        assert!(kept.is_empty());
     });
 }
 

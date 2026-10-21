@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use abi::Receipt;
-use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
+use abi::{BlobId, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
@@ -457,27 +457,15 @@ async fn query<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<u8>> {
     let network = ctx.network_id();
     let time = ctx.now();
     let asked = offload(move || {
-        let submission = match node::verify(&query.frame, &network) {
-            Ok(submission) => submission,
-            Err(refusal) => return Asked::Unverified(refusal),
-        };
         let source = reading.source();
-        let program = submission.target;
-        let answer = source.queried(
-            query.layer,
-            time,
-            Origin::External(submission.signer),
-            &program,
-            submission.payload,
-        );
-        let queried = tokio::runtime::Handle::current().block_on(answer);
-        Asked::Answered(queried.map(|queried| (program, queried)))
+        tokio::runtime::Handle::current()
+            .block_on(crate::query::answer(&source, query, &network, time))
     })
     .await;
     match asked {
-        Ok(Asked::Unverified(refusal)) => Reply::Refused(refusal),
-        Ok(Asked::Answered(Ok((program, queried)))) => counted(&ctx, program, queried),
-        Ok(Asked::Answered(Err(error))) => failed(error),
+        Ok(Ok(Ok((program, queried)))) => counted(&ctx, program, queried),
+        Ok(Ok(Err(refusal))) => Reply::Refused(refusal),
+        Ok(Err(error)) => failed(error),
         Err(error) => failed(error),
     }
 }
@@ -499,11 +487,6 @@ fn counted<E: Context>(ctx: &Ctx<E>, program: ProgramId, queried: host::Queried)
         Ok(bytes) => Reply::Answered(bytes),
         Err(refusal) => Reply::Refused(refusal),
     }
-}
-
-enum Asked {
-    Unverified(Refusal),
-    Answered(host::Result<(ProgramId, host::Queried)>),
 }
 
 async fn get_value<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Vec<u8>>> {

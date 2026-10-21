@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use abi::role::validators::Member;
+use abi::role::validators::{Member, QueryPolicy};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
@@ -28,6 +28,28 @@ const EGRESS_FRESH: &str = "egress.toml.fresh";
 const EGRESS_GRANTS: &str = "egress-grants";
 const NODE: &str = "node.toml";
 const MACHINE: &str = "machine.key";
+const STAMP: &str = "contract";
+const APPLIED: [&str; 9] = [
+    host::STATE_DIR,
+    host::BLOBS_DIR,
+    crate::history::DIR,
+    crate::activity::DIR,
+    crate::snapshot::DIR,
+    RUNTIME,
+    ANCHOR,
+    HTTP,
+    STAMP,
+];
+const UNSTAMPED: Stamp = Stamp {
+    contract: 9,
+    from: 0,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Stamp {
+    pub contract: u32,
+    pub from: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Descriptor {
@@ -127,6 +149,30 @@ impl Workspace {
 
     pub fn write_anchor(&self, anchor: &Anchor) -> Result<()> {
         self.write_record(ANCHOR, anchor)
+    }
+
+    pub fn stamp(&self) -> Result<Stamp> {
+        match std::fs::read(self.dir.join(STAMP)) {
+            Ok(bytes) => abi::decode(&bytes).map_err(|refusal| Error::Corrupt(refusal.sentence)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UNSTAMPED),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn write_stamp(&self, stamp: &Stamp) -> Result<()> {
+        self.write_record(STAMP, stamp)
+    }
+
+    pub(crate) fn set_aside(&self, name: &str) -> Result<PathBuf> {
+        let aside = self.dir.join(name);
+        std::fs::create_dir(&aside)?;
+        for applied in APPLIED {
+            let path = self.dir.join(applied);
+            if path.exists() {
+                std::fs::rename(path, aside.join(applied))?;
+            }
+        }
+        Ok(aside)
     }
 
     pub fn http(&self) -> Result<SocketAddr> {
@@ -259,10 +305,29 @@ pub struct Founding {
     pub hooks: Vec<String>,
     #[serde(default)]
     pub limits: Metering,
+    #[serde(default)]
+    pub queries: Queries,
 }
 
 fn default_member_cap() -> u32 {
     16
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Queries {
+    #[default]
+    Signed,
+    Open,
+}
+
+impl Queries {
+    fn policy(&self) -> QueryPolicy {
+        match self {
+            Queries::Signed => QueryPolicy::Signed,
+            Queries::Open => QueryPolicy::Open,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -390,6 +455,7 @@ impl Founding {
             epoch_length: self.epoch_length,
             time: self.time,
             member_cap: self.member_cap,
+            queries: self.queries.policy(),
         })
     }
 }
@@ -401,6 +467,7 @@ pub fn halo_address(text: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use abi::role::validators::QueryPolicy;
     use commonware_cryptography::Signer as _;
     use commonware_runtime::Runner as _;
 
@@ -453,6 +520,18 @@ mod tests {
         assert_eq!(hooked.hooks, ["activity"]);
         let plain = genesis_of(&FILE.replace("HOOKS", "").replace("ROLES", ""));
         assert!(plain.hooks.is_empty());
+    }
+
+    #[test]
+    fn a_founding_answers_only_signed_queries_unless_it_opens_them() {
+        let plain = genesis_of(&FILE.replace("HOOKS", "").replace("ROLES", ""));
+        assert_eq!(plain.queries, QueryPolicy::Signed);
+        let open = genesis_of(
+            &FILE
+                .replace("HOOKS", "queries = \"open\"\n")
+                .replace("ROLES", ""),
+        );
+        assert_eq!(open.queries, QueryPolicy::Open);
     }
 
     #[test]

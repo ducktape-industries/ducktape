@@ -166,6 +166,7 @@ fn genesis(members: &[validators::Member], epoch_length: u64) -> Genesis {
         epoch_length,
         time: TIME,
         member_cap: 16,
+        queries: abi::role::validators::QueryPolicy::Signed,
     }
 }
 

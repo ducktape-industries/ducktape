@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::thread::JoinHandle;
 
-use abi::role::validators::{Motion, Op};
+use abi::role::validators::{Motion, Op, QueryPolicy};
 use abi::role::{egress, halo};
 use abi::{BlobId, HashKind, HostOp, HostReply, Outcome, Scan, reason, role};
 use blob::contract::Entry;
@@ -352,6 +352,16 @@ async fn frame(client: &Client, key: &ed25519::PrivateKey, steps: Vec<Step>) -> 
     signed(client, key, "probe", abi::encode(&steps)).await
 }
 
+async fn query_frame(
+    client: &Client,
+    key: &ed25519::PrivateKey,
+    target: &str,
+    payload: Vec<u8>,
+) -> Vec<u8> {
+    let anchor = client.status().await.unwrap().anchor();
+    Frame::sign_query(key, NETWORK.as_bytes(), anchor, target, payload).encode()
+}
+
 async fn membership(client: &Client, key: &ed25519::PrivateKey, op: Op) -> u64 {
     let anchor = client.status().await.unwrap().anchor();
     let frame = Frame::sign(
@@ -411,6 +421,59 @@ fn client_runtime() -> ::tokio::runtime::Runtime {
         .enable_all()
         .build()
         .unwrap()
+}
+
+#[test]
+fn an_unsigned_query_reads_as_no_key_and_is_answered_only_while_the_network_opens_them() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    let text = std::fs::read_to_string(&founding).unwrap();
+    std::fs::write(&founding, format!("queries = \"open\"\n{text}")).unwrap();
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    client_runtime().block_on(async {
+        let account = abi::encode(&role::identity::Query::Account(Vec::new()));
+        let answer = client
+            .query_unsigned(Layer::Confirmed, "identity", account)
+            .await
+            .unwrap();
+        assert_eq!(
+            abi::decode::<role::identity::Reply>(&answer).unwrap(),
+            role::identity::Reply::Account(None),
+            "the empty key holds no account"
+        );
+        let env = abi::encode(&vec![Step::Env]);
+        let answer = client
+            .query_unsigned(Layer::Confirmed, "probe", env.clone())
+            .await
+            .unwrap();
+        let replies: Vec<Reply> = abi::decode(&answer).unwrap();
+        let [Reply::Env(seen)] = replies.as_slice() else {
+            panic!("the probe answers its env: {replies:?}");
+        };
+        assert_eq!(seen.origin, abi::Origin::unsigned());
+        assert_eq!(seen.origin, abi::Origin::External(Vec::new()));
+        assert_eq!(seen.sender, None);
+
+        let closing = Motion::Queries {
+            policy: QueryPolicy::Signed,
+        };
+        membership(&client, &seat.identity, Op::Vote(closing)).await;
+        let unsigned = client
+            .query_unsigned(Layer::Confirmed, "probe", env.clone())
+            .await
+            .unwrap_err();
+        let noded::Error::Refused(refusal) = unsigned else {
+            panic!("an unsigned query is refused once the vote closes them: {unsigned}");
+        };
+        assert_eq!(refusal.reason, reason::UNAUTHORIZED);
+        let signed = query_frame(&client, &seat.identity, "probe", env).await;
+        client.query(Layer::Confirmed, signed).await.unwrap();
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
 }
 
 #[test]
@@ -718,12 +781,37 @@ fn a_validator_serves_its_network_over_http() {
             node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0
         );
 
-        let query = frame(&client, &alice, vec![Step::Op(HostOp::Get(b"a".to_vec()))]).await;
-        let answer = client.query(Layer::Confirmed, query).await.unwrap();
+        let read = abi::encode(&vec![Step::Op(HostOp::Get(b"a".to_vec()))]);
+        let query = query_frame(&client, &alice, "probe", read.clone()).await;
+        let answer = client.query(Layer::Confirmed, query.clone()).await.unwrap();
         assert_eq!(
             answer,
             abi::encode(&vec![Reply::Host(HostReply::Value(Some(b"1".to_vec())))])
         );
+        let as_op = client.submit(query, Preconfirm::Off).await.unwrap_err();
+        let noded::Error::Refused(op_refused) = as_op else {
+            panic!("a query's frame is refused as an op: {as_op}");
+        };
+        assert_eq!(op_refused.reason, reason::INVALID_INPUT);
+        let op = signed(&client, &alice, "probe", read.clone()).await;
+        let as_query = client.query(Layer::Confirmed, op).await.unwrap_err();
+        let noded::Error::Refused(query_refused) = as_query else {
+            panic!("an op's frame is refused as a query: {as_query}");
+        };
+        assert_eq!(query_refused.reason, reason::INVALID_INPUT);
+        let stale = Tip {
+            height: 0,
+            id: [7; 32],
+        };
+        let stale = Frame::sign_query(&alice, NETWORK.as_bytes(), stale, "probe", read);
+        let replayed = client
+            .query(Layer::Confirmed, stale.encode())
+            .await
+            .unwrap_err();
+        let noded::Error::Refused(stale_refused) = replayed else {
+            panic!("a query anchored to no recent block is refused: {replayed}");
+        };
+        assert_eq!(stale_refused.reason, reason::ANCHOR);
 
         let programs = client.programs().await.unwrap();
         let code = programs["probe"];
@@ -1771,6 +1859,145 @@ fn a_shrunk_set_finalizes_without_the_removed_member() {
     }
 }
 
+fn refused_start(seat: &Seat) -> String {
+    let workspace = seat.workspace.clone();
+    runner(&workspace.runtime_dir()).start(|context| async move {
+        let cadence = workspace
+            .descriptor()
+            .unwrap()
+            .cadence(consensus::Timeouts::default())
+            .unwrap();
+        let started = noded::run_on(
+            context,
+            &workspace,
+            Logs::install("info").unwrap(),
+            listeners(),
+            HaloConfig::default(),
+            LoadConfig::default(),
+            cadence,
+        )
+        .await;
+        match started {
+            Ok(_) => panic!("the node started on state from before the roll"),
+            Err(error) => error.to_string(),
+        }
+    })
+}
+
+fn rolled(seat: &Seat, height: u64) -> Result<noded::Rolled, String> {
+    let workspace = seat.workspace.clone();
+    runner(&workspace.runtime_dir()).start(|context| async move {
+        noded::roll(context, &workspace, height)
+            .await
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[test]
+fn a_node_stopped_before_the_roll_runs_again_only_once_roll_syncs_it_to_a_head_past_it() {
+    let root = tempfile::tempdir().unwrap();
+    let validator = Seat::new(root.path(), "n0");
+    let mut resident = Seat::new(root.path(), "n1");
+    resident.address = None;
+    let founding = founding(root.path(), &[&validator], EPOCH_LENGTH);
+    validator.init(&founding);
+    let live = validator.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let runtime = client_runtime();
+
+    resident.join(&client);
+    assert_eq!(
+        resident.workspace.stamp().unwrap().contract,
+        noded::NODE_CONTRACT
+    );
+    let follower = resident.start();
+    runtime.block_on(resident.admin(&follower.client, Admin::Shutdown));
+    follower.thread.join().unwrap();
+    std::fs::remove_file(resident.workspace.dir().join("contract")).unwrap();
+    assert!(refused_start(&resident).contains("applied under contract 9"));
+
+    let written = runtime.block_on(async {
+        let mut changes = client.changes("probe").await.unwrap();
+        client
+            .submit(
+                frame(&client, &alice, vec![set(b"a", b"while it was down")]).await,
+                Preconfirm::Off,
+            )
+            .await
+            .unwrap();
+        changes.next().await.unwrap().unwrap()
+    });
+    let roll = runtime.block_on(client.status()).unwrap().height;
+    assert!(roll >= written.height);
+
+    let synced = rolled(&resident, roll).unwrap();
+    let noded::Rolled::Synced { stamp, aside } = synced else {
+        panic!("a node behind the roll syncs: {synced:?}");
+    };
+    assert_eq!(stamp.contract, noded::NODE_CONTRACT);
+    assert!(stamp.from > roll, "{stamp:?}");
+    assert!(aside.join("state").exists());
+    assert_eq!(rolled(&resident, roll), Ok(noded::Rolled::Already(stamp)));
+
+    let follower = resident.start();
+    runtime.block_on(async {
+        let status = follower.client.status().await.unwrap();
+        assert!(status.height + 1 >= stamp.from, "{status:?}");
+        assert_eq!(
+            follower
+                .client
+                .get(Layer::Confirmed, "probe", b"a")
+                .await
+                .unwrap(),
+            Some(b"while it was down".to_vec())
+        );
+    });
+    shut_down(&runtime, &[&validator, &resident], vec![live, follower]);
+
+    let tip = runner(&validator.workspace.runtime_dir()).start(|context| {
+        let workspace = validator.workspace.clone();
+        async move {
+            let descriptor = workspace.descriptor().unwrap();
+            node::Node::open(context, &descriptor.network, workspace.dir())
+                .await
+                .unwrap()
+                .tip()
+                .unwrap()
+                .height
+        }
+    });
+    validator
+        .workspace
+        .write_stamp(&noded::Stamp {
+            contract: 9,
+            from: 0,
+        })
+        .unwrap();
+    assert!(refused_start(&validator).contains("applied under contract 9"));
+    assert!(
+        rolled(&validator, tip - 1)
+            .unwrap_err()
+            .contains("past the roll height")
+    );
+    assert!(
+        rolled(&validator, tip + 1)
+            .unwrap_err()
+            .contains("names no source")
+    );
+    let stamp = noded::Stamp {
+        contract: noded::NODE_CONTRACT,
+        from: tip + 1,
+    };
+    assert_eq!(rolled(&validator, tip), Ok(noded::Rolled::Stamped(stamp)));
+    let live = validator.start();
+    runtime.block_on(async {
+        let mut blocks = live.client.changes(host::RECENT).await.unwrap();
+        blocks.next().await.unwrap().unwrap();
+    });
+    shut_down(&runtime, &[&validator], vec![live]);
+}
+
 #[test]
 fn a_late_validator_joins_by_state_sync_and_follows() {
     let root = tempfile::tempdir().unwrap();
@@ -2443,7 +2670,7 @@ fn shut_down(runtime: &::tokio::runtime::Runtime, seats: &[&Seat], live: Vec<Liv
 }
 
 async fn lanes(client: &Client, key: &ed25519::PrivateKey) -> Vec<halo::Lane> {
-    let asked = signed(client, key, "halo", abi::encode(&halo::Query::Lanes)).await;
+    let asked = query_frame(client, key, "halo", abi::encode(&halo::Query::Lanes)).await;
     let answer = client.query(Layer::Confirmed, asked).await.unwrap();
     match abi::decode(&answer).unwrap() {
         halo::Reply::Lanes(lanes) => lanes,
@@ -3187,6 +3414,11 @@ fn join_held(seat: &Seat, source: Client, gate: Arc<Gate>) -> JoinHandle<()> {
             .unwrap();
             workspace.write_descriptor(&descriptor).unwrap();
             workspace.write_anchor(&joined.anchor).unwrap();
+            let stamp = noded::Stamp {
+                contract: noded::NODE_CONTRACT,
+                from: joined.node.tip().unwrap().height + 1,
+            };
+            workspace.write_stamp(&stamp).unwrap();
         });
     })
 }

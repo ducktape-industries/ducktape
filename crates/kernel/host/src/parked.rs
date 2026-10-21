@@ -51,6 +51,10 @@ fn page_key(id: FrameId, index: u32) -> Vec<u8> {
     [b"page/".as_slice(), &id.to_be_bytes(), &index.to_be_bytes()].concat()
 }
 
+fn client_key(id: FrameId) -> Vec<u8> {
+    [b"client/".as_slice(), &id.to_be_bytes()].concat()
+}
+
 fn of_program(program: &str) -> Vec<u8> {
     [b"of/".as_slice(), program.as_bytes(), b"/"].concat()
 }
@@ -134,8 +138,39 @@ pub fn save(
     Ok(())
 }
 
+pub fn client(view: &View<'_>, id: FrameId) -> Result<Option<String>> {
+    let Some(bytes) = view.get(PARKED, &client_key(id))? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| crate::Error::Corrupt(format!("frame {id}'s client is not UTF-8")))
+}
+
+pub fn keep_client(
+    storage: &Reads,
+    overlay: &mut Overlay,
+    id: FrameId,
+    client: Option<&str>,
+) -> Result<()> {
+    match client {
+        Some(client) => overlay.set(PARKED, client_key(id), client.as_bytes().to_vec()),
+        None => drop_client(storage, overlay, id)?,
+    }
+    Ok(())
+}
+
+fn drop_client(storage: &Reads, overlay: &mut Overlay, id: FrameId) -> Result<()> {
+    let view = View::new(storage, vec![&*overlay]);
+    if view.get(PARKED, &client_key(id))?.is_some() {
+        overlay.delete(PARKED, client_key(id));
+    }
+    Ok(())
+}
+
 pub fn remove(storage: &Reads, overlay: &mut Overlay, id: FrameId, program: &str) -> Result<()> {
     drop_image(storage, overlay, id)?;
+    drop_client(storage, overlay, id)?;
     overlay.delete(PARKED, of_key(program, id));
     overlay.delete(PARKED, frame_key(id));
     Ok(())

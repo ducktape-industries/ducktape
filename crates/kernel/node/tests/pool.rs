@@ -59,6 +59,7 @@ fn two_proofs_of_one_body() -> (Checked, Checked) {
         salt: None,
         target: "probe".into(),
         payload: b"a0".to_vec(),
+        client: None,
     };
     let proof = eth_proof(&key, NAMESPACE, &body.preimage());
     let mut raw_parity = proof.clone();

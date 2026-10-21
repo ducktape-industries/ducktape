@@ -12,7 +12,7 @@ use commonware_consensus::types::Height;
 use commonware_cryptography::sha256;
 use consensus::{Certificate, validators_of};
 use host::{ANCHOR_WINDOW, Submission, SubmissionId};
-use node::{Block, Body, Carried, Frame, Node};
+use node::{Block, Carried, Frame, Node};
 
 use crate::history::Row;
 use crate::wire::{BlockAsk, BlockRef, Blocks, Finalized, Located, Page, Tx, TxAsk, TxRef};
@@ -326,27 +326,12 @@ pub(crate) fn ran(block: &Block, carried: &[Carried]) -> Result<Ran> {
                     block.height, carried.frame
                 ))
             })?;
-            let Frame {
-                body:
-                    Body {
-                        signer,
-                        anchor,
-                        salt,
-                        target,
-                        payload,
-                        ..
-                    },
-                ..
-            } = Frame::decode(bytes).map_err(|refusal| {
-                Error::Corrupt(format!("block {}: {}", block.height, refusal.sentence))
-            })?;
-            let submission = Submission {
-                signer,
-                anchor,
-                salt,
-                target,
-                payload,
-            };
+            let submission = Frame::decode(bytes)
+                .map_err(|refusal| {
+                    Error::Corrupt(format!("block {}: {}", block.height, refusal.sentence))
+                })?
+                .body
+                .submission();
             Ok((carried.frame, carried.id, submission))
         })
         .collect()

@@ -387,6 +387,7 @@ where
                 .await?,
             ),
             HostOp::Crypto(op) => crypto::serve(op),
+            HostOp::Client => HostReply::Client(None),
             HostOp::Await { .. } | HostOp::Defer | HostOp::Resume { .. } => {
                 HostReply::Refused(Refusal::new(reason::UNSUPPORTED, "a query does not await"))
             }
@@ -665,6 +666,7 @@ pub struct Frame {
     pub fuel: Option<u64>,
     pub first_item: u64,
     pub next_item: u64,
+    pub client: Option<String>,
 }
 
 pub struct Called {
@@ -964,6 +966,7 @@ where
                 self.call(target, payload, acting)
             }
             HostOp::Defer => Ok(self.defer()),
+            HostOp::Client => Ok(HostReply::Client(self.frame.client.clone())),
             HostOp::Resume {
                 frame,
                 ticket,

@@ -205,11 +205,11 @@ pub async fn ask(
     request: Vec<u8>,
     layer: Layer,
 ) -> Result<Vec<u8>, String> {
-    let frame = Frame::sign(
+    let frame = Frame::sign_query_as(
+        crate::CLIENT,
         key,
         status.network.as_bytes(),
         status.anchor(),
-        None,
         program,
         request,
     );

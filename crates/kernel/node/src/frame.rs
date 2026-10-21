@@ -7,6 +7,7 @@ use host::{Submission, Tip};
 use keyscheme::KeyScheme;
 
 pub const NAMESPACE: &[u8] = b"ducktape:frame";
+pub const QUERY_NAMESPACE: &[u8] = b"ducktape:query";
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Body {
@@ -17,6 +18,7 @@ pub struct Body {
     pub salt: Option<u64>,
     pub target: String,
     pub payload: Vec<u8>,
+    pub client: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -37,12 +39,82 @@ impl Body {
             salt: self.salt,
             target: self.target.clone(),
             payload: self.payload.clone(),
+            client: self.client.clone(),
         }
     }
 }
 
 impl Frame {
     pub fn sign(
+        key: &ed25519::PrivateKey,
+        network: &[u8],
+        anchor: Tip,
+        salt: Option<u64>,
+        target: &str,
+        payload: Vec<u8>,
+    ) -> Frame {
+        Frame::signed(NAMESPACE, None, key, network, anchor, salt, target, payload)
+    }
+
+    pub fn sign_as(
+        client: &str,
+        key: &ed25519::PrivateKey,
+        network: &[u8],
+        anchor: Tip,
+        salt: Option<u64>,
+        target: &str,
+        payload: Vec<u8>,
+    ) -> Frame {
+        let client = Some(client);
+        Frame::signed(
+            NAMESPACE, client, key, network, anchor, salt, target, payload,
+        )
+    }
+
+    pub fn sign_query(
+        key: &ed25519::PrivateKey,
+        network: &[u8],
+        anchor: Tip,
+        target: &str,
+        payload: Vec<u8>,
+    ) -> Frame {
+        Frame::signed(
+            QUERY_NAMESPACE,
+            None,
+            key,
+            network,
+            anchor,
+            None,
+            target,
+            payload,
+        )
+    }
+
+    pub fn sign_query_as(
+        client: &str,
+        key: &ed25519::PrivateKey,
+        network: &[u8],
+        anchor: Tip,
+        target: &str,
+        payload: Vec<u8>,
+    ) -> Frame {
+        let client = Some(client);
+        Frame::signed(
+            QUERY_NAMESPACE,
+            client,
+            key,
+            network,
+            anchor,
+            None,
+            target,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signed(
+        namespace: &[u8],
+        client: Option<&str>,
         key: &ed25519::PrivateKey,
         network: &[u8],
         anchor: Tip,
@@ -58,8 +130,9 @@ impl Frame {
             salt,
             target: target.to_owned(),
             payload,
+            client: client.map(str::to_owned),
         };
-        let proof = key.sign(NAMESPACE, &body.preimage()).as_ref().to_vec();
+        let proof = key.sign(namespace, &body.preimage()).as_ref().to_vec();
         Frame { body, proof }
     }
 
@@ -72,6 +145,14 @@ impl Frame {
     }
 
     pub fn verify(&self, network: &[u8]) -> Result<Submission, Refusal> {
+        self.verified(NAMESPACE, network)
+    }
+
+    pub fn verify_query(&self, network: &[u8]) -> Result<Submission, Refusal> {
+        self.verified(QUERY_NAMESPACE, network)
+    }
+
+    fn verified(&self, namespace: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
         let on_this_network = self.body.network == network;
         if !on_this_network {
             return Err(Refusal::new(
@@ -81,7 +162,7 @@ impl Frame {
         }
         let bound = self.body.scheme.verify(
             &self.body.signer,
-            NAMESPACE,
+            namespace,
             &self.body.preimage(),
             &self.proof,
         );
@@ -97,6 +178,10 @@ impl Frame {
 
 pub fn verify(bytes: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
     Frame::decode(bytes)?.verify(network)
+}
+
+pub fn verify_query(bytes: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
+    Frame::decode(bytes)?.verify_query(network)
 }
 
 #[derive(Clone, Debug)]

@@ -84,7 +84,13 @@ pub enum Submitted {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Query {
     pub layer: Layer,
-    pub frame: Vec<u8>,
+    pub ask: Ask,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Ask {
+    Signed(Vec<u8>),
+    Unsigned { target: ProgramId, payload: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

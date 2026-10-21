@@ -1,8 +1,9 @@
 // Source lint: the modules an RPC request runs through name no lock, and a handler takes the
 // request context, never the daemon.
 
-const REQUEST_PATH: [&str; 24] = [
+const REQUEST_PATH: [&str; 25] = [
     "server.rs",
+    "query.rs",
     "ctx.rs",
     "view.rs",
     "changes.rs",

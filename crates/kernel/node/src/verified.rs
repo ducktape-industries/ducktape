@@ -182,6 +182,7 @@ mod tests {
             salt: None,
             target: "probe".into(),
             payload: payload.to_vec(),
+            client: None,
         }
     }
 

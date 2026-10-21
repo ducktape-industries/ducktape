@@ -18,7 +18,9 @@ pub mod machine;
 mod mesh;
 mod network;
 mod pool;
+mod query;
 mod relay;
+mod roll;
 mod run;
 mod server;
 mod snapshot;
@@ -48,12 +50,13 @@ pub use egress::lane::{LANE as EGRESS_LANE, Seating, seating, serve_box};
 pub use endpoint::{Endpoint, Scheme};
 pub use logs::Logs;
 pub use mesh::Mesh;
+pub use roll::{Rolled, roll};
 pub use run::{
     HaloConfig, Listen, Listeners, LoadConfig, Running, enroll, init, invite, join, run, run_on,
 };
 pub use view::{View, Views};
 pub use wire::{NODE_CONTRACT, Status};
-pub use workspace::{Descriptor, Founding, Workspace};
+pub use workspace::{Descriptor, Founding, Stamp, Workspace};
 pub use writer::Held;
 
 use crate::changes::{Changes, Follows, Subscription, Wrote};
@@ -143,6 +146,8 @@ pub enum Error {
     Unrelayed,
     #[error("machine.key is this workspace's identity key: a machine signs with a key of its own")]
     MachineIsIdentity,
+    #[error("{0}")]
+    Unrolled(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {

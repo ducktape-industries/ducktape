@@ -59,6 +59,7 @@ time = 1700000000000          # the genesis block's time, unix milliseconds
 epoch_length = 64             # blocks per validator epoch
 block_time_ms = 1000
 member_cap = 16               # optional, default 16: the most members (validators and residents) it ever holds, 1 to 128; fixed at founding
+queries = "signed"            # optional, default "signed": "open" answers unsigned queries too; the validators program holds it from here on (`ducktape vote queries`)
 hooks = ["activity"]          # optional: founding programs the kernel tells of every frame; the programs role holds the list from here on
 
 [[validators]]
@@ -324,7 +325,8 @@ Membership changes only by the validators' vote. The door starts closed, so
 a stranger needs an invite a validator signed: `ducktape invite` prints one,
 good for one enrollment for 72 hours (`--hours`). Validators vote with
 `ducktape vote promote|demote|remove <key>`, `ducktape vote open|close` (the
-door), `ducktape vote role <role> <op>`, which runs `op` on the program bound
+door), `ducktape vote queries signed|open` (whether the network answers unsigned
+queries), `ducktape vote role <role> <op>`, which runs `op` on the program bound
 to the role once it passes (`programs` takes a program change, `halo` a lane
 to open, set or close; neither takes a change from anything else). A role
 moves only with the program change that publishes the program declaring it,
@@ -805,6 +807,45 @@ ducktape blob put code.wasm --kind program --wait  # put a bundle, print its ids
 ducktape machine init                   # mint machine.key and print its public key
 ducktape machine run                    # run the work fleet assigns to the machines [machine] names
 ```
+
+A query is a call to a program's `query`, which changes nothing. A signed
+query is a frame signed under the namespace `ducktape:query`
+(`node::Frame::sign_query`), never under `ducktape:frame`, which every op
+signs under: `/v1/submit` takes only an op's signature and `/v1/query` only a
+query's, so neither runs as the other. `/v1/query` takes a borsh
+`noded::wire::Query { layer, ask }`. `Ask::Signed(frame)` runs as
+`Origin::External` of its signer, while its anchor is one of the last
+`host::ANCHOR_WINDOW` blocks, as an op's must be, so a captured query is not
+read again later. `Ask::Unsigned { target, payload }` is
+answered only while the program in the validators role answers
+`validators::Query::QueryPolicy` with `Open` (the founding file's `queries`,
+then `ducktape vote queries`), and refused otherwise. An unsigned query runs as
+`Origin::External` of the empty key (`abi::Origin::unsigned()`): no signature
+verifies under it and no account holds it, so a read that needs a signer's key
+or an account refuses it as it refuses a stranger. No code may read the empty
+key as a real one.
+
+A workspace records the contract its state was applied under (the file
+`contract`: the contract and the first height applied under it; a workspace
+without one reads as contract 9). `ducktape run` refuses a workspace stamped
+with another contract than its own, or whose tip is below that first height.
+A contract bump that changes how blocks decode rolls as a stop at one announced
+height R: with the node stopped, `ducktape roll R` stamps a workspace whose tip
+is R; one behind R state-syncs from its `source` to a head at or past R, served
+by a node on the new contract (the state from before goes to `pre-roll-<tip>/`
+in the workspace), then stamps from the head after it; one past R is refused, and
+joins again. So a binary never applies a block another contract produced.
+
+A frame's body ends with `client`, the signer's own word for the software
+that signed it (`ducktape-cli/<version>` from the CLI, the app's
+`ducktape-app/<version>+<commit> (<os>; <features>)`), or none. It is signed
+with the rest of the body and is part of the submission's id, and nothing
+checks it. A program reads it with the host op `HostOp::Client`, which answers
+the client of the submission whose frame is running (the messages and calls
+that frame makes included, and the frame again when it resumes after parking:
+the kernel keeps a parked frame's client beside it, under `client/<frame>`) and `None` in a query, a hook, a scheduled run and
+the kernel's own runs. It is for showing and for choosing what to show, never
+for deciding who may act.
 
 Reads are open; writes are signed frames. Each frame names a recent block, its
 anchor, and is valid only while that block is one of the last 256: the CLI

@@ -347,7 +347,11 @@ async fn found<E: Context>(
     )
     .await?;
     workspace.write_descriptor(&descriptor)?;
-    workspace.write_anchor(&Anchor::Genesis(block))
+    workspace.write_anchor(&Anchor::Genesis(block))?;
+    workspace.write_stamp(&crate::workspace::Stamp {
+        contract: crate::wire::NODE_CONTRACT,
+        from: 1,
+    })
 }
 
 async fn adopt<E: Context>(
@@ -376,7 +380,11 @@ async fn adopt<E: Context>(
     .await?;
     workspace.write_source(&base)?;
     workspace.write_descriptor(&descriptor)?;
-    workspace.write_anchor(&joined.anchor)
+    workspace.write_anchor(&joined.anchor)?;
+    workspace.write_stamp(&crate::workspace::Stamp {
+        contract: crate::wire::NODE_CONTRACT,
+        from: joined.node.tip()?.height + 1,
+    })
 }
 
 async fn enrolled<E: Context>(
@@ -444,6 +452,7 @@ async fn start<E: Context>(
     let egress = crate::egress::Station::open(workspace.clone())?;
     let mut node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     node.meter_queries(load.query_fuel.map(NonZeroU64::get));
+    crate::roll::admits(workspace.stamp()?, node.tip()?.height)?;
     let network = Network {
         epoch_length: node.epoch_length()?,
         cadence,
