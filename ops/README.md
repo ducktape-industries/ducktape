@@ -795,6 +795,20 @@ one up for another network.
     so a disk sitting on its line posts once. The 10 GB node-volume row
     clears at 10.5 GB, twice the 0.2–0.3 GB it swings while it sits on
     the line; the other rows have none.
+  - each release `WATCH_RELEASES` names, as a workflow and the runs that
+    build its channel. The desktop app's `release.yml` builds the nightly
+    on a `dev` push, on its daily `schedule` and on `workflow_dispatch`
+    (each of those builds dev's head), and stable on a `main` push.
+    GitHub's API lists the finished runs of each kind, and the newest
+    (by `created_at`) that passed or failed decides, so a cancelled or
+    skipped run is passed over. A failed release posts its event, branch,
+    commit and run link, and the next one that passes posts good again.
+    GitHub answers 60 unsigned calls an hour per address, shared with
+    everything else that leaves fabrics-1. So watch asks again only once
+    the `remaining` calls its last answer reported, spread over the time
+    to its `reset`, cover one more read of every kind of run; between
+    reads it keeps the last readings. A refused or unreadable answer (a
+    spent limit answers 403) is unread.
 - A check it cannot read changes nothing, and logs `check_unread` once as
   it turns unread: with the node down, the rate and the public URL are
   unread. It saves what it decided to its claim `state` before it posts,

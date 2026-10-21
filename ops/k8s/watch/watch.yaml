@@ -149,6 +149,10 @@ spec:
                 {"check": "disk-node-fallback", "label": "node volume, at the fallback line", "path": "/disks/node", "rule": "free_bytes_under", "limit": 6000000000},
                 {"check": "disk-root", "label": "fabrics-1 root disk", "path": "/disks/root", "rule": "free_percent_under", "limit": @NODEFS_PERCENT@},
                 {"check": "disk-home", "label": "rlm-home disk", "path": "/disks/home", "rule": "used_percent_at", "limit": @IMAGE_GC_PERCENT@}]
+            - name: WATCH_RELEASES
+              value: >-
+                [{"check": "release-nightly", "label": "desktop nightly", "repo": "ducktape-industries/app", "workflow": "release.yml", "runs": [{"branch": "dev", "event": "push"}, {"event": "schedule"}, {"event": "workflow_dispatch"}]},
+                {"check": "release-stable", "label": "desktop stable", "repo": "ducktape-industries/app", "workflow": "release.yml", "runs": [{"branch": "main", "event": "push"}]}]
             - {name: WATCH_STATE, value: /state}
             - {name: WATCH_KEYS, value: /keys}
             - {name: WATCH_WORKSPACE, value: /tmp/ducktape}

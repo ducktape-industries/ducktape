@@ -1,9 +1,12 @@
 """Exercise watch against a recorded /v1/status and simulated node, Kubernetes API, disks and CLI: each check, each transition, and posts that land, fail or land unseen; run by `make test`."""
+import email.message
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
 import unittest
+import urllib.error
 from collections import namedtuple
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -99,12 +102,18 @@ def warm_pod(run):
 class FakeHttp:
     def __init__(self, answers):
         self.answers = answers
+        self.asked = []
 
     def get(self, url, headers=None, context=None):
+        code, _, body = self.answer(url, headers, context)
+        return code, body
+
+    def answer(self, url, headers=None, context=None):
+        self.asked.append(url)
         answer = self.answers[url]
         if isinstance(answer, Exception):
             raise answer
-        return answer
+        return answer if len(answer) == 3 else (answer[0], {}, answer[1])
 
 
 class FakeKube:
@@ -364,6 +373,109 @@ class WarmPod(unittest.TestCase):
         for files, answer, api in cases:
             reading, _ = warm_read(files, answer, api)
             self.assertEqual(reading.seen, watch.UNREAD, (answer, reading.value))
+
+
+NIGHTLY = watch.Release.of({"check": "release-nightly", "label": "desktop nightly", "repo": "ducktape-industries/app", "workflow": "release.yml", "runs": [{"branch": "dev", "event": "push"}, {"event": "schedule"}, {"event": "workflow_dispatch"}]})
+STABLE = watch.Release.of({"check": "release-stable", "label": "desktop stable", "repo": "ducktape-industries/app", "workflow": "release.yml", "runs": [{"event": "push", "branch": "main"}]})
+RUNS = "https://api.github.com/repos/ducktape-industries/app/actions/workflows/release.yml/runs"
+PUSHES = RUNS + "?branch=dev&event=push&status=completed"
+SCHEDULED = RUNS + "?event=schedule&status=completed"
+DISPATCHED = RUNS + "?event=workflow_dispatch&status=completed"
+STABLE_URL = RUNS + "?branch=main&event=push&status=completed"
+FAILED = ("4c70294b1cf2824712bb754125bb03f6cca2d33e", "failure", 39649540423, "push", "dev", "2026-10-21T18:05:12Z")
+CANCELLED = ("6bb7bf45cbf883827dbd01173889e0585577c37c", "cancelled", 39575615673, "push", "dev", "2026-10-21T09:16:01Z")
+PASSED = ("1d89fa74248a980835cfab95c8e675608c2549f8", "success", 39453514359, "push", "dev", "2026-10-20T16:00:01Z")
+SCHEDULE_FAILED = ("437f74979ebcfc3445e2330a13842eb2f4a59eca", "failure", 39570749340, "schedule", "main", "2026-10-21T08:38:02Z")
+SCHEDULE_PASSED = ("437f74979ebcfc3445e2330a13842eb2f4a59eca", "success", 39700000000, "schedule", "main", "2026-10-22T03:17:30Z")
+RATE_LIMITED = json.dumps({"message": "API rate limit exceeded for 203.0.113.7. (But here's the good news: Authenticated requests get a higher rate limit. Check out the documentation for more details.)", "documentation_url": "https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting"}).encode()
+LIMIT = {"x-ratelimit-limit": "60", "x-ratelimit-remaining": "60", "x-ratelimit-reset": "3600", "x-ratelimit-used": "0"}
+
+
+def runs(*rows):
+    found = [
+        {"id": number, "name": "release", "head_branch": branch, "head_sha": sha, "path": ".github/workflows/release.yml", "event": event, "status": "completed", "conclusion": conclusion, "created_at": created, "html_url": f"https://github.com/ducktape-industries/app/actions/runs/{number}"}
+        for sha, conclusion, number, event, branch, created in rows
+    ]
+    return json.dumps({"total_count": len(found), "workflow_runs": found}).encode()
+
+
+def message(pairs):
+    held = email.message.Message()
+    for name, value in pairs:
+        held[name] = value
+    return held
+
+
+class Releases(unittest.TestCase):
+    def test_each_kind_of_run_is_asked_for_its_finished_runs(self):
+        self.assertEqual(NIGHTLY.urls(), [PUSHES, SCHEDULED, DISPATCHED])
+        self.assertEqual(STABLE.urls(), [STABLE_URL])
+
+    def test_the_newest_run_that_passed_or_failed_decides_and_a_cancelled_one_is_passed_over(self):
+        failed = watch.release_reading(NIGHTLY, [(200, runs(CANCELLED, FAILED, PASSED)), (200, runs()), (200, runs())])
+        self.assertEqual((failed.check, failed.seen, failed.value), ("release-nightly", watch.BAD, "release.yml's push run on dev at 4c70294b failed: https://github.com/ducktape-industries/app/actions/runs/39649540423"))
+        passed = watch.release_reading(NIGHTLY, [(200, runs(CANCELLED, PASSED)), (200, runs()), (200, runs())])
+        self.assertEqual((passed.seen, passed.value), (watch.OK, "release.yml's push run on dev at 1d89fa74 passed: https://github.com/ducktape-industries/app/actions/runs/39453514359"))
+
+    def test_a_scheduled_nightly_newer_than_the_last_push_decides_either_way(self):
+        rebuilt = watch.release_reading(NIGHTLY, [(200, runs(FAILED)), (200, runs(SCHEDULE_PASSED)), (200, runs())])
+        self.assertEqual((rebuilt.seen, rebuilt.value), (watch.OK, "release.yml's schedule run on main at 437f7497 passed: https://github.com/ducktape-industries/app/actions/runs/39700000000"))
+        broken = watch.release_reading(NIGHTLY, [(200, runs(PASSED)), (200, runs(SCHEDULE_FAILED)), (200, runs())])
+        self.assertEqual((broken.seen, broken.value), (watch.BAD, "release.yml's schedule run on main at 437f7497 failed: https://github.com/ducktape-industries/app/actions/runs/39570749340"))
+
+    def test_no_decided_run_a_refusal_or_another_shape_is_unread(self):
+        cases = [
+            [(200, runs(CANCELLED))],
+            [(200, runs())],
+            [(403, RATE_LIMITED)],
+            [(200, runs(PASSED)), (502, b"<html>bad gateway</html>")],
+            [(200, b"<html>")],
+            [(200, b"[]")],
+            [(200, b'{"total_count": 0}')],
+        ]
+        for answers in cases:
+            self.assertEqual(watch.release_reading(NIGHTLY, answers).seen, watch.UNREAD, answers)
+        self.assertTrue(watch.release_reading(NIGHTLY, [(403, RATE_LIMITED)]).value.startswith("GitHub answered 403: API rate limit exceeded for 203.0.113.7."))
+
+    def test_reads_are_spaced_by_the_limit_github_reports(self):
+        self.assertEqual(watch.next_read_ms(0, LIMIT, 2), 120_000)
+        self.assertEqual(watch.next_read_ms(0, {**LIMIT, "x-ratelimit-remaining": "1"}, 2), 3_600_000)
+        self.assertEqual(watch.next_read_ms(5_000_000, LIMIT, 2), 5_000_000)
+        self.assertEqual(watch.next_read_ms(7, {}, 2), 7)
+
+    def test_an_unanswered_read_is_unread_and_asks_again_at_the_next_sample(self):
+        readings, due = watch.releases_read(FakeHttp({PUSHES: watch.Unread("timed out")}), (NIGHTLY,), 40_000)
+        self.assertEqual(([reading.seen for reading in readings], due), ([watch.UNREAD], 40_000))
+
+    def test_the_real_adapter_hands_back_githubs_headers_lowercased_on_an_answer_and_on_a_refusal(self):
+        seen = []
+        limit = [("X-RateLimit-Remaining", "59"), ("X-RateLimit-Reset", "1792610000")]
+
+        class Answer:
+            status = 200
+            headers = message(limit)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *rest):
+                return False
+
+            def read(self):
+                return runs(FAILED)
+
+        def answers(request, timeout, context):
+            seen.append((request.full_url, request.get_header("Accept"), timeout))
+            return Answer()
+
+        def refuses(request, timeout, context):
+            raise urllib.error.HTTPError(request.full_url, 403, "rate limit exceeded", message([("X-RateLimit-Remaining", "0"), ("X-RateLimit-Reset", "1792610000")]), io.BytesIO(RATE_LIMITED))
+
+        readings, due = watch.releases_read(watch.Http(answers), (STABLE,), 1_792_609_000_000)
+        self.assertEqual(seen, [(STABLE_URL, "application/vnd.github+json", watch.SAMPLE_S)])
+        self.assertEqual(([reading.seen for reading in readings], due), ([watch.BAD], 1_792_609_000_000 + 1_000_000 // 59))
+        readings, due = watch.releases_read(watch.Http(refuses), (STABLE,), 1_792_609_000_000)
+        self.assertEqual(([reading.seen for reading in readings], due), ([watch.UNREAD], 1_792_610_000_000))
 
 
 def reading(seen, check="rate"):
@@ -719,6 +831,31 @@ class Whole(unittest.TestCase):
         self.assertEqual(posted[-3:], [1, 1, 2])
         line = "bad under 10 GB free, good again at 10.5 GB free"
         self.assertEqual(texts, [f"🔴 node volume: 10.0 GB free of 29.7 GB (33% free), {line}", f"🟢 node volume is good again: 10.6 GB free of 29.7 GB (35% free), {line}"])
+
+    def test_a_failed_nightly_posts_once_with_its_run_and_good_again_once_one_passes_reading_github_only_as_its_limit_allows(self):
+        config = watch.Config(NODE, PUBLIC, "", "alerts", (), (), releases=(NIGHTLY,))
+        http = FakeHttp({NODE + "/v1/status": (200, status(1)), PUBLIC + "/v1/status": (200, status(1))})
+        cli = FakeCli()
+        clock = Clock()
+        posted = []
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = watch.Watch(config, http, ready_kube(), cli, watch.Store(pathlib.Path(temp) / "state.json"), watch.Pager([]), clock)
+            for at in range(19):
+                http.answers[PUSHES] = (200, LIMIT, runs(FAILED))
+                http.answers[SCHEDULED] = (200, LIMIT, runs(SCHEDULE_PASSED) if at == 18 else runs())
+                http.answers[DISPATCHED] = (200, LIMIT, runs())
+                http.answers[NODE + "/v1/status"] = (200, status(at * 10))
+                watcher.tick()
+                clock.now += watch.SAMPLE_S
+                posted.append(len(cli.ops))
+        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        self.assertEqual([http.asked.count(url) for url in (PUSHES, SCHEDULED, DISPATCHED)], [2, 2, 2])
+        self.assertEqual(posted, [1] * 18 + [2])
+        self.assertEqual(texts, [
+            "🔴 desktop nightly: release.yml's push run on dev at 4c70294b failed: https://github.com/ducktape-industries/app/actions/runs/39649540423",
+            "🟢 desktop nightly is good again: release.yml's schedule run on main at 437f7497 passed: https://github.com/ducktape-industries/app/actions/runs/39700000000",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

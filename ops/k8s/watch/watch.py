@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# watch: duckpond's alarms, off the chain and read-only. Each sample reads the block rate, the node's and the public /v1/status, ccs, harness's model budget, the Kubernetes API, the disks, the Deployments duckpond runs on and the run container of the warm pod /shared/tools/warm-pod names.
+# watch: duckpond's alarms, off the chain and read-only. Each sample reads the block rate, the node's and the public /v1/status, ccs, harness's model budget, the Kubernetes API, the disks, the Deployments duckpond runs on, the run container of the warm pod /shared/tools/warm-pod names and GitHub's newest finished run of each release WATCH_RELEASES names.
 # It posts to chat channel `alerts` when a check turns bad and when it is good again, never waiting on a block, and hands an alert that no block carries by the next sample to the pager command `WATCH_PAGER` names.
 # ops/k8s/watch/watch.yaml runs it on fabrics-1, watch-test.py tests it, and `watch.py once` prints one sample.
 import json
@@ -30,6 +30,8 @@ MARKS = {BAD: "🔴", OK: "🟢"}
 TURN_AFTER = 2
 SHAPE_ERRORS = (AttributeError, KeyError, TypeError, ValueError)
 WARM_POD_RUN = "run"
+GITHUB = "https://api.github.com"
+DECIDED = ("success", "failure")
 
 
 class Unread(Exception):
@@ -66,14 +68,22 @@ class Http:
         self.opener = opener
 
     def get(self, url, headers=None, context=None):
+        code, _, body = self.answer(url, headers, context)
+        return code, body
+
+    def answer(self, url, headers=None, context=None):
         request = urllib.request.Request(url, headers={"User-Agent": "watch", **(headers or {})})
         try:
             with self.opener(request, timeout=SAMPLE_S, context=context) as answer:
-                return answer.status, answer.read()
+                return answer.status, lowered(answer.headers), answer.read()
         except urllib.error.HTTPError as error:
-            return error.code, error.read()
+            return error.code, lowered(error.headers), error.read()
         except OSError as error:
             raise Unread(str(error)) from error
+
+
+def lowered(headers):
+    return {name.lower(): value for name, value in (headers or {}).items()}
 
 
 def height_of(status):
@@ -321,6 +331,74 @@ def warm_pod_seen(cli, kube, api, path, namespace):
         return unread(check, label, f"the API answered pod {namespace}/{name} in another shape: {error!r}")
 
 
+@dataclass(frozen=True)
+class Release:
+    check: str
+    label: str
+    repo: str
+    workflow: str
+    runs: tuple
+
+    @staticmethod
+    def of(row):
+        return Release(row["check"], row["label"], row["repo"], row["workflow"], tuple(tuple(sorted(runs.items())) for runs in row["runs"]))
+
+    def urls(self):
+        base = f"{GITHUB}/repos/{self.repo}/actions/workflows/{self.workflow}/runs"
+        return [f"{base}?{urllib.parse.urlencode({**dict(runs), 'status': 'completed'})}" for runs in self.runs]
+
+
+def github_said(body):
+    try:
+        return json.loads(body).get("message", "")
+    except SHAPE_ERRORS:
+        return body.decode(errors="replace").strip()
+
+
+def release_reading(release, answers):
+    runs = []
+    try:
+        for code, body in answers:
+            if code != 200:
+                return unread(release.check, release.label, f"GitHub answered {code}: {github_said(body)}")
+            runs.extend(json.loads(body)["workflow_runs"])
+        decided = sorted((run for run in runs if run["conclusion"] in DECIDED), key=lambda run: run["created_at"], reverse=True)
+        if not decided:
+            return unread(release.check, release.label, f"none of GitHub's {len(runs)} newest finished {release.workflow} runs passed or failed")
+        run = decided[0]
+        failed = run["conclusion"] == "failure"
+        value = f"{release.workflow}'s {run['event']} run on {run['head_branch']} at {run['head_sha'][:8]} {'failed' if failed else 'passed'}: {run['html_url']}"
+    except SHAPE_ERRORS as error:
+        return unread(release.check, release.label, f"GitHub answered in another shape: {error!r}")
+    return judged(release.check, release.label, failed, value)
+
+
+def next_read_ms(now_ms, headers, calls):
+    try:
+        remaining = int(headers["x-ratelimit-remaining"])
+        reset_ms = int(headers["x-ratelimit-reset"]) * 1000
+    except (KeyError, ValueError):
+        return now_ms
+    left_ms = max(reset_ms - now_ms, 0)
+    if remaining < calls:
+        return now_ms + left_ms
+    return now_ms + left_ms * calls // remaining
+
+
+def releases_read(http, releases, now_ms):
+    readings, headers = [], {}
+    for release in releases:
+        answers = []
+        try:
+            for url in release.urls():
+                code, headers, body = http.answer(url, {"Accept": "application/vnd.github+json"})
+                answers.append((code, body))
+            readings.append(release_reading(release, answers))
+        except Unread as error:
+            readings.append(unread(release.check, release.label, f"GitHub did not answer: {error}"))
+    return readings, next_read_ms(now_ms, headers, sum(len(release.runs) for release in releases))
+
+
 class Cli:
     def __init__(self, ducktape, node, workspace, keys, runner=subprocess.run):
         self.ducktape = ducktape
@@ -373,6 +451,7 @@ class Config:
     deployments: tuple
     warm_pod_file: str = ""
     warm_pod_namespace: str = ""
+    releases: tuple = ()
 
     @staticmethod
     def from_env(env):
@@ -385,6 +464,7 @@ class Config:
             deployments=tuple(env["WATCH_DEPLOYMENTS"].split()),
             warm_pod_file=env["WATCH_WARM_POD_FILE"],
             warm_pod_namespace=env["WATCH_WARM_POD_NAMESPACE"],
+            releases=tuple(Release.of(row) for row in json.loads(env.get("WATCH_RELEASES", "[]"))),
         )
 
 
@@ -517,6 +597,7 @@ class Watch:
         self.clock = clock
         self.stat = stat
         self.samples = []
+        self.released = ([], 0)
         self.state = store.load()
 
     def sample(self, now_ms):
@@ -530,7 +611,14 @@ class Watch:
         if self.config.warm_pod_file:
             readings.append(warm_pod_reading(self.cli, self.kube, api, self.config.warm_pod_file, self.config.warm_pod_namespace))
         readings.extend(disk_read(disk, self.stat, self.state["checks"].get(disk.check, {}).get("seen")) for disk in self.config.disks)
+        readings.extend(self.release_readings(now_ms))
         return readings
+
+    def release_readings(self, now_ms):
+        due_ms = self.released[1]
+        if self.config.releases and now_ms >= due_ms:
+            self.released = releases_read(self.http, self.config.releases, now_ms)
+        return self.released[0]
 
     def tick(self):
         now_ms = int(self.clock() * 1000)
@@ -540,7 +628,7 @@ class Watch:
         self.store.save(self.state)
 
     def run(self, pause=time.sleep):
-        say("watching", channel=self.config.channel, deployments=list(self.config.deployments), warm_pod=self.config.warm_pod_file, disks=[disk.check for disk in self.config.disks])
+        say("watching", channel=self.config.channel, deployments=list(self.config.deployments), warm_pod=self.config.warm_pod_file, disks=[disk.check for disk in self.config.disks], releases=[release.check for release in self.config.releases])
         while True:
             began = self.clock()
             self.tick()
