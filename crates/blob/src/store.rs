@@ -4,19 +4,23 @@
 
 mod frames;
 mod segments;
+mod tidier;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "testkit"))]
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use abi::{Blob, BlobHeader, BlobId, HashKind, Refusal, reason};
 
 use crate::contract::Entry;
 use crate::{Collision, Hasher, frame, header, id_of, is_kind, name_of, parse, parse_header};
-use segments::{Hit, Log};
+use segments::{Copier, Hit, Log, Plan, Round};
+pub use tidier::Tidier;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -92,9 +96,34 @@ struct Shared {
     dir: PathBuf,
     sizes: Sizes,
     log: Mutex<Log>,
+    copier: Mutex<Copier>,
     moving: Mutex<Moving>,
     partials: AtomicU64,
     held: fs::File,
+    #[cfg(any(test, feature = "testkit"))]
+    gate: Mutex<Option<Armed>>,
+}
+
+#[cfg(any(test, feature = "testkit"))]
+struct Armed {
+    reached: mpsc::SyncSender<()>,
+    go: mpsc::Receiver<()>,
+    on: std::thread::ThreadId,
+}
+
+#[cfg(any(test, feature = "testkit"))]
+pub struct CopyGate {
+    reached: mpsc::Receiver<()>,
+    _go: mpsc::SyncSender<()>,
+}
+
+#[cfg(any(test, feature = "testkit"))]
+impl CopyGate {
+    pub fn reached(&self) {
+        self.reached
+            .recv()
+            .expect("a tidy round reaches the gate before the store lets go of it");
+    }
 }
 
 #[derive(Default)]
@@ -173,7 +202,7 @@ impl Blobs {
                 format!("another process holds the blob store at {}", dir.display()),
             ),
         })?;
-        let mut log = Log::open(&dir.join(SEGMENTS), sizes.segment)?;
+        let (mut log, copier) = Log::open(&dir.join(SEGMENTS), sizes.segment)?;
         for (id, kind, len) in frames::held(&dir.join(FRAMED))? {
             log.hold_framed(id, &kind, len);
         }
@@ -181,9 +210,12 @@ impl Blobs {
             dir: dir.clone(),
             sizes,
             log: Mutex::new(log),
+            copier: Mutex::new(copier),
             moving: Mutex::default(),
             partials: AtomicU64::new(0),
             held,
+            #[cfg(any(test, feature = "testkit"))]
+            gate: Mutex::default(),
         });
         open.retain(|_, weak| weak.strong_count() > 0);
         open.insert(dir, Arc::downgrade(&shared));
@@ -199,6 +231,47 @@ impl Blobs {
 
     fn dir(&self) -> &Path {
         &self.shared.dir
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn gate_copies(&self) -> CopyGate {
+        let (reached, heard) = mpsc::sync_channel(1);
+        let (go, wait) = mpsc::sync_channel(0);
+        let armed = Armed {
+            reached,
+            go: wait,
+            on: std::thread::current().id(),
+        };
+        *self
+            .shared
+            .gate
+            .lock()
+            .expect("the copy gate is never poisoned") = Some(armed);
+        CopyGate {
+            reached: heard,
+            _go: go,
+        }
+    }
+
+    fn copied(&self) {
+        #[cfg(any(test, feature = "testkit"))]
+        {
+            let armed = self
+                .shared
+                .gate
+                .lock()
+                .expect("the copy gate is never poisoned")
+                .take();
+            if let Some(armed) = armed {
+                let elsewhere = armed.on != std::thread::current().id();
+                assert!(
+                    elsewhere,
+                    "a tidy round reached its copy on the thread that holds the gate, which can never let go"
+                );
+                let _ = armed.reached.send(());
+                let _ = armed.go.recv();
+            }
+        }
     }
 
     fn legacy(&self, id: &BlobId) -> PathBuf {
@@ -250,11 +323,16 @@ impl Blobs {
     pub fn remove(&self, id: &BlobId) -> Result<()> {
         let mut log = self.log();
         let framed = log.unframe(id);
+        let legacy = self.legacy(id);
+        let only_legacy = !framed && !log.holds(id) && legacy.is_file();
         log.bury(id)?;
+        if only_legacy {
+            log.bury_legacy(id)?;
+        }
         if framed {
             gone(fs::remove_file(self.framed_path(id)))?;
         }
-        gone(fs::remove_file(self.legacy(id)))
+        gone(fs::remove_file(legacy))
     }
 
     pub fn promote(&self, stage: Stage) -> Result<()> {
@@ -279,29 +357,93 @@ impl Blobs {
 
     pub fn tidy(&self) -> Result<()> {
         let whole = self.shared.sizes.segment;
-        let mut budget = whole;
-        let mut drained = Vec::new();
+        let mut copier = self
+            .shared
+            .copier
+            .lock()
+            .expect("the copy stream is never poisoned");
         let worn = self.log().worn();
+        let into_worn = copier.active().is_some_and(|n| worn.contains(&n));
+        if into_worn {
+            copier.roll()?;
+        }
+        let mut budget = whole;
+        let mut plans = Vec::new();
         for n in worn {
             if budget == 0 {
                 break;
             }
             let plan = self.log().plan(n, budget, whole)?;
             budget = budget.saturating_sub(plan.bytes);
-            let copies = plan.read()?;
-            let mut log = self.log();
-            log.land(copies)?;
-            if log.drained(n) {
-                drained.push(n);
+            plans.push(plan);
+        }
+        let batch = self.legacy_batch(budget, whole)?;
+        let mut round = Round::default();
+        let mut framed = Vec::new();
+        let copied = self.copy(plans, batch, &mut copier, &mut round, &mut framed);
+        if let Err(error) = copied {
+            self.log().strays(round, &mut copier);
+            for (_, partial) in framed {
+                let _ = fs::remove_file(&partial.path);
+            }
+            return Err(error);
+        }
+        self.copied();
+        let mut log = self.log();
+        let landed = log.land(round, &mut copier);
+        let mut unlink = landed.unlink;
+        let mut dropped = Vec::new();
+        let mut published = Vec::new();
+        for (legacy, partial) in framed {
+            let fresh = legacy.path.is_file() && !log.holds(&legacy.id);
+            match fresh {
+                true => {
+                    fs::rename(&partial.path, self.framed_path(&legacy.id))?;
+                    log.hold_framed(legacy.id, &partial.kind, partial.len);
+                    published.push(legacy.path);
+                }
+                false => {
+                    dropped.push(partial.path);
+                    if log.holds(&legacy.id) {
+                        unlink.push(legacy.path);
+                    }
+                }
             }
         }
-        self.sync()?;
-        let mut log = self.log();
-        for n in drained {
-            log.retire(n)?;
-        }
         drop(log);
-        self.move_legacy(budget, whole)
+        drop(copier);
+        for path in landed.drained.into_iter().chain(dropped) {
+            gone(fs::remove_file(path))?;
+        }
+        if !published.is_empty() {
+            synced_dir(&self.dir().join(FRAMED))?;
+        }
+        for path in unlink.into_iter().chain(published) {
+            gone(fs::remove_file(path))?;
+        }
+        Ok(())
+    }
+
+    fn copy(
+        &self,
+        plans: Vec<Plan>,
+        batch: Vec<Legacy>,
+        copier: &mut Copier,
+        round: &mut Round,
+        framed: &mut Vec<(Legacy, Partial)>,
+    ) -> Result<()> {
+        for plan in plans {
+            plan.copy(copier, round)?;
+        }
+        for legacy in batch {
+            match self.moved(&legacy) {
+                Ok(Some(Moved::Logged(record))) => round.moved(copier, record, legacy.path)?,
+                Ok(Some(Moved::Framed(partial))) => framed.push((legacy, partial)),
+                Ok(None) | Err(Error::Corrupt(..) | Error::Collision(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        copier.sync()
     }
 
     fn sync(&self) -> Result<()> {
@@ -412,43 +554,8 @@ impl Blobs {
             Err(error) => return Err(error.into()),
         };
         let framed = verified(&legacy.id, framed)?;
-        let record = segments::record(legacy.id, &framed)?;
+        let record = segments::legacy_record(legacy.id, &framed)?;
         Ok(Some(Moved::Logged(record)))
-    }
-
-    fn move_legacy(&self, budget: u64, whole: u64) -> Result<()> {
-        let mut moved = Vec::new();
-        for legacy in self.legacy_batch(budget, whole)? {
-            match self.moved(&legacy) {
-                Ok(Some(prepared)) => moved.push((legacy, prepared)),
-                Ok(None) | Err(Error::Corrupt(..) | Error::Collision(_)) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        if moved.is_empty() {
-            return Ok(());
-        }
-        let mut log = self.log();
-        for (legacy, prepared) in &moved {
-            let fresh = legacy.path.is_file() && !log.holds(&legacy.id);
-            match (fresh, prepared) {
-                (true, Moved::Logged(record)) => log.log(record)?,
-                (true, Moved::Framed(partial)) => {
-                    self.publish_framed(&mut log, legacy.id, partial)?
-                }
-                (false, Moved::Logged(_)) => {}
-                (false, Moved::Framed(partial)) => gone(fs::remove_file(&partial.path))?,
-            }
-        }
-        drop(log);
-        self.sync()?;
-        let log = self.log();
-        for (legacy, _) in moved {
-            if log.holds(&legacy.id) {
-                gone(fs::remove_file(&legacy.path))?;
-            }
-        }
-        Ok(())
     }
 
     pub fn unpack(self) -> Result<Unpacked> {
@@ -1761,6 +1868,170 @@ mod tests {
         drop(old);
         let aside = Blobs::open(&root.path().join("aside")).unwrap();
         assert_eq!(aside.get(&id).unwrap().unwrap().body, text(8));
+    }
+
+    fn worn(dir: &Path) -> (Blobs, Vec<BlobId>) {
+        let blobs = Blobs::sized(dir, SMALL).unwrap();
+        let (ids, _) = put_each(&blobs, dir, 30);
+        for (i, id) in ids.iter().enumerate() {
+            if !i.is_multiple_of(3) {
+                blobs.remove(id).unwrap();
+            }
+        }
+        blobs.promote(Stage::default()).unwrap();
+        (blobs, ids)
+    }
+
+    fn reads_kept(blobs: &Blobs, ids: &[BlobId], released: &[usize]) {
+        for (i, id) in ids.iter().enumerate() {
+            let kept = i.is_multiple_of(3) && !released.contains(&i);
+            let want = kept.then(|| noise(300, i as u64));
+            assert_eq!(
+                blobs.get(id).unwrap().map(|blob| blob.body),
+                want,
+                "blob {i}"
+            );
+        }
+    }
+
+    fn held_mid_copy(blobs: &Blobs) -> (CopyGate, std::thread::JoinHandle<()>) {
+        let gate = blobs.gate_copies();
+        let tidier = blobs.clone();
+        let round = std::thread::spawn(move || tidier.tidy().unwrap());
+        gate.reached();
+        (gate, round)
+    }
+
+    fn lock_is_free(blobs: &Blobs) -> bool {
+        blobs.shared.log.try_lock().is_ok()
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        for path in every_file(from).into_keys() {
+            let into = to.join(path.strip_prefix(from).unwrap());
+            fs::create_dir_all(into.parent().unwrap()).unwrap();
+            fs::copy(&path, &into).unwrap();
+        }
+    }
+
+    fn newest(dir: &Path, magic: &[u8; 8]) -> Option<PathBuf> {
+        every_file(&dir.join(SEGMENTS))
+            .into_keys()
+            .filter(|path| fs::read(path).unwrap().starts_with(magic))
+            .max()
+    }
+
+    #[test]
+    fn a_tidy_round_held_mid_copy_holds_no_lock_a_block_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, ids) = worn(dir.path());
+        let (gate, round) = held_mid_copy(&blobs);
+        assert!(
+            lock_is_free(&blobs),
+            "a tidy round holds the store's lock while it copies"
+        );
+        let mut stage = Stage::default();
+        let fresh = stage.put(HashKind::Sha256, "page", &text(5)).unwrap();
+        blobs.promote(stage).unwrap();
+        blobs.remove(&ids[3]).unwrap();
+        blobs.promote(Stage::default()).unwrap();
+        assert_eq!(blobs.get(&fresh).unwrap().unwrap().body, text(5));
+        reads_kept(&blobs, &ids, &[3]);
+        drop(gate);
+        round.join().unwrap();
+
+        reads_kept(&blobs, &ids, &[3]);
+        assert_eq!(blobs.get(&fresh).unwrap().unwrap().body, text(5));
+        drop(blobs);
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        reads_kept(&blobs, &ids, &[3]);
+        assert_eq!(blobs.get(&fresh).unwrap().unwrap().body, text(5));
+    }
+
+    #[test]
+    fn a_blob_released_between_its_copy_and_the_land_stays_gone_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, ids) = worn(dir.path());
+        let (gate, round) = held_mid_copy(&blobs);
+        assert!(
+            lock_is_free(&blobs),
+            "a tidy round holds the store's lock while it copies"
+        );
+        blobs.remove(&ids[0]).unwrap();
+        blobs.promote(Stage::default()).unwrap();
+        let crashed = tempfile::tempdir().unwrap();
+        copy_dir(dir.path(), crashed.path());
+        drop(gate);
+        round.join().unwrap();
+        reads_kept(&blobs, &ids, &[0]);
+
+        for _ in 0..2 {
+            let reopened = Blobs::sized(crashed.path(), SMALL).unwrap();
+            assert!(
+                !reopened.has(&ids[0]),
+                "a blob released while its copy waited to land is back after a crash"
+            );
+            reads_kept(&reopened, &ids, &[0]);
+            for _ in 0..ids.len() {
+                reopened.tidy().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn each_stream_cut_in_its_last_write_reopens_with_every_whole_record_before_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, ids) = worn(dir.path());
+        let (gate, round) = held_mid_copy(&blobs);
+        assert!(
+            newest(dir.path(), b"dtblobc1").is_some(),
+            "a tidy round writes its copies to segments of their own"
+        );
+        let mut stage = Stage::default();
+        let cut = stage.put(HashKind::Sha256, "page", &text(6)).unwrap();
+        blobs.promote(stage).unwrap();
+        let crashed = tempfile::tempdir().unwrap();
+        copy_dir(dir.path(), crashed.path());
+        drop(gate);
+        round.join().unwrap();
+
+        let mut cuts = Vec::new();
+        for magic in [b"dtblobs1", b"dtblobc1"] {
+            let path = newest(crashed.path(), magic).unwrap();
+            let &(at, size) = segments::heads(&path).last().unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(at + size / 2)
+                .unwrap();
+            cuts.push((path, at));
+        }
+        let reopened = Blobs::sized(crashed.path(), SMALL).unwrap();
+        for (path, at) in &cuts {
+            assert_eq!(
+                fs::metadata(path).unwrap().len(),
+                *at,
+                "{} is cut back to its last whole record",
+                path.display()
+            );
+        }
+        assert!(
+            !reopened.has(&cut),
+            "the blob whose write was cut is absent"
+        );
+        reads_kept(&reopened, &ids, &[]);
+        let mut stage = Stage::default();
+        let after = stage.put(HashKind::Sha256, "page", &text(7)).unwrap();
+        reopened.promote(stage).unwrap();
+        for _ in 0..ids.len() {
+            reopened.tidy().unwrap();
+        }
+        drop(reopened);
+        let reopened = Blobs::sized(crashed.path(), SMALL).unwrap();
+        reads_kept(&reopened, &ids, &[]);
+        assert_eq!(reopened.get(&after).unwrap().unwrap().body, text(7));
+        assert!(!reopened.has(&cut));
     }
 
     #[test]

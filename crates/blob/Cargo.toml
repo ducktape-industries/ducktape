@@ -19,6 +19,7 @@ node = [
     "dep:tokio",
     "dep:tracing",
 ]
+testkit = ["store"]
 
 [dependencies]
 abi = { workspace = true }

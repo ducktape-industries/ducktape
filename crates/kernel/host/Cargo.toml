@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+blob = { workspace = true, features = ["testkit"] }
 commonware-utils = { workspace = true }
 fixture-access = { path = "../fixtures/access" }
 fixture-awaiter = { path = "../fixtures/awaiter" }

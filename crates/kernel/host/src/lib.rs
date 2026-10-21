@@ -18,7 +18,7 @@ use abi::{
     ProgramCall, ProgramId, Receipt, Refusal, Root, Scan, hook, reason,
     role::{self, access, identity, ownership, programs, validators},
 };
-use blob::{Blobs, Layered, Stage};
+use blob::{Blobs, Layered, Stage, Tidier};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
@@ -200,6 +200,7 @@ where
 {
     store: Store<E>,
     blobs: Blobs,
+    tidier: Tidier,
     network: Vec<u8>,
     roles: Roles,
     loaded: Loaded,
@@ -452,10 +453,12 @@ where
         }
         let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
+        let tidier = Tidier::spawn(blobs.clone())?;
         let layout_from = namespace::layout_from(&genesis.network);
         let mut host = Host {
             store,
             blobs,
+            tidier,
             network: genesis.network,
             roles: roles.clone(),
             loaded: Loaded::new(genesis.limits, None),
@@ -566,9 +569,11 @@ where
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
         let roles = roles_of(&store.view(Vec::new()))?;
         let layout_from = namespace::layout_from(&network);
+        let tidier = Tidier::spawn(blobs.clone())?;
         let mut host = Host {
             store,
             blobs,
+            tidier,
             network,
             roles,
             loaded: Loaded::new(limits, None),
@@ -965,7 +970,7 @@ where
         };
         let applied = applied?;
         self.unlink(&applied.writes, block.time).await;
-        self.tidy();
+        self.tidier.wake();
         Ok(applied)
     }
 }
@@ -2236,17 +2241,6 @@ where
             self.blobs.remove(&id)?;
         }
         Ok(())
-    }
-
-    fn tidy(&self) {
-        if let Err(error) = self.blobs.tidy() {
-            tracing::warn!(
-                target: "ducktape::blobs",
-                event = "blob_tidy_failed",
-                %error,
-                "the blob store kept a worn segment or an old file this block; the block is applied"
-            );
-        }
     }
 
     async fn unlink(&self, writes: &Writes, time: u64) {

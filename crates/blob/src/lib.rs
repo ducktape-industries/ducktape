@@ -12,10 +12,12 @@ use abi::{BlobHeader, BlobId, HashKind, Refusal, hex, reason};
 use sha1_checked::CollisionResult;
 use sha2::Digest as _;
 
+#[cfg(feature = "testkit")]
+pub use store::CopyGate;
 #[cfg(feature = "store")]
 pub use store::{
-    Blobs, Error, FRAME_BYTES, Layered, Reader, Result, SEGMENT_BYTES, Stage, Unpacked, file_entry,
-    names, size_of, window,
+    Blobs, Error, FRAME_BYTES, Layered, Reader, Result, SEGMENT_BYTES, Stage, Tidier, Unpacked,
+    file_entry, names, size_of, window,
 };
 
 pub fn is_kind(kind: &str) -> bool {
