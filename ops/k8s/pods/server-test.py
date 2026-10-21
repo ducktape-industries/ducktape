@@ -509,6 +509,13 @@ class Wait(Streamed):
         self.assertEqual(response.read(), b"")
         self.assertNotIn("watch_pod", self.kube.verbs())
 
+    def test_a_wait_stream_says_the_same_request_may_pick_it_up_again(self):
+        self.kube.answer("get", ran(pod_json(state=ENDED, phase="Succeeded")))
+        response = self.stream("/v1/pods/duckpond-41/wait?every=30", headers={**ASKED, "ducktape-heard": "3"})
+        self.assertEqual(response.getheader("ducktape-reattach"), "request")
+        kind, data = self.event(response)
+        self.assertEqual((kind, data["exit_code"]), ("ended", 0))
+
     def test_a_wait_names_every_in_whole_seconds_from_one(self):
         for query, words in (("", "names every"), ("?every=0", "from 1"), ("?every=1.5", "whole number"), ("?every=5&tail=3", "no tail")):
             self.refused("GET", f"/v1/pods/duckpond-41/wait{query}", None, 400, [words])
@@ -632,6 +639,13 @@ class StreamedExec(Streamed):
         self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
         self.assertEqual(response.read(), b"")
         self.assertEqual(self.kube.calls[-1], ("exec", "duckpond-41", None, ["make"]))
+
+    def test_an_exec_stream_is_not_marked_for_another_pick_up(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        self.kube.answer("exec", ran(b"built\n"))
+        response = self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"], "every": 30})
+        self.assertIsNone(response.getheader("ducktape-reattach"))
+        self.assertEqual(self.past_alive(response)[0], "ended")
 
     def test_an_exec_without_every_still_answers_whole(self):
         self.kube.answer("exec", ran(b"built\n"))
@@ -3950,7 +3964,9 @@ class DesktopRunner(Streamed):
 
     def test_a_wait_ends_when_the_runners_log_stream_does(self):
         self.gate.processes.append(Followed(255, b"Timeout, server lan not responding.\n"))
-        kind, data = self.past_alive(self.stream("/v1/pods/desktop/wait?every=9"))
+        response = self.stream("/v1/pods/desktop/wait?every=9")
+        self.assertEqual(response.getheader("ducktape-reattach"), "request")
+        kind, data = self.past_alive(response)
         self.assertEqual(kind, "ended")
         self.assertEqual((data["exit_code"], data["pod"]), (None, None))
         self.assertIn("ssh exit 255", data["line"])

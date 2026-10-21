@@ -48,7 +48,12 @@ or through a member node's halo forward.
   egress's wait for a whole answer (`DEFAULT_WAIT`, 64 blocks, times the network's block time,
   which `deploy` reads from `NODE_URL`'s `/v1/status`), since egress gives up on a whole answer
   then anyway. A stream has no such bound (egress's wait runs from its last event), so a roll
-  still ends every stream as cut; the command an exec stream ran goes on in its pod.
+  ends every stream it holds. A wait (a pod's or a build runner's) answers with
+  `ducktape-reattach: request`, so a node that serves egress (core `README.md`, the service
+  request section) sends the same request again to the new pod, which waits on the same pod
+  and ends with its real end; a wait's events before its end are only alive beats, so the new
+  one starts afresh whatever `ducktape-heard` says. An exec stream carries no such mark and
+  is still cut; the command it ran goes on in its pod.
 
 - **A Kubernetes namespace and ServiceAccount.** `pods.yaml` makes namespace `pods`, which
   holds the service, and namespace `agents`, where agents' work runs. It also makes the

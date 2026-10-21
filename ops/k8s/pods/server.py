@@ -58,6 +58,8 @@ ATTEMPT_LABEL = NOTE + FLEET_ATTEMPT
 NOTIFY_CHANNEL = NOTE + "notify-channel"
 NOTIFY_THREAD = NOTE + "notify-thread"
 NOTIFIED = NOTE + "notified"
+REATTACH = "ducktape-reattach"
+REATTACH_BY = "request"
 NOTIFY_LINE = "ducktape-notify "
 NOTIFY_FOR = "ducktape-notify-for "
 CALLER_WORD = "CALLER="
@@ -314,6 +316,7 @@ class Answered:
 @dataclass
 class Stream:
     events: object
+    reattach: bool = False
 
 
 @dataclass(frozen=True)
@@ -3803,8 +3806,8 @@ class Service:
     def wait(self, name, query, headers):
         every = wait_every(query, headers)
         if name in self.runners:
-            return 200, Stream(self.runner_waited(name, self.runners[name].follow(every), every))
-        return 200, Stream(self.waited(name, self.pod(name), every))
+            return 200, Stream(self.runner_waited(name, self.runners[name].follow(every), every), reattach=True)
+        return 200, Stream(self.waited(name, self.pod(name), every), reattach=True)
 
     def follow(self, name):
         with self.lock:
@@ -4420,7 +4423,7 @@ def handler(service, drain=None):
                     status, answer = 500, {"error": f"the pods service failed: {error!r}"}
                 if isinstance(answer, Stream):
                     streaming = True
-                    self.stream(status, answer.events)
+                    self.stream(status, answer)
                     return
                 match answer:
                     case Answered(kind=kind, body=payload):
@@ -4442,10 +4445,13 @@ def handler(service, drain=None):
                 if not kept:
                     self.close_connection = True
 
-        def stream(self, status, events):
+        def stream(self, status, answer):
+            events = answer.events
             kept = drain.streaming(self.connection)
             self.send_response(status)
             self.send_header("content-type", "text/event-stream")
+            if answer.reattach:
+                self.send_header(REATTACH, REATTACH_BY)
             self.send_header("cache-control", "no-cache")
             self.send_header("transfer-encoding", "chunked")
             self.send_header("connection", "close")
