@@ -361,7 +361,7 @@ fn asked_first<E: Context>(
     time: u64,
     frame: &[u8],
 ) -> Result<(Asked, Ran), Refusal> {
-    let submission = node::verify(frame, network)?;
+    let submission = node::verify_query(frame, network)?;
     let fresh = view.source().fresh(&submission);
     let asked = Asked::from(submission);
     let ran = match fresh {

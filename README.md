@@ -1096,7 +1096,8 @@ node's own identity key. Each verb's
 `/v1/watch/<program>[?keys]` is a WebSocket that carries what
 `/v1/changes/<program>[?keys]` carries, plus standing queries. The client
 sends borsh `Watch` frames: `Ask { id, frame }`, with a query frame signed as
-`/v1/query` takes it, and `Drop { id }`. The node checks the frame and its
+`/v1/query` takes it (under `ducktape:query`: an op's signature is refused, so
+no standing ask is also a transaction), and `Drop { id }`. The node checks the frame and its
 anchor once, runs the query on the confirmed layer as the frame's signer and
 answers `Pushed::Answer { id, height, outcome }`; an ask that is refused does
 not stand. A node that caps no query's fuel (no `load.query_fuel`) refuses
