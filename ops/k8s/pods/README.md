@@ -4,7 +4,7 @@
 cluster through the network's egress. It makes pods with fetched inputs and execs into
 them, either whole or streamed. It also serves logs and a wait that streams until a pod
 ends, applies and deletes manifests, passes Kubernetes API calls through inside one
-namespace, puts a pod's outputs as blobs or files, packs a pod's commit for a forge push,
+namespace, puts a pod's outputs as blobs or files, reads a file out of a pod, packs a pod's commit for a forge push and reads forge's report of it,
 posts when work ends, and reports usage. The build runners `PODS_RUNNERS` names (`desktop`
 unless it names others) are machines reserved as pods of their names, reached by ssh, straight
 or through a member node's halo forward.

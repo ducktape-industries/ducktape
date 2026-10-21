@@ -479,10 +479,10 @@ class Served(unittest.TestCase):
 
 
 class Streamed(Served):
-    def stream(self, path, method="GET", body=None):
+    def stream(self, path, method="GET", body=None, headers=ASKED):
         connection = http.client.HTTPConnection(*self.http.server_address)
         self.addCleanup(connection.close)
-        connection.request(method, path, body=None if body is None else json.dumps(body).encode(), headers=ASKED)
+        connection.request(method, path, body=None if body is None else json.dumps(body).encode(), headers=headers)
         return connection.getresponse()
 
     def event(self, response):
@@ -517,6 +517,20 @@ class Wait(Streamed):
     def test_a_wait_on_no_pod_is_refused_before_any_stream(self):
         self.kube.answer("get", ran(code=1, err=NOT_FOUND))
         self.refused("GET", "/v1/pods/duckpond-9/wait?every=5", None, 404, ["duckpond-9"])
+
+    def test_a_wait_takes_every_from_its_every_header(self):
+        self.kube.answer("get", ran(pod_json(state=ENDED, phase="Succeeded")))
+        response = self.stream("/v1/pods/duckpond-41/wait", headers={**ASKED, "every": "30"})
+        self.assertEqual(response.status, 200)
+        kind, data = self.event(response)
+        self.assertEqual((kind, data["exit_code"]), ("ended", 0))
+
+    def test_a_waits_every_header_is_a_whole_number_of_seconds_from_one(self):
+        for every, words in (("0", "from 1"), ("1.5", "whole number"), ("x", "the every header")):
+            code, answer = self.call("GET", "/v1/pods/duckpond-41/wait", None, {**ASKED, "every": every})
+            self.assertEqual(code, 400, answer)
+            self.assertIn(words, answer["error"])
+        self.assertNotIn("get", self.kube.verbs())
 
     def test_a_running_pod_is_alive_each_every_until_its_run_container_ends(self):
         self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
@@ -624,6 +638,22 @@ class StreamedExec(Streamed):
         status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]})
         self.assertEqual((status, answer), (200, {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
         self.assertNotIn("get", self.kube.verbs())
+
+    def test_an_exec_with_an_every_header_streams_as_one_with_every_does(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        self.kube.answer("exec", ran(b"built\n"))
+        response = self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"]}, {**ASKED, "every": "30"})
+        self.assertEqual((response.status, response.getheader("content-type")), (200, "text/event-stream"))
+        self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
+        self.assertEqual(response.read(), b"")
+        self.assertEqual(self.kube.calls[-1], ("exec", "duckpond-41", None, ["make"]))
+
+    def test_an_execs_every_header_is_a_whole_number_of_seconds_from_one(self):
+        for every, words in (("0", "from 1"), ("1.5", "whole number"), ("x", "the every header")):
+            code, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"]}, {**ASKED, "every": every})
+            self.assertEqual(code, 400, answer)
+            self.assertIn(words, answer["error"])
+        self.assertNotIn("exec", self.kube.verbs())
 
     def test_a_streamed_exec_on_no_pod_is_refused_before_any_stream(self):
         self.kube.answer("get", ran(code=1, err=NOT_FOUND))
@@ -1051,6 +1081,71 @@ class Exec(Served):
         self.assertEqual(self.call("POST", "/v1/pods/duckpond-9/exec", {"command": ["true"]})[0], 404)
         self.refused("POST", "/v1/pods/duckpond-41/exec", {"command": []}, 400, ["command holds strings"])
 
+    def test_a_script_runs_with_sh_c(self):
+        self.kube.answer("exec", ran(b"hi\n"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"script": "echo hi | cat"})
+        self.assertEqual((status, answer["stdout"]), (200, "hi\n"))
+        self.assertEqual(self.kube.calls, [("exec", "duckpond-41", None, ["sh", "-c", "echo hi | cat"])])
+
+    def test_an_exec_names_its_command_or_its_script(self):
+        self.refused("POST", "/v1/pods/duckpond-41/exec", {"command": ["true"], "script": "true"}, 400, ["not both"])
+        self.refused("POST", "/v1/pods/duckpond-41/exec", {"script": ""}, 400, ["script holds shell text"])
+        self.refused("POST", "/v1/pods/duckpond-41/exec", {"script": ["true"]}, 400, ["script is a JSON str"])
+        self.assertEqual(self.kube.calls, [])
+
+
+class Read(Served):
+    def test_a_read_answers_the_files_size_and_its_bytes_from_the_offset(self):
+        self.kube.answer("exec", ran(b"11\nllo wo"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/read", {"path": "/out/a", "offset": 2, "length": 6})
+        self.assertEqual((status, answer), (200, {"path": "/out/a", "size": 11, "offset": 2, "length": 6, "eof": False, "text": "llo wo"}))
+        self.assertEqual(self.kube.calls, [("exec", "duckpond-41", None, ["sh", "-c", server.READING, "read", "/out/a", "2", "6"])])
+
+    def test_a_read_to_the_end_says_eof_and_bytes_that_are_not_text_come_as_hex(self):
+        self.kube.answer("exec", ran(b"3\n\xff\x00\x01"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/read", {"path": "/out/b", "container": "out"})
+        self.assertEqual((status, answer["eof"], answer["length"], answer["text_hex"]), (200, True, 3, "ff0001"))
+        self.assertNotIn("text", answer)
+        self.assertEqual(self.kube.calls[-1][2:], ("out", ["sh", "-c", server.READING, "read", "/out/b", "0", ""]))
+
+    def test_a_missing_file_is_not_found_and_another_failure_is_refused_with_why(self):
+        missing = ran(code=2, err="sh: 1: cannot open /nope: No such file\ncommand terminated with exit code 2")
+        directory = ran(code=1, err="tail: error reading '/d': Is a directory\ncommand terminated with exit code 1")
+        self.kube.answer("exec", missing, directory)
+        self.refused("POST", "/v1/pods/duckpond-41/read", {"path": "/nope"}, 404, ["/nope was not read", "No such file"])
+        self.refused("POST", "/v1/pods/duckpond-41/read", {"path": "/d"}, 400, ["/d was not read", "Is a directory"])
+
+    def test_a_pod_kubernetes_cannot_reach_is_refused_with_why(self):
+        self.kube.answer("exec", ran(code=1, err=NOT_FOUND))
+        self.refused("POST", "/v1/pods/duckpond-9/read", {"path": "/out/a"}, 404, ["duckpond-9"])
+
+    def test_a_read_names_an_absolute_path_an_offset_from_0_and_a_length_from_1(self):
+        for body, words in (
+            ({}, "names its path"),
+            ({"path": "x"}, "absolute path"),
+            ({"path": "/x", "offset": -1}, "from 0"),
+            ({"path": "/x", "length": 0}, "from 1"),
+            ({"path": "/x", "length": "5"}, "JSON int"),
+            ({"path": "/x", "every": 5}, "no field every"),
+        ):
+            self.refused("POST", "/v1/pods/duckpond-41/read", body, 400, [words])
+        self.assertEqual(self.kube.calls, [])
+
+    def test_reading_prints_the_size_then_the_bytes_asked(self):
+        with tempfile.TemporaryDirectory() as work:
+            path = pathlib.Path(work) / "f"
+            path.write_bytes(b"hello world")
+
+            def read(file, *words):
+                return subprocess.run(["sh", "-c", server.READING, "read", str(file), *words], capture_output=True)
+
+            for words, printed in ((("0", ""), b"11\nhello world"), (("6", ""), b"11\nworld"), (("2", "3"), b"11\nllo"), (("20", ""), b"11\n")):
+                done = read(path, *words)
+                self.assertEqual((done.returncode, done.stdout), (0, printed), done.stderr)
+            missing = read(pathlib.Path(work) / "nope", "0", "")
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn(b"No such file", missing.stderr)
+
 
 class Blob(Served):
     def setUp(self):
@@ -1259,6 +1354,99 @@ class Push(Served):
         self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "have": ["main"]}, 400, ["commit ids"])
         self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "repo": "core"}, 400, ["no field repo"])
         self.assertEqual(self.kube.calls, [])
+
+    def test_a_push_to_a_branch_takes_its_head_from_heads_and_answers_what_forges_push_takes(self):
+        self.kube.answer("exec", ran(f"{COMMIT} {HAVE}\n1\n".encode()), ran(pack_of(3)))
+        heads = [{"name": "refs/heads/j-1/x", "target": HAVE}, {"name": "refs/heads/j-1/x-2", "target": "ab" * 20}]
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/push", {"path": "/work/programs", "branch": "j-1/x", "heads": heads})
+        self.assertEqual(status, 200, answer)
+        line = f"{HAVE} {COMMIT} refs/heads/j-1/x".encode() + b"\0report-status"
+        request = f"{len(line) + 4:04x}".encode() + line + b"0000"
+        self.assertEqual((answer["branch"], answer["old"], answer["unchanged"], answer["commit"]), ("refs/heads/j-1/x", HAVE, False, COMMIT))
+        self.assertEqual(answer["forge"], {"request": request.hex(), "pack": {"Sha256": "cd" * 32}})
+        resolve, pack = self.execs()
+        self.assertEqual((resolve[3][-2:], pack[3][-2:]), (["HEAD", HAVE], [COMMIT, HAVE]))
+
+    def test_a_new_branch_is_pushed_from_zeros_against_only_the_remote_refs(self):
+        self.kube.answer("exec", ran(f"{COMMIT} {HAVE}\n1\n".encode()), ran(pack_of(1)))
+        heads = [{"name": "refs/heads/j-1/x-2", "target": "ab" * 20}]
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "branch": "j-1/x", "heads": heads})
+        self.assertEqual((status, answer["old"], answer["unchanged"]), (200, None, False), answer)
+        sent = bytes.fromhex(answer["forge"]["request"])
+        self.assertEqual(sent[4:].split(b"\0")[0], f"{'0' * 40} {COMMIT} refs/heads/j-1/x".encode())
+        resolve, pack = self.execs()
+        self.assertEqual((resolve[3][-1], pack[3][-1]), ("HEAD", COMMIT))
+
+    def test_a_commit_that_does_not_land_alone_is_refused_unless_allow_stack(self):
+        stacked = ran(f"{COMMIT} {'ab' * 20}\n2\n".encode())
+        self.kube.answer("exec", stacked, stacked, stacked, ran(pack_of(2)))
+        onto = {"path": "/w", "branch": "j-1/x", "heads": [{"name": "refs/heads/j-1/x", "target": HAVE}]}
+        self.refused("POST", "/v1/pods/duckpond-41/push", onto, 409, [f"is not a child of refs/heads/j-1/x's head {HAVE}", "allow_stack: true"])
+        self.refused("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "branch": "j-1/y", "heads": []}, 409, ["which forge does not hold yet", "2 commits", "allow_stack: true"])
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/push", {**onto, "allow_stack": True})
+        self.assertEqual((status, answer["commits"]), (200, 2), answer)
+        self.assertEqual((len(self.execs()), len(self.signer.puts)), (4, 1))
+
+    def test_a_branch_already_at_the_commit_answers_unchanged(self):
+        self.kube.answer("exec", ran(f"{COMMIT} {HAVE}\n0\n".encode()), ran(pack_of(0)))
+        heads = [{"name": "refs/heads/j-1/x", "target": COMMIT}]
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/push", {"path": "/w", "branch": "j-1/x", "heads": heads})
+        self.assertEqual((status, answer["unchanged"], answer["forge"]["pack"]), (200, True, None), answer)
+        self.assertEqual(self.signer.puts, [])
+
+    def test_a_push_to_a_branch_names_the_branch_by_name_its_heads_and_no_have(self):
+        for body, words in (
+            ({"path": "/w", "branch": "refs/heads/x", "heads": []}, "a branch's name under refs/heads/"),
+            ({"path": "/w", "branch": "-x", "heads": []}, "a branch's name under refs/heads/"),
+            ({"path": "/w", "branch": "x"}, "names heads"),
+            ({"path": "/w", "branch": "x", "have": [HAVE], "heads": []}, "not both"),
+            ({"path": "/w", "heads": []}, "heads only with its branch"),
+            ({"path": "/w", "allow_stack": True}, "allow_stack only with its branch"),
+            ({"path": "/w", "branch": "x", "heads": [{"name": "refs/heads/x"}]}, "each {name, target}"),
+            ({"path": "/w", "branch": "x", "heads": [{"name": "refs/heads/x", "target": "main"}]}, "not a commit id"),
+            ({"path": "/w", "branch": "x", "heads": [], "allow_stack": "yes"}, "allow_stack is a JSON bool"),
+        ):
+            self.refused("POST", "/v1/pods/duckpond-41/push", body, 400, [words])
+        self.assertEqual(self.kube.calls, [])
+
+
+def pkt(text):
+    data = text.encode()
+    return f"{len(data) + 4:04x}".encode() + data
+
+
+class Report(Served):
+    PUSHED = {"branch": "refs/heads/j-1/x", "commit": COMMIT, "old": HAVE, "objects": 3, "unchanged": False}
+
+    def test_a_report_of_the_branch_moving_answers_the_push(self):
+        report = (pkt("unpack ok\n") + pkt("ok refs/heads/j-1/x\n") + b"0000").hex()
+        status, answer = self.call("POST", "/v1/report", {"report": report, "push": self.PUSHED})
+        self.assertEqual((status, answer), (200, {"pushed": "refs/heads/j-1/x", "head": COMMIT, "old": HAVE, "objects": 3}))
+        self.assertEqual((self.kube.calls, self.signer.submits), ([], []))
+
+    def test_a_branch_forge_did_not_move_is_refused_in_forges_words(self):
+        report = (pkt("unpack ok\n") + pkt("ng refs/heads/j-1/x non-fast-forward\n") + b"0000").hex()
+        answer = self.refused("POST", "/v1/report", {"report": report, "push": self.PUSHED}, 409, [])
+        self.assertEqual(answer["error"], "forge did not move the branch: ng refs/heads/j-1/x non-fast-forward")
+
+    def test_a_pack_forge_did_not_unpack_is_refused_with_why(self):
+        report = (pkt("unpack index-pack failed\n") + b"0000").hex()
+        self.refused("POST", "/v1/report", {"report": report, "push": self.PUSHED}, 422, ["forge took none of the pack: index-pack failed"])
+
+    def test_a_branch_already_at_its_commit_is_unchanged_whatever_the_report_says(self):
+        report = (pkt("unpack ok\n") + pkt("ng refs/heads/j-1/x up to date\n") + b"0000").hex()
+        status, answer = self.call("POST", "/v1/report", {"report": report, "push": {**self.PUSHED, "old": COMMIT, "unchanged": True}})
+        self.assertEqual((status, answer), (200, {"pushed": "refs/heads/j-1/x", "head": COMMIT, "old": COMMIT, "objects": 3, "unchanged": True}))
+
+    def test_bytes_that_are_no_git_report_are_refused(self):
+        for report, status, words in (
+            ("zz", 400, "as hex"),
+            (b"0003abc".hex(), 400, "no git report"),
+            (b"00ffabc".hex(), 400, "no git report"),
+            ((pkt("unpack ok\n") + b"0000").hex(), 502, "names no ref"),
+        ):
+            self.refused("POST", "/v1/report", {"report": report, "push": self.PUSHED}, status, [words])
+        self.refused("POST", "/v1/report", {"push": self.PUSHED}, 400, ["names its report"])
 
 
 class Retried(Served):

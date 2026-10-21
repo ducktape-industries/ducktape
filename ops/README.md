@@ -183,7 +183,7 @@ one up for another network.
 - `k8s/pods/server.py` is the service, and `server.py fetch` the init
   container that fetches a pod's inputs. Its routes, under `/v1`: `pods`
   (create, list), `pods/NAME` (status, delete), `pods/NAME/logs`,
-  `pods/NAME/wait`, `pods/NAME/exec`, `pods/NAME/blob`, `pods/NAME/file`, `pods/NAME/push`, `manifests` (apply,
+  `pods/NAME/wait`, `pods/NAME/exec`, `pods/NAME/read`, `pods/NAME/blob`, `pods/NAME/file`, `pods/NAME/push`, `report`, `manifests` (apply,
   delete), `manifests/KIND[/NAME]`, `usage`, and `k8s/PATH`, which passes a
   Kubernetes API call through when PATH is inside namespace `agents`
   (`api/v1/namespaces/agents/...`, `apis/GROUP/VERSION/namespaces/agents/...`)
@@ -388,7 +388,9 @@ one up for another network.
   ```
 
 - `pods/NAME/wait?every=SECONDS` and an exec that names `every` answer
-  `text/event-stream`, which a network hears event by event
+  `text/event-stream` (either may give `every` as the request header
+  `every: SECONDS` instead, as harness's paced streams do; a query's or an
+  exec's own `every` is read before the header), which a network hears event by event
   (`Delivery::Events`): an `alive` event each `every` seconds, which moves
   the caller's egress expiry on, then one `ended` event and the end of the
   stream. A stream is chunked and ends with its last chunk only once its last
@@ -411,6 +413,32 @@ one up for another network.
   The service pushes nothing: the caller sends forge's
   `Push` with the pack as its own account, so forge's write list decides as
   for any push.
+- A push may name a `branch` (its name under `refs/heads/`, like `j-1/x`)
+  and `heads`, the items of forge's `RefNames` for the prefix
+  `refs/heads/<branch>`, in place of `have`: the item named exactly
+  `refs/heads/<branch>` is the branch's head (`old`, `null` for a new
+  branch), and what forge holds. Unless `allow_stack` is true it refuses
+  (409) a commit whose parent is not that head, or one that would land more
+  than one commit forge does not hold yet. The answer adds `branch`, `old`,
+  `unchanged` (the branch is at the commit already) and `forge`: `request`,
+  the pkt-lines forge's `Push` takes (`<old> <commit> refs/heads/<branch>\0report-status`,
+  zeros for a new branch's old, then a flush) as hex, and `pack`, the blob
+  as forge's `BlobId` (`{"Sha256": hex}`, or `null`): the values forge's
+  `Push` takes as they are.
+- `report` `{report, push}` reads forge's answer to that `Push` (git's
+  report-status, as hex) for the answer of the push it made: 200 `{pushed,
+  head, old, objects}` when forge moved the branch, and with `unchanged`
+  when the push said the branch was at its commit already, whatever the
+  report holds; 409 `forge did not move the branch: <its line>`; 422 when
+  forge did not unpack the pack; 400 for bytes that are no git report.
+- `pods/NAME/read` `{path, offset, length, container}` reads a file
+  straight out of a pod: its `size`, and its bytes from `offset` (0 when
+  left out), `length` of them or all the rest, as `text`, or `text_hex`
+  where they are not UTF-8, with the `length` read and `eof`. A file that
+  is not there answers 404, any other failure to read it 400. A build
+  runner (`desktop`) refuses it as it refuses any exec that is not build.sh.
+- An exec names its `command` (a list, run as it is) or its `script`
+  (shell text, run with `sh -c`), never both.
 - `pods/NAME/blob` `{path | paths, kind, container}` puts a file the pod
   wrote as a blob of `kind` and answers its `blob` id and `size`; with
   `paths` it puts every one of them in one bundle and answers `blobs`, a

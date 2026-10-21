@@ -81,8 +81,10 @@ FORGE = {"repo": str, "commit": str}
 FILES = {"path": str, "snapshot": str}
 BLOB = {"path": str, "paths": list, "kind": str, "container": str}
 FILE = {"path": str, "to": str, "message": str, "container": str}
-EXEC = {"command": list, "container": str, "every": int}
-PUSH = {"path": str, "ref": str, "have": list, "container": str}
+EXEC = {"command": list, "script": str, "container": str, "every": int}
+PUSH = {"path": str, "ref": str, "have": list, "container": str, "branch": str, "heads": list, "allow_stack": bool}
+READ = {"path": str, "offset": int, "length": int, "container": str}
+REPORT = {"report": str, "push": dict}
 APPLY = {"manifests": list, "requester": int}
 DELETE = {"kind": str, "name": str}
 LOGS = {"tail", "since", "container"}
@@ -227,6 +229,11 @@ shift 2
 having "$new" "$@" | git pack-objects --revs --stdout -q
 """
 )
+READING = r"""size=$(wc -c < "$1") || exit
+printf '%s\n' "$size"
+if [ -n "$3" ]; then tail -c +$(($2 + 1)) -- "$1" | head -c "$3"; else tail -c +$(($2 + 1)) -- "$1"; fi
+"""
+FLUSH = b"0000"
 WATCH_PAUSE = 1
 SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 DESKTOP = "desktop"
@@ -1165,7 +1172,10 @@ def checked(body, shape, what):
     if unknown:
         raise Refused(400, f"{what} has no field {', '.join(unknown)}; its fields are {', '.join(shape)}")
     for field, kind in shape.items():
-        mistyped = field in body and (not isinstance(body[field], kind) or isinstance(body[field], bool))
+        value = body.get(field)
+        wrong_kind = not isinstance(value, kind)
+        bool_for_number = kind is not bool and isinstance(value, bool)
+        mistyped = field in body and (wrong_kind or bool_for_number)
         if mistyped:
             raise Refused(400, f"{what}'s {field} is a JSON {kind.__name__}")
     return body
@@ -1787,16 +1797,46 @@ def from_one(value, field):
     return value
 
 
-def wait_every(query):
+def wait_every(query, headers):
     unknown = sorted(set(query) - WAIT)
     if unknown:
         raise Refused(400, f"a wait takes no {', '.join(unknown)}; it takes every")
-    if "every" not in query:
-        raise Refused(400, "a wait names every: the seconds between the alive events that keep the caller's request from expiring")
-    value = query["every"][-1]
+    if "every" in query:
+        return seconds(query["every"][-1], "every")
+    every = header_every(headers)
+    if every is None:
+        raise Refused(400, "a wait names every, in its query or as its every header: the seconds between the alive events that keep the caller's request from expiring")
+    return every
+
+
+def seconds(value, field):
     if not value.isdigit():
-        raise Refused(400, "every is a whole number of seconds from 1")
-    return from_one(int(value), "every")
+        raise Refused(400, f"{field} is a whole number of seconds from 1")
+    return from_one(int(value), field)
+
+
+def header_every(headers):
+    if "every" not in headers:
+        return None
+    return seconds(headers["every"], "the every header")
+
+
+def exec_every(asked, headers):
+    if "every" in asked:
+        return from_one(asked["every"], "every")
+    return header_every(headers)
+
+
+def exec_command(asked):
+    match asked:
+        case {"command": _, "script": _}:
+            raise Refused(400, "an exec names its command or its script, not both")
+        case {"script": ""}:
+            raise Refused(400, "script holds shell text")
+        case {"script": script}:
+            return ["sh", "-c", script]
+        case _:
+            return strings(asked.get("command", []), "command")
 
 
 def sse(event, data):
@@ -1857,6 +1897,129 @@ def git_output(name, ran, doing):
 def exec_answer(name, ran):
     stderr = reached(name, ran)
     return {"exit_code": ran.code, **text_or_hex(ran.out, "stdout"), **text_or_hex(stderr.encode(), "stderr")}
+
+
+def read_answer(name, path, offset, ran):
+    stderr = reached(name, ran).strip()
+    if ran.code != 0:
+        status = 404 if "No such file" in stderr else 400
+        raise Refused(status, f"{path} was not read: {stderr or f'exit code {ran.code}'}")
+    line, newline, data = ran.out.partition(b"\n")
+    sized = bool(newline) and line.strip().isdigit()
+    if not sized:
+        raise Refused(502, f"reading {path} printed no size line first: {ran.out[:80]!r}")
+    size = int(line)
+    return {"path": path, "size": size, "offset": offset, "length": len(data), "eof": offset + len(data) >= size, **text_or_hex(data, "text")}
+
+
+def pkt_line(data):
+    return f"{len(data) + 4:04x}".encode() + data
+
+
+def pkt_lines(data):
+    lines, at = [], 0
+    while at < len(data):
+        head = data[at : at + 4]
+        size = int(head, 16) if re.fullmatch(rb"[0-9a-f]{4}", head) else None
+        framed = size is not None and (size == 0 or 4 <= size <= len(data) - at)
+        if not framed:
+            raise Refused(400, f"the report is no git report: {data[:80]!r}")
+        if size:
+            lines.append(data[at + 4 : at + size].rstrip(b"\n").decode(errors="replace"))
+        at += size or 4
+    return lines
+
+
+def forge_blob(blob):
+    if blob is None:
+        return None
+    kind, _, digest = blob.partition(":")
+    return {kind.capitalize(): digest}
+
+
+def branch_head(ref, heads):
+    for head in heads:
+        listed = isinstance(head, dict) and isinstance(head.get("name"), str) and isinstance(head.get("target"), str)
+        if not listed:
+            raise Refused(400, "heads holds forge's RefNames items, each {name, target}")
+        if head["name"] != ref:
+            continue
+        if not OID.fullmatch(head["target"]):
+            raise Refused(400, f"heads names {ref} at {head['target']!r}, not a commit id")
+        return head["target"]
+    return None
+
+
+class Onto:
+    def __init__(self, branch, heads, allow_stack):
+        self.ref = f"refs/heads/{branch}"
+        self.old = branch_head(self.ref, heads)
+        self.allow_stack = allow_stack
+
+    def have(self):
+        return [] if self.old is None else [self.old]
+
+    def lands(self, commit, parents, commits):
+        unchanged = commit == self.old
+        lands_as_asked = self.allow_stack or unchanged
+        if lands_as_asked:
+            return
+        parent = parents[0] if parents else "no parent"
+        asked = "allow_stack: true is for a push like that made on purpose, such as carrying someone's commits"
+        moved_on = self.old is not None and parent != self.old
+        if moved_on:
+            raise Refused(409, f"{commit} is not a child of {self.ref}'s head {self.old}: its parent is {parent}. Rebase it onto {self.old}, or push {parent} first if it belongs there; {asked}")
+        if commits > 1:
+            raise Refused(409, f"{commit} stacks on {parent}, which forge does not hold yet: the push would land {commits} commits on the new branch {self.ref}. Push {parent} first, or rebase {commit} onto a commit forge holds, like dev's head; {asked}")
+
+    def answered(self, answer):
+        commit = answer["commit"]
+        old = self.old or "0" * len(commit)
+        request = pkt_line(f"{old} {commit} {self.ref}".encode() + b"\0report-status") + FLUSH
+        forge = {"request": request.hex(), "pack": forge_blob(answer["pack"])}
+        return {**answer, "branch": self.ref, "old": self.old, "unchanged": commit == self.old, "forge": forge}
+
+
+def pushed_onto(asked):
+    if "branch" not in asked:
+        unbranched = [field for field in ("heads", "allow_stack") if field in asked]
+        if unbranched:
+            raise Refused(400, f"a push names {unbranched[0]} only with its branch")
+        return None
+    branch = asked["branch"]
+    if "have" in asked:
+        raise Refused(400, "a push names its branch or its have, not both: with a branch, the branch's head in heads is what forge has")
+    plain = bool(branch) and not branch.startswith(("refs/", "-"))
+    if not plain:
+        raise Refused(400, f"branch {branch!r} is a branch's name under refs/heads/, like j-1/x")
+    if "heads" not in asked:
+        raise Refused(400, f"a push to a branch names heads: the items of forge's RefNames for the prefix refs/heads/{branch}")
+    return Onto(branch, asked["heads"], asked.get("allow_stack", False))
+
+
+def onto_answer(onto, answer):
+    return answer if onto is None else onto.answered(answer)
+
+
+def report_answer(report, push):
+    said = {"pushed": push.get("branch"), "head": push.get("commit"), "old": push.get("old"), "objects": push.get("objects")}
+    if push.get("unchanged") is True:
+        return {**said, "unchanged": True}
+    try:
+        data = bytes.fromhex(report)
+    except ValueError as error:
+        raise Refused(400, "report is forge's Push answer as hex, as an op step reads it") from error
+    for line in pkt_lines(data):
+        match line.split(" ", 1):
+            case ["unpack", "ok"]:
+                continue
+            case ["unpack", why]:
+                raise Refused(422, f"forge took none of the pack: {why}")
+            case ["ok", ref]:
+                return {**said, "pushed": ref}
+            case _:
+                raise Refused(409, f"forge did not move the branch: {line}")
+    raise Refused(502, f"forge's report names no ref: {report}")
 
 
 def log_options(query):
@@ -3487,8 +3650,8 @@ class Service:
             raise kube_refusal(ran, f"pod {name}'s logs were not read")
         return 200, ran.out
 
-    def wait(self, name, query):
-        every = wait_every(query)
+    def wait(self, name, query, headers):
+        every = wait_every(query, headers)
         if name in self.runners:
             return 200, Stream(self.runner_waited(name, self.runners[name].follow(every), every))
         return 200, Stream(self.waited(name, self.pod(name), every))
@@ -3645,15 +3808,15 @@ class Service:
             raise kube_refusal(ran, f"pod {name} was not deleted")
         return 200, {"deleted": name}
 
-    def exec(self, name, asked_by, body):
+    def exec(self, name, asked_by, body, headers):
         asked = checked(body, EXEC, "an exec")
-        command = self.called(asked_by, name, strings(asked.get("command", []), "command"))
+        every = exec_every(asked, headers)
+        command = self.called(asked_by, name, exec_command(asked))
         container = asked.get("container")
         if name in self.runners and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in runner_words(command, name)):
             self.follow(name)
-        if "every" not in asked:
+        if every is None:
             return 200, exec_answer(name, answered(self.execution(asked_by, name, container, command).get()))
-        every = from_one(asked["every"], "every")
         if name not in self.runners and name != BUILDS:
             self.pod(name)
         return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
@@ -3748,7 +3911,8 @@ class Service:
         rev = asked.get("ref") or "HEAD"
         if rev.startswith("-"):
             raise Refused(400, f"ref {rev} names a revision, not an option")
-        have = asked.get("have", [])
+        onto = pushed_onto(asked)
+        have = asked.get("have", []) if onto is None else onto.have()
         unnamed = [oid for oid in have if not isinstance(oid, str) or not OID.fullmatch(oid)]
         if unnamed:
             raise Refused(400, f"have holds commit ids, 40 or 64 lowercase hex digits, not {unnamed[0]!r}")
@@ -3759,13 +3923,15 @@ class Service:
         lines = git_output(name, resolved, f"{rev} names no commit in {path}").decode().splitlines()
         commit, *parents = lines[0].split()
         commits = int(lines[1])
+        if onto is not None:
+            onto.lands(commit, parents, commits)
         packing = ["sh", "-c", PACKING, "pack", path, commit, *have]
         packed = self.executed(asked_by, name, container, packing, again=True)
         pack = git_output(name, packed, f"{commit} was not packed in {path}")
         objects = objects_of(pack)
         answer = {"commit": commit, "parents": parents, "commits": commits, "objects": objects, "size": len(pack), "kind": PACK}
         if objects == 0:
-            return 200, {**answer, "pack": None}
+            return 200, onto_answer(onto, {**answer, "pack": None})
         with tempfile.TemporaryDirectory() as temp:
             file = Path(temp) / "pack"
             file.write_bytes(pack)
@@ -3773,7 +3939,23 @@ class Service:
         if put.code != 0:
             raise Refused(502, f"the pack was not put: {put.err or put.out.decode(errors='replace')}")
         held = put_answer(put.out.decode(), 1)
-        return 200, {**answer, "pack": held.pop("blobs")[0], **held}
+        return 200, onto_answer(onto, {**answer, "pack": held.pop("blobs")[0], **held})
+
+    def contents(self, name, asked_by, body):
+        asked = named(checked(body, READ, "a read"), ["path"], "a read")
+        path = absolute(asked["path"], "path")
+        offset = number(asked.get("offset", 0), "offset")
+        length = asked.get("length")
+        too_short = length is not None and length < 1
+        if too_short:
+            raise Refused(400, "length is a number from 1")
+        command = ["sh", "-c", READING, "read", path, str(offset), "" if length is None else str(length)]
+        ran = self.executed(asked_by, name, asked.get("container"), command, again=True)
+        return 200, read_answer(name, path, offset, ran)
+
+    def report(self, body):
+        asked = named(checked(body, REPORT, "a report"), ["report", "push"], "a report")
+        return 200, report_answer(asked["report"], asked["push"])
 
     def cluster_kinds(self):
         ran = self.kube.cluster_kinds()
@@ -3919,9 +4101,11 @@ class Service:
             case ("GET", "pods", name, "logs"):
                 return self.logs(name, query)
             case ("GET", "pods", name, "wait"):
-                return self.wait(name, query)
+                return self.wait(name, query, headers)
             case ("POST", "pods", name, "exec"):
-                return self.exec(name, asked, parsed(body))
+                return self.exec(name, asked, parsed(body), headers)
+            case ("POST", "pods", name, "read"):
+                return self.contents(name, asked, parsed(body))
             case ("POST", "pods", name, "blob"):
                 return self.blob(name, asked, parsed(body))
             case ("POST", "pods", name, "file"):
@@ -3938,6 +4122,8 @@ class Service:
                 return self.read(kind, None)
             case ("GET", "manifests", kind, name):
                 return self.read(kind, name)
+            case ("POST", "report"):
+                return self.report(parsed(body))
             case ("GET", "usage"):
                 return self.usage()
             case (_, "k8s", *path):
@@ -3946,12 +4132,12 @@ class Service:
                 raise Refused(404, f"{method} {parts.path} is not a route")
 
 
-POD_ROUTES = ("logs", "wait", "exec", "blob", "file", "push")
+POD_ROUTES = ("logs", "wait", "exec", "read", "blob", "file", "push")
 
 
 def route_of(target):
     match [segment for segment in urlsplit(target).path.split("/") if segment]:
-        case ["v1", ("pods" | "manifests" | "usage") as route]:
+        case ["v1", ("pods" | "manifests" | "usage" | "report") as route]:
             return route
         case ["v1", "pods", _]:
             return "pods/NAME"
