@@ -461,3 +461,63 @@ fn an_overlay_counts_every_write_and_a_restore_takes_none_back() {
     assert!(overlay.written_since(APP, before));
     assert_eq!(overlay.mark(), before + 2);
 }
+
+#[test]
+fn a_key_deleted_and_put_again_between_adoptions_keeps_its_new_value() {
+    deterministic::Runner::default().start(|context| async move {
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let mut upstream = Store::open(
+            context.child("upstream"),
+            "s",
+            storage(&upstream_dir),
+            [APP.to_owned()],
+        )
+        .await
+        .unwrap();
+        upstream
+            .commit(0, writes(APP, &[(b"a", Some(b"1")), (b"b", Some(b"2"))]))
+            .await
+            .unwrap();
+        let (_, commitments) = upstream.into_parts();
+        let dir = tempfile::tempdir().unwrap();
+        let mut adoption = Adoption::default();
+        let joiner = Store::adopt_from(
+            context.child("joiner"),
+            "s",
+            storage(&dir),
+            0,
+            commitments,
+            &mut adoption,
+        )
+        .await
+        .unwrap();
+
+        let (storage, mut commitments) = joiner.into_parts();
+        let mut app = commitments.remove(APP).unwrap();
+        let deleted = writes(APP, &[(b"a", None)]);
+        app.apply(1, &deleted.programs[APP]).await.unwrap();
+        let put_again = writes(APP, &[(b"a", Some(b"11"))]);
+        app.apply(2, &put_again.programs[APP]).await.unwrap();
+        let expected_root = app.root().unwrap();
+        let joiner = Store::adopt_from(
+            context.child("again"),
+            "s",
+            storage,
+            2,
+            BTreeMap::from([(APP.to_owned(), app)]),
+            &mut adoption,
+        )
+        .await
+        .unwrap();
+        assert!(
+            adoption.replaced().is_empty(),
+            "APP wrote only what changed"
+        );
+        assert_eq!(joiner.height().unwrap(), Some(2));
+        assert_eq!(joiner.root(APP).unwrap().unwrap(), expected_root);
+        assert_eq!(
+            joiner.view(vec![]).scan(APP, &Scan::prefix(b"")).unwrap(),
+            vec![entry(b"a", b"11"), entry(b"b", b"2")]
+        );
+    });
+}

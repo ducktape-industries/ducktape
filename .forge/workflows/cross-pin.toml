@@ -1,0 +1,22 @@
+# core's build at its programs pin: a change that touches abi, blob or the pin checks the workspace with its tests,
+# which compiles every programs crate core links against this abi. tools' cross-pin.sh decides and runs it.
+name = "cross-pin"
+
+[on]
+push = ["dev"]
+change = ["opened", "updated"]
+
+[notify]
+channel = "ci"
+
+[[jobs]]
+id = "cross-pin"
+runs-on = ["pods"]
+cpu = "16"
+scratch = ["/var/tmp/target"]
+image = "localhost:5000/toolchain:b240e4516c93@sha256:d80bfd948f37f381542c720e3f67a39c06606e88aec9f66f88aefb295468136b"
+steps = [
+    "git config --global --add safe.directory '*'",
+    "git clone -q \"$(git remote get-url origin | sed 's#/forge/core$#/forge/tools#')\" /var/tmp/tools",
+    "sh /var/tmp/tools/cross-pin.sh /work/core",
+]
