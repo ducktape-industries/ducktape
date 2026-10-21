@@ -10,16 +10,19 @@ The app people run never speaks a different contract from the node, in either di
 
 - Pick the roll height R. Post R and the expected time in #engineering, in a thread of its own (the roll thread). Mention eddy (18), orthory (15), the operator (22) and every resident operator.
 - Check that the app people have installed already shows "this node speaks contract X; update this app" (app #144 and later). A roll never ships that screen.
-- Stage every client's contract N+1 build and say where each one is. Staged means proven, not only built: each build has run once against an N+1 node (a local network, or a rehearsal on a copy) before R. On 10-21 chief-relay's first contract-10 image crash-looped, because it signed queries as writes. The clients:
-  - the node and every resident (each runs `ducktape roll R` at R);
-  - pods, the mac runner, forge-mirror, pushd, chief-relay, pi-chief;
-  - the reconcile, watch and warm pod images, and the warm pod's shared `/out` binaries (its pause check reads `/out/ducktape` and fails closed);
-  - the desktop build runner's toolchain and out images;
-  - every repo's CI toolchain pin under `.forge/workflows` (tools check.toml, app gates and release tomls, programs gates.toml);
-  - the operator's own CLI scripts (post, readback, alerts), in their N+1 form;
-  - each agent's CLI, its git helper (git-remote-duck as a release, not only a blob under ops/) and change_op;
-  - ts-client and the chat bridge;
-  - the operator's client list from the last roll, which is kept as the template.
+- Stage every client's contract N+1 build and say where each one is. Staged means proven, not only built: each build has run once against an N+1 node (a local network, or a rehearsal on a copy) before R. On 10-21 chief-relay's first contract-10 image crash-looped, because it signed queries as writes. The clients, each with its owner after the colon, who acks R and swaps it at R (on 10-21 pushd sat on contract 9 for 2h40m because nobody owned its swap):
+  - the node: the operator (22); every resident: its own operator (each runs `ducktape roll R` at R);
+  - pods, the mac runner, forge-mirror, chief-relay, pi-chief: the operator (22);
+  - pushd: eddy-zk-1 (39);
+  - the reconcile, watch and warm pod images: the operator (22);
+  - the build machines' shared `/out` binaries, the warm pod's and the desktop build runner's out image (the warm pod's pause check reads `/out/ducktape` and fails closed): tech (21);
+  - the desktop build runner's toolchain image: the operator (22);
+  - every repo's CI toolchain pin under `.forge/workflows` (tools check.toml, app gates and release tomls, programs gates.toml): tech (21);
+  - the operator's own CLI scripts (post, readback, alerts), in their N+1 form: the operator (22);
+  - each agent's CLI, its git helper (git-remote-duck as a release, not only a blob under ops/) and change_op: tech (21);
+  - ts-client: eddy-zk-1 (39); the chat bridge: the operator (22);
+  - publish the CLI release `bin-<core commit>` on GitHub (the ducktape CLI and git-remote-duck, which cloud boxes install over HTTPS): the operator (22);
+  - the operator's client list from the last roll, which is kept as the template: the operator (22).
 - The contract N+1 app change is reviewed and ready, but not merged.
 - If TestFlight allows it, build the N+1 app from that reviewed branch now and hold it undistributed.
 - Acks. Every client owner acks R in the roll thread before R. A missing ack either holds the roll, or goes on the checklist as a named gap before R.
