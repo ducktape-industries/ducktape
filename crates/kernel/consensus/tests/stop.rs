@@ -116,7 +116,11 @@ fn an_actor_ended_by_a_dropped_acknowledgement_leaves_its_engines_no_closed_mail
                 chain,
             );
             let validators = vec![key.public_key().as_ref().to_vec()];
-            membership.seat(genesis.tip(), &validators).await.unwrap();
+            let unopened = abi::Root([0; 32]);
+            membership
+                .seat(genesis.tip(), unopened, &validators)
+                .await
+                .unwrap();
             deliveries.next().await.expect("a block is delivered");
             assert!(ended.await.is_err(), "the actor ends on the dropped ack");
             membership.stop().await;

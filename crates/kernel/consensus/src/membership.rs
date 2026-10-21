@@ -1,4 +1,6 @@
+use abi::Root;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
+use commonware_consensus::types::Height;
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Blocker, Receiver, Sender};
@@ -7,10 +9,11 @@ use commonware_utils::ordered::Set;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::Tip;
+use node::Settled;
 
 use crate::anchor::Anchor;
 use crate::catchup::{self, Signal};
-use crate::chain::Chain;
+use crate::chain::{Chain, Opening, required_after};
 use crate::engine::{Engine, Epoch, floor, sweep};
 use crate::lanes::{EngineMux, Lanes};
 use crate::marshal::{Marshal, MarshalMailbox};
@@ -120,16 +123,22 @@ where
 
     /// Seats the epoch after `tip` with its `validators`' keys; a node whose
     /// key is not among them follows.
-    pub async fn seat(&mut self, tip: Tip, validators: &[Vec<u8>]) -> Result<Standing, Error> {
+    pub async fn seat(
+        &mut self,
+        tip: Tip,
+        root: Root,
+        validators: &[Vec<u8>],
+    ) -> Result<Standing, Error> {
         let epoch = self.network.epoch_after(tip.height);
         let validators = validators_of(validators).ok_or(Error::Validators { epoch })?;
         self.roster.seat(epoch, validators);
-        let standing = self.engine(epoch, tip).await?;
+        let opening = opening(&self.marshal, &self.network, epoch, tip, root).await;
+        let standing = self.engine(epoch, tip, opening).await?;
         let _ = self.seats.unbounded_send(Signal::Seated(epoch));
         Ok(standing)
     }
 
-    async fn engine(&mut self, epoch: u64, tip: Tip) -> Result<Standing, Error> {
+    async fn engine(&mut self, epoch: u64, tip: Tip, opening: Opening) -> Result<Standing, Error> {
         let Some((scheme, standing)) = self.seat_in(epoch) else {
             self.engine = None;
             self.votes.clear();
@@ -153,6 +162,7 @@ where
                 previous,
                 floor,
                 votes: self.votes.clone(),
+                opening,
             },
             lanes,
             &self.marshal,
@@ -180,4 +190,34 @@ where
         let seats_someone = !verifier.participants().is_empty();
         seats_someone.then_some((verifier, Standing::Follower))
     }
+}
+
+async fn opening(
+    marshal: &MarshalMailbox,
+    network: &Network,
+    epoch: u64,
+    tip: Tip,
+    root: Root,
+) -> Opening {
+    let first = network.first(epoch);
+    let floored_on_the_close = tip.height + 1 == first;
+    let settled = floored_on_the_close.then_some(Settled {
+        height: tip.height,
+        root: root.0,
+    });
+    let required = opened(marshal, network, epoch.checked_sub(1)).await;
+    Opening {
+        first,
+        settled,
+        required,
+    }
+}
+
+async fn opened(marshal: &MarshalMailbox, network: &Network, epoch: Option<u64>) -> bool {
+    let Some(epoch) = epoch else {
+        return false;
+    };
+    let first = Height::new(network.first(epoch));
+    let previous = marshal.get_block(first).await;
+    required_after(previous.as_ref())
 }

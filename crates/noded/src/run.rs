@@ -467,6 +467,7 @@ async fn start<E: Context>(
     let history = History::open(&history_dir, Durability::EachBlock)?;
     let seated = recorded_epochs(&node)?;
     let tip = node.tip()?;
+    let root = node.host().root()?;
     let epoch = network.epoch_after(tip.height);
     let validators = seated.get(&epoch).cloned().ok_or(Error::Corrupt(format!(
         "the state records no validators for epoch {epoch}: it predates validators being \
@@ -623,7 +624,7 @@ async fn start<E: Context>(
         &marshal,
         chain,
     );
-    let standing = membership.seat(tip, &validators).await?;
+    let standing = membership.seat(tip, root, &validators).await?;
     tracing::info!(
         target: "ducktape::node",
         event = "node_started",
@@ -1514,7 +1515,9 @@ async fn applied<E: Context>(
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
     tracker.track(epoch, &members);
-    membership.seat(block.tip(), &validators).await?;
+    membership
+        .seat(block.tip(), node.host().root()?, &validators)
+        .await?;
     phases.seating = lap.lap();
     let follows = !validators.contains(&daemon.identity);
     if follows {

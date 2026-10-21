@@ -341,6 +341,14 @@ ducktape join https://a.example.org --halo b.example.org:9100 --invite <hex>
 ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100
 ```
 
+Each epoch's first block carries, as its last frame, the root of the
+network's state after the previous epoch's last block (`node::Settled`): the
+hash over every program's commitment root that `ducktape status` prints. A
+node seats an epoch's validators only once it has applied the block that
+closes the epoch before, so each holds that root, and each refuses a first
+block whose record names another root, and a record on any other block.
+The record is no frame: nothing runs it.
+
 Membership changes only by the validators' vote. The door starts closed, so
 a stranger needs an invite a validator signed: `ducktape invite` prints one,
 good for one enrollment for 72 hours (`--hours`). Validators vote with

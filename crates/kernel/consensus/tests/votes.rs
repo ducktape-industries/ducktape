@@ -107,7 +107,11 @@ impl Peer {
             &marshal,
             chain,
         );
-        membership.seat(genesis.tip(), validators).await.unwrap();
+        let unopened = abi::Root([0; 32]);
+        membership
+            .seat(genesis.tip(), unopened, validators)
+            .await
+            .unwrap();
         let votes = membership.votes().clone();
         let (applied, heights) = mpsc::unbounded();
         context.child("pump").spawn({

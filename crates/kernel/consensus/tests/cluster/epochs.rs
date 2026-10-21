@@ -75,6 +75,76 @@ fn a_validator_epochs_behind_catches_up_by_the_traffic_it_hears() {
     });
 }
 
+async fn every_epoch_opens_on_the_root_it_closed_on(peer: &Peer, network: &Network, tip: u64) {
+    for height in 1..=tip {
+        let block = peer.marshal.block(height).await.unwrap();
+        let records: Vec<(usize, Settled)> = block.records().collect();
+        let opens = height % network.epoch_length == 0;
+        let expected = match opens {
+            true => vec![(
+                block.frames.len().saturating_sub(1),
+                Settled {
+                    height: height - 1,
+                    root: peer.root_at(height - 1).0,
+                },
+            )],
+            false => Vec::new(),
+        };
+        assert_eq!(records, expected, "block {height}");
+    }
+}
+
+#[test]
+fn each_epoch_opens_on_the_root_its_last_epoch_closed_on() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=3).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh(&context, &keys).await;
+        let network = network(4);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+        let alice = key(11);
+        peers[0]
+            .submit(frame(&alice, vec![set(b"settled", b"yes")]))
+            .await;
+        let tip = peers[0].reached(network.first(3)).await;
+        every_epoch_opens_on_the_root_it_closed_on(&peers[0], &network, tip).await;
+    });
+}
+
+#[test]
+fn validators_refuse_an_epoch_opening_on_a_root_they_never_reached() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=4).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh(&context, &keys).await;
+        let network = network(4);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+        peers[3].skew_root();
+
+        let opened = peers[3].proposes_an_opening(&network).await;
+        let tip = peers[0].reached(opened + 1).await;
+        every_epoch_opens_on_the_root_it_closed_on(&peers[0], &network, tip).await;
+    });
+}
+
+#[test]
+fn validators_refuse_an_opening_with_no_record_once_the_last_one_carried_one() {
+    runner().start(|context| async move {
+        let keys: Vec<_> = (1..=4).map(key).collect();
+        let members: Vec<_> = keys.iter().map(member).collect();
+        let oracle = mesh(&context, &keys).await;
+        let network = network(4);
+        let mut peers = validators(&context, &oracle, &keys, &members, &network).await;
+        peers[3].tamper(Tamper::Unseal {
+            from: network.first(2),
+        });
+
+        let unsealed = peers[3].tampered().await;
+        let tip = peers[0].reached(unsealed + 1).await;
+        every_epoch_opens_on_the_root_it_closed_on(&peers[0], &network, tip).await;
+    });
+}
+
 /// `follower` applies `height` before `source` closes that height's epoch:
 /// it follows at the tip, not an epoch behind.
 async fn follows_at_the_tip(follower: &mut Peer, source: &Peer, height: u64, network: &Network) {

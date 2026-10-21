@@ -178,7 +178,7 @@ impl Marshal {
         )
         .await;
         let fed = Some((buffer.clone(), resolver.1.clone()));
-        let actor = actor.start(App::<E, C>::new(chain, cadence), buffer, resolver);
+        let actor = actor.start(App::<E, C>::new(chain, cadence, None), buffer, resolver);
         Ok(Marshal {
             mailbox,
             anchor,

@@ -9,7 +9,7 @@ use commonware_cryptography::ed25519::certificate::Certificate;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_utils::Participant;
 use host::Tip;
-use node::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES};
+use node::{BLOCK_BYTES, Block, Digest, Frame, MESSAGE_BYTES, Settled};
 
 const RESOLVER_FRAMING: usize = 8 + 1 + 5;
 
@@ -45,9 +45,27 @@ fn the_largest_frame_a_block_carries_fills_it_and_one_byte_more_does_not() {
     let largest = largest_carried(&bytes);
     assert!(!Block::carries(&bytes[..largest + 1]));
     let frame = bytes[..largest].to_vec();
-    let block = Block::packed(WIDEST, u64::MAX, [&frame]);
+    let mut block = Block::packed(WIDEST, u64::MAX, [&frame]);
     assert_eq!(block.frames.len(), 1);
+    block.settle(Settled {
+        height: u64::MAX,
+        root: [0xff; 32],
+    });
     assert!(block.encode_size() <= BLOCK_BYTES);
+}
+
+#[test]
+fn a_settled_record_reads_back_and_never_runs_as_a_frame() {
+    let settled = Settled {
+        height: 63,
+        root: [7; 32],
+    };
+    let record = settled.frame();
+    assert_eq!(Settled::read(&record), Some(settled));
+    assert!(Frame::decode(&record).is_err());
+    let mut block = Block::next(WIDEST, u64::MAX, Vec::new());
+    block.settle(settled);
+    assert_eq!(block.records().collect::<Vec<_>>(), vec![(0, settled)]);
 }
 
 #[test]
@@ -66,7 +84,11 @@ fn a_block_packs_the_waiting_frames_in_order_until_the_next_would_overflow() {
 fn the_widest_backfill_reply_fits_one_mesh_message() {
     let bytes = vec![0u8; BLOCK_BYTES];
     let frame = bytes[..largest_carried(&bytes)].to_vec();
-    let block = Block::packed(WIDEST, u64::MAX, [&frame]);
+    let mut block = Block::packed(WIDEST, u64::MAX, [&frame]);
+    block.settle(Settled {
+        height: u64::MAX,
+        root: [0xff; 32],
+    });
     let reply = (finalization_signed_by_every_member(), block);
     assert!(RESOLVER_FRAMING + reply.encode_size() <= MESSAGE_BYTES as usize);
 }

@@ -41,6 +41,10 @@ impl Network {
         (height + 1) / self.epoch_length
     }
 
+    pub fn first(&self, epoch: u64) -> u64 {
+        epoch * self.epoch_length
+    }
+
     pub fn anchor(&self, epoch: u64) -> u64 {
         (epoch * self.epoch_length).saturating_sub(1)
     }

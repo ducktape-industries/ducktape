@@ -10,6 +10,43 @@ pub type Digest = sha256::Digest;
 pub use host::BLOCK_BYTES;
 const ENVELOPE_BYTES: usize = 1 << 17;
 pub const MESSAGE_BYTES: u32 = (BLOCK_BYTES + ENVELOPE_BYTES) as u32;
+const SETTLED: &[u8] = b"\xffducktape:settled";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settled {
+    pub height: u64,
+    pub root: [u8; 32],
+}
+
+impl Settled {
+    pub fn frame(&self) -> Vec<u8> {
+        [
+            SETTLED,
+            self.height.to_le_bytes().as_slice(),
+            self.root.as_slice(),
+        ]
+        .concat()
+    }
+
+    pub fn read(frame: &[u8]) -> Option<Settled> {
+        let rest = frame.strip_prefix(SETTLED)?;
+        let (height, root) = rest.split_first_chunk::<8>()?;
+        let root = <[u8; 32]>::try_from(root).ok()?;
+        Some(Settled {
+            height: u64::from_le_bytes(*height),
+            root,
+        })
+    }
+
+    fn room(frames: usize) -> usize {
+        let counted = (frames + 1).encode_size() - frames.encode_size();
+        let blank = Settled {
+            height: 0,
+            root: [0; 32],
+        };
+        counted + blank.frame().encode_size()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
@@ -49,7 +86,8 @@ impl Block {
             let count = block.frames.len();
             let counted = (count + 1).encode_size() - count.encode_size();
             let grown = size + counted + frame.encode_size();
-            if grown > BLOCK_BYTES {
+            let sealable = grown + Settled::room(count + 1) <= BLOCK_BYTES;
+            if !sealable {
                 break;
             }
             size = grown;
@@ -66,9 +104,24 @@ impl Block {
             height: u64::MAX - 1,
             id: [0; 32],
         };
-        let empty = Block::next(widest, u64::MAX, Vec::new()).encode_size();
-        let counted = 1usize.encode_size() - 0usize.encode_size();
-        empty + counted + UInt(length).encode_size() + frame.len() <= BLOCK_BYTES
+        let mut sealed = Block::next(widest, u64::MAX, Vec::new());
+        sealed.settle(Settled {
+            height: u64::MAX,
+            root: [0; 32],
+        });
+        let counted = 2usize.encode_size() - 1usize.encode_size();
+        sealed.encode_size() + counted + UInt(length).encode_size() + frame.len() <= BLOCK_BYTES
+    }
+
+    pub fn settle(&mut self, settled: Settled) {
+        self.frames.push(settled.frame());
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = (usize, Settled)> + '_ {
+        self.frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| Some((index, Settled::read(frame)?)))
     }
 
     pub fn tip(&self) -> Tip {

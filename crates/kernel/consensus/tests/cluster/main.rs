@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use host::{Founding, Genesis, Layer, Limits, Tip};
 use node::{
-    BLOCK_BYTES, Block, Frame, MESSAGE_BYTES, Mempool, Node, Preconfirm, Sequenced, Source,
+    BLOCK_BYTES, Block, Frame, MESSAGE_BYTES, Mempool, Node, Preconfirm, Sequenced, Settled, Source,
 };
 
 mod epochs;
@@ -38,6 +39,7 @@ type Ctx = deterministic::Context;
 type Shared = Arc<futures::lock::Mutex<Node<Ctx>>>;
 type Pool = Arc<futures::lock::Mutex<Mempool<Ctx>>>;
 type Roots = Arc<Mutex<BTreeMap<u64, Root>>>;
+type Skewed = Arc<AtomicBool>;
 type Carried = Arc<Mutex<BTreeMap<u64, Vec<Vec<u8>>>>>;
 type Stalls = Arc<Mutex<Option<Stall>>>;
 type Tampering = Arc<Mutex<Option<Tamper>>>;
@@ -313,12 +315,23 @@ impl Chain for Participant {
     fn deliver(&mut self, block: Arc<Block>, ack: Exact) {
         let _ = self.inbox.unbounded_send((block, ack));
     }
+
+    fn seal(&mut self, block: &mut Block, settled: Settled) {
+        let tamper = *self.tamper.lock().unwrap();
+        let unsealed = tamper.is_some_and(|tamper| tamper.unseals(block.height));
+        if unsealed {
+            let _ = self.tampered.unbounded_send(block.height);
+            return;
+        }
+        block.settle(settled);
+    }
 }
 
 #[derive(Clone, Copy)]
 enum Tamper {
     Backdate,
     Oversize,
+    Unseal { from: u64 },
 }
 
 impl Tamper {
@@ -327,8 +340,16 @@ impl Tamper {
             Tamper::Backdate if parent.time > 0 => block.time = parent.time - 1,
             Tamper::Backdate => return false,
             Tamper::Oversize => block.frames.push(vec![0; BLOCK_BYTES]),
+            Tamper::Unseal { .. } => return false,
         }
         true
+    }
+
+    fn unseals(self, height: u64) -> bool {
+        match self {
+            Tamper::Unseal { from } => height >= from,
+            Tamper::Backdate | Tamper::Oversize => false,
+        }
     }
 }
 
@@ -357,6 +378,7 @@ struct Peer {
     tamper: Tampering,
     tampered: mpsc::UnboundedReceiver<u64>,
     roots: Roots,
+    skewed: Skewed,
     carried: Carried,
     _dir: tempfile::TempDir,
 }
@@ -380,6 +402,7 @@ impl Peer {
         .await
         .unwrap();
         let seated = node.epoch_validators(0).unwrap().unwrap();
+        let founded = node.host().root().unwrap();
         let mempool = Mempool::new(
             context.child("pool"),
             node.verified(),
@@ -401,6 +424,7 @@ impl Peer {
         let stalls: Stalls = Arc::default();
         let tamper: Tampering = Arc::default();
         let roots: Roots = Arc::default();
+        let skewed: Skewed = Arc::default();
         let carried: Carried = Arc::default();
         let chain = Participant {
             pool: pool.clone(),
@@ -439,7 +463,10 @@ impl Peer {
             &marshal,
             chain,
         );
-        let standing = membership.seat(genesis_block.tip(), &seated).await.unwrap();
+        let standing = membership
+            .seat(genesis_block.tip(), founded, &seated)
+            .await
+            .unwrap();
         assert_eq!(standing == Standing::Validator, roster.participates(0));
         context.child("pump").spawn({
             let pump = Pump {
@@ -448,6 +475,7 @@ impl Peer {
                 applied,
                 stalls: stalls.clone(),
                 roots: roots.clone(),
+                skewed: skewed.clone(),
                 carried: carried.clone(),
                 network: network.clone(),
             };
@@ -465,6 +493,7 @@ impl Peer {
             tamper,
             tampered,
             roots,
+            skewed,
             carried,
             _dir: dir,
         }
@@ -493,6 +522,20 @@ impl Peer {
 
     fn me(&self) -> ed25519::PublicKey {
         self.key.public_key()
+    }
+
+    fn skew_root(&self) {
+        self.skewed.store(true, Ordering::Relaxed);
+    }
+
+    async fn proposes_an_opening(&mut self, network: &Network) -> u64 {
+        loop {
+            let height = self.proposed.next().await.expect("consensus lives");
+            let opens = height % network.epoch_length == 0;
+            if opens {
+                return height;
+            }
+        }
     }
 
     fn tamper(&self, tamper: Tamper) {
@@ -560,11 +603,22 @@ struct Pump {
     applied: mpsc::UnboundedSender<u64>,
     stalls: Stalls,
     roots: Roots,
+    skewed: Skewed,
     carried: Carried,
     network: Network,
 }
 
 impl Pump {
+    fn skew(&self, root: Root) -> Root {
+        let skewed = self.skewed.load(Ordering::Relaxed);
+        if !skewed {
+            return root;
+        }
+        let mut bytes = root.0;
+        bytes[0] ^= 1;
+        Root(bytes)
+    }
+
     async fn run(self, mut membership: Seating, mut deliveries: mpsc::UnboundedReceiver<Delivery>) {
         while let Some((block, ack)) = deliveries.next().await {
             let mut node = self.node.lock().await;
@@ -604,13 +658,17 @@ impl Pump {
                     .epoch_validators(epoch)
                     .unwrap()
                     .expect("the boundary records the epoch");
-                Some((epoch, validators))
+                let root = self.skew(node.host().root().unwrap());
+                Some((epoch, validators, root))
             } else {
                 None
             };
             drop(node);
-            if let Some((_, validators)) = seating {
-                membership.seat(block.tip(), &validators).await.unwrap();
+            if let Some((_, validators, root)) = seating {
+                membership
+                    .seat(block.tip(), root, &validators)
+                    .await
+                    .unwrap();
             }
             ack.acknowledge();
             let _ = self.applied.unbounded_send(block.height);

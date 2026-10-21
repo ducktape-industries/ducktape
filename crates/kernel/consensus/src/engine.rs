@@ -17,7 +17,7 @@ use host::Tip;
 use node::Digest;
 
 use crate::anchor::Anchor;
-use crate::chain::{App, Chain};
+use crate::chain::{App, Chain, Opening};
 use crate::elector::Continuing;
 use crate::lanes::EngineLanes;
 use crate::marshal::{Certificate, MarshalMailbox};
@@ -39,6 +39,7 @@ pub(crate) struct Epoch {
     pub floor: EngineFloor,
     /// The book the engine counts each finalize vote it hears into.
     pub votes: Votes,
+    pub opening: Opening,
 }
 
 pub(crate) struct Engine {
@@ -76,7 +77,7 @@ impl Engine {
         let cadence = network.cadence;
         let inline = Inline::new(
             context.child("inline"),
-            App::<E, C>::new(chain, cadence),
+            App::<E, C>::new(chain, cadence, Some(epoch.opening)),
             marshal.clone(),
             FixedEpocher::new(
                 NonZeroU64::new(network.epoch_length).expect("an epoch spans blocks"),

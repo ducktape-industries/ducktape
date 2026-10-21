@@ -18,7 +18,7 @@ use commonware_storage::Context;
 use host::{Applied, Genesis, Host, Layer, Snapshot, Submission, SubmissionId, Tip};
 use state::{Commitment, View};
 
-pub use block::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES};
+pub use block::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES, Settled};
 pub use frame::{
     Body, Checked, FORWARD_NAMESPACE, Frame, NAMESPACE, QUERY_NAMESPACE, verify, verify_forward,
     verify_query,
