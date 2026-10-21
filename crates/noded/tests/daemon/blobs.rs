@@ -418,3 +418,44 @@ fn blocks_finalize_while_dropping_unnamed_blobs_waits_for_an_rpc_blocking_thread
     runtime.block_on(seat.admin(&client, Admin::Shutdown));
     live.thread.join().unwrap();
 }
+
+#[test]
+fn blobs_held_answers_each_id_as_a_read_would_and_a_released_one_is_not_held() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let (kept, released, never) = (part(b"kept"), part(b"released"), part(b"never put"));
+    client_runtime().block_on(async {
+        let client = &live.client;
+        let mut changes = client.changes("probe").await.unwrap();
+        let steps = vec![put_part(b"kept"), put_part(b"released"), set(b"put", b"1")];
+        let put = frame(client, &alice, steps).await;
+        client.submit(put, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"put"]).await;
+        assert_eq!(
+            client.blobs_held(&[kept, released, never]).await.unwrap(),
+            [true, true, false]
+        );
+        let steps = vec![
+            Step::Op(HostOp::BlobRelease(released)),
+            set(b"released", b"1"),
+        ];
+        let release = frame(client, &alice, steps).await;
+        client.submit(release, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"released"]).await;
+        assert_eq!(
+            client
+                .blobs_held(&[kept, released, never, kept])
+                .await
+                .unwrap(),
+            [true, false, false, true]
+        );
+        assert_eq!(client.blob(released).await.unwrap(), None);
+        assert!(client.blobs_held(&[]).await.unwrap().is_empty());
+        seat.admin(client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}

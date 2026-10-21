@@ -1020,7 +1020,8 @@ it is a key of its own, so a put rewrites one small row however many paths share
 the blob. Once no program holds it, the row goes, and after that block commits the
 node deletes the blob's file, unless a held bundle names it or a program runs it
 as code. Every node does this, so a read of a released blob that no held bundle
-names answers no blob, the same as a read of an id nobody put. A row written before rows named their holders
+names answers no blob, the same as a read of an id nobody put.
+A row written before rows named their holders
 names none, and nothing releases it. A joiner streams only the programs' code
 and notes any its source no longer serves. If any is noted and the source's
 head has moved, it syncs to the new head, holding it as it holds the first,
@@ -1050,7 +1051,11 @@ answers none. A source that has gone away is asked again every block time
 (`join_unanswered`, logged on the first try and every tenth): deleting the
 workspace's `source` file and restarting the node stops it. New program
 code is a bundle of kind `program`: the programs role schedules only code the
-blobs program reports held.
+blobs program reports held. `POST /v1/blobs/held` answers, for a list of ids,
+one bool each, whether the network holds each blob (a `$blobs` roster row, else
+the blobs role), without reading any blob: a client that keeps blobs it read
+asks it before showing one again. A node still fetching a blob the network holds
+may yet answer a read of it with not found.
 
 `submit` pools the frame and prints its id; the block that carries it
 decides its outcome. The node runs a frame before its block only when the

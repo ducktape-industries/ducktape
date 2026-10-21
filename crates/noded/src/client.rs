@@ -206,6 +206,10 @@ impl Client {
         self.post(route::BLOBS, &ids).await
     }
 
+    pub async fn blobs_held(&self, ids: &[BlobId]) -> Result<Vec<bool>> {
+        self.post(route::BLOBS_HELD, &ids).await
+    }
+
     pub async fn missing_blobs(&self) -> Result<Vec<BlobId>> {
         self.fetch(route::BLOB_MISSING).await
     }

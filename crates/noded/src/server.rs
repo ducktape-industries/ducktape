@@ -188,6 +188,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::BLOB_GET, post(blob_get::<E>))
         .route(route::BLOBS, post(blobs::<E>))
         .route(route::BLOBS_ZSTD, post(blobs_zstd::<E>))
+        .route(route::BLOBS_HELD, post(blobs_held::<E>))
         .route(route::BLOB_MISSING, get(blob_missing::<E>))
         .route(route::PROGRAMS, get(programs::<E>))
         .route(route::BLOCKS, post(blocks::<E>))
@@ -779,6 +780,25 @@ fn put_entries(
             "an upload carries a put, not a receipt",
         )),
     }
+}
+
+async fn blobs_held<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<bool>> {
+    let ids: Vec<BlobId> = match abi::decode(&body) {
+        Ok(ids) => ids,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    let view = ctx.view().clone();
+    let now = ctx.now();
+    answered(
+        offload(move || {
+            let source = view.source();
+            let handle = tokio::runtime::Handle::current();
+            ids.iter()
+                .map(|id| handle.block_on(source.readable(id, now)))
+                .collect::<Result<Vec<bool>, _>>()
+        })
+        .await,
+    )
 }
 
 async fn blob_missing<E: Context>(ctx: Ctx<E>) -> Reply<Vec<BlobId>> {
