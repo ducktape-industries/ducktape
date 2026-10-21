@@ -11,6 +11,9 @@ use crate::{Error, LOCAL, Pending, Result, Slot, Writes};
 const SEPARATOR: u8 = 0;
 const HEIGHT: &[u8] = b"\xffheight";
 const PENDING: &[u8] = b"\xffpending";
+const RECORD: u64 = 1 << 30;
+const PUT_COST: u64 = 32;
+const DELETE_COST: u64 = 16;
 pub const RESERVED_PREFIX: char = '$';
 
 pub struct Storage {
@@ -176,20 +179,29 @@ impl Storage {
         Ok(self.db().write(batch)?)
     }
 
-    /// Replaces everything this storage holds with `writes` at `height`: a
-    /// join installs a whole state, and one a failed or cut-off join left
-    /// here, or another chain's, is no part of it. The old keys are read into
-    /// the same batch, so only a retry over leftovers pays for them against
-    /// the batch's write limit.
     pub fn install(&self, height: u64, writes: &Writes) -> Result<()> {
-        let mut batch = WriteBatch::new();
-        for entry in self.db().iter(None, None, false)? {
+        self.unmark()?;
+        let snapshot = self.db().snapshot();
+        let mut chunks = Chunks::new(self.db());
+        for entry in self.db().iter_at(None, None, false, &snapshot)? {
             let (key, _) = entry?;
-            batch.delete(key);
+            chunks.delete(key)?;
         }
-        stage(&mut batch, writes);
-        batch.put(HEIGHT, abi::encode(&height));
+        chunks.stage(writes)?;
+        chunks.write()?;
+        self.mark(height)
+    }
+
+    fn unmark(&self) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete(HEIGHT);
         batch.delete(PENDING);
+        Ok(self.db().write(batch)?)
+    }
+
+    fn mark(&self, height: u64) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(HEIGHT, abi::encode(&height));
         Ok(self.db().write(batch)?)
     }
 
@@ -229,17 +241,86 @@ impl Storage {
         writes: &Writes,
         replaced: &BTreeSet<ProgramId>,
     ) -> Result<()> {
-        let mut batch = WriteBatch::new();
+        self.unmark()?;
+        let pinned = self.reads.pinned();
+        let mut chunks = Chunks::new(self.db());
         for program in replaced {
-            for entry in self.iter(program, b"", None, false)? {
+            for entry in pinned.iter(program, b"", None, false)? {
                 let (key, _) = entry?;
-                batch.delete(namespaced(program, &key));
+                chunks.delete(namespaced(program, &key))?;
             }
         }
-        stage(&mut batch, writes);
-        batch.put(HEIGHT, abi::encode(&height));
-        batch.delete(PENDING);
-        Ok(self.db().write(batch)?)
+        chunks.stage(writes)?;
+        chunks.write()?;
+        self.mark(height)
+    }
+}
+
+struct Chunks<'a> {
+    db: &'a Db,
+    batch: WriteBatch,
+    estimate: u64,
+}
+
+impl<'a> Chunks<'a> {
+    fn new(db: &'a Db) -> Chunks<'a> {
+        Chunks {
+            db,
+            batch: WriteBatch::new(),
+            estimate: 0,
+        }
+    }
+
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let cost = (key.len() + value.len()) as u64 + PUT_COST;
+        self.room(cost)?;
+        self.batch.put(key, value);
+        self.estimate += cost;
+        Ok(())
+    }
+
+    fn delete(&mut self, key: Vec<u8>) -> Result<()> {
+        let cost = key.len() as u64 + DELETE_COST;
+        self.room(cost)?;
+        self.batch.delete(key);
+        self.estimate += cost;
+        Ok(())
+    }
+
+    fn room(&mut self, cost: u64) -> Result<()> {
+        let full = self.estimate + cost >= RECORD;
+        if full {
+            self.write()?;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::replace(&mut self.batch, WriteBatch::new());
+        self.estimate = 0;
+        Ok(self.db.write(batch)?)
+    }
+
+    fn slot(&mut self, key: Vec<u8>, slot: &Slot) -> Result<()> {
+        match slot {
+            Some(value) => self.put(key, value.clone()),
+            None => self.delete(key),
+        }
+    }
+
+    fn stage(&mut self, writes: &Writes) -> Result<()> {
+        for (program, keys) in &writes.programs {
+            for (key, slot) in keys {
+                self.slot(namespaced(program, key), slot)?;
+            }
+        }
+        for (key, slot) in &writes.local {
+            self.slot(namespaced(LOCAL, key), slot)?;
+        }
+        Ok(())
     }
 }
 

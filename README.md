@@ -981,7 +981,11 @@ and notes any its source no longer serves. If any is noted and the source's
 head has moved, it syncs to the new head, holding it as it holds the first,
 writes only the keys that changed since it last adopted (a program whose log
 no longer reaches back that far, or one admitted or dropped since, is
-rewritten whole), and fetches only the code it still lacks. Once it has all
+rewritten whole), and fetches only the code it still lacks. It writes the
+adopted keys in pieces, each kept under the store's own limit on one write,
+after clearing the store's height, and writes the height last: a join cut off
+part way leaves a store with no height, which a node never runs, and the next
+join clears it and writes it again. Once it has all
 of it, it deletes each blob it fetched that the state it ends at no longer
 names. A source that refuses code its own tip names ends the join. Every other
 blob comes after: when a joined node starts, `run` asks the node it joined
