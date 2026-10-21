@@ -1,5 +1,5 @@
 # The pods service and the agents namespace it manages: priority, RBAC, the admission policies on the operator's quota hardcap and on every pod, hardcap itself and the LimitRange defaults, isolation, its Deployment and its fixed-address Service.
-# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@ and @AGENTS_MEMORY@; the key it signs with is the Secret `blob-key`, and the desktop runner's ssh key the Secret `desktop-runner`.
+# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@, @AGENTS_MEMORY@, @PRESTOP@ and @GRACE@; the key it signs with is the Secret `blob-key`, and the desktop runner's ssh key the Secret `desktop-runner`.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -343,6 +343,7 @@ spec:
         app: pods
     spec:
       serviceAccountName: pods
+      terminationGracePeriodSeconds: @GRACE@
       securityContext:
         fsGroup: 1000
       containers:
@@ -363,7 +364,7 @@ spec:
             tcpSocket: {port: http}
           lifecycle:
             preStop:
-              sleep: {seconds: 5}
+              sleep: {seconds: @PRESTOP@}
           volumeMounts:
             - {name: keys, mountPath: /keys, readOnly: true}
             - {name: desktop, mountPath: /desktop, readOnly: true}

@@ -40,6 +40,17 @@ limits=$(hardcap)
 read -r agents_cpu agents_memory <<<"$limits"
 echo "hardcap: requests.cpu $agents_cpu, requests.memory $agents_memory"
 kubectl_version=v1.36.5
+prestop=5
+default_wait=64
+block_ms=$(curl -fsS "$node_url/v1/status" | od -An -v -tu1 | awk '
+  { for (i = 1; i <= NF; i++) b[n++] = $i }
+  END {
+    at = 4 + b[0] + 256 * b[1] + 65536 * b[2] + 16777216 * b[3] + 8
+    for (i = 7; i >= 0; i--) ms = ms * 256 + b[at + i]
+    print ms
+  }')
+grace=$((prestop + (default_wait * block_ms + 999) / 1000))
+echo "grace: ${grace}s (preStop ${prestop}s, egress wait $default_wait blocks of ${block_ms}ms)"
 tunnel_port=35312
 
 stage=$(mktemp -d)
@@ -60,6 +71,7 @@ podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_p
 image="localhost:5000/pods:$tag@$(cat "$stage/digest")"
 sed -e "s#@IMAGE@#$image#g" -e "s#@NODE_URL@#$node_url#g" -e "s#@FORGE@#$forge#g" \
   -e "s#@AGENTS_CPU@#$agents_cpu#g" -e "s#@AGENTS_MEMORY@#$agents_memory#g" \
+  -e "s#@PRESTOP@#$prestop#g" -e "s#@GRACE@#$grace#g" \
   "$here/pods.yaml" | kubectl --context "$context" apply -f -
 kubectl --context "$context" -n pods rollout status deployment/pods
 echo "$image"

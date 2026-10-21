@@ -42,8 +42,13 @@ or through a member node's halo forward.
 - **A roll and the calls in flight.** The Deployment's pods container has a readiness probe on
   its port, so the rollout stops the old pod only once the new one listens, and a five-second
   `preStop` sleep, so a call the Service routed to the old pod just before it left the
-  endpoints is still answered if it ends within those five seconds. A call still open then (an
-  exec stream, a streamed wait, a long whole answer) is cut when the old pod exits.
+  endpoints still reaches it. At SIGTERM the service stops listening, hangs up its idle
+  connections and every stream it holds (an exec stream, a streamed wait), and answers each
+  whole call still open before it exits. `terminationGracePeriodSeconds` is the preStop plus
+  egress's wait for a whole answer (`DEFAULT_WAIT`, 64 blocks, times the network's block time,
+  which `deploy` reads from `NODE_URL`'s `/v1/status`), since egress gives up on a whole answer
+  then anyway. A stream has no such bound (egress's wait runs from its last event), so a roll
+  still ends every stream as cut; the command an exec stream ran goes on in its pod.
 
 - **A Kubernetes namespace and ServiceAccount.** `pods.yaml` makes namespace `pods`, which
   holds the service, and namespace `agents`, where agents' work runs. It also makes the

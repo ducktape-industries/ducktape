@@ -4945,6 +4945,34 @@ class RunnerList(unittest.TestCase):
                 self.assertEqual(runner.takes(list(words)), expected, words)
 
 
+def unblock(place):
+    for name, flags in (("started", os.O_RDONLY), ("watching", os.O_RDONLY), ("release", os.O_WRONLY), ("hold", os.O_WRONLY)):
+        try:
+            held = os.open(place / name, flags | os.O_NONBLOCK)
+        except OSError:
+            continue
+        if flags == os.O_WRONLY:
+            os.write(held, b"go\n")
+        os.close(held)
+
+
+FAKE_KUBECTL = """#!/usr/bin/env python3
+import os, pathlib, sys
+place = pathlib.Path(os.environ["FAKE_KUBE"])
+words = sys.argv[1:]
+if "exec" in words:
+    (place / "started").write_text("exec\\n")
+    print("built", (place / "release").read_text().strip())
+elif "pod" in words and "--watch" in words:
+    (place / "watching").write_text("watch\\n")
+    (place / "hold").read_text()
+elif "pod" in words:
+    print(POD)
+else:
+    sys.exit(1)
+"""
+
+
 class Stopped(unittest.TestCase):
     def node(self):
         served = ThreadingHTTPServer(("127.0.0.1", 0), Node)
@@ -5008,6 +5036,56 @@ class Stopped(unittest.TestCase):
                 client.join()
             self.assertEqual(process.wait(), 0, said)
             self.assertIn("event=pods_stopping signal=SIGTERM", said)
+
+    def test_a_sigterm_cuts_streams_at_once_and_answers_whole_calls_before_the_service_ends(self):
+        with tempfile.TemporaryDirectory() as temp:
+            place = pathlib.Path(temp)
+            for name in ("started", "release", "watching", "hold"):
+                os.mkfifo(place / name)
+            kubectl = place / "kubectl"
+            kubectl.write_text(FAKE_KUBECTL.replace("POD", repr(json.dumps(pod_json(state=RUNNING, phase="Running")))))
+            kubectl.chmod(0o755)
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=self.node(), PODS_FORGE="duck://chain/forge", PODS_KUBECTL=str(kubectl), PODS_LISTEN="127.0.0.1:0", PODS_KEYS=temp, FAKE_KUBE=temp)
+            process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(process.kill)
+            try:
+                self.drained(process, place)
+            finally:
+                unblock(place)
+
+    def drained(self, process, place):
+        lines = iter(process.stderr.readline, "")
+        serving = next(line for line in lines if "event=pods_serving" in line)
+        port = int(serving.split("listen=127.0.0.1:")[1].split()[0])
+        waiting = http.client.HTTPConnection("127.0.0.1", port)
+        waiting.request("GET", "/v1/pods/duckpond-41/wait?every=3600", headers=ASKED)
+        stream = waiting.getresponse()
+        self.assertEqual(stream.status, 200)
+        (place / "watching").read_text()
+        answers = []
+
+        def call():
+            link = http.client.HTTPConnection("127.0.0.1", port)
+            link.request("POST", "/v1/pods/duckpond-41/exec", body=json.dumps({"command": ["make"]}), headers=ASKED)
+            answered = link.getresponse()
+            answers.append((answered.status, json.loads(answered.read())))
+
+        caller = threading.Thread(target=call)
+        caller.start()
+        (place / "started").read_text()
+        process.send_signal(signal.SIGTERM)
+        next(line for line in lines if "event=pods_stopping" in line)
+        with self.assertRaises(http.client.IncompleteRead):
+            stream.read()
+        with self.assertRaises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", port))
+        (place / "release").write_text("once\n")
+        caller.join()
+        said = process.stderr.read()
+        process.stderr.close()
+        self.assertEqual(process.wait(), 0, said)
+        self.assertEqual(answers, [(200, {"exit_code": 0, "stdout": "built once\n", "stderr": ""})])
+        self.assertIn("event=pods_drained", said)
 
     def test_a_signal_while_a_line_is_being_written_writes_nothing_itself(self):
         written = io.StringIO()

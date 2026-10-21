@@ -17,6 +17,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -4332,38 +4333,117 @@ def parsed(body):
         raise Refused(400, f"the body is not JSON: {error}") from error
 
 
-def handler(service):
+def hang_up(connection):
+    try:
+        connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+class Drain:
+    def __init__(self):
+        self.held = threading.Condition()
+        self.whole = 0
+        self.idle = set()
+        self.streams = set()
+        self.stopping = False
+
+    def opened(self, connection):
+        with self.held:
+            if not self.stopping:
+                self.idle.add(connection)
+
+    def closed(self, connection):
+        with self.held:
+            self.idle.discard(connection)
+            self.streams.discard(connection)
+
+    def called(self, connection):
+        with self.held:
+            self.idle.discard(connection)
+            self.whole += 1
+
+    def answered(self, connection):
+        with self.held:
+            self.whole -= 1
+            self.held.notify_all()
+            if not self.stopping:
+                self.idle.add(connection)
+            return not self.stopping
+
+    def streaming(self, connection):
+        with self.held:
+            self.whole -= 1
+            self.held.notify_all()
+            if not self.stopping:
+                self.streams.add(connection)
+            return not self.stopping
+
+    def stop(self):
+        with self.held:
+            self.stopping = True
+            cut, self.idle, self.streams = self.idle | self.streams, set(), set()
+        for connection in cut:
+            hang_up(connection)
+        with self.held:
+            self.held.wait_for(lambda: self.whole == 0)
+        return len(cut)
+
+
+def handler(service, drain=None):
+    drain = Drain() if drain is None else drain
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
+        def setup(self):
+            super().setup()
+            drain.opened(self.connection)
+
+        def finish(self):
+            drain.closed(self.connection)
+            super().finish()
+
         def respond(self, method):
-            length = int(self.headers.get("content-length") or 0)
-            body = self.rfile.read(length) if length else b""
-            headers = {name.lower(): value for name, value in self.headers.items()}
+            drain.called(self.connection)
+            streaming = False
             try:
-                status, answer = service.answer(method, self.path, headers, body)
-            except Refused as refusal:
-                status, answer = refusal.status, {"error": refusal.sentence}
-            except Exception as error:
-                say("pods_failed", reason="unexpected", detail=json.dumps(repr(error)))
-                status, answer = 500, {"error": f"the pods service failed: {error!r}"}
-            if isinstance(answer, Stream):
-                self.stream(status, answer.events)
-                return
-            match answer:
-                case Answered(kind=kind, body=payload):
-                    pass
-                case bytes():
-                    payload, kind = answer, "text/plain; charset=utf-8"
-                case _:
-                    payload, kind = json.dumps(answer).encode(), "application/json"
-            self.send_response(status)
-            self.send_header("content-type", kind)
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+                headers = {name.lower(): value for name, value in self.headers.items()}
+                try:
+                    status, answer = service.answer(method, self.path, headers, body)
+                except Refused as refusal:
+                    status, answer = refusal.status, {"error": refusal.sentence}
+                except Exception as error:
+                    say("pods_failed", reason="unexpected", detail=json.dumps(repr(error)))
+                    status, answer = 500, {"error": f"the pods service failed: {error!r}"}
+                if isinstance(answer, Stream):
+                    streaming = True
+                    self.stream(status, answer.events)
+                    return
+                match answer:
+                    case Answered(kind=kind, body=payload):
+                        pass
+                    case bytes():
+                        payload, kind = answer, "text/plain; charset=utf-8"
+                    case _:
+                        payload, kind = json.dumps(answer).encode(), "application/json"
+                self.send_response(status)
+                self.send_header("content-type", kind)
+                self.send_header("content-length", str(len(payload)))
+                if drain.stopping:
+                    self.send_header("connection", "close")
+                    self.close_connection = True
+                self.end_headers()
+                self.wfile.write(payload)
+            finally:
+                kept = streaming or drain.answered(self.connection)
+                if not kept:
+                    self.close_connection = True
 
         def stream(self, status, events):
+            kept = drain.streaming(self.connection)
             self.send_response(status)
             self.send_header("content-type", "text/event-stream")
             self.send_header("cache-control", "no-cache")
@@ -4372,13 +4452,16 @@ def handler(service):
             self.end_headers()
             said = streamed(events)
             try:
+                if not kept:
+                    self.wfile.flush()
+                    hang_up(self.connection)
                 for event in said:
                     self.wfile.write(chunk(event))
                     self.wfile.flush()
                 self.wfile.write(LAST_CHUNK)
                 self.wfile.flush()
             except OSError:
-                say("pods_stream_unheard", reason="caller_gone")
+                say("pods_stream_unheard", reason="stopping" if drain.stopping else "caller_gone")
             finally:
                 said.close()
                 events.close()
@@ -4560,14 +4643,19 @@ def main():
         if runner.held():
             service.follow(runner.name)
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
-    server = ThreadingHTTPServer((host, int(port)), handler(service))
+    drain = Drain()
+    server = ThreadingHTTPServer((host, int(port)), handler(service, drain))
     try:
         signal.signal(signal.SIGTERM, exit_on_signal)
         bound, at = server.server_address[:2]
         say("pods_serving", namespace=kube.namespace, listen=f"{bound}:{at}", keyed=signer.held())
         server.serve_forever()
     except Stopping as stopping:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        server.server_close()
         say("pods_stopping", signal=stopping.args[0])
+        cut = drain.stop()
+        say("pods_drained", cut=cut)
         os._exit(0)
 
 
