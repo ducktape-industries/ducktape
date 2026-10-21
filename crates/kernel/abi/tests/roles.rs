@@ -97,16 +97,16 @@ fn the_egress_role_takes_unregister_after_expire_at_tag_8() {
 }
 
 #[test]
-fn renames_ask_at_tag_6_and_rename_program_takes_identity_tag_12() {
+fn renames_ask_at_tag_12_answer_at_tag_9_and_rename_program_takes_identity_tag_12() {
     assert_eq!(
         abi::encode(&programs::Query::Renames(1)),
-        [6, 1, 0, 0, 0, 0, 0, 0, 0]
+        [12, 1, 0, 0, 0, 0, 0, 0, 0]
     );
     let renames = programs::Reply::Renames(vec![("a".to_owned(), "o/a".to_owned())]);
     assert_eq!(
         abi::encode(&renames),
         [
-            6, 1, 0, 0, 0, 1, 0, 0, 0, b'a', 3, 0, 0, 0, b'o', b'/', b'a'
+            9, 1, 0, 0, 0, 1, 0, 0, 0, b'a', 3, 0, 0, 0, b'o', b'/', b'a'
         ]
     );
     let rename = identity::Op::RenameProgram {

@@ -631,7 +631,7 @@ pub mod role {
             At(u64) = 0,
             Roles = 4,
             Hooks(u64) = 5,
-            Renames(u64) = 6,
+            Renames(u64) = 12,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -641,7 +641,7 @@ pub mod role {
             Programs(Vec<Entry>) = 0,
             Roles(Roles) = 4,
             Hooks(Vec<ProgramId>) = 5,
-            Renames(Vec<(ProgramId, ProgramId)>) = 6,
+            Renames(Vec<(ProgramId, ProgramId)>) = 9,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
