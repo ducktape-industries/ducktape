@@ -1044,11 +1044,19 @@ one up for another network.
   {"labels": ["sign:dev.ducktape.app"],
    "builders": [44, 38],
    "repos": {"app": {"developer-id": ["main", "dev"], "testflight": ["main", "dev"],
-                     "release-manifest": {"stable": ["main"], "nightly": ["main", "dev"]}}},
-   "tools": {"developer-id": ["/path/to/developer-id"], "testflight": ["/path/to/testflight"],
-             "release-manifest": ["/path/to/release-manifest"]},
+                     "release-manifest": {"stable": ["main"], "nightly": ["main", "dev"]},
+                     "r2-mirror": {"stable": ["main"], "nightly": ["main", "dev"]}}},
+   "tools": {"developer-id": ["<app checkout>/ops/signer/developer-id.sh"],
+             "release-manifest": ["<app checkout>/ops/signer/release-manifest.sh"],
+             "r2-mirror": ["<app checkout>/ops/signer/r2-mirror.sh"],
+             "testflight": ["/path/to/testflight"]},
    "publish": {"app": {"release-manifest": {"files": "/shared/releases/app/", "tags": "release/"}}}}
   ```
+
+  The app's tools live in app's `ops/signer/`, run from a checkout of app
+  at a fixed `main` commit (never the built one); its README there says
+  what each reads and writes and which keychain items hold their keys.
+  `testflight` has no tool yet.
 
   Every answer the signer checks, blobs included, comes from the node in
   `SIGNER_DUCKTAPE`, and the CLI checks it against nothing else: that node
