@@ -172,10 +172,12 @@ mod program {
                 Op::Events(events) => streamed(ctx, env, events),
                 Op::EndStream { id, events, end } => ended(ctx, env, id, events, end),
                 Op::Expire { id } => expire(ctx, env, id),
-                Op::Register { .. } | Op::Assign { .. } => Err(Refusal::new(
-                    reason::UNSUPPORTED,
-                    "this fixture serves, requests, answers, streams and expires",
-                )),
+                Op::Register { .. } | Op::Assign { .. } | Op::Unregister { .. } => {
+                    Err(Refusal::new(
+                        reason::UNSUPPORTED,
+                        "this fixture serves, requests, answers, streams and expires",
+                    ))
+                }
             }
         }
 

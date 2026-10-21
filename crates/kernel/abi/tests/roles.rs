@@ -1,5 +1,5 @@
 use abi::Origin;
-use abi::role::{access, identity, ownership};
+use abi::role::{access, egress, identity, ownership};
 
 fn tag(value: &impl borsh::BorshSerialize) -> u8 {
     abi::encode(value)[0]
@@ -85,4 +85,13 @@ fn the_ownership_role_takes_its_guard_at_tag_0() {
         writes: Vec::new(),
     };
     assert_eq!(tag(&ownership::Op::Guard(guard)), 0);
+}
+
+#[test]
+fn the_egress_role_takes_unregister_after_expire_at_tag_8() {
+    assert_eq!(tag(&egress::Op::Expire { id: 1 }), 7);
+    let unregister = egress::Op::Unregister {
+        service: "s".into(),
+    };
+    assert_eq!(abi::encode(&unregister), [8, 1, 0, 0, 0, b's']);
 }

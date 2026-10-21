@@ -1095,6 +1095,9 @@ pub mod role {
             Expire {
                 id: u64,
             },
+            Unregister {
+                service: String,
+            },
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
