@@ -12,8 +12,8 @@ use futures::channel::mpsc;
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::egress::call::{self, Caller, Clients, Unretried};
-use crate::egress::config::{Config, Reach};
+use crate::egress::call::{self, Blocks, Caller, Clients, Unretried};
+use crate::egress::config::{Config, Reach, Upstream};
 use crate::egress::station::Serving;
 
 type Chunks = mpsc::UnboundedSender<std::io::Result<Bytes>>;
@@ -119,6 +119,224 @@ fn events_op(id: u64, events: &[(u64, &str)]) -> Op {
 
 fn event(id: u64, seq: u64, data: &str) -> Op {
     events_op(id, &[(seq, data)])
+}
+
+type Asked = Arc<Mutex<Vec<String>>>;
+
+async fn rejoining(marked: bool) -> (String, Asked, Arc<tokio::sync::Notify>) {
+    let asked = Asked::default();
+    let heard = Arc::new(tokio::sync::Notify::new());
+    let (seen, cut) = (asked.clone(), heard.clone());
+    let answer = move |headers: axum::http::HeaderMap| {
+        let (seen, cut) = (seen.clone(), cut.clone());
+        async move {
+            let named = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            };
+            let request = named("ducktape-request").unwrap_or_default();
+            let resumed = named("ducktape-heard");
+            seen.lock()
+                .unwrap()
+                .push(format!("{request}:{}", resumed.as_deref().unwrap_or("-")));
+            let body = match resumed.and_then(|heard| heard.parse::<usize>().ok()) {
+                None => futures::stream::once(async {
+                    Ok::<_, std::io::Error>(Bytes::from("data: 1\n\ndata: 2\n\ndata: cut"))
+                })
+                .chain(futures::stream::once(async move {
+                    cut.notified().await;
+                    Err(std::io::Error::other("the old pod stopped"))
+                }))
+                .boxed(),
+                Some(heard) => {
+                    let after: String =
+                        ["data: 1\n\n", "data: 2\n\n", "data: 3\n\n"][heard..].concat();
+                    futures::stream::once(
+                        async move { Ok::<_, std::io::Error>(Bytes::from(after)) },
+                    )
+                    .boxed()
+                }
+            };
+            let mut response = axum::response::Response::new(Body::from_stream(body));
+            let headers = response.headers_mut();
+            headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+            if marked {
+                headers.insert("ducktape-reattach", "request".parse().unwrap());
+            }
+            response
+        }
+    };
+    let app = Router::new().route("/rejoin", get(answer));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), asked, heard)
+}
+
+struct Ahead {
+    tip: u64,
+    expiry: u64,
+}
+
+impl Blocks for Ahead {
+    fn tip(&mut self) -> u64 {
+        self.tip
+    }
+
+    async fn expiry(&mut self) -> Option<u64> {
+        Some(self.expiry)
+    }
+
+    async fn changed(&mut self) -> bool {
+        self.tip += 1;
+        true
+    }
+}
+
+fn service_row(id: u64, service: &str, target: &str) -> RequestRow {
+    RequestRow {
+        request: Request::Http {
+            service: service.into(),
+            head: Head {
+                method: Method::Get,
+                target: target.into(),
+                headers: Vec::new(),
+            },
+            body: Vec::new(),
+        },
+        delivery: events(),
+        ..row(id)
+    }
+}
+
+fn pods_serving(base: &str) -> Serving {
+    let upstream = Upstream {
+        base: url::Url::parse(base).unwrap(),
+        secrets: Vec::new(),
+    };
+    let config = Config {
+        relay: true,
+        http: true,
+        reach: Reach::Private,
+        services: BTreeMap::from([("pods".to_owned(), upstream)]),
+    };
+    let clients = Clients::new(config.reach).unwrap();
+    Serving { config, clients }
+}
+
+async fn rejoined(
+    row: &RequestRow,
+    serving: &Serving,
+    blocks: &mut Ahead,
+    heard: &tokio::sync::Notify,
+    mut event: impl FnMut(Vec<u8>),
+) -> Called {
+    let caller = Caller {
+        chain: "dognet-b5b6ea90",
+        program: "harness",
+        id: row.id,
+    };
+    let told = |data| {
+        event(data);
+        heard.notify_one();
+    };
+    call::answer(
+        serving,
+        &caller,
+        &row.request,
+        &row.delivery,
+        Vec::new(),
+        blocks,
+        told,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_stream_the_service_marked_reattachable_is_asked_again_and_its_events_number_on() {
+    let (base, asked, heard) = rejoining(true).await;
+    let serving = pods_serving(&base);
+    let row = service_row(5, "pods", "/rejoin");
+    let mut desk = served();
+    desk.read(assigned(&row));
+    let mut blocks = Ahead {
+        tip: 10,
+        expiry: 74,
+    };
+    let mut heard_events = Vec::new();
+    let ended = rejoined(&row, &serving, &mut blocks, &heard, |data| {
+        heard_events.push(data)
+    })
+    .await;
+    for data in heard_events {
+        desk.called(5, Called::Event(data));
+    }
+    desk.called(5, ended.clone());
+    assert_eq!(*asked.lock().unwrap(), ["5:-", "5:2"]);
+    assert_eq!(blocks.tip, 11);
+    assert_eq!(desk.launch(), [Step::Send(flight(5, 0))]);
+    let all = [(0, "data: 1\n"), (1, "data: 2\n"), (2, "data: 3\n")];
+    assert_eq!(desk.op(&flight(5, 0)), Some(events_op(5, &all)));
+    let next = desk.sent(&flight(5, 0), Sent::Pending(b"frame 0".to_vec()));
+    assert_eq!(next, Some(Step::Send(flight(5, 1))));
+    let Some(Op::EndStream { events, end, .. }) = desk.op(&flight(5, 1)) else {
+        panic!("no end after the events: {ended:?}");
+    };
+    assert_eq!(events, 3);
+    let StreamEnd::Complete { status, headers } = end else {
+        panic!("the stream did not complete: {end:?}");
+    };
+    assert_eq!(status, 200);
+    let mark = ("ducktape-reattach".to_owned(), "request".to_owned());
+    assert!(headers.contains(&mark), "{headers:?}");
+}
+
+#[tokio::test]
+async fn a_stream_is_not_asked_again_unmarked_over_http_or_when_its_expiry_comes_first() {
+    let stream_broken = Called::End(StreamEnd::Cut {
+        reason: "stream_broken".into(),
+    });
+    let (unmarked, unmarked_asked, unmarked_heard) = rejoining(false).await;
+    let (marked, http_asked, http_heard) = rejoining(true).await;
+    let (late, late_asked, late_heard) = rejoining(true).await;
+    let cases = [
+        (
+            pods_serving(&unmarked),
+            service_row(6, "pods", "/rejoin"),
+            unmarked_asked,
+            unmarked_heard,
+            74,
+        ),
+        (
+            pods_serving(&marked),
+            service_row(7, HTTP, &format!("{marked}/rejoin")),
+            http_asked,
+            http_heard,
+            74,
+        ),
+        (
+            pods_serving(&late),
+            service_row(8, "pods", "/rejoin"),
+            late_asked,
+            late_heard,
+            12,
+        ),
+    ];
+    for (serving, row, asked, heard, expiry) in cases {
+        let mut blocks = Ahead { tip: 10, expiry };
+        let mut heard_events = Vec::new();
+        let ended = rejoined(&row, &serving, &mut blocks, &heard, |data| {
+            heard_events.push(data)
+        })
+        .await;
+        assert_eq!(ended, stream_broken, "request {}", row.id);
+        let read = [b"data: 1\n".to_vec(), b"data: 2\n".to_vec()];
+        assert_eq!(heard_events, read, "request {}", row.id);
+        assert_eq!(asked.lock().unwrap().len(), 1, "request {}", row.id);
+        assert_eq!(blocks.tip, 10, "request {}", row.id);
+    }
 }
 
 fn whole(called: Called) -> Response {

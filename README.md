@@ -531,6 +531,18 @@ an HTTP proxy in both directions: it forwards no hop-by-hop header
 `transfer-encoding`, `upgrade`, `proxy-authenticate`, `proxy-authorization`),
 so none of them is sent upstream or written into an answer.
 
+A service whose streamed answer can be picked up again by the same request
+says so with the response header `ducktape-reattach: request`. When such a
+stream breaks before its end, the node sends the same request again (the same
+`ducktape-request` id) one block later, and again each block while the
+connection is refused, for as long as the request's expiry is still ahead (the
+wait from the stream's last event). The request sent again carries
+`ducktape-heard: N`, the number of whole events the node already took from the
+stream (an event cut off part way is not counted), and the service answers
+with the events after those N. The new stream's events carry on with the next
+event number, so the program that asked sees one stream. A stream without that header, an `http` request, or a
+request whose expiry comes first ends cut (`stream_broken`), as before.
+
 ## Configure a node
 
 `ducktape run` reads `node.toml` from the workspace. The file is optional,
