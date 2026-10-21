@@ -667,6 +667,11 @@ async fn start<E: Context>(
         snapshot: snapshot_removals.served(),
         history,
         recent: crate::blocks::Recent::new(),
+        slowed: crate::health::Slowed::new(),
+        started: crate::health::Started {
+            at_ms: millis(&context),
+            height: tip.height,
+        },
         activity,
         logs,
         shutdown,
@@ -1164,6 +1169,45 @@ fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
     );
 }
 
+fn slow_of(
+    phases: &Phases,
+    height: u64,
+    block_time_ms: u64,
+    commands: u64,
+    commanding: Duration,
+) -> Option<crate::health::Slow> {
+    if !phases.slow(block_time_ms) {
+        return None;
+    }
+    let slowest = phases
+        .slowest
+        .as_ref()
+        .map(|slowest| crate::health::Slowest {
+            ms: ms(slowest.spent),
+            program: slowest.program.clone(),
+            position: slowest.position,
+            tx: slowest.tx.clone(),
+        });
+    Some(crate::health::Slow {
+        height,
+        total_ms: ms(phases.total),
+        behind_ms: ms(phases.behind),
+        commands,
+        commands_ms: ms(commanding),
+        executing_ms: ms(phases.executing),
+        committing_ms: ms(phases.committing),
+        verifying_ms: ms(phases.verifying()),
+        publishing_ms: ms(phases.publishing),
+        recording_ms: ms(phases.recording),
+        proposer_ms: ms(phases.proposing),
+        history_ms: ms(phases.keeping),
+        receipting_ms: ms(phases.receipting),
+        seating_ms: ms(phases.seating),
+        snapshot_ms: ms(phases.snapshotting),
+        slowest,
+    })
+}
+
 enum Event<D = Delivery, C = Command> {
     Delivered(D),
     Unfed,
@@ -1237,6 +1281,16 @@ async fn delivered<E: Context>(
             phases.total = whole.lap();
             let block_time_ms = daemon.network.cadence.block_time_ms();
             reported(&phases, &writing.tally, block.height, block_time_ms);
+            let slow = slow_of(
+                &phases,
+                block.height,
+                block_time_ms,
+                writing.tally.commands,
+                writing.tally.commanding,
+            );
+            if let Some(slow) = slow {
+                daemon.slowed.keep(slow);
+            }
             writing.tally.commands = 0;
             writing.tally.commanding = Duration::ZERO;
             Flow::Writing
@@ -1537,7 +1591,9 @@ mod tests {
 
     use abi::Outcome;
 
-    use super::{Event, Phases, Slowest, listing, next, relay_address, rewrites, slowest_of};
+    use super::{
+        Event, Phases, Slowest, listing, next, relay_address, rewrites, slow_of, slowest_of,
+    };
 
     #[test]
     fn a_member_is_relayed_through_its_address_only_when_that_is_a_websocket() {
@@ -1608,6 +1664,48 @@ mod tests {
             ..Phases::default()
         };
         assert_eq!(replayed.verifying(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_slow_block_is_kept_with_its_phases_and_a_block_within_its_time_is_not() {
+        let phases = Phases {
+            total: Duration::from_millis(1500),
+            behind: Duration::from_millis(40),
+            applying: Duration::from_millis(1400),
+            executing: Duration::from_millis(900),
+            committing: Duration::from_millis(300),
+            slowest: Some(Slowest {
+                spent: Duration::from_millis(800),
+                program: "harness".into(),
+                position: 3,
+                tx: "ab".into(),
+            }),
+            ..Phases::default()
+        };
+        let kept = slow_of(&phases, 7, 1000, 2, Duration::from_millis(5)).unwrap();
+        assert_eq!(
+            (
+                kept.height,
+                kept.total_ms,
+                kept.behind_ms,
+                kept.executing_ms,
+                kept.committing_ms,
+                kept.verifying_ms,
+                kept.commands,
+                kept.commands_ms,
+            ),
+            (7, 1500, 40, 900, 300, 200, 2, 5)
+        );
+        assert_eq!(
+            kept.slowest,
+            Some(crate::health::Slowest {
+                ms: 800,
+                program: "harness".into(),
+                position: 3,
+                tx: "ab".into(),
+            })
+        );
+        assert_eq!(slow_of(&phases, 7, 1500, 0, Duration::ZERO), None);
     }
 
     #[test]

@@ -6,6 +6,8 @@ COPY src/ .
 COPY git-remote-duck /usr/local/bin/git-remote-duck
 RUN git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
 RUN git config --system url.duck://duckpond-725bcad1/forge/fluent31.insteadOf https://github.com/ducktape-industries/fluent31
+ARG COMMIT
+ENV DUCKTAPE_COMMIT=$COMMIT
 RUN cargo build --locked --release -p node-bin
 
 FROM docker.io/library/debian:trixie-slim

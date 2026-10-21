@@ -142,6 +142,13 @@ impl<E: Context> Ctx<E> {
         self.daemon.logs.lines()
     }
 
+    pub(crate) async fn health(
+        &self,
+        since: Option<u64>,
+    ) -> Result<std::result::Result<crate::health::Health, String>> {
+        self.daemon.health(since).await
+    }
+
     pub(crate) fn retune(&self, directives: &str) -> std::result::Result<(), String> {
         self.daemon.logs.retune(directives)
     }

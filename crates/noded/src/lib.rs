@@ -12,6 +12,7 @@ mod endpoint;
 mod fill;
 mod forward;
 mod halo_self;
+mod health;
 mod history;
 mod link;
 pub mod live;
@@ -179,6 +180,8 @@ pub struct Daemon<E: Context> {
     snapshot: snapshot::Served,
     history: history::History,
     recent: blocks::Recent,
+    slowed: health::Slowed,
+    started: health::Started,
     activity: activity::Index,
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,

@@ -1093,6 +1093,20 @@ votes and `ducktape halo` never preconfirm. `ducktape logs`,
 node's own identity key. Each verb's
 `--help` carries the rest.
 
+`/v1/health` answers JSON, unsigned, for an agent or a person asking whether
+the chain is slow and why. It names the tip (height, time and age), the block
+rate from `since` up to now (`?since=<height>`, else one epoch back) against a
+floor of 0.7 of the rate the cadence aims at, which is the floor watch alerts
+on, and each block from `since` on that the writer took longer than a block
+time to apply, with its `apply_slow` phases and slowest frame. It tallies
+every slow block the node still remembers by slowest program: the node keeps,
+in memory since its start, as many slow blocks as its log ring holds lines.
+It also names the build's commit (`DUCKTAPE_COMMIT` at compile time, which
+the node image sets from its `COMMIT`), when the node started and at which
+height, every member with the newest height it signed, and the roles. Agents
+read it through the egress service that fronts the node's own HTTP. Every
+fact in it is public on other routes already.
+
 `/v1/watch/<program>[?keys]` is a WebSocket that carries what
 `/v1/changes/<program>[?keys]` carries, plus standing queries. The client
 sends borsh `Watch` frames: `Ask { id, frame }`, with a query frame signed as

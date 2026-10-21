@@ -196,6 +196,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::TX, post(tx::<E>))
         .route(route::ACTIVITY, post(activity::<E>))
         .route(route::LOGS, get(logs::<E>))
+        .route(route::HEALTH, get(health::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::EGRESS_SET, post(egress_set::<E>))
         .route(route::SYNC, post(sync::<E>))
@@ -981,6 +982,18 @@ async fn activity<E: Context>(
 
 async fn logs<E: Context>(ctx: Ctx<E>) -> Reply<Vec<String>> {
     Reply::Answered(ctx.logs())
+}
+
+async fn health<E: Context>(ctx: Ctx<E>, RawQuery(query): RawQuery) -> Response {
+    let since = match crate::health::since(query.as_deref()) {
+        Ok(since) => since,
+        Err(error) => return crate::health::refused(StatusCode::BAD_REQUEST, error),
+    };
+    match ctx.health(since).await {
+        Ok(Ok(health)) => crate::health::answered(&health),
+        Ok(Err(error)) => crate::health::refused(StatusCode::BAD_REQUEST, error),
+        Err(error) => crate::health::refused(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 async fn admin<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<()> {

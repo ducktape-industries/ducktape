@@ -3143,6 +3143,7 @@ dependencies = [
  "rustix",
  "rustls",
  "serde",
+ "serde_json",
  "state",
  "statesync",
  "store",

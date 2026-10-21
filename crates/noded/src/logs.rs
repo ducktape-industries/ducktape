@@ -11,7 +11,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Registry, reload};
 
-const RING: usize = 4096;
+pub(crate) const RING: usize = 4096;
 
 type Filter = reload::Handle<EnvFilter, Registry>;
 

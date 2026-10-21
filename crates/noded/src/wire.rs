@@ -34,6 +34,7 @@ pub mod route {
     pub const TX: &str = "/v1/tx";
     pub const ACTIVITY: &str = "/v1/activity";
     pub const LOGS: &str = "/v1/logs";
+    pub const HEALTH: &str = "/v1/health";
     pub const ADMIN: &str = "/v1/admin";
     pub const EGRESS_SET: &str = "/v1/egress/set";
     pub const SYNC: &str = "/v1/sync";

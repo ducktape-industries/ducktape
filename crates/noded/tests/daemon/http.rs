@@ -632,3 +632,115 @@ fn a_second_upload_is_read_while_the_first_is_in_flight() {
     client_runtime().block_on(seat.admin(&client, Admin::Shutdown));
     live.thread.join().unwrap();
 }
+
+async fn health(http: SocketAddr, query: &str) -> (u16, Vec<u8>) {
+    let url = format!("http://{http}/v1/health{query}");
+    let answer = reqwest::Client::new()
+        .get(url)
+        .header("user-agent", "noded-daemon-test")
+        .send()
+        .await
+        .unwrap();
+    let status = answer.status().as_u16();
+    (status, answer.bytes().await.unwrap().to_vec())
+}
+
+fn json(status: u16, body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(body)
+        .unwrap_or_else(|_| panic!("{status}: {}", String::from_utf8_lossy(body)))
+}
+
+#[test]
+fn a_node_says_in_one_json_answer_how_fast_its_chain_goes_and_what_slowed_it() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+
+    client_runtime().block_on(async {
+        let landing = frame(&client, &alice, vec![set(b"a", b"1")]).await;
+        let (height, _) = client
+            .land(&Frame::decode(&landing).unwrap())
+            .await
+            .unwrap();
+        reach(&client, height + EPOCH_LENGTH).await;
+
+        let (status, body) = health(seat.http, "").await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let health_now = json(status, &body);
+        assert_eq!(health_now["network"], NETWORK);
+        assert_eq!(health_now["contract"], noded::NODE_CONTRACT);
+        assert_eq!(health_now["block_time_ms"], BLOCK_TIME_MS);
+        assert_eq!(health_now["epoch_length"], EPOCH_LENGTH);
+        let tip = health_now["tip"]["height"].as_u64().unwrap();
+        assert!(tip >= height + EPOCH_LENGTH, "{health_now}");
+        let block = client.block(block_at(tip, 0)).await.unwrap().unwrap();
+        assert_eq!(health_now["tip"]["time_ms"], block.time);
+        let now = health_now["now_ms"].as_u64().unwrap();
+        assert_eq!(health_now["tip"]["age_ms"], now.saturating_sub(block.time));
+        let rate = &health_now["rate"];
+        assert_eq!(
+            rate["since"],
+            tip - EPOCH_LENGTH,
+            "the last epoch by default"
+        );
+        assert_eq!(rate["blocks"], EPOCH_LENGTH);
+        let per_s = rate["blocks_per_s"].as_f64().unwrap();
+        assert!(per_s > 0.0, "{health_now}");
+        let floor = rate["floor"].as_f64().unwrap();
+        assert_eq!(floor, 0.7 * 1000.0 / BLOCK_TIME_MS as f64);
+        assert_eq!(rate["below_floor"], per_s < floor);
+        let commit = option_env!("DUCKTAPE_COMMIT").filter(|commit| !commit.is_empty());
+        assert_eq!(health_now["build"]["commit"], serde_json::json!(commit));
+        let started = &health_now["build"];
+        assert!(started["started_ms"].as_u64().is_some_and(|at| at <= now));
+        assert_eq!(
+            started["started_at"], 0,
+            "a founding node starts at genesis"
+        );
+        let members = health_now["members"].as_array().unwrap();
+        let [member] = members.as_slice() else {
+            panic!("one member: {health_now}");
+        };
+        assert_eq!(
+            member["key"],
+            hex::encode(seat.identity.public_key().as_ref())
+        );
+        assert!(member["signed"].as_u64().is_some(), "{health_now}");
+        assert_eq!(health_now["roles"][role::VALIDATORS], "valset");
+        for slow in health_now["slow"].as_array().unwrap() {
+            assert!(slow["total_ms"].as_u64().unwrap() > BLOCK_TIME_MS, "{slow}");
+            assert!(
+                slow["height"].as_u64().unwrap() >= tip - EPOCH_LENGTH,
+                "{slow}"
+            );
+        }
+        let remembered = &health_now["remembered"];
+        assert!(remembered["blocks"].as_u64().is_some(), "{health_now}");
+
+        let (status, body) = health(seat.http, "?since=0").await;
+        let whole = json(status, &body);
+        assert_eq!(status, 200, "{whole}");
+        assert_eq!(whole["rate"]["since"], 0);
+        assert!(whole["rate"]["blocks"].as_u64().unwrap() >= tip);
+
+        let past = format!("?since={}", tip + 1000);
+        let (status, body) = health(seat.http, &past).await;
+        let refused = json(status, &body);
+        assert_eq!(status, 400, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("past the tip"),
+            "{refused}"
+        );
+        let (status, body) = health(seat.http, "?from=1").await;
+        let unknown = json(status, &body);
+        assert_eq!(status, 400, "{unknown}");
+        assert!(unknown["error"].as_str().is_some(), "{unknown}");
+
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
