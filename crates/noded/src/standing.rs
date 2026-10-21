@@ -11,7 +11,7 @@ use abi::{Origin, ProgramId, Refusal, reason};
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
 use commonware_cryptography::{Hasher as _, Sha256, sha256};
-use futures::stream::SplitSink;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt as _, StreamExt as _, pin_mut};
 use host::{ReadSet, Submission, Written};
 
@@ -72,6 +72,7 @@ enum Flow {
     Pulled,
     Stopped,
     Ended,
+    Refused,
 }
 
 struct Socket<E: Context> {
@@ -118,6 +119,7 @@ pub(crate) async fn serve<E: Context>(socket: WebSocket, watching: Watching<E>) 
             Flow::Pulled => pulling = socket.pull.next(),
             Flow::Stopped => return crate::server::goodbye(socket.client).await,
             Flow::Ended => return,
+            Flow::Refused => return socket.hear_close(frames).await,
         }
     }
 }
@@ -230,8 +232,32 @@ impl<E: Context> Socket<E> {
             code: close_code::PROTOCOL,
             reason: "a frame that is not a Watch".into(),
         };
-        self.send(Message::Close(Some(refused))).await;
-        Flow::Ended
+        match self.send(Message::Close(Some(refused))).await {
+            Flow::Watching => Flow::Refused,
+            other => other,
+        }
+    }
+
+    async fn hear_close(self, frames: SplitStream<WebSocket>) {
+        let Socket {
+            client: _client,
+            pull,
+            stopping,
+            ..
+        } = self;
+        if stopping {
+            return;
+        }
+        let until_close = frames
+            .take_while(|frame| {
+                let open = matches!(frame, Ok(message) if !matches!(message, Message::Close(_)));
+                std::future::ready(open)
+            })
+            .for_each(|_| std::future::ready(()));
+        tokio::select! {
+            () = until_close => {}
+            _ = pull.cut => {}
+        }
     }
 
     async fn send(&mut self, message: Message) -> Flow {
@@ -404,6 +430,7 @@ fn pulled_on(flow: Flow) -> Flow {
         Flow::Watching | Flow::Pulled => Flow::Pulled,
         Flow::Stopped => Flow::Stopped,
         Flow::Ended => Flow::Ended,
+        Flow::Refused => Flow::Refused,
     }
 }
 
