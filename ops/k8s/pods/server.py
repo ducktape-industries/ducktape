@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import base64
 import binascii
@@ -142,6 +142,11 @@ FILES_PROGRAM = "files"
 CHUNK = "chunk"
 CHUNK_SIZE = 1 << 20
 EGRESS = "egress"
+FORGE_REACH = "forge-reach"
+REPORT_LINE = "ducktape-report "
+REPORT_STATES = {"passed": 1, "failed": 2}
+FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
+MOVED_ELSEWHERE = re.compile(r"moved to run (\S+?):(\S+) on another machine")
 PACK = "pack"
 DROPPED = (
     "connection closed before message completed",
@@ -1566,6 +1571,59 @@ def notify_lines(name, stream):
             yield channel, text.strip(), caller
 
 
+def report_lines(name, stream):
+    for raw in stream:
+        line = raw.decode(errors="replace").rstrip("\r\n")
+        if not line.startswith(REPORT_LINE):
+            continue
+        words = line[len(REPORT_LINE):].split()
+        if len(words) < 5 or not FULL_COMMIT.fullmatch(words[1]) or words[3] not in REPORT_STATES:
+            continue
+        repo, commit, context, state, run, *reach = words
+        yield {"repo": repo, "commit": commit, "context": context, "state": state, "run": run, "url": f"{name}:{run}", "reach": reach or [""]}
+
+
+def lane_record_holds(said, record):
+    lines = record.splitlines()
+    named = f"run {said['run']}: {said['repo']} {said['commit']}, slot "
+    lane = any(line.startswith(named) and line.endswith(", lane") for line in lines)
+    if said["state"] == "passed":
+        ended = "GATES ok" in lines
+    else:
+        ended = any(line.startswith("GATES FAIL:") for line in lines)
+    reach = " ".join(path for path in said["reach"] if path) or "the whole tree"
+    recorded = f"report: build.sh#lane {said['state']}, reach: {reach}" in lines
+    return lane and ended and recorded
+
+
+def reach_report(said):
+    reach = borsh_vec([borsh_text(path) for path in said["reach"]])
+    head = borsh_text(said["repo"]) + borsh_text(said["commit"]) + borsh_text(said["context"])
+    return u8(1) + head + u8(REPORT_STATES[said["state"]]) + borsh_option(said["url"], borsh_text) + reach + borsh_option(None, u64)
+
+
+def reach_reports(repo, commit, after):
+    return u8(0) + borsh_text(repo) + borsh_text(commit) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+
+
+def reports_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != 0:
+        raise Refused(502, "forge-reach answered its reports with something else")
+    reader.u64()
+    found = []
+    for _ in range(int.from_bytes(reader.take(4), "little")):
+        reader.u64()
+        context = reader.bytes().decode(errors="replace")
+        reader.u8()
+        url = reader.bytes().decode(errors="replace") if reader.u8() == 1 else None
+        reader.u64()
+        for _ in range(int.from_bytes(reader.take(4), "little")):
+            reader.bytes()
+        found.append((context, url))
+    return found, reader.bytes() if reader.u8() == 1 else None
+
+
 def lost_runs(name, stream):
     armed, done = {}, set()
     for raw in stream:
@@ -2218,6 +2276,8 @@ class Notifier:
         self.signer = signer
         self.following = set()
         self.posted = {}
+        self.reported = {}
+        self.records = None
         self.lock = threading.Lock()
         self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
         self.pause = time.sleep
@@ -2315,7 +2375,88 @@ class Notifier:
                 return newest + 1, asked, None
         return 0, asked, None
 
+    def reporting(self, name, stream):
+        for raw in stream:
+            for said in report_lines(name, [raw]):
+                self.report(name, said)
+            yield raw
+
+    def report(self, name, said):
+        with self.lock:
+            if said["url"] in self.reported.get(name, ()):
+                return
+        if not self.signer.held():
+            say("pods_unreported", run=json.dumps(said["url"]), reason="no_key")
+            return
+        try:
+            record = self.records(name, said["run"]) if self.records else None
+        except Refused as refused:
+            say("pods_unreported", run=json.dumps(said["url"]), reason="unread", detail=json.dumps(refused.sentence))
+            return
+        if record is None or not lane_record_holds(said, record):
+            why = f"{name} records no lane run {said['run']} of {said['repo']} {said['commit']} that ended {said['state']} with that reach"
+            say("pods_unreported", run=json.dumps(said["url"]), reason="unrecorded", detail=json.dumps(why))
+            with self.lock:
+                self.reported.setdefault(name, set()).add(said["url"])
+            return
+        pause = self.retry_pause
+        attempts = 0
+        while True:
+            try:
+                settled = self.report_once(said)
+                break
+            except Unanswered as why:
+                attempts += 1
+                if attempts & (attempts - 1) == 0:
+                    say("pods_retried", attempts=attempts, reason="node_unanswered", run=json.dumps(said["url"]), detail=json.dumps(str(why)))
+                self.pause(pause)
+                pause *= 2
+        if settled:
+            with self.lock:
+                self.reported.setdefault(name, set()).add(said["url"])
+
+    def report_once(self, said):
+        outcome, reason, sentence, _ = receipt(self.signer.submit(FORGE_REACH, reach_report(said)))
+        if outcome == "applied":
+            say("pods_reported", run=json.dumps(said["url"]), commit=said["commit"], state=said["state"])
+            return True
+        if outcome in ("unknown", "unlanded") or (outcome == "failed" and unanswered(sentence)):
+            raise Unanswered(sentence)
+        say("pods_unreported", run=json.dumps(said["url"]), reason=reason or outcome, detail=json.dumps(sentence))
+        return outcome == "rejected"
+
+    def recorded(self, said):
+        after = None
+        while True:
+            ran = self.signer.query(FORGE_REACH, reach_reports(said["repo"], said["commit"], after))
+            if ran.code != 0:
+                raise Refused(502, ran.err or ran.out.decode(errors="replace") or f"ducktape exited {ran.code}")
+            found, after = reports_of(ran.out)
+            if (said["context"], said["url"]) in found:
+                return True
+            if after is None:
+                return False
+
+    def reports_passed(self, name, said):
+        for newest in range(len(said) - 1, -1, -1):
+            try:
+                held = self.recorded(said[newest])
+            except Refused as refused:
+                return 0, refused.sentence
+            if held:
+                with self.lock:
+                    self.reported.setdefault(name, set()).update(each["url"] for each in said[: newest + 1])
+                return newest + 1, None
+        return 0, None
+
     def caught_up(self, name, logged):
+        reports = list(report_lines(name, logged))
+        if reports:
+            reported, why = self.reports_passed(name, reports)
+            if why is None:
+                say("pods_reports_caught_up", pod=name, already_reported=reported)
+            else:
+                say("pods_uncaught", pod=name, reports=len(reports), detail=json.dumps(why))
         passed, asked, why = self.passed(name, list(notify_lines(name, logged)))
         if why is not None:
             say("pods_uncaught", pod=name, asked=asked, detail=json.dumps(why))
@@ -2323,7 +2464,7 @@ class Notifier:
         say("pods_caught_up", pod=name, already_posted=passed, asked=asked)
 
     def lines(self, name, requester, stream, unvouched=False, concerned=None):
-        return self.each(name, requester, notify_lines(name, stream), unvouched, concerned)
+        return self.each(name, requester, notify_lines(name, self.reporting(name, stream)), unvouched, concerned)
 
     def each(self, name, requester, said, unvouched=False, concerned=None):
         concerned = requester if concerned is None else concerned
@@ -2398,6 +2539,7 @@ class Notifier:
         elif kind == "DELETED":
             with self.lock:
                 self.posted.pop(event["object"]["metadata"]["name"], None)
+                self.reported.pop(event["object"]["metadata"]["name"], None)
 
     def watch(self):
         failures = 0
@@ -2449,6 +2591,7 @@ class Service:
         self.api = api
         self.schemas = Schemas(api)
         self.notifier = Notifier(kube, signer, self.retry_pause)
+        self.notifier.records = self.lane_record
         self.pause = time.sleep
         self.execs = {}
         self.lock = threading.Lock()
@@ -2655,6 +2798,14 @@ class Service:
     def list(self):
         return 200, {"pods": [view(pod) for pod in self.items(self.kube.list(), "the pods were not listed")]}
 
+    def lane_record(self, machine, run):
+        command = ["sh", BUILD_SH, "status", run]
+        if machine == DESKTOP:
+            return self.desktop.ran(command).out.decode(errors="replace")
+        if not self.warm_pod or machine != self.warm():
+            return None
+        return self.kube.exec(machine, None, command).out.decode(errors="replace")
+
     def warm(self):
         if not self.warm_pod:
             raise Refused(503, f"pod {DESKTOP} is not free and this service names no warm pod (PODS_WARM_POD), so pod {BUILDS} has nowhere to run it")
@@ -2856,6 +3007,8 @@ class Service:
         first = called[0] if called else ""
         if first == REROUTE and len(called) == 1:
             return Ran(0, self.reroute(asked, alive).encode(), f"{BUILDS}: reroute")
+        if first == "bump" and len(called) > 1:
+            return self.bumped(asked, settings, called[1:], alive)
         if first in MACHINE_WIDE:
             raise Refused(400, f"build.sh {first} acts on one machine, so name it (pod {DESKTOP}, or the warm pod) rather than pod {BUILDS}")
         if first in ADDRESSED:
@@ -2912,6 +3065,26 @@ class Service:
             say("pods_routed", to="warm", reason="desktop_lost", detail=json.dumps(refused.sentence))
             ran = self.launched_on(asked, machine, settings, words, alive)
         return on_machine(machine, ran)
+
+    def bumped(self, asked, settings, named, alive):
+        outs, errs, code = [], [], 0
+        for word in reversed(named):
+            machine, colon, run = word.partition(":")
+            if not colon:
+                run = word
+                machine, _ = self.holder(asked, run, alive)
+            seen = set()
+            while True:
+                seen.add((machine, run))
+                ran = self.on(asked, machine, [*settings, "bump", run], alive)
+                moved = MOVED_ELSEWHERE.search(ran.err + ran.out.decode(errors="replace"))
+                if ran.code == 0 or moved is None or (moved.group(1), moved.group(2)) in seen:
+                    break
+                machine, run = moved.group(1), moved.group(2)
+            outs.append(ran.out)
+            errs.append(f"{BUILDS}: {word} bumped on {machine}" + (f"\n{ran.err}" if ran.err else ""))
+            code = max(code, ran.code)
+        return Ran(code, b"".join(reversed(outs)), "\n".join(reversed(errs)))
 
     def launched_on(self, asked, machine, settings, words, alive):
         if "WAIT=1" not in settings:

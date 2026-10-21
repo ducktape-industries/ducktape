@@ -2290,6 +2290,136 @@ class Unanswering(Signer):
         return super().query(program, request)
 
 
+class Reporting(Signer):
+    def __init__(self):
+        super().__init__()
+        self.recorded = set()
+        self.reports_asked = []
+
+    def query(self, program, request):
+        if program != server.FORGE_REACH:
+            return super().query(program, request)
+        self.reports_asked.append(request)
+        reader = server.Reader(request)
+        reader.u8()
+        repo, commit = reader.bytes().decode(), reader.bytes().decode()
+        items = [(context, url) for held_repo, held_commit, context, url in sorted(self.recorded) if (held_repo, held_commit) == (repo, commit)]
+        rows = b"".join(server.u64(23) + server.borsh_text(context) + server.u8(1) + server.borsh_option(url, server.borsh_text) + server.u64(9) + server.borsh_vec([]) for context, url in items)
+        return ran(server.u8(0) + server.u64(9) + len(items).to_bytes(4, "little") + rows + server.u8(0))
+
+
+GATED = "a" * 40
+OTHER = "b" * 40
+
+
+def text(value):
+    return len(value.encode()).to_bytes(4, "little") + value.encode()
+
+
+def lane_run(run, commit=GATED, state="passed", reach="crates/a", repo="programs"):
+    verdict = "GATES ok" if state == "passed" else "GATES FAIL: clippy"
+    return f"job j-1\nrun {run}: {repo} {commit}, slot lane, lane\nGATE clippy ok\nreport: build.sh#lane {state}, reach: {reach}\n{verdict}\n"
+
+
+class Reports(unittest.TestCase):
+    def setUp(self):
+        self.kube = Kube()
+        self.signer = Reporting()
+        self.notifier = server.Notifier(self.kube, self.signer, 1)
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.paused = []
+        self.notifier.pause = self.paused.append
+        self.runs = {}
+        self.notifier.records = lambda name, run: self.runs.get((name, run))
+
+    def report(self, url, commit=GATED, state="passed", reach=("crates/a",), repo="programs"):
+        return ("forge-reach", server.reach_report({"repo": repo, "commit": commit, "context": "build.sh#lane", "state": state, "url": url, "reach": list(reach)}))
+
+    def test_a_report_is_forge_reachs_report_op_in_its_own_field_order(self):
+        said = {"repo": "programs", "commit": GATED, "context": "build.sh#lane", "state": "failed", "url": "desktop:r1", "reach": ["Cargo.lock", "crates/a"]}
+        whole = b"\x01" + text("programs") + text(GATED) + text("build.sh#lane") + b"\x02" + b"\x01" + text("desktop:r1") + (2).to_bytes(4, "little") + text("Cargo.lock") + text("crates/a") + b"\x00"
+        self.assertEqual(server.reach_report(said), whole)
+
+    def test_a_lanes_report_line_goes_to_forge_reach_once_as_the_pods_own(self):
+        self.kube.logs_of["duckpond-41"] = (
+            f"ducktape-report programs {GATED} build.sh#lane passed r1 Cargo.lock crates/app/chat\n"
+            f"ducktape-report core {OTHER} build.sh#lane failed r2\n"
+            "ducktape-report programs abc123 build.sh#lane passed r3 x\n"
+            f"ducktape-report programs {GATED} build.sh#lane maybe r4 x\n"
+            f"ducktape-report programs {GATED}\n"
+        ).encode()
+        self.runs[("duckpond-41", "r1")] = lane_run("r1", reach="Cargo.lock crates/app/chat")
+        self.runs[("duckpond-41", "r2")] = lane_run("r2", commit=OTHER, state="failed", reach="the whole tree", repo="core")
+        for _ in range(2):
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        first = self.report("duckpond-41:r1", reach=("Cargo.lock", "crates/app/chat"))
+        whole = self.report("duckpond-41:r2", commit=OTHER, state="failed", reach=("",), repo="core")
+        self.assertEqual(self.signer.submits, [first, whole])
+
+    def test_a_restart_reports_only_the_lines_newer_than_the_newest_forge_reach_holds(self):
+        logged = "".join(f"ducktape-report programs {commit} build.sh#lane passed r{n} crates/a\n" for n, commit in ((1, GATED), (2, OTHER), (3, GATED))).encode()
+        self.kube.answer("logs", ran(logged))
+        self.kube.logs_of["duckpond-41"] = logged
+        self.signer.recorded.add(("programs", OTHER, "build.sh#lane", "duckpond-41:r2"))
+        self.runs[("duckpond-41", "r3")] = lane_run("r3")
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [self.report("duckpond-41:r3")])
+        self.assertEqual(self.signer.reports_asked, [server.reach_reports("programs", GATED, None), server.reach_reports("programs", OTHER, None)])
+        said.assert_any_call("pods_reports_caught_up", pod="duckpond-41", already_reported=2)
+
+    def test_a_report_forge_reach_refuses_is_logged_and_not_sent_again(self):
+        self.signer.submitted = ran(POOLED + b"landed 961 rejected invalid_input: reach path ./x is not a plain path\n")
+        self.kube.logs_of["duckpond-41"] = f"ducktape-report programs {GATED} build.sh#lane passed r1 ./x\n".encode()
+        self.runs[("duckpond-41", "r1")] = lane_run("r1", reach="./x")
+        with unittest.mock.patch.object(server, "say") as said:
+            for _ in range(2):
+                self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [self.report("duckpond-41:r1", reach=("./x",))])
+        said.assert_any_call("pods_unreported", run=json.dumps("duckpond-41:r1"), reason="invalid_input", detail=unittest.mock.ANY)
+
+    def test_a_report_the_node_does_not_answer_is_sent_again(self):
+        self.signer.submitted = [ran(code=1, err="ducktape: the node failed (502): bad gateway"), ran(POOLED + b"landed 961 applied 00ff\n")]
+        self.kube.logs_of["duckpond-41"] = f"ducktape-report programs {GATED} build.sh#lane passed r1 crates/a\n".encode()
+        self.runs[("duckpond-41", "r1")] = lane_run("r1")
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [self.report("duckpond-41:r1")] * 2)
+        self.assertEqual(self.paused, [1])
+
+    def test_a_line_no_build_machine_records_as_that_lane_is_never_reported(self):
+        forged = {
+            "agents-pod": ("r1", None),
+            "sh-run": ("r2", f"job j-1\nrun r2: programs {GATED}, slot 1, sh echo ducktape-report programs {GATED} build.sh#lane passed r2 crates/a\nsh exit 0\n"),
+            "other-reach": ("r3", lane_run("r3", reach="crates/b")),
+            "other-verdict": ("r4", lane_run("r4", state="failed")),
+            "other-commit": ("r5", lane_run("r5", commit=OTHER)),
+        }
+        lines = []
+        for run, record in forged.values():
+            if record is not None:
+                self.runs[("duckpond-41", run)] = record
+            lines.append(f"ducktape-report programs {GATED} build.sh#lane passed {run} crates/a\n")
+        self.kube.logs_of["duckpond-41"] = "".join(lines).encode()
+        with unittest.mock.patch.object(server, "say") as said:
+            for _ in range(2):
+                self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [])
+        unrecorded = [call.kwargs["run"] for call in said.call_args_list if call.args == ("pods_unreported",) and call.kwargs.get("reason") == "unrecorded"]
+        self.assertEqual(unrecorded, [json.dumps(f"duckpond-41:r{n}") for n in range(1, 6)])
+
+    def test_a_line_whose_record_cannot_be_read_is_not_reported_nor_marked(self):
+        self.kube.logs_of["duckpond-41"] = f"ducktape-report programs {GATED} build.sh#lane passed r1 crates/a\n".encode()
+
+        def unread(name, run):
+            raise server.Refused(502, "the warm pod's name was not read")
+
+        self.notifier.records = unread
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.notifier.records = lambda name, run: lane_run("r1")
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [self.report("duckpond-41:r1")])
+
+
 class Posts(unittest.TestCase):
     def setUp(self):
         self.kube = Kube()
@@ -3512,6 +3642,34 @@ class Builds(Streamed):
         self.kube.answer("exec", ran(b"stopped w1 (job j-1)\nstopped w2 (job j-1)\n"))
         self.assertEqual(self.built("stop", f"{WARM}:w1", f"{WARM}:w2", "w3")[0], 200)
         self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "stop", "w1", "w2", "w3"])])
+
+    def test_a_report_is_checked_only_against_a_build_machines_own_record(self):
+        self.gate.answers["exec"] = ran(lane_run("r1").encode())
+        self.kube.answer("exec", ran(lane_run("w1").encode()))
+        self.assertIsNone(self.service.lane_record("duckpond-41", "r9"))
+        self.assertIn("run w1: programs", self.service.lane_record(WARM, "w1"))
+        self.assertIn("run r1: programs", self.service.lane_record("desktop", "r1"))
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "status", "w1"])])
+        self.assertEqual(self.gate.words(), [["exec", "status", "r1"]])
+        self.assertIs(self.service.notifier.records.__func__, server.Service.lane_record)
+
+    def test_a_bump_through_builds_follows_its_run_to_the_machine_it_moved_to(self):
+        self.gate.answers["exec"] = ran(code=2, err="build.sh: no run w1 in pod orthorymain (a run of an earlier warm pod is gone with it)")
+        self.gate.answers["exec bump"] = ran(b"bumped r9: place 1 in the pod's heavy-run queue\n")
+        self.kube.answer("exec", ran(b"job j-1\nmoved to run desktop:r9 by build.sh moved\n"), ran(code=2, err="build.sh: that run was moved to run desktop:r9 on another machine: bump it there"))
+        status, answer = self.built("bump", "w1")
+        self.assertEqual((status, answer["stdout"]), (200, "bumped r9: place 1 in the pod's heavy-run queue\n"))
+        self.assertIn("w1 bumped on desktop", answer["stderr"])
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "status", "w1"]), (WARM, None, ["sh", BUILD, "bump", "w1"])])
+        self.assertEqual(self.gate.words(), [["exec", "status", "w1"], ["exec", "bump", "r9"]])
+
+    def test_a_bump_through_builds_bumps_each_run_on_its_machine_in_the_order_named(self):
+        self.gate.answers["exec bump"] = ran(b"bumped r1: place 1 in the pod's heavy-run queue\n")
+        self.kube.answer("exec", ran(b"bumped w1: place 1 in the pod's heavy-run queue\n"))
+        status, answer = self.built("bump", "desktop:r1", f"{WARM}:w1")
+        self.assertEqual((status, answer["stdout"]), (200, "bumped r1: place 1 in the pod's heavy-run queue\nbumped w1: place 1 in the pod's heavy-run queue\n"))
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "bump", "w1"])])
+        self.assertEqual(self.gate.words(), [["exec", "bump", "r1"]])
 
     def test_runs_on_two_machines_in_one_call_are_refused(self):
         self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "stop", f"{WARM}:w1", "desktop:r1"]}, 400, ["one machine per call", "desktop:r1 names pod desktop", "call it once for each"])

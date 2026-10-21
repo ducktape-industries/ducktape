@@ -323,7 +323,12 @@ one up for another network.
   The runs after the first (`stop` and `wait` take several) go to the
   first's machine, each without its `<machine>:` part, and one naming
   another machine is refused with 400 (call once per machine);
-  calls that act on one machine (`busy`, `bump`, `prune`, `jobs`,
+  `bump <run>...` bumps each run on the machine that holds it (found as
+  `status` finds one, or named as `<machine>:<run>`), the last named first so
+  each machine's queue keeps the order named, and follows a run build.sh says
+  was moved to another machine (`moved to run <machine>:<run> on another
+  machine`) to bump it there; a bare `bump` and the other
+  calls that act on one machine (`busy`, `prune`, `jobs`,
   `heavy-runs`, `disk-targets`, `queue-out`, `queue-in`, `self-update`,
   `worktree`, `measure`) are refused with 400, since they name a machine. A run the
   desktop never started (unreachable, down) goes to the warm pod. A held run
@@ -484,6 +489,28 @@ one up for another network.
   pod's processes no memory once full; the reply warns of each, saying the
   processes are OOM-killed. A reply with nothing to warn of has no
   `warnings` field.
+- Each line a followed pod (or the desktop runner) prints that reads
+  `ducktape-report <repo> <commit> <context> passed|failed <run> [<path>...]`
+  (build.sh's lane: its verdict, and the paths it read) is a forge-reach
+  `Report` the service sends as its own account: url `<pod>:<run>`, reach the
+  paths (none is `""`, the whole tree), no change. It is sent only when the
+  line came from a build machine (the desktop runner, or the pod
+  `PODS_WARM_POD` names) and that machine's `build.sh status <run>` records a
+  lane run of that repo and commit (`run <run>: <repo> <commit>, slot …,
+  lane`) that ended with the line's verdict (`GATES ok`, or `GATES FAIL:`) and
+  recorded the line's reach (`report: build.sh#lane <state>, reach: <path>...`
+  or `reach: the whole tree`); otherwise `pods_unreported reason=unrecorded`,
+  final, or `reason=unread` while the record can't be read. A branch whose
+  `RequireChecks` names forge-reach with the context `<the service's
+  account>/<context>` then lands a change whose Preview left that reach alone.
+  Each run is reported once (`pods_reported`). A refusal is final
+  (`pods_unreported` with its reason), and a submit the node doesn't answer
+  is sent again as a post is. Before the service follows a log, one read
+  walks its report lines from the newest back, asking forge-reach `Reports`
+  of each line's commit, and every line up to the newest it holds counts as
+  reported (`pods_reports_caught_up pod= already_reported=`; a failed ask logs
+  `pods_uncaught` and marks nothing). So a line echoed in an agent's pod, or
+  by an `sh` run in the warm pod, reports nothing.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one chat notice there when it ends (chat `Notify`: kind `pod`,
   group and subject the pod, status passed or failed by the run container's
