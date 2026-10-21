@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime};
 use abi::Receipt;
 use arc_swap::ArcSwap;
 use borsh::{BorshDeserialize, BorshSerialize};
-use commonware_consensus::types::Height;
 use commonware_cryptography::sha256;
 use consensus::{Certificate, validators_of};
 use host::{ANCHOR_WINDOW, Submission, SubmissionId};
@@ -244,9 +243,13 @@ impl<E: Context> Daemon<E> {
         id: sha256::Digest,
         ran: Ran,
         receipts: Option<Vec<Receipt>>,
+        finalization: Option<Certificate>,
     ) -> Result<Recorded> {
         let asked = self.context.current();
-        let proposer = self.proposer(node, block.height).await?;
+        let proposer = match &finalization {
+            Some(certificate) => proposer_of(node, certificate)?,
+            None => None,
+        };
         let proposed = self.context.current();
         let (kept, payloads) = summarize(
             block,
@@ -271,6 +274,7 @@ impl<E: Context> Daemon<E> {
         node: &Node<E>,
         block: &Block,
         id: sha256::Digest,
+        finalization: Option<Certificate>,
     ) -> Result<()> {
         if self.history.has(block.height)? {
             return Ok(());
@@ -280,15 +284,9 @@ impl<E: Context> Daemon<E> {
             .into_iter()
             .map(|(frame, submission)| (frame, submission.id(), submission))
             .collect();
-        self.record(node, block, id, ran, None).await?;
+        self.record(node, block, id, ran, None, finalization)
+            .await?;
         Ok(())
-    }
-
-    async fn proposer(&self, node: &Node<E>, height: u64) -> Result<Option<Vec<u8>>> {
-        let Some(certificate) = self.anchors.get_finalization(Height::new(height)).await else {
-            return Ok(None);
-        };
-        proposer_of(node, &certificate)
     }
 }
 

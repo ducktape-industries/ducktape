@@ -245,7 +245,7 @@ impl Exchange for Loopback {
     async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
         let request: Request = abi::decode(&abi::encode(&request)).unwrap();
         let node = self.0.node.lock().await;
-        let published = statesync::Published::of(&node).unwrap();
+        let published = statesync::Published::of(&node, None).unwrap();
         drop(node);
         let served = serve(&published, &self.0.holds, request).await;
         let response = anchored(served, &*self.0).await;
@@ -254,7 +254,7 @@ impl Exchange for Loopback {
 
     async fn hold(&self) -> Result<(Response, statesync::Ending), Infallible> {
         let node = self.0.node.lock().await;
-        let published = Arc::new(statesync::Published::of(&node).unwrap());
+        let published = Arc::new(statesync::Published::of(&node, None).unwrap());
         drop(node);
         let (served, hold) = statesync::held(published, &self.0.holds);
         let response = anchored(served, &*self.0).await;

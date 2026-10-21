@@ -22,14 +22,15 @@ use commonware_runtime::telemetry::metrics::{Gauge, Histogram, MetricsExt as _, 
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use consensus::{
-    Ancestry, Anchor, Cadence, Chain, EngineMux, Marshal, Membership, Network, Roster, Transport,
-    validators_of,
+    Ancestry, Anchor, Cadence, Chain, EngineMux, Marshal, MarshalMailbox, Membership, Network,
+    Roster, Transport, validators_of,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use halo::{Class, Halo, Lane, Seat};
 use host::Layer;
 use node::{Block, Frame, Node, Sequenced};
+use statesync::Anchors as _;
 use tokio::sync::watch;
 
 use crate::changes::Changes;
@@ -507,7 +508,7 @@ async fn start<E: Context>(
         identity: &identity_key,
         readers: &readers,
     };
-    let base = Arc::new(View::of(&node, &facts)?);
+    let base = Arc::new(View::of(&node, &facts, None)?);
     let current = Arc::new(Current::new());
     current.views.store(Some(base.clone()));
     let seeding = base.clone();
@@ -653,7 +654,6 @@ async fn start<E: Context>(
         descriptor: descriptor.clone(),
         network,
         identity: identity_key,
-        anchors: marshal.mailbox().clone(),
         holds: statesync::Holds::default(),
         holds_ended: Default::default(),
         snapshot: snapshot_removals.served(),
@@ -680,7 +680,7 @@ async fn start<E: Context>(
         && founding
     {
         daemon
-            .record_unrecorded(&node, genesis, genesis.digest())
+            .record_unrecorded(&node, genesis, genesis.digest(), None)
             .await?;
     }
     let applied_unsummarized = carried
@@ -695,10 +695,13 @@ async fn start<E: Context>(
                 "block {height} is archived and marshal does not read it"
             ))
         })?;
+        let finalization = archived.get_finalization(asked).await;
         daemon
-            .record_unrecorded(&node, &block, block.digest())
+            .record_unrecorded(&node, &block, block.digest(), finalization)
             .await?;
     }
+    let anchors = marshal.mailbox().clone();
+    published(&node, &daemon, anchors.anchor(tip).await);
     if let Some(head) = daemon.head(tip.height).await? {
         daemon.changes.opened(head);
     }
@@ -707,6 +710,7 @@ async fn start<E: Context>(
     let pump = context.child("pump").spawn({
         let writing = Writing {
             daemon: daemon.clone(),
+            anchors,
             node,
             commands,
             membership,
@@ -994,6 +998,7 @@ impl<E: Context> Chain for Participant<E> {
 
 struct Writing<E: Context> {
     daemon: Arc<Daemon<E>>,
+    anchors: MarshalMailbox,
     node: Node<E>,
     commands: mpsc::UnboundedReceiver<Command>,
     membership: Seating<E>,
@@ -1284,8 +1289,8 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
     let _ = closer.send(closed);
 }
 
-fn published<E: Context>(node: &Node<E>, daemon: &Daemon<E>) {
-    match View::of(node, &daemon.facts()) {
+fn published<E: Context>(node: &Node<E>, daemon: &Daemon<E>, anchor: Option<Anchor>) {
+    match View::of(node, &daemon.facts(), anchor) {
         Ok(view) => {
             daemon.current.views.store(Some(Arc::new(view)));
         }
@@ -1384,6 +1389,7 @@ async fn applied<E: Context>(
     phases.applying = lap.lap();
     let Writing {
         daemon,
+        anchors,
         node,
         membership,
         tracker,
@@ -1391,7 +1397,12 @@ async fn applied<E: Context>(
         ..
     } = writing;
     let daemon: &Daemon<E> = daemon;
-    published(node, daemon);
+    let anchor = anchors.anchor(node.tip()?).await;
+    let finalization = match &anchor {
+        Some(Anchor::Finalized(certificate)) => Some(certificate.clone()),
+        Some(Anchor::Genesis(_)) | None => None,
+    };
+    published(node, daemon, anchor);
     let id = block.digest();
     daemon.votes.applied(id, block.height);
     daemon.tips.send_replace(block.height);
@@ -1412,7 +1423,9 @@ async fn applied<E: Context>(
             phases.slowest = slowest_of(spent.slowest, &receipts, &carried);
             let records = std::mem::take(&mut applied.records);
             let refused = crate::activity::refused(&records, &receipts);
-            let recorded = daemon.record(node, block, id, ran, Some(receipts)).await?;
+            let recorded = daemon
+                .record(node, block, id, ran, Some(receipts), finalization)
+                .await?;
             phases.proposing = recorded.proposing;
             phases.keeping = recorded.keeping;
             daemon.activity.offer(crate::activity::Block {
@@ -1452,7 +1465,9 @@ async fn applied<E: Context>(
             members_written
         }
         Sequenced::Replayed => {
-            daemon.record_unrecorded(node, block, id).await?;
+            daemon
+                .record_unrecorded(node, block, id, finalization)
+                .await?;
             phases.recording = lap.lap();
             false
         }

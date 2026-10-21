@@ -1,5 +1,5 @@
-// Source lint: the modules an RPC request runs through name no lock, and a handler takes the
-// request context, never the daemon.
+// Source lint: the modules an RPC request runs through name no lock and never reach marshal's
+// mailbox, and a handler takes the request context, never the daemon.
 
 const REQUEST_PATH: [&str; 25] = [
     "server.rs",
@@ -52,6 +52,25 @@ fn no_module_on_the_request_path_names_a_lock() {
         })
         .collect();
     assert!(named.is_empty(), "locks on the request path: {named:?}");
+}
+
+#[test]
+fn no_module_on_the_request_path_reaches_marshal() {
+    let reaching: Vec<(&str, &str)> = REQUEST_PATH
+        .iter()
+        .flat_map(|module| {
+            let text = source(module);
+            ["MarshalMailbox", "get_finalization", "get_block("]
+                .into_iter()
+                .filter(move |name| text.contains(name))
+                .map(move |name| (*module, name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        reaching.is_empty(),
+        "modules on the request path that ask marshal: {reaching:?}"
+    );
 }
 
 #[test]

@@ -35,7 +35,7 @@ mod writer;
 use std::sync::Arc;
 
 use abi::{ProgramId, Refusal};
-use consensus::{MarshalMailbox, Network, Votes};
+use consensus::{Network, Votes};
 use host::Applied;
 use node::{Checked, Preconfirm, Source, Taken};
 use tokio::sync::watch;
@@ -169,7 +169,6 @@ pub struct Daemon<E: Context> {
     pub descriptor: Descriptor,
     pub network: Network,
     pub identity: Vec<u8>,
-    pub anchors: MarshalMailbox,
     holds: statesync::Holds<E>,
     holds_ended: Arc<std::sync::atomic::AtomicU64>,
     snapshot: snapshot::Served,
@@ -262,13 +261,13 @@ impl<E: Context> Daemon<E> {
             height,
             hold: Box::new(hold),
         });
-        Ok((statesync::anchored(served, &self.anchors).await, held))
+        Ok((statesync::anchored(served, &**view.sync()).await, held))
     }
 
     pub async fn sync(&self, request: statesync::Request) -> Result<statesync::Response> {
         let view = self.view()?;
         let served = statesync::serve(view.sync(), &self.holds, request).await;
-        Ok(statesync::anchored(served, &self.anchors).await)
+        Ok(statesync::anchored(served, &**view.sync()).await)
     }
 
     pub(crate) fn subscribe(&self, program: ProgramId, keys: bool) -> Subscription {

@@ -33,11 +33,19 @@ impl Anchors for MarshalMailbox {
 
 pub struct Published<E: Context> {
     tip: Tip,
+    anchor: Option<Anchor>,
     programs: BTreeMap<ProgramId, Arc<Serving<E>>>,
 }
 
+impl<E: Context> Anchors for Published<E> {
+    async fn anchor(&self, tip: Tip) -> Option<Anchor> {
+        let ours = tip == self.tip;
+        ours.then(|| self.anchor.clone()).flatten()
+    }
+}
+
 impl<E: Context> Published<E> {
-    pub fn of(node: &Node<E>) -> node::Result<Published<E>> {
+    pub fn of(node: &Node<E>, anchor: Option<Anchor>) -> node::Result<Published<E>> {
         let programs = node
             .host()
             .store()
@@ -46,6 +54,7 @@ impl<E: Context> Published<E> {
             .collect();
         Ok(Published {
             tip: node.tip()?,
+            anchor,
             programs,
         })
     }
@@ -181,8 +190,8 @@ fn head<E: Context>(published: &Published<E>) -> Served {
 }
 
 pub fn manifest<E: Context>(node: &Node<E>) -> Result<Manifest, Refusal> {
-    let published =
-        Published::of(node).map_err(|error| Refusal::new(reason::NOT_FOUND, error.to_string()))?;
+    let published = Published::of(node, None)
+        .map_err(|error| Refusal::new(reason::NOT_FOUND, error.to_string()))?;
     let targets = targets(&published)?;
     Ok(Manifest {
         tip: published.tip,
