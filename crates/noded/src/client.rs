@@ -284,14 +284,12 @@ impl Client {
         };
         let (socket, _) =
             tokio_tungstenite::connect_async_with_config(url, Some(unbounded), false).await?;
-        Ok(socket.filter_map(|message| {
-            let change = match message {
-                Ok(Message::Binary(bytes)) => Some(abi::decode(&bytes).map_err(Error::Decode)),
-                Ok(_) => None,
-                Err(error) => Some(Err(Error::Ws(Box::new(error)))),
-            };
-            futures::future::ready(change)
-        }))
+        let (heard, received) = tokio::sync::mpsc::unbounded_channel();
+        let reading = tokio::spawn(read_changes(socket, heard));
+        Ok(Changes {
+            received,
+            reading: reading.abort_handle(),
+        })
     }
 
     pub async fn forward<R, W>(&self, frame: &Frame, input: R, mut output: W) -> Result<()>
@@ -367,6 +365,47 @@ impl Client {
 pub struct Upload {
     pub kind: String,
     pub path: std::path::PathBuf,
+}
+
+struct Changes {
+    received: tokio::sync::mpsc::UnboundedReceiver<Result<Change>>,
+    reading: tokio::task::AbortHandle,
+}
+
+impl Stream for Changes {
+    type Item = Result<Change>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Change>>> {
+        self.received.poll_recv(cx)
+    }
+}
+
+impl Drop for Changes {
+    fn drop(&mut self) {
+        self.reading.abort();
+    }
+}
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn read_changes(
+    mut socket: Socket,
+    heard: tokio::sync::mpsc::UnboundedSender<Result<Change>>,
+) {
+    while let Some(message) = socket.next().await {
+        let change = match message {
+            Ok(Message::Binary(bytes)) => abi::decode(&bytes).map_err(Error::Decode),
+            Ok(_) => continue,
+            Err(error) => Err(Error::Ws(Box::new(error))),
+        };
+        if heard.send(change).is_err() {
+            return;
+        }
+    }
 }
 
 type Part = std::pin::Pin<Box<dyn Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;

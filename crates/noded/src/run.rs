@@ -1644,6 +1644,60 @@ mod tests {
         assert_eq!(slowest_of(None, &receipts, &carried), None);
     }
 
+    #[tokio::test]
+    async fn seating_answers_its_changes_socket_while_it_asks_the_network() {
+        use std::sync::Arc;
+
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+        use axum::routing::get;
+        use tokio::sync::Notify;
+
+        use crate::wire::{Network, PeerStatus, route};
+
+        let key = vec![7u8; 32];
+        let ponged = Arc::new(Notify::new());
+        let changes = {
+            let ponged = ponged.clone();
+            move |upgrade: WebSocketUpgrade| {
+                let ponged = ponged.clone();
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let ping = Message::Ping(1u64.to_le_bytes().to_vec().into());
+                        if socket.send(ping).await.is_err() {
+                            return;
+                        }
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if let Message::Pong(_) = message {
+                                ponged.notify_one();
+                            }
+                        }
+                    })
+                }
+            }
+        };
+        let network = {
+            let ponged = ponged.clone();
+            let key = key.clone();
+            move || {
+                let ponged = ponged.clone();
+                let key = key.clone();
+                async move {
+                    ponged.notified().await;
+                    let members = vec![PeerStatus { key, signed: None }];
+                    abi::encode(&Network { height: 1, members })
+                }
+            }
+        };
+        let router = axum::Router::new()
+            .route(&format!("{}/{{program}}", route::CHANGES), get(changes))
+            .route(route::NETWORK, get(network));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let source = crate::Client::new(format!("http://{address}"));
+        super::seated(&source, &key).await.unwrap();
+    }
+
     #[test]
     fn the_table_reads_as_one_line() {
         let lane = |name: &str, id, enabled, pinned| halo::Lane {

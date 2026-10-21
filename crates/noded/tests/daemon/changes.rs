@@ -287,3 +287,33 @@ fn a_changes_socket_keeps_no_view_of_a_block_it_was_opened_at() {
     runtime.block_on(seat.admin(&client, Admin::Shutdown));
     live.thread.join().unwrap();
 }
+
+#[test]
+fn a_changes_stream_left_unread_past_two_epochs_stays_open_and_misses_no_block() {
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        let mut unread = client.changes(host::RECENT).await.unwrap();
+        let mut ticks = client.changes(host::RECENT).await.unwrap();
+        let first = ticks.next().await.unwrap().unwrap().height;
+        let past = first + 3 * EPOCH_LENGTH;
+        while ticks.next().await.unwrap().unwrap().height < past {}
+        let mut heights: Vec<u64> = Vec::new();
+        while heights.last().is_none_or(|at| *at <= past) {
+            let change = unread
+                .next()
+                .await
+                .expect("a stream left unread stays open");
+            heights.push(change.unwrap().height);
+        }
+        let contiguous = heights.windows(2).all(|pair| pair[1] == pair[0] + 1);
+        assert!(contiguous, "{heights:?}");
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
