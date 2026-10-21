@@ -20,7 +20,8 @@ use fixture_probe::{Reply, Step};
 use fixture_programs::Change;
 use fixture_relay::Script;
 use fixture_wasm::{
-    ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET,
+    ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROBE_BATCH, PROGRAMS, RELAY,
+    VALSET,
 };
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
@@ -3355,6 +3356,27 @@ fn hook_runs(genesis: Genesis, steps: Vec<Step>) -> Genesis {
     genesis
 }
 
+fn probe_code(mut genesis: Genesis, code: &[u8]) -> Genesis {
+    let probe = genesis
+        .programs
+        .iter_mut()
+        .find(|founding| founding.program == "probe")
+        .expect("the probe is founded");
+    probe.code = code.to_vec();
+    genesis
+}
+
+fn peek(height: u64, position: u32) -> Submission {
+    submit(
+        "probe",
+        script(vec![get(&fixture_probe::seen(height, position))]),
+    )
+}
+
+fn peeked(record: Option<&hook::Record>) -> Vec<Reply> {
+    vec![Reply::Host(HostReply::Value(record.map(abi::encode)))]
+}
+
 fn told(host: &Host<Ctx>, height: u64, position: u32) -> Option<hook::Record> {
     stored(host, "probe", &fixture_probe::seen(height, position))
         .map(|bytes| abi::decode(&bytes).unwrap())
@@ -3471,16 +3493,21 @@ fn a_hook_that_fails_keeps_none_of_its_writes_and_the_block_goes_on() {
         reply: false,
         acting: None,
     });
-    let runs: [(Vec<Step>, Option<&[u8]>); 4] = [
-        (vec![set(b"k", b"v")], Some(b"v")),
-        (vec![set(b"k", b"v"), Step::Fail("no".into())], None),
-        (vec![set(b"k", b"v"), Step::Spin], None),
-        (vec![set(b"k", b"v"), op(emit)], None),
-    ];
-    for (steps, kept) in runs {
+    let runs = || -> [(Vec<Step>, Option<&'static [u8]>); 4] {
+        [
+            (vec![set(b"k", b"v")], Some(b"v")),
+            (vec![set(b"k", b"v"), Step::Fail("no".into())], None),
+            (vec![set(b"k", b"v"), Step::Spin], None),
+            (vec![set(b"k", b"v"), op(emit.clone())], None),
+        ]
+    };
+    let each = [PROBE, PROBE_BATCH]
+        .into_iter()
+        .flat_map(|code| runs().into_iter().map(move |run| (code, run)));
+    for (code, (steps, kept)) in each {
         deterministic::Runner::default().start(|context| async move {
             let dir = tempfile::tempdir().unwrap();
-            let genesis = hook_runs(hooked(metered(), &["probe"]), steps);
+            let genesis = hook_runs(probe_code(hooked(metered(), &["probe"]), code), steps);
             let mut host = found(context, "net", dir.path(), genesis).await;
             let applied = host
                 .apply(block(
@@ -3549,6 +3576,108 @@ fn the_kernel_hooks_only_what_the_programs_role_answers() {
             .await
             .unwrap();
         assert_eq!(told(&host, 1, 0), None);
+    });
+}
+
+#[test]
+fn a_hook_that_takes_batches_is_told_once_after_the_frames_with_the_same_records() {
+    deterministic::Runner::default().start(|context| async move {
+        let frames = || {
+            vec![
+                submit("ping", abi::encode(&note(b"one"))),
+                peek(1, 0),
+                submit("ping", abi::encode(&fail(false))),
+            ]
+        };
+        let mut seen = Vec::new();
+        let mut rows = Vec::new();
+        let mut records = Vec::new();
+        for (name, code) in [("frames", PROBE), ("batch", PROBE_BATCH)] {
+            let dir = tempfile::tempdir().unwrap();
+            let genesis = probe_code(hooked(standard(), &["probe"]), code);
+            let mut host = found(context.child(name), name, dir.path(), genesis).await;
+            let applied = host.apply(block(1, frames())).await.unwrap();
+            seen.push(replies(&applied.submissions[1]));
+            records.push(applied.records);
+            rows.push((0..3).map(|at| told(&host, 1, at)).collect::<Vec<_>>());
+        }
+        let first = told_of("ping", SIGNER, Some(ACCOUNT), true);
+        assert_eq!(
+            seen[0],
+            peeked(Some(&first)),
+            "told a frame at a time, a frame reads what the hook wrote for the frames before it"
+        );
+        assert_eq!(seen[1], peeked(None), "a batch is told after every frame");
+        assert_eq!(records[0], records[1]);
+        assert_eq!(rows[0], rows[1]);
+        assert_eq!(rows[1][0], Some(first));
+        assert!(rows[1].iter().all(Option::is_some));
+    });
+}
+
+#[test]
+fn a_refused_batch_is_told_again_a_frame_at_a_time() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = probe_code(hooked(standard(), &["probe"]), PROBE_BATCH);
+        let mut host = found(context, "net", dir.path(), genesis).await;
+        let untold = Submission {
+            signer: fixture_probe::UNTOLD.to_vec(),
+            ..submit("ping", abi::encode(&note(b"two")))
+        };
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit("ping", abi::encode(&note(b"one"))),
+                    untold,
+                    submit("ping", abi::encode(&note(b"three"))),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(applied.records.len(), 3);
+        assert!(told(&host, 1, 0).is_some());
+        assert_eq!(told(&host, 1, 1), None);
+        assert!(told(&host, 1, 2).is_some());
+    });
+}
+
+#[test]
+fn a_hook_is_told_a_frame_at_a_time_until_its_code_takes_batches() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = hooked(standard(), &["probe"]);
+        let mut host = found(context, "net", dir.path(), genesis).await;
+        let framed = blob::frame("program", PROBE_BATCH).unwrap();
+        let code = blob::id_of(HashKind::Sha1, &framed).unwrap();
+        let put = op(HostOp::BlobPutAlone {
+            hash: HashKind::Sha1,
+            kind: "program".into(),
+            body: PROBE_BATCH.to_vec(),
+        });
+        let ping = |bytes: &[u8]| submit("ping", abi::encode(&note(bytes)));
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    ping(b"one"),
+                    peek(1, 0),
+                    submit("probe", script(vec![put])),
+                    submit("programs", change("probe", code, script(Vec::new()))),
+                ],
+            ))
+            .await
+            .unwrap();
+        let first = told_of("ping", SIGNER, Some(ACCOUNT), true);
+        assert_eq!(replies(&applied.submissions[1]), peeked(Some(&first)));
+        let applied = host
+            .apply(block(2, vec![ping(b"two"), peek(2, 0)]))
+            .await
+            .unwrap();
+        assert_eq!(host.programs().unwrap()["probe"], code);
+        assert_eq!(replies(&applied.submissions[1]), peeked(None));
+        assert!(told(&host, 2, 0).is_some());
     });
 }
 

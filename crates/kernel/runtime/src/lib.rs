@@ -59,6 +59,12 @@ pub struct Code {
     fresh: Arc<OnceCell<Vec<u8>>>,
 }
 
+impl Code {
+    pub fn exports(&self, name: &str) -> bool {
+        self.module.get_export(name).is_some()
+    }
+}
+
 pub enum Ran {
     Done(ProgramReply),
     Parked(Suspended),

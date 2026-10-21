@@ -18,6 +18,8 @@ pub enum Reply {
 
 pub const HOOK: &[u8] = b"#hook";
 
+pub const UNTOLD: &[u8] = b"untold";
+
 pub const NEEDS: &[u8] = b"#needs";
 
 pub fn resource_key(key: &str) -> Vec<u8> {
@@ -39,7 +41,7 @@ mod program {
     use abi::{Env, Refusal, hook};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{HOOK, NEEDS, Reply, Step, resource_key, seen};
+    use crate::{HOOK, NEEDS, Reply, Step, UNTOLD, resource_key, seen};
 
     struct Probe;
 
@@ -69,6 +71,9 @@ mod program {
         }
 
         fn hook(ctx: &mut Execute, env: &Env, record: hook::Record) -> Result<(), Refusal> {
+            if record.signer == UNTOLD {
+                return Err(Refusal::new("probe", "asked not to be told"));
+            }
             if let Some(script) = ctx.get(HOOK) {
                 run(ctx, env, &script)?;
             }
@@ -98,4 +103,7 @@ mod program {
     }
 
     program::program!(Probe);
+
+    #[cfg(feature = "batch")]
+    program::hooks!();
 }

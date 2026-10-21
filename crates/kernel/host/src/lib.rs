@@ -273,6 +273,7 @@ impl Submitted {
 
 struct Hooks {
     programs: Vec<ProgramId>,
+    batched: Vec<ProgramId>,
     tallies: BTreeMap<ProgramId, HookTally>,
 }
 
@@ -919,6 +920,16 @@ where
                 });
             }
         }
+        self.source()
+            .tell_batched(
+                &mut hooks,
+                &records,
+                block.height,
+                block.time,
+                &mut overlay,
+                &mut stage,
+            )
+            .await?;
         self.log_hooks(block.height, hooks);
         let refusals = self
             .run_scheduled(block.height, block.time, &mut overlay, &mut stage)
@@ -1031,6 +1042,7 @@ where
     ) -> Result<Hooks> {
         let none = || Hooks {
             programs: Vec::new(),
+            batched: Vec::new(),
             tallies: BTreeMap::new(),
         };
         let reply = unit::query(
@@ -1051,11 +1063,17 @@ where
             return Ok(none());
         };
         let mut hooks = none();
-        for hook in listed {
-            let runs = self.loaded.module(&hook).is_some();
-            let first = !hooks.programs.contains(&hook);
-            if runs && first {
-                hooks.programs.push(hook);
+        for program in listed {
+            let Some(code) = self.loaded.module(&program) else {
+                continue;
+            };
+            let told = if code.exports(hook::BATCH_EXPORT) {
+                &mut hooks.batched
+            } else {
+                &mut hooks.programs
+            };
+            if !told.contains(&program) {
+                told.push(program);
             }
         }
         Ok(hooks)
@@ -1070,39 +1088,96 @@ where
         stage: &mut Stage,
     ) -> Result<()> {
         for program in &hooks.programs {
-            let refused = self
-                .call_hook(program, record, time, overlay, stage)
+            self.tell_one(&mut hooks.tallies, program, record, time, overlay, stage)
                 .await?;
-            let tally = hooks.tallies.entry(program.clone()).or_default();
+        }
+        Ok(())
+    }
+
+    async fn tell_batched(
+        &self,
+        hooks: &mut Hooks,
+        records: &[hook::Record],
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        for program in &hooks.batched {
+            let call = ProgramCall::Hooks(records.to_vec());
+            let refused = self
+                .call_hook(program, height, call, time, overlay, stage)
+                .await?;
+            hooks.tallies.entry(program.clone()).or_default();
             let Some(refusal) = refused else {
                 continue;
             };
             tracing::debug!(
                 target: "ducktape::hook",
-                event = "hook_refused",
+                event = "hook_batch_refused",
                 hook = %program,
-                height = record.height,
-                position = record.position,
+                height,
+                records = records.len(),
                 reason = %refusal.reason,
             );
-            tally.refused += 1;
-            tally.reason.get_or_insert(refusal.reason);
+            for record in records {
+                self.tell_one(&mut hooks.tallies, program, record, time, overlay, stage)
+                    .await?;
+            }
         }
+        Ok(())
+    }
+
+    async fn tell_one(
+        &self,
+        tallies: &mut BTreeMap<ProgramId, HookTally>,
+        program: &str,
+        record: &hook::Record,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+    ) -> Result<()> {
+        let call = ProgramCall::Hook(record.clone());
+        let refused = self
+            .call_hook(program, record.height, call, time, overlay, stage)
+            .await?;
+        let tally = tallies.entry(program.to_owned()).or_default();
+        let Some(refusal) = refused else {
+            return Ok(());
+        };
+        tracing::debug!(
+            target: "ducktape::hook",
+            event = "hook_refused",
+            hook = %program,
+            height = record.height,
+            position = record.position,
+            reason = %refusal.reason,
+        );
+        tally.refused += 1;
+        tally.reason.get_or_insert(refusal.reason);
         Ok(())
     }
 
     async fn call_hook(
         &self,
         program: &str,
-        record: &hook::Record,
+        height: u64,
+        call: ProgramCall,
         time: u64,
         overlay: &mut Overlay,
         stage: &mut Stage,
     ) -> Result<Option<Refusal>> {
+        let told = match &call {
+            ProgramCall::Hooks(records) => records.len() as u64,
+            _ => 1,
+        };
         let checkpoint = overlay.checkpoint();
         let env = Env {
             network: self.network.to_vec(),
-            height: record.height,
+            height,
             time,
             me: program.to_owned(),
             origin: Origin::System,
@@ -1111,17 +1186,18 @@ where
             cause: Cause::Direct,
         };
         let mut frame = Frame {
-            fuel: self.loaded.limits().fuel.map(|_| HOOK_FUEL),
+            fuel: self
+                .loaded
+                .limits()
+                .fuel
+                .map(|_| HOOK_FUEL.saturating_mul(told)),
             first_item: 0,
             next_item: 0,
             client: None,
         };
-        let invocation = Invocation {
-            env,
-            call: ProgramCall::Hook(record.clone()),
-        };
+        let invocation = Invocation { env, call };
         let (receipt, effects) = unit::execute(
-            self.world(record.height, time),
+            self.world(height, time),
             overlay,
             stage,
             &mut frame,

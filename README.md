@@ -223,12 +223,22 @@ carry the receipts of scheduled runs. A scheduled run may schedule entries
 for later heights. On a network that binds no scheduler role nothing runs.
 
 A hook is a program the kernel tells of every frame a block carries, after
-the frame has run: at each block it asks the programs role `Hooks(height)` and,
-after each frame, calls every hook it named with `ProgramCall::Hook` and an
-`abi::hook::Record` (the height, the frame's position in the block, its
-signer, the account it acted as, its target and whether it applied), from
-the `System` origin on a fixed budget of `HOOK_FUEL`. A hook never changes
-the frame: one that refuses, traps, spends its fuel or sends a message has
+the frame has run: at each block it asks the programs role `Hooks(height)` and
+tells every hook it named of each frame with an `abi::hook::Record` (the
+height, the frame's position in the block, its signer, the account it acted
+as, its target and whether it applied), from the `System` origin. A hook
+whose code exports `abi::hook::BATCH_EXPORT` (an empty function named
+`hooks`; the core fixture SDK's `hooks!()` writes it) is called once per
+block, after its frames and before the scheduler, with `ProgramCall::Hooks`
+and every record, on `HOOK_FUEL` per record. Its writes land after every frame
+of the block, so a frame that reads its program in the same block sees the
+state the block started from. When it refuses that call, its
+writes are undone and it is told each record alone, as any other hook is.
+Any other hook is called after each frame with `ProgramCall::Hook` and that
+frame's record, on a fixed budget of `HOOK_FUEL`, so a frame reads what the
+hook wrote for the frames before it. Whether a hook takes batches is a
+property of its code, so a block replays as it ran under the code its height
+ran. A hook never changes the frame: one that refuses, traps, spends its fuel or sends a message has
 its own writes undone, and the block goes on. The founding file's `hooks`
 seeds the programs role's list; a running network hooks or unhooks a program
 through the programs role like any other change.

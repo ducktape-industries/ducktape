@@ -561,10 +561,13 @@ pub enum ProgramCall {
     },
     Access(Vec<u8>),
     Resource(String),
+    Hooks(Vec<hook::Record>),
 }
 
 pub mod hook {
     use crate::{BorshDeserialize, BorshSerialize, ProgramId, role::identity::AccountNumber};
+
+    pub const BATCH_EXPORT: &str = "hooks";
 
     #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
     pub struct Record {
@@ -2249,17 +2252,25 @@ mod tests {
             request: vec![1, 2],
         };
         let reply = HostReply::Query(Err(Refusal::new("r", "s")));
+        let record = hook::Record {
+            height: 7,
+            position: 2,
+            signer: vec![1],
+            account: Some(4),
+            target: "chat".into(),
+            applied: false,
+        };
         let invocation = Invocation {
             env: env.clone(),
-            call: ProgramCall::Hook(hook::Record {
-                height: 7,
-                position: 2,
-                signer: vec![1],
-                account: Some(4),
-                target: "chat".into(),
-                applied: false,
-            }),
+            call: ProgramCall::Hook(record.clone()),
         };
+        let batch = Invocation {
+            env: env.clone(),
+            call: ProgramCall::Hooks(vec![record.clone(), record]),
+        };
+        assert_eq!(decode::<Invocation>(&encode(&batch)).unwrap(), batch);
+        assert_eq!(encode(&ProgramCall::Resource(String::new()))[0], 6);
+        assert_eq!(encode(&ProgramCall::Hooks(Vec::new()))[0], 7);
         let program_reply: ProgramReply = Ok(());
         assert_eq!(decode::<Env>(&encode(&env)).unwrap(), env);
         assert_eq!(decode::<HostOp>(&encode(&op)).unwrap(), op);

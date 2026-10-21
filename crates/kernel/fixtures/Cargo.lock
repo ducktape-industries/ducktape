@@ -192,6 +192,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-probe-batch"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
+]
+
+[[package]]
 name = "fixture-programs"
 version = "0.1.0"
 dependencies = [

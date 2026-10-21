@@ -47,6 +47,17 @@ macro_rules! awaiting_program {
     };
 }
 
+#[macro_export]
+macro_rules! hooks {
+    () => {
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+            #[unsafe(no_mangle)]
+            pub extern "C" fn hooks() {}
+        };
+    };
+}
+
 #[cfg(target_arch = "wasm32")]
 pub mod exports {
     use super::{Invocation, Program, Refusal, dispatch, reason};
@@ -113,6 +124,15 @@ mod context {
         fn hook(_ctx: &mut Execute, _env: &Env, _record: abi::hook::Record) -> Result<(), Refusal> {
             Err(Refusal::new(reason::UNSUPPORTED, "this program is no hook"))
         }
+        fn hooks(
+            ctx: &mut Execute,
+            env: &Env,
+            records: Vec<abi::hook::Record>,
+        ) -> Result<(), Refusal> {
+            records
+                .into_iter()
+                .try_for_each(|record| Self::hook(ctx, env, record))
+        }
     }
 
     pub fn dispatch<P: Program>(invocation: Invocation) -> ProgramReply {
@@ -124,6 +144,7 @@ mod context {
             ProgramCall::Access(payload) => access::<P>(&env, &payload),
             ProgramCall::Resource(key) => resource::<P>(&env, &key),
             ProgramCall::Hook(record) => hook::<P>(&env, record),
+            ProgramCall::Hooks(records) => hooks::<P>(&env, records),
             ProgramCall::Resume { .. } => Err(Refusal::new(
                 reason::UNSUPPORTED,
                 "this program awaits nothing",
@@ -146,6 +167,16 @@ mod context {
     }
 
     fn hook<P: Program>(env: &Env, record: abi::hook::Record) -> ProgramReply {
+        kernel(env)?;
+        P::hook(&mut Execute(()), env, record)
+    }
+
+    fn hooks<P: Program>(env: &Env, records: Vec<abi::hook::Record>) -> ProgramReply {
+        kernel(env)?;
+        P::hooks(&mut Execute(()), env, records)
+    }
+
+    fn kernel(env: &Env) -> Result<(), Refusal> {
         let from_the_kernel = env.origin == Origin::System;
         if !from_the_kernel {
             return Err(Refusal::new(
@@ -153,7 +184,7 @@ mod context {
                 "only the kernel calls a hook",
             ));
         }
-        P::hook(&mut Execute(()), env, record)
+        Ok(())
     }
 
     pub trait Reads {

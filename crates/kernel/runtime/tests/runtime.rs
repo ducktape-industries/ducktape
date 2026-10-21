@@ -347,3 +347,19 @@ async fn a_run_on_a_reused_stack_overflows_as_one_on_a_fresh_stack_does() {
         assert_eq!(sentence, "the run trapped: call stack exhausted");
     }
 }
+
+#[test]
+fn a_code_answers_whether_it_exports_a_name() {
+    let runtime = Runtime::new(Limits::default());
+    let plain = runtime.load(&wat::parse_str(RECURSES).unwrap()).unwrap();
+    assert!(plain.exports("call"));
+    assert!(!plain.exports(abi::hook::BATCH_EXPORT));
+    assert!(
+        !runtime
+            .load(PROBE)
+            .unwrap()
+            .exports(abi::hook::BATCH_EXPORT)
+    );
+    let batch = runtime.load(fixture_wasm::PROBE_BATCH).unwrap();
+    assert!(batch.exports(abi::hook::BATCH_EXPORT));
+}

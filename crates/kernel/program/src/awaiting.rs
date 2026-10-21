@@ -218,7 +218,7 @@ fn run<P: AwaitingProgram>(invocation: Invocation) -> ProgramReply {
             Ok(())
         }
         ProgramCall::Init(_) => Ok(()),
-        ProgramCall::Hook(_) => Err(Refusal::new(
+        ProgramCall::Hook(_) | ProgramCall::Hooks(_) => Err(Refusal::new(
             reason::UNSUPPORTED,
             "an awaiting program is no hook",
         )),

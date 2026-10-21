@@ -1,0 +1,17 @@
+[package]
+name = "fixture-probe-batch"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "../probe/src/lib.rs"
+crate-type = ["cdylib"]
+
+[features]
+default = ["batch"]
+batch = []
+
+[dependencies]
+abi = { workspace = true }
+program = { workspace = true }
+borsh = { workspace = true }

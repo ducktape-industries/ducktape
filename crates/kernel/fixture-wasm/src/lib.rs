@@ -18,6 +18,7 @@ fixtures! {
     ORACLE => "fixture_oracle",
     OWNERSHIP => "fixture_ownership",
     PROBE => "fixture_probe",
+    PROBE_BATCH => "fixture_probe_batch",
     PROGRAMS => "fixture_programs",
     RELAY => "fixture_relay",
     SCHEDULER => "fixture_scheduler",
