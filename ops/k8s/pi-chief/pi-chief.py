@@ -152,6 +152,7 @@ class Status:
     epoch_length: int
     height: int
     roles: dict
+    contract: int
 
 
 @dataclass(frozen=True)
@@ -203,10 +204,10 @@ def status_of(data):
     reader.take(32)
     reader.u64()
     reader.bytes()
-    reader.u32()
+    contract = reader.u32()
     reader.take(32)
     roles = dict(reader.vec(lambda: (reader.text(), reader.text())))
-    return Status(network, block_time_ms, epoch_length, height, roles)
+    return Status(network, block_time_ms, epoch_length, height, roles, contract)
 
 
 def table_of(data):
@@ -565,6 +566,8 @@ class NodeFailed:
     cause: str
     height: int
     stalled_s: int
+    contract: int | None
+    previous_contract: int | None
 
 
 @dataclass(frozen=True)
@@ -642,18 +645,22 @@ def count_receipts(state, blocks):
                     record["before"]["applied"] = True
 
 
-def track_node(state, rollout, stalled):
+def track_node(state, rollout, stalled, contract):
     node = state.get("node")
     if node is None:
-        state["node"] = {"image": rollout.image, "proven": True, "previous": None, "complete_at": None, "came_in_stall": False, "own": False}
-        return
+        node = {"image": rollout.image, "proven": True, "previous": None, "complete_at": None, "came_in_stall": False, "own": False, "contract": None, "previous_contract": None}
+        state["node"] = node
     if rollout.image != node["image"]:
         last_proven = node["image"] if node["proven"] else node["previous"]
+        last_contract = node.get("contract") if node["proven"] else node.get("previous_contract")
         own = state.get("own_image") == rollout.image
         state["own_image"] = None
-        node = {"image": rollout.image, "proven": False, "previous": last_proven, "complete_at": None, "came_in_stall": stalled is not None, "own": own}
+        node = {"image": rollout.image, "proven": False, "previous": last_proven, "complete_at": None, "came_in_stall": stalled is not None, "own": own, "contract": None, "previous_contract": last_contract}
         state["node"] = node
         say("node_image_changed", image=rollout.image, previous=last_proven, own=own, came_in_stall=stalled is not None)
+    if rollout.complete and contract is not None and node.get("contract") is None:
+        node["contract"] = contract
+        say("node_contract_seen", image=node["image"], contract=contract)
     tip = state.get("tip")
     if node["proven"] or tip is None:
         return
@@ -685,7 +692,7 @@ def stall_finding(state, stalled):
         return HaltedAtSwitch(f"halt-{tip}", program, tip, stalled)
     if node_watched(state):
         node = state["node"]
-        return NodeFailed(f"node-{short(node['image'])}", node["image"], node["previous"], "stall", tip, stalled)
+        return NodeFailed(f"node-{short(node['image'])}", node["image"], node["previous"], "stall", tip, stalled, node.get("contract"), node.get("previous_contract"))
     return Stalled(f"stall-{tip}", tip, stalled)
 
 
@@ -707,7 +714,7 @@ def judge(state, seen, stalled):
     elif deadline_passed:
         node = state["node"]
         height = state["tip"]["height"] if state.get("tip") else 0
-        found.append(NodeFailed(f"node-{short(node['image'])}", node["image"], node["previous"], "deadline", height, 0))
+        found.append(NodeFailed(f"node-{short(node['image'])}", node["image"], node["previous"], "deadline", height, 0, node.get("contract"), node.get("previous_contract")))
     found.extend(program_findings(state))
     return [finding for finding in found if finding.key not in state["reported"]]
 
@@ -729,7 +736,7 @@ def decide(state, seen):
     state["advanced"] = previous_tip is not None and (state.get("tip") or {}).get("height", previous_tip) > previous_tip
     stalled = stalled_for(state, seen.now)
     if seen.rollout is not None:
-        track_node(state, seen.rollout, stalled)
+        track_node(state, seen.rollout, stalled, None if seen.status is None else seen.status.contract)
     if seen.scheduled is not None:
         tip = state["tip"]["height"]
         state["due"] = {"at": tip, "programs": sorted({pending.change.program for pending in seen.scheduled if pending.height == tip + 1})}
@@ -1034,7 +1041,9 @@ class Rollbacks:
         self.cli = cli
         self.kube = kube
 
-    def node_dry_run(self, image, previous):
+    def node_dry_run(self, image, previous, contract, previous_contract):
+        if contract is not None and previous_contract is not None and contract != previous_contract:
+            return Refused("contract_differs", f"{image} runs node contract {contract} and {previous} ran contract {previous_contract}, so {previous} would refuse the state {image} stamped")
         deployment = self.kube.deployment()
         rollout = rollout_of(deployment, self.kube.container)
         if rollout.image != image:
@@ -1050,8 +1059,8 @@ class Rollbacks:
             return Refused("patch_changes_more", f"the server-side dry run changes {changed}, not only {wanted}")
         return Would({"deployment": f"{self.kube.namespace}/{self.kube.name}", "from": image, "to": previous, "changes": changed, "resource_version": rollout.resource_version, "body": body})
 
-    def node_rollback(self, image, previous):
-        checked = self.node_dry_run(image, previous)
+    def node_rollback(self, image, previous, contract, previous_contract):
+        checked = self.node_dry_run(image, previous, contract, previous_contract)
         if not isinstance(checked, Would):
             return checked
         try:
@@ -1184,8 +1193,8 @@ class Chief:
         if self.state["held"]:
             return Held(self.state["held"]["key"])
         if self.config.mode == "act":
-            return self.rollbacks.node_rollback(finding.image, finding.previous)
-        return self.rollbacks.node_dry_run(finding.image, finding.previous)
+            return self.rollbacks.node_rollback(finding.image, finding.previous, finding.contract, finding.previous_contract)
+        return self.rollbacks.node_dry_run(finding.image, finding.previous, finding.contract, finding.previous_contract)
 
     def node_failed(self, finding):
         action = f"set the node container's image back to {finding.previous}"
@@ -1363,15 +1372,25 @@ def parts(env):
     return node, cli, kube
 
 
+def node_dry_run_recorded(rollbacks, record):
+    kube = rollbacks.kube
+    deployment = kube.deployment()
+    image = rollout_of(deployment, kube.container).image
+    previous = image_before(deployment, kube.replicasets(), kube.container)
+    if previous is None:
+        return Refused("no_previous", "no older ReplicaSet runs another image")
+    contract = record.get("contract") if record.get("image") == image else None
+    previous_contract = record.get("previous_contract") if record.get("previous") == previous else None
+    return rollbacks.node_dry_run(image, previous, contract, previous_contract)
+
+
 def dry_run(args, env):
     node, cli, kube = parts(env)
     rollbacks = Rollbacks(Config.from_env(env), node, cli, kube)
     match args:
         case ["node"]:
-            deployment = kube.deployment()
-            image = rollout_of(deployment, kube.container).image
-            previous = image_before(deployment, kube.replicasets(), kube.container)
-            verdict = Refused("no_previous", "no older ReplicaSet runs another image") if previous is None else rollbacks.node_dry_run(image, previous)
+            record = Store(Path(env.get("PI_CHIEF_STATE", "/state")) / "state.json").load().get("node") or {}
+            verdict = node_dry_run_recorded(rollbacks, record)
         case ["program", program, code]:
             verdict = rollbacks.program_dry_run(program, node.table().get(program), code)
         case _:

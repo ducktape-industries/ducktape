@@ -89,6 +89,7 @@ class Chain:
         self.time = 1_000_000
         self.answers = True
         self.payloads = {}
+        self.contract = 10
 
     def make(self, *txs):
         height = len(self.blocks) + 100
@@ -110,7 +111,7 @@ class FakeNode:
 
     def status(self):
         self.check()
-        return pc.Status("duckpond", 1000, EPOCH, self.chain.tip(), ROLES)
+        return pc.Status("duckpond", 1000, EPOCH, self.chain.tip(), ROLES, self.chain.contract)
 
     def table(self):
         self.check()
@@ -318,7 +319,7 @@ class World:
 class Recorded(unittest.TestCase):
     def test_status_names_the_chain_its_block_time_epoch_and_roles(self):
         status = pc.status_of(b(STATUS))
-        self.assertEqual((status.network, status.block_time_ms, status.epoch_length), ("duckpond", 1000, 64))
+        self.assertEqual((status.network, status.block_time_ms, status.epoch_length, status.contract), ("duckpond", 1000, 64, 9))
         self.assertEqual(status.roles["validators"], "valset")
         self.assertNotIn("harness", status.roles.values())
 
@@ -383,6 +384,62 @@ class NodeTriggers(unittest.TestCase):
         self.assertEqual(pc.container_image(world.kube.live["spec"]["template"], "node"), X)
         self.assertEqual(world.kube.live["spec"]["template"]["spec"]["containers"][0]["resources"], {"requests": {"cpu": "8"}})
         self.assertEqual(world.chief.state["held"]["key"], key)
+
+    def test_a_rollback_to_an_image_that_ran_another_contract_refuses(self):
+        world = World()
+        world.tick()
+        world.roll(Z)
+        world.chain.contract = 11
+        world.tick()
+        world.stall(DEADLINE)
+        self.assertEqual(world.reports(), [f"node-{pc.short(Z)}"])
+        self.assertEqual(world.kube.patches, [])
+        self.assertIn("contract_differs", " ".join(world.lines(f"node-{pc.short(Z)}")))
+        self.assertIsNone(world.chief.state["held"])
+
+    def test_coming_back_after_a_contract_roll_with_its_old_record_refuses(self):
+        world = World()
+        world.tick()
+        world.roll(Z)
+        world.chain.contract = 11
+        world.chain.make()
+        world.chief = pc.Chief(config(), world.node, world.cli, world.kube, world.store, clock=world.clock, pause=lambda seconds: None)
+        world.tick()
+        world.stall(DEADLINE)
+        self.assertEqual(world.kube.patches, [])
+        self.assertIn("contract_differs", " ".join(world.lines(f"node-{pc.short(Z)}")))
+
+    def test_dry_run_node_judges_the_recorded_contracts_and_never_asks_the_node(self):
+        world = World()
+        world.tick()
+        world.roll(Z)
+        world.chain.contract = 11
+        world.tick()
+        world.chain.answers = False
+        rollbacks = pc.Rollbacks(config(), world.node, world.cli, world.kube)
+        verdict = pc.node_dry_run_recorded(rollbacks, world.chief.state["node"])
+        self.assertEqual(verdict.reason, "contract_differs")
+        self.assertEqual(world.kube.patches, [])
+
+    def test_dry_run_node_allows_what_act_mode_allows_when_the_running_contract_was_never_seen(self):
+        world = World()
+        world.tick()
+        world.roll(Z, complete=False)
+        world.chain.contract = 11
+        world.tick()
+        world.chain.answers = False
+        self.assertIsNone(world.chief.state["node"]["contract"])
+        rollbacks = pc.Rollbacks(config(), world.node, world.cli, world.kube)
+        verdict = pc.node_dry_run_recorded(rollbacks, world.chief.state["node"])
+        self.assertIsInstance(verdict, pc.Would)
+        self.assertEqual(verdict.evidence["to"], X)
+
+    def test_a_record_kept_before_contracts_learns_the_running_one(self):
+        world = World()
+        world.tick()
+        del world.chief.state["node"]["contract"]
+        world.tick()
+        self.assertEqual(world.chief.state["node"]["contract"], 10)
 
     def test_a_stall_shorter_than_the_deadline_is_nothing(self):
         world = World()

@@ -29,7 +29,7 @@ The app people run never speaks a different contract from the node, in either di
 
 ## 2. At R: one sitting, no gaps
 
-- pi-chief is scaled to 0 before the node stops at R, and comes back only as its proven N+1 image after "node proven", **with its `node` key removed** from its state (absent or null, not `{}`, so it takes the running N+1 image as proven; `{}` crashes it every tick). With its old record it would treat N+1 as unproven and, on a stall in the next epoch, set the node back to the N image, which refuses state stamped with the new contract.
+- pi-chief is scaled to 0 before the node stops at R, and comes back only as its proven N+1 image after "node proven". Its old record treats N+1 as unproven, but it never sets the node back across a contract: it records the contract each image ran, and a stall in the next epoch is refused as `contract_differs` rather than sending the node back to the N image, which refuses state stamped with the new contract.
 - The node stops at R and rolls. Residents run `ducktape roll R` with it.
 - The operator posts "node proven" from node-only checks (apply_slow, state root, history, egress, decodes) before rolling any image. PAUSED and the agents' after-roll steps wait on that word, and the image rolls come after it.
 - As soon as `/v1/status` answers contract N+1, merge the app change, then build TestFlight and desktop, or release the held build.

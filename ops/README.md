@@ -698,7 +698,12 @@ one up for another network.
   image, carrying the Deployment's `resourceVersion`. It is sent only after
   a server-side dry run that changes nothing but that image, and only to
   the image it last saw proven, which must also be the image of the newest
-  older ReplicaSet with another image.
+  older ReplicaSet with another image. It records the contract `/v1/status`
+  answers once each image's rollout completes, and refuses
+  (`contract_differs`) a rollback to an image that ran another contract
+  than the running one: the older node refuses state the newer contract
+  stamped. A contract it never saw (the new image never completed its
+  rollout) doesn't hold a rollback back.
 - The program trigger is a code change of a program that fills no role,
   after which the host refused at least one of its receipts, nested ones
   included, as `trap` or `protocol` and applied none, while the old code
@@ -740,6 +745,9 @@ one up for another network.
   run in its pod, show a rollback without making it: the server-side dry
   run of the patch and what it changes, or the `Schedule` signed through a
   local stand-in node that passes on only `/v1/status` and keeps the frame.
+  `dry-run node` judges contracts from the state file's record, as the
+  daemon does, and never asks the node, so it answers while the node
+  crash-loops.
   `k8s/pi-chief/pi-chief-test.py` covers it.
 
 ## duckpond's alarms
