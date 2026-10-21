@@ -93,6 +93,7 @@ spec:
             - {name: RECONCILE_NODE_NAME, value: fabrics-1}
             - {name: RECONCILE_CHANNEL, value: infra}
             - {name: RECONCILE_PROBER, value: "17"}
+            - {name: RECONCILE_CONCERNS, value: "22 17"}
             - {name: RECONCILE_STATE, value: /state}
             - {name: RECONCILE_KEYS, value: /keys}
             - {name: RECONCILE_WORKSPACE, value: /tmp/ducktape}

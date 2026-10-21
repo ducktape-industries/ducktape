@@ -774,7 +774,13 @@ one up for another network.
   signed by its account's key, which the node's workspace file
   `egress-grants` lists. It plans it again at once: a base that no longer
   answers puts back the file it applied before. It posts each outcome to
-  chat channel `infra`: applied, refused, rolled back, and proven when the
+  chat channel `infra` as a chat notice (`Notify`, kind `infra`, group the
+  duty and its commit (`egress-<sha>`, `pods-<sha>`, so one roll's states
+  are one item), status Passed for proven, Running for applied, Note for a
+  report mode's would, Failed otherwise), told only to the accounts
+  `RECONCILE_CONCERNS` names (space-separated; the deploy sets `22 17`; an
+  empty setting means nobody is told, the notice only lands in the room):
+  applied, refused, rolled back, and proven when the
   egress program's row for the node lists what the file serves. It never
   sends a refused file again; a new `main` is a new try. A node that does
   not answer (the CLI says no `refused: <reason>:`) is no refusal: the
@@ -800,8 +806,8 @@ one up for another network.
   Deployment's `resourceVersion`); reconcile then follows the rollout on
   the Deployment's watch stream. It is proven when the rollout completes,
   the node's dry `egress set` says `pods` answered from the node, and the
-  running pod's `imageID` is the declared digest; the post in `infra`
-  mentions `RECONCILE_PROBER` (17), who runs the functional probe (exec, a
+  running pod's `imageID` is the declared digest; the notice in `infra`
+  also concerns `RECONCILE_PROBER` (17), who runs the functional probe (exec, a
   tmpfs scratch, a notify post) with the pod tools, since nothing off the
   chain reaches the pods service. A failed proof, or a rollout past
   `progressDeadlineSeconds`, patches back the image it replaced. A digest

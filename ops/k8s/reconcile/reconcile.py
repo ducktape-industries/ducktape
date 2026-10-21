@@ -455,6 +455,26 @@ def pods_verdict_body(found):
     )
 
 
+def report_status(key):
+    kind = key.removeprefix("pods-").rsplit("-", 1)[0]
+    if kind == "proven":
+        return "Passed"
+    if kind == "applied":
+        return "Running"
+    if kind.startswith("would-"):
+        return "Note"
+    return "Failed"
+
+
+def report_group(key):
+    duty = "pods" if key.startswith("pods-") else "egress"
+    return f"{duty}-{key.rsplit('-', 1)[1]}"
+
+
+def concerns_of(setting):
+    return tuple(int(account) for account in setting.split())
+
+
 def fresh_pods():
     return {"seen_tip": None, "main_text": None, "applied": None, "rolling": None}
 
@@ -464,7 +484,7 @@ def fresh_state():
 
 
 class Reconcile:
-    def __init__(self, mode, node_name, node_key, channel, cli, forge, store, kube, prober):
+    def __init__(self, mode, node_name, node_key, channel, cli, forge, store, kube, prober, concerns=()):
         if mode not in MODES:
             raise ValueError(f"RECONCILE_MODE is report or act, not {mode}")
         self.mode = mode
@@ -476,6 +496,7 @@ class Reconcile:
         self.store = store
         self.kube = kube
         self.prober = prober
+        self.concerns = tuple(concerns)
         self.state = store.load()
         if self.state.get("mode") != mode:
             self.state["seen_tip"] = None
@@ -485,7 +506,15 @@ class Reconcile:
 
     def report(self, key, lines, mention=None):
         say("report", key=key, lines=lines)
-        self.state["outbox"].append({"id": f"reconcile-{key}", "text": "\n".join(lines), "tried": 0, "mention": mention})
+        self.state["outbox"].append({"id": f"reconcile-{key}", "key": key, "text": "\n".join(lines), "tried": 0, "mention": mention})
+
+    def notice_op(self, item):
+        first, *rest = item["text"].split("\n")
+        mention = item["mention"]
+        concerns = [*self.concerns, *([] if mention is None or mention in self.concerns else [mention])]
+        key = item.get("key", item["id"].removeprefix("reconcile-"))
+        notice = {"kind": "infra", "group": report_group(key), "subject": first, "link": None, "status": report_status(key), "detail": "; ".join(rest), "concerns": concerns}
+        return {"Notify": {"channel_id": self.channel, "message_id": item["id"], "thread": None, "notice": notice}}
 
     def judge_changes(self):
         main_text = self.state["main_text"]
@@ -683,10 +712,7 @@ class Reconcile:
             try:
                 landed = self.cli.query("chat", {"MessageById": {"message_id": item["id"]}}).get("Message") is not None
                 if not landed:
-                    mention = item["mention"]
-                    named = [] if mention is None else [{"text": f"<@{mention}>", "marks": [{"Mention": {"Account": mention}}]}, {"text": " ", "marks": []}]
-                    paragraph = {"Paragraph": [*named, {"text": item["text"], "marks": []}]}
-                    self.cli.op("chat", {"PostMessage": {"channel_id": self.channel, "message_id": item["id"], "blocks": [paragraph], "thread": None}})
+                    self.cli.op("chat", self.notice_op(item))
             except Unread as error:
                 if worth_a_line(item["tried"]):
                     say("report_unposted", id=item["id"], attempts=item["tried"], detail=str(error))
@@ -754,8 +780,8 @@ def main():
     cli = Cli(shlex.split(env.get("RECONCILE_DUCKTAPE", "ducktape")), node, workspace, Path(env.get("RECONCILE_KEYS", "/keys")))
     store = Store(Path(env.get("RECONCILE_STATE", "/state")) / "state.json")
     status = read_status(node)
-    reconcile = Reconcile(env["RECONCILE_MODE"], env["RECONCILE_NODE_NAME"], node_key(status), env["RECONCILE_CHANNEL"], cli, Forge(cli), store, Kube(), int(env["RECONCILE_PROBER"]))
-    say("reconciling", mode=reconcile.mode, path=reconcile.path, pods=PODS_PATH, channel=reconcile.channel, prober=reconcile.prober)
+    reconcile = Reconcile(env["RECONCILE_MODE"], env["RECONCILE_NODE_NAME"], node_key(status), env["RECONCILE_CHANNEL"], cli, Forge(cli), store, Kube(), int(env["RECONCILE_PROBER"]), concerns_of(env.get("RECONCILE_CONCERNS", "")))
+    say("reconciling", mode=reconcile.mode, path=reconcile.path, pods=PODS_PATH, channel=reconcile.channel, prober=reconcile.prober, concerns=reconcile.concerns)
     while True:
         reconcile.tick()
         time.sleep(block_time_s(status))

@@ -21,6 +21,7 @@ SECRETED = LIVE + '[services.anthropic]\nbase = "http://10.43.41.41:4141"\nsecre
 WITH_MAC = LIVE + '[services.mac]\nbase = "http://10.43.80.81:8080"\n'
 NO_PODS = 'relay = true\n[services.mac]\nbase = "http://10.43.80.81:8080"\n'
 PROBER = 17
+CONCERNS = (22,)
 
 
 def image(letter):
@@ -168,6 +169,7 @@ class FakeCli:
         self.node = node
         self.posts = []
         self.mentions = []
+        self.notices = []
 
     def egress_set(self, text, dry):
         return self.node.egress_set(text, dry)
@@ -178,9 +180,10 @@ class FakeCli:
         return {"Message": None}
 
     def op(self, program, op):
-        spans = op["PostMessage"]["blocks"][0]["Paragraph"]
-        self.posts.append("".join(span["text"] for span in spans))
-        self.mentions.append([mark["Mention"]["Account"] for span in spans for mark in span["marks"] if "Mention" in mark])
+        notice = op["Notify"]["notice"]
+        self.notices.append(op["Notify"])
+        self.posts.append("\n".join(part for part in (notice["subject"], notice["detail"]) if part))
+        self.mentions.append(notice["concerns"])
         return {"landed": 1}
 
 
@@ -196,7 +199,7 @@ def world(main_text=LIVE, mode="act", pods_text=None):
     kube = FakeKube()
     temp = tempfile.TemporaryDirectory()
     store = rc.Store(pathlib.Path(temp.name) / "state.json")
-    reconcile = rc.Reconcile(mode, "fabrics-1", KEY, "infra", cli, forge, store, kube, PROBER)
+    reconcile = rc.Reconcile(mode, "fabrics-1", KEY, "infra", cli, forge, store, kube, PROBER, CONCERNS)
     return node, cli, forge, kube, reconcile, temp
 
 
@@ -205,6 +208,37 @@ class Ran:
         self.returncode = code
         self.stdout = stdout
         self.stderr = stderr
+
+
+class Notices(unittest.TestCase):
+    def test_each_report_kind_has_its_status(self):
+        for key, status in [("proven-aaaaaaaaaaaa", "Passed"), ("pods-proven-aaaaaaaaaaaa", "Passed"), ("applied-aaaaaaaaaaaa", "Running"), ("would-apply-aaaaaaaaaaaa", "Note"), ("pods-would-roll-aaaaaaaaaaaa", "Note"), ("refused-aaaaaaaaaaaa", "Failed"), ("pods-rolled-back-aaaaaaaaaaaa", "Failed"), ("stuck-aaaaaaaaaaaa", "Failed"), ("absent-aaaaaaaaaaaa", "Failed"), ("pods-moved-aaaaaaaaaaaa", "Failed")]:
+            self.assertEqual(rc.report_status(key), status, key)
+
+    def test_one_rolls_reports_share_a_group_and_each_duty_its_own(self):
+        egress = {rc.report_group(f"{kind}-aaaaaaaaaaaa") for kind in ("would-apply", "refused", "applied", "proven", "stuck", "rolled-back", "absent")}
+        pods = {rc.report_group(f"pods-{kind}-aaaaaaaaaaaa") for kind in ("would-roll", "refused", "proven", "moved", "stuck", "rolled-back")}
+        self.assertEqual((egress, pods), ({"egress-aaaaaaaaaaaa"}, {"pods-aaaaaaaaaaaa"}))
+
+    def test_the_setting_names_whom_reports_concern_and_empty_names_nobody(self):
+        self.assertEqual(rc.concerns_of("22 17"), (22, 17))
+        self.assertEqual(rc.concerns_of(""), ())
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            reconcile.concerns = ()
+            reconcile.report("absent-aaaaaaaaaaaa", ["infra main aaaaaaaaaaaa holds no egress/fabrics-1.toml; egress is left as it is."])
+            reconcile.flush()
+            self.assertEqual(cli.mentions, [[]])
+            self.assertEqual(cli.notices[0]["notice"]["detail"], "")
+
+    def test_a_report_saved_before_notices_still_posts_as_one(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            reconcile.state["outbox"].append({"id": "reconcile-pods-proven-aaaaaaaaaaaa", "text": "proven\nroll back by hand", "tried": 0, "mention": PROBER})
+            reconcile.flush()
+            told = cli.notices[0]["notice"]
+            self.assertEqual((told["group"], told["status"], told["subject"], told["detail"]), ("pods-aaaaaaaaaaaa", "Passed", "proven", "roll back by hand"))
+            self.assertEqual(told["concerns"], [*CONCERNS, PROBER])
 
 
 class RealForge(unittest.TestCase):
@@ -751,7 +785,11 @@ class PodsRoll(unittest.TestCase):
             self.assertEqual(reconcile.state["pods"]["applied"]["image"], POD_B)
             self.assertIn(f"runs {POD_B}, proven", cli.posts[0])
             self.assertIn(f"roll back by hand to {POD_A}", cli.posts[0])
-            self.assertEqual(cli.mentions[0], [PROBER])
+            self.assertEqual(cli.mentions[0], [*CONCERNS, PROBER])
+            told = cli.notices[0]
+            self.assertEqual((told["channel_id"], told["thread"]), ("infra", None))
+            self.assertEqual((told["notice"]["kind"], told["notice"]["status"]), ("infra", "Passed"))
+            self.assertEqual(told["notice"]["group"], "pods-" + told["message_id"].rsplit("-", 1)[1])
             reconcile.tick()
             self.assertEqual(len(cli.posts), 1)
 
@@ -764,7 +802,8 @@ class PodsRoll(unittest.TestCase):
             self.assertEqual(rc.out_image(kube.live["spec"]["template"]), POD_A)
             self.assertIn("progress deadline (600 s)", cli.posts[0])
             self.assertIn(f"runs {POD_A} again. Revert eeeeeeeeeeee in infra.", cli.posts[0])
-            self.assertEqual(cli.mentions[0], [])
+            self.assertEqual(cli.mentions[0], list(CONCERNS))
+            self.assertEqual(cli.notices[0]["notice"]["status"], "Failed")
             self.assertIsNone(reconcile.state["pods"]["rolling"])
 
     def test_a_node_that_does_not_reach_the_new_pod_rolls_back(self):
