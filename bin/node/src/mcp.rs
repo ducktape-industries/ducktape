@@ -52,7 +52,7 @@ pub(crate) fn agent(
 ) -> Result<(Profile, AccountNumber), String> {
     let Some(profile) = profile else {
         return Err(format!(
-            "the key {key} acts as no account. {AGENTS_ONLY}: make one with identity's CreateAgent from your own account, give it this key with identity's AddKey (`ducktape wallet consent --account <agent>` with this key active signs its consent), then start ducktape mcp again"
+            "the key {key} acts as no account. {AGENTS_ONLY}: make one with identity's create_agent from your own account, give it this key with identity's add_key (`ducktape wallet consent --account <agent>` with this key active signs its consent), then start ducktape mcp again"
         ));
     };
     let (number, name) = (profile.number, profile.name.clone());
@@ -62,7 +62,7 @@ pub(crate) fn agent(
             Ok((profile, manager))
         }
         Kind::User => Err(format!(
-            "the key {key} acts as account {number} ({name}), a person's own account. {AGENTS_ONLY}: make an agent with identity's CreateAgent and give it a key of its own with AddKey"
+            "the key {key} acts as account {number} ({name}), a person's own account. {AGENTS_ONLY}: make an agent with identity's create_agent and give it a key of its own with add_key"
         )),
         Kind::System(program) => Err(format!(
             "the key {key} acts as account {number}, program {program}'s own account. {AGENTS_ONLY}"
@@ -509,7 +509,7 @@ async fn write<N: Network>(network: &N, arguments: Value) -> Result<Value, Strin
 
 async fn head<N: Network>(network: &N) -> Result<Option<BlobId>, String> {
     let files::Reply::Head(head) = ask(network, &files::Query::Head).await? else {
-        return Err(unexpected("Head"));
+        return Err(unexpected("head"));
     };
     Ok(head.map(|row| row.id))
 }

@@ -76,7 +76,7 @@ impl Net {
             "channel_id": ROOM,
             "seq": seq,
             "thread": thread,
-            "author": { "Account": author },
+            "author": { "account": author },
             "deleted": false,
             "text": text,
         });
@@ -88,7 +88,7 @@ impl Net {
         let source = json!({ "program": "chat", "object": { "kind": "message", "id": id } });
         self.changes.borrow_mut().insert(
             change,
-            json!({ "seq": change, "kind": "Added", "detail": "", "source": source }),
+            json!({ "seq": change, "kind": "added", "detail": "", "source": source }),
         );
     }
 
@@ -98,7 +98,7 @@ impl Net {
             json!({ "program": "wake", "object": { "kind": "wake", "id": wake.to_string() } });
         self.changes.borrow_mut().insert(
             change,
-            json!({ "seq": change, "kind": "Added", "detail": detail, "source": source }),
+            json!({ "seq": change, "kind": "added", "detail": detail, "source": source }),
         );
     }
 
@@ -125,23 +125,23 @@ impl Chain for Net {
 
     async fn query(&self, program: &str, query: Value) -> Result<Value, String> {
         Ok(match (program, &query) {
-            ("attribution", query) if query.get("Change").is_some() => {
-                let seq = query["Change"]["seq"].as_u64().unwrap();
+            ("attribution", query) if query.get("change").is_some() => {
+                let seq = query["change"]["seq"].as_u64().unwrap();
                 let change = self.changes.borrow().get(&seq).cloned();
-                json!({ "Change": change })
+                json!({ "change": change })
             }
-            ("attribution", query) if query.get("ChangesTo").is_some() => {
-                assert_eq!(query["ChangesTo"]["recipient"], json!(ME));
+            ("attribution", query) if query.get("changes_to").is_some() => {
+                assert_eq!(query["changes_to"]["recipient"], json!(ME));
                 let items: Vec<Value> = self.changes.borrow().values().cloned().collect();
-                json!({ "Changes": { "height": 0, "items": items, "next": null } })
+                json!({ "changes": { "height": 0, "items": items, "next": null } })
             }
-            ("chat", query) if query.get("MessageById").is_some() => {
-                let id = query["MessageById"]["message_id"].as_str().unwrap();
-                json!({ "Message": self.rows.borrow().get(id).cloned() })
+            ("chat", query) if query.get("message_by_id").is_some() => {
+                let id = query["message_by_id"]["message_id"].as_str().unwrap();
+                json!({ "message": self.rows.borrow().get(id).cloned() })
             }
-            ("identity", query) if query.get("Hears").is_some() => {
-                let from = query["Hears"]["from"].as_u64().unwrap();
-                json!({ "Hears": !self.deaf.borrow().contains(&from) })
+            ("identity", query) if query.get("hears").is_some() => {
+                let from = query["hears"]["from"].as_u64().unwrap();
+                json!({ "hears": !self.deaf.borrow().contains(&from) })
             }
             _ => panic!("{program} was asked {query}"),
         })
@@ -152,31 +152,31 @@ impl Chain for Net {
         let (name, body) = op.as_object().unwrap().iter().next().unwrap();
         let applied = Sent::Applied(Value::Null);
         Ok(match (program, name.as_str()) {
-            ("chat", "Take") if self.busy.borrow().contains(&place(body)) => Sent::Rejected {
+            ("chat", "take") if self.busy.borrow().contains(&place(body)) => Sent::Rejected {
                 reason: "busy".into(),
                 sentence: "account 9 holds it".into(),
             },
-            ("chat", "Take") => {
+            ("chat", "take") => {
                 self.holds.borrow_mut().insert(place(body));
                 applied
             }
-            ("chat", "Release") => {
+            ("chat", "release") => {
                 self.holds.borrow_mut().remove(&place(body));
                 *self.released.borrow_mut() = Some(self.standing());
                 applied
             }
-            ("chat", "Drafting") => {
+            ("chat", "drafting") => {
                 let channel = body["channel_id"].as_str().unwrap().to_owned();
                 self.drafts.borrow_mut().insert(channel);
                 applied
             }
-            ("chat", "Undraft") => {
+            ("chat", "undraft") => {
                 self.drafts
                     .borrow_mut()
                     .remove(body["channel_id"].as_str().unwrap());
                 applied
             }
-            ("chat", "Post") => {
+            ("chat", "post") => {
                 let id = body["message_id"].as_str().unwrap().to_owned();
                 if self.rows.borrow().contains_key(&id) {
                     return Ok(Sent::Rejected {
@@ -188,11 +188,11 @@ impl Chain for Net {
                 self.holds.borrow_mut().remove(&(channel.clone(), thread));
                 self.drafts.borrow_mut().remove(&channel);
                 let row =
-                    json!({ "message_id": id, "channel_id": channel, "author": { "Account": ME } });
+                    json!({ "message_id": id, "channel_id": channel, "author": { "account": ME } });
                 self.rows.borrow_mut().insert(id, row);
                 applied
             }
-            ("wake", "WakeOn") => {
+            ("wake", "wake_on") => {
                 let mut wakes = self.wakes.borrow_mut();
                 *wakes += 1;
                 Sent::Applied(json!(*wakes))
@@ -332,11 +332,11 @@ fn at(thread: u64) -> Where {
 }
 
 fn take(thread: u64) -> Value {
-    json!({ "Take": { "channel_id": ROOM, "thread": thread } })
+    json!({ "take": { "channel_id": ROOM, "thread": thread } })
 }
 
 fn post(seq: u64, thread: u64, text: &str) -> Value {
-    json!({ "Post": {
+    json!({ "post": {
         "channel_id": ROOM,
         "message_id": format!("bridge-{ME}-{ROOM}-{seq}"),
         "text": text,
@@ -345,7 +345,7 @@ fn post(seq: u64, thread: u64, text: &str) -> Value {
 }
 
 fn draft(thread: u64, text: &str, doing: Option<&str>) -> Value {
-    json!({ "Drafting": {
+    json!({ "drafting": {
         "channel_id": ROOM,
         "thread": thread,
         "text": text,
@@ -599,7 +599,7 @@ fn a_busy_place_is_waited_on_with_a_clear_wake_and_a_wake_the_model_armed_comes_
             assert_eq!(op(seen).await, take(5));
             assert_eq!(
                 op(seen).await,
-                json!({ "WakeOn": { "event": { "Clear": { "channel_id": ROOM, "thread": 5 } } } })
+                json!({ "wake_on": { "event": { "clear": { "channel_id": ROOM, "thread": 5 } } } })
             );
             net.busy.borrow_mut().clear();
             net.woke(2, 1);
@@ -619,7 +619,7 @@ fn a_busy_place_is_waited_on_with_a_clear_wake_and_a_wake_the_model_armed_comes_
             said(next(seen).await, "Wake 7 is over.");
             script.play(1, Event::Answer("two".into()));
             assert_eq!(next(seen).await, Seen::Finished);
-            let wake = json!({ "Post": {
+            let wake = json!({ "post": {
             "channel_id": ROOM,
             "message_id": format!("bridge-{ME}-wake-7"),
             "text": "two",
@@ -680,11 +680,11 @@ fn a_bridge_killed_mid_turn_lets_go_of_its_place_on_restart_and_resumes_the_open
         let _keep = &heard;
         assert_eq!(
             op(&mut seen).await,
-            json!({ "Undraft": { "channel_id": ROOM } })
+            json!({ "undraft": { "channel_id": ROOM } })
         );
         assert_eq!(
             op(&mut seen).await,
-            json!({ "Release": { "channel_id": ROOM, "thread": 5 } })
+            json!({ "release": { "channel_id": ROOM, "thread": 5 } })
         );
         assert_eq!(op(&mut seen).await, take(5));
         assert_eq!(
@@ -852,10 +852,10 @@ fn only_the_accounts_written_to_rows_are_its_seqs_and_only_a_wakeon_arms_a_wake(
     assert_eq!(seq_of(&prefix, &other, true), None);
     assert_eq!(seq_of(&prefix, &key[..key.len() - 1], true), None);
     let answer = json!({ "ok": true, "returned": 4, "landed": 10 });
-    let wake_on = json!({ "WakeOn": { "event": { "Height": { "height": 9 } } } });
+    let wake_on = json!({ "wake_on": { "event": { "height": { "height": 9 } } } });
     assert_eq!(armed("wake", &wake_on, &answer), Some(4));
     assert_eq!(
-        armed("wake", &json!({ "Cancel": { "wake": 4 } }), &answer),
+        armed("wake", &json!({ "cancel": { "wake": 4 } }), &answer),
         None
     );
     assert_eq!(armed("chat", &wake_on, &answer), None);

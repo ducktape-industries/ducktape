@@ -19,11 +19,11 @@ STATUS = "080000006475636b706f6e64c036714aa1010000e80300000000000040000000000000
 NODE = "http://node"
 PUBLIC = "https://public"
 CCS = "http://ccs"
-Stat = namedtuple("Stat", "f_blocks f_bfree f_bavail f_frsize")
+Stat = namedtuple("stat", "f_blocks f_bfree f_bavail f_frsize")
 WARM_FILE = "/shared/tools/warm-pod"
 WARM = "duckpond-warm-20261021"
 WARM_PATH = f"/api/v1/namespaces/agents/pods/{WARM}"
-SNAPSHOT = {"Sha256": "a3cce76a042711ab8d3bad219c9d95a1e32ea3ce754c7d25fe17ff0a24a0c8e3"}
+SNAPSHOT = {"sha256": "a3cce76a042711ab8d3bad219c9d95a1e32ea3ce754c7d25fe17ff0a24a0c8e3"}
 RUNNING = {"running": {"startedAt": "2026-10-21T07:45:12Z"}}
 OOM = {"terminated": {"exitCode": 137, "reason": "OOMKilled", "startedAt": "2026-10-20T08:02:41Z", "finishedAt": "2026-10-21T07:30:06Z", "containerID": "containerd://5e1c"}}
 NOT_FOUND = json.dumps({"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure", "message": f'pods "{WARM}" not found', "reason": "NotFound", "details": {"name": WARM, "kind": "pods"}, "code": 404}).encode()
@@ -87,7 +87,7 @@ def deployment(ready, reason="MinimumReplicasAvailable"):
 def file_entry(path, held):
     if held is None:
         return None
-    return {"meta": [], "node": {"File": {"exec": False, "file": {"Sha256": "2fa87f0d297ac133358c60908e6e726948d2c768c35b6bff2ae0627b4d818e6c"}, "size": len(held)}}, "path": path}
+    return {"meta": [], "node": {"file": {"exec": False, "file": {"sha256": "2fa87f0d297ac133358c60908e6e726948d2c768c35b6bff2ae0627b4d818e6c"}, "size": len(held)}}, "path": path}
 
 
 def warm_pod(run):
@@ -145,40 +145,40 @@ class FakeCli:
             self.asked.append(query)
             if isinstance(self.budget, Exception):
                 raise self.budget
-            if query != "BudgetFacts":
+            if query != "budget_facts":
                 raise watch.Unread(f"harness: Query did not decode: {query}")
-            return {"BudgetFacts": {"budget": self.budget, "facts": []}}
+            return {"budget_facts": {"budget": self.budget, "facts": []}}
         if program == "files":
             return self.files_answer(query)
-        found = self.posted.get(query["MessageById"]["message_id"])
-        return {"Message": None if found is None else {"text": found}}
+        found = self.posted.get(query["message_by_id"]["message_id"])
+        return {"message": None if found is None else {"text": found}}
 
     def files_answer(self, query):
         if isinstance(self.files, Exception):
             raise self.files
         self.reads.append(query)
         match query:
-            case {"Stat": {"at": None, "path": path}}:
-                return {"Stat": {"entry": file_entry(path, self.files.get(path)), "snapshot": SNAPSHOT}}
-            case {"Read": {"at": at, "len": length, "offset": offset, "path": path}}:
+            case {"stat": {"at": None, "path": path}}:
+                return {"stat": {"entry": file_entry(path, self.files.get(path)), "snapshot": SNAPSHOT}}
+            case {"read": {"at": at, "len": length, "offset": offset, "path": path}}:
                 held = self.files[path]
                 part = held[offset : offset + length]
-                return {"Contents": {"bytes": part.hex(), "eof": offset + length >= len(held), "offset": offset, "size": len(held), "snapshot": at}}
+                return {"contents": {"bytes": part.hex(), "eof": offset + length >= len(held), "offset": offset, "size": len(held), "snapshot": at}}
 
     def op(self, program, op):
         self.ops.append(op)
-        posted = op["PostMessage"]
+        posted = op["post_message"]
         if self.dying:
-            self.posted[posted["message_id"]] = posted["blocks"][0]["Paragraph"][0]["text"]
+            self.posted[posted["message_id"]] = posted["blocks"][0]["paragraph"][0]["text"]
             raise Killed()
         if self.landing_unseen:
-            self.posted[posted["message_id"]] = posted["blocks"][0]["Paragraph"][0]["text"]
+            self.posted[posted["message_id"]] = posted["blocks"][0]["paragraph"][0]["text"]
             raise watch.Unread("the answer was lost")
         if self.failing:
             raise watch.Unread("unlanded")
         if self.stalled:
             return {"pooled": posted["message_id"]}
-        self.posted[posted["message_id"]] = posted["blocks"][0]["Paragraph"][0]["text"]
+        self.posted[posted["message_id"]] = posted["blocks"][0]["paragraph"][0]["text"]
         return {"pooled": posted["message_id"]}
 
 
@@ -269,7 +269,7 @@ class Budget(unittest.TestCase):
     def test_the_budget_is_read_from_harness_budget_facts(self):
         cli = FakeCli()
         self.assertEqual(watch.budget_read(cli).seen, watch.OK)
-        self.assertEqual(cli.asked, ["BudgetFacts"])
+        self.assertEqual(cli.asked, ["budget_facts"])
 
     def test_harness_unanswered_is_unread(self):
         self.assertEqual(watch.budget_read(FakeCli(budget=watch.Unread("no"))).seen, watch.UNREAD)
@@ -354,7 +354,7 @@ class WarmPod(unittest.TestCase):
     def test_a_running_run_container_is_ok_and_the_file_is_read_at_the_size_and_snapshot_stat_answered(self):
         reading, cli = warm_read(self.named, (200, warm_pod(RUNNING)))
         self.assertEqual((reading.check, reading.seen, reading.value), ("warm-pod", watch.OK, f"{WARM}'s run container is running"))
-        self.assertEqual(cli.reads, [{"Stat": {"at": None, "path": WARM_FILE}}, {"Read": {"at": SNAPSHOT, "len": 23, "offset": 0, "path": WARM_FILE}}])
+        self.assertEqual(cli.reads, [{"stat": {"at": None, "path": WARM_FILE}}, {"read": {"at": SNAPSHOT, "len": 23, "offset": 0, "path": WARM_FILE}}])
 
     def test_a_terminated_run_container_is_bad_with_its_reason_and_exit_code_while_out_runs_on(self):
         reading, _ = warm_read(self.named, (200, warm_pod(OOM)))
@@ -590,9 +590,9 @@ class Blocking(unittest.TestCase):
             (keys / "password").write_text("p")
             cli = watch.Cli(["ducktape"], NODE, keys, keys, blocks)
             with self.assertRaises(watch.Unread):
-                cli.op("chat", {"PostMessage": {}})
+                cli.op("chat", {"post_message": {}})
             with self.assertRaises(watch.Unread):
-                cli.query("chat", {"MessageById": {"message_id": "x"}}, confirmed=True)
+                cli.query("chat", {"message_by_id": {"message_id": "x"}}, confirmed=True)
         self.assertEqual([timeout for _, timeout in seen], [watch.SAMPLE_S, watch.SAMPLE_S])
         self.assertNotIn("--land", seen[0][0])
         self.assertIn("--confirmed", seen[1][0])
@@ -609,7 +609,7 @@ class Flush(unittest.TestCase):
         left = watch.flush(cli, "alerts", [self.item()], pager)
         self.assertTrue(left[0]["sent"])
         self.assertEqual(watch.flush(cli, "alerts", left, pager), [])
-        self.assertEqual(cli.ops[0]["PostMessage"]["channel_id"], "alerts")
+        self.assertEqual(cli.ops[0]["post_message"]["channel_id"], "alerts")
         self.assertEqual(len(cli.ops), 1)
         self.assertEqual(runner.pages, [])
 
@@ -740,7 +740,7 @@ class Whole(unittest.TestCase):
                 http.answers[NODE + "/v1/status"] = (200, status(next(heights)))
                 watcher.tick()
                 clock.now += watch.SAMPLE_S
-            texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+            texts = [op["post_message"]["blocks"][0]["paragraph"][0]["text"] for op in cli.ops]
             self.assertEqual(len(texts), 2)
             self.assertTrue(texts[0].startswith("🔴 block rate: 0.25 blocks/s"))
             self.assertTrue(texts[1].startswith("🟢 block rate is good again"))
@@ -765,7 +765,7 @@ class Whole(unittest.TestCase):
             tick(up)
             self.assertEqual(len(cli.ops), 1)
             tick(up)
-            texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+            texts = [op["post_message"]["blocks"][0]["paragraph"][0]["text"] for op in cli.ops]
             self.assertEqual(texts, ["🔴 public /v1/status: no answer: timed out", "🟢 public /v1/status is good again: height 1"])
 
     def test_a_post_that_landed_before_the_pod_stopped_is_not_posted_again(self):
@@ -795,7 +795,7 @@ class Whole(unittest.TestCase):
                 kube.answers[WARM_PATH] = (200, warm_pod(run))
                 watcher.tick()
                 posted.append(len(cli.ops))
-        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        texts = [op["post_message"]["blocks"][0]["paragraph"][0]["text"] for op in cli.ops]
         self.assertEqual(posted, [0, 0, 1, 1, 1, 2])
         self.assertEqual(texts, [f"🔴 warm pod: {WARM}'s run container ended: OOMKilled, exit 137", f"🟢 warm pod is good again: {WARM}'s run container is running"])
 
@@ -814,7 +814,7 @@ class Whole(unittest.TestCase):
                 free[0] = sample
                 watcher.tick()
                 posted.append(len(cli.ops))
-        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        texts = [op["post_message"]["blocks"][0]["paragraph"][0]["text"] for op in cli.ops]
         self.assertEqual(posted, [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2])
         shown = "10.0 GB free of 29.7 GB (33% free), bad under 10 GB free"
         self.assertEqual(texts, [f"🔴 node volume: {shown}", f"🟢 node volume is good again: {shown}"])
@@ -836,7 +836,7 @@ class Whole(unittest.TestCase):
                 watcher.tick()
                 clock.now += watch.SAMPLE_S
                 posted.append(len(cli.ops))
-        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        texts = [op["post_message"]["blocks"][0]["paragraph"][0]["text"] for op in cli.ops]
         self.assertEqual(posted[-3:], [1, 1, 2])
         line = "bad under 10 GB free, good again at 10.5 GB free"
         self.assertEqual(texts, [f"🔴 node volume: 10.0 GB free of 29.7 GB (33% free), {line}", f"🟢 node volume is good again: 10.6 GB free of 29.7 GB (35% free), {line}"])
@@ -857,7 +857,7 @@ class Whole(unittest.TestCase):
                 watcher.tick()
                 clock.now += watch.SAMPLE_S
                 posted.append(len(cli.ops))
-        texts = [op["PostMessage"]["blocks"][0]["Paragraph"][0]["text"] for op in cli.ops]
+        texts = [op["post_message"]["blocks"][0]["paragraph"][0]["text"] for op in cli.ops]
         self.assertEqual([http.asked.count(url) for url in (PUSHES, SCHEDULED, DISPATCHED)], [2, 2, 2])
         self.assertEqual(posted, [1] * 18 + [2])
         self.assertEqual(texts, [

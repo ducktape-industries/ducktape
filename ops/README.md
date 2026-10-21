@@ -423,7 +423,7 @@ one up for another network.
   `unchanged` (the branch is at the commit already) and `forge`: `request`,
   the pkt-lines forge's `Push` takes (`<old> <commit> refs/heads/<branch>\0report-status`,
   zeros for a new branch's old, then a flush) as hex, and `pack`, the blob
-  as forge's `BlobId` (`{"Sha256": hex}`, or `null`): the values forge's
+  as forge's `BlobId` (`{"sha256": hex}`, or `null`): the values forge's
   `Push` takes as they are.
 - `report` `{report, push}` reads forge's answer to that `Push` (git's
   report-status, as hex) for the answer of the push it made: 200 `{pushed,

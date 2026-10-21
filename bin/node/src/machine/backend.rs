@@ -179,21 +179,21 @@ pub fn variant(value: &Value) -> Result<(&str, &Value), String> {
 fn input(value: &Value) -> Result<Input, String> {
     let (name, body) = variant(value)?;
     match name {
-        "Forge" => Ok(Input::Forge {
+        "forge" => Ok(Input::Forge {
             path: text(body, "path")?,
             repo: text(body, "repo")?,
             commit: text(body, "commit")?,
         }),
-        "Files" => Ok(Input::Files {
+        "files" => Ok(Input::Files {
             path: text(body, "path")?,
             files: text(body, "files")?,
             snapshot: body["snapshot"].clone(),
         }),
-        "Blob" => Ok(Input::Blob {
+        "blob" => Ok(Input::Blob {
             path: text(body, "path")?,
             blob: blob_of(&body["blob"])?,
         }),
-        "Scratch" => Ok(Input::Scratch {
+        "scratch" => Ok(Input::Scratch {
             path: text(body, "path")?,
             memory: body["memory"].as_bool().unwrap_or(false),
             size: optional(&body["size"]),
@@ -210,8 +210,8 @@ pub fn blob_of(value: &Value) -> Result<BlobId, String> {
 
 pub fn blob_json(id: &BlobId) -> Value {
     match id {
-        BlobId::Sha256(digest) => json!({ "Sha256": hex::encode(digest) }),
-        BlobId::Sha1(digest) => json!({ "Sha1": hex::encode(digest) }),
+        BlobId::Sha256(digest) => json!({ "sha256": hex::encode(digest) }),
+        BlobId::Sha1(digest) => json!({ "sha1": hex::encode(digest) }),
     }
 }
 
@@ -594,14 +594,14 @@ async fn read_file(at: &Path, files: &str, snapshot: &Value, talk: &Talk) -> Res
 }
 
 async fn read_bytes(files: &str, snapshot: &Value, talk: &Talk) -> Result<Vec<u8>, String> {
-    let stat = json!({ "Stat": { "path": files, "at": snapshot } });
+    let stat = json!({ "stat": { "path": files, "at": snapshot } });
     let stated = talk.files_ask(stat).await?;
-    let size = stated["Stat"]["entry"]["node"]["File"]["size"]
+    let size = stated["stat"]["entry"]["node"]["file"]["size"]
         .as_u64()
         .ok_or_else(|| format!("{files} is no file in files"))?;
-    let read = json!({ "Read": { "path": files, "at": snapshot, "offset": 0, "len": size } });
+    let read = json!({ "read": { "path": files, "at": snapshot, "offset": 0, "len": size } });
     let answered = talk.files_ask(read).await?;
-    let contents = &answered["Contents"];
+    let contents = &answered["contents"];
     let whole = contents["eof"] == json!(true);
     if !whole {
         return Err(format!("{files} did not come whole in one answer"));
@@ -956,7 +956,7 @@ mod tests {
         let (_kept, stop) = oneshot::channel();
         let (end, ending) = wait(child, kill, stop).await;
         assert_eq!((end.clone(), ending), (End::Exited(3), Ending::Running));
-        assert_eq!(state_of(&end, ending).0, "Failed");
+        assert_eq!(state_of(&end, ending).0, "failed");
         let logged = std::fs::read_to_string(dir.join("log")).unwrap();
         let lines: Vec<&str> = logged.lines().collect();
         assert_eq!(lines[0], "hi");
@@ -996,7 +996,7 @@ mod tests {
         stopper.send(Ending::Stopped).unwrap();
         let (end, ending) = wait(child, kill, stop).await;
         assert_eq!((end.clone(), ending), (End::Signalled, Ending::Stopped));
-        assert_eq!(state_of(&end, ending).0, "Cancelled");
+        assert_eq!(state_of(&end, ending).0, "cancelled");
     }
 
     #[tokio::test]
@@ -1027,20 +1027,20 @@ mod tests {
             "by": 11,
             "height": 9,
             "spec": {
-                "kind": "Job",
+                "kind": "job",
                 "image": null,
                 "command": ["make", "check"],
                 "env": [["A", "1"]],
                 "workdir": "/src",
                 "inputs": [
-                    {"Forge": {"path": "/src", "repo": "core", "commit": "abc"}},
-                    {"Blob": {"path": "/in/b", "blob": {"Sha256": "00".repeat(32)}}},
-                    {"Scratch": {"path": "/tmp", "memory": true, "size": null}}
+                    {"forge": {"path": "/src", "repo": "core", "commit": "abc"}},
+                    {"blob": {"path": "/in/b", "blob": {"sha256": "00".repeat(32)}}},
+                    {"scratch": {"path": "/tmp", "memory": true, "size": null}}
                 ],
                 "asks": {"cpu": "500m", "memory": "1Gi"},
                 "on": null,
                 "out": null,
-                "on_loss": "Retry",
+                "on_loss": "retry",
                 "notify": null
             }
         });
@@ -1062,7 +1062,7 @@ mod tests {
         );
         assert_eq!(
             blob_json(&BlobId::Sha256([0; 32])),
-            json!({"Sha256": "00".repeat(32)})
+            json!({"sha256": "00".repeat(32)})
         );
         assert!(Workload::read(&json!(null)).is_err());
     }

@@ -266,8 +266,8 @@ impl Talk {
         match self.identity(&asked).await? {
             identity::Reply::Number(Some(account)) => Ok(account),
             identity::Reply::Number(None) => Err(
-                "machine.key acts as no account: make one with identity's CreateAgent and add \
-                 the key to it with AddKey"
+                "machine.key acts as no account: make one with identity's create_agent and add \
+                 the key to it with add_key"
                     .into(),
             ),
             _ => Err("identity answered OfKey with another reply".into()),
@@ -512,7 +512,7 @@ impl Serving {
 
     async fn ready(&self) -> Result<(), String> {
         for machine in &self.machines {
-            let ready = json!({ "Ready": {
+            let ready = json!({ "ready": {
                 "name": machine.name,
                 "labels": machine.labels,
                 "slots": machine.slots,
@@ -561,7 +561,7 @@ impl Serving {
             if !decide::beat_due(height, last, holding) {
                 continue;
             }
-            let beat = json!({ "Beat": { "name": name } });
+            let beat = json!({ "beat": { "name": name } });
             match self.shared.talk.fleet(beat, Landing::Pool).await {
                 Ok(_) => {
                     self.failures.remove("beat_unsent");
@@ -596,12 +596,12 @@ impl Serving {
         let mut held = Vec::new();
         let mut after = Value::Null;
         loop {
-            let query = json!({ "Holds": {
+            let query = json!({ "holds": {
                 "machine": { "account": self.account, "name": name },
                 "page": { "after": after, "limit": null },
             }});
             let reply = self.shared.talk.fleet_ask(query).await?;
-            let page = &reply["Runs"];
+            let page = &reply["runs"];
             let items = page["items"]
                 .as_array()
                 .ok_or("fleet answered Holds with no runs")?;
@@ -735,7 +735,7 @@ impl Serving {
         }
         self.local.remove(&run);
         if let Some(machine) = machine {
-            self.settle(&machine, run, attempt, "Errored", decide::LOST);
+            self.settle(&machine, run, attempt, "errored", decide::LOST);
         }
     }
 
@@ -788,9 +788,9 @@ impl Serving {
 
 fn serves(machine: &MachineEntry, manager: u64) -> Value {
     match (&machine.serves, machine.backend) {
-        (Some(accounts), _) => json!({ "Listed": accounts }),
-        (None, Backend::Shell) => json!({ "Listed": [manager] }),
-        (None, Backend::Podman | Backend::Pods) => json!("Anyone"),
+        (Some(accounts), _) => json!({ "listed": accounts }),
+        (None, Backend::Shell) => json!({ "listed": [manager] }),
+        (None, Backend::Podman | Backend::Pods) => json!("anyone"),
     }
 }
 
@@ -826,21 +826,21 @@ impl Task {
     async fn took(&self, stop: oneshot::Receiver<Ending>) -> Result<(), Failure> {
         let talk = &self.shared.talk;
         let (run, attempt) = (self.run, self.attempt);
-        let asked = json!({ "Workload": { "id": run } });
+        let asked = json!({ "workload": { "id": run } });
         let reply = talk
             .fleet_ask(asked)
             .await
             .map_err(|error| ("workload_unread", error))?;
         let workload =
-            Workload::read(&reply["Workload"]).map_err(|error| ("workload_unread", error))?;
+            Workload::read(&reply["workload"]).map_err(|error| ("workload_unread", error))?;
         if let Some(why) = backend::refuses(self.machine.backend, &workload, self.shared.clones) {
-            let decline = json!({ "Decline": { "run": run, "attempt": attempt, "why": why } });
+            let decline = json!({ "decline": { "run": run, "attempt": attempt, "why": why } });
             talk.fleet(decline, Landing::Land)
                 .await
                 .map_err(|error| ("decline_refused", error))?;
             return Ok(());
         }
-        let claim = json!({ "Claim": { "run": run, "attempt": attempt } });
+        let claim = json!({ "claim": { "run": run, "attempt": attempt } });
         let claimed = talk
             .fleet(claim, Landing::Land)
             .await
@@ -875,7 +875,7 @@ impl Task {
             Ok(started) => started,
             Err(error) => {
                 let kept = format!("{error}; its folder stays in {}", dir.display());
-                return self.report("Errored", kept, None).await;
+                return self.report("errored", kept, None).await;
             }
         };
         let started = Done::Started {
@@ -950,7 +950,7 @@ impl Task {
         summary: String,
         out: Option<Value>,
     ) -> Result<(), Failure> {
-        let report = json!({ "Report": {
+        let report = json!({ "report": {
             "run": self.run,
             "attempt": self.attempt,
             "state": state,
@@ -1053,13 +1053,13 @@ mod tests {
             service: None,
         };
         let shell = super::serves(&machine(noded::Backend::Shell, None), 15);
-        assert_eq!(shell, json!({ "Listed": [15] }));
+        assert_eq!(shell, json!({ "listed": [15] }));
         let podman = super::serves(&machine(noded::Backend::Podman, None), 15);
-        assert_eq!(podman, json!("Anyone"));
+        assert_eq!(podman, json!("anyone"));
         let listed = super::serves(&machine(noded::Backend::Shell, Some(vec![17, 39])), 15);
-        assert_eq!(listed, json!({ "Listed": [17, 39] }));
+        assert_eq!(listed, json!({ "listed": [17, 39] }));
         let pods = super::serves(&machine(noded::Backend::Pods, None), 15);
-        assert_eq!(pods, json!("Anyone"));
+        assert_eq!(pods, json!("anyone"));
     }
 
     #[test]

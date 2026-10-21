@@ -37,34 +37,34 @@ enum Op {
 impl Op {
     fn name(&self) -> &'static str {
         match self {
-            Op::Undraft => "Undraft",
-            Op::Release => "Release",
-            Op::Take => "Take",
+            Op::Undraft => "undraft",
+            Op::Release => "release",
+            Op::Take => "take",
             Op::Clear => "WakeOn Clear",
-            Op::Draft { .. } => "Drafting",
-            Op::Post { .. } => "Post",
+            Op::Draft { .. } => "drafting",
+            Op::Post { .. } => "post",
         }
     }
 
     fn json(&self, at: &Where) -> (&'static str, Value) {
         let (channel, thread) = (&at.channel, at.thread);
         match self {
-            Op::Undraft => (CHAT, json!({ "Undraft": { "channel_id": channel } })),
+            Op::Undraft => (CHAT, json!({ "undraft": { "channel_id": channel } })),
             Op::Release => (
                 CHAT,
-                json!({ "Release": { "channel_id": channel, "thread": thread } }),
+                json!({ "release": { "channel_id": channel, "thread": thread } }),
             ),
             Op::Take => (
                 CHAT,
-                json!({ "Take": { "channel_id": channel, "thread": thread } }),
+                json!({ "take": { "channel_id": channel, "thread": thread } }),
             ),
             Op::Clear => (
                 WAKE,
-                json!({ "WakeOn": { "event": { "Clear": { "channel_id": channel, "thread": thread } } } }),
+                json!({ "wake_on": { "event": { "clear": { "channel_id": channel, "thread": thread } } } }),
             ),
             Op::Draft { text, doing } => (
                 CHAT,
-                json!({ "Drafting": {
+                json!({ "drafting": {
                     "channel_id": channel,
                     "thread": thread,
                     "text": text,
@@ -74,7 +74,7 @@ impl Op {
             ),
             Op::Post { key, text } => (
                 CHAT,
-                json!({ "Post": {
+                json!({ "post": {
                     "channel_id": channel,
                     "message_id": key,
                     "text": text,
@@ -291,9 +291,9 @@ impl<'a, C: Chain, A: Adapter> Bridge<'a, C, A> {
         let mut cursor = self.after.clone();
         let mut settled = true;
         loop {
-            let asked = json!({ "ChangesTo": { "recipient": me, "page": { "after": cursor, "limit": null } } });
+            let asked = json!({ "changes_to": { "recipient": me, "page": { "after": cursor, "limit": null } } });
             let reply = self.chain.query(ATTRIBUTION, asked).await?;
-            let changes = &reply["Changes"];
+            let changes = &reply["changes"];
             for change in changes["items"].as_array().into_iter().flatten() {
                 let seq = change["seq"]
                     .as_u64()

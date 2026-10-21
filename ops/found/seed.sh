@@ -51,9 +51,9 @@ for who in founder chief; do
   [ -n "$(active_key "$who")" ] || { echo "seed: $who's workspace holds no active wallet key; run ducktape wallet new $who there first" >&2; exit 1; }
 done
 
-land founder create-founder identity '{"Create": {"name": "founder", "scheme": "Ed25519"}}'
+land founder create-founder identity '{"create": {"name": "founder", "scheme": "ed25519"}}'
 founder=$(returned create-founder)
-land founder create-chief identity '{"CreateAgent": {"name": "chief"}}'
+land founder create-chief identity '{"create_agent": {"name": "chief"}}'
 chief=$(returned create-chief)
 
 if [ ! -e add-chief-key.landed ]; then
@@ -71,7 +71,7 @@ network=$(as chief status | awk '$1 == "network" {print $2}')
 put_config chief chief /shared/agents/chief/md
 land chief script-chief identity "{\"SetScript\": {\"account\": $chief, \"script\": {\"calls\": \"harness\", \"config\": \"/shared/agents/chief/md\"}}}"
 
-land chief create-tech identity '{"CreateAgent": {"name": "tech"}}'
+land chief create-tech identity '{"create_agent": {"name": "tech"}}'
 tech=$(returned create-tech)
 [ -e tech.prompt ] || printf 'You are tech (account %s), the engineer agent of the %s network, managed by chief (account %s). Your full prompt is still to be seeded.\n' "$tech" "$network" "$chief" > tech.prompt
 put_config chief tech /shared/agents/tech/md

@@ -37,8 +37,8 @@ pub fn pack_path(repo: &str, commit: &str) -> String {
 }
 
 pub fn put_change(path: String, size: u64, chunks: Vec<Value>) -> Value {
-    let content = json!({ "Chunks": { "size": size, "chunks": chunks } });
-    json!({ "Put": { "path": path, "exec": false, "meta": [], "content": content } })
+    let content = json!({ "chunks": { "size": size, "chunks": chunks } });
+    json!({ "put": { "path": path, "exec": false, "meta": [], "content": content } })
 }
 
 pub async fn written(
@@ -70,9 +70,9 @@ pub async fn committed(
 ) -> Result<Value, String> {
     let mut stale_attempts: u64 = 0;
     loop {
-        let head = talk.files_ask(json!("Head")).await?;
-        let base = head["Head"]["id"].clone();
-        let commit = json!({ "Commit": {
+        let head = talk.files_ask(json!("head")).await?;
+        let base = head["head"]["id"].clone();
+        let commit = json!({ "commit": {
             "base": base,
             "message": message,
             "changes": changes,
@@ -317,7 +317,7 @@ pub(super) mod tests {
             .changes
             .iter()
             .map(|change| {
-                change["Put"]["content"]["Chunks"]["chunks"]
+                change["put"]["content"]["chunks"]["chunks"]
                     .as_array()
                     .unwrap()
                     .len()
@@ -325,7 +325,7 @@ pub(super) mod tests {
             .collect();
         assert_eq!(counts, [1, 2, 0]);
         assert_eq!(
-            made.changes[1]["Put"]["path"],
+            made.changes[1]["put"]["path"],
             json!("/shared/fleet/1/out/large")
         );
         assert!(stale(
@@ -408,7 +408,7 @@ pub(super) mod tests {
         let paths: Vec<&str> = chunked
             .changes
             .iter()
-            .map(|change| change["Put"]["path"].as_str().unwrap())
+            .map(|change| change["put"]["path"].as_str().unwrap())
             .collect();
         let pack = pack_path("core", &commit);
         assert_eq!(paths, ["/shared/fleet/3/log", pack.as_str()]);

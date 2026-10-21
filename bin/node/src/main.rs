@@ -683,7 +683,7 @@ enum WalletVerb {
     Use { name: String },
     #[command(
         about = "sign with the active key a consent to a key joining an account, and print it as the \
-                 JSON identity's AddKey op takes as its consent"
+                 JSON identity's add_key op takes as its consent"
     )]
     Consent {
         #[arg(long, help = "the account the key joins")]
@@ -704,7 +704,7 @@ enum WalletVerb {
 
 const EXPIRES: &str = "the unix time in milliseconds past which identity refuses the consent; \
                        without it the consent never expires, which gives a leaked one to nobody: \
-                       the AddKey that uses it still needs the signature of the account's manager \
+                       the add_key that uses it still needs the signature of the account's manager \
                        (or of the joining key, on a user's account), and the consent is bound to \
                        the joining key's generation, the account and the network";
 

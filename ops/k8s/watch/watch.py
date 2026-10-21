@@ -275,13 +275,13 @@ def deployment_reading(kube, api, name):
 
 
 def warm_pod_named(cli, path):
-    stat = cli.query("files", {"Stat": {"at": None, "path": path}})["Stat"]
-    file = (stat["entry"] or {"node": {}})["node"].get("File")
+    stat = cli.query("files", {"stat": {"at": None, "path": path}})["stat"]
+    file = (stat["entry"] or {"node": {}})["node"].get("file")
     holds_no_bytes = file is None or file["size"] == 0
     if holds_no_bytes:
         return ""
-    read = {"Read": {"at": stat["snapshot"], "len": file["size"], "offset": 0, "path": path}}
-    return bytes.fromhex(cli.query("files", read)["Contents"]["bytes"]).decode(errors="replace").strip()
+    read = {"read": {"at": stat["snapshot"], "len": file["size"], "offset": 0, "path": path}}
+    return bytes.fromhex(cli.query("files", read)["contents"]["bytes"]).decode(errors="replace").strip()
 
 
 def run_container_reading(check, label, name, pod):
@@ -435,7 +435,7 @@ class Cli:
 
 def budget_read(cli):
     try:
-        report = cli.query("harness", "BudgetFacts")["BudgetFacts"]["budget"]
+        report = cli.query("harness", "budget_facts")["budget_facts"]["budget"]
     except Unread as error:
         return unread("budget", "model budget", f"harness did not answer: {error}")
     return budget_reading(report)
@@ -515,13 +515,13 @@ def decide(state, readings, now_ms):
 
 
 def post_op(channel, item):
-    paragraph = {"Paragraph": [{"text": item["text"], "marks": []}]}
-    return {"PostMessage": {"channel_id": channel, "message_id": item["id"], "blocks": [paragraph], "thread": None}}
+    paragraph = {"paragraph": [{"text": item["text"], "marks": []}]}
+    return {"post_message": {"channel_id": channel, "message_id": item["id"], "blocks": [paragraph], "thread": None}}
 
 
 def posted_already(cli, item):
-    found = cli.query("chat", {"MessageById": {"message_id": item["id"]}}, confirmed=True)
-    return found.get("Message") is not None
+    found = cli.query("chat", {"message_by_id": {"message_id": item["id"]}}, confirmed=True)
+    return found.get("message") is not None
 
 
 class Pager:

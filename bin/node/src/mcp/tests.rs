@@ -53,7 +53,7 @@ fn code() -> Code {
     let schema = borsh::schema::BorshSchemaContainer::for_type::<Roots>();
     let told = Told {
         description: COUNT.into(),
-        example: Some(json!({ "Count": { "by": 1 } })),
+        example: Some(json!({ "count": { "by": 1 } })),
         returns: None,
     };
     let described = Described {
@@ -221,17 +221,17 @@ fn a_session_initializes_lists_its_tools_and_answers_each_network_tool() {
             calling(
                 4,
                 "network_schema",
-                json!({ "program": "counter", "op": "Count" }),
+                json!({ "program": "counter", "op": "count" }),
             ),
             calling(
                 5,
                 "network_query",
-                json!({ "program": "counter", "query": "Total" }),
+                json!({ "program": "counter", "query": "total" }),
             ),
             calling(
                 6,
                 "network_call",
-                json!({ "program": "counter", "op": { "Count": { "by": 2 } } }),
+                json!({ "program": "counter", "op": { "count": { "by": 2 } } }),
             ),
             json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }),
         ],
@@ -279,8 +279,8 @@ fn a_session_initializes_lists_its_tools_and_answers_each_network_tool() {
     );
     let unfolded = told(&answers, 4);
     assert_eq!(unfolded["description"], json!(COUNT));
-    assert_eq!(unfolded["example"], json!({ "Count": { "by": 1 } }));
-    assert_eq!(told(&answers, 5), json!({ "reply": { "Total": 7 } }));
+    assert_eq!(unfolded["example"], json!({ "count": { "by": 1 } }));
+    assert_eq!(told(&answers, 5), json!({ "reply": { "total": 7 } }));
     assert_eq!(
         told(&answers, 6),
         json!({ "ok": true, "returned": 5, "landed": 4 })
@@ -301,17 +301,17 @@ fn a_refused_encode_or_a_rejected_op_is_a_tool_error_and_a_bad_message_a_protoco
             calling(
                 1,
                 "network_call",
-                json!({ "program": "counter", "op": { "Count": { "by": "two" } } }),
+                json!({ "program": "counter", "op": { "count": { "by": "two" } } }),
             ),
             calling(
                 2,
                 "network_call",
-                json!({ "program": "counter", "op": "Reset" }),
+                json!({ "program": "counter", "op": "reset" }),
             ),
             calling(
                 3,
                 "network_schema",
-                json!({ "program": "counter", "op": "Shout" }),
+                json!({ "program": "counter", "op": "shout" }),
             ),
             calling(4, "network_schema", json!({ "program": "nobody" })),
             calling(5, "chat_post", json!({})),
@@ -319,7 +319,7 @@ fn a_refused_encode_or_a_rejected_op_is_a_tool_error_and_a_bad_message_a_protoco
         ],
     );
     let encode = refused(&answers, 1);
-    assert!(encode.starts_with("at op.Count.by: "), "{encode}");
+    assert!(encode.starts_with("at op.count.by: "), "{encode}");
     assert_eq!(
         *fake.sent.borrow(),
         vec![("counter".to_owned(), abi::encode(&Op::Reset))],
@@ -328,7 +328,7 @@ fn a_refused_encode_or_a_rejected_op_is_a_tool_error_and_a_bad_message_a_protoco
     assert_eq!(refused(&answers, 2), "rejected unauthorized: not yours");
     let unknown = refused(&answers, 3);
     assert!(
-        unknown.starts_with("program counter has no op Shout; its ops are Count, Reset"),
+        unknown.starts_with("program counter has no op shout; its ops are count, reset"),
         "{unknown}"
     );
     assert_eq!(
@@ -453,7 +453,7 @@ fn only_an_agent_accounts_key_is_served_and_any_other_is_refused_with_how_to_mak
         person.starts_with("the key ab acts as account 60 (scout), a person's own account. ducktape mcp signs only as an agent account"),
         "{person}"
     );
-    assert!(person.contains("CreateAgent"), "{person}");
+    assert!(person.contains("create_agent"), "{person}");
     let system = super::agent(key, Some(profile(Kind::System("chat".into())))).unwrap_err();
     assert!(system.contains("program chat's own account"), "{system}");
     let none = super::agent(key, None).unwrap_err();
@@ -461,5 +461,5 @@ fn only_an_agent_accounts_key_is_served_and_any_other_is_refused_with_how_to_mak
         none.starts_with("the key ab acts as no account. "),
         "{none}"
     );
-    assert!(none.contains("AddKey"), "{none}");
+    assert!(none.contains("add_key"), "{none}");
 }

@@ -303,11 +303,11 @@ pub fn pod_body(workload: &Workload, fills: &[Fill]) -> Result<Value, String> {
 
 fn method_word(method: http::Method) -> &'static str {
     match method {
-        http::Method::Get => "Get",
-        http::Method::Post => "Post",
-        http::Method::Put => "Put",
-        http::Method::Patch => "Patch",
-        http::Method::Delete => "Delete",
+        http::Method::Get => "get",
+        http::Method::Post => "post",
+        http::Method::Put => "put",
+        http::Method::Patch => "patch",
+        http::Method::Delete => "delete",
     }
 }
 
@@ -330,11 +330,11 @@ pub fn call_op(
     } else {
         vec![json!(["content-type", "application/json"])]
     };
-    json!({ "Call": {
+    json!({ "call": {
         "run": asked.run,
         "attempt": asked.attempt,
         "call": asked.call,
-        "request": { "Http": {
+        "request": { "http": {
             "service": asked.service,
             "head": { "method": method_word(method), "target": target, "headers": headers },
             "body": parts,
@@ -349,13 +349,13 @@ pub fn settled(pieces: &[Value]) -> Result<Option<Reply>, String> {
     for row in pieces {
         let (name, body) = variant(&row["piece"])?;
         match name {
-            "Event" => {
+            "event" => {
                 let data = body["data"]
                     .as_str()
                     .ok_or("a piece's event holds no data")?;
                 events.push(hex::decode(data).sentence()?);
             }
-            "Answer" => {
+            "answer" => {
                 let bytes = hex::decode(body.as_str().ok_or("a piece's answer holds no bytes")?)
                     .sentence()?;
                 let response: http::Response =
@@ -366,7 +366,7 @@ pub fn settled(pieces: &[Value]) -> Result<Option<Reply>, String> {
                     events,
                 }));
             }
-            "Failed" => {
+            "failed" => {
                 let why = body.as_str().unwrap_or_default().to_owned();
                 return Ok(Some(Reply::Failed { why, events }));
             }
@@ -450,9 +450,9 @@ pub fn ended_view(view: &Value) -> Option<Value> {
 
 pub fn ended(data: &Value) -> End {
     let state = match data["exit_code"].as_i64() {
-        Some(0) => "Passed",
-        Some(_) => "Failed",
-        None => "Errored",
+        Some(0) => "passed",
+        Some(_) => "failed",
+        None => "errored",
     };
     let summary = data["line"]
         .as_str()
@@ -660,7 +660,7 @@ pub async fn flow<R: Relay>(
             Waited::Unread(why) => {
                 let left = deleted(relay, &pod).await;
                 return Flowed::Ended {
-                    state: "Errored",
+                    state: "errored",
                     summary: noted(why, left),
                     gathered: None,
                 };
@@ -780,14 +780,14 @@ impl Fleeted {
         let mut rows = Vec::new();
         let mut after = Value::Null;
         loop {
-            let query = json!({ "Pieces": {
+            let query = json!({ "pieces": {
                 "run": self.run,
                 "attempt": self.attempt,
                 "call": call,
                 "page": { "after": after, "limit": null },
             }});
             let reply = self.shared.talk.fleet_ask(query).await?;
-            let page = &reply["Pieces"];
+            let page = &reply["pieces"];
             let items = page["items"]
                 .as_array()
                 .ok_or("fleet answered Pieces with no pieces")?;
@@ -839,9 +839,9 @@ impl Relay for Fleeted {
     }
 
     async fn pack(&mut self, repo: &str, commit: &str) -> Result<bool, String> {
-        let stat = json!({ "Stat": { "path": out::pack_path(repo, commit), "at": null } });
+        let stat = json!({ "stat": { "path": out::pack_path(repo, commit), "at": null } });
         let stated = self.shared.talk.files_ask(stat).await?;
-        Ok(stated["Stat"]["entry"]["node"]["File"].is_object())
+        Ok(stated["stat"]["entry"]["node"]["file"].is_object())
     }
 }
 
@@ -873,11 +873,11 @@ pub async fn ran(
     let (run, attempt) = (task.run, task.attempt);
     let made = dir.clone();
     if let Err(error) = blocking(move || super::backend::fresh(&made)).await {
-        return task.report("Errored", error, None).await;
+        return task.report("errored", error, None).await;
     }
     let every = match every(task.shared.block_ms) {
         Ok(every) => every,
-        Err(why) => return task.report("Errored", why, None).await,
+        Err(why) => return task.report("errored", why, None).await,
     };
     let calls = Calls::default();
     let mut relay = Fleeted {
@@ -900,10 +900,10 @@ pub async fn ran(
     let flowed = flow(&mut relay, workload, every, stop, &mut started).await;
     let _ = blocking(move || std::fs::remove_dir_all(dir).sentence()).await;
     let (state, summary, gathered) = match flowed {
-        Flowed::Unmade(why) => return task.report("Errored", why, None).await,
+        Flowed::Unmade(why) => return task.report("errored", why, None).await,
         Flowed::Stopped(Ending::Dropped) => return Ok(()),
         Flowed::Stopped(Ending::Stopped | Ending::Running) => {
-            return task.report("Cancelled", "stopped".to_owned(), None).await;
+            return task.report("cancelled", "stopped".to_owned(), None).await;
         }
         Flowed::Ended {
             state,
@@ -960,7 +960,7 @@ mod tests {
                 Input::Files {
                     path: "/in/f".into(),
                     files: "/shared/f".into(),
-                    snapshot: json!({ "Sha256": "cd".repeat(32) }),
+                    snapshot: json!({ "sha256": "cd".repeat(32) }),
                 },
                 Input::Blob {
                     path: "/in/b".into(),
@@ -1058,7 +1058,7 @@ mod tests {
     fn event(n: u64, text: &str) -> Value {
         piece(
             n,
-            json!({ "Event": { "seq": n, "data": hex::encode(text) } }),
+            json!({ "event": { "seq": n, "data": hex::encode(text) } }),
         )
     }
 
@@ -1068,7 +1068,7 @@ mod tests {
             headers: Vec::new(),
             body: body.to_vec(),
         };
-        piece(n, json!({ "Answer": hex::encode(abi::encode(&response)) }))
+        piece(n, json!({ "answer": hex::encode(abi::encode(&response)) }))
     }
 
     #[test]
@@ -1084,7 +1084,7 @@ mod tests {
                 events: vec![alive.as_bytes().to_vec()],
             })
         );
-        let failed = settled(&[piece(0, json!({ "Failed": "the stream broke off" }))]).unwrap();
+        let failed = settled(&[piece(0, json!({ "failed": "the stream broke off" }))]).unwrap();
         assert_eq!(
             failed,
             Some(Reply::Failed {
@@ -1092,7 +1092,7 @@ mod tests {
                 events: Vec::new(),
             })
         );
-        assert!(settled(&[piece(0, json!({ "Other": 1 }))]).is_err());
+        assert!(settled(&[piece(0, json!({ "other": 1 }))]).is_err());
     }
 
     #[test]
@@ -1128,20 +1128,20 @@ mod tests {
     #[test]
     fn an_end_reads_as_passed_failed_or_errored_and_says_when_the_fetch_failed() {
         let passed = ended_view(&view(Some(("terminated", json!(0))), None)).unwrap();
-        assert_eq!(ended(&passed).state, "Passed");
+        assert_eq!(ended(&passed).state, "passed");
         let failed = ended_view(&view(Some(("terminated", json!(3))), None)).unwrap();
         let end = ended(&failed);
-        assert_eq!((end.state, end.fetch_failed), ("Failed", false));
+        assert_eq!((end.state, end.fetch_failed), ("failed", false));
         assert!(end.summary.contains("exit code 3"), "{}", end.summary);
         let unfetched = ended_view(&view(None, Some(("terminated", json!(1))))).unwrap();
         let end = ended(&unfetched);
-        assert_eq!((end.state, end.fetch_failed), ("Errored", true));
+        assert_eq!((end.state, end.fetch_failed), ("errored", true));
         assert_eq!(
             ended_view(&view(Some(("running", Value::Null)), None)),
             None
         );
         let gone = json!({ "line": "pod duckpond-41 is gone", "exit_code": null, "pod": null });
-        assert_eq!(ended(&gone).state, "Errored");
+        assert_eq!(ended(&gone).state, "errored");
     }
 
     #[test]
@@ -1152,7 +1152,7 @@ mod tests {
             attempt: 2,
             call: 3,
         };
-        let part = json!({ "Sha256": "11".repeat(32) });
+        let part = json!({ "sha256": "11".repeat(32) });
         let op = call_op(
             &asked,
             http::Method::Post,
@@ -1162,11 +1162,11 @@ mod tests {
         );
         assert_eq!(
             op,
-            json!({ "Call": {
+            json!({ "call": {
                 "run": 7, "attempt": 2, "call": 3,
-                "request": { "Http": {
+                "request": { "http": {
                     "service": "pods",
-                    "head": { "method": "Post", "target": "/v1/pods", "headers": [["content-type", "application/json"]] },
+                    "head": { "method": "post", "target": "/v1/pods", "headers": [["content-type", "application/json"]] },
                     "body": [part],
                 }},
                 "stream": false, "wait": null,
@@ -1180,10 +1180,10 @@ mod tests {
             true,
         );
         assert_eq!(
-            wait["Call"]["request"]["Http"]["head"]["headers"],
+            wait["call"]["request"]["http"]["head"]["headers"],
             json!([])
         );
-        assert_eq!(wait["Call"]["stream"], true);
+        assert_eq!(wait["call"]["stream"], true);
     }
 
     #[test]
@@ -1208,7 +1208,7 @@ mod tests {
         let (made, refused) = changes(&gathered, "/shared/fleet/7/").unwrap();
         let paths: Vec<&str> = made
             .iter()
-            .map(|change| change["Put"]["path"].as_str().unwrap())
+            .map(|change| change["put"]["path"].as_str().unwrap())
             .collect();
         let pack = format!("/shared/fleet/packs/core/{commit}.pack");
         assert_eq!(
@@ -1220,10 +1220,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            made[0]["Put"]["content"],
-            json!({ "Chunks": { "size": 3, "chunks": [{ "Sha256": "01".repeat(32) }] } })
+            made[0]["put"]["content"],
+            json!({ "chunks": { "size": 3, "chunks": [{ "sha256": "01".repeat(32) }] } })
         );
-        assert_eq!(made[1]["Put"]["content"]["Chunks"]["chunks"], json!([]));
+        assert_eq!(made[1]["put"]["content"]["chunks"]["chunks"], json!([]));
         assert_eq!(refused.len(), 1);
         let unput = Gathered {
             blobs: Vec::new(),
@@ -1364,7 +1364,7 @@ mod tests {
         assert_eq!(
             flowed,
             Flowed::Ended {
-                state: "Passed",
+                state: "passed",
                 summary: "pod duckpond-41 ended: exit code 0 (Completed)".into(),
                 gathered: Some(Gathered {
                     manifest,
@@ -1407,7 +1407,7 @@ mod tests {
         let Flowed::Ended { state, .. } = flowed else {
             panic!("not ended: {flowed:?}");
         };
-        assert_eq!(state, "Failed");
+        assert_eq!(state, "failed");
     }
 
     #[tokio::test]
@@ -1475,7 +1475,7 @@ mod tests {
         let Flowed::Ended { state, summary, .. } = flowed else {
             panic!("not ended: {flowed:?}");
         };
-        assert_eq!(state, "Errored");
+        assert_eq!(state, "errored");
         assert!(summary.contains("fetching its inputs failed"), "{summary}");
     }
 }

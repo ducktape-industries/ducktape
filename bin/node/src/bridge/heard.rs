@@ -19,9 +19,9 @@ pub(crate) fn answer_key(account: u64, channel: &str, seq: u64) -> String {
 
 pub(crate) async fn fetch<C: Chain>(chain: &C, seq: u64) -> Result<Heard, String> {
     let reply = chain
-        .query(ATTRIBUTION, json!({ "Change": { "seq": seq } }))
+        .query(ATTRIBUTION, json!({ "change": { "seq": seq } }))
         .await?;
-    match &reply["Change"] {
+    match &reply["change"] {
         Value::Null => Ok(Heard::Ignored("attribution holds no such change".into())),
         change => classify(chain, change.clone()).await,
     }
@@ -33,7 +33,7 @@ pub(crate) async fn classify<C: Chain>(chain: &C, change: Value) -> Result<Heard
     let program = source["program"].as_str().unwrap_or_default();
     let kind = source["object"]["kind"].as_str().unwrap_or_default();
     let id = source["object"]["id"].as_str().unwrap_or_default();
-    if change["kind"] != json!("Added") {
+    if change["kind"] != json!("added") {
         return Ok(Heard::Ignored(format!(
             "{program}'s {kind} {id} was not added for this account"
         )));
@@ -66,13 +66,13 @@ fn woke(account: u64, seq: u64, id: &str, detail: &Value) -> Heard {
 async fn message<C: Chain>(chain: &C, seq: u64, id: &str) -> Result<Heard, String> {
     let me = chain.account();
     let reply = chain
-        .query(CHAT, json!({ "MessageById": { "message_id": id } }))
+        .query(CHAT, json!({ "message_by_id": { "message_id": id } }))
         .await?;
-    let row = &reply["Message"];
+    let row = &reply["message"];
     if row.is_null() || row["deleted"] == json!(true) {
         return Ok(Heard::Ignored(format!("message {id} is gone")));
     }
-    let Some(author) = row["author"]["Account"].as_u64() else {
+    let Some(author) = row["author"]["account"].as_u64() else {
         return Ok(Heard::Ignored(format!(
             "message {id} was not written by an account"
         )));
@@ -88,10 +88,10 @@ async fn message<C: Chain>(chain: &C, seq: u64, id: &str) -> Result<Heard, Strin
     let hears = chain
         .query(
             chain.identity(),
-            json!({ "Hears": { "account": me, "from": author } }),
+            json!({ "hears": { "account": me, "from": author } }),
         )
         .await?;
-    if hears["Hears"] != json!(true) {
+    if hears["hears"] != json!(true) {
         return Ok(Heard::Ignored(format!(
             "this account does not answer account {author}"
         )));
@@ -117,7 +117,7 @@ async fn message<C: Chain>(chain: &C, seq: u64, id: &str) -> Result<Heard, Strin
 
 pub(crate) async fn answered<C: Chain>(chain: &C, key: &str) -> Result<bool, String> {
     let reply = chain
-        .query(CHAT, json!({ "MessageById": { "message_id": key } }))
+        .query(CHAT, json!({ "message_by_id": { "message_id": key } }))
         .await?;
-    Ok(!reply["Message"].is_null())
+    Ok(!reply["message"].is_null())
 }

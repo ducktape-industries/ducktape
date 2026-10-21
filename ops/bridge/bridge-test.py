@@ -38,18 +38,23 @@ if verb == "op":
         sys.exit(1)
     print(json.dumps({"landed": 9, "ok": True}))
     sys.exit(0)
-changes = {str(change["seq"]): change for change in fixture["changes"]}
+snake = fixture.get("snake", False)
+changes = {str(change["seq"]): {**change, **({"kind": change["kind"].lower()} if snake and "kind" in change else {})} for change in fixture["changes"]}
+
+
+def said(name, value):
+    print(json.dumps({name.lower() if snake else name: value}))
 if "ChangesTo" in asked:
     after = asked["ChangesTo"]["page"].get("after")
     pages = fixture["pages"]
     at = 0 if after is None else int(after) + 1
     items = [changes[str(seq)] for seq in pages[at]]
     following = str(at) if at + 1 < len(pages) else None
-    print(json.dumps({"Changes": {"height": 9, "items": items, "next": following}}))
+    said("Changes", {"height": 9, "items": items, "next": following})
 elif "Change" in asked:
-    print(json.dumps({"Change": changes.get(str(asked["Change"]["seq"]))}))
+    said("Change", changes.get(str(asked["Change"]["seq"])))
 elif "MessageById" in asked:
-    print(json.dumps({"Message": fixture["messages"].get(asked["MessageById"]["message_id"])}))
+    said("Message", fixture["messages"].get(asked["MessageById"]["message_id"]))
 '''
 
 
@@ -165,6 +170,14 @@ class Bridge(unittest.TestCase):
         self.assertEqual(self.seen_texts(), ["first", "fifth"])
         self.assertEqual([row["program"] for row in self.posted()], ["chat", "chat"])
         self.assertEqual(self.posted()[0]["op"]["AddReaction"]["emoji"], "👀")
+        self.assertEqual(read(self.state), "6")
+
+    def test_a_ducktape_that_answers_in_snake_case_is_read_the_same(self):
+        fixture = self.world()
+        fixture["snake"] = True
+        done = self.run_bridge(fixture)
+        self.assertIn("closed attribution's changes", done.stderr)
+        self.assertEqual(self.seen_texts(), ["first", "fifth"])
         self.assertEqual(read(self.state), "6")
 
     def test_the_handler_never_sees_the_wallet_password_and_ducktape_does(self):

@@ -131,16 +131,16 @@ class Forge:
         self.cli = cli
 
     def tip(self):
-        query = {"Log": {"repo": REPO, "from": {"Ref": hexed(MAIN)}, "exclude": None, "page": {"after": None, "limit": 1}}}
-        return self.cli.query("forge", query)["Log"]["tip"]
+        query = {"log": {"repo": REPO, "from": {"ref": hexed(MAIN)}, "exclude": None, "page": {"after": None, "limit": 1}}}
+        return self.cli.query("forge", query)["log"]["tip"]
 
     def entry(self, commit, path):
         folder, _, name = path.rpartition("/")
         page = {"after": None, "limit": None}
         while True:
-            query = {"Tree": {"repo": REPO, "at": commit, "path": hexed(folder), "page": page}}
+            query = {"tree": {"repo": REPO, "at": commit, "path": hexed(folder), "page": page}}
             try:
-                listed = self.cli.query("forge", query)["Tree"]["page"]
+                listed = self.cli.query("forge", query)["tree"]["page"]
             except Unread as unread:
                 if unread.reason == NOT_FOUND:
                     return None
@@ -160,7 +160,7 @@ class Forge:
         size = 0
         while True:
             rest = {"offset": len(read), "len": size - len(read)} if read else None
-            blob = self.cli.query("forge", {"Blob": {"repo": REPO, "oid": oid, "range": rest}})["Blob"]["blob"]
+            blob = self.cli.query("forge", {"blob": {"repo": REPO, "oid": oid, "range": rest}})["blob"]["blob"]
             size = blob["size"]
             read.extend(bytes.fromhex(blob["bytes"]))
             if len(read) >= size or not blob["bytes"]:
@@ -170,22 +170,22 @@ class Forge:
         page = {"after": None, "limit": None}
         found = []
         while True:
-            query = {"Changes": {"repo": REPO, "filter": {"author": None, "involves": None, "state": "Open"}, "page": page}}
-            listed = self.cli.query("forge", query)["Changes"]["page"]
+            query = {"changes": {"repo": REPO, "filter": {"author": None, "involves": None, "state": "open"}, "page": page}}
+            listed = self.cli.query("forge", query)["changes"]["page"]
             found.extend(item["n"] for item in listed["items"] if item["into"] == hexed(MAIN))
             if listed["next"] is None:
                 return found
             page = {"after": listed["next"], "limit": None}
 
     def head(self, n):
-        query = {"Change": {"repo": REPO, "n": n, "page": {"after": None, "limit": 1}}}
-        return self.cli.query("forge", query)["Change"]["source_head"]
+        query = {"change": {"repo": REPO, "n": n, "page": {"after": None, "limit": 1}}}
+        return self.cli.query("forge", query)["change"]["source_head"]
 
     def judge(self, n, head, passed, body, context):
-        state = "Passed" if passed else "Failed"
-        self.cli.op("forge", {"Status": {"repo": REPO, "commit": head, "context": context, "state": state, "url": None}})
-        review = {"base_oid": None, "body": body, "comments": [], "commit_oid": head, "verdict": "Comment"}
-        self.cli.op("forge", {"ReviewSubmit": {"repo": REPO, "n": n, "review": review}})
+        state = "passed" if passed else "failed"
+        self.cli.op("forge", {"status": {"repo": REPO, "commit": head, "context": context, "state": state, "url": None}})
+        review = {"base_oid": None, "body": body, "comments": [], "commit_oid": head, "verdict": "comment"}
+        self.cli.op("forge", {"review_submit": {"repo": REPO, "n": n, "review": review}})
 
 
 class Kube:
@@ -458,12 +458,12 @@ def pods_verdict_body(found):
 def report_status(key):
     kind = key.removeprefix("pods-").rsplit("-", 1)[0]
     if kind == "proven":
-        return "Passed"
+        return "passed"
     if kind == "applied":
-        return "Running"
+        return "running"
     if kind.startswith("would-"):
-        return "Note"
-    return "Failed"
+        return "note"
+    return "failed"
 
 
 def report_group(key):
@@ -514,7 +514,7 @@ class Reconcile:
         concerns = [*self.concerns, *([] if mention is None or mention in self.concerns else [mention])]
         key = item.get("key", item["id"].removeprefix("reconcile-"))
         notice = {"kind": "infra", "group": report_group(key), "subject": first, "link": None, "status": report_status(key), "detail": "; ".join(rest), "concerns": concerns}
-        return {"Notify": {"channel_id": self.channel, "message_id": item["id"], "thread": None, "notice": notice}}
+        return {"notify": {"channel_id": self.channel, "message_id": item["id"], "thread": None, "notice": notice}}
 
     def judge_changes(self):
         main_text = self.state["main_text"]
@@ -577,7 +577,7 @@ class Reconcile:
         proving = self.state["proving"]
         if proving is None:
             return
-        row = self.cli.query("egress", {"Node": {"key": self.node_key}})["Node"]
+        row = self.cli.query("egress", {"node": {"key": self.node_key}})["node"]
         if row is None or sorted(row["services"]) != proving["served"]:
             return
         self.state["proving"] = None
@@ -710,7 +710,7 @@ class Reconcile:
         for item in self.state["outbox"]:
             item = {**item, "tried": item["tried"] + 1}
             try:
-                landed = self.cli.query("chat", {"MessageById": {"message_id": item["id"]}}).get("Message") is not None
+                landed = self.cli.query("chat", {"message_by_id": {"message_id": item["id"]}}).get("message") is not None
                 if not landed:
                     self.cli.op("chat", self.notice_op(item))
             except Unread as error:

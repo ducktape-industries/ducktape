@@ -71,9 +71,9 @@ pub fn held(row: &Value) -> Result<Held, String> {
         .and_then(|attempt| u32::try_from(attempt).ok())
         .ok_or("a held run has no attempt")?;
     let seen = match row["state"].as_str() {
-        Some("Assigned") => Seen::Assigned,
-        Some("Running") => Seen::Running,
-        Some("Stopping") => Seen::Stopping,
+        Some("assigned") => Seen::Assigned,
+        Some("running") => Seen::Running,
+        Some("stopping") => Seen::Stopping,
         other => return Err(format!("run {run} is held as {other:?}")),
     };
     Ok(Held { run, attempt, seen })
@@ -106,13 +106,13 @@ fn act(held: &Held, mine: Option<Ending>) -> Option<Act> {
         (Seen::Running, None) => Some(Act::Settle {
             run,
             attempt,
-            state: "Errored",
+            state: "errored",
             summary: RESTARTED,
         }),
         (Seen::Stopping, None) => Some(Act::Settle {
             run,
             attempt,
-            state: "Cancelled",
+            state: "cancelled",
             summary: UNSTARTED,
         }),
         (Seen::Stopping, Some(Ending::Running)) => Some(Act::Stop { run }),
@@ -131,12 +131,12 @@ pub fn beat_due(height: u64, last: u64, holding: bool) -> bool {
 
 pub fn state_of(end: &End, ending: Ending) -> (&'static str, String) {
     match ending {
-        Ending::Stopped => ("Cancelled", "stopped".to_owned()),
+        Ending::Stopped => ("cancelled", "stopped".to_owned()),
         Ending::Running | Ending::Dropped => match end {
-            End::Exited(0) => ("Passed", "exit 0".to_owned()),
-            End::Exited(code) => ("Failed", format!("exit {code}")),
-            End::Signalled => ("Failed", "ended by a signal".to_owned()),
-            End::Unwaited(why) => ("Errored", why.clone()),
+            End::Exited(0) => ("passed", "exit 0".to_owned()),
+            End::Exited(code) => ("failed", format!("exit {code}")),
+            End::Signalled => ("failed", "ended by a signal".to_owned()),
+            End::Unwaited(why) => ("errored", why.clone()),
         },
     }
 }
@@ -207,13 +207,13 @@ mod tests {
                 Act::Settle {
                     run: 5,
                     attempt: 1,
-                    state: "Errored",
+                    state: "errored",
                     summary: RESTARTED,
                 },
                 Act::Settle {
                     run: 6,
                     attempt: 1,
-                    state: "Cancelled",
+                    state: "cancelled",
                     summary: UNSTARTED,
                 },
             ]
@@ -236,24 +236,24 @@ mod tests {
     #[test]
     fn an_end_reads_as_passed_failed_errored_or_cancelled() {
         let running = Ending::Running;
-        assert_eq!(state_of(&End::Exited(0), running).0, "Passed");
+        assert_eq!(state_of(&End::Exited(0), running).0, "passed");
         assert_eq!(
             state_of(&End::Exited(3), running),
-            ("Failed", "exit 3".to_owned())
+            ("failed", "exit 3".to_owned())
         );
-        assert_eq!(state_of(&End::Signalled, running).0, "Failed");
+        assert_eq!(state_of(&End::Signalled, running).0, "failed");
         assert_eq!(
             state_of(&End::Unwaited("gone".into()), running).0,
-            "Errored"
+            "errored"
         );
-        assert_eq!(state_of(&End::Signalled, Ending::Stopped).0, "Cancelled");
+        assert_eq!(state_of(&End::Signalled, Ending::Stopped).0, "cancelled");
     }
 
     #[test]
     fn a_held_row_reads_from_fleets_json_and_only_holds_and_runs_wake_a_machine() {
-        let row = json!({"id": 9, "attempt": 2, "state": "Stopping", "summary": ""});
+        let row = json!({"id": 9, "attempt": 2, "state": "stopping", "summary": ""});
         assert_eq!(super::held(&row).unwrap(), held(9, 2, Seen::Stopping));
-        assert!(super::held(&json!({"id": 9, "attempt": 2, "state": "Passed"})).is_err());
+        assert!(super::held(&json!({"id": 9, "attempt": 2, "state": "passed"})).is_err());
         assert!(touches(&[(b"h/abc".to_vec(), None)]));
         assert!(touches(&[(b"r/abc".to_vec(), Some(vec![1]))]));
         assert!(!touches(&[(b"b/abc".to_vec(), Some(vec![1]))]));

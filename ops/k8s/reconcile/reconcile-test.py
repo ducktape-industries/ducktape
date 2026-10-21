@@ -176,12 +176,12 @@ class FakeCli:
 
     def query(self, program, query):
         if program == "egress":
-            return {"Node": {"key": KEY, "services": self.node.recorded, "since": 1}}
-        return {"Message": None}
+            return {"node": {"key": KEY, "services": self.node.recorded, "since": 1}}
+        return {"message": None}
 
     def op(self, program, op):
-        notice = op["Notify"]["notice"]
-        self.notices.append(op["Notify"])
+        notice = op["notify"]["notice"]
+        self.notices.append(op["notify"])
         self.posts.append("\n".join(part for part in (notice["subject"], notice["detail"]) if part))
         self.mentions.append(notice["concerns"])
         return {"landed": 1}
@@ -212,7 +212,7 @@ class Ran:
 
 class Notices(unittest.TestCase):
     def test_each_report_kind_has_its_status(self):
-        for key, status in [("proven-aaaaaaaaaaaa", "Passed"), ("pods-proven-aaaaaaaaaaaa", "Passed"), ("applied-aaaaaaaaaaaa", "Running"), ("would-apply-aaaaaaaaaaaa", "Note"), ("pods-would-roll-aaaaaaaaaaaa", "Note"), ("refused-aaaaaaaaaaaa", "Failed"), ("pods-rolled-back-aaaaaaaaaaaa", "Failed"), ("stuck-aaaaaaaaaaaa", "Failed"), ("absent-aaaaaaaaaaaa", "Failed"), ("pods-moved-aaaaaaaaaaaa", "Failed")]:
+        for key, status in [("proven-aaaaaaaaaaaa", "passed"), ("pods-proven-aaaaaaaaaaaa", "passed"), ("applied-aaaaaaaaaaaa", "running"), ("would-apply-aaaaaaaaaaaa", "note"), ("pods-would-roll-aaaaaaaaaaaa", "note"), ("refused-aaaaaaaaaaaa", "failed"), ("pods-rolled-back-aaaaaaaaaaaa", "failed"), ("stuck-aaaaaaaaaaaa", "failed"), ("absent-aaaaaaaaaaaa", "failed"), ("pods-moved-aaaaaaaaaaaa", "failed")]:
             self.assertEqual(rc.report_status(key), status, key)
 
     def test_one_rolls_reports_share_a_group_and_each_duty_its_own(self):
@@ -237,7 +237,7 @@ class Notices(unittest.TestCase):
             reconcile.state["outbox"].append({"id": "reconcile-pods-proven-aaaaaaaaaaaa", "text": "proven\nroll back by hand", "tried": 0, "mention": PROBER})
             reconcile.flush()
             told = cli.notices[0]["notice"]
-            self.assertEqual((told["group"], told["status"], told["subject"], told["detail"]), ("pods-aaaaaaaaaaaa", "Passed", "proven", "roll back by hand"))
+            self.assertEqual((told["group"], told["status"], told["subject"], told["detail"]), ("pods-aaaaaaaaaaaa", "passed", "proven", "roll back by hand"))
             self.assertEqual(told["concerns"], [*CONCERNS, PROBER])
 
 
@@ -788,7 +788,7 @@ class PodsRoll(unittest.TestCase):
             self.assertEqual(cli.mentions[0], [*CONCERNS, PROBER])
             told = cli.notices[0]
             self.assertEqual((told["channel_id"], told["thread"]), ("infra", None))
-            self.assertEqual((told["notice"]["kind"], told["notice"]["status"]), ("infra", "Passed"))
+            self.assertEqual((told["notice"]["kind"], told["notice"]["status"]), ("infra", "passed"))
             self.assertEqual(told["notice"]["group"], "pods-" + told["message_id"].rsplit("-", 1)[1])
             reconcile.tick()
             self.assertEqual(len(cli.posts), 1)
@@ -803,7 +803,7 @@ class PodsRoll(unittest.TestCase):
             self.assertIn("progress deadline (600 s)", cli.posts[0])
             self.assertIn(f"runs {POD_A} again. Revert eeeeeeeeeeee in infra.", cli.posts[0])
             self.assertEqual(cli.mentions[0], list(CONCERNS))
-            self.assertEqual(cli.notices[0]["notice"]["status"], "Failed")
+            self.assertEqual(cli.notices[0]["notice"]["status"], "failed")
             self.assertIsNone(reconcile.state["pods"]["rolling"])
 
     def test_a_node_that_does_not_reach_the_new_pod_rolls_back(self):

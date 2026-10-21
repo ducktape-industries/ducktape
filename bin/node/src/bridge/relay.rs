@@ -119,7 +119,7 @@ impl<N: Network> Network for Relayed<'_, N> {
 }
 
 pub(crate) fn armed(program: &str, op: &Value, answer: &Value) -> Option<u64> {
-    if program != WAKE || op.get("WakeOn").is_none() {
+    if program != WAKE || op.get("wake_on").is_none() {
         return None;
     }
     answer["returned"].as_u64()
