@@ -359,6 +359,11 @@ spec:
             - {name: PODS_WARM_POD, value: /shared/tools/warm-pod}
           ports:
             - {name: http, containerPort: 8080}
+          readinessProbe:
+            tcpSocket: {port: http}
+          lifecycle:
+            preStop:
+              sleep: {seconds: 5}
           volumeMounts:
             - {name: keys, mountPath: /keys, readOnly: true}
             - {name: desktop, mountPath: /desktop, readOnly: true}

@@ -36,6 +36,12 @@ or through a member node's halo forward.
 
 ## What it needs
 
+- **A roll and the calls in flight.** The Deployment's pods container has a readiness probe on
+  its port, so the rollout stops the old pod only once the new one listens, and a five-second
+  `preStop` sleep, so a call the Service routed to the old pod just before it left the
+  endpoints is still answered if it ends within those five seconds. A call still open then (an
+  exec stream, a streamed wait, a long whole answer) is cut when the old pod exits.
+
 - **A Kubernetes namespace and ServiceAccount.** `pods.yaml` makes namespace `pods`, which
   holds the service, and namespace `agents`, where agents' work runs. It also makes the
   ServiceAccount `pods` with a Role in `agents` (pods, exec, logs, the workload kinds), a
