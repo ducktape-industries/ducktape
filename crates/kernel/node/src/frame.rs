@@ -8,6 +8,7 @@ use keyscheme::KeyScheme;
 
 pub const NAMESPACE: &[u8] = b"ducktape:frame";
 pub const QUERY_NAMESPACE: &[u8] = b"ducktape:query";
+pub const FORWARD_NAMESPACE: &[u8] = b"ducktape:forward";
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Body {
@@ -111,6 +112,25 @@ impl Frame {
         )
     }
 
+    pub fn sign_forward(
+        key: &ed25519::PrivateKey,
+        network: &[u8],
+        anchor: Tip,
+        target: &str,
+        payload: Vec<u8>,
+    ) -> Frame {
+        Frame::signed(
+            FORWARD_NAMESPACE,
+            None,
+            key,
+            network,
+            anchor,
+            None,
+            target,
+            payload,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn signed(
         namespace: &[u8],
@@ -152,6 +172,10 @@ impl Frame {
         self.verified(QUERY_NAMESPACE, network)
     }
 
+    pub fn verify_forward(&self, network: &[u8]) -> Result<Submission, Refusal> {
+        self.verified(FORWARD_NAMESPACE, network)
+    }
+
     fn verified(&self, namespace: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
         let on_this_network = self.body.network == network;
         if !on_this_network {
@@ -182,6 +206,10 @@ pub fn verify(bytes: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
 
 pub fn verify_query(bytes: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
     Frame::decode(bytes)?.verify_query(network)
+}
+
+pub fn verify_forward(bytes: &[u8], network: &[u8]) -> Result<Submission, Refusal> {
+    Frame::decode(bytes)?.verify_forward(network)
 }
 
 #[derive(Clone, Debug)]

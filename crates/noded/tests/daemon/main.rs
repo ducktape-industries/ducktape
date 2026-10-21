@@ -607,6 +607,7 @@ fn first_target(head: &statesync::Response) -> Option<statesync::Request> {
 mod blobs;
 mod changes;
 mod dial;
+mod forward;
 mod http;
 mod load;
 mod members;

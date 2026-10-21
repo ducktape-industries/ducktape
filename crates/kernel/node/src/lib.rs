@@ -19,7 +19,10 @@ use host::{Applied, Genesis, Host, Layer, Snapshot, Submission, SubmissionId, Ti
 use state::{Commitment, View};
 
 pub use block::{BLOCK_BYTES, Block, Digest, MESSAGE_BYTES};
-pub use frame::{Body, Checked, Frame, NAMESPACE, QUERY_NAMESPACE, verify, verify_query};
+pub use frame::{
+    Body, Checked, FORWARD_NAMESPACE, Frame, NAMESPACE, QUERY_NAMESPACE, verify, verify_forward,
+    verify_query,
+};
 pub use mempool::Mempool;
 pub use verified::Verified;
 

@@ -26,6 +26,7 @@ const RUNTIME: &str = "runtime";
 const EGRESS: &str = "egress.toml";
 const EGRESS_FRESH: &str = "egress.toml.fresh";
 const EGRESS_GRANTS: &str = "egress-grants";
+const FORWARD: &str = "forward.toml";
 const NODE: &str = "node.toml";
 const MACHINE: &str = "machine.key";
 const STAMP: &str = "contract";
@@ -241,6 +242,10 @@ impl Workspace {
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn forward_offers(&self) -> PathBuf {
+        self.dir.join(FORWARD)
     }
 
     pub fn settings_file(&self) -> PathBuf {

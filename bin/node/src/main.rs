@@ -234,6 +234,17 @@ enum Verb {
     #[command(subcommand, about = "the user keys that sign frames")]
     Wallet(WalletVerb),
     #[command(
+        about = "pipe stdin and stdout to a service a member's node forwards over halo's \
+                 ducktape/forward lane, through the node --node names, in a call signed by the \
+                 active wallet key: what ssh's ProxyCommand runs"
+    )]
+    Forward {
+        #[arg(help = "the member node's key, in hex")]
+        member: String,
+        #[arg(help = "the service its forward.toml names")]
+        service: String,
+    },
+    #[command(
         subcommand,
         about = "run the work fleet assigns to the machines [machine] names, signed by machine.key"
     )]
@@ -430,6 +441,16 @@ struct RunArgs {
     egress_lane_backlog: Option<NonZeroUsize>,
     #[arg(
         long,
+        value_parser = permits,
+        help = defaulted(
+            "the forward lane streams members opened that wait for this node to take them",
+            "load.forward_lane_backlog",
+            LoadConfig::default().forward_lane_backlog
+        )
+    )]
+    forward_lane_backlog: Option<NonZeroUsize>,
+    #[arg(
+        long,
         help = defaulted(
             "the fuel one query this node answers off the chain may burn, the queries it makes \
              included; past it the query is refused as out of fuel. Frames never take it",
@@ -492,6 +513,7 @@ impl RunArgs {
                 live_lane_per_sender: self.live_lane_per_sender,
                 live_linger_ms: self.live_linger_ms,
                 egress_lane_backlog: self.egress_lane_backlog,
+                forward_lane_backlog: self.forward_lane_backlog,
                 query_fuel: self.query_fuel,
             },
             consensus: ConsensusSettings {
@@ -1280,6 +1302,22 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             json::print(&json::consent(client, &signer, asked).await?);
             Ok(())
         }
+        Verb::Forward { member, service } => {
+            let status = client.status().await.sentence()?;
+            let key = signer(workspace)?;
+            let member = hex::decode(member).sentence()?;
+            let frame = Frame::sign_forward(
+                &key,
+                status.network.as_bytes(),
+                status.anchor(),
+                &service,
+                member,
+            );
+            client
+                .forward(&frame, tokio::io::stdin(), tokio::io::stdout())
+                .await
+                .sentence()
+        }
         Verb::Version
         | Verb::Identity
         | Verb::Init { .. }
@@ -1816,6 +1854,7 @@ mod tests {
                     live_lane_per_sender: Some(count(16)),
                     live_linger_ms: NonZeroU64::new(700),
                     egress_lane_backlog: Some(count(2)),
+                    forward_lane_backlog: None,
                     query_fuel: NonZeroU64::new(5_000_000),
                 },
                 consensus: ConsensusSettings {

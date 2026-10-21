@@ -217,6 +217,10 @@ impl<E: Context> Ctx<E> {
         self.daemon.halo.clone()
     }
 
+    pub(crate) fn forwarding(self) -> Arc<Daemon<E>> {
+        self.daemon
+    }
+
     pub(crate) fn answered(&self, answered: crate::server::Answered) {
         let _ = self.daemon.answered.send(answered);
     }

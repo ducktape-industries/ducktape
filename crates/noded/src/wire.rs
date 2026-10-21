@@ -39,8 +39,27 @@ pub mod route {
     pub const SNAPSHOT: &str = "/v1/snapshot";
     pub const NETWORK: &str = "/v1/network";
     pub const HALO_SELF: &str = "/v1/halo/self";
+    pub const FORWARD: &str = "/v1/forward";
     pub const P2P: &str = "/v1/p2p";
     pub const METRICS: &str = "/metrics";
+}
+
+/// How a forward's far end answered its call, before any byte of the service flows.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Forwarded {
+    /// The service took the connection; its bytes follow.
+    Opened,
+    /// The call was refused, before any connection to the service.
+    Refused(Refusal),
+}
+
+impl Forwarded {
+    pub fn of<T>(outcome: &std::result::Result<T, Refusal>) -> Forwarded {
+        match outcome {
+            Ok(_) => Forwarded::Opened,
+            Err(refusal) => Forwarded::Refused(refusal.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

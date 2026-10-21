@@ -215,6 +215,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(live_wire::ROUTE, get(live_socket::<E>))
         .route(halo::RELAY_ROUTE, get(halo_relay::<E>))
         .route(halo::SEEN_ROUTE, get(seen))
+        .route(route::FORWARD, get(forward::<E>))
         .layer(axum::middleware::from_fn_with_state(
             daemon.clone(),
             timed::<E>,
@@ -1196,6 +1197,11 @@ async fn live_socket<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Resp
 async fn halo_relay<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
     let halo = ctx.halo();
     upgrade.on_upgrade(move |socket| relayed(socket, halo))
+}
+
+async fn forward<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
+    let daemon = ctx.forwarding();
+    upgrade.on_upgrade(move |socket| crate::forward::called(socket, daemon))
 }
 
 async fn relayed(socket: WebSocket, halo: Arc<halo::Halo>) {

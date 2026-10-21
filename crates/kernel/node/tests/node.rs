@@ -986,6 +986,20 @@ fn a_query_frame_is_refused_as_an_op_and_an_op_frame_as_a_query() {
 }
 
 #[test]
+fn a_forward_frame_verifies_only_as_a_forward() {
+    let signer = key(7);
+    let forward = Frame::sign_forward(&signer, NETWORK, origin(), "builds", vec![1]).encode();
+    assert!(node::verify_forward(&forward, NETWORK).is_ok());
+    let as_op = node::verify(&forward, NETWORK).unwrap_err();
+    assert_eq!(as_op.reason, reason::INVALID_INPUT);
+    let as_query = node::verify_query(&forward, NETWORK).unwrap_err();
+    assert_eq!(as_query.reason, reason::INVALID_INPUT);
+    let query = Frame::sign_query(&signer, NETWORK, origin(), "builds", vec![1]).encode();
+    let as_forward = node::verify_forward(&query, NETWORK).unwrap_err();
+    assert_eq!(as_forward.reason, reason::INVALID_INPUT);
+}
+
+#[test]
 fn a_block_applies_only_the_frames_that_verify() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();

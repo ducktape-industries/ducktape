@@ -135,6 +135,7 @@ pub struct LoadConfig {
     pub live_lane_per_sender: NonZeroUsize,
     pub live_linger: Duration,
     pub egress_lane_backlog: NonZeroUsize,
+    pub forward_lane_backlog: NonZeroUsize,
     pub rpc_cpus: Option<Vec<usize>>,
     pub rpc_blocking_threads: Option<NonZeroUsize>,
     pub query_fuel: Option<NonZeroU64>,
@@ -156,6 +157,7 @@ impl Default for LoadConfig {
             live_lane_per_sender: live.lane_per_sender,
             live_linger: live.linger,
             egress_lane_backlog: live.lane_backlog,
+            forward_lane_backlog: live.lane_backlog,
             rpc_cpus: None,
             rpc_blocking_threads: None,
             query_fuel: None,
@@ -644,6 +646,11 @@ async fn start<E: Context>(
     let (answered, answers) = tokio::sync::mpsc::unbounded_channel();
     let (queried, queries) = tokio::sync::mpsc::unbounded_channel();
     let halo_self = watch::Sender::new(crate::halo_self::first(&halo));
+    let forward = crate::forward::Forwarding::bind(
+        &halo,
+        load.forward_lane_backlog,
+        workspace.forward_offers(),
+    )?;
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         current,
@@ -674,6 +681,7 @@ async fn start<E: Context>(
         key: identity.clone(),
         mesh: transport::loopback(p2p),
         halo_self,
+        forward,
     });
     let founding = tip.height == 0;
     if let Anchor::Genesis(genesis) = marshal.anchor()
@@ -748,6 +756,9 @@ async fn start<E: Context>(
     )?;
     if let (Some(source), Some(handle)) = (source, rpc.handle()) {
         handle.spawn(crate::fill::fill(daemon.clone(), source));
+    }
+    if let Some(handle) = rpc.handle() {
+        crate::forward::spawn(daemon.clone(), handle);
     }
     if let Some(handle) = rpc.handle() {
         crate::egress::lane::spawn(daemon.clone(), handle, load.egress_lane_backlog)?;

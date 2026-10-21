@@ -3,17 +3,18 @@ use std::collections::BTreeMap;
 use abi::Receipt;
 use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
-use futures::{Stream, StreamExt as _};
+use futures::{SinkExt as _, Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
 use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
 use statesync::{Ending, Exchange, Failure, Fault, Request, Response};
+use tokio::io::AsyncWriteExt as _;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Get, HaloSelf, Located, Network, Page,
-    Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
+    Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Forwarded, Get, HaloSelf, Located, Network,
+    Page, Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
 };
 use crate::{Error, Result};
 
@@ -291,6 +292,53 @@ impl Client {
             };
             futures::future::ready(change)
         }))
+    }
+
+    pub async fn forward<R, W>(&self, frame: &Frame, input: R, mut output: W) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let url = format!("{}{}", self.base.replacen("http", "ws", 1), route::FORWARD);
+        let (socket, _) = tokio_tungstenite::connect_async(url).await?;
+        let (mut sink, mut source) = socket.split();
+        sink.send(Message::Binary(frame.encode())).await?;
+        let Some(opening) = source.next().await else {
+            return Err(Error::Cut);
+        };
+        let Message::Binary(opening) = opening? else {
+            return Err(Error::Cut);
+        };
+        if let Forwarded::Refused(refusal) = abi::decode(&opening).map_err(Error::Decode)? {
+            return Err(Error::Refused(refusal));
+        }
+        let sending = async {
+            let mut chunks = tokio_util::io::ReaderStream::new(input);
+            while let Some(chunk) = chunks.next().await {
+                sink.send(Message::Binary(chunk?.to_vec())).await?;
+            }
+            sink.send(Message::Binary(Vec::new())).await?;
+            Ok::<(), Error>(())
+        };
+        let receiving = async {
+            while let Some(message) = source.next().await {
+                let bytes = match message? {
+                    Message::Binary(bytes) => bytes,
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                    Message::Text(_) | Message::Close(_) => return Err(Error::Cut),
+                };
+                let ended = bytes.is_empty();
+                if ended {
+                    return output.flush().await.map_err(Error::from);
+                }
+                output.write_all(&bytes).await?;
+                output.flush().await?;
+            }
+            Err(Error::Cut)
+        };
+        futures::future::try_join(sending, receiving).await?;
+        let _ = sink.send(Message::Close(None)).await;
+        Ok(())
     }
 
     fn url(&self, route: &str) -> String {
@@ -573,7 +621,8 @@ impl Fault for Error {
             | Error::Egress(_)
             | Error::Unrelayed
             | Error::MachineIsIdentity
-            | Error::Unrolled(_) => Failure::Definite,
+            | Error::Unrolled(_)
+            | Error::Cut => Failure::Definite,
         }
     }
 }

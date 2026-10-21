@@ -533,6 +533,7 @@ live_lane_backlog = 64        # --live-lane-backlog
 live_lane_per_sender = 256    # --live-lane-per-sender
 live_linger_ms = 5000         # --live-linger-ms
 egress_lane_backlog = 64      # --egress-lane-backlog
+forward_lane_backlog = 64     # --forward-lane-backlog
 query_fuel = 1000000000       # --query-fuel; default no cap: every query is metered and counted
 
 [consensus]
@@ -693,6 +694,32 @@ reads over it, so a vote that paused it would cut a node off from the very block
 the vote. A stream is served at the lower of the class it asks and its lane's cap. A stream
 already open when its lane is paused or closed runs on. Every node binds `ducktape/egress` at
 start, for egress boxes (above); it carries streams once a vote opens it.
+
+Every node also binds `ducktape/forward` at start, and it carries streams once a vote opens it
+(`Open { name: "ducktape/forward", cap: Client }`). It reaches a service on a member's machine
+that has no public port, such as a build runner's sshd, over the member's halo link, relayed
+when the member is behind a NAT. A call is a frame signed under `ducktape:forward` whose target
+is the service and whose payload is the member node's key. The caller opens the WebSocket
+`GET /v1/forward` on any node and sends the frame as its first message. That node checks the
+signature, the network and the anchor (as fresh as a signed query's), opens a lane stream to
+the member and passes the frame on. The member's node checks the same again, that the frame
+names its own key, and that its own `forward.toml` offers the service and lists the signer,
+all before it connects. A signer the service does not list is refused `not_found`, the same
+as for a service the node does not offer, so no key learns what a member forwards:
+
+```toml
+[services.builds]
+address = "127.0.0.1:22"
+signers = ["<the caller's ed25519 key, hex>"]
+```
+
+The node re-reads `forward.toml` on every call, and a missing file offers nothing. The first
+message back is a `wire::Forwarded`: `Opened`, or `Refused` with the reason. Then each binary
+message carries the service's bytes. An empty one ends that direction, and a WebSocket that
+closes before both ends were sent is a cut. `ducktape forward <member key hex> <service>`
+pipes stdin and stdout through it, signed by the active wallet key, so ssh runs it as
+`ProxyCommand`. A stream opened while the link is relayed is cut when a punch replaces the
+relay; the caller opens again.
 
 Live tracks: the relay in every node (`crates/noded/src/live/`) lets a desktop
 client publish and subscribe to tracks of a room off consensus, in what the

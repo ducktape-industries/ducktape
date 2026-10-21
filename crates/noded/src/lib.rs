@@ -10,6 +10,7 @@ mod ctx;
 mod egress;
 mod endpoint;
 mod fill;
+mod forward;
 mod halo_self;
 mod history;
 mod link;
@@ -49,6 +50,7 @@ pub use config::{
 pub use cores::{CpuList, pin_block_threads};
 pub use egress::lane::{LANE as EGRESS_LANE, Seating, seating, serve_box};
 pub use endpoint::{Endpoint, Scheme};
+pub use forward::LANE as FORWARD_LANE;
 pub use logs::Logs;
 pub use mesh::Mesh;
 pub use roll::{Rolled, roll};
@@ -149,6 +151,8 @@ pub enum Error {
     MachineIsIdentity,
     #[error("{0}")]
     Unrolled(String),
+    #[error("the forward ended before the far side's bytes did")]
+    Cut,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
@@ -190,6 +194,7 @@ pub struct Daemon<E: Context> {
     /// Each validator's newest finalize vote, as a height (`network.rs`).
     votes: Votes,
     halo_self: watch::Sender<wire::HaloSelf>,
+    forward: forward::Forwarding,
 }
 
 pub struct HeldHead {
