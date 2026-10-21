@@ -30,16 +30,15 @@ The app people run never speaks a different contract from the node, in either di
 ## 2. At R: one sitting, no gaps
 
 - pi-chief is scaled to 0 before the node stops at R, and comes back only as its proven N+1 image after "node proven". Its old record treats N+1 as unproven, but it never sets the node back across a contract: it records the contract each image ran, and a stall in the next epoch is refused as `contract_differs` rather than sending the node back to the N image, which refuses state stamped with the new contract.
+- Before the node stops, the operator checks that no app release run is past its `contract` job and short of its last release step: forge's release-stable and release-nightly (short of `mirror`), and GitHub's release.yml (short of `publish`) and testflight.yml (short of `upload`). The gate below runs just before those steps, and nothing after it checks again; GitHub's two wait in the `release` environment, so that wait can straddle R.
 - The node stops at R and rolls. Residents run `ducktape roll R` with it.
 - The operator posts "node proven" from node-only checks (apply_slow, state root, history, egress, decodes) before rolling any image. PAUSED and the agents' after-roll steps wait on that word, and the image rolls come after it.
-- As soon as `/v1/status` answers contract N+1, merge the app change, then build TestFlight and desktop, or release the held build.
+- As soon as `/v1/status` answers contract N+1, merge the app change. Its dev push starts TestFlight and GitHub release.yml's nightly (release.yml also runs on a push to `main` and on its daily cron), and a `nightly` dispatch or a push to `main` starts forge's desktop release. A build made ahead of R with TestFlight's `upload` off is uploaded by a run after R.
 - Post in the roll thread at R, and again once the node is proven.
 
 ## 3. The gate
 
-**Planned, not built yet (J-134):** App CI's TestFlight and desktop release jobs build only when app dev's `NODE_CONTRACT` equals the live node's contract (`/v1/status`). With it, an app on the wrong contract can't reach a phone: before R it is held back, and after R it is the only build that goes out.
-
-**Until that gate lands,** pause TestFlight and desktop releases from dev for the window by hand: from the moment the N+1 app change is ready until it merges at R.
+app's `ops/contract-gate.py` (app change 163) compares the built commit's `NODE_CONTRACT` with the contract duckpond's `/v1/status` answers, and fails on a difference or on no readable status. Every release step waits for it to pass: forge release-stable's and release-nightly's `publish`, GitHub release.yml's `publish`, and TestFlight's `upload`. Builds run whatever the node speaks, so an N+1 build can be made ahead of R, and an app on the wrong contract can't reach a phone or a desktop: before R it isn't released, and after R it is the only build that goes out. An upload is TestFlight's release to the testers, so ahead of R the N+1 phone build is signed and exported with `upload` off, and a run after R uploads it.
 
 tools' `build.sh pack` (tools change 102) checks one side only: it refuses a program built for a contract past the node's. It doesn't refuse an older-contract build after R, so it is not the same gate.
 
