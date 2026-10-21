@@ -84,6 +84,11 @@ The node serves HTTP, the WebSocket peers and the app dial (`/v1/p2p`), on
   8844 and 9100 unless you set them. The founding `address` is
   `ws://<ip>:<HTTP_PORT>` and `halo` is `<ip>:<HALO_PORT>`.
 
+Behind a tunnel or a home router, UDP 9100 needs no port forward: members
+that do not reach it carry halo over the `address`'s WebSocket (`/v1/halo`)
+and punch through to a direct path where the router allows it (README §
+Reach a node).
+
 On a machine that already runs a network, pick ports nothing holds: list
 the host's sockets (`ss -lntu`) and the ports pods hold
 (`kubectl get pods -A -o json | jq '[.items[].spec.containers[].ports[]? | select(.hostPort)]'`).

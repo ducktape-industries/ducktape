@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -7,8 +8,8 @@ use abi::{BlobId, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
-use axum::extract::{FromRequest, MatchedPath, Path, RawQuery, Request};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, FromRequest, MatchedPath, Path, RawQuery, Request};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::serve::ListenerExt as _;
@@ -105,11 +106,14 @@ async fn accepting(
             tracing::debug!(target: "ducktape::http", %error, "a connection keeps nagle");
         }
     });
-    let served = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            let _ = down.wait_for(|down| *down).await;
-        })
-        .await;
+    let served = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = down.wait_for(|down| *down).await;
+    })
+    .await;
     if let Err(error) = served {
         tracing::error!(target: "ducktape::http", %error, "the http server stopped");
     }
@@ -209,6 +213,8 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::HEADS, get(heads::<E>))
         .route(route::P2P, get(p2p::<E>))
         .route(live_wire::ROUTE, get(live_socket::<E>))
+        .route(halo::RELAY_ROUTE, get(halo_relay::<E>))
+        .route(halo::SEEN_ROUTE, get(seen))
         .layer(axum::middleware::from_fn_with_state(
             daemon.clone(),
             timed::<E>,
@@ -1187,6 +1193,59 @@ async fn live_socket<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Resp
     crate::live::ws_upgrade(upgrade).on_upgrade(move |socket| live.serve_ws(socket))
 }
 
+async fn halo_relay<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
+    let halo = ctx.halo();
+    upgrade.on_upgrade(move |socket| relayed(socket, halo))
+}
+
+async fn relayed(socket: WebSocket, halo: Arc<halo::Halo>) {
+    if let Err(error) = halo.relayed(piped(socket)).await {
+        tracing::debug!(
+            target: "ducktape::halo",
+            %error,
+            reason = "unrelayed",
+            "a halo link carried on this node's http did not come up"
+        );
+    }
+}
+
+fn piped(socket: WebSocket) -> halo::Pipe {
+    let (sink, stream) = socket.split();
+    let send = sink
+        .sink_map_err(std::io::Error::other)
+        .with(|packet: Bytes| {
+            futures::future::ready(Ok::<Message, std::io::Error>(Message::Binary(packet)))
+        });
+    let recv = stream.filter_map(|message| {
+        futures::future::ready(match message {
+            Ok(Message::Binary(packet)) => Some(Ok(packet)),
+            Ok(Message::Ping(_) | Message::Pong(_)) => None,
+            Ok(Message::Text(_) | Message::Close(_)) => {
+                Some(Err(std::io::ErrorKind::ConnectionAborted.into()))
+            }
+            Err(error) => Some(Err(std::io::Error::other(error))),
+        })
+    });
+    halo::Pipe {
+        send: Box::pin(send),
+        recv: Box::pin(recv),
+    }
+}
+
+const CLIENT_IP: &str = "cf-connecting-ip";
+
+async fn seen(ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> String {
+    seen_from(&headers, peer).to_string()
+}
+
+fn seen_from(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    headers
+        .get(CLIENT_IP)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(peer.ip().to_canonical())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1216,6 +1275,39 @@ mod tests {
             panic!("a body over the cap is refused");
         };
         assert_eq!(refusal.reason, reason::CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn seen_answers_the_cloudflare_client_ip_when_it_reads_and_else_the_peer() {
+        let router = Router::new().route(halo::SEEN_ROUTE, get(seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let url = format!("http://{address}{}", halo::SEEN_ROUTE);
+        let client = reqwest::Client::new();
+        let mut answers = Vec::new();
+        for header in [
+            None,
+            Some("203.0.113.9"),
+            Some(" 2001:db8::7 "),
+            Some("not an ip"),
+        ] {
+            let mut asked = client.get(&url);
+            if let Some(value) = header {
+                asked = asked.header(CLIENT_IP, value);
+            }
+            answers.push(asked.send().await.unwrap().text().await.unwrap());
+        }
+        assert_eq!(
+            answers,
+            ["127.0.0.1", "203.0.113.9", "2001:db8::7", "127.0.0.1"]
+        );
     }
 
     #[test]

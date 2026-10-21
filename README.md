@@ -632,6 +632,24 @@ punched through rather than directly at that address, and a network that does
 not route a host back to its own public address fails that dial while members
 still reach the node directly. `GET /v1/halo/self` answers `Unregistered`,
 `Dialing { at }`, `Reached { at }` or `Unreachable { at, reason }`.
+
+A member whose `address` is `ws://` or `wss://` also carries halo on its
+`--http` socket: a member that does not reach it over UDP opens a WebSocket
+at `/v1/halo` there and runs the same QUIC inside it, with the same node-key
+admission and lanes. Over that link each side tells the other where it is
+reached directly: the IP `GET /v1/seen` answered (Cloudflare's
+`CF-Connecting-IP` when the request carries it, else the TCP peer) with the
+port it bound. Both then dial those addresses at once, which most home
+routers let through, so a node behind a router or a tunnel needs no port
+forward. The direct link is preferred, and the relayed one closes once it is
+up. Behind a router that maps each remote apart (symmetric or carrier-grade
+NAT) the punch fails and halo stays on the relayed link. Two members with no
+`ws://` or `wss://` address learn where the other is reached from a member
+both are linked to. A member tells its address only to members it admitted.
+The `/v1/seen` answer is not authenticated: someone on the path can rewrite
+it, and the member then tells a wrong address. That costs reachability, not
+data. Its members' direct dials miss and it stays on the relayed link, while
+node keys still decide who is admitted.
 `--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
 `--halo-inbound-streams` is how many streams members open to the node wait

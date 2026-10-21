@@ -34,7 +34,7 @@ use statesync::Anchors as _;
 use tokio::sync::watch;
 
 use crate::changes::Changes;
-use crate::endpoint::Endpoint;
+use crate::endpoint::{Endpoint, Scheme};
 use crate::history::{Durability, History};
 use crate::live;
 use crate::mesh::{Mesh, Outbound, Tracker};
@@ -938,11 +938,17 @@ pub fn seats(members: &[Member], validators: &[Vec<u8>]) -> Vec<Seat> {
             Some(Seat {
                 key,
                 halo: member.halo.clone(),
-                https: None,
+                https: relay_address(member.address.as_deref()),
                 validator,
             })
         })
         .collect()
+}
+
+fn relay_address(address: Option<&str>) -> Option<String> {
+    let endpoint: Endpoint = address?.parse().ok()?;
+    let web = matches!(endpoint.scheme, Scheme::Ws | Scheme::Wss);
+    web.then(|| endpoint.to_string())
 }
 
 /// Every recorded epoch's validator keys: the sets the roster verifies
@@ -1516,7 +1522,24 @@ mod tests {
 
     use abi::Outcome;
 
-    use super::{Event, Phases, Slowest, listing, next, rewrites, slowest_of};
+    use super::{Event, Phases, Slowest, listing, next, relay_address, rewrites, slowest_of};
+
+    #[test]
+    fn a_member_is_relayed_through_its_address_only_when_that_is_a_websocket() {
+        let relayed = |address: Option<&str>| relay_address(address);
+        assert_eq!(
+            relayed(Some("wss://node.example")).as_deref(),
+            Some("wss://node.example:443")
+        );
+        assert_eq!(
+            relayed(Some("ws://localhost:8844")).as_deref(),
+            Some("ws://localhost:8844")
+        );
+        assert_eq!(relayed(Some("tcp://node.example:9000")), None);
+        assert_eq!(relayed(Some("tls://node.example:9443")), None);
+        assert_eq!(relayed(Some("not an address")), None);
+        assert_eq!(relayed(None), None);
+    }
 
     #[test]
     fn a_program_is_rewritten_by_its_own_state_or_a_swap_of_its_code() {

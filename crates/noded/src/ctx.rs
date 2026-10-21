@@ -213,6 +213,10 @@ impl<E: Context> Ctx<E> {
         self.daemon.live.clone()
     }
 
+    pub(crate) fn halo(self) -> Arc<halo::Halo> {
+        self.daemon.halo.clone()
+    }
+
     pub(crate) fn answered(&self, answered: crate::server::Answered) {
         let _ = self.daemon.answered.send(answered);
     }

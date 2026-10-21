@@ -2954,6 +2954,42 @@ fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
     shut_down(&runtime, &[&moving, &hidden], live);
 }
 
+#[test]
+fn members_no_one_can_reach_over_udp_link_over_halo_carried_on_one_members_http_and_gather() {
+    let root = tempfile::tempdir().unwrap();
+    let mut served = Seat::unreachable(root.path(), "n0");
+    let mut hidden = Seat::unreachable(root.path(), "n1");
+    served.address = Some(format!("ws://localhost:{}", served.http.port()));
+    hidden.address = None;
+    let founding = founding(root.path(), &[&served, &hidden], EPOCH_LENGTH);
+    served.init(&founding);
+    hidden.init(&founding);
+    let live = vec![served.start(), hidden.start()];
+    let page = root.path().join("page");
+    std::fs::write(&page, b"gathered over a relayed halo link").unwrap();
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let client = &live[0].client;
+        let (id, bundle) = put_page(client, &page, 1).await;
+        let role = client
+            .status()
+            .await
+            .unwrap()
+            .roles
+            .get(role::BLOBS)
+            .unwrap()
+            .clone();
+        client.held(&role, bundle).await.unwrap();
+        live[1].client.held(&role, bundle).await.unwrap();
+        let framed = blob::frame("page", b"gathered over a relayed halo link").unwrap();
+        assert_eq!(
+            live[1].client.blobs(&[id]).await.unwrap(),
+            vec![Some(framed)]
+        );
+    });
+    shut_down(&runtime, &[&served, &hidden], live);
+}
+
 fn reached(runtime: &::tokio::runtime::Runtime, root: &Path, dialer: Seat, dialed: Seat) {
     let founding = founding(root, &[&dialer, &dialed], EPOCH_LENGTH);
     dialer.init(&founding);
