@@ -7,6 +7,7 @@ import socket
 import importlib.util
 import io
 import itertools
+import tarfile
 import json
 import os
 import pathlib
@@ -2767,6 +2768,130 @@ class Reports(unittest.TestCase):
         for lead in ("report sent:", "report:"):
             record = f"job j-1\nrun r1: programs {GATED}, slot lane, lane\n{lead} build.sh#lane passed, reach: crates/a\nGATES ok\n"
             self.assertTrue(server.lane_record_holds(said, record), lead)
+
+
+
+def shots_tar(files):
+    held = io.BytesIO()
+    with tarfile.open(fileobj=held, mode="w") as archive:
+        for name, data in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return held.getvalue()
+
+
+SHOT = "ducktape-files r1 /w/runs/r1/shots.tar /shared/jobs/J-1/shots\n"
+SHOT_END = "ducktape-notify builds r1 ended: shot exit 0 (programs abc, slot quick)\n"
+
+
+class Shots(unittest.TestCase):
+    def setUp(self):
+        self.kube = Kube()
+        self.signer = Signer()
+        self.signer.put_ran = ran(("\n".join(CHUNKS) + "\nbundle 8 put at block 950\n").encode())
+        self.notifier = server.Notifier(self.kube, self.signer, 1)
+        self.notifier.spawn = lambda target, *args: target(*args)
+        self.paused = []
+        self.notifier.pause = self.paused.append
+        self.tars = {("duckpond-41", "/w/runs/r1/shots.tar"): shots_tar({"./a.png": b"abcdef", "phone/b.png": b"xy"})}
+        self.read = []
+        self.notifier.fetched = self.fetched
+        chunk_size = server.CHUNK_SIZE
+        server.CHUNK_SIZE = 4
+        self.addCleanup(setattr, server, "CHUNK_SIZE", chunk_size)
+
+    def fetched(self, name, path):
+        self.read.append((name, path))
+        if (name, path) not in self.tars:
+            raise server.Refused(404, f"{path} was not read from pod {name}: No such file")
+        return self.tars[(name, path)]
+
+    def logged(self, text):
+        self.kube.answer("logs", ran(text.encode()))
+        self.kube.logs_of["duckpond-41"] = text.encode()
+
+    def seen(self, times=1):
+        for _ in range(times):
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+
+    def sent(self, program):
+        return [payload for sent_to, payload in self.signer.submits if sent_to == program]
+
+    def written(self, base=SNAPSHOT):
+        items = [("/shared/jobs/J-1/shots/a.png", 6, CHUNKS[:2]), ("/shared/jobs/J-1/shots/phone/b.png", 2, CHUNKS[2:])]
+        return server.files_commit_many(base, "pods: duckpond-41 run r1 wrote /shared/jobs/J-1/shots", items)
+
+    def test_a_commit_of_several_files_puts_each_in_order_and_one_file_reads_as_before(self):
+        one = server.files_commit(SNAPSHOT, "m", "/a", 5, CHUNKS[:1])
+        two = server.files_commit_many(SNAPSHOT, "m", [("/a", 5, CHUNKS[:1]), ("/b", 0, [])])
+        self.assertEqual(one, server.files_commit_many(SNAPSHOT, "m", [("/a", 5, CHUNKS[:1])]))
+        self.assertEqual(two[: len(one)][-len(server.files_put("/a", 5, CHUNKS[:1])) :], server.files_put("/a", 5, CHUNKS[:1]))
+        self.assertEqual(two, server.u8(1) + server.borsh_option(SNAPSHOT, server.blob_id) + server.borsh_text("m") + server.borsh_vec([server.files_put("/a", 5, CHUNKS[:1]), server.files_put("/b", 0, [])]))
+
+    def test_a_runs_shots_land_in_one_files_commit_and_its_end_notice_says_where(self):
+        self.logged(SHOT + SHOT_END)
+        self.seen()
+        self.assertEqual(self.read, [("duckpond-41", "/w/runs/r1/shots.tar")])
+        self.assertEqual(self.signer.puts, [([b"abcd", b"ef", b"xy"], "chunk")])
+        self.assertEqual(self.sent("files"), [self.written()])
+        (posted,) = self.sent("chat")
+        self.assertIn("r1 ended: shot exit 0 (programs abc, slot quick) \u00b7 shots written: 2 files under /shared/jobs/J-1/shots at block 960".encode(), posted)
+
+    def test_a_line_heard_again_writes_nothing_again(self):
+        self.logged(SHOT + SHOT_END)
+        self.seen(times=2)
+        self.assertEqual(self.sent("files"), [self.written()])
+        self.assertEqual(len(self.read), 1)
+
+    def test_a_restart_writes_only_the_shots_of_runs_whose_end_chat_does_not_hold_yet(self):
+        self.tars[("duckpond-41", "/w/runs/r2/shots.tar")] = shots_tar({"c.png": b"c"})
+        later = "ducktape-files r2 /w/runs/r2/shots.tar /shared/jobs/J-1/later\nducktape-notify builds r2 ended: shot exit 0 (x)\n"
+        self.logged(SHOT + SHOT_END + later)
+        self.signer.messages.add(server.line_id("duckpond-41", "builds", SHOT_END.removeprefix("ducktape-notify builds ").strip()))
+        self.seen()
+        self.assertEqual(self.read, [("duckpond-41", "/w/runs/r2/shots.tar")])
+        (written,) = self.sent("files")
+        self.assertIn(b"/shared/jobs/J-1/later/c.png", written)
+
+    def test_a_tar_naming_a_path_outside_its_folder_writes_nothing_and_the_end_says_why(self):
+        self.tars[("duckpond-41", "/w/runs/r1/shots.tar")] = shots_tar({"a.png": b"a", "../x": b"x"})
+        self.logged(SHOT + SHOT_END)
+        self.seen()
+        self.assertEqual((self.signer.puts, self.sent("files")), ([], []))
+        (posted,) = self.sent("chat")
+        self.assertIn("shots not written: the shots' tar holds '../x', which is no path under /shared/jobs/J-1/shots".encode(), posted)
+
+    def test_a_tar_the_machine_cannot_read_writes_nothing_and_the_end_says_why(self):
+        self.tars.clear()
+        self.logged(SHOT + SHOT_END)
+        self.seen()
+        self.assertEqual(self.sent("files"), [])
+        (posted,) = self.sent("chat")
+        self.assertIn(b"shots not written: /w/runs/r1/shots.tar was not read from pod duckpond-41: No such file", posted)
+
+    def test_files_refusing_the_commit_is_final_and_the_end_says_its_reason(self):
+        self.signer.submitted = [ran(POOLED + b"landed 960 rejected unauthorized: /shared/jobs is written by its write list only\n"), ran(POOLED + b"landed 961 applied 00ff\n")]
+        self.logged(SHOT + SHOT_END)
+        self.seen()
+        self.assertEqual(self.sent("files"), [self.written()])
+        (posted,) = self.sent("chat")
+        self.assertIn(b"shots not written: unauthorized: /shared/jobs is written by its write list only", posted)
+
+    def test_a_commit_the_node_does_not_answer_is_made_again(self):
+        self.signer.submitted = [ran(code=1, err="ducktape: the node failed (502): bad gateway"), ran(POOLED + b"landed 961 applied 00ff\n")]
+        self.logged(SHOT + SHOT_END)
+        self.seen()
+        self.assertEqual(self.sent("files"), [self.written()] * 2)
+        self.assertEqual(self.paused, [1])
+
+    def test_a_commit_files_moved_under_is_made_again_onto_the_head_read_then(self):
+        moved = "sha256:" + "cd" * 32
+        self.signer.head = [ran(bytes([0, 1, 0]) + bytes.fromhex("ab" * 32)), ran(bytes([0, 1, 0]) + bytes.fromhex("cd" * 32))]
+        self.signer.submitted = [ran(POOLED + b"landed 960 rejected stale: the head moved\n"), ran(POOLED + b"landed 961 applied 00ff\n")]
+        self.logged(SHOT + SHOT_END)
+        self.seen()
+        self.assertEqual(self.sent("files"), [self.written(), self.written(moved)])
 
 
 class Posts(unittest.TestCase):

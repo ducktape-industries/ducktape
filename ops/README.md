@@ -588,6 +588,20 @@ one up for another network.
   machine's own files, so the check trusts anyone who can run commands on the
   build machines: it guards against mistakes, not against a forged run
   directory.
+- Each line a followed pod (or a build runner) prints that reads
+  `ducktape-files <run> <tar> <folder>` (build.sh's `shot` run with `TO`)
+  names a tar the run made on that machine: the service reads it in one
+  read, puts every file's chunks in one `blob put`, and writes all of them
+  under `<folder>` (each at its path in the tar; a path that leaves the
+  folder refuses the whole tar) in one files commit as its own account
+  (message `pods: <pod> run <run> wrote <folder>`), so a shot round lands in
+  one commit with no call per file. It retries as a report does (a node
+  that doesn't answer, a head files moved under it), and that run's end
+  notice then ends with ` · shots written: <n> files under <folder> at block
+  <h>`, or ` · shots not written: <why>`. A line is written once per pod;
+  before the service follows a log, the files lines ahead of the newest end
+  notice chat holds count as written. It writes what `pods/NAME/file` would
+  (any caller may ask that of any pod), so it gives no new power.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one chat notice there when it ends (chat `Notify`: kind `pod`,
   group and subject the pod, status passed or failed by the run container's

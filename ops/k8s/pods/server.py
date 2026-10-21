@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import base64
 import binascii
@@ -7,6 +7,7 @@ import copy
 import datetime
 import decimal
 import hashlib
+import io
 import itertools
 import json
 import math
@@ -20,6 +21,7 @@ import signal
 import socket
 import ssl
 import subprocess
+import tarfile
 import sys
 import tempfile
 import threading
@@ -30,7 +32,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
 RUN = "run"
@@ -158,6 +160,7 @@ CHUNK_SIZE = 1 << 20
 EGRESS = "egress"
 FORGE_REACH = "forge-reach"
 REPORT_LINE = "ducktape-report "
+FILES_LINE = "ducktape-files "
 REPORT_STATES = {"passed": 1, "failed": 2}
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
 MOVED_ELSEWHERE = re.compile(r"moved to run (\S+?):(\S+) on another machine")
@@ -661,9 +664,16 @@ def files_commit_of(message, path, size, chunks):
 
 
 def files_commit(base, message, path, size, chunks):
+    return files_commit_many(base, message, [(path, size, chunks)])
+
+
+def files_put(path, size, chunks):
     content = u8(1) + u64(size) + borsh_vec([blob_id(chunk) for chunk in chunks])
-    put = u8(0) + borsh_text(path) + u8(0) + (0).to_bytes(4, "little") + content
-    return u8(1) + borsh_option(base, blob_id) + borsh_text(message) + borsh_vec([put])
+    return u8(0) + borsh_text(path) + u8(0) + (0).to_bytes(4, "little") + content
+
+
+def files_commit_many(base, message, items):
+    return u8(1) + borsh_option(base, blob_id) + borsh_text(message) + borsh_vec([files_put(*item) for item in items])
 
 
 def egress_request(request):
@@ -1728,6 +1738,32 @@ def report_lines(name, stream):
         yield {"repo": repo, "commit": commit, "context": context, "state": state, "run": run, "url": f"{name}:{run}", "reach": reach or [""]}
 
 
+def files_lines(stream):
+    for raw in stream:
+        line = raw.decode(errors="replace").rstrip("\r\n")
+        if not line.startswith(FILES_LINE):
+            continue
+        words = line[len(FILES_LINE):].split(" ", 2)
+        if len(words) == 3 and words[0] and words[1].startswith("/") and words[2].startswith("/"):
+            yield {"run": words[0], "tar": words[1], "to": words[2]}
+
+
+def shot_files(data, to):
+    listed = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            for member in archive.getmembers():
+                if not member.isfile():
+                    continue
+                parts = [part for part in PurePosixPath(member.name).parts if part != "."]
+                if not parts or parts[0] == "/" or ".." in parts:
+                    raise Refused(400, f"the shots' tar holds {member.name!r}, which is no path under {to}")
+                listed.append((f"{to.rstrip('/')}/{'/'.join(parts)}", archive.extractfile(member).read()))
+    except tarfile.TarError as error:
+        raise Refused(400, f"the shots are no tar: {error}") from error
+    return sorted(listed)
+
+
 def lane_record_holds(said, record):
     lines = record.splitlines()
     named = f"run {said['run']}: {said['repo']} {said['commit']}, slot "
@@ -2591,6 +2627,9 @@ class Notifier:
         self.posted = {}
         self.reported = {}
         self.outcomes = {}
+        self.shots = {}
+        self.filed = {}
+        self.fetched = None
         self.records = None
         self.open = {}
         self.done = {}
@@ -2758,8 +2797,93 @@ class Notifier:
     def told(self, name, text):
         run = RUN_NAMED.match(text)
         with self.lock:
-            outcome = None if run is None else self.outcomes.get(name, {}).get(run.group(1))
-        return text if outcome is None else f"{text} \u00b7 {outcome}"
+            notes = [] if run is None else [held.get(name, {}).get(run.group(1)) for held in (self.outcomes, self.shots)]
+        return " \u00b7 ".join([text, *[note for note in notes if note is not None]])
+
+    def filing(self, name, stream):
+        for raw in stream:
+            for said in files_lines([raw]):
+                self.file(name, said)
+            yield raw
+
+    def file(self, name, said):
+        key = (said["run"], said["tar"])
+        with self.lock:
+            if key in self.filed.get(name, ()):
+                return
+        try:
+            outcome = self.filed_outcome(name, said)
+        except Refused as refused:
+            say("pods_unfiled", run=json.dumps(f"{name}:{said['run']}"), reason="refused", detail=json.dumps(refused.sentence))
+            outcome = f"shots not written: {refused.sentence}"
+        with self.lock:
+            self.filed.setdefault(name, set()).add(key)
+            self.shots.setdefault(name, {})[said["run"]] = outcome
+
+    def filed_outcome(self, name, said):
+        if not self.signer.held():
+            say("pods_unfiled", run=json.dumps(f"{name}:{said['run']}"), reason="no_key")
+            return "shots not written: no_key"
+        items = shot_files(self.fetched(name, said["tar"]), said["to"])
+        pause = self.retry_pause
+        attempts = 0
+        while True:
+            try:
+                return self.file_once(name, said, items)
+            except Unanswered as why:
+                attempts += 1
+                if attempts & (attempts - 1) == 0:
+                    say("pods_retried", attempts=attempts, reason="node_unanswered", run=json.dumps(f"{name}:{said['run']}"), detail=json.dumps(str(why)))
+                self.pause(pause)
+                pause *= 2
+
+    def file_once(self, name, said, items):
+        pieces = [(path, data, [data[start : start + CHUNK_SIZE] for start in range(0, len(data), CHUNK_SIZE)]) for path, data in items]
+        ids = []
+        with tempfile.TemporaryDirectory() as temp:
+            paths = []
+            for piece in (part for _, _, parts in pieces for part in parts):
+                paths.append(Path(temp) / f"chunk-{len(paths)}")
+                paths[-1].write_bytes(piece)
+            if paths:
+                put = self.signer.put(paths, CHUNK)
+                why = failed(put)
+                if why is not None and unanswered(why):
+                    raise Unanswered(why)
+                if why is not None:
+                    raise Refused(502, f"the shots' chunks were not put: {why}")
+                ids = put_answer(put.out.decode(), len(paths))["blobs"]
+        listed, at = [], 0
+        for path, data, parts in pieces:
+            listed.append((path, len(data), ids[at : at + len(parts)]))
+            at += len(parts)
+        message = f"pods: {name} run {said['run']} wrote {said['to']}"
+        while True:
+            head = self.signer.query(FILES_PROGRAM, files_head())
+            why = failed(head)
+            if why is not None and unanswered(why):
+                raise Unanswered(why)
+            if why is not None:
+                raise Refused(502, f"files' head was not read: {why}")
+            outcome, reason, sentence, height = receipt(self.signer.submit(FILES_PROGRAM, files_commit_many(head_of(head.out), message, listed)))
+            if outcome == "applied":
+                say("pods_filed", run=json.dumps(f"{name}:{said['run']}"), files=len(listed), height=height)
+                return f"shots written: {len(listed)} files under {said['to']} at block {height}"
+            if moved_under(outcome, reason, sentence):
+                continue
+            if outcome in ("unknown", "unlanded") or (outcome == "failed" and unanswered(sentence)):
+                raise Unanswered(sentence)
+            say("pods_unfiled", run=json.dumps(f"{name}:{said['run']}"), reason=reason or outcome, detail=json.dumps(sentence))
+            return f"shots not written: {reason or outcome}: {sentence}"
+
+    def filed_before(self, name, logged, passed):
+        notified = 0
+        for raw in logged:
+            if notified >= passed:
+                return
+            notified += len(list(notify_lines(name, [raw])))
+            with self.lock:
+                self.filed.setdefault(name, set()).update((said["run"], said["tar"]) for said in files_lines([raw]))
 
     def recorded(self, said):
         after = None
@@ -2797,10 +2921,11 @@ class Notifier:
         if why is not None:
             say("pods_uncaught", pod=name, asked=asked, detail=json.dumps(why))
             return
+        self.filed_before(name, logged, passed)
         say("pods_caught_up", pod=name, already_posted=passed, asked=asked)
 
     def lines(self, name, requester, stream, unvouched=False, concerned=None):
-        return self.each(name, requester, notify_lines(name, self.reporting(name, stream)), unvouched, concerned)
+        return self.each(name, requester, notify_lines(name, self.filing(name, self.reporting(name, stream))), unvouched, concerned)
 
     def each(self, name, requester, said, unvouched=False, concerned=None):
         concerned = requester if concerned is None else concerned
@@ -3022,6 +3147,8 @@ class Notifier:
             with self.lock:
                 self.posted.pop(name, None)
                 self.reported.pop(name, None)
+                self.filed.pop(name, None)
+                self.shots.pop(name, None)
                 self.outcomes.pop(name, None)
                 self.deleting.discard(name)
             self.lose(name, "it was deleted before the run ended")
@@ -3078,6 +3205,7 @@ class Service:
         self.schemas = Schemas(api)
         self.notifier = Notifier(kube, signer, self.retry_pause)
         self.notifier.records = self.lane_record
+        self.notifier.fetched = self.machine_file
         self.notifier.recall = lambda words: self.recalled(words, None)
         self.pause = time.sleep
         self.execs = {}
@@ -3298,6 +3426,13 @@ class Service:
         if not self.warm_pod or machine != self.warm():
             return None
         return self.kube.exec(machine, None, command).out.decode(errors="replace")
+
+    def machine_file(self, machine, path):
+        command = ["cat", "--", path]
+        ran = self.runners[machine].ran(command) if machine in self.runners else self.kube.exec(machine, None, command)
+        if ran.code != 0:
+            raise kube_refusal(ran, f"{path} was not read from pod {machine}")
+        return ran.out
 
     def warm(self):
         if not self.warm_pod:
