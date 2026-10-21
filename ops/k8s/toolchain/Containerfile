@@ -52,4 +52,5 @@ RUN curl -fsSL -o /tmp/shellcheck.tar.xz \
 COPY git-remote-duck /usr/local/bin/git-remote-duck
 RUN git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
 ENV DUCKTAPE_DEVICE_KEY_STORE=file
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 WORKDIR /work
