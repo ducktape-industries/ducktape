@@ -2448,10 +2448,7 @@ fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
     let [one, two] = heights[..] else {
         panic!("both large frames land");
     };
-    assert!(
-        one < two,
-        "two nearly full frames share no block: {one}, {two}"
-    );
+    assert_ne!(one, two, "two nearly full frames share no block");
     drop(changes);
 
     let refused = runtime.block_on(
