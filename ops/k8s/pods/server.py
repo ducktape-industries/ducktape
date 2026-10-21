@@ -60,6 +60,7 @@ NOTIFIED = NOTE + "notified"
 NOTIFY_LINE = "ducktape-notify "
 NOTIFY_FOR = "ducktape-notify-for "
 CALLER_WORD = "CALLER="
+PINNED_WORD = "PINNED=1"
 ACCOUNT = re.compile(r"[0-9]{1,20}")
 U64_MAX = (1 << 64) - 1
 EGRESS_SENDER = 7
@@ -864,10 +865,14 @@ def build_settings(command, scripted):
     return before + list(itertools.takewhile(SETTING.fullmatch, called[2:]))
 
 
-def with_caller(command, caller):
+def with_setting(command, word):
     if command[:2] == ["sh", BUILD_SH]:
-        return [*command[:2], f"{CALLER_WORD}{caller}", *command[2:]]
-    return [*command[:2], f"{CALLER_WORD}{caller} {command[2]}"]
+        return [*command[:2], word, *command[2:]]
+    return [*command[:2], f"{word} {command[2]}"]
+
+
+def with_caller(command, caller):
+    return with_setting(command, f"{CALLER_WORD}{caller}")
 
 
 def runner_view(name, said):
@@ -3848,6 +3853,10 @@ class Service:
             return command
         if any(word.startswith(CALLER_WORD) for word in settings):
             raise Refused(400, f"pods names a build.sh call's caller itself, as the account egress says sent its request: leave {CALLER_WORD}<n> out of the call")
+        a_pod_by_name = name not in self.runners and name != BUILDS
+        pinned_here = a_pod_by_name and PINNED_WORD not in settings
+        if pinned_here:
+            command = with_setting(command, PINNED_WORD)
         try:
             caller = self.sender(asked)
         except Refused as refused:

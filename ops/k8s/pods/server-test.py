@@ -3655,9 +3655,27 @@ class DesktopRunner(Streamed):
             ],
         )
         pods = [call[3] for call in self.kube.calls if call[0] == "exec"]
-        self.assertEqual(pods, [["sh", BUILD, "CALLER=21", "programs", "dev", "lint"], ["cat", "/out/a"]])
+        self.assertEqual(pods, [["sh", BUILD, "CALLER=21", "PINNED=1", "programs", "dev", "lint"], ["cat", "/out/a"]])
         self.assertEqual(self.signer.senders, [server.egress_sender(request) for request in (51, 52, 53, 55)])
         self.refused("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "CALLER=9", "programs", "dev", "gates"]}, 400, ["leave CALLER=<n> out"])
+
+    def test_a_build_call_to_a_pod_by_name_is_pinned_there_and_one_through_builds_or_to_a_runner_is_not(self):
+        self.gate.answers["exec"] = ran(b"run r1\n")
+        self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["sh", BUILD, "JOB=j-1", "programs", "dev", "lint"]}, headers=asked(71))
+        self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["sh", BUILD, "PINNED=1", "programs", "dev", "gates"]}, headers=asked(72))
+        self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["cat", "/out/a"]}, headers=asked(73))
+        self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "programs", "dev", "gates"]}, headers=asked(74))
+        pods = [call[3] for call in self.kube.calls if call[0] == "exec"]
+        self.assertEqual(
+            pods,
+            [
+                ["sh", BUILD, "PINNED=1", "JOB=j-1", "programs", "dev", "lint"],
+                ["sh", BUILD, "PINNED=1", "programs", "dev", "gates"],
+                ["cat", "/out/a"],
+            ],
+        )
+        execs = [words for words in self.gate.words() if words[0] == "exec"]
+        self.assertEqual(execs, [["exec", "programs", "dev", "gates"]])
 
     def test_a_build_call_egress_names_no_sender_for_goes_as_it_came_and_says_so_once(self):
         self.signer.sender = ran(code=1, err="egress: no such query")

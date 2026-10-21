@@ -33,6 +33,9 @@ or through a member node's halo forward.
   called again by the next builds call, which can reach the warm pod too. A run whose words carry
   `AGAIN=1` is posted lost as above, and a run marked as being called again when the service
   stopped is posted with a word to read `build.sh busy` before calling it again.
+- A build.sh call sent to a pod by name (the warm pod, not `builds` or a build runner) goes with
+  `PINNED=1` added to its settings, unless it names that itself. build.sh's `movable` then keeps
+  the run, so `builds`' reroute never moves it to another machine.
 
 ## What it needs
 
