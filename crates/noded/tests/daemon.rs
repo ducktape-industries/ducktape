@@ -1732,9 +1732,19 @@ fn holds_file(dir: &Path, id: &BlobId) -> bool {
     let name = blob::name_of(id);
     let mut dirs = vec![dir.to_path_buf()];
     while let Some(at) = dirs.pop() {
-        for entry in std::fs::read_dir(&at).unwrap() {
+        let entries = match std::fs::read_dir(&at) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("{}: {error}", at.display()),
+        };
+        for entry in entries {
             let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_dir() {
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("{}: {error}", entry.path().display()),
+            };
+            if kind.is_dir() {
                 dirs.push(entry.path());
                 continue;
             }
