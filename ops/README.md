@@ -685,7 +685,7 @@ one up for another network.
   container back to the image it ran before an image change. Everything
   else it reports. It ticks once per block time (`/v1/status`) and reads
   the node in the cluster at `node-http.duckpond.svc:8844`: `/v1/status`,
-  `/v1/programs` and `/v1/blocks`. It signs only through the ducktape CLI,
+  `/v1/programs`, `/v1/blocks` and `/v1/tx`. It signs only through the ducktape CLI,
   as its own agent account, which orthory (15) manages. The account's key
   and password are the Secret `key` (files `key` and `password`) in
   namespace `pi-chief`, created apart from the deploy:
@@ -713,22 +713,32 @@ one up for another network.
 - The program trigger is a code change of a program that fills no role,
   after which the host refused at least one of its receipts, nested ones
   included, as `trap` or `protocol` and applied none, while the old code
-  was seen applying ops. The rollback is a `Schedule` of `Set` back to the
-  old code with the program's params, at the tip plus `host::ANCHOR_WINDOW`
-  plus `programs::NOTICE`, so it is valid in whichever block carries it.
+  was seen applying ops. The rollback is a `ScheduleOver` of `Set` back to
+  the old code with the program's params, expecting the failing code, at
+  the tip plus `host::ANCHOR_WINDOW` plus `programs::NOTICE`, so it is valid
+  in whichever block carries it, and programs refuses it if anything else
+  changed the program first.
   It reads NOTICE for each rollback from the live `programs` code's own
   source: programs `Sources` names the repository and commit that code was
   built from, and forge's `Tree` and `Blob` give that commit's
   `crates/system/programs/src/lib.rs`, so a programs `Set` never leaves it
   with a stale number.
-  It sends the `Schedule` with `ducktape submit --land` and counts the
+  It sends the `ScheduleOver` with `ducktape submit --land` and counts the
   rollback made only when a block applied it, naming that block
-  (`scheduled_in`). A `Schedule` refused in its block, or one no block
+  (`scheduled_in`). A `ScheduleOver` refused in its block, or one no block
   carried before its anchor aged out (`unlanded`), is reported and holds
-  nothing. Chat posts are sent the same way. It reports instead when the
-  change was scheduled by account 18 or an agent 18 manages (the signer of
-  the `Schedule` in the blocks, through identity), when it finds no such
-  `Schedule`, when a change for the program already waits, or when NOTICE
+  nothing. Chat posts are sent the same way. It learns who made a change
+  from programs `Scheduled` while the change waits: it reads it at its
+  first start and in each block that applied a `programs` receipt, and
+  keeps each waiting `Set` or `Publish`'s account by program and code until
+  the switch, or until its height passes without one. An agent's deploy
+  reaches programs nested under egress and harness, so no frame carries
+  its op. Only for a change that landed while it was down does it search
+  the blocks before the switch for a `Schedule` or `ScheduleOver` frame
+  and take its signer, through identity. It reports instead when the
+  change was made by account 18 or an agent 18 manages, by the validators'
+  vote (`vote`), when it finds neither (`scheduler_unknown`), when a change
+  for the program already waits, or when NOTICE
   can't be read from the live `programs` code's source (`notice_source`:
   `Sources` names another code or no commit, or that commit's `lib.rs`
   isn't in forge or doesn't name `NOTICE` once).
@@ -754,7 +764,7 @@ one up for another network.
   runs as its dry run and the report says what it would do.
 - `pi-chief.py dry-run node` and `pi-chief.py dry-run program PROGRAM CODE`,
   run in its pod, show a rollback without making it: the server-side dry
-  run of the patch and what it changes, or the `Schedule` signed through a
+  run of the patch and what it changes, or the `ScheduleOver` signed through a
   local stand-in node that passes on only `/v1/status` and keeps the frame.
   `dry-run node` judges contracts from the state file's record, as the
   daemon does, and never asks the node, so it answers while the node

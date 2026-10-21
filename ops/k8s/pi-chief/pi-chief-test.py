@@ -26,6 +26,8 @@ ENTRY_HARNESS = "02e01302000000000001070000006861726e6573730053b651a06c566fe0447
 REACTORS_759 = "0b01000000f70200000000000004000000f09f918d01000000001100000000000000"
 MESSAGE_764 = "0201290000006368616e6e656c2d313864663931323766316133656566342d31373932333130373733393439353834fc02000000000000290000006d6573736167652d313864666464663165346136346635662d31373932333935313538303831393532000f00000000000000c00c020000000000f0f01453a101000001000000000100000022010000eab7b8eb9faceba9b420ec9db4eba087eab28c20ed9598ec9e902e206f70657261746f72ed959ced858c20eba790ed95b4ec849c20666162726963732d31ec979020ecb2b4ec9db8ec9db4eb9e9120ebb384eb8f84eba19c20eb8f8cec9584eab080eb8a94207069206167656e7420ecb9b4ed94bcebb3b8ec9d8420ed9598eb829820eba78ceb93a4ec96b4eb8baceb9dbceab3a020ed95b42028636f70792066726f6d20697473206f776e2073657474696e677320616e6420736b696c6c73292e2070692d6368696566eba19c2e20ec9698eb8a9420ecb2b4ec9db8ec9db4eb9e9120ec8381eab48020ec9786eab3a020eca780eab88820ec98a4ed8dbceba088ec9db4ed84b020ecb298eb9fbc20eb8f8cec9584eab080eb8a94eab1b0ec95bc0000000022010000eab7b8eb9faceba9b420ec9db4eba087eab28c20ed9598ec9e902e206f70657261746f72ed959ced858c20eba790ed95b4ec849c20666162726963732d31ec979020ecb2b4ec9db8ec9db4eb9e9120ebb384eb8f84eba19c20eb8f8cec9584eab080eb8a94207069206167656e7420ecb9b4ed94bcebb3b8ec9d8420ed9598eb829820eba78ceb93a4ec96b4eb8baceb9dbceab3a020ed95b42028636f70792066726f6d20697473206f776e2073657474696e677320616e6420736b696c6c73292e2070692d6368696566eba19c2e20ec9698eb8a9420ecb2b4ec9db8ec9db4eb9e9120ec8381eab48020ec9786eab3a020eca780eab88820ec98a4ed8dbceba088ec9db4ed84b020ecb298eb9fbc20eb8f8cec9584eab080eb8a94eab1b0ec95bc000000000000000001eb020000000000000000000000000000000000000000000000"
 CHAT_CODE = "sha256:c9478db204d103f7f395f93c793bfda4f2a20f8e09c1b64d214f31b055e15d6f"
+SCHEDULE_OVER_TX = "01821405000000000001000000ab21ca5fa1010000e3834cfb2154e2ba008dbad5202bd9f517e492c784d3a184767a5c3aebfabee920000000ad8cb74ee6d695bbe4a556ce717010799c2b101c55a0b8a0a2e07ca94fa57ba57f1405000000000091ab95137ea81145e02b4241d8a0744b791859b52743cef473910bcc0faf80cf0800000070726f6772616d7359000000015900000003cb14050000000000020800000074656c656772616d00fe080e56a0d5d358c55792fbde3b5ae7b0f708a726862935301f08b8d1fc80ff0100e61d45bce1c9dcfa4f8930401e1199156303da95853dd28173a1903bad6e5325010800000070726f6772616d7300000000000000000000000000"
+TELEGRAM_VIEW = "sha256:fe080e56a0d5d358c55792fbde3b5ae7b0f708a726862935301f08b8d1fc80ff"
 OPEN_DM_15 = "010f000000000000000800000070692d6368696566"
 POST_ONE_LINE = "0408000000646d2d31352d34300a00000070692d63686965662d78010000000001000000080000006c696e65206f6e650000000000"
 
@@ -163,7 +165,7 @@ class FakeCli:
         self.queries.append((program, request))
         match (program, request[0]):
             case ("programs", 1):
-                return pc.u8(1) + pc.u64(self.chain.tip()) + pc.borsh_vec([pc.u64(height) + pc.u8(0) + pc.borsh_text(name) + pc.blob_id(code) + pc.borsh_bytes(b"p") + pc.u8(0) for height, name, code in self.pending]) + pc.u8(0)
+                return pc.u8(1) + pc.u64(self.chain.tip()) + pc.borsh_vec([pc.u64(height) + pc.u8(0) + pc.borsh_text(name) + pc.blob_id(code) + pc.borsh_bytes(b"p") + pc.borsh_option(by[0] if by else None, pc.u64) for height, name, code, *by in self.pending]) + pc.u8(0)
             case ("programs", 2):
                 name = pc.Reader(request[1:]).text()
                 code = self.chain.programs.get(name)
@@ -338,11 +340,22 @@ class World:
     def switch_harness(self, code, scheduled_by, signer=SIGNER):
         self.switch("harness", code, scheduled_by, signer)
 
-    def switch(self, program, code, scheduled_by, signer=SIGNER):
-        self.chain.payloads[(self.chain.tip() + 1, 0)] = pc.u8(0) + pc.u64(self.chain.tip() + 3) + pc.u8(0) + pc.borsh_text(program) + pc.blob_id(code) + pc.borsh_bytes(b"params")
+    def switch(self, program, code, scheduled_by, signer=SIGNER, over=None):
+        tail = b"" if over is None else pc.borsh_option(over, pc.blob_id)
+        tag = 0 if over is None else 3
+        self.chain.payloads[(self.chain.tip() + 1, 0)] = pc.u8(tag) + pc.u64(self.chain.tip() + 3) + pc.u8(0) + pc.borsh_text(program) + pc.blob_id(code) + pc.borsh_bytes(b"params") + tail
         self.cli.accounts[signer] = scheduled_by
         self.tick(tx("programs", applied("programs"), signer=signer))
         self.tick()
+        self.chain.programs[program] = code
+        self.tick()
+
+    def switch_through_harness(self, program, code, account, manager):
+        self.cli.accounts[b"agent"] = (account, manager)
+        self.cli.pending = [(self.chain.tip() + 3, program, code, account)]
+        self.tick(tx("egress", applied("egress"), applied("harness"), applied("programs")))
+        self.tick()
+        self.cli.pending = []
         self.chain.programs[program] = code
         self.tick()
 
@@ -363,6 +376,16 @@ class Recorded(unittest.TestCase):
         self.assertIsNone(pc.manager_of(b(ACCOUNT_18)))
         self.assertEqual(pc.manager_of(b(ACCOUNT_24)), 18)
 
+    def test_a_schedule_over_tx_names_its_change_and_signer(self):
+        located = pc.located_of(b(SCHEDULE_OVER_TX))
+        scheduled = pc.schedule_of(located.payload)
+        self.assertEqual(scheduled, pc.Pending(333003, pc.Change("set_view", "telegram", TELEGRAM_VIEW), None))
+        self.assertEqual(located.signer.hex()[:16], "ad8cb74ee6d695bb")
+
+    def test_a_pending_rename_decodes(self):
+        reply = pc.u8(1) + pc.u64(90) + pc.borsh_vec([pc.u64(100) + pc.u8(7) + pc.borsh_text("tally") + pc.borsh_text("eddy/tally") + pc.u8(0)]) + pc.u8(0)
+        self.assertEqual(pc.scheduled_of(reply), [pc.Pending(100, pc.Change("rename", "tally", None), None)])
+
     def test_programs_replies_decode(self):
         pending = pc.scheduled_of(b(SCHEDULED))
         self.assertEqual({item.change.program for item in pending}, {"actions", "actions-pods"})
@@ -380,11 +403,11 @@ class Recorded(unittest.TestCase):
         self.assertEqual(pc.post_message("dm-15-40", "pi-chief-x", ["line one"]).hex(), POST_ONE_LINE)
         self.assertEqual(pc.dm_channel(40, 15), "dm-15-40")
 
-    def test_a_schedule_set_reads_back_as_the_same_set(self):
-        op = pc.schedule_set(500, "harness", A, b"params")
+    def test_a_schedule_over_set_reads_back_as_the_same_set(self):
+        op = pc.schedule_over_set(500, "harness", A, b"params", B)
         scheduled = pc.schedule_of(op)
         self.assertEqual((scheduled.height, scheduled.change), (500, pc.Change("set", "harness", A)))
-        self.assertTrue(op.endswith(pc.borsh_bytes(b"params")))
+        self.assertTrue(op.endswith(pc.borsh_bytes(b"params") + pc.borsh_option(B, pc.blob_id)))
 
     def test_forge_and_programs_queries_carry_their_tags(self):
         self.assertEqual(pc.sources_query(), b"\x07")
@@ -582,7 +605,8 @@ class ProgramTriggers(unittest.TestCase):
         self.assertEqual(scheduled.height, world.chain.tip() + ANCHOR + SOURCE_NOTICE)
         self.assertEqual(set(world.cli.tree_asks), {SOURCE_FOLDER})
         program, payload = next(held for held in world.cli.submits if held[0] == "programs")
-        self.assertTrue(payload.endswith(pc.borsh_bytes(b"params")))
+        self.assertEqual(payload[0], 3)
+        self.assertTrue(payload.endswith(pc.borsh_bytes(b"params") + pc.borsh_option(B, pc.blob_id)))
         self.assertEqual(world.chief.state["held"]["key"], f"program-harness-{pc.short(B)}")
         self.assertEqual(world.chief.state["own_programs"], {"harness": A})
 
@@ -631,6 +655,58 @@ class ProgramTriggers(unittest.TestCase):
         world = self.failing_harness(scheduled_by=(24, 18))
         self.assertIsNone(self.scheduled_set(world))
         self.assertIn("hands_off", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
+
+    def test_a_change_sent_as_schedule_over_is_named_from_its_frame(self):
+        world = World()
+        world.tick()
+        world.tick(tx("harness", applied("harness")))
+        world.switch("harness", B, (25, 15), over=A)
+        world.tick(tx("harness", refused("harness", "trap")))
+        self.assertIsNotNone(self.scheduled_set(world))
+        self.assertEqual(world.chief.state["programs"]["harness"]["scheduler"]["account"], 25)
+
+    def test_a_change_an_agent_sent_through_harness_is_named_from_programs_scheduled(self):
+        world = World()
+        world.tick()
+        world.tick(tx("harness", applied("harness")))
+        world.switch_through_harness("harness", B, 25, 15)
+        world.tick(tx("harness", refused("harness", "trap")))
+        self.assertIsNotNone(self.scheduled_set(world))
+        self.assertEqual(world.chief.state["programs"]["harness"]["scheduler"]["account"], 25)
+        self.assertEqual(world.chief.state["schedulers"], {})
+
+    def test_a_change_an_agent_eddy_manages_sent_through_harness_is_reported_only(self):
+        world = World()
+        world.tick()
+        world.tick(tx("harness", applied("harness")))
+        world.switch_through_harness("harness", B, 24, 18)
+        world.tick(tx("harness", refused("harness", "trap")))
+        self.assertIsNone(self.scheduled_set(world))
+        self.assertIn("hands_off", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
+
+    def test_a_change_the_vote_scheduled_is_reported_only(self):
+        world = World()
+        world.tick()
+        world.tick(tx("harness", applied("harness")))
+        world.cli.pending = [(world.chain.tip() + 3, "harness", B)]
+        world.tick(tx("valset", applied("valset"), applied("programs")))
+        world.tick()
+        world.cli.pending = []
+        world.chain.programs["harness"] = B
+        world.tick()
+        world.tick(tx("harness", refused("harness", "trap")))
+        self.assertIsNone(self.scheduled_set(world))
+        self.assertIn("(vote)", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
+
+    def test_a_cancelled_change_is_forgotten_once_its_height_passes(self):
+        world = World()
+        world.tick()
+        world.cli.pending = [(world.chain.tip() + 3, "harness", B, 25)]
+        world.tick(tx("egress", applied("egress"), applied("harness"), applied("programs")))
+        self.assertEqual(list(world.chief.state["schedulers"]), [f"harness {B}"])
+        world.cli.pending = []
+        world.tick(blocks=4)
+        self.assertEqual(world.chief.state["schedulers"], {})
 
     def test_a_change_with_no_schedule_in_the_blocks_is_reported_only(self):
         world = World()
@@ -733,7 +809,7 @@ class ProgramTriggers(unittest.TestCase):
         world.tick(tx("harness", refused("harness", "trap")))
         world.tick(tx("harness", refused("harness", "trap")))
         text = " ".join(world.lines(f"program-harness-{pc.short(B)}"))
-        self.assertIn("the Schedule never landed, so nothing changed: no block carried the frame before its anchor aged out (unlanded)", text)
+        self.assertIn("the ScheduleOver never landed, so nothing changed: no block carried the frame before its anchor aged out (unlanded)", text)
         self.assertIsNone(world.chief.state["held"])
         self.assertEqual(len([held for held in world.cli.submits if held[0] == "programs"]), 1)
 

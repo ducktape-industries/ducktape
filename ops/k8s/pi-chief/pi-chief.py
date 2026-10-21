@@ -34,7 +34,7 @@ ATTEMPTS_PER_LINE = 10
 MANAGER = "pi-chief"
 SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 LEVELS = {"unreached": "warn", "report_unposted": "warn", "kube_unread": "warn", "stopped": "error"}
-CHANGES = ("set", "remove", "set_view", "remove_view", "set_hook", "remove_hook", "publish")
+CHANGES = ("set", "remove", "set_view", "remove_view", "set_hook", "remove_hook", "publish", "rename")
 
 
 class Unreached(Exception):
@@ -300,27 +300,38 @@ def change_of(reader):
             return Change(verb, name, view)
         case "remove" | "remove_view" | "set_hook" | "remove_hook":
             return Change(verb, reader.text(), None)
+        case "rename":
+            program = reader.text()
+            reader.text()
+            return Change(verb, program, None)
 
 
 def schedule_of(payload):
     reader = Reader(payload)
-    if reader.u8() != 0:
+    if reader.u8() not in (0, 3):
         return None
     height = reader.u64()
     return Pending(height, change_of(reader), None)
 
 
-def scheduled_query():
-    return u8(1) + borsh_option(None, borsh_bytes) + borsh_option(None, u64)
+def scheduled_query(after=None):
+    return u8(1) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
 
 
-def scheduled_of(reply):
+def scheduled_page(reply):
     reader = Reader(reply)
     reader.tagged(1, "programs' Scheduled")
     reader.u64()
     items = reader.vec(lambda: Pending(reader.u64(), change_of(reader), reader.option(reader.u64)))
-    reader.option(reader.bytes)
-    return items
+    return items, reader.option(reader.bytes)
+
+
+def scheduled_of(reply):
+    return scheduled_page(reply)[0]
+
+
+def scheduler_key(program, code):
+    return f"{program} {code}"
 
 
 def program_query(program):
@@ -393,8 +404,8 @@ def blob_of(reply):
     return data
 
 
-def schedule_set(height, program, code, params):
-    return u8(0) + u64(height) + u8(0) + borsh_text(program) + blob_id(code) + borsh_bytes(params)
+def schedule_over_set(height, program, code, params, expected):
+    return u8(3) + u64(height) + u8(0) + borsh_text(program) + blob_id(code) + borsh_bytes(params) + borsh_option(expected, blob_id)
 
 
 def dm_open(counterpart, name):
@@ -615,7 +626,7 @@ class Stalled:
 
 
 def fresh_state():
-    return {"reported": [], "outbox": [], "programs": {}, "own_programs": {}, "own_image": None, "held": None}
+    return {"reported": [], "outbox": [], "programs": {}, "own_programs": {}, "own_image": None, "held": None, "schedulers": None}
 
 
 def stalled_for(state, now):
@@ -629,6 +640,7 @@ def stalled_for(state, now):
 
 def track_programs(state, table):
     records = state["programs"]
+    schedulers = state.get("schedulers") or {}
     for program in list(records):
         if program not in table.programs:
             del records[program]
@@ -642,8 +654,20 @@ def track_programs(state, table):
             continue
         own = state["own_programs"].pop(program, None) == code
         before = {"code": record["code"], "until": record["seen_at"], "applied": record["applied"] > 0}
-        records[program] = {"code": code, "since": table.high, "seen_at": table.low, "applied": 0, "failed": 0, "before": before, "own": own, "scheduler": None}
+        scheduled = schedulers.pop(scheduler_key(program, code), None)
+        records[program] = {"code": code, "since": table.high, "seen_at": table.low, "applied": 0, "failed": 0, "before": before, "own": own, "scheduler": None, "scheduled": scheduled}
         say("program_switched", program=program, before=record["code"], code=code, since=table.high, own=own)
+    for key, held in list(schedulers.items()):
+        if held["height"] <= table.low:
+            del schedulers[key]
+
+
+def track_schedulers(state, scheduled):
+    schedulers = state.get("schedulers") or {}
+    for pending in scheduled:
+        if pending.change.verb in ("set", "publish"):
+            schedulers[scheduler_key(pending.change.program, pending.change.code)] = {"account": pending.by, "height": pending.height}
+    state["schedulers"] = schedulers
 
 
 def count_receipts(state, blocks):
@@ -757,6 +781,8 @@ def decide(state, seen):
     if seen.rollout is not None:
         track_node(state, seen.rollout, stalled, None if seen.status is None else seen.status.contract)
     if seen.scheduled is not None:
+        track_schedulers(state, seen.scheduled)
+    if seen.scheduled is not None and stalled is not None:
         tip = state["tip"]["height"]
         state["due"] = {"at": tip, "programs": sorted({pending.change.program for pending in seen.scheduled if pending.height == tip + 1})}
     return state, judge(state, seen, stalled)
@@ -802,8 +828,10 @@ def program_refusal(finding, record, roles):
 
 
 def scheduler_refusal(finding, scheduler, hands_off):
+    if scheduler.get("vote"):
+        return Refused("vote", f"programs listed the change of {finding.program} to {finding.code} at height {scheduler['height']} as the validators' vote's, so pi-chief leaves it to the vote")
     if scheduler["account"] is None:
-        return Refused("scheduler_unknown", f"pi-chief found no Schedule that set {finding.program} to {finding.code} in the blocks before the switch, so it does not know who made the change")
+        return Refused("scheduler_unknown", f"pi-chief saw no change of {finding.program} to {finding.code} waiting in programs' Scheduled and found no Schedule or ScheduleOver that set it in the blocks before the switch, so it does not know who made the change")
     hands_off_change = hands_off in (scheduler["account"], scheduler["manager"])
     if hands_off_change:
         return Refused("hands_off", f"account {scheduler['account']} (managed by {scheduler['manager']}) scheduled the change at height {scheduler['height']}, and changes by account {hands_off} or its agents are theirs to undo")
@@ -867,6 +895,19 @@ def revert_lines(program, verdict):
             return [landing_line(evidence, "lands"), *harness_lines(program, "harness reverted: chief, sweep threads")]
         case Held() | Refused() | Unknown() | Waiting():
             return []
+
+
+def pending_changes(cli):
+    items, after = [], None
+    while True:
+        page, after = scheduled_page(cli.query(PROGRAMS, scheduled_query(after)))
+        items.extend(page)
+        if after is None:
+            return items
+
+
+def programs_moved(blocks):
+    return any(outcome.program == PROGRAMS and outcome.applied for block in blocks for tx in block.txs for outcome in tx.outcomes)
 
 
 class Node:
@@ -1112,14 +1153,14 @@ class Rollbacks:
         if live.get(program) != code:
             return Refused("code_moved", f"{program} now runs {live.get(program)}, not {code}")
         status = self.node.status()
-        waiting = [item for item in scheduled_of(self.cli.query(PROGRAMS, scheduled_query())) if item.change.program == program and item.height > status.height]
+        waiting = [item for item in pending_changes(self.cli) if item.change.program == program and item.height > status.height]
         if waiting:
             return Refused("pending", f"a change to {program} already waits at height {waiting[0].height}")
         entry = entry_of(self.cli.query(PROGRAMS, program_query(program)))
         if entry is None or entry[1] != code:
             return Refused("code_moved", f"programs answers {entry} for {program}")
         height = status.height + self.config.anchor_window + notice
-        op = schedule_set(height, program, previous, entry[2])
+        op = schedule_over_set(height, program, previous, entry[2], code)
         evidence = {"program": program, "from": code, "to": previous, "height": height, "tip": status.height, "block_time_ms": status.block_time_ms, "params_hex": entry[2].hex(), "op_hex": op.hex(), "notice": notice, "notice_source": notice_source}
         return Would(evidence)
 
@@ -1147,7 +1188,7 @@ class Rollbacks:
             case "rejected":
                 return Refused(said, f"programs refused the Set in block {block}: {sentence}")
             case "unlanded":
-                return Refused("unlanded", f"the Schedule never landed, so nothing changed: {sentence}")
+                return Refused("unlanded", f"the ScheduleOver never landed, so nothing changed: {sentence}")
             case "unknown":
                 return Unknown(sentence)
 
@@ -1204,9 +1245,11 @@ class Chief:
             after = self.node.status()
             tip = blocks[-1].height if blocks else (self.state.get("tip") or {}).get("height")
             unread_at_tip = (self.state.get("due") or {}).get("at") != tip
+            stalled_unread = self.stalled_now(blocks, now) and unread_at_tip
+            unread = self.state.get("schedulers") is None
             scheduled = None
-            if self.stalled_now(blocks, now) and unread_at_tip:
-                scheduled = tuple(scheduled_of(self.cli.query(PROGRAMS, scheduled_query())))
+            if stalled_unread or unread or programs_moved(blocks):
+                scheduled = tuple(pending_changes(self.cli))
         except (Unreached, Failed) as error:
             self.unreached += 1
             if worth_a_line(self.unreached):
@@ -1240,7 +1283,15 @@ class Chief:
             self.hold(finding.key)
         self.report(finding.key, finding_lines(finding) + verdict_lines(verdict, action))
 
-    def scheduler(self, program, code, since):
+    def named(self, account, height):
+        manager = None if account is None else manager_of(self.cli.query(IDENTITY, account_query(account)))
+        return {"account": account, "manager": manager, "height": height}
+
+    def scheduler(self, program, code, since, scheduled):
+        if scheduled is not None and scheduled["account"] is None:
+            return {"account": None, "manager": None, "height": scheduled["height"], "vote": True}
+        if scheduled is not None:
+            return self.named(scheduled["account"], scheduled["height"])
         listed_from = None
         before = since + 1
         epoch = self.state["chain"]["epoch_length"]
@@ -1267,9 +1318,7 @@ class Chief:
         sets = scheduled is not None and scheduled.change.verb in ("set", "publish")
         if not sets or (scheduled.change.program, scheduled.change.code) != (program, code):
             return None
-        account = number_of(self.cli.query(IDENTITY, of_key_query(located.signer)))
-        manager = None if account is None else manager_of(self.cli.query(IDENTITY, account_query(account)))
-        return {"account": account, "manager": manager, "height": block.height}
+        return self.named(number_of(self.cli.query(IDENTITY, of_key_query(located.signer))), block.height)
 
     def program_verdict(self, finding):
         record = self.state["programs"][finding.program]
@@ -1277,7 +1326,7 @@ class Chief:
         if refused is not None:
             return refused
         if record["scheduler"] is None:
-            record["scheduler"] = self.scheduler(finding.program, finding.code, finding.since)
+            record["scheduler"] = self.scheduler(finding.program, finding.code, finding.since, record.get("scheduled"))
         refused = scheduler_refusal(finding, record["scheduler"], self.config.hands_off)
         if refused is not None:
             return refused
