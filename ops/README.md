@@ -710,6 +710,11 @@ one up for another network.
   was seen applying ops. The rollback is a `Schedule` of `Set` back to the
   old code with the program's params, at the tip plus `host::ANCHOR_WINDOW`
   plus `programs::NOTICE`, so it is valid in whichever block carries it.
+  It reads NOTICE for each rollback from the live `programs` code's own
+  source: programs `Sources` names the repository and commit that code was
+  built from, and forge's `Tree` and `Blob` give that commit's
+  `crates/system/programs/src/lib.rs`, so a programs `Set` never leaves it
+  with a stale number.
   It sends the `Schedule` with `ducktape submit --land` and counts the
   rollback made only when a block applied it, naming that block
   (`scheduled_in`). A `Schedule` refused in its block, or one no block
@@ -717,8 +722,10 @@ one up for another network.
   nothing. Chat posts are sent the same way. It reports instead when the
   change was scheduled by account 18 or an agent 18 manages (the signer of
   the `Schedule` in the blocks, through identity), when it finds no such
-  `Schedule`, when a change for the program already waits, or when the live
-  `programs` code is not the one NOTICE was read from.
+  `Schedule`, when a change for the program already waits, or when NOTICE
+  can't be read from the live `programs` code's source (`notice_source`:
+  `Sources` names another code or no commit, or that commit's `lib.rs`
+  isn't in forge or doesn't name `NOTICE` once).
 - A stall with the tip at a program's switch, or with a change due at the
   next block, is reported only: no block can carry a program change, and a
   node rollback does not change a program's code. So are a stall with no
@@ -729,17 +736,15 @@ one up for another network.
   Its state (what it saw run, the open hold, unposted reports) is the
   claim `state`. Stop it with
   `kubectl -n pi-chief scale deployment/pi-chief --replicas=0`.
-- `PI_CHIEF_MODE=report|act k8s/pi-chief/deploy DUCKTAPE_COMMIT
-  PROGRAMS_CHECKOUT PROGRAMS_COMMIT ACCOUNT` builds
+- `PI_CHIEF_MODE=report|act k8s/pi-chief/deploy DUCKTAPE_COMMIT ACCOUNT`
+  builds
   `k8s/pi-chief/Containerfile` with the CLI from `git archive
   DUCKTAPE_COMMIT`, pushes it to the cluster node's registry and applies
   `k8s/pi-chief/pi-chief.yaml`: namespace `pi-chief`, service account
   `pi-chief`, a Role in `duckpond` (deployment `node` get, watch and patch;
   replicasets get and list; pods and their logs get, list and watch), the
   claim, a policy closing every inbound port, and Deployment `pi-chief`.
-  It reads ANCHOR_WINDOW from that source and NOTICE from
-  `PROGRAMS_COMMIT`, the commit the live `programs` code was built from,
-  and stores the live code's id with it. In `report` mode every rollback
+  It reads ANCHOR_WINDOW from that source. In `report` mode every rollback
   runs as its dry run and the report says what it would do.
 - `pi-chief.py dry-run node` and `pi-chief.py dry-run program PROGRAM CODE`,
   run in its pod, show a rollback without making it: the server-side dry

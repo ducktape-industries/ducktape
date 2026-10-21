@@ -41,7 +41,10 @@ UID = "deployment-uid"
 SIGNER = bytes.fromhex("408bd99d74e77c47a24d63fab653c8f72ee058c6f5d34c0c4e70290349652f69")
 DEADLINE = 600
 EPOCH = 64
-NOTICE = 60
+SOURCE_COMMIT = "5" * 40
+SOURCE_NOTICE = 75
+LIB_OID = "6" * 40
+SOURCE_FOLDER = ("programs", SOURCE_COMMIT, b"crates/system/programs/src")
 ANCHOR = 256
 
 
@@ -148,6 +151,11 @@ class FakeCli:
         self.posted = set()
         self.answer = "applied"
         self.queries_answer = True
+        self.sources = {}
+        self.source_code = {}
+        self.tree = {SOURCE_FOLDER: [(b"describe.rs", "8" * 40), (b"examples.rs", "9" * 40), (b"lib.rs", LIB_OID)]}
+        self.files = {LIB_OID: f"// programs\npub const NOTICE: u64 = {SOURCE_NOTICE};\n".encode()}
+        self.tree_asks = []
 
     def query(self, program, request):
         if not self.chain.answers or not self.queries_answer:
@@ -160,6 +168,29 @@ class FakeCli:
                 name = pc.Reader(request[1:]).text()
                 code = self.chain.programs.get(name)
                 return pc.u8(2) + pc.u64(self.chain.tip()) + pc.borsh_option(code, lambda held: pc.borsh_text(name) + pc.blob_id(held) + pc.borsh_bytes(self.entries.get(name, b"params")))
+            case ("programs", 7):
+                rows = []
+                for name, code in sorted(self.chain.programs.items()):
+                    source = self.sources.get(name, ("programs", SOURCE_COMMIT))
+                    held = pc.u8(1) if source is None else pc.u8(0) + pc.borsh_text(source[0]) + pc.borsh_text(source[1])
+                    rows.append(pc.borsh_text(name) + pc.blob_id(self.source_code.get(name, code)) + held)
+                return pc.u8(7) + pc.u64(self.chain.tip()) + pc.borsh_vec(rows)
+            case ("forge", 6):
+                reader = pc.Reader(request[1:])
+                asked = (reader.text(), reader.text(), reader.bytes())
+                after = reader.option(reader.bytes)
+                self.tree_asks.append(asked)
+                entries = self.tree.get(asked, [])
+                at = int(after or b"0")
+                more = str(at + 1).encode() if at + 1 < len(entries) else None
+                listed = pc.borsh_vec([pc.borsh_bytes(name) + pc.borsh_text(oid) + pc.u8(0) for name, oid in entries[at : at + 1]])
+                return pc.u8(4) + pc.u64(self.chain.tip()) + pc.borsh_text("7" * 40) + pc.u64(self.chain.tip()) + listed + pc.borsh_option(more, pc.borsh_bytes)
+            case ("forge", 7):
+                reader = pc.Reader(request[1:])
+                reader.text()
+                oid = reader.text()
+                data = self.files[oid]
+                return pc.u8(5) + pc.u64(self.chain.tip()) + pc.borsh_text(oid) + pc.u64(len(data)) + pc.u8(0) + pc.u64(0) + pc.u64(len(data)) + pc.borsh_bytes(data)
             case ("identity", 0):
                 key = pc.Reader(request[1:]).bytes()
                 return pc.u8(0) + pc.borsh_option(self.accounts.get(key, (None, None))[0], pc.u64)
@@ -262,19 +293,19 @@ class Clock:
         return self.chain.time / 1000
 
 
-def config(mode="act", notice_code=PROGRAMS_CODE):
-    return pc.Config(mode=mode, account=40, report_to=(15, 17), hands_off=18, notice=NOTICE, notice_code=notice_code, anchor_window=ANCHOR)
+def config(mode="act"):
+    return pc.Config(mode=mode, account=40, report_to=(15, 17), hands_off=18, anchor_window=ANCHOR)
 
 
 class World:
-    def __init__(self, mode="act", image=X, notice_code=PROGRAMS_CODE):
+    def __init__(self, mode="act", image=X):
         self.chain = Chain({"programs": PROGRAMS_CODE, "identity": OTHER_CODE, "harness": A})
         self.node = FakeNode(self.chain)
         self.cli = FakeCli(self.chain)
         self.kube = FakeKube(deployment(image, revision=1), [replicaset(image, 1)])
         self.store = MemoryStore()
         self.clock = Clock(self.chain)
-        self.chief = pc.Chief(config(mode, notice_code), self.node, self.cli, self.kube, self.store, clock=self.clock, pause=lambda seconds: None)
+        self.chief = pc.Chief(config(mode), self.node, self.cli, self.kube, self.store, clock=self.clock, pause=lambda seconds: None)
         self.chain.make()
 
     def tick(self, *txs, blocks=1):
@@ -355,13 +386,10 @@ class Recorded(unittest.TestCase):
         self.assertEqual((scheduled.height, scheduled.change), (500, pc.Change("set", "harness", A)))
         self.assertTrue(op.endswith(pc.borsh_bytes(b"params")))
 
-    def test_a_wasm_custom_section_is_found_by_name(self):
-        source = pc.borsh_text("ducktape-industries/programs") + pc.borsh_text("a46d082d")
-        name = pc.borsh_text("ducktape.source")[4:]
-        section = bytes([len(name)]) + name + source
-        wasm = b"\0asm\x01\0\0\0" + bytes([1, 1, 0]) + bytes([0, len(section)]) + section
-        self.assertEqual(pc.stamped_commit(wasm), "a46d082d")
-        self.assertIsNone(pc.stamped_commit(b"\0asm\x01\0\0\0"))
+    def test_forge_and_programs_queries_carry_their_tags(self):
+        self.assertEqual(pc.sources_query(), b"\x07")
+        self.assertEqual(pc.tree_query("programs", "ab", b"src", None)[:1], b"\x06")
+        self.assertEqual(pc.blob_query("programs", "ab")[:1], b"\x07")
 
 
 class NodeTriggers(unittest.TestCase):
@@ -533,8 +561,10 @@ class NodeTriggers(unittest.TestCase):
 
 
 class ProgramTriggers(unittest.TestCase):
-    def failing_harness(self, mode="act", scheduled_by=(25, 15), notice_code=PROGRAMS_CODE):
-        world = World(mode=mode, notice_code=notice_code)
+    def failing_harness(self, mode="act", scheduled_by=(25, 15), before=None):
+        world = World(mode=mode)
+        if before is not None:
+            before(world)
         world.tick()
         world.tick(tx("harness", applied("harness")))
         world.switch_harness(B, scheduled_by)
@@ -549,7 +579,8 @@ class ProgramTriggers(unittest.TestCase):
         world = self.failing_harness()
         scheduled = self.scheduled_set(world)
         self.assertEqual(scheduled.change, pc.Change("set", "harness", A))
-        self.assertEqual(scheduled.height, world.chain.tip() + ANCHOR + NOTICE)
+        self.assertEqual(scheduled.height, world.chain.tip() + ANCHOR + SOURCE_NOTICE)
+        self.assertEqual(set(world.cli.tree_asks), {SOURCE_FOLDER})
         program, payload = next(held for held in world.cli.submits if held[0] == "programs")
         self.assertTrue(payload.endswith(pc.borsh_bytes(b"params")))
         self.assertEqual(world.chief.state["held"]["key"], f"program-harness-{pc.short(B)}")
@@ -621,10 +652,25 @@ class ProgramTriggers(unittest.TestCase):
         self.assertIsNone(self.scheduled_set(world))
         self.assertIn("role", " ".join(world.lines(f"program-identity-{pc.short(B)}")))
 
-    def test_a_programs_code_other_than_the_one_notice_was_read_from_reports(self):
-        world = self.failing_harness(notice_code=OTHER_CODE)
+    def test_programs_naming_another_code_for_itself_reports(self):
+        world = self.failing_harness(before=lambda world: world.cli.source_code.update({"programs": OTHER_CODE}))
         self.assertIsNone(self.scheduled_set(world))
-        self.assertIn("notice_code", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
+        self.assertIn("notice_source", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
+
+    def test_an_unstamped_programs_code_reports(self):
+        world = self.failing_harness(before=lambda world: world.cli.sources.update({"programs": None}))
+        self.assertIsNone(self.scheduled_set(world))
+        self.assertIn("notice_source", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
+
+    def test_a_programs_source_with_no_notice_reports(self):
+        world = self.failing_harness(before=lambda world: world.cli.files.update({LIB_OID: b"pub const OTHER: u64 = 1;\n"}))
+        self.assertIsNone(self.scheduled_set(world))
+        self.assertIn("notice_source", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
+
+    def test_a_programs_source_with_no_lib_reports(self):
+        world = self.failing_harness(before=lambda world: world.cli.tree.update({SOURCE_FOLDER: [(b"describe.rs", "8" * 40)]}))
+        self.assertIsNone(self.scheduled_set(world))
+        self.assertIn("notice_source", " ".join(world.lines(f"program-harness-{pc.short(B)}")))
 
     def test_a_change_already_waiting_for_the_program_reports(self):
         world = World()
@@ -722,9 +768,9 @@ class RevertReports(unittest.TestCase):
 
     def test_an_acted_revert_names_the_block_it_lands_at_and_how_to_cancel_it(self):
         world, tip, text = self.failing("counter", "act")
-        height = tip + ANCHOR + NOTICE
+        height = tip + ANCHOR + SOURCE_NOTICE
         self.assertEqual(self.scheduled(world).height, height)
-        self.assertIn(f"It lands at block {height} (about 5 min); Cancel before {height} if this revert is wrong.", text)
+        self.assertIn(f"It lands at block {height} (about 6 min); Cancel before {height} if this revert is wrong.", text)
 
     def test_an_acted_revert_names_the_block_that_carried_its_schedule(self):
         world, tip, text = self.failing("counter", "act")
@@ -732,8 +778,8 @@ class RevertReports(unittest.TestCase):
 
     def test_a_dry_run_revert_names_the_block_it_would_land_at(self):
         world, tip, text = self.failing("counter", "report")
-        height = tip + ANCHOR + NOTICE
-        self.assertIn(f"It would land at block {height} (about 5 min); Cancel before {height} if this revert is wrong.", text)
+        height = tip + ANCHOR + SOURCE_NOTICE
+        self.assertIn(f"It would land at block {height} (about 6 min); Cancel before {height} if this revert is wrong.", text)
 
     def test_the_minutes_come_from_the_block_time(self):
         line = pc.landing_line({"height": 1316, "tip": 1000, "block_time_ms": 2000}, "lands")

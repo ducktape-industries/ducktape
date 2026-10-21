@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # Builds the pi-chief image around the ducktape CLI built from the source of DUCKTAPE_COMMIT, pushes it to the cluster node's registry, and applies pi-chief.yaml with the numbers it acts on read from their sources.
-# Usage: PI_CHIEF_MODE=report|act ops/k8s/pi-chief/deploy DUCKTAPE_COMMIT PROGRAMS_CHECKOUT PROGRAMS_COMMIT ACCOUNT; the Secret pi-chief/key (key, password) is created apart from it.
+# Usage: PI_CHIEF_MODE=report|act ops/k8s/pi-chief/deploy DUCKTAPE_COMMIT ACCOUNT; the Secret pi-chief/key (key, password) is created apart from it.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-usage="usage: PI_CHIEF_MODE=report|act ops/k8s/pi-chief/deploy DUCKTAPE_COMMIT PROGRAMS_CHECKOUT PROGRAMS_COMMIT ACCOUNT"
+usage="usage: PI_CHIEF_MODE=report|act ops/k8s/pi-chief/deploy DUCKTAPE_COMMIT ACCOUNT"
 commit=$(git -C "$here" rev-parse --verify "${1:?$usage}^{commit}")
-programs=${2:?$usage}
-programs_commit=$(git -C "$programs" rev-parse --verify "${3:?$usage}^{commit}")
-account=${4:?$usage}
+account=${2:?$usage}
 mode=${PI_CHIEF_MODE:?PI_CHIEF_MODE is report, which runs every rollback as a dry run, or act}
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 context=${DEPLOY_CONTEXT:-fabrics-1}
-public=${PI_CHIEF_PUBLIC_NODE:-https://duckpond.ducktape.industries}
 tunnel_port=35314
 
 fail() { echo "deploy: $*" >&2; exit 1; }
@@ -25,14 +22,7 @@ mkdir "$stage/src"
 git -C "$(git -C "$here" rev-parse --show-toplevel)" archive "$commit" | tar -x -C "$stage/src"
 duck_release=$("$here/../git-remote-duck" "$stage/git-remote-duck")
 anchor_window=$(sed -n 's/^pub const ANCHOR_WINDOW: u64 = \([0-9]*\);$/\1/p' "$stage/src/crates/kernel/host/src/lib.rs")
-notice=$(git -C "$programs" show "$programs_commit:crates/system/programs/src/lib.rs" | sed -n 's/^pub const NOTICE: u64 = \([0-9]*\);$/\1/p')
 [ -n "$anchor_window" ] || fail "host::ANCHOR_WINDOW is not in the source of $commit"
-[ -n "$notice" ] || fail "programs::NOTICE is not in the source of $programs_commit"
-read -r notice_code stamped < <(python3 "$here/pi-chief.py" programs-source "$public")
-case $stamped in
-  unstamped | "$programs_commit") ;;
-  *) fail "the live programs code $notice_code was built from $stamped, not $programs_commit" ;;
-esac
 cp "$here/pi-chief.py" "$stage/pi-chief.py"
 tag=$(cat "$here/Containerfile" "$stage/pi-chief.py" <(echo "$commit $duck_release") | sha256sum | cut -c1-12)
 nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit" \
@@ -41,7 +31,7 @@ ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:1
 podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/pi-chief:$tag"
 image="localhost:5000/pi-chief:$tag@$(cat "$stage/digest")"
 sed -e "s#@IMAGE@#$image#g" -e "s#@MODE@#$mode#g" -e "s#@ACCOUNT@#$account#g" \
-  -e "s#@NOTICE@#$notice#g" -e "s#@NOTICE_CODE@#$notice_code#g" -e "s#@ANCHOR_WINDOW@#$anchor_window#g" \
+  -e "s#@ANCHOR_WINDOW@#$anchor_window#g" \
   "$here/pi-chief.yaml" | kubectl --context "$context" apply -f -
 kubectl --context "$context" -n pi-chief rollout status deployment/pi-chief
-echo "$image mode=$mode notice=$notice from $notice_code at $programs_commit anchor_window=$anchor_window"
+echo "$image mode=$mode anchor_window=$anchor_window"

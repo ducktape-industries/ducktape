@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pi-chief: duckpond's recovery daemon, off the chain. It rolls a program that fills no role back to the code it ran before a change after which it failed, or the node back to the image it ran before an image change after which the chain stopped, and reports everything else to orthory (15) and chief (17) in DMs.
-# ops/k8s/pi-chief/pi-chief.yaml runs it on fabrics-1 and pi-chief-test.py tests it; `dry-run node` and `dry-run program PROGRAM CODE` show a rollback without making it, and `programs-source NODE` names the live programs code for deploy.
+# ops/k8s/pi-chief/pi-chief.yaml runs it on fabrics-1 and pi-chief-test.py tests it; `dry-run node` and `dry-run program PROGRAM CODE` show a rollback without making it.
 import copy
 import hashlib
 import json
@@ -21,12 +21,15 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 PROGRAMS = "programs"
+FORGE = "forge"
+NOTICE_FOLDER = b"crates/system/programs/src"
+NOTICE_FILE = b"lib.rs"
+NOTICE_LINE = re.compile(r"^pub const NOTICE: u64 = ([0-9]+);$", re.M)
 CHAT = "chat"
 IDENTITY = "identity"
 HARNESS = "harness"
 HOST_FAULTS = ("trap", "protocol")
 HASHES = {"sha256": (0, 32), "sha1": (1, 20)}
-SOURCE_SECTION = "ducktape.source"
 ATTEMPTS_PER_LINE = 10
 MANAGER = "pi-chief"
 SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
@@ -331,47 +334,63 @@ def entry_of(reply):
     return reader.option(lambda: (reader.text(), reader.blob(), reader.bytes()))
 
 
-def leb128(data, at):
-    value = shift = 0
-    while True:
-        byte = data[at]
-        at += 1
-        value |= (byte & 0x7F) << shift
-        shift += 7
-        if byte < 0x80:
-            return value, at
+def sources_query():
+    return u8(7)
 
 
-def wasm_section(wasm, wanted):
-    if wasm[:4] != b"\0asm":
-        raise Failed("the code is not wasm")
-    at = 8
-    while at < len(wasm):
-        kind = wasm[at]
-        size, at = leb128(wasm, at + 1)
-        end = at + size
-        if kind == 0:
-            length, start = leb128(wasm, at)
-            if wasm[start : start + length].decode(errors="replace") == wanted:
-                return wasm[start + length : end]
-        at = end
-    return None
+def sources_of(reply):
+    reader = Reader(reply)
+    reader.tagged(7, "programs' Sources")
+    reader.u64()
+
+    def built():
+        program = reader.text()
+        code = reader.blob()
+        match reader.u8():
+            case 0:
+                return program, code, (reader.text(), reader.text())
+            case 1:
+                return program, code, None
+            case 2:
+                reader.text()
+                return program, code, None
+            case tag:
+                raise Failed(f"programs' Sources names provenance {tag}")
+
+    return {program: (code, source) for program, code, source in reader.vec(built)}
 
 
-def framed_body(framed):
-    header, nul, body = framed.partition(b"\0")
-    if not nul:
-        raise Failed("a blob came back without its header")
-    return body
+def tree_query(repo, at, path, after):
+    return u8(6) + borsh_text(repo) + borsh_text(at) + borsh_bytes(path) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
 
 
-def stamped_commit(wasm):
-    section = wasm_section(wasm, SOURCE_SECTION)
-    if section is None:
-        return None
-    reader = Reader(section)
+def tree_of(reply):
+    reader = Reader(reply)
+    reader.tagged(4, "forge's Tree")
+    reader.u64()
     reader.text()
-    return reader.text()
+    reader.u64()
+    entries = reader.vec(lambda: (reader.bytes(), reader.text(), reader.u8()))
+    return entries, reader.option(reader.bytes)
+
+
+def blob_query(repo, oid):
+    return u8(7) + borsh_text(repo) + borsh_text(oid) + borsh_option(None, u64)
+
+
+def blob_of(reply):
+    reader = Reader(reply)
+    reader.tagged(5, "forge's Blob")
+    reader.u64()
+    reader.text()
+    size = reader.u64()
+    reader.u8()
+    reader.u64()
+    reader.u64()
+    data = reader.bytes()
+    if len(data) != size:
+        raise Failed(f"forge answered {len(data)} of the file's {size} bytes")
+    return data
 
 
 def schedule_set(height, program, code, params):
@@ -873,13 +892,6 @@ class Node:
     def blocks(self, before, limit):
         return page_of(self.call("/v1/blocks", blocks_ask(before, limit, 0)))
 
-    def blob(self, code):
-        reader = Reader(self.call("/v1/blob/get", blob_id(code)))
-        framed = reader.option(reader.bytes)
-        if framed is None:
-            raise Failed(f"the node holds no blob {code}")
-        return framed
-
     def tx(self, height, position, most):
         return located_of(self.call("/v1/tx", tx_ask(height, position, most)))
 
@@ -1004,8 +1016,6 @@ class Config:
     account: int
     report_to: tuple
     hands_off: int
-    notice: int
-    notice_code: str
     anchor_window: int
 
     @staticmethod
@@ -1015,8 +1025,6 @@ class Config:
             account=int(env["PI_CHIEF_ACCOUNT"]),
             report_to=tuple(int(number) for number in env["PI_CHIEF_REPORT_TO"].split()),
             hands_off=int(env["PI_CHIEF_HANDS_OFF"]),
-            notice=int(env["PI_CHIEF_NOTICE"]),
-            notice_code=env["PI_CHIEF_NOTICE_CODE"],
             anchor_window=int(env["PI_CHIEF_ANCHOR_WINDOW"]),
         )
 
@@ -1069,10 +1077,38 @@ class Rollbacks:
             return Unknown(str(failed))
         return Acted({**checked.evidence, "image_now": container_image(patched["spec"]["template"], self.kube.container)})
 
+    def source_file(self, repo, commit, folder, name):
+        after = None
+        while True:
+            entries, after = tree_of(self.cli.query(FORGE, tree_query(repo, commit, folder, after)))
+            oid = next((oid for entry, oid, kind in entries if entry == name), None)
+            if oid is not None:
+                return blob_of(self.cli.query(FORGE, blob_query(repo, oid)))
+            if after is None:
+                return None
+
+    def notice(self, code):
+        held = sources_of(self.cli.query(PROGRAMS, sources_query())).get(PROGRAMS)
+        if held is None or held[0] != code:
+            return Refused("notice_source", f"programs' Sources names {held[0] if held else 'nothing'} for programs, not the live {code}")
+        if held[1] is None:
+            return Refused("notice_source", f"the programs code {code} names no source commit, so its NOTICE can't be read")
+        repo, commit = held[1]
+        where = f"{repo} {commit} {(NOTICE_FOLDER + b'/' + NOTICE_FILE).decode()}"
+        source = self.source_file(repo, commit, NOTICE_FOLDER, NOTICE_FILE)
+        if source is None:
+            return Refused("notice_source", f"forge holds no {where}")
+        found = NOTICE_LINE.findall(source.decode(errors="replace"))
+        if len(found) != 1:
+            return Refused("notice_source", f"{where} names NOTICE {len(found)} times, not once")
+        return int(found[0]), f"{repo} {commit}"
+
     def program_op(self, program, code, previous):
         live = self.node.table()
-        if live.get(PROGRAMS) != self.config.notice_code:
-            return Refused("notice_code", f"the programs code is now {live.get(PROGRAMS)}, not {self.config.notice_code}, whose source NOTICE {self.config.notice} was read from")
+        read = self.notice(live.get(PROGRAMS))
+        if isinstance(read, Refused):
+            return read
+        notice, notice_source = read
         if live.get(program) != code:
             return Refused("code_moved", f"{program} now runs {live.get(program)}, not {code}")
         status = self.node.status()
@@ -1082,9 +1118,9 @@ class Rollbacks:
         entry = entry_of(self.cli.query(PROGRAMS, program_query(program)))
         if entry is None or entry[1] != code:
             return Refused("code_moved", f"programs answers {entry} for {program}")
-        height = status.height + self.config.anchor_window + self.config.notice
+        height = status.height + self.config.anchor_window + notice
         op = schedule_set(height, program, previous, entry[2])
-        evidence = {"program": program, "from": code, "to": previous, "height": height, "tip": status.height, "block_time_ms": status.block_time_ms, "params_hex": entry[2].hex(), "op_hex": op.hex()}
+        evidence = {"program": program, "from": code, "to": previous, "height": height, "tip": status.height, "block_time_ms": status.block_time_ms, "params_hex": entry[2].hex(), "op_hex": op.hex(), "notice": notice, "notice_source": notice_source}
         return Would(evidence)
 
     def program_dry_run(self, program, code, previous):
@@ -1398,12 +1434,6 @@ def dry_run(args, env):
     print(json.dumps({"verdict": type(verdict).__name__, **verdict.__dict__}, indent=2, sort_keys=True, default=str))
 
 
-def programs_source(node_url):
-    node = Node(node_url)
-    code = node.table()[PROGRAMS]
-    print(code, stamped_commit(framed_body(node.blob(code))) or "unstamped")
-
-
 def main():
     env = os.environ
     match sys.argv[1:]:
@@ -1413,10 +1443,8 @@ def main():
             Chief(Config.from_env(env), node, cli, kube, store).run()
         case ["dry-run", *args]:
             dry_run(args, env)
-        case ["programs-source", node_url]:
-            programs_source(node_url)
         case other:
-            sys.exit(f"usage: pi-chief.py [dry-run node | dry-run program PROGRAM CODE | programs-source NODE], not {' '.join(other)}")
+            sys.exit(f"usage: pi-chief.py [dry-run node | dry-run program PROGRAM CODE], not {' '.join(other)}")
 
 
 if __name__ == "__main__":

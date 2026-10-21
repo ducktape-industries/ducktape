@@ -1,5 +1,5 @@
 # pi-chief on fabrics-1: its namespace and service account, the Role it holds in duckpond, its state claim, a policy closing every inbound port, and its Deployment.
-# Applied by ops/k8s/pi-chief/deploy, which substitutes @IMAGE@, @MODE@, @ACCOUNT@, @NOTICE@, @NOTICE_CODE@ and @ANCHOR_WINDOW@; it signs with the key in the Secret `key`.
+# Applied by ops/k8s/pi-chief/deploy, which substitutes @IMAGE@, @MODE@, @ACCOUNT@ and @ANCHOR_WINDOW@; it signs with the key in the Secret `key`.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -95,8 +95,6 @@ spec:
             - {name: PI_CHIEF_ACCOUNT, value: "@ACCOUNT@"}
             - {name: PI_CHIEF_REPORT_TO, value: "15 17"}
             - {name: PI_CHIEF_HANDS_OFF, value: "18"}
-            - {name: PI_CHIEF_NOTICE, value: "@NOTICE@"}
-            - {name: PI_CHIEF_NOTICE_CODE, value: "@NOTICE_CODE@"}
             - {name: PI_CHIEF_ANCHOR_WINDOW, value: "@ANCHOR_WINDOW@"}
             - {name: PI_CHIEF_NODE, value: http://node-http.duckpond.svc:8844}
             - {name: PI_CHIEF_NAMESPACE, value: duckpond}
