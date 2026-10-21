@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import base64
 import binascii
@@ -1728,7 +1728,7 @@ def lane_record_holds(said, record):
     else:
         ended = any(line.startswith("GATES FAIL:") for line in lines)
     reach = " ".join(path for path in said["reach"] if path) or "the whole tree"
-    recorded = f"report: build.sh#lane {said['state']}, reach: {reach}" in lines
+    recorded = any(f"{lead} build.sh#lane {said['state']}, reach: {reach}" in lines for lead in ("report sent:", "report:"))
     return lane and ended and recorded
 
 
@@ -2581,6 +2581,7 @@ class Notifier:
         self.following = set()
         self.posted = {}
         self.reported = {}
+        self.outcomes = {}
         self.records = None
         self.open = {}
         self.done = {}
@@ -2698,15 +2699,18 @@ class Notifier:
                 return
         if not self.signer.held():
             say("pods_unreported", run=json.dumps(said["url"]), reason="no_key")
+            self.remember(name, said, "report not landed: no_key")
             return
         try:
             record = self.records(name, said["run"]) if self.records else None
         except Refused as refused:
             say("pods_unreported", run=json.dumps(said["url"]), reason="unread", detail=json.dumps(refused.sentence))
+            self.remember(name, said, f"report not landed: unread: {refused.sentence}")
             return
         if record is None or not lane_record_holds(said, record):
             why = f"{name} records no lane run {said['run']} of {said['repo']} {said['commit']} that ended {said['state']} with that reach"
             say("pods_unreported", run=json.dumps(said["url"]), reason="unrecorded", detail=json.dumps(why))
+            self.remember(name, said, f"report not landed: unrecorded: {why}")
             with self.lock:
                 self.reported.setdefault(name, set()).add(said["url"])
             return
@@ -2714,7 +2718,7 @@ class Notifier:
         attempts = 0
         while True:
             try:
-                settled = self.report_once(said)
+                settled = self.report_once(name, said)
                 break
             except Unanswered as why:
                 attempts += 1
@@ -2726,15 +2730,27 @@ class Notifier:
             with self.lock:
                 self.reported.setdefault(name, set()).add(said["url"])
 
-    def report_once(self, said):
+    def report_once(self, name, said):
         outcome, reason, sentence, _ = receipt(self.signer.submit(FORGE_REACH, reach_report(said)))
         if outcome == "applied":
             say("pods_reported", run=json.dumps(said["url"]), commit=said["commit"], state=said["state"])
+            self.remember(name, said, f"report landed: {said['repo']} {said['commit']} {said['context']} {said['state']}")
             return True
         if outcome in ("unknown", "unlanded") or (outcome == "failed" and unanswered(sentence)):
             raise Unanswered(sentence)
         say("pods_unreported", run=json.dumps(said["url"]), reason=reason or outcome, detail=json.dumps(sentence))
+        self.remember(name, said, f"report not landed: {reason or outcome}: {sentence}")
         return outcome == "rejected"
+
+    def remember(self, name, said, outcome):
+        with self.lock:
+            self.outcomes.setdefault(name, {})[said["run"]] = outcome
+
+    def told(self, name, text):
+        run = RUN_NAMED.match(text)
+        with self.lock:
+            outcome = None if run is None else self.outcomes.get(name, {}).get(run.group(1))
+        return text if outcome is None else f"{text} \u00b7 {outcome}"
 
     def recorded(self, said):
         after = None
@@ -2785,7 +2801,7 @@ class Notifier:
             with self.lock:
                 if message_id in self.posted.get(name, ()):
                     continue
-            posted = self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line_said(name, text, concerned if caller is None else caller), unvouched)
+            posted = self.post({NOTIFY_CHANNEL: channel}, requester, message_id, line_said(name, self.told(name, text), concerned if caller is None else caller), unvouched)
             if posted:
                 held += posted is HELD
                 with self.lock:
@@ -2997,6 +3013,7 @@ class Notifier:
             with self.lock:
                 self.posted.pop(name, None)
                 self.reported.pop(name, None)
+                self.outcomes.pop(name, None)
                 self.deleting.discard(name)
             self.lose(name, "it was deleted before the run ended")
 

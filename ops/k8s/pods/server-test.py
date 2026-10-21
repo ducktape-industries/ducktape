@@ -2613,7 +2613,7 @@ def text(value):
 
 def lane_run(run, commit=GATED, state="passed", reach="crates/a", repo="programs"):
     verdict = "GATES ok" if state == "passed" else "GATES FAIL: clippy"
-    return f"job j-1\nrun {run}: {repo} {commit}, slot lane, lane\nGATE clippy ok\nreport: build.sh#lane {state}, reach: {reach}\n{verdict}\n"
+    return f"job j-1\nrun {run}: {repo} {commit}, slot lane, lane\nGATE clippy ok\nreport sent: build.sh#lane {state}, reach: {reach}\n{verdict}\n"
 
 
 class Reports(unittest.TestCase):
@@ -2713,6 +2713,46 @@ class Reports(unittest.TestCase):
         self.notifier.records = lambda name, run: lane_run("r1")
         self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
         self.assertEqual(self.signer.submits, [self.report("duckpond-41:r1")])
+
+    def ended(self, channel, text, told):
+        return ("chat", server.notice_message(channel, server.line_id("duckpond-41", channel, text), None, server.line_said("duckpond-41", told, 17)))
+
+    def test_a_lanes_end_line_says_its_report_landed(self):
+        self.kube.logs_of["duckpond-41"] = f"ducktape-report programs {GATED} build.sh#lane passed r1 crates/a\nducktape-notify j-1 r1 ended: exit 0, GATES ok\n".encode()
+        self.runs[("duckpond-41", "r1")] = lane_run("r1")
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        text = "r1 ended: exit 0, GATES ok"
+        told = f"{text} \u00b7 report landed: programs {GATED} build.sh#lane passed"
+        self.assertEqual(self.signer.submits, [self.report("duckpond-41:r1"), self.ended("j-1", text, told)])
+
+    def test_a_lanes_end_line_says_why_forge_reach_refused_its_report(self):
+        self.signer.submitted = [ran(POOLED + b"landed 961 rejected invalid_input: reach path ./x is not a plain path\n"), ran(POOLED + b"landed 962 applied 00ff\n")]
+        self.kube.logs_of["duckpond-41"] = f"ducktape-report programs {GATED} build.sh#lane passed r1 ./x\nducktape-notify j-1 r1 ended: exit 0, GATES ok\n".encode()
+        self.runs[("duckpond-41", "r1")] = lane_run("r1", reach="./x")
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        text = "r1 ended: exit 0, GATES ok"
+        told = f"{text} \u00b7 report not landed: invalid_input: reach path ./x is not a plain path"
+        self.assertEqual(self.signer.submits, [self.report("duckpond-41:r1", reach=("./x",)), self.ended("j-1", text, told)])
+
+    def test_each_end_line_of_a_lane_its_record_does_not_hold_says_so_and_other_runs_lines_say_nothing(self):
+        self.kube.logs_of["duckpond-41"] = (
+            f"ducktape-report programs {GATED} build.sh#lane passed r1 crates/a\n"
+            "ducktape-notify j-2 r1 ended: exit 0, GATES ok\n"
+            "ducktape-notify j-1 r1 ended: exit 0, GATES ok\n"
+            "ducktape-notify j-1 r2 ended: exit 0, GATES ok\n"
+        ).encode()
+        self.runs[("duckpond-41", "r1")] = lane_run("r1", reach="crates/b")
+        self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        text = "r1 ended: exit 0, GATES ok"
+        told = f"{text} \u00b7 report not landed: unrecorded: duckpond-41 records no lane run r1 of programs {GATED} that ended passed with that reach"
+        other = "r2 ended: exit 0, GATES ok"
+        self.assertEqual(self.signer.submits, [self.ended("j-2", text, told), self.ended("j-1", text, told), self.ended("j-1", other, other)])
+
+    def test_a_record_holds_whether_its_build_sh_says_report_sent_or_report(self):
+        said = next(server.report_lines("duckpond-41", [f"ducktape-report programs {GATED} build.sh#lane passed r1 crates/a\n".encode()]))
+        for lead in ("report sent:", "report:"):
+            record = f"job j-1\nrun r1: programs {GATED}, slot lane, lane\n{lead} build.sh#lane passed, reach: crates/a\nGATES ok\n"
+            self.assertTrue(server.lane_record_holds(said, record), lead)
 
 
 class Posts(unittest.TestCase):

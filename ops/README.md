@@ -566,14 +566,20 @@ one up for another network.
   `PODS_WARM_POD` names) and that machine's `build.sh status <run>` records a
   lane run of that repo and commit (`run <run>: <repo> <commit>, slot …,
   lane`) that ended with the line's verdict (`GATES ok`, or `GATES FAIL:`) and
-  recorded the line's reach (`report: build.sh#lane <state>, reach: <path>...`
-  or `reach: the whole tree`); otherwise `pods_unreported reason=unrecorded`,
+  recorded the line's reach (`report sent: build.sh#lane <state>, reach:
+  <path>...` or `reach: the whole tree`; a build.sh from before it said
+  `report sent:` says `report:`); otherwise `pods_unreported reason=unrecorded`,
   final, or `reason=unread` while the record can't be read. A branch whose
   `RequireChecks` names forge-reach with the context `<the service's
   account>/<context>` then lands a change whose Preview left that reach alone.
   Each run is reported once (`pods_reported`). A refusal is final
   (`pods_unreported` with its reason), and a submit the node doesn't answer
-  is sent again as a post is. Before the service follows a log, one read
+  is sent again as a post is. Each end notice of that run (`<run> ended:
+  …`, in its NOTIFY channel and each folded one) then ends with where the
+  report went: ` · report landed: <repo> <commit> <context> <state>`, or
+  ` · report not landed: <reason>: <detail>` (`no_key`, `unread`,
+  `unrecorded`, or forge-reach's refusal), so whoever waits on the run reads
+  whether its check reached forge-reach. Before the service follows a log, one read
   walks its report lines from the newest back, asking forge-reach `Reports`
   of each line's commit, and every line up to the newest it holds counts as
   reported (`pods_reports_caught_up pod= already_reported=`; a failed ask logs
