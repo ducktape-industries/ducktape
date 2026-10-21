@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints, and usage; the reserved pod `desktop` is orthory's desktop build runner, reached by ssh through its `gate` command.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import base64
 import binascii
@@ -242,7 +242,15 @@ MOVABLE_RUN = re.compile(r"move (\S+) (heavy|lane|quick:\S+) ([0-9]+) (\S+)")
 LANE_WAIT = re.compile(r"(heavy|lane|quick:\S+) ([0-9]+)")
 REROUTE = "reroute"
 DESKTOP_KEYS = "/desktop"
-DESKTOP_FILES = ("id_ed25519", "known_hosts", "hosts", "user")
+RUNNER_FILES = ("id_ed25519", "known_hosts", "user")
+HOSTS_FILE = "hosts"
+FORWARD_FILE = "forward"
+KINDS_FILE = "kinds"
+MOVABLE_WORD = "MOVABLE=1"
+UNSTARTING = frozenset({"ahead", "lanes", "movable", "take", "moved", "yield"})
+RUNNER_NAME = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
+AHEAD_PAUSED = re.compile(rb"ahead (heavy|lane|quick|light) paused")
+LANE_PAUSED = re.compile(r"(heavy|lane|quick:\S+) paused")
 BUILD_SH = "/var/tmp/warm/build.sh"
 SETTING = re.compile(r"[A-Z_][A-Za-z0-9_]*=.*", re.S)
 UNPLAIN = frozenset("$`;|&<>()*?[~#\n")
@@ -801,7 +809,7 @@ def plain_words(script):
         return None
 
 
-def desktop_words(command, name=DESKTOP):
+def runner_words(command, name):
     words = plain_words(command[2]) if len(command) == 3 and command[:2] == ["sh", "-c"] else command
     settings = list(itertools.takewhile(SETTING.fullmatch, words or []))
     called = (words or [])[len(settings) :]
@@ -830,11 +838,11 @@ def with_caller(command, caller):
     return [*command[:2], f"{CALLER_WORD}{caller} {command[2]}"]
 
 
-def desktop_view(said):
+def runner_view(name, said):
     running = {"state": "running", "reason": None, "message": None, "exit_code": None, "started": said.get("started"), "finished": None}
     container = {"name": RUN, "image": None, "command": ["sh", BUILD_SH], "args": [], "workdir": None, "resources": {}, "status": running}
     return {
-        "name": DESKTOP,
+        "name": name,
         "created": said.get("started"),
         "phase": "Running",
         "reason": None,
@@ -851,19 +859,19 @@ def desktop_view(said):
     }
 
 
-def desktop_free(said):
+def runner_free(name, said):
     busy, ran = said.get("busy"), said.get("busy_exit")
     if not isinstance(busy, list) or not all(isinstance(line, str) for line in busy):
-        return False, f"the desktop's ping has busy as a {type(busy).__name__}, not a list of lines"
+        return False, f"the {name}'s ping has busy as a {type(busy).__name__}, not a list of lines"
     if type(ran) is not int:
-        return False, f"the desktop's ping has busy_exit as a {type(ran).__name__}, not a number"
+        return False, f"the {name}'s ping has busy_exit as a {type(ran).__name__}, not a number"
     if ran != 0:
-        return False, f"the desktop's build.sh busy exited {ran}"
+        return False, f"the {name}'s build.sh busy exited {ran}"
     kinds = ["stray" if line.startswith("stray ") else (line.split()[2:3] or [""])[0] for line in busy]
     if "stray" in kinds:
-        return False, "a process no run started holds one of the desktop's build locks"
+        return False, f"a process no run started holds one of the {name}'s build locks"
     if "quiet" in kinds:
-        return False, "a quiet run holds every heavy slot of the desktop"
+        return False, f"a quiet run holds every heavy slot of the {name}"
     return True, None
 
 
@@ -904,38 +912,101 @@ def on_machine(machine, ran, started=True):
     return Ran(ran.code, out, f"{BUILDS}: on {machine}\n{ran.err}".rstrip("\n"))
 
 
-def gate_run(argv):
-    done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True)
+def run_kind(words):
+    settings = list(itertools.takewhile(SETTING.fullmatch, words))
+    called = words[len(settings) :]
+    first = called[0] if called else ""
+    if first == "apply":
+        return first
+    if first in ADDRESSED or first in MACHINE_WIDE or first in UNSTARTING or first == REROUTE or len(called) < 3:
+        return None
+    return called[2]
+
+
+def unpacked(words):
+    try:
+        said = base64.b64decode(words, validate=True).split(b"\0")
+    except (binascii.Error, ValueError):
+        return []
+    return [word.decode(errors="replace") for word in said if word]
+
+
+def soonest(machines):
+    timed = all(here[2] is not None for _, here in machines)
+    return min(machines, key=lambda machine: machine[1][2] if timed else machine[1][1])[0], timed
+
+
+def runners_of(text, signer):
+    runners, names = [], set()
+    for word in text.split():
+        name, equals, keys = word.partition("=")
+        if not equals or not RUNNER_NAME.fullmatch(name) or name == BUILDS or name in names or not keys.startswith("/"):
+            raise ValueError(f"PODS_RUNNERS names each build runner as <name>=<the absolute path of its keys>, split by whitespace, each name once and none of them {BUILDS}, not {word!r}")
+        names.add(name)
+        runners.append(Runner(name, Path(keys), signer=signer))
+    return runners
+
+
+def gate_run(argv, env=None):
+    done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, env=env)
     return Ran(done.returncode, done.stdout, done.stderr.decode(errors="replace").strip())
 
 
-def gate_spawn(argv):
-    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def gate_spawn(argv, env=None):
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
 
 
-class Desktop:
-    def __init__(self, keys, home=None, runner=gate_run, spawn=gate_spawn):
+class Runner:
+    def __init__(self, name, keys, home=None, runner=gate_run, spawn=gate_spawn, signer=None):
+        self.name = name
         self.keys = keys
         self.home = home
         self.runner = runner
         self.spawn = spawn
+        self.signer = signer
         self.lock = threading.Lock()
         self.reached = None
         self.key = None
 
+    def forwarded(self):
+        return (self.keys / FORWARD_FILE).is_file()
+
     def held(self):
-        return all((self.keys / name).is_file() for name in DESKTOP_FILES)
+        if not all((self.keys / name).is_file() for name in RUNNER_FILES):
+            return False
+        if self.forwarded():
+            return self.signer is not None and self.signer.held()
+        return (self.keys / HOSTS_FILE).is_file()
+
+    def takes(self, words):
+        kind = run_kind(words)
+        listed = self.keys / KINDS_FILE
+        if kind is None or not listed.is_file():
+            return True
+        movable = MOVABLE_WORD in itertools.takewhile(SETTING.fullmatch, words)
+        return kind in listed.read_text().split() and (kind != "sh" or movable)
 
     def hosts(self):
-        listed = (self.keys / "hosts").read_text().split()
+        if self.forwarded():
+            return [self.name]
+        listed = (self.keys / HOSTS_FILE).read_text().split()
         with self.lock:
             first = self.reached
         return sorted(listed, key=lambda host: host != first)
 
+    def proxy(self):
+        said = (self.keys / FORWARD_FILE).read_text().split()
+        if len(said) != 2:
+            raise Refused(503, f"the {self.name}'s forward file holds {len(said)} words, not a member node's key and the service it forwards, so the {self.name} runner is not reachable")
+        return shlex.join([*self.signer.ducktape, "forward", *said]).replace("%", "%%")
+
+    def environ(self):
+        return self.signer.env() if self.forwarded() else None
+
     def identity(self):
         with self.lock:
             if self.key is None:
-                home = self.home or Path(tempfile.mkdtemp(prefix="desktop-"))
+                home = self.home or Path(tempfile.mkdtemp(prefix=f"{self.name}-"))
                 home.mkdir(parents=True, exist_ok=True)
                 key = home / "id_ed25519"
                 with os.fdopen(os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
@@ -946,6 +1017,8 @@ class Desktop:
     def argv(self, host, words, alive):
         user = (self.keys / "user").read_text().strip()
         options = ["IdentitiesOnly=yes", "BatchMode=yes", "StrictHostKeyChecking=yes", f"UserKnownHostsFile={self.keys / 'known_hosts'}"]
+        if self.forwarded():
+            options.append(f"ProxyCommand={self.proxy()}")
         if alive is not None:
             options.append(f"ServerAliveInterval={alive}")
         flags = [part for option in options for part in ("-o", option)]
@@ -953,21 +1026,21 @@ class Desktop:
 
     def call(self, words, alive=None, again=True):
         if not self.held():
-            raise Refused(503, f"this service holds no key for pod {DESKTOP}, so the desktop runner is not reachable")
+            raise Refused(503, f"this service holds no key for pod {self.name}, so the {self.name} runner is not reachable")
         failures = []
         for host in self.hosts():
-            ran = self.runner(self.argv(host, words, alive))
+            ran = self.runner(self.argv(host, words, alive), self.environ())
             if ran.code == SSH_FAILED and not again and not ran.err.startswith(UNCONNECTED):
-                raise Cut(f"the exec's connection to pod {DESKTOP} at {host} was cut while it ran ({ran.err or 'ssh exited 255'}); its command may still be running there, so it was not run again", ran.out)
+                raise Cut(f"the exec's connection to pod {self.name} at {host} was cut while it ran ({ran.err or 'ssh exited 255'}); its command may still be running there, so it was not run again", ran.out)
             if ran.code == SSH_FAILED:
                 failures.append(f"{host}: {ran.err or 'ssh exited 255'}")
                 continue
             with self.lock:
                 self.reached = host
             if ran.code == RUNNER_DOWN:
-                raise Refused(503, f"the desktop's runner is down: {ran.err}")
+                raise Refused(503, f"the {self.name}'s runner is down: {ran.err}")
             return ran
-        raise Refused(503, f"the desktop is unreachable: {'; '.join(failures) or 'its hosts file names no host'}")
+        raise Refused(503, f"the {self.name} is unreachable: {'; '.join(failures) or 'its hosts file names no host'}")
 
     def ran(self, command, alive=None):
         match command:
@@ -978,36 +1051,40 @@ class Desktop:
             case ["sh", "-c", script, "pack", *words] if script == PACKING:
                 return self.call(["pack", *words])
             case _:
-                return self.call(["exec", *desktop_words(command)], alive, again=False)
+                words = runner_words(command, self.name)
+                if not self.takes(words):
+                    listed = " ".join((self.keys / KINDS_FILE).read_text().split())
+                    raise Refused(400, f"pod {self.name} takes only the run kinds its kinds file lists ({listed}; an sh only with {MOVABLE_WORD}), not build.sh {run_kind(words)}")
+                return self.call(["exec", *words], alive, again=False)
 
     def state(self):
         ran = self.call(["ping"])
         try:
             said = json.loads(ran.out)
         except json.JSONDecodeError as error:
-            raise Refused(502, f"the desktop's ping answered {ran.out.decode(errors='replace').strip()!r}, not JSON") from error
+            raise Refused(502, f"the {self.name}'s ping answered {ran.out.decode(errors='replace').strip()!r}, not JSON") from error
         if ran.code != 0 or not said.get("up"):
-            raise Refused(503, f"the desktop's runner is not up: {said.get('state') or ran.err or f'ping exited {ran.code}'}")
+            raise Refused(503, f"the {self.name}'s runner is not up: {said.get('state') or ran.err or f'ping exited {ran.code}'}")
         return said
 
     def logs(self, options):
         kept = [option for option in options if option.startswith(("--tail=", "--since="))]
         ran = self.call(["logs", *kept])
         if ran.code != 0:
-            raise Refused(502, f"the desktop's logs were not read: {ran.err or f'gate exited {ran.code}'}")
+            raise Refused(502, f"the {self.name}'s logs were not read: {ran.err or f'gate exited {ran.code}'}")
         return ran.out
 
     def follow(self, alive):
         self.state()
         with self.lock:
             host = self.reached
-        return self.spawn(self.argv(host, ["logs", "--tail=0", "--follow"], alive))
+        return self.spawn(self.argv(host, ["logs", "--tail=0", "--follow"], alive), self.environ())
 
     def tail(self, since):
         self.state()
         with self.lock:
             host = self.reached
-        return self.spawn(self.argv(host, ["logs", f"--since={since}s", "--follow"], None))
+        return self.spawn(self.argv(host, ["logs", f"--since={since}s", "--follow"], None), self.environ())
 
 
 def heard_in(stream, heard):
@@ -2574,14 +2651,14 @@ def json_stream(stream):
 
 
 class Service:
-    def __init__(self, kube, signer, fetching, stats, api, desktop=None, warm_pod=None):
+    def __init__(self, kube, signer, fetching, stats, api, runners=None, warm_pod=None):
         self.kube = kube
         self.warm_pod = warm_pod
         self.uncalled = 0
-        self.desktop = desktop or Desktop(Path(DESKTOP_KEYS))
-        self.desktop_wanted = threading.Event()
-        self.desktop_follower = None
-        self.rest = self.desktop_wanted.wait
+        self.runners = {runner.name: runner for runner in (runners if runners is not None else [Runner(DESKTOP, Path(DESKTOP_KEYS), signer=signer)])}
+        self.wanted = {name: threading.Event() for name in self.runners}
+        self.followers = {}
+        self.rest = lambda name, pause: self.wanted[name].wait(pause)
         self.retry_pause = fetching.block_ms / 1000
         self.clock = time.monotonic
         self.wall = time.time
@@ -2598,6 +2675,9 @@ class Service:
         self.swept = threading.Event()
         self.rerouting = threading.Lock()
         self.launched = {}
+
+    def machines(self):
+        return ", ".join(f"pod {name}" for name in self.runners)
 
     def pod(self, name):
         ran = self.kube.get(name)
@@ -2668,7 +2748,7 @@ class Service:
         for machine, runs in places.items():
             command = ["sh", BUILD_SH, "ended", *sorted(runs)]
             try:
-                ran = self.desktop.ran(command, None) if machine == DESKTOP else self.kube.exec(machine, None, command)
+                ran = self.runners[machine].ran(command, None) if machine in self.runners else self.kube.exec(machine, None, command)
             except Refused:
                 continue
             gone = ran.code != 0 and "(NotFound)" in ran.err
@@ -2710,8 +2790,11 @@ class Service:
                 say("pods_sweep_failed", detail=json.dumps(repr(error)))
 
     def executed(self, asked, name, container, command, again=False, alive=None):
-        if name == DESKTOP:
-            return self.desktop.ran(command, alive)
+        if name in self.runners:
+            try:
+                return self.runners[name].ran(command, alive)
+            except Cut as cut:
+                return self.read_again(asked, name, cut, "WAIT=1" in (build_settings(command, True) or []), alive)
         if name == BUILDS:
             return self.routed(asked, command, alive)
 
@@ -2773,7 +2856,7 @@ class Service:
 
     def output(self, name, asked_by, asked):
         container = asked.get("container")
-        if name != DESKTOP:
+        if name not in self.runners:
             pod = self.pod(name)
             names = [held["name"] for held in pod["spec"]["containers"]]
             container = container or (OUT if OUT in names else None)
@@ -2800,15 +2883,15 @@ class Service:
 
     def lane_record(self, machine, run):
         command = ["sh", BUILD_SH, "status", run]
-        if machine == DESKTOP:
-            return self.desktop.ran(command).out.decode(errors="replace")
+        if machine in self.runners:
+            return self.runners[machine].ran(command).out.decode(errors="replace")
         if not self.warm_pod or machine != self.warm():
             return None
         return self.kube.exec(machine, None, command).out.decode(errors="replace")
 
     def warm(self):
         if not self.warm_pod:
-            raise Refused(503, f"pod {DESKTOP} is not free and this service names no warm pod (PODS_WARM_POD), so pod {BUILDS} has nowhere to run it")
+            raise Refused(503, f"no build runner is free and this service names no warm pod (PODS_WARM_POD), so pod {BUILDS} has nowhere to run it")
         reply = self.signer.query(FILES_PROGRAM, files_read(self.warm_pod, None, 0, CHUNK_SIZE))
         if reply.code != 0:
             raise Refused(502, f"the warm pod's name was not read from {self.warm_pod}: {failed(reply)}")
@@ -2818,53 +2901,56 @@ class Service:
         return name
 
     def pick(self, asked, words, alive):
-        try:
-            said = self.desktop.state()
-        except Refused as refused:
-            say("pods_routed", to="warm", reason="desktop_unready", detail=json.dumps(refused.sentence))
-            return self.warm(), False
-        free, why = desktop_free(said)
-        if not free:
+        passed, readable, kept = [], [], []
+        for name, runner in self.runners.items():
+            if not runner.takes(words):
+                continue
             try:
-                warm = self.warm()
+                said = runner.state()
             except Refused as refused:
-                say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(f"{why}; {refused.sentence}"))
-                return DESKTOP, False
-            there, unasked = self.ahead(asked, warm, words, alive)
-            if there is None:
-                say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(f"{why}; {unasked}"))
-                return DESKTOP, False
-            say("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps(why))
-            return warm, False
-        here, why = self.ahead(asked, DESKTOP, words, alive)
-        if here is None:
-            try:
-                warm = self.warm()
-            except Refused as refused:
-                say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(refused.sentence))
-                return DESKTOP, False
-            say("pods_routed", to="warm", reason="desktop_unasked", detail=json.dumps(why))
-            return warm, False
-        if here[1] == 0:
-            return DESKTOP, True
+                passed.append(("runner_unready", name, refused.sentence))
+                continue
+            free, why = runner_free(name, said)
+            here = None
+            if free:
+                here, why = self.ahead(asked, name, words, alive)
+            if here is None:
+                passed.append(("runner_unasked" if free else "runner_busy", name, why))
+                kept.append(name)
+                continue
+            if here[1] == 0:
+                return self.went(name, name, passed), True
+            readable.append((name, here))
+        if not readable and not kept:
+            return self.went(self.warm(), "warm", passed), False
+        stay = soonest(readable)[0] if readable else kept[0]
         try:
             warm = self.warm()
         except Refused as refused:
-            say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(refused.sentence))
-            return DESKTOP, False
+            return self.went(stay, stay, [*passed, ("warm_unasked", None, refused.sentence)]), False
+        busy = any(reason == "runner_busy" for reason, _, _ in passed)
+        if not readable and not busy:
+            return self.went(warm, "warm", passed), False
         there, why = self.ahead(asked, warm, words, alive)
         if there is None:
-            say("pods_routed", to=DESKTOP, reason="warm_unasked", detail=json.dumps(why))
-            return DESKTOP, False
-        if here[2] is not None and there[2] is not None:
-            if there[2] >= here[2]:
-                return DESKTOP, False
-            say("pods_routed", to="warm", reason="sooner_end", detail=json.dumps(f"{here[0]}: ends in {here[2]}s on pod {DESKTOP}, {there[2]}s on pod {warm}"))
-            return warm, False
-        if there[1] >= here[1]:
-            return DESKTOP, False
-        say("pods_routed", to="warm", reason="shorter_wait", detail=json.dumps(f"{here[0]}: {here[1]} ahead on pod {DESKTOP}, {there[1]} on pod {warm}"))
-        return warm, False
+            return self.went(stay, stay, [*passed, ("warm_unasked", None, why)]), False
+        if not readable:
+            return self.went(warm, "warm", passed), False
+        machines = [*readable, (warm, there)]
+        machine, timed = soonest(machines)
+        if machine != machines[0][0]:
+            lane = machines[0][1][0]
+            if timed:
+                said = f"{lane}: ends in " + ", ".join(f"{here[2]}s on pod {name}" for name, here in machines)
+            else:
+                said = f"{lane}: " + ", ".join(f"{here[1]}{' ahead' if index == 0 else ''} on pod {name}" for index, (name, here) in enumerate(machines))
+            passed.append(("sooner_end" if timed else "shorter_wait", None, said))
+        return self.went(machine, "warm" if machine == warm else machine, passed), False
+
+    def went(self, machine, to, passed):
+        for reason, runner, sentence in passed:
+            say("pods_routed", to=to, reason=reason, **({"runner": runner} if runner else {}), detail=json.dumps(sentence))
+        return machine
 
     def reroute(self, asked, alive):
         with self.rerouting:
@@ -2889,11 +2975,26 @@ class Service:
         listed = self.executed(asked, warm, None, ["sh", BUILD_SH, "movable"], alive=alive)
         if listed.code != 0:
             raise Refused(502, f"build.sh movable on pod {warm} answered exit {listed.code}")
-        lanes = self.desktop.ran(["sh", BUILD_SH, "lanes"], alive)
-        if lanes.code != 0:
-            raise Refused(502, f"build.sh lanes on pod {DESKTOP} answered exit {lanes.code}")
-        waits = {found.group(1): int(found.group(2)) for found in map(LANE_WAIT.fullmatch, lanes.out.decode(errors="replace").splitlines()) if found}
-        said, chosen, moved_ahead = [], [], {}
+        waits, unread = {}, []
+        for name, runner in self.runners.items():
+            try:
+                lanes = runner.ran(["sh", BUILD_SH, "lanes"], alive)
+            except Refused as refused:
+                unread.append(refused.sentence)
+                continue
+            if lanes.code != 0:
+                unread.append(f"build.sh lanes on pod {name} answered exit {lanes.code}")
+                continue
+            waits[name] = {}
+            for line in lanes.out.decode(errors="replace").splitlines():
+                found, paused = LANE_WAIT.fullmatch(line), LANE_PAUSED.fullmatch(line)
+                if found:
+                    waits[name][found.group(1)] = int(found.group(2))
+                elif paused:
+                    waits[name][paused.group(1)] = None
+        if not waits:
+            raise Refused(502, "; ".join(unread) or "this service names no build runner")
+        said, chosen, moved_ahead = [], {}, {}
         candidates = []
         for line in listed.out.decode(errors="replace").splitlines():
             found = MOVABLE_RUN.fullmatch(line)
@@ -2902,34 +3003,39 @@ class Service:
             elif line.startswith("keep "):
                 said.append(line)
         for lane, ahead, run, words in sorted(candidates):
-            here, there = waits.get(lane, 0), ahead - moved_ahead.get(lane, 0)
+            there = ahead - moved_ahead.get(lane, 0)
+            taking = [(waits[name].get(lane, 0), name) for name in waits if waits[name].get(lane, 0) is not None and self.runners[name].takes(unpacked(words))]
+            if not taking:
+                said.append(f"keep {run} no build runner that takes it says its {lane} lane's wait")
+                continue
+            here, name = min(taking, key=lambda pair: pair[0])
             if here < there:
-                chosen.append((run, words))
-                waits[lane] = here + 1
+                chosen.setdefault(name, []).append((run, words))
+                waits[name][lane] = here + 1
                 moved_ahead[lane] = moved_ahead.get(lane, 0) + 1
             else:
-                said.append(f"keep {run} the {lane} lane waits for {here} runs on pod {DESKTOP} and {there} here")
-        if chosen:
-            said += self.carried(asked, warm, chosen, alive)
+                said.append(f"keep {run} the {lane} lane waits for {here} runs on pod {name} and {there} here")
+        for name, runs in chosen.items():
+            said += self.carried(asked, warm, name, runs, alive)
         moved = sum(1 for line in said if ": moved to run " in line)
         say("pods_rerouted", moved=moved, kept=len(said) - moved)
         return "\n".join(said) + "\n" if said else f"nothing queued on pod {warm} to move\n"
 
-    def carried(self, asked, warm, chosen, alive):
+    def carried(self, asked, warm, name, chosen, alive):
         if any(notifies(words) for _, words in chosen):
-            self.follow_desktop()
+            self.follow(name)
         try:
-            took = self.desktop.ran(["sh", BUILD_SH, "take", *[words for _, words in chosen]], alive)
+            took = self.runners[name].ran(["sh", BUILD_SH, "take", *[words for _, words in chosen]], alive)
         except Refused as refused:
-            raise Refused(502, f"{refused.sentence}; build.sh take on pod {DESKTOP} may have started some of these runs, each still queued on pod {warm} ({', '.join(run for run, _ in chosen)}): read build.sh busy on pod {DESKTOP} before calling reroute again") from refused
+            raise Refused(502, f"{refused.sentence}; build.sh take on pod {name} may have started some of these runs, each still queued on pod {warm} ({', '.join(run for run, _ in chosen)}): read build.sh busy on pod {name} before calling reroute again") from refused
         lines = took.out.decode(errors="replace").splitlines()
         said, pairs = [], {}
         for index, (run, _) in enumerate(chosen):
             line = lines[index] if index < len(lines) else f"failed: build.sh take answered exit {took.code} and said nothing of it"
             if line.startswith("run "):
-                pairs[run] = f"{DESKTOP}:{line[4:]}"
+                pairs[run] = f"{name}:{line[4:]}"
             else:
-                said.append(f"keep {run} pod {DESKTOP} {line}")
+                said.append(f"keep {run} pod {name} {line}")
         if not pairs:
             return said
         answers, why = self.warm_moved(asked, warm, pairs, alive)
@@ -2947,7 +3053,7 @@ class Service:
             else:
                 said.append(line)
         if stays:
-            said += self.yielded(warm, stays, alive)
+            said += self.yielded(warm, name, stays, alive)
         return said
 
     def warm_moved(self, asked, warm, pairs, alive):
@@ -2958,10 +3064,10 @@ class Service:
         lines = (line.split(": ", 1) for line in ran.out.decode(errors="replace").splitlines() if ": " in line)
         return {run: f"{run}: {rest}" for run, rest in lines if run in pairs}, f"build.sh moved on pod {warm} answered exit {ran.code} without a line for it"
 
-    def yielded(self, warm, stays, alive):
+    def yielded(self, warm, name, stays, alive):
         words = [word for run, copy in stays.items() for word in (copy.partition(":")[2], f"{warm}:{run}")]
         try:
-            ran = self.desktop.ran(["sh", BUILD_SH, "yield", *words], alive)
+            ran = self.runners[name].ran(["sh", BUILD_SH, "yield", *words], alive)
             answers = dict(line.split(": ", 1) for line in ran.out.decode(errors="replace").splitlines() if ": " in line)
             why = f"build.sh yield answered exit {ran.code}"
         except Refused as refused:
@@ -2979,13 +3085,16 @@ class Service:
 
     def asked_on(self, asked, machine, words, alive):
         command = ["sh", BUILD_SH, *words]
-        return self.desktop.ran(command, alive) if machine == DESKTOP else self.executed(asked, machine, None, command, alive=alive)
+        return self.runners[machine].ran(command, alive) if machine in self.runners else self.executed(asked, machine, None, command, alive=alive)
 
     def ahead(self, asked, machine, words, alive):
         try:
             ran = self.asked_on(asked, machine, ["ahead", *words], alive)
         except Refused as refused:
             return None, refused.sentence
+        paused = AHEAD_PAUSED.fullmatch(ran.out.strip()) if ran.code == 0 else None
+        if paused is not None:
+            return None, f"build.sh ahead on pod {machine} says its {paused.group(1).decode()} runs wait on its pause"
         found = AHEAD.fullmatch(ran.out.strip()) if ran.code == 0 else None
         if found is None:
             return None, f"build.sh ahead on pod {machine} answered exit {ran.code} with no ahead line"
@@ -2993,15 +3102,15 @@ class Service:
         return (found.group(1).decode(), int(found.group(2)), int(ends) if ends and ends != b"-" else None), None
 
     def on(self, asked, machine, words, alive):
-        if machine == DESKTOP and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in words):
-            self.follow_desktop()
+        if machine in self.runners and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in words):
+            self.follow(machine)
         command = ["sh", BUILD_SH, *words]
-        if machine == DESKTOP:
-            return self.desktop.ran(command, alive)
+        if machine in self.runners:
+            return self.runners[machine].ran(command, alive)
         return self.executed(asked, machine, None, command, alive=alive)
 
     def routed(self, asked, command, alive):
-        words = desktop_words(command, BUILDS)
+        words = runner_words(command, BUILDS)
         settings = list(itertools.takewhile(SETTING.fullmatch, words))
         called = words[len(settings) :]
         first = called[0] if called else ""
@@ -3010,7 +3119,7 @@ class Service:
         if first == "bump" and len(called) > 1:
             return self.bumped(asked, settings, called[1:], alive)
         if first in MACHINE_WIDE:
-            raise Refused(400, f"build.sh {first} acts on one machine, so name it (pod {DESKTOP}, or the warm pod) rather than pod {BUILDS}")
+            raise Refused(400, f"build.sh {first} acts on one machine, so name it ({self.machines()}, or the warm pod) rather than pod {BUILDS}")
         if first in ADDRESSED:
             named = called[1] if len(called) > 1 else ""
             if not named:
@@ -3035,7 +3144,7 @@ class Service:
         machine, idle = self.pick(asked, words, alive)
         named = named_commit(called)
         if named is not None:
-            held = self.holding(asked, machine, *named, alive)
+            held = self.holding(asked, machine, *named, words, alive)
             idle = idle and held == machine
             machine = held
         if not self.still_open(asked):
@@ -3045,24 +3154,25 @@ class Service:
             if idle:
                 self.reroute_after(asked)
         except Refused as refused:
-            if machine != DESKTOP:
+            if machine not in self.runners:
                 raise
-            if isinstance(refused, Cut):
-                self.record(words, DESKTOP, refused.out)
+            lost = machine
+            started = STARTED.search(refused.out) if isinstance(refused, Cut) else None
+            run = f"{lost}:{started.group(1).decode(errors='replace')}" if started else None
             if isinstance(refused, Cut) and verb not in READ_ONLY:
-                started = STARTED.search(refused.out)
-                run = f"{DESKTOP}:{started.group(1).decode(errors='replace')}" if started else None
                 say("pods_parked", verb=json.dumps(verb), run=run or "unstarted", detail=json.dumps(refused.sentence))
-                where = f"build.sh status {run}" if run else f"build.sh busy on pod {DESKTOP}"
-                raise Refused(502, f"{refused.sentence}; build.sh {verb} changes things, so it is parked rather than run on another machine{f' as run {run}' if run else ''}: once pod {DESKTOP} answers, read {where} before calling it again") from refused
+                where = f"build.sh status {run}" if run else f"build.sh busy on pod {lost}"
+                raise Refused(502, f"{refused.sentence}; build.sh {verb} changes things, so it is parked rather than run on another machine{f' as run {run}' if run else ''}: once pod {lost} answers, read {where} before calling it again") from refused
+            if not self.still_open(asked):
+                raise Refused(502, f"{refused.sentence}; request {asked['request']}, which asked for this, is gone, so it was not run on another machine{f', and run {run} may still run there' if run else ''}") from refused
             try:
                 machine = self.warm()
             except Refused as unnamed:
-                started = STARTED.search(refused.out) if isinstance(refused, Cut) else None
-                run = f" as run {DESKTOP}:{started.group(1).decode(errors='replace')}, which may still run there" if started else ""
-                say("pods_unrouted", reason="desktop_lost", detail=json.dumps(f"{refused.sentence}; {unnamed.sentence}"))
-                raise Refused(502, f"{refused.sentence}{run}; it was not run elsewhere, since {unnamed.sentence}: once pod {DESKTOP} answers, read build.sh {'status ' + DESKTOP + ':' + started.group(1).decode(errors='replace') if started else 'busy on pod ' + DESKTOP} before calling it again") from refused
-            say("pods_routed", to="warm", reason="desktop_lost", detail=json.dumps(refused.sentence))
+                say("pods_unrouted", reason="runner_lost", runner=lost, detail=json.dumps(f"{refused.sentence}; {unnamed.sentence}"))
+                still = f" as run {run}, which may still run there" if run else ""
+                where = f"status {run}" if run else f"busy on pod {lost}"
+                raise Refused(502, f"{refused.sentence}{still}; it was not run elsewhere, since {unnamed.sentence}: once pod {lost} answers, read build.sh {where} before calling it again") from refused
+            say("pods_routed", to="warm", reason="runner_lost", runner=lost, detail=json.dumps(refused.sentence))
             ran = self.launched_on(asked, machine, settings, words, alive)
         return on_machine(machine, ran)
 
@@ -3087,37 +3197,68 @@ class Service:
         return Ran(code, b"".join(reversed(outs)), "\n".join(reversed(errs)))
 
     def launched_on(self, asked, machine, settings, words, alive):
-        if "WAIT=1" not in settings:
-            ran = self.on(asked, machine, words, alive)
-            self.record(words, machine, ran.out)
-            return ran
+        held = "WAIT=1" in settings
         unheld = [word for word in settings if word != "WAIT=1"] + words[len(settings) :]
-        ran = self.on(asked, machine, unheld, alive)
+        try:
+            ran = self.on(asked, machine, unheld if held else words, alive)
+        except Cut as cut:
+            self.record(words, machine, cut.out)
+            return self.read_again(asked, machine, cut, held, alive)
         self.record(words, machine, ran.out)
         started = STARTED.search(ran.out)
-        if started is None:
+        if not held or started is None:
             return ran
         run = started.group(1).decode(errors="replace")
         try:
-            held = self.asked_on(asked, machine, ["wait", run], alive)
+            waited = self.asked_on(asked, machine, ["wait", run], alive)
         except Cut as cut:
-            raise Cut(cut.sentence, f"run {run}\n".encode() + cut.out) from cut
-        return Ran(held.code, f"run {run}\n".encode() + held.out, held.err)
+            return self.read_again(asked, machine, Cut(cut.sentence, f"run {run}\n".encode() + cut.out), held, alive)
+        return Ran(waited.code, f"run {run}\n".encode() + waited.out, waited.err)
 
-    def holding(self, asked, machine, repo, commit, alive):
+    def read_again(self, asked, machine, cut, held, alive):
+        started = STARTED.search(cut.out)
+        if started is None or machine not in self.runners:
+            raise cut
+        run = started.group(1).decode(errors="replace")
+        verb = "wait" if held else "status"
+        pause = self.retry_pause
+        attempts = 0
+        while True:
+            try:
+                read = self.runners[machine].ran(["sh", BUILD_SH, verb, run], alive)
+                break
+            except Cut as again:
+                attempts += 1
+                if attempts & (attempts - 1) == 0:
+                    say("pods_retried", attempts=attempts, reason="runner_cut", detail=json.dumps(again.sentence))
+                if not self.still_open(asked):
+                    raise cut from again
+                self.pause(pause)
+                pause *= 2
+            except Refused as refused:
+                raise cut from refused
+        if not held and not read.out.startswith(b"job "):
+            raise cut
+        say("pods_reread", run=json.dumps(f"{machine}:{run}"), verb=verb)
+        note = f"{cut.sentence}; then run {run} was read again through {machine}:{run}"
+        if held:
+            return Ran(read.code, f"run {run}\n".encode() + read.out, f"{note}\n{read.err}".rstrip("\n"))
+        return Ran(0, cut.out, f"{note}\n{read.err}".rstrip("\n"))
+
+    def holding(self, asked, machine, repo, commit, words, alive):
         if self.holds(asked, machine, repo, commit, alive) is not False:
             return machine
-        if machine == DESKTOP:
+        others = [name for name, runner in self.runners.items() if name != machine and runner.takes(words)]
+        if machine in self.runners:
             try:
-                other = self.warm()
+                others.append(self.warm())
             except Refused:
-                return machine
-        else:
-            other = DESKTOP
-        if self.holds(asked, other, repo, commit, alive) is not True:
-            return machine
-        say("pods_routed", to=DESKTOP if other == DESKTOP else "warm", reason="holds_commit", detail=json.dumps(f"{repo} {commit} is in pod {other}'s clone and not in pod {machine}'s"))
-        return other
+                pass
+        for other in others:
+            if self.holds(asked, other, repo, commit, alive) is True:
+                say("pods_routed", to=other if other in self.runners else "warm", reason="holds_commit", detail=json.dumps(f"{repo} {commit} is in pod {other}'s clone and not in pod {machine}'s"))
+                return other
+        return machine
 
     def holds(self, asked, machine, repo, commit, alive):
         try:
@@ -3187,7 +3328,7 @@ class Service:
 
     def holder(self, asked, run, alive):
         unasked, lacking = [], []
-        for machine in (DESKTOP, None):
+        for machine in (*self.runners, None):
             where = f"pod {machine}" if machine else "the warm pod"
             try:
                 if machine is None and not self.warm_pod:
@@ -3211,14 +3352,14 @@ class Service:
 
     def status(self, name):
         if name == BUILDS:
-            raise Refused(400, f"pod {BUILDS} routes build.sh to the machine where it ends first and is no pod itself: read pod {DESKTOP} or the warm pod")
-        if name == DESKTOP:
-            return 200, {"pod": desktop_view(self.desktop.state())}
+            raise Refused(400, f"pod {BUILDS} routes build.sh to the machine where it ends first and is no pod itself: read {self.machines()} or the warm pod")
+        if name in self.runners:
+            return 200, {"pod": runner_view(name, self.runners[name].state())}
         return 200, {"pod": view(self.pod(name))}
 
     def logs(self, name, query):
-        if name == DESKTOP:
-            return 200, self.desktop.logs(log_options(query))
+        if name in self.runners:
+            return 200, self.runners[name].logs(log_options(query))
         ran = self.kube.logs(name, log_options(query))
         if ran.code != 0:
             raise kube_refusal(ran, f"pod {name}'s logs were not read")
@@ -3226,54 +3367,54 @@ class Service:
 
     def wait(self, name, query):
         every = wait_every(query)
-        if name == DESKTOP:
-            return 200, Stream(self.desktop_waited(self.desktop.follow(every), every))
+        if name in self.runners:
+            return 200, Stream(self.runner_waited(name, self.runners[name].follow(every), every))
         return 200, Stream(self.waited(name, self.pod(name), every))
 
-    def follow_desktop(self):
+    def follow(self, name):
         with self.lock:
-            if self.desktop_follower is None:
-                self.desktop_follower = threading.Thread(target=self.followed_desktop, args=(self.clock(), self.wall()), daemon=True)
-                self.desktop_follower.start()
-        self.desktop_wanted.set()
+            if name not in self.followers:
+                self.followers[name] = threading.Thread(target=self.followed, args=(name, self.clock(), self.wall()), daemon=True)
+                self.followers[name].start()
+        self.wanted[name].set()
 
-    def followed_desktop(self, begun, wall):
+    def followed(self, name, begun, wall):
         since = begun
         reached = False
         pause = self.retry_pause
         while True:
             asked = self.clock()
             if not reached:
-                since, reached = self.runner_began(since, begun, wall)
+                since, reached = self.runner_began(name, since, begun, wall)
                 if reached:
-                    self.caught_up(math.ceil(asked - since))
+                    self.caught_up(name, math.ceil(asked - since))
             heard = []
             try:
-                process = self.desktop.tail(math.ceil(asked - since))
+                process = self.runners[name].tail(math.ceil(asked - since))
             except Refused as refused:
-                say("pods_unfollowed", pod=DESKTOP, detail=json.dumps(refused.sentence))
+                say("pods_unfollowed", pod=name, detail=json.dumps(refused.sentence))
             else:
-                concerned = self.warm_requester()
+                concerned = self.warm_requester(name)
                 with process.stdout:
-                    held = self.notifier.lines(DESKTOP, None, heard_in(process.stdout, heard), unvouched=True, concerned=concerned)
-                say("pods_unfollowed", pod=DESKTOP, code=process.wait(), already_posted=held)
+                    held = self.notifier.lines(name, None, heard_in(process.stdout, heard), unvouched=True, concerned=concerned)
+                say("pods_unfollowed", pod=name, code=process.wait(), already_posted=held)
             if heard:
                 since, pause = asked, self.retry_pause
-            self.rest(pause)
+            self.rest(name, pause)
             if not heard:
                 pause *= 2
-            self.desktop_wanted.clear()
+            self.wanted[name].clear()
 
-    def caught_up(self, window):
+    def caught_up(self, name, window):
         try:
-            logged = self.desktop.logs([f"--since={window}s"])
+            logged = self.runners[name].logs([f"--since={window}s"])
         except Refused as refused:
-            say("pods_uncaught", pod=DESKTOP, detail=json.dumps(refused.sentence))
+            say("pods_uncaught", pod=name, detail=json.dumps(refused.sentence))
             return
-        self.notifier.caught_up(DESKTOP, logged.splitlines(keepends=True))
+        self.notifier.caught_up(name, logged.splitlines(keepends=True))
 
     def called(self, asked, name, command):
-        settings = build_settings(command, name in (DESKTOP, BUILDS))
+        settings = build_settings(command, name in self.runners or name == BUILDS)
         if settings is None:
             return command
         if any(word.startswith(CALLER_WORD) for word in settings):
@@ -3300,31 +3441,31 @@ class Service:
             raise Refused(502, f"egress was not asked who sent request {asked['request']}: {why}")
         return sender_of(reply.out)
 
-    def warm_requester(self):
+    def warm_requester(self, name):
         if not self.warm_pod:
             return None
         try:
             return requester_of(self.pod(self.warm()).get("metadata", {}).get("labels") or {})
         except Refused as refused:
-            say("pods_unconcerned", pod=DESKTOP, detail=json.dumps(refused.sentence))
+            say("pods_unconcerned", pod=name, detail=json.dumps(refused.sentence))
             return None
 
-    def runner_began(self, since, begun, wall):
+    def runner_began(self, name, since, begun, wall):
         try:
-            said = self.desktop.state()
+            said = self.runners[name].state()
         except Refused as refused:
-            say("pods_unresumed", pod=DESKTOP, detail=json.dumps(refused.sentence))
+            say("pods_unresumed", pod=name, detail=json.dumps(refused.sentence))
             return since, False
         if said.get("started") is None:
-            say("pods_unresumed", pod=DESKTOP, detail=json.dumps("the desktop's ping names no start time"))
+            say("pods_unresumed", pod=name, detail=json.dumps(f"the {name}'s ping names no start time"))
             return since, False
         started = go_time(said["started"])
         if started is None:
-            say("pods_unresumed", pod=DESKTOP, detail=json.dumps(f"the desktop's ping names its start as {said['started']!r}, not as podman's StartedAt (date, time, offset, zone)"))
+            say("pods_unresumed", pod=name, detail=json.dumps(f"the {name}'s ping names its start as {said['started']!r}, not as podman's StartedAt (date, time, offset, zone)"))
             return since, False
         return min(since, begun - max(0.0, wall - started)), True
 
-    def desktop_waited(self, process, every):
+    def runner_waited(self, name, process, every):
         ended = queue.Queue()
 
         def drained():
@@ -3339,7 +3480,7 @@ class Service:
         finally:
             if process.poll() is None:
                 process.kill()
-        line = f"pod {DESKTOP}'s log stream ended (ssh exit {code}): {why or 'it said nothing'}"
+        line = f"pod {name}'s log stream ended (ssh exit {code}): {why or 'it said nothing'}"
         yield sse("ended", {"line": line, "exit_code": None, "pod": None})
 
     def waited(self, name, pod, every):
@@ -3375,8 +3516,8 @@ class Service:
         return ended_event(json.loads(ran.out))
 
     def delete(self, name):
-        if name == DESKTOP:
-            raise Refused(403, f"pod {DESKTOP} is orthory's desktop build runner, a machine and not a pod, so nothing deletes it")
+        if name in self.runners:
+            raise Refused(403, f"pod {name} is a build runner, a machine and not a pod, so nothing deletes it")
         ran = self.kube.delete(name)
         if ran.code != 0:
             raise kube_refusal(ran, f"pod {name} was not deleted")
@@ -3386,12 +3527,12 @@ class Service:
         asked = checked(body, EXEC, "an exec")
         command = self.called(asked_by, name, strings(asked.get("command", []), "command"))
         container = asked.get("container")
-        if name == DESKTOP and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in desktop_words(command)):
-            self.follow_desktop()
+        if name in self.runners and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in runner_words(command, name)):
+            self.follow(name)
         if "every" not in asked:
             return 200, exec_answer(name, answered(self.execution(asked_by, name, container, command).get()))
         every = from_one(asked["every"], "every")
-        if name not in (DESKTOP, BUILDS):
+        if name not in self.runners and name != BUILDS:
             self.pod(name)
         return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
 
@@ -3628,7 +3769,7 @@ class Service:
 
     def replaced(self, target, refusal):
         segments = [segment for segment in urlsplit(target).path.split("/") if segment]
-        if refusal.status != 404 or segments[:2] != ["v1", "pods"] or len(segments) < 3 or segments[2] in (DESKTOP, BUILDS) or not self.warm_pod:
+        if refusal.status != 404 or segments[:2] != ["v1", "pods"] or len(segments) < 3 or segments[2] in self.runners or segments[2] == BUILDS or not self.warm_pod:
             return refusal
         name = segments[2]
         try:
@@ -3928,12 +4069,16 @@ def main():
     fetching = Fetching(image=named["PODS_OUT_IMAGE"], node=named["PODS_NODE"], forge=named["PODS_FORGE"], block_ms=block_ms)
     kube = Kube(shlex.split(os.environ.get("PODS_KUBECTL", "kubectl")), os.environ.get("PODS_NAMESPACE", "agents"))
     signer = Signer(shlex.split(os.environ.get("PODS_DUCKTAPE", "ducktape")), Path(os.environ.get("PODS_KEYS", "/keys")))
-    desktop = Desktop(Path(os.environ.get("PODS_DESKTOP", DESKTOP_KEYS)))
-    service = Service(kube, signer, fetching, Stats(), Api(), desktop, os.environ.get("PODS_WARM_POD"))
+    try:
+        runners = runners_of(os.environ.get("PODS_RUNNERS", f"{DESKTOP}={DESKTOP_KEYS}"), signer)
+    except ValueError as error:
+        sys.exit(str(error))
+    service = Service(kube, signer, fetching, Stats(), Api(), runners, os.environ.get("PODS_WARM_POD"))
     threading.Thread(target=service.notifier.watch, daemon=True).start()
     threading.Thread(target=service.sweeper, daemon=True).start()
-    if desktop.held():
-        service.follow_desktop()
+    for runner in runners:
+        if runner.held():
+            service.follow(runner.name)
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), handler(service))
     try:

@@ -5,8 +5,9 @@ cluster through the network's egress. It makes pods with fetched inputs and exec
 them, either whole or streamed. It also serves logs and a wait that streams until a pod
 ends, applies and deletes manifests, passes Kubernetes API calls through inside one
 namespace, puts a pod's outputs as blobs or files, packs a pod's commit for a forge push,
-posts when work ends, and reports usage. The reserved pod `desktop` is a build runner on
-another machine, reached by ssh.
+posts when work ends, and reports usage. The build runners `PODS_RUNNERS` names (`desktop`
+unless it names others) are machines reserved as pods of their names, reached by ssh, straight
+or through a member node's halo forward.
 
 - The contract agents call: `/shared/jobs/J-016-deploys-and-pods/pods-contract.md` in the
   network's files (endpoints, bodies, answers, refusals), and the routes in
@@ -52,10 +53,15 @@ another machine, reached by ssh.
   it starts, and every retry pause starts there; it stops, saying why, when that node
   doesn't answer.
 - **Optional: the warm pod for `builds`.** `PODS_WARM_POD`, a files path whose one line names
-  the warm pod `builds` falls back to. Unset, `builds` answers 503 when the desktop isn't free.
-- **Optional: the desktop runner.** The Secret `desktop-runner` in namespace `pods` (files
-  `id_ed25519`, `id_ed25519.pub`, `known_hosts`, `hosts`, `user`), mounted at `/desktop`.
-  Without it, pod `desktop` answers 503.
+  the warm pod `builds` falls back to. Unset, `builds` answers 503 when no runner is free.
+- **Optional: the build runners.** `PODS_RUNNERS`, `<name>=<keys path>` words in tie order
+  (`desktop=/desktop` when unset), each keys path a mounted Secret (files `id_ed25519`,
+  `id_ed25519.pub`, `known_hosts`, `user`, and `hosts` or `forward`, optionally `kinds`):
+  duckpond's are `desktop-runner` at `/desktop` and `runner-zk-dev` at `/runners/zk-dev`. A
+  runner with a `forward` file is reached through `ducktape forward` (from `PODS_DUCKTAPE`,
+  signed with the service's key from `blob-key`), so the image's CLI must carry that verb and
+  the serving node's `forward.toml` must list the service's key among that service's
+  `signers`. Without its Secret, a runner's pod answers 503.
 
 ## Stand one up for another network
 

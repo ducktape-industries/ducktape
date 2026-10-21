@@ -198,14 +198,29 @@ one up for another network.
   that isn't also JSON is a 400), and one whose operation
   declares no body (a proxy) passes as sent.
   `server-test.py` covers them.
-- The reserved pod `desktop` is orthory's desktop build runner, a rootless
-  podman container that runs the warm pod's `build.sh`. The service
-  reaches it by ssh with the Secret `desktop-runner` in namespace `pods`
-  (files `id_ed25519`, `known_hosts`, `hosts`, `user`; `hosts` lists, split by any whitespace, the
-  addresses to try in order, and the one that last answered is tried first),
-  whose key may only run the desktop's `gate` command. `pods/desktop` answers
+- The build runners `PODS_RUNNERS` names (`<name>=<keys path>` words, split
+  by whitespace, in tie order; `desktop=/desktop` when unset) are machines,
+  each a rootless podman container that runs the warm pod's `build.sh`,
+  reserved as pods of their names (duckpond: `desktop`, orthory's desktop,
+  and `zk-dev`, eddy's dev box). The service reaches each by ssh with the
+  files in its keys path, a Secret in namespace `pods` (`desktop-runner` at
+  `/desktop`, `runner-zk-dev` at `/runners/zk-dev`; files `id_ed25519`,
+  `known_hosts`, `user`, and `hosts` or `forward`). `hosts` lists, split by
+  any whitespace, the addresses to try in order, and the one that last
+  answered is tried first. `forward` names a member node's key and a service
+  that node's `forward.toml` offers: ssh then reaches the runner through
+  `ducktape forward <key> <service>` as its `ProxyCommand` (the
+  `PODS_DUCKTAPE` CLI, signed with the service's own key, which that
+  service's `signers` must list), and `known_hosts` names the runner's host
+  key under the runner's name; while the service holds no key the runner
+  answers 503. The runner's key may only run that machine's `gate` command.
+  A runner whose keys hold a `kinds` file takes only the run kinds it lists
+  (build.sh's third word, or `apply`; an `sh` only with `MOVABLE=1`):
+  `builds` never sends it another kind, and one named straight at it is
+  refused with 400, while calls that start no run (`status`, `busy`, `ahead`,
+  …) go as ever. `pods/<runner>` answers
   the runner's `ping` as a pod that runs (503 while it is down or
-  unreachable); `pods/desktop/exec` runs only `build.sh`: the command
+  unreachable); `pods/<runner>/exec` runs only `build.sh`: the command
   `["sh", "/var/tmp/warm/build.sh", ...]`, or a script of plain words that
   calls it (KEY=VALUE words first, no expansion, operator or comment outside
   quotes), and refuses anything else with 400. An exec is sent to the next
@@ -239,13 +254,13 @@ one up for another network.
   chat refused) is final: it is not offered again, not even after a restart. Of the rest, each stream's end line (`pods_unfollowed`) counts them
   as `already_posted`, with no line of its own for each. While the ping names no start, or one not in
   that shape, it reads from then on, logs `pods_unresumed` with why, and asks again on the next join. Each `ducktape-notify`
-  line is a chat notice in its channel (subject `desktop`, the line as its
-  detail, grouped by the run it names as `desktop:<run>`), for the warm pod's
+  line is a chat notice in its channel (subject the runner's name, the line as its
+  detail, grouped by the run it names as `<runner>:<run>`), for the warm pod's
   requester (the pod `PODS_WARM_POD` names; for no one while none is named,
   or while that pod can't be read, which logs `pods_unconcerned` with why),
   posted as `pods` where the channel exists, is not archived and is open to anyone
-  (a desktop run has no requester to vouch for a members-only room). A
-  build.sh call (on pod `builds` or `desktop`, as an argv or a plain-words
+  (a runner's run has no requester to vouch for a members-only room). A
+  build.sh call (on pod `builds` or a runner, as an argv or a plain-words
   script, or on any pod as the argv `sh /var/tmp/warm/build.sh …`) gets the
   word `CALLER=<account>` from the service: the account egress says sent its
   request (egress `Sender { id }`, for the `ducktape-request` number), so a
@@ -256,61 +271,72 @@ one up for another network.
   `ducktape-notify` line is, for that account in place of the requester; an
   account that isn't a u64 (identity's account number) makes it no
   notify-for line at all. `CALLER` comes from egress only on those calls:
-  `desktop`, `builds`, and a pod's bare build.sh argv. Anything else a pod
+  the runners, `builds`, and a pod's bare build.sh argv. Anything else a pod
   runs (a `sh -c` script on any other pod, say) goes as it came, so a pod's
   own output can name any account in a notify-for line, as a chat mention can
   name anyone.
 - The reserved pod `builds` routes a build.sh call to the machine where it
-  ends first: `desktop` when its `ping` says it is up, its `busy` reads (a
-  list of `build.sh busy` lines, `busy_exit` 0) and
-  no quiet run or stray lock holder is among them (a line naming no weight
-  build.sh prints, such as a piece of a call whose words hold a line
-  break, is skipped), and its `build.sh ahead
-  <the call's words>` (`ahead <lane> <n> <finish>`: the lane the call runs
-  in, how many runs in flight there it would wait for, and the seconds until
-  it would end there by that machine's own run times, or `-` while that
-  machine has none to go by; an older build.sh says no finish) is 0, or its
-  finish is no later than the warm pod's (the warm pod the files path
-  `PODS_WARM_POD` names, duckpond: `/shared/tools/warm-pod`), else the warm
-  pod (`pods_routed reason=sooner_end`). While either machine says no
-  finish, the counts decide instead: the desktop's no more than the warm
-  pod's (`reason=shorter_wait` otherwise). A machine that can't say
-  its wait leaves the run to the other, and a desktop that can't say its
-  wait, or that its ping finds busy, keeps the run when the warm pod can't
-  be named (an empty or unread warm-pod file, as while the warm pod is
-  recreated) or can't say its own wait (a name of a pod that is gone):
-  only a desktop that is down then leaves a call nowhere to run (503, or
-  the file's 502). A desktop run whose session was cut while no warm pod
-  is named answers 502 with both reasons, naming the run when it started
-  (`pods_unrouted`). A call naming a commit id (7 to 40 hex digits, an
+  ends first. It asks each runner that takes the call's kind, in
+  `PODS_RUNNERS`' order: one whose `ping` says it is up, whose `busy` reads
+  (a list of `build.sh busy` lines, `busy_exit` 0) with no quiet run or
+  stray lock holder among them (a line naming no weight build.sh prints,
+  such as a piece of a call whose words hold a line break, is skipped), and
+  whose `build.sh ahead <the call's words>` (`ahead <lane> <n> <finish>`:
+  the lane the call runs in, how many runs in flight there it would wait
+  for, and the seconds until it would end there by that machine's own run
+  times, or `-` while that machine has none to go by; an older build.sh
+  says no finish) is 0 takes the run at once. Otherwise the run goes where
+  its finish is soonest, among the runners that said one and the warm pod
+  (the warm pod the files path `PODS_WARM_POD` names, duckpond:
+  `/shared/tools/warm-pod`), ties going to the runner named first and the
+  warm pod last (`pods_routed reason=sooner_end` when that is not the first
+  runner that said one). While any of them says no finish, the counts
+  decide instead (`reason=shorter_wait`). A runner that is down or can't be
+  reached (`runner_unready`), whose ping finds it busy (`runner_busy`), or
+  that can't say its wait (`runner_unasked`; `ahead <lane> paused` while
+  its own pause holds that lane's runs back counts so) is passed over, each
+  logged once per call with `runner=<its name>`. The warm pod is asked its
+  own wait only while some runner said one or was busy, and when no runner
+  could be asked at all it takes the run unasked. A runner passed over as
+  busy or unasked, or one that said its wait, keeps the run when the warm
+  pod can't be named (an empty or unread warm-pod file, as while the warm
+  pod is recreated) or can't say its own wait (a name of a pod that is
+  gone) (`warm_unasked`): only runners all down then leave a call nowhere
+  to run (503, or the file's 502). A runner's run whose session was cut
+  while no warm pod is named answers 502 with both reasons, naming the run
+  when it started (`pods_unrouted reason=runner_lost`). A call naming a commit id (7 to 40 hex digits, an
   apply's base too) asks the picked machine's `build.sh holds <repo>
-  <commit>` (its clone, no fetch); when that machine lacks it and the other
-  holds it, the run goes to the other (`pods_routed reason=holds_commit`), so
+  <commit>` (its clone, no fetch); when that machine lacks it, the run goes
+  to the first other machine whose clone holds it (the runners that take
+  its kind in order, then the warm pod; `pods_routed reason=holds_commit`), so
   a commit made on one machine (an apply not pushed yet) builds where it
   is; when neither holds it the run goes where it ends first and fetches
   it from forge, and a commit forge lacks too ends saying to push it
   first. `reroute` (build.sh's
-  words `reroute` alone) moves the warm pod's queued runs to the desktop
-  while the desktop would start them sooner: the warm pod's `build.sh
+  words `reroute` alone) moves the warm pod's queued runs to the runners
+  that would start them sooner, each to the runner, of those that take its
+  kind and say that lane's wait (`<lane> paused` says none), whose wait is
+  least, ties to the runner named first: the warm pod's `build.sh
   movable` (the queued runs another machine may take, in lane order: the
-  read-only verbs, and an `sh` or `shot` whose call set `MOVABLE=1`), the
-  desktop's `build.sh lanes`, one desktop `build.sh take` of every run it
-  moves (after following the desktop's log when a moved run names NOTIFY,
-  so its end posts; a run naming a commit the desktop's clone lacks after
+  read-only verbs, and an `sh` or `shot` whose call set `MOVABLE=1`), each
+  runner's `build.sh lanes` (a runner that can't answer is passed over), one
+  `build.sh take` on each runner of every run it moves there (after
+  following that runner's log when a moved run names NOTIFY, so its end
+  posts; a run naming a commit that runner's clone lacks after
   one fetch of forge's branches, such as an apply made on the warm pod and
   never pushed, is not started there: take answers `lacks <commit>: …` and
   the run stays queued on the warm pod, kept with that line), and one warm `build.sh moved` ending each there and
   naming its replacement, asked once more for the runs its answer leaves
-  out. A run that started meanwhile stays, and its desktop copy ends with
+  out. A run that started meanwhile stays, and its runner's copy ends with
   `build.sh yield`, posting no end. A handful of execs, however many runs,
   and one line per run moved or kept with why: `unknown` names both runs
   and why when the warm pod never says, `unstopped` a copy yield did not
   end, a copy that had already ended is named so (both runs then post an
   end), and
-  a take cut mid-call answers 502 naming the runs it may have started. A builds call that finds the desktop's lane free reroutes
+  a take cut mid-call answers 502 naming the runs it may have started. A builds call that finds a runner's lane free reroutes
   once it is sent, one reroute at a time (`pods_rerouted`, or
   `pods_reroute_failed` with its sentence). A call whose request egress says is gone runs nothing (502), and one egress can't be asked about runs and logs `pods_request_unchecked`. builds keeps each run it starts under the call's words (settings included), so a later call of the same words (a retry whose answer never came back) gets that run while the run's machine's `build.sh claim` says `same` (queued or running, the same call and JOB, and a branch it names still at the run's commit), following `moved` to the run that stands for it, and also while that machine can't be asked or forge can't say (`pods_run_claimed`; a `WAIT=1` call then waits on it); otherwise it starts its own (`pods_run_unclaimed`). As exec starts and ends wake the sweeper, one `build.sh ended` per machine holding such runs drops each that ended and follows each moved, keeping those of a machine it can't ask, and dropping those of a pod that is gone. Its exec takes build.sh's words as
-  `desktop` does; the answer's `run <id>` reads `run <machine>:<id>` and its
+  a runner does; the answer's `run <id>` reads `run <machine>:<id>` and its
   stderr starts `builds: on <machine>`. A call to any other pod that
   answers 404 names the warm pod `PODS_WARM_POD` names now, when that is
   another pod (`if pod X was the warm pod, it has been replaced: the warm
@@ -318,7 +344,7 @@ one up for another network.
   the new one. `status`, `log`, `stop`, `wait` and
   `requeue` name their run as `<machine>:<run>` and go to that machine, or
   by its bare id (as build.sh's `read it with:` line and NOTIFY name it),
-  and go to the first machine, the desktop then the warm pod, whose
+  and go to the first machine, the runners in order then the warm pod, whose
   `build.sh status` of it starts with its `job` line (a bare `status` answers
   that read itself): 404 only when every machine answered `no run`, else
   503 naming each machine that could not be asked or answered otherwise.
@@ -332,21 +358,33 @@ one up for another network.
   machine`) to bump it there; a bare `bump` and the other
   calls that act on one machine (`busy`, `prune`, `jobs`,
   `heavy-runs`, `disk-targets`, `queue-out`, `queue-in`, `self-update`,
-  `worktree`, `measure`) are refused with 400, since they name a machine. A run the
-  desktop never started (unreachable, down) goes to the warm pod. A held run
-  (`WAIT=1`, or a streamed exec) whose desktop session was cut runs again on
-  the warm pod when it only reads (`gates`, `lint`, `check`, `lane`,
-  `lane-test`, `test`, `show`, `grep`, `schema-diff`), and any other is
-  parked: 502 naming its run (`desktop:<id>`, when the run had started) and
-  `build.sh status` of it to read once the desktop answers, before calling
-  it again, and the event `pods_parked`. Routing logs `pods_routed` with a
-  token (`desktop_unready`, `desktop_busy`, `desktop_lost`,
-  `desktop_unasked`, `warm_unasked`, `shorter_wait`) and the
+  `worktree`, `measure`) are refused with 400, since they name a machine. A run a
+  runner never started (unreachable, down) goes to the warm pod. A run whose
+  session to a runner was cut after build.sh printed its run (`run <id>`;
+  a held `WAIT=1` call's wait too), whether through `builds` or straight at
+  the runner, is read again through `<runner>:<id>`: a held call waits on
+  it again (`build.sh wait`), any other reads its `status`, each cut again
+  tried anew while its request waits, the pause doubling from the block
+  time (`pods_retried reason=runner_cut`, then `pods_reread run= verb=`), so
+  a forward stream a halo punch replaced, which cuts the ssh session while
+  the run goes on, costs no second run. When that runner can't be asked
+  again, or the run never printed its id, a held run (`WAIT=1`, or a
+  streamed exec) whose request still waits runs again on the warm pod when it only reads (`gates`,
+  `lint`, `check`, `lane`, `lane-test`, `test`, `show`, `grep`,
+  `schema-diff`), and any other is parked: 502 naming its run
+  (`<runner>:<id>`, when the run had started) and `build.sh status` of it to
+  read once that runner answers, before calling it again, and the event
+  `pods_parked`. Routing logs `pods_routed` with a token (`runner_unready`,
+  `runner_busy`, `runner_unasked` and `runner_lost`, each with `runner=`;
+  `warm_unasked`, `sooner_end`, `shorter_wait`, `holds_commit`) and the
   sentence in `detail`. `GET pods/builds` is refused: it is no pod.
 
   ```sh
   kubectl -n pods create secret generic desktop-runner --from-file=id_ed25519=KEY \
     --from-file=id_ed25519.pub=KEY.pub --from-file=known_hosts=KNOWN_HOSTS --from-file=hosts=HOSTS --from-file=user=USER
+  kubectl -n pods create secret generic runner-zk-dev --from-file=id_ed25519=KEY \
+    --from-file=id_ed25519.pub=KEY.pub --from-file=known_hosts=KNOWN_HOSTS --from-file=forward=FORWARD \
+    --from-file=user=USER --from-file=kinds=KINDS
   ```
 
 - `pods/NAME/wait?every=SECONDS` and an exec that names `every` answer
@@ -491,12 +529,12 @@ one up for another network.
   pod's processes no memory once full; the reply warns of each, saying the
   processes are OOM-killed. A reply with nothing to warn of has no
   `warnings` field.
-- Each line a followed pod (or the desktop runner) prints that reads
+- Each line a followed pod (or a build runner) prints that reads
   `ducktape-report <repo> <commit> <context> passed|failed <run> [<path>...]`
   (build.sh's lane: its verdict, and the paths it read) is a forge-reach
   `Report` the service sends as its own account: url `<pod>:<run>`, reach the
   paths (none is `""`, the whole tree), no change. It is sent only when the
-  line came from a build machine (the desktop runner, or the pod
+  line came from a build machine (a build runner, or the pod
   `PODS_WARM_POD` names) and that machine's `build.sh status <run>` records a
   lane run of that repo and commit (`run <run>: <repo> <commit>, slot …,
   lane`) that ended with the line's verdict (`GATES ok`, or `GATES FAIL:`) and
@@ -514,7 +552,7 @@ one up for another network.
   `pods_uncaught` and marks nothing). So a line echoed in an agent's pod, or
   by an `sh` run in the warm pod, reports nothing. The record is the build
   machine's own files, so the check trusts anyone who can run commands on the
-  two build machines: it guards against mistakes, not against a forged run
+  build machines: it guards against mistakes, not against a forged run
   directory.
 - A pod created with a `notify` (a chat channel, and optionally a thread in
   it) gets one chat notice there when it ends (chat `Notify`: kind `pod`,
@@ -531,7 +569,7 @@ one up for another network.
   start, or the service's own), one read of that log finds the newest line
   chat holds, asking from the newest line back, and every line up to it
   counts as posted with no ask of its own (`pods_caught_up pod=
-  already_posted= asked=`, as for the desktop; a log it can't read, or a
+  already_posted= asked=`, as for a runner; a log it can't read, or a
   chat ask that fails during the walk, logs `pods_uncaught` with why, and
   each line is asked as it comes). A pod that ends before the service saw it run, or while the
   service was down, has its log read before its end post. Every post, the

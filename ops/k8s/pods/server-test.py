@@ -246,9 +246,13 @@ class Signer:
         self.request = ran(OPEN)
         self.sender = ran(server.u8(server.EGRESS_SENDER) + server.u8(0))
         self.senders = []
+        self.ducktape = ["ducktape", "--workspace", "/home/pods", "--node", "https://node.example"]
 
     def held(self):
         return self.keyed
+
+    def env(self):
+        return {"DUCKTAPE_USER_KEY": "/keys/key", "DUCKTAPE_PASSWORD": "p"}
 
     def put(self, paths, kind):
         self.puts.append(([pathlib.Path(path).read_bytes() for path in paths], kind))
@@ -411,13 +415,13 @@ class Api:
 
 
 class Served(unittest.TestCase):
-    def serve(self, signer=None, desktop=None):
+    def serve(self, signer=None, runners=None):
         self.kube = Kube()
         self.kube.answer("cluster_kinds", ran(KINDS))
         self.signer = signer or Signer()
         self.stats = Stats()
         self.api = Api()
-        service = self.service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api, desktop)
+        service = self.service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api, runners)
         self.paused = []
         service.pause = self.paused.append
         quiet = type("Quiet", (server.handler(service),), {"log_message": lambda *_: None})
@@ -3009,24 +3013,32 @@ class Gate:
         self.processes = []
         self.followers = queue.Queue()
         self.spawned = queue.Queue()
+        self.envs = []
+        self.sequence = {}
+        self.by_host = {}
 
-    def run(self, argv):
+    def run(self, argv, env=None):
         host = argv[-2].split("@", 1)[1]
         words = json.loads(argv[-1])
         self.calls.append((host, words, argv))
+        self.envs.append(env)
+        key = " ".join(words[:2])
+        if self.sequence.get(key):
+            return self.sequence[key].pop(0)
+        answers = {**self.answers, **self.by_host.get(host, {})}
         if host in self.down:
             return ran(code=255, err=f"ssh: connect to host {host} port 22: No route to host")
         if words[:2] == ["exec", "ahead"] and host not in self.cut and host not in self.said:
-            return self.answers.get("ahead", NONE_AHEAD)
-        if len(words) > 1 and words[0] == "exec" and f"exec {words[1]}" in self.answers and host not in self.cut and host not in self.said:
-            return self.answers[f"exec {words[1]}"]
+            return answers.get("ahead", NONE_AHEAD)
+        if len(words) > 1 and words[0] == "exec" and f"exec {words[1]}" in answers and host not in self.cut and host not in self.said:
+            return answers[f"exec {words[1]}"]
         if host in self.cut or (words[1:2] and words[0] == "exec" and set(words) & self.cut_words):
             return ran(self.cut_said, code=255, err=f"Connection to {host} closed by remote host.")
         if host in self.said:
             return ran(code=255, err=self.said[host])
-        return self.answers.get(words[0], ran(b""))
+        return answers.get(words[0], ran(b""))
 
-    def spawn(self, argv):
+    def spawn(self, argv, env=None):
         words = json.loads(argv[-1])
         self.calls.append((argv[-2].split("@", 1)[1], words, argv))
         if any(word.startswith("--since=") for word in words):
@@ -3064,9 +3076,9 @@ class DesktopRunner(Streamed):
         for name, text in {"id_ed25519": "private", "known_hosts": "desk ssh-ed25519 AAAA", "hosts": "lan\ntail\nwifi\n", "user": "orthory\n"}.items():
             (self.keys / name).write_text(text)
         self.gate = Gate()
-        desktop = server.Desktop(self.keys, pathlib.Path(held.name) / "home", runner=self.gate.run, spawn=self.gate.spawn)
-        self.serve(desktop=desktop)
-        self.service.rest = self.paused.append
+        desktop = server.Runner("desktop", self.keys, pathlib.Path(held.name) / "home", runner=self.gate.run, spawn=self.gate.spawn)
+        self.serve(runners=[desktop])
+        self.service.rest = lambda name, pause: self.paused.append(pause)
         self.service.wall = lambda: RUNNER_STARTED
 
     def notified(self, line):
@@ -3149,7 +3161,7 @@ class DesktopRunner(Streamed):
         self.service.clock = lambda: 1000.0
         self.service.wall = lambda: RUNNER_STARTED + 599.5
         with unittest.mock.patch.object(server, "say") as said:
-            self.service.follow_desktop()
+            self.service.follow("desktop")
             self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=0s")
             self.gate.answers["ping"] = ran(UP)
             self.gate.followers.put(Followed(255, b""))
@@ -3161,7 +3173,7 @@ class DesktopRunner(Streamed):
         self.service.clock = lambda: 1000.0
         self.service.wall = lambda: RUNNER_STARTED + 599.5
         with unittest.mock.patch.object(server, "say") as said:
-            self.service.follow_desktop()
+            self.service.follow("desktop")
             self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=0s")
         said.assert_any_call("pods_unresumed", pod="desktop", detail=json.dumps("the desktop's ping names its start as '2026-10-20T03:58:31Z', not as podman's StartedAt (date, time, offset, zone)"))
 
@@ -3184,7 +3196,7 @@ class DesktopRunner(Streamed):
         self.service.clock = lambda: 1000.0
         self.service.wall = lambda: RUNNER_STARTED + 599.5
         with unittest.mock.patch.object(server, "say") as said:
-            self.service.follow_desktop()
+            self.service.follow("desktop")
             self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=600s")
             self.gate.followers.put(Followed(0, b"", logged))
             self.gate.spawned.get(timeout=10)
@@ -3218,7 +3230,7 @@ class DesktopRunner(Streamed):
         self.service.clock = lambda: 1000.0
         self.service.wall = lambda: RUNNER_STARTED + 599.5
         with unittest.mock.patch.object(server, "say") as said:
-            self.service.follow_desktop()
+            self.service.follow("desktop")
             self.gate.spawned.get(timeout=10)
             self.gate.followers.put(Followed(0, b"", logged))
             self.gate.spawned.get(timeout=10)
@@ -3232,7 +3244,7 @@ class DesktopRunner(Streamed):
         self.service.clock = lambda: 1000.0
         self.service.wall = lambda: RUNNER_STARTED + 599.5
         with unittest.mock.patch.object(server, "say") as said:
-            self.service.follow_desktop()
+            self.service.follow("desktop")
             self.assertEqual(self.gate.spawned.get(timeout=10)[1], "--since=600s")
         said.assert_any_call("pods_uncaught", pod="desktop", detail=json.dumps("the desktop's logs were not read: gate: refused bad_log_option: --since"))
 
@@ -3507,7 +3519,7 @@ class Builds(Streamed):
         with unittest.mock.patch.object(server, "say") as said:
             status, answer = self.built("programs", "dev", "gates")
         self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"))
-        said.assert_any_call("pods_routed", to="warm", reason="desktop_unasked", detail=json.dumps("build.sh ahead on pod desktop answered exit 2 with no ahead line"))
+        said.assert_any_call("pods_routed", to="warm", reason="runner_unasked", runner="desktop", detail=json.dumps("build.sh ahead on pod desktop answered exit 2 with no ahead line"))
         self.assertNotIn("secret.sh", repr(said.call_args_list))
 
     def test_a_warm_pod_that_cannot_say_its_wait_leaves_the_run_on_the_desktop(self):
@@ -3529,9 +3541,10 @@ class Builds(Streamed):
         self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "programs", "dev", "gates"]), (WARM, None, ["sh", BUILD, "wait", "w1"])])
         self.assertEqual(self.service.launched, {("WAIT=1", "programs", "dev", "gates"): (WARM, "w1")})
 
-    def test_a_run_that_changes_things_whose_desktop_session_broke_is_parked_with_its_run(self):
+    def test_a_run_that_changes_things_whose_desktop_session_broke_and_cannot_be_read_again_is_parked_with_its_run(self):
         self.gate.cut_words = {"apply"}
         self.gate.cut_said = b"run r7\n"
+        self.gate.sequence["exec wait"] = [ran(code=69, err="gate: runner_down")]
         with unittest.mock.patch.object(server, "say") as said:
             self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "WAIT=1", "apply", "programs", "dev", "/home/x/edit.sh"]}, 502, ["parked", "build.sh apply", "as run desktop:r7", "build.sh status desktop:r7"])
         self.assertEqual(self.warm_execs(), [])
@@ -3618,7 +3631,7 @@ class Builds(Streamed):
         self.kube.answer("exec", ran(b"ahead heavy 0\n"), ran(b"run w1\n"))
         with unittest.mock.patch.object(server, "say") as said:
             self.built("programs", "dev", "gates")
-        said.assert_any_call("pods_routed", to="warm", reason="desktop_busy", detail=json.dumps("the desktop's ping has busy as a str, not a list of lines"))
+        said.assert_any_call("pods_routed", to="warm", reason="runner_busy", runner="desktop", detail=json.dumps("the desktop's ping has busy as a str, not a list of lines"))
         self.assertNotIn("secret.sh", repr(said.call_args_list))
 
     def test_a_log_through_builds_keeps_its_lines_as_they_are(self):
@@ -3815,8 +3828,8 @@ class Builds(Streamed):
         self.assertEqual(seen, [{("WAIT=1", "programs", "dev", "check"): ("desktop", "r1")}])
         self.assertEqual([words for words in self.gate.words() if words[:1] == ["exec"] and words[1:2] != ["ahead"]], [["exec", "programs", "dev", "check"], ["exec", "wait", "r1"]])
 
-    def test_a_held_call_whose_desktop_session_broke_mid_wait_is_parked_with_its_run(self):
-        self.gate.cut_words = {"wait"}
+    def test_a_held_call_whose_desktop_session_broke_mid_wait_and_cannot_be_asked_again_is_parked_with_its_run(self):
+        self.gate.sequence["exec wait"] = [ran(code=255, err="Connection to lan closed by remote host."), ran(code=69, err="gate: runner_down")]
         self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "WAIT=1", "apply", "programs", "dev", "/home/x/edit.sh"]}, 502, ["parked", "as run desktop:r1"])
         self.assertEqual(self.service.launched[("WAIT=1", "apply", "programs", "dev", "/home/x/edit.sh")], ("desktop", "r1"))
 
@@ -4020,9 +4033,9 @@ class Builds(Streamed):
         self.kube.answer("exec", ran(f"move w1 heavy 3 {notifying}\n".encode()), ran(b"w1: moved to run desktop:r1\n"))
         self.gate.answers["exec lanes"] = ran(b"heavy 0\n")
         self.gate.answers["exec take"] = ran(b"run r1\n")
-        with unittest.mock.patch.object(self.service, "follow_desktop") as followed:
+        with unittest.mock.patch.object(self.service, "follow") as followed:
             self.built("reroute")
-        followed.assert_called_once_with()
+        followed.assert_called_once_with("desktop")
 
     def test_reroute_keeps_a_second_run_once_the_first_move_fills_the_desktops_lane(self):
         self.kube.answer("exec", ran(b"move w1 heavy 1 d29yZHMx\nmove w2 heavy 2 d29yZHMy\n"), ran(b"w1: moved to run desktop:r1\n"))
@@ -4076,7 +4089,8 @@ class Builds(Streamed):
         with unittest.mock.patch.object(server, "say") as said:
             status, answer = self.built("programs", "dev", "show", "README.md")
         self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run desktop:r1"))
-        said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=json.dumps("a process no run started holds one of the desktop's build locks; /shared/tools/warm-pod names no warm pod"))
+        said.assert_any_call("pods_routed", to="desktop", reason="runner_busy", runner="desktop", detail=json.dumps("a process no run started holds one of the desktop's build locks"))
+        said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=json.dumps("/shared/tools/warm-pod names no warm pod"))
 
     def test_a_warm_pod_file_naming_a_gone_pod_sends_a_run_the_desktop_judges_busy_to_the_desktop(self):
         self.gate.answers["ping"] = ran({**UP, "busy": ["stray 412 holds /var/tmp/warm/heavy.lock: sleep"]})
@@ -4091,6 +4105,7 @@ class Builds(Streamed):
         self.signer.head = ran(files_answer(b""))
         self.gate.cut_words = {"gates"}
         self.gate.cut_said = b"run r7\n"
+        self.gate.sequence["exec wait"] = [ran(code=69, err="gate: runner_down")]
         self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "WAIT=1", "programs", "dev", "gates"]}, 502, ["as run desktop:r7, which may still run there", "/shared/tools/warm-pod names no warm pod", "build.sh status desktop:r7"])
 
     def test_an_empty_warm_pod_file_sends_a_light_call_to_an_idle_desktop(self):
@@ -4104,6 +4119,262 @@ class Builds(Streamed):
 
     def test_it_is_no_pod_to_read(self):
         self.refused("GET", "/v1/pods/builds", None, 400, ["routes build.sh"])
+
+
+MEMBER = "ad8cb74e" + "0" * 56
+ZK_KINDS = "gates lint check lane lane-test test quick wasm shot sh\n"
+
+
+class Runners(Streamed):
+    def setUp(self):
+        held = tempfile.TemporaryDirectory()
+        self.addCleanup(held.cleanup)
+        root = pathlib.Path(held.name)
+        self.gate = Gate()
+        signer = Signer()
+        made = []
+        for name, files in (("desktop", {"hosts": "lan\n"}), ("zk-dev", {"forward": f"{MEMBER} builds-zk-dev\n", "kinds": ZK_KINDS})):
+            keys = root / name
+            keys.mkdir()
+            for file, text in {"id_ed25519": "private", "known_hosts": f"{name} ssh-ed25519 AAAA", "user": "runner\n", **files}.items():
+                (keys / file).write_text(text)
+            made.append(server.Runner(name, keys, root / f"{name}-home", runner=self.gate.run, spawn=self.gate.spawn, signer=signer))
+        self.serve(signer=signer, runners=made)
+        self.service.rest = lambda name, pause: self.paused.append(pause)
+        self.service.wall = lambda: RUNNER_STARTED
+        self.service.warm_pod = "/shared/tools/warm-pod"
+        self.signer.head = ran(files_answer(f"{WARM}\n".encode()))
+        self.gate.answers["exec"] = ran(b"run r1\nread it with: build.sh status r1\n")
+        self.gate.by_host["lan"] = {}
+        self.gate.by_host["zk-dev"] = {"exec": ran(b"run z1\nread it with: build.sh status z1\n"), "ping": ran({**UP, "runner": "zk-dev"})}
+        self.kube.answer("exec", ran(b"run w1\nread it with: build.sh status w1\n"))
+        self.service.reroute_after = lambda asked: None
+        self.service.claim = lambda asked, settings, words, alive: None
+
+    def built(self, *words, request=41):
+        return self.call("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, *words]}, headers=asked(request))
+
+    def warm_execs(self):
+        return [call[1:] for call in self.kube.calls if call[0] == "exec"]
+
+    def on(self, host):
+        return [words for called, words, _ in self.gate.calls if called == host]
+
+    def aheads(self, desktop, zk, warm):
+        self.gate.by_host["lan"]["ahead"] = ran(desktop)
+        self.gate.by_host["zk-dev"]["ahead"] = ran(zk)
+        self.kube.answer("exec", ran(warm), ran(b"run w1\n"))
+
+    def test_zk_dev_is_reached_through_its_member_node_s_forward_signed_with_the_service_s_key(self):
+        status, answer = self.call("GET", "/v1/pods/zk-dev")
+        self.assertEqual((status, answer["pod"]["name"], answer["pod"]["runner"]["runner"]), (200, "zk-dev", "zk-dev"))
+        host, words, argv = self.gate.calls[-1]
+        self.assertEqual((host, words, argv[-2]), ("zk-dev", ["ping"], "runner@zk-dev"))
+        self.assertIn(f"ProxyCommand=ducktape --workspace /home/pods --node https://node.example forward {MEMBER} builds-zk-dev", argv)
+        self.assertEqual(self.gate.envs[-1], self.signer.env())
+        self.assertEqual(self.call("GET", "/v1/pods/desktop")[0], 200)
+        self.assertEqual(self.gate.calls[-1][2][-2], "runner@lan")
+        self.assertFalse(any(option.startswith("ProxyCommand=") for option in self.gate.calls[-1][2]))
+        self.assertIsNone(self.gate.envs[-1])
+
+    def test_a_forward_runner_is_unreachable_while_the_service_holds_no_key_to_sign_with(self):
+        self.signer.keyed = False
+        self.refused("GET", "/v1/pods/zk-dev", None, 503, ["holds no key for pod zk-dev"])
+        self.assertEqual(self.on("zk-dev"), [])
+
+    def test_a_run_goes_to_the_runner_where_it_ends_first(self):
+        self.aheads(b"ahead heavy 3 900\n", b"ahead heavy 1 300\n", b"ahead heavy 2 600\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("JOB=j-1", "programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run zk-dev:z1"))
+        self.assertTrue(answer["stderr"].startswith("builds: on zk-dev"))
+        self.assertEqual(self.on("zk-dev")[-1], ["exec", "JOB=j-1", "programs", "dev", "gates"])
+        said.assert_any_call("pods_routed", to="zk-dev", reason="sooner_end", detail=json.dumps(f"heavy: ends in 900s on pod desktop, 300s on pod zk-dev, 600s on pod {WARM}"))
+
+    def test_without_every_finish_the_counts_decide_and_say_so(self):
+        self.aheads(b"ahead heavy 3 900\n", b"ahead heavy 1 -\n", b"ahead heavy 2 600\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run zk-dev:z1")
+        said.assert_any_call("pods_routed", to="zk-dev", reason="shorter_wait", detail=json.dumps(f"heavy: 3 ahead on pod desktop, 1 on pod zk-dev, 2 on pod {WARM}"))
+
+    def test_an_equal_end_goes_to_the_runner_named_first(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 1 500\n", b"ahead heavy 1 500\n")
+        self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+
+    def test_an_idle_runner_takes_the_run_and_the_warm_pod_is_not_asked(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 99999\n", b"ahead heavy 0 1\n")
+        self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run zk-dev:z1")
+        self.assertEqual(self.warm_execs(), [])
+
+    def test_a_kind_zk_dev_does_not_take_never_goes_there(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 1\n", b"ahead heavy 5 900\n")
+        for request, words in enumerate((("programs", "dev", "pack", "chat"), ("programs", "dev", "sh", "make x"), ("apply", "--no-gate", "programs", "dev", "/home/x/e.sh")), start=60):
+            self.kube.answer("exec", ran(b"ahead heavy 5 900\n"), ran(b"run w1\n"))
+            self.assertEqual(self.built(*words, request=request)[1]["stdout"].splitlines()[0], "run desktop:r1", words)
+        self.assertEqual(self.on("zk-dev"), [])
+        self.assertEqual(self.built("MOVABLE=1", "programs", "dev", "sh", "make check", request=70)[1]["stdout"].splitlines()[0], "run zk-dev:z1")
+
+    def test_a_kind_named_straight_at_zk_dev_is_refused_naming_its_kinds(self):
+        self.refused("POST", "/v1/pods/zk-dev/exec", {"command": ["sh", BUILD, "programs", "dev", "pack", "chat"]}, 400, ["pod zk-dev takes only the run kinds its kinds file lists", "not build.sh pack"])
+        self.assertEqual(self.on("zk-dev"), [])
+        self.assertEqual(self.call("POST", "/v1/pods/zk-dev/exec", {"command": ["sh", BUILD, "status", "z1"]}, headers=asked(42))[0], 200)
+        self.assertEqual(self.on("zk-dev"), [["exec", "status", "z1"]])
+
+    def test_a_zk_dev_that_cannot_be_reached_is_passed_over_and_named(self):
+        self.gate.down = {"zk-dev"}
+        self.aheads(b"ahead heavy 1 500\n", b"ahead heavy 0 1\n", b"ahead heavy 2 900\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+        said.assert_any_call("pods_routed", to="desktop", reason="runner_unready", runner="zk-dev", detail=unittest.mock.ANY)
+
+    def test_a_runner_whose_heavy_runs_wait_on_its_pause_is_passed_over(self):
+        self.aheads(b"ahead heavy 2 900\n", b"ahead heavy paused\n", b"ahead heavy 3 1200\n")
+        with unittest.mock.patch.object(server, "say") as said:
+            self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
+        said.assert_any_call("pods_routed", to="desktop", reason="runner_unasked", runner="zk-dev", detail=json.dumps("build.sh ahead on pod zk-dev says its heavy runs wait on its pause"))
+
+    def test_a_bare_run_id_is_found_on_zk_dev(self):
+        self.gate.by_host["lan"]["exec status"] = ran(code=2, err="build.sh: no run z1 in pod desktop")
+        self.gate.by_host["zk-dev"]["exec status"] = ran(b"job j-1\nended: exit 0\n")
+        status, answer = self.built("status", "z1")
+        self.assertEqual((status, answer["stdout"]), (200, "job j-1\nended: exit 0\n"))
+        self.assertTrue(answer["stderr"].startswith("builds: on zk-dev"))
+
+    def test_a_held_run_whose_zk_dev_session_a_punch_cut_is_read_again_through_its_id(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 1\n", b"ahead heavy 2 900\n")
+        self.gate.by_host["zk-dev"]["exec"] = ran(b"run z7\n")
+        self.gate.sequence["exec wait"] = [ran(code=255, err="Connection to zk-dev closed by remote host."), ran(b"run z7: programs dev, gates\nGATES ok\n")]
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("WAIT=1", "programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"]), (200, "run zk-dev:z7\nrun z7: programs dev, gates\nGATES ok\n"))
+        self.assertIn("then run z7 was read again through zk-dev:z7", answer["stderr"])
+        self.assertEqual(self.on("zk-dev")[-3:], [["exec", "programs", "dev", "gates"], ["exec", "wait", "z7"], ["exec", "wait", "z7"]])
+        self.assertEqual(self.warm_execs(), [])
+        said.assert_any_call("pods_reread", run=json.dumps("zk-dev:z7"), verb="wait")
+        self.assertEqual(self.service.launched, {("WAIT=1", "programs", "dev", "gates"): ("zk-dev", "z7")})
+
+    def test_a_held_run_cut_again_is_read_again_while_its_request_waits(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 1\n", b"ahead heavy 2 900\n")
+        self.gate.by_host["zk-dev"]["exec"] = ran(b"run z7\n")
+        cut = ran(code=255, err="Connection to zk-dev closed by remote host.")
+        self.gate.sequence["exec wait"] = [cut, cut, cut, ran(b"GATES ok\n")]
+        status, answer = self.built("WAIT=1", "programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"]), (200, "run zk-dev:z7\nGATES ok\n"))
+        self.assertEqual(self.paused, [1, 2])
+
+    def test_a_held_run_whose_request_is_gone_is_not_read_again(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 1\n", b"ahead heavy 2 900\n")
+        self.kube.answer("exec", ran(b"run w1\n"))
+        self.gate.by_host["zk-dev"]["exec"] = ran(b"run z7\n")
+        cut = ran(code=255, err="Connection to zk-dev closed by remote host.")
+        self.gate.sequence["exec wait"] = [cut, cut, ran(b"GATES ok\n")]
+        self.signer.request = [ran(OPEN), ran(GONE)]
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "WAIT=1", "programs", "dev", "gates"]}, 502, ["request 41, which asked for this, is gone, so it was not run on another machine, and run zk-dev:z7 may still run there"])
+        self.assertEqual(self.on("zk-dev").count(["exec", "wait", "z7"]), 2)
+        self.assertEqual(self.paused, [])
+        self.assertEqual(self.warm_execs(), [])
+
+    def test_a_run_whose_zk_dev_session_was_cut_after_it_started_is_read_again_and_not_run_elsewhere(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 1\n", b"ahead heavy 2 900\n")
+        self.gate.sequence["exec programs"] = [ran(b"run z8\n", code=255, err="Connection to zk-dev closed by remote host.")]
+        self.gate.by_host["zk-dev"]["exec status"] = ran(b"job j-1\nrunning: 1m\n", code=3)
+        status, answer = self.built("programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run zk-dev:z8"))
+        self.assertEqual(self.on("zk-dev")[-1], ["exec", "status", "z8"])
+        self.assertEqual(self.warm_execs(), [])
+
+    def test_a_cut_run_its_runner_cannot_answer_again_runs_again_on_the_warm_pod_when_it_only_reads(self):
+        self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 1\n", b"ahead heavy 2 900\n")
+        self.kube.answer("exec", ran(b"run w1\n"))
+        self.gate.by_host["zk-dev"]["exec"] = ran(b"run z7\n")
+        self.gate.sequence["exec wait"] = [ran(code=255, err="Connection to zk-dev closed by remote host."), ran(code=69, err="gate: runner_down")]
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("WAIT=1", "programs", "dev", "gates")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, f"run {WARM}:w1"))
+        said.assert_any_call("pods_routed", to="warm", reason="runner_lost", runner="zk-dev", detail=unittest.mock.ANY)
+
+    def test_zk_dev_s_end_lines_post_under_its_name(self):
+        self.service.warm_pod = None
+        self.call("POST", "/v1/pods/zk-dev/exec", {"command": ["sh", BUILD, "JOB=j-1", "NOTIFY=j-1", "programs", "dev", "gates"]})
+        words = self.gate.spawned.get(timeout=10)
+        self.assertEqual(words[0], "logs")
+        self.gate.followers.put(Followed(255, b""))
+        self.gate.followers.put(Followed(0, b"", b"ducktape-notify j-1 z1 ended: exit 0, GATES ok\n"))
+        self.gate.spawned.get(timeout=10)
+        self.gate.spawned.get(timeout=10)
+        line = "zk-dev \u00b7 z1 ended: exit 0, GATES ok"
+        self.assertIn(("chat", notified("j-1", server.notify_id("zk-dev", "j-1", line), None, line, None)), self.signer.submits)
+        self.assertEqual({host for host, words, _ in self.gate.calls if words[:1] == ["logs"]}, {"zk-dev"})
+
+    def test_a_commit_only_zk_dev_holds_runs_there(self):
+        made = "f1916715" + "0" * 32
+        self.aheads(b"ahead heavy 0 1\n", b"ahead heavy 0 1\n", b"ahead heavy 0 1\n")
+        self.gate.by_host["lan"]["exec holds"] = ran(f"lacks {made}\n".encode(), code=1)
+        self.gate.by_host["zk-dev"]["exec holds"] = ran(f"holds {made}\n".encode())
+        with unittest.mock.patch.object(server, "say") as said:
+            status, answer = self.built("programs", made, "lane")
+        self.assertEqual((status, answer["stdout"].splitlines()[0]), (200, "run zk-dev:z1"))
+        self.assertEqual(self.warm_execs(), [])
+        said.assert_any_call("pods_routed", to="zk-dev", reason="holds_commit", detail=json.dumps(f"programs {made} is in pod zk-dev's clone and not in pod desktop's"))
+
+    def test_reroute_moves_each_run_to_the_runner_that_takes_it_and_waits_least(self):
+        gates = base64.b64encode(b"JOB=j-1\0NOTIFY=\0programs\0dev\0gates\0").decode()
+        diff = base64.b64encode(b"JOB=j-1\0NOTIFY=\0programs\0dev\0schema-diff\0chat\0").decode()
+        self.kube.answer("exec", ran(f"move w1 heavy 3 {gates}\nmove w2 heavy 4 {diff}\n".encode()), ran(b"w1: moved to run zk-dev:z1\n"), ran(b"w2: moved to run desktop:r2\n"))
+        self.gate.by_host["lan"].update({"exec lanes": ran(b"heavy 1\nlane 0\n"), "exec take": ran(b"run r2\n")})
+        self.gate.by_host["zk-dev"].update({"exec lanes": ran(b"heavy 0\nlane 0\n"), "exec take": ran(b"run z1\n")})
+        lines = self.built("reroute")[1]["stdout"].splitlines()
+        self.assertEqual(lines, ["w1: moved to run zk-dev:z1", "w2: moved to run desktop:r2"])
+        self.assertEqual([(host, words) for host, words, _ in self.gate.calls if words[1:2] == ["take"]], [("zk-dev", ["exec", "take", gates]), ("lan", ["exec", "take", diff])])
+
+    def test_reroute_leaves_a_lane_a_runner_says_is_paused(self):
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"), ran(b"w1: moved to run desktop:r1\n"))
+        self.gate.by_host["lan"].update({"exec lanes": ran(b"heavy 2\n"), "exec take": ran(b"run r1\n")})
+        self.gate.by_host["zk-dev"]["exec lanes"] = ran(b"heavy paused\nlane 0\n")
+        self.assertEqual(self.built("reroute")[1]["stdout"].splitlines(), ["w1: moved to run desktop:r1"])
+        self.assertNotIn(["exec", "take", "d29yZHMx"], self.on("zk-dev"))
+
+    def test_reroute_passes_over_a_runner_it_cannot_ask(self):
+        self.gate.down = {"zk-dev"}
+        self.kube.answer("exec", ran(b"move w1 heavy 3 d29yZHMx\n"), ran(b"w1: moved to run desktop:r1\n"))
+        self.gate.by_host["lan"].update({"exec lanes": ran(b"heavy 0\n"), "exec take": ran(b"run r1\n")})
+        self.assertEqual(self.built("reroute")[1]["stdout"].splitlines(), ["w1: moved to run desktop:r1"])
+
+    def test_a_runner_is_never_deleted_and_builds_names_every_runner(self):
+        self.refused("DELETE", "/v1/pods/zk-dev", None, 403, ["pod zk-dev is a build runner"])
+        self.refused("GET", "/v1/pods/builds", None, 400, ["read pod desktop, pod zk-dev or the warm pod"])
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "busy"]}, 400, ["(pod desktop, pod zk-dev, or the warm pod)"])
+
+
+class RunnerList(unittest.TestCase):
+    def test_pods_runners_names_each_runner_and_its_keys_in_tie_order(self):
+        runners = server.runners_of("desktop=/desktop \t zk-dev=/runners/zk-dev\n", None)
+        self.assertEqual([(runner.name, runner.keys) for runner in runners], [("desktop", pathlib.Path("/desktop")), ("zk-dev", pathlib.Path("/runners/zk-dev"))])
+        for wrong in ("desktop", "builds=/b", "desktop=/a desktop=/b", "zk-dev=relative", "Zk=/z", "-a=/a", "=/a"):
+            with self.assertRaises(ValueError, msg=wrong):
+                server.runners_of(wrong, None)
+
+    def test_a_kinds_file_limits_only_the_calls_that_start_a_run(self):
+        with tempfile.TemporaryDirectory() as held:
+            keys = pathlib.Path(held)
+            runner = server.Runner("zk-dev", keys)
+            self.assertTrue(runner.takes(["programs", "dev", "pack"]))
+            (keys / "kinds").write_text(ZK_KINDS)
+            takes = {
+                ("programs", "dev", "gates"): True,
+                ("JOB=j-1", "programs", "dev", "lane"): True,
+                ("programs", "dev", "pack"): False,
+                ("programs", "dev", "schema-diff", "chat"): False,
+                ("apply", "programs", "dev", "/x.sh"): False,
+                ("programs", "dev", "sh", "make"): False,
+                ("MOVABLE=1", "programs", "dev", "sh", "make"): True,
+                ("status", "z1"): True,
+                ("busy",): True,
+                ("ahead", "programs", "dev", "pack"): True,
+                ("stop", "z1", "z2"): True,
+            }
+            for words, expected in takes.items():
+                self.assertEqual(runner.takes(list(words)), expected, words)
 
 
 class Stopped(unittest.TestCase):

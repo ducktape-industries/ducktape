@@ -327,13 +327,14 @@ spec:
             - {name: PODS_FORGE, value: "@FORGE@"}
             - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node @NODE_URL@"}
             - {name: PODS_KEYS, value: /keys}
-            - {name: PODS_DESKTOP, value: /desktop}
+            - {name: PODS_RUNNERS, value: "desktop=/desktop zk-dev=/runners/zk-dev"}
             - {name: PODS_WARM_POD, value: /shared/tools/warm-pod}
           ports:
             - {name: http, containerPort: 8080}
           volumeMounts:
             - {name: keys, mountPath: /keys, readOnly: true}
             - {name: desktop, mountPath: /desktop, readOnly: true}
+            - {name: runner-zk-dev, mountPath: /runners/zk-dev, readOnly: true}
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
@@ -347,6 +348,11 @@ spec:
         - name: desktop
           secret:
             secretName: desktop-runner
+            optional: true
+            defaultMode: 0440
+        - name: runner-zk-dev
+          secret:
+            secretName: runner-zk-dev
             optional: true
             defaultMode: 0440
 ---
