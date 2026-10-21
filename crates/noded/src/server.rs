@@ -593,10 +593,11 @@ async fn blobs_zstd<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Response {
         Ok(encoder) => encoder,
         Err(error) => return failed::<()>(error).into_response(),
     };
-    let start = (pieces(ctx, ids).boxed(), encoder);
-    let answer = futures::stream::unfold(Some(start), |state| async move {
-        let (mut pieces, encoder) = state?;
-        let Some(piece) = pieces.next().await else {
+    let mut pieces = pieces(ctx, ids).boxed();
+    let first = pieces.next().await;
+    let answer = futures::stream::unfold(Some((pieces, encoder, first)), |state| async move {
+        let (mut pieces, encoder, held) = state?;
+        let Some(piece) = held else {
             let last = settled(offload(move || finished(encoder)).await);
             return Some((last.map(Bytes::from), None));
         };
@@ -604,8 +605,10 @@ async fn blobs_zstd<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Response {
             Ok(plain) => plain,
             Err(error) => return Some((Err(error), None)),
         };
-        match settled(offload(move || compressed(encoder, &plain)).await) {
-            Ok((encoder, out)) => Some((Ok(Bytes::from(out)), Some((pieces, encoder)))),
+        let (done, next) =
+            futures::join!(offload(move || compressed(encoder, &plain)), pieces.next());
+        match settled(done) {
+            Ok((encoder, out)) => Some((Ok(Bytes::from(out)), Some((pieces, encoder, next)))),
             Err(error) => Some((Err(error), None)),
         }
     });
@@ -619,10 +622,10 @@ fn settled<T>(done: crate::Result<std::io::Result<T>>) -> crate::Result<T> {
 fn compressed(mut encoder: Encoder, plain: &[Bytes]) -> std::io::Result<(Encoder, Vec<u8>)> {
     use zstd::stream::raw::{InBuffer, Operation, OutBuffer};
     let mut out = Vec::new();
+    let mut room = vec![0; zstd::zstd_safe::CCtx::out_size()];
     for part in plain {
         let mut input = InBuffer::around(part);
         while input.pos() < part.len() {
-            let mut room = vec![0; zstd::zstd_safe::CCtx::out_size()];
             let mut output = OutBuffer::around(&mut room[..]);
             encoder.run(&mut input, &mut output)?;
             let wrote = output.pos();
