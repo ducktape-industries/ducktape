@@ -9,7 +9,7 @@ use abi::Receipt;
 use arc_swap::ArcSwap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_consensus::types::Height;
-use commonware_cryptography::Digestible as _;
+use commonware_cryptography::sha256;
 use consensus::{Certificate, validators_of};
 use host::{ANCHOR_WINDOW, Submission, SubmissionId};
 use node::{Block, Body, Carried, Frame, Node};
@@ -181,6 +181,15 @@ impl<E: Context> Daemon<E> {
         Ok(Some(Arc::new(decoded(&bytes)?)))
     }
 
+    pub(crate) async fn head(&self, height: u64) -> Result<Option<crate::wire::Head>> {
+        let kept = self.summary(height).await?;
+        Ok(kept.map(|kept| crate::wire::Head {
+            height: kept.block.height,
+            id: kept.block.id,
+            time: kept.block.time,
+        }))
+    }
+
     async fn summary_by_id(&self, id: [u8; 32]) -> Result<Option<Arc<Kept>>> {
         if let Some(kept) = self.recent.by_id(id) {
             return Ok(Some(kept));
@@ -232,14 +241,21 @@ impl<E: Context> Daemon<E> {
         &self,
         node: &Node<E>,
         block: &Block,
+        id: sha256::Digest,
         ran: Ran,
         receipts: Option<Vec<Receipt>>,
     ) -> Result<Recorded> {
         let asked = self.context.current();
         let proposer = self.proposer(node, block.height).await?;
         let proposed = self.context.current();
-        let (kept, payloads) =
-            summarize(block, self.network.epoch_length, proposer, ran, receipts)?;
+        let (kept, payloads) = summarize(
+            block,
+            id,
+            self.network.epoch_length,
+            proposer,
+            ran,
+            receipts,
+        )?;
         let summary = abi::encode(&kept);
         self.history.keep(row_of(&kept, summary, payloads))?;
         let stored = self.context.current();
@@ -250,7 +266,12 @@ impl<E: Context> Daemon<E> {
         })
     }
 
-    pub(crate) async fn record_unrecorded(&self, node: &Node<E>, block: &Block) -> Result<()> {
+    pub(crate) async fn record_unrecorded(
+        &self,
+        node: &Node<E>,
+        block: &Block,
+        id: sha256::Digest,
+    ) -> Result<()> {
         if self.history.has(block.height)? {
             return Ok(());
         }
@@ -259,7 +280,7 @@ impl<E: Context> Daemon<E> {
             .into_iter()
             .map(|(frame, submission)| (frame, submission.id(), submission))
             .collect();
-        self.record(node, block, ran, None).await?;
+        self.record(node, block, id, ran, None).await?;
         Ok(())
     }
 
@@ -373,6 +394,7 @@ fn row_of(kept: &Kept, summary: Vec<u8>, payloads: Vec<Vec<u8>>) -> Row {
 
 fn summarize(
     block: &Block,
+    id: sha256::Digest,
     epoch_length: u64,
     proposer: Option<Vec<u8>>,
     ran: Ran,
@@ -402,7 +424,7 @@ fn summarize(
     let kept = Kept {
         block: Finalized {
             height: block.height,
-            id: block.digest().0,
+            id: id.0,
             parent: block.parent.0,
             time: block.time,
             epoch: block.height / epoch_length,

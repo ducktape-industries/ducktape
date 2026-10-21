@@ -1,6 +1,6 @@
-// The `/v1/changes` and `/v1/watch` fan-out: one task owns every socket's subscriber. A changes
-// socket gets each block's word in its own queue; a watch socket pulls what the blocks since its
-// last pull wrote, merged into one, so no socket and no block waits on another.
+// The `/v1/changes`, `/v1/heads` and `/v1/watch` fan-out: one task owns every socket's subscriber.
+// A changes or heads socket gets each block's word in its own queue; a watch socket pulls what the
+// blocks since its last pull wrote, merged into one, so no socket and no block waits on another.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,12 +14,15 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::Context;
 use crate::view::View;
-use crate::wire::Change;
+use crate::wire::{Change, Head};
+
+pub(crate) enum Follows {
+    Program { program: ProgramId, keys: bool },
+    Heads,
+}
 
 pub(crate) struct Subscriber<E: Context> {
     socket: u64,
-    program: ProgramId,
-    keys: bool,
     delivery: Delivery<E>,
     since: u64,
     read: Arc<AtomicU64>,
@@ -27,11 +30,16 @@ pub(crate) struct Subscriber<E: Context> {
 }
 
 enum Delivery<E: Context> {
-    Queued(queue::UnboundedSender<Published>),
+    Queued {
+        follows: Follows,
+        sender: queue::UnboundedSender<Published>,
+    },
     Pulled(Pulled<E>),
 }
 
 struct Pulled<E: Context> {
+    program: ProgramId,
+    keys: bool,
     merged: Option<Box<Merged<E>>>,
     asked: Option<oneshot::Sender<Merged<E>>>,
 }
@@ -57,11 +65,12 @@ struct Seated {
 
 pub(crate) enum Published {
     Change(Change),
+    Head(Head),
     Ping(u64),
 }
 
 pub(crate) struct Wrote<E: Context> {
-    pub(crate) height: u64,
+    pub(crate) head: Head,
     pub(crate) root: abi::Root,
     pub(crate) writes: Arc<Writes>,
     pub(crate) view: Option<Arc<View<E>>>,
@@ -87,6 +96,7 @@ pub(crate) enum Event<E: Context> {
     Take(Take<E>),
     HangUp(oneshot::Sender<()>),
     Unasked,
+    Opened(Head),
 }
 
 enum Flow {
@@ -113,6 +123,7 @@ pub(crate) struct Fanout<E: Context> {
     inbox: mpsc::UnboundedReceiver<Event<E>>,
     network: Network,
     tip: u64,
+    head: Option<Head>,
     subscribers: BTreeMap<u64, Subscriber<E>>,
 }
 
@@ -123,6 +134,7 @@ impl<E: Context> Changes<E> {
             inbox: events,
             network,
             tip,
+            head: None,
             subscribers: BTreeMap::new(),
         };
         let changes = Changes {
@@ -132,9 +144,13 @@ impl<E: Context> Changes<E> {
         (changes, fanout)
     }
 
-    pub(crate) fn subscribe(&self, program: ProgramId, keys: bool) -> Subscription {
+    pub(crate) fn opened(&self, head: Head) {
+        let _ = self.inbox.send(Event::Opened(head));
+    }
+
+    pub(crate) fn subscribe(&self, follows: Follows) -> Subscription {
         let (sender, changes) = queue::unbounded();
-        let seated = self.seat(program, keys, Delivery::Queued(sender));
+        let seated = self.seat(Delivery::Queued { follows, sender });
         Subscription {
             changes,
             read: seated.read,
@@ -144,10 +160,12 @@ impl<E: Context> Changes<E> {
 
     pub(crate) fn pull(&self, program: ProgramId, keys: bool) -> Pull<E> {
         let pulled = Pulled {
+            program,
+            keys,
             merged: None,
             asked: None,
         };
-        let seated = self.seat(program, keys, Delivery::Pulled(pulled));
+        let seated = self.seat(Delivery::Pulled(pulled));
         Pull {
             socket: seated.socket,
             changes: self.clone(),
@@ -156,14 +174,12 @@ impl<E: Context> Changes<E> {
         }
     }
 
-    fn seat(&self, program: ProgramId, keys: bool, delivery: Delivery<E>) -> Seated {
+    fn seat(&self, delivery: Delivery<E>) -> Seated {
         let socket = self.sockets.fetch_add(1, Ordering::Relaxed);
         let (cut, dropped) = cut::channel();
         let read = Arc::new(AtomicU64::new(0));
         let subscriber = Subscriber {
             socket,
-            program,
-            keys,
             delivery,
             since: 0,
             read: read.clone(),
@@ -219,6 +235,7 @@ pub(crate) async fn fan<E: Context>(mut fanout: Fanout<E>) {
             Event::Take(take) => taken(&mut fanout, take),
             Event::HangUp(reply) => Flow::HangingUp(reply),
             Event::Unasked => Flow::Closed,
+            Event::Opened(head) => opened(&mut fanout, head),
         };
         match flow {
             Flow::Fanning => {}
@@ -230,13 +247,28 @@ pub(crate) async fn fan<E: Context>(mut fanout: Fanout<E>) {
 
 fn subscribed<E: Context>(fanout: &mut Fanout<E>, mut subscriber: Subscriber<E>) -> Flow {
     subscriber.since = fanout.tip;
+    if let Delivery::Queued {
+        follows: Follows::Heads,
+        sender,
+    } = &subscriber.delivery
+        && let Some(head) = fanout.head
+        && sender.unbounded_send(Published::Head(head)).is_err()
+    {
+        return Flow::Fanning;
+    }
     fanout.subscribers.insert(subscriber.socket, subscriber);
     Flow::Fanning
 }
 
+fn opened<E: Context>(fanout: &mut Fanout<E>, head: Head) -> Flow {
+    fanout.head.get_or_insert(head);
+    Flow::Fanning
+}
+
 fn written<E: Context>(fanout: &mut Fanout<E>, wrote: Wrote<E>) -> Flow {
-    let height = wrote.height;
+    let height = wrote.head.height;
     fanout.tip = height;
+    fanout.head = Some(wrote.head);
     let closes = fanout.network.closes_an_epoch(height);
     let last = height
         .checked_sub(fanout.network.epoch_length)
@@ -249,15 +281,9 @@ fn written<E: Context>(fanout: &mut Fanout<E>, wrote: Wrote<E>) -> Flow {
         if unanswered || gone {
             return false;
         }
-        let Subscriber {
-            program,
-            keys,
-            delivery,
-            ..
-        } = subscriber;
-        match delivery {
-            Delivery::Queued(sender) => queued(sender, program, *keys, &wrote, closes),
-            Delivery::Pulled(pulled) => pulled.add(program, *keys, &wrote, closes),
+        match &mut subscriber.delivery {
+            Delivery::Queued { follows, sender } => queued(sender, follows, &wrote, closes),
+            Delivery::Pulled(pulled) => pulled.add(&wrote, closes),
         }
     });
     Flow::Fanning
@@ -265,25 +291,36 @@ fn written<E: Context>(fanout: &mut Fanout<E>, wrote: Wrote<E>) -> Flow {
 
 fn queued<E: Context>(
     sender: &queue::UnboundedSender<Published>,
-    program: &str,
-    keys: bool,
+    follows: &Follows,
     wrote: &Wrote<E>,
     closes: bool,
 ) -> bool {
-    let height = wrote.height;
-    let Some(writes) = wrote.writes.programs.get(program) else {
-        return sender.unbounded_send(Published::Ping(height)).is_ok();
+    let ping = || {
+        sender
+            .unbounded_send(Published::Ping(wrote.head.height))
+            .is_ok()
     };
-    let change = Change {
-        height,
-        root: wrote.root,
-        writes: writes
-            .iter()
-            .map(|(key, written)| (key.clone(), shown(keys, written)))
-            .collect(),
-    };
-    let sent = sender.unbounded_send(Published::Change(change));
-    sent.is_ok() && (!closes || sender.unbounded_send(Published::Ping(height)).is_ok())
+    match word(follows, wrote) {
+        None => ping(),
+        Some(said) => sender.unbounded_send(said).is_ok() && (!closes || ping()),
+    }
+}
+
+fn word<E: Context>(follows: &Follows, wrote: &Wrote<E>) -> Option<Published> {
+    match follows {
+        Follows::Heads => Some(Published::Head(wrote.head)),
+        Follows::Program { program, keys } => {
+            let writes = wrote.writes.programs.get(program)?;
+            Some(Published::Change(Change {
+                height: wrote.head.height,
+                root: wrote.root,
+                writes: writes
+                    .iter()
+                    .map(|(key, written)| (key.clone(), shown(*keys, written)))
+                    .collect(),
+            }))
+        }
+    }
 }
 
 fn shown(keys: bool, value: &Option<Vec<u8>>) -> Option<Vec<u8>> {
@@ -294,12 +331,12 @@ fn shown(keys: bool, value: &Option<Vec<u8>>) -> Option<Vec<u8>> {
 }
 
 impl<E: Context> Pulled<E> {
-    fn add(&mut self, program: &str, keys: bool, wrote: &Wrote<E>, closes: bool) -> bool {
+    fn add(&mut self, wrote: &Wrote<E>, closes: bool) -> bool {
         let mut merged = self
             .merged
             .take()
             .unwrap_or_else(|| Box::new(Merged::at(wrote)));
-        merged.add(program, keys, wrote, closes);
+        merged.add(&self.program, self.keys, wrote, closes);
         let Some(asked) = self.asked.take() else {
             self.merged = Some(merged);
             return true;
@@ -319,7 +356,7 @@ impl<E: Context> Pulled<E> {
 impl<E: Context> Merged<E> {
     fn at(wrote: &Wrote<E>) -> Merged<E> {
         Merged {
-            height: wrote.height,
+            height: wrote.head.height,
             root: wrote.root,
             view: None,
             writes: BTreeMap::new(),
@@ -329,7 +366,7 @@ impl<E: Context> Merged<E> {
     }
 
     fn add(&mut self, program: &str, keys: bool, wrote: &Wrote<E>, closes: bool) {
-        self.height = wrote.height;
+        self.height = wrote.head.height;
         self.root = wrote.root;
         self.view = wrote.view.clone();
         self.closes |= closes;
@@ -374,80 +411,4 @@ fn hang_up<E: Context>(mut fanout: Fanout<E>, reply: oneshot::Sender<()>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use consensus::{Cadence, Network, Timeouts};
-    use state::Writes;
-
-    use super::{Changes, Wrote, fan};
-
-    type E = commonware_runtime::tokio::Context;
-
-    fn wrote(height: u64, writes: &[(&str, &str)]) -> Wrote<E> {
-        let mut programs: BTreeMap<String, BTreeMap<Vec<u8>, Option<Vec<u8>>>> = BTreeMap::new();
-        for (program, key) in writes {
-            let value = Some(height.to_le_bytes().to_vec());
-            programs
-                .entry(program.to_string())
-                .or_default()
-                .insert(key.as_bytes().to_vec(), value);
-        }
-        Wrote {
-            height,
-            root: abi::Root([0; 32]),
-            writes: Arc::new(Writes {
-                programs,
-                local: Default::default(),
-            }),
-            view: None,
-        }
-    }
-
-    #[test]
-    fn a_watch_socket_that_pulls_late_gets_every_block_since_merged_into_one_then_waits_for_the_next()
-     {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let cadence = Cadence::new(Duration::from_millis(250), Timeouts::default()).unwrap();
-        let network = Network {
-            epoch_length: 1_000,
-            cadence,
-        };
-        let (changes, fanout) = Changes::<E>::new(network, 0);
-        runtime.spawn(fan(fanout));
-        runtime.block_on(async {
-            let pull = changes.pull("probe".into(), false);
-            changes.wrote(wrote(1, &[("probe", "a"), ("other", "x")]));
-            changes.wrote(wrote(2, &[("probe", "a"), ("probe", "b")]));
-            let first = pull.next();
-            let second = pull.next();
-            changes.wrote(wrote(3, &[("other", "y")]));
-            changes.hang_up().await;
-            let merged = first
-                .await
-                .expect("a pull with blocks waiting is answered at once");
-            assert_eq!(merged.height, 2);
-            let newest = Some(2u64.to_le_bytes().to_vec());
-            let writes = BTreeMap::from([(b"a".to_vec(), newest.clone()), (b"b".to_vec(), newest)]);
-            assert_eq!(merged.writes, writes);
-            let written = host::Written::from([
-                ("other".to_owned(), BTreeSet::from([b"x".to_vec()])),
-                (
-                    "probe".to_owned(),
-                    BTreeSet::from([b"a".to_vec(), b"b".to_vec()]),
-                ),
-            ]);
-            assert_eq!(merged.written, written);
-            let merged = second
-                .await
-                .expect("a pull with no block waiting is answered by the next one");
-            assert_eq!(merged.height, 3);
-            assert!(merged.writes.is_empty());
-        });
-    }
-}
+mod tests;

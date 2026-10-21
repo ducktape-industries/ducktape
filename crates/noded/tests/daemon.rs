@@ -21,8 +21,8 @@ use futures::{SinkExt as _, StreamExt as _};
 use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
 use noded::wire::{
-    Admin, BlockAsk, BlockRef, Blocks, Change, EgressPlan, EgressSet, Reached, Submitted, TxAsk,
-    TxRef,
+    Admin, BlockAsk, BlockRef, Blocks, Change, EgressPlan, EgressSet, Head, Reached, Submitted,
+    TxAsk, TxRef,
 };
 use noded::{
     Client, Endpoint, HaloConfig, Listen, Listeners, LoadConfig, Logs, Running, Upload, Workspace,
@@ -60,6 +60,18 @@ fn listeners() -> Listeners {
         tls: Some(tcp()),
         halo: udp(),
         live: Some(udp()),
+    }
+}
+
+/// The sockets a seat first served on, bound again, so a restart is where its peers dial it.
+fn rebound(seat: &Seat) -> Listeners {
+    let tcp = |address: SocketAddr| TcpListener::bind(address).unwrap();
+    Listeners {
+        p2p: tcp(seat.p2p),
+        http: tcp(seat.http),
+        tls: Some(tcp(seat.tls)),
+        halo: UdpSocket::bind(seat.halo).unwrap(),
+        live: Some(UdpSocket::bind((outbound_ip(), 0)).unwrap()),
     }
 }
 
@@ -1019,6 +1031,116 @@ fn a_changes_socket_that_answers_no_ping_for_a_whole_epoch_is_cut_and_one_that_r
             }
         }
         seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
+#[test]
+fn a_heads_socket_opened_on_a_restarted_node_before_its_first_block_opens_on_its_tip() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let root = tempfile::tempdir().unwrap();
+    let dialed = Seat::new(root.path(), "n0");
+    let mut dialer = Seat::new(root.path(), "n1");
+    dialer.address = None;
+    let founding = founding(root.path(), &[&dialed, &dialer], EPOCH_LENGTH);
+    dialed.init(&founding);
+    dialer.init(&founding);
+    let live = vec![dialed.start(), dialer.start()];
+    let runtime = client_runtime();
+    runtime.block_on(reach(&live[0].client, 2));
+    shut_down(&runtime, &[&dialed, &dialer], live);
+
+    *dialed.held.lock().unwrap() = Some(rebound(&dialed));
+    let restarted = dialed.start();
+    let (tip, mut heads) = runtime.block_on(async {
+        let tip = restarted.client.status().await.unwrap().height;
+        let url = format!("ws://{}{}", dialed.http, noded::wire::route::HEADS);
+        let heads = tokio_tungstenite::connect_async(url).await.unwrap().0;
+        (tip, heads)
+    });
+    let rejoined = dialer.start();
+    let heard = runtime.block_on(async {
+        let mut heard = Vec::new();
+        while heard.len() < 2 {
+            if let Message::Binary(bytes) = heads.next().await.unwrap().unwrap() {
+                heard.push(abi::decode::<Head>(&bytes).unwrap().height);
+            }
+        }
+        heard
+    });
+    assert_eq!(
+        heard,
+        [tip, tip + 1],
+        "the socket opened on the tip, then heard the next block"
+    );
+    shut_down(&runtime, &[&dialed, &dialer], vec![restarted, rejoined]);
+}
+
+#[test]
+fn a_heads_socket_carries_each_block_as_its_record_names_it_and_closes_on_shutdown() {
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+
+    client_runtime().block_on(async {
+        let url = format!("ws://{}{}", seat.http, noded::wire::route::HEADS);
+        let open = || async {
+            tokio_tungstenite::connect_async(url.clone())
+                .await
+                .unwrap()
+                .0
+        };
+        let head = |frame: Message| match frame {
+            Message::Binary(bytes) => {
+                assert_eq!(bytes.len(), 48, "a head is 48 bytes");
+                Some(abi::decode::<Head>(&bytes).unwrap())
+            }
+            _ => None,
+        };
+        let mut first = open().await;
+        let mut heard = Vec::new();
+        while heard.len() < 16 {
+            if let Some(head) = head(first.next().await.unwrap().unwrap()) {
+                heard.push(head);
+            }
+        }
+        for pair in heard.windows(2) {
+            assert_eq!(pair[1].height, pair[0].height + 1, "{heard:?}");
+        }
+        for head in &heard {
+            let ask = BlockAsk {
+                by: BlockRef::Height(head.height),
+                most: 0,
+            };
+            let block = client.block(ask).await.unwrap().unwrap();
+            assert_eq!(
+                (head.height, head.id, head.time),
+                (block.height, block.id, block.time)
+            );
+        }
+        let newest = heard.last().unwrap().height;
+        let mut second = open().await;
+        let opening = loop {
+            if let Some(head) = head(second.next().await.unwrap().unwrap()) {
+                break head;
+            }
+        };
+        assert!(opening.height >= newest, "{opening:?} after {newest}");
+        seat.admin(&client, Admin::Shutdown).await;
+        let mut closed = None;
+        while let Some(Ok(frame)) = second.next().await {
+            if let Message::Close(frame) = frame {
+                closed = frame.map(|frame| frame.code);
+            }
+        }
+        assert_eq!(closed, Some(CloseCode::Away));
     });
     live.thread.join().unwrap();
 }

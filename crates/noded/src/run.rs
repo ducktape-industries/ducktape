@@ -667,7 +667,9 @@ async fn start<E: Context>(
     if let Anchor::Genesis(genesis) = marshal.anchor()
         && founding
     {
-        daemon.record_unrecorded(&node, genesis).await?;
+        daemon
+            .record_unrecorded(&node, genesis, genesis.digest())
+            .await?;
     }
     let applied_unsummarized = carried
         .unsummarized
@@ -681,7 +683,12 @@ async fn start<E: Context>(
                 "block {height} is archived and marshal does not read it"
             ))
         })?;
-        daemon.record_unrecorded(&node, &block).await?;
+        daemon
+            .record_unrecorded(&node, &block, block.digest())
+            .await?;
+    }
+    if let Some(head) = daemon.head(tip.height).await? {
+        daemon.changes.opened(head);
     }
 
     let pump = context.child("pump").spawn({
@@ -1354,7 +1361,8 @@ async fn applied<E: Context>(
     } = writing;
     let daemon: &Daemon<E> = daemon;
     published(node, daemon);
-    daemon.votes.applied(block.digest(), block.height);
+    let id = block.digest();
+    daemon.votes.applied(id, block.height);
     daemon.tips.send_replace(block.height);
     phases.publishing = lap.lap();
     let closes = daemon.network.closes_an_epoch(block.height);
@@ -1373,7 +1381,7 @@ async fn applied<E: Context>(
             phases.slowest = slowest_of(spent.slowest, &receipts, &carried);
             let records = std::mem::take(&mut applied.records);
             let refused = crate::activity::refused(&records, &receipts);
-            let recorded = daemon.record(node, block, ran, Some(receipts)).await?;
+            let recorded = daemon.record(node, block, id, ran, Some(receipts)).await?;
             phases.proposing = recorded.proposing;
             phases.keeping = recorded.keeping;
             daemon.activity.offer(crate::activity::Block {
@@ -1383,7 +1391,14 @@ async fn applied<E: Context>(
                 refused,
             });
             phases.recording = lap.lap();
-            daemon.publish(&applied);
+            daemon.publish(
+                &applied,
+                crate::wire::Head {
+                    height: block.height,
+                    id: id.0,
+                    time: block.time,
+                },
+            );
             let validators = node.host().role(role::VALIDATORS)?;
             let members_written = applied
                 .writes
@@ -1406,7 +1421,7 @@ async fn applied<E: Context>(
             members_written
         }
         Sequenced::Replayed => {
-            daemon.record_unrecorded(node, block).await?;
+            daemon.record_unrecorded(node, block, id).await?;
             phases.recording = lap.lap();
             false
         }

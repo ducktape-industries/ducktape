@@ -56,7 +56,8 @@ pub use wire::{NODE_CONTRACT, Status};
 pub use workspace::{Descriptor, Founding, Workspace};
 pub use writer::Held;
 
-use crate::changes::{Changes, Subscription, Wrote};
+use crate::changes::{Changes, Follows, Subscription, Wrote};
+use crate::wire::Head;
 
 pub trait Context:
     consensus::Context + commonware_runtime::Network + commonware_runtime::Resolver
@@ -264,14 +265,18 @@ impl<E: Context> Daemon<E> {
     }
 
     pub(crate) fn subscribe(&self, program: ProgramId, keys: bool) -> Subscription {
-        self.changes.subscribe(program, keys)
+        self.changes.subscribe(Follows::Program { program, keys })
+    }
+
+    pub(crate) fn subscribe_heads(&self) -> Subscription {
+        self.changes.subscribe(Follows::Heads)
     }
 
     pub(crate) async fn hang_up(&self) {
         self.changes.hang_up().await;
     }
 
-    pub fn publish(&self, applied: &Applied) {
+    pub fn publish(&self, applied: &Applied, head: Head) {
         self.live.invalidate(&applied.writes);
         let view = self
             .current
@@ -279,7 +284,7 @@ impl<E: Context> Daemon<E> {
             .ok()
             .filter(|view| view.tip().height == applied.height);
         self.changes.wrote(Wrote {
-            height: applied.height,
+            head,
             root: applied.root,
             writes: Arc::new(applied.writes.clone()),
             view,

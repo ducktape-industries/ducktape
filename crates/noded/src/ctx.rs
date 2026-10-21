@@ -201,6 +201,10 @@ impl<E: Context> Ctx<E> {
         }
     }
 
+    pub(crate) fn subscribe_heads(self) -> Subscription {
+        self.daemon.subscribe_heads()
+    }
+
     pub(crate) fn mesh(self) -> std::net::SocketAddr {
         self.daemon.mesh
     }

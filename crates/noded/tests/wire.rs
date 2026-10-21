@@ -2,7 +2,7 @@
 
 use abi::Root;
 use node::Preconfirm;
-use noded::wire::{Status, Submit};
+use noded::wire::{Head, Status, Submit};
 
 #[test]
 fn a_submit_is_its_frame_then_one_preconfirm_byte() {
@@ -14,6 +14,21 @@ fn a_submit_is_its_frame_then_one_preconfirm_byte() {
     };
     assert_eq!(submit(Preconfirm::Off), [1, 0, 0, 0, 7, 0]);
     assert_eq!(submit(Preconfirm::On), [1, 0, 0, 0, 7, 1]);
+}
+
+#[test]
+fn a_head_is_its_height_its_id_and_its_time_in_48_bytes() {
+    let head = Head {
+        height: 1,
+        id: [2; 32],
+        time: 3,
+    };
+    let bytes = abi::encode(&head);
+    let mut expected = 1u64.to_le_bytes().to_vec();
+    expected.extend([2; 32]);
+    expected.extend(3u64.to_le_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(bytes.len(), 48);
 }
 
 #[test]

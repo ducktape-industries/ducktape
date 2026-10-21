@@ -205,6 +205,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
             get(changes::<E>),
         )
         .route(&format!("{}/{{program}}", route::WATCH), get(watching::<E>))
+        .route(route::HEADS, get(heads::<E>))
         .route(route::P2P, get(p2p::<E>))
         .route(live_wire::ROUTE, get(live_socket::<E>))
         .layer(axum::middleware::from_fn_with_state(
@@ -819,6 +820,11 @@ fn keys_asked(query: Option<&str>) -> bool {
     query.is_some_and(|query| query.split('&').any(|asked| asked == "keys"))
 }
 
+async fn heads<E: Context>(ctx: Ctx<E>, upgrade: WebSocketUpgrade) -> Response {
+    let subscription = ctx.subscribe_heads();
+    upgrade.on_upgrade(move |socket| stream(socket, subscription))
+}
+
 enum Next {
     Published(Published),
     Pong(Bytes),
@@ -854,6 +860,7 @@ async fn stream(socket: WebSocket, subscription: Subscription) {
             Next::Published(Published::Change(change)) => {
                 Message::Binary(abi::encode(&change).into())
             }
+            Next::Published(Published::Head(head)) => Message::Binary(abi::encode(&head).into()),
             Next::Published(Published::Ping(height)) => {
                 Message::Ping(Bytes::copy_from_slice(&height.to_le_bytes()))
             }

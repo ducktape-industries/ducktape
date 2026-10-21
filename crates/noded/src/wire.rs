@@ -4,7 +4,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use host::{Layer, Tip};
 use node::Preconfirm;
 
-pub const NODE_CONTRACT: u32 = 9;
+pub const NODE_CONTRACT: u32 = 10;
 pub const ADMIN: &str = "$admin";
 pub const EGRESS: &str = "$egress";
 
@@ -26,6 +26,7 @@ pub mod route {
     /// block. A client that answers no ping for a whole epoch is cut.
     pub const CHANGES: &str = "/v1/changes";
     pub const WATCH: &str = "/v1/watch";
+    pub const HEADS: &str = "/v1/heads";
     pub const BLOCKS: &str = "/v1/blocks";
     pub const BLOCK: &str = "/v1/block";
     pub const TX: &str = "/v1/tx";
@@ -133,6 +134,13 @@ pub struct Change {
     pub height: u64,
     pub root: Root,
     pub writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Head {
+    pub height: u64,
+    pub id: [u8; 32],
+    pub time: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

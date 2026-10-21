@@ -672,9 +672,7 @@ room's program granted its account under the `live` table, over QUIC on a UDP
 socket of its own (`run --live 0.0.0.0:9200`, ALPN `ducktape-live`, the node
 key's certificate) or the WebSocket `/v1/live`; nodes carry a track between
 their clients over halo's lane `ducktape/live`. `GET /v1/live/port` names the QUIC port, or
-none without `--live`, and then clients take the WebSocket. A node built before the route
-answers 404, which the app reads as live unavailable, so the route moves no contract number
-(`noded::NODE_CONTRACT` stays 9). The clocks a client must honour are `live-wire`'s:
+none without `--live`, and then clients take the WebSocket. The clocks a client must honour are `live-wire`'s:
 `HANDSHAKE_WAIT` for each step of the handshake, `KEEP_ALIVE` and `IDLE` (a connection silent
 that long is closed, on either path), and `IDLE_SESSION` for a session holding nothing.
 
@@ -943,9 +941,16 @@ an older build starts on the same workspace, `ducktape restore-archives`, run
 with the node stopped, writes the history and the blocks back into the archives
 that build reads.
 
+`/v1/heads` is a WebSocket of the chain's finalized heads, for a client that
+needs the chain's height and time without its blocks: one borsh `Head { height,
+id, time }` for each block the node applies. It opens with the newest head the
+node has applied since it started (none before its first block). Like
+`/v1/changes`, it pings with the height at each epoch's last block and cuts a
+client that answers no ping for a whole epoch.
+
 `ducktape shutdown`, SIGTERM and SIGINT stop `ducktape run` the same way.
 The node stops taking blocks and lets the block it is applying finish. It
-closes every `/v1/changes` and `/v1/watch` socket with a going-away close frame, flushes its
+closes every `/v1/changes`, `/v1/watch` and `/v1/heads` socket with a going-away close frame, flushes its
 state to disk and exits 0, so the next start replays no write log. A signal
 that arrives while the node is still opening its state ends the start at
 once.
