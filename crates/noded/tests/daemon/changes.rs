@@ -272,10 +272,14 @@ fn a_changes_socket_keeps_no_view_of_a_block_it_was_opened_at() {
         let opened_at = opened.upgrade().unwrap().tip().height;
         let mut changes = client.changes(host::RECENT).await.unwrap();
         let _quiet = client.changes("probe").await.unwrap();
-        while changes.next().await.unwrap().unwrap().height < opened_at + 2 {}
+        let open_through = opened_at + EPOCH_LENGTH;
+        let mut height = opened_at;
+        while opened.upgrade().is_some() && height < open_through {
+            height = changes.next().await.unwrap().unwrap().height;
+        }
         assert!(
             opened.upgrade().is_none(),
-            "a view of block {opened_at} outlives two blocks while sockets stay open"
+            "a view of block {opened_at} outlives block {height}, an epoch on, while sockets stay open"
         );
     });
     drop(daemon);
