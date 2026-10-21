@@ -24,6 +24,7 @@ pub const LINES: &[u8] = b"line/";
 pub const ON: &[u8] = b"on/";
 pub const INDEXED_AT: &[u8] = b"indexed_at";
 pub const PLACES: &[u8] = b"place/";
+pub const PARENT: &[u8] = b"parent";
 pub const READ_ROWS: &[u8] = b"read/";
 pub const READS_DUE: &[u8] = b"read-due/";
 
@@ -35,12 +36,20 @@ const READS_FROM: [(&[u8], Option<u64>); 2] =
 const HEIGHT_BYTES: usize = size_of::<u64>();
 const ID_BYTES: usize = size_of::<SubmissionId>();
 
-pub fn layout_from(network: &[u8]) -> u64 {
-    announced(&LAYOUT_FROM, network)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Activations {
+    pub layout_from: u64,
+    pub reads_from: u64,
 }
 
-pub fn reads_from(network: &[u8]) -> u64 {
-    announced(&READS_FROM, network)
+impl Activations {
+    pub fn of(network: &[u8], parent: Option<&[u8]>) -> Activations {
+        let lineage = parent.unwrap_or(network);
+        Activations {
+            layout_from: announced(&LAYOUT_FROM, lineage),
+            reads_from: announced(&READS_FROM, lineage),
+        }
+    }
 }
 
 fn announced(table: &[(&[u8], Option<u64>)], network: &[u8]) -> u64 {

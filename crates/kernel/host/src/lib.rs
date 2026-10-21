@@ -91,6 +91,8 @@ pub enum Error {
     MemberCap { cap: u32 },
     #[error("host state is corrupt: {0}")]
     Corrupt(String),
+    #[error("a fork takes a network id of its own, and this state is already {0}")]
+    Unrenamed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -205,6 +207,7 @@ where
     blobs: Blobs,
     tidier: Tidier,
     network: Vec<u8>,
+    parent: Option<Vec<u8>>,
     roles: Roles,
     loaded: Loaded,
     hook_streaks: BTreeMap<ProgramId, u64>,
@@ -459,13 +462,16 @@ where
         let store = Store::open(context, name, storage, RESERVED.map(str::to_owned)).await?;
         let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
         let tidier = Tidier::spawn(blobs.clone())?;
-        let layout_from = namespace::layout_from(&genesis.network);
-        let reads_from = namespace::reads_from(&genesis.network);
+        let namespace::Activations {
+            layout_from,
+            reads_from,
+        } = namespace::Activations::of(&genesis.network, None);
         let mut host = Host {
             store,
             blobs,
             tidier,
             network: genesis.network,
+            parent: None,
             roles: roles.clone(),
             loaded: Loaded::new(genesis.limits, None),
             hook_streaks: BTreeMap::new(),
@@ -539,6 +545,38 @@ where
         Host::assemble(store, blobs)
     }
 
+    pub async fn fork(context: E, dir: &Path, network: &str) -> Result<Host<E>> {
+        let mut host = Host::open(context, network, dir).await?;
+        let renamed = host.network.as_slice() != network.as_bytes();
+        if !renamed {
+            return Err(Error::Unrenamed(network.to_owned()));
+        }
+        let parent = host.parent.clone().unwrap_or_else(|| host.network.clone());
+        let tip = host.tip()?;
+        let mut overlay = Overlay::default();
+        overlay.set(NETWORK, namespace::ID.to_vec(), network.as_bytes().to_vec());
+        overlay.set(NETWORK, namespace::PARENT.to_vec(), parent.clone());
+        let namespace::Activations {
+            layout_from,
+            reads_from,
+        } = namespace::Activations::of(network.as_bytes(), Some(parent.as_slice()));
+        host.layout_from = layout_from;
+        host.reads_from = reads_from;
+        host.network = network.as_bytes().to_vec();
+        host.parent = Some(parent);
+        host.commit(
+            tip,
+            overlay,
+            Stage::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
+        host.close().await?;
+        Ok(host)
+    }
+
     pub async fn adopt(
         context: E,
         name: &str,
@@ -576,14 +614,18 @@ where
             .get(NETWORK, namespace::ID)?
             .ok_or_else(|| Error::Corrupt("the network records no id".into()))?;
         let roles = roles_of(&store.view(Vec::new()))?;
-        let layout_from = namespace::layout_from(&network);
-        let reads_from = namespace::reads_from(&network);
+        let parent = store.view(Vec::new()).get(NETWORK, namespace::PARENT)?;
+        let namespace::Activations {
+            layout_from,
+            reads_from,
+        } = namespace::Activations::of(&network, parent.as_deref());
         let tidier = Tidier::spawn(blobs.clone())?;
         let mut host = Host {
             store,
             blobs,
             tidier,
             network,
+            parent,
             roles,
             loaded: Loaded::new(limits, None),
             hook_streaks: BTreeMap::new(),
@@ -647,6 +689,10 @@ where
 
     pub fn network(&self) -> &[u8] {
         &self.network
+    }
+
+    pub fn parent(&self) -> Option<&[u8]> {
+        self.parent.as_deref()
     }
 
     pub fn source(&self) -> Source<'_, E> {
