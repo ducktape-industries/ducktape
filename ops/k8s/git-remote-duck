@@ -2,9 +2,9 @@
 # Fetches the pinned git-remote-duck release from duckpond's public node as one blob, checks its sha256 and prints the release's name.
 # Usage: ops/k8s/git-remote-duck DEST, where DUCK_NODE overrides the node it reads from.
 set -euo pipefail
-release=git-remote-duck-5cd6cf7e
-blob=42f6d078294891d74961506f1c0281e1b26a3e43e72a57c51188aba1c1180746
-sha256=31716aefa87bb1d978cceaf82842d1d8cb9ba8e62fa13a3b84686d08e28dd647
+release=git-remote-duck-48e61598
+blob=2a2bac760cb818a98c65d2169154af1f3632a31123a1f1108a74076f80543e32
+sha256=a44c2a4fcc36ad5a1fa07520a5edec63aa8e7de7d85a5f5e9391be52be38e41b
 node=${DUCK_NODE:-https://duckpond.ducktape.industries}
 dest=${1:?usage: ops/k8s/git-remote-duck DEST}
 python3 - "$node" "$blob" "$sha256" "$dest" <<'PY'

@@ -121,7 +121,7 @@ under `ops/`.
 - `main` moves only on an explicit, user-requested release of `dev`: a forge
   change from `dev` into `main`.
 - A checkout reaches forge through a remote `forge`, with git-remote-duck
-  (release `git-remote-duck-5cd6cf7e`, pinned in `ops/k8s/git-remote-duck`) on `PATH`:
+  (release `git-remote-duck-48e61598`, pinned in `ops/k8s/git-remote-duck`) on `PATH`:
   `git remote add forge duck://duckpond-725bcad1/forge/core` and
   `git config duck.duckpond-725bcad1.node https://duckpond.ducktape.industries`.
   `git fetch forge` needs nothing more. A push signs with a git key on a
