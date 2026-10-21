@@ -468,10 +468,13 @@ async fn query<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<u8>> {
     };
     let network = ctx.network_id();
     let time = ctx.now();
+    let newest = ctx.view().clone();
     let asked = offload(move || {
         let source = reading.source();
-        tokio::runtime::Handle::current()
-            .block_on(crate::query::answer(&source, query, &network, time))
+        let anchors = newest.source();
+        tokio::runtime::Handle::current().block_on(crate::query::answer(
+            &source, &anchors, query, &network, time,
+        ))
     })
     .await;
     match asked {

@@ -166,13 +166,17 @@ impl<E: Context> Pooling<E> {
 }
 
 struct Pool<E: Context> {
+    based: Based<E>,
+    relay: Arc<Relay<E>>,
+    network: Vec<u8>,
+    posts: blob::service::Posts,
+}
+
+struct Based<E: Context> {
     mempool: Mempool<E>,
     base: Arc<View<E>>,
     published: Arc<Current<E>>,
     applied: Arc<AtomicU64>,
-    relay: Arc<Relay<E>>,
-    network: Vec<u8>,
-    posts: blob::service::Posts,
 }
 
 struct Wakes<E: Context> {
@@ -208,11 +212,14 @@ pub(crate) fn start<E: Context>(
         receipts,
         applied: applied.clone(),
     };
-    let pool = Pool {
+    let based = Based {
         mempool,
         base,
         published,
         applied,
+    };
+    let pool = Pool {
+        based,
         relay,
         network,
         posts,
@@ -234,13 +241,18 @@ pub(crate) fn start<E: Context>(
 
 async fn pooled<E: Context>(mut pool: Pool<E>, mut wakes: Wakes<E>) {
     loop {
-        let event = next(&pool.published, pool.mempool.replaying(), &mut wakes).await;
+        let event = next(
+            &pool.based.published,
+            pool.based.mempool.replaying(),
+            &mut wakes,
+        )
+        .await;
         let flow = match event {
-            Event::Build(build) => built(&mut pool, build),
+            Event::Build(build) => built(&mut pool.based, build),
             Event::Receipt(receipt) => receipted(&mut pool, receipt).await,
-            Event::Viewed(view) => viewed(&mut pool, view),
+            Event::Viewed(view) => viewed(&mut pool.based, view),
             Event::Withdrawn => withdrawn(),
-            Event::Replay => replayed(&mut pool).await,
+            Event::Replay => replayed(&mut pool.based).await,
             Event::Submit(submit) => submitted(&mut pool, submit).await,
             Event::Offer(offer) => offered(&mut pool, offer),
             Event::Close(closer) => Flow::Closing(closer),
@@ -273,26 +285,31 @@ async fn next<E: Context>(
     }
 }
 
-fn built<E: Context>(pool: &mut Pool<E>, build: Build) -> Flow {
+fn built<E: Context>(based: &mut Based<E>, build: Build) -> Flow {
     let Build {
         parent,
         unapplied,
         time,
         reply,
     } = build;
-    let block = pool
+    let block = based
         .mempool
         .build(parent, unapplied.iter().map(AsRef::as_ref), time);
     let _ = reply.send(block);
     Flow::Pooling
 }
 
-fn viewed<E: Context>(pool: &mut Pool<E>, view: Arc<View<E>>) -> Flow {
-    let same_height = view.tip().height == pool.base.tip().height;
+fn viewed<E: Context>(based: &mut Based<E>, view: Arc<View<E>>) -> Flow {
+    rebase_onto(based, view);
+    Flow::Pooling
+}
+
+fn rebase_onto<E: Context>(based: &mut Based<E>, view: Arc<View<E>>) {
+    let same_height = view.tip().height == based.base.tip().height;
     if same_height {
-        return Flow::Pooling;
+        return;
     }
-    let stale = match pool.mempool.rebase(view.snapshot()) {
+    let stale = match based.mempool.rebase(view.snapshot()) {
         Ok(stale) => stale,
         Err(error) => {
             tracing::warn!(
@@ -303,29 +320,35 @@ fn viewed<E: Context>(pool: &mut Pool<E>, view: Arc<View<E>>) -> Flow {
                 reason = "rebase_failed",
                 "the pool could not recheck what it holds against a new block"
             );
-            return Flow::Pooling;
+            return;
         }
     };
     tracing::debug!(
         target: TARGET,
         height = view.tip().height,
         dropped = stale.len(),
-        held = pool.mempool.len(),
+        held = based.mempool.len(),
         "the pool rechecked what it holds against a new block"
     );
-    pool.base = view;
-    pool.applied
-        .store(pool.mempool.applied().height, Ordering::Release);
-    publish(pool);
-    Flow::Pooling
+    based.base = view;
+    based
+        .applied
+        .store(based.mempool.applied().height, Ordering::Release);
+    publish(based);
+}
+
+fn caught_up<E: Context>(based: &mut Based<E>) {
+    if let Some(newest) = based.published.views.load_full() {
+        rebase_onto(based, newest);
+    }
 }
 
 fn withdrawn() -> Flow {
     Flow::Pooling
 }
 
-async fn replayed<E: Context>(pool: &mut Pool<E>) -> Flow {
-    if let Err(error) = pool.mempool.replay().await {
+async fn replayed<E: Context>(based: &mut Based<E>) -> Flow {
+    if let Err(error) = based.mempool.replay().await {
         tracing::warn!(
             target: TARGET,
             event = "pool_unreplayed",
@@ -334,9 +357,9 @@ async fn replayed<E: Context>(pool: &mut Pool<E>) -> Flow {
             "the pool could not predict a held frame again over a new block"
         );
     }
-    let replayed = !pool.mempool.replaying();
+    let replayed = !based.mempool.replaying();
     if replayed {
-        publish(pool);
+        publish(based);
     }
     Flow::Pooling
 }
@@ -348,25 +371,26 @@ async fn submitted<E: Context>(pool: &mut Pool<E>, submit: Submit) -> Flow {
         preconfirm,
         reply,
     } = submit;
-    let taken = take(pool, checked, source, preconfirm).await;
+    let taken = take(&mut pool.based, checked, source, preconfirm).await;
     let _ = reply.send(taken);
     Flow::Pooling
 }
 
 async fn take<E: Context>(
-    pool: &mut Pool<E>,
+    based: &mut Based<E>,
     checked: Checked,
     source: Source,
     preconfirm: Preconfirm,
 ) -> Answer {
-    let taken = pool
+    caught_up(based);
+    let taken = based
         .mempool
         .take(checked, source, preconfirm)
         .await
         .map_err(Error::from);
     let predicted = matches!(taken, Ok(Ok(Taken::New(Some(_)))));
     if predicted {
-        publish(pool);
+        publish(based);
     }
     taken
 }
@@ -376,7 +400,7 @@ async fn own<E: Context>(pool: &mut Pool<E>, frame: Vec<u8>) -> Answer {
         Ok(checked) => checked,
         Err(refusal) => return Ok(Err(refusal)),
     };
-    let taken = take(pool, checked, Source::Client, Preconfirm::Off).await;
+    let taken = take(&mut pool.based, checked, Source::Client, Preconfirm::Off).await;
     if let Err(error) = &taken {
         tracing::warn!(
             target: TARGET,
@@ -427,22 +451,22 @@ async fn receipted<E: Context>(pool: &mut Pool<E>, receipt: Receipt) -> Flow {
 
 fn offered<E: Context>(pool: &mut Pool<E>, offer: Offer) -> Flow {
     let frames = match offer {
-        Offer::Due => pool.mempool.reoffer(),
-        Offer::Every => pool.mempool.reoffer_all(),
+        Offer::Due => pool.based.mempool.reoffer(),
+        Offer::Every => pool.based.mempool.reoffer_all(),
     };
     pool.relay.send(frames.iter().map(Vec::as_slice));
     Flow::Pooling
 }
 
 fn close<E: Context>(pool: Pool<E>, closer: oneshot::Sender<()>) {
-    pool.published.speculative.store(None);
+    pool.based.published.speculative.store(None);
     drop(pool);
     let _ = closer.send(());
 }
 
-fn publish<E: Context>(pool: &Pool<E>) {
-    let published = speculative(&pool.base, &pool.mempool);
-    pool.published.speculative.store(Some(Arc::new(published)));
+fn publish<E: Context>(based: &Based<E>) {
+    let published = speculative(&based.base, &based.mempool);
+    based.published.speculative.store(Some(Arc::new(published)));
 }
 
 fn speculative<E: Context>(base: &Arc<View<E>>, mempool: &Mempool<E>) -> Speculative<E> {
@@ -455,8 +479,14 @@ mod tests {
     use commonware_runtime::tokio::Context;
     use tokio::sync::{mpsc, watch};
 
-    use super::{Answer, Event, Offer, Receipt, Reposted, Wakes, next};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use node::{Frame, Preconfirm, Source, Taken};
+
+    use super::{Answer, Based, Event, Offer, Receipt, Reposted, Wakes, next, take};
     use crate::view::Current;
+    use crate::view::tests::{NETWORK, founded};
 
     #[test]
     fn a_receipt_is_signed_again_only_when_its_posted_one_is_gone() {
@@ -507,5 +537,30 @@ mod tests {
         assert!(matches!(event, Event::Receipt(_)));
         let event = next(&published, false, &mut wakes).await;
         assert!(matches!(event, Event::Offer(Offer::Due)));
+    }
+
+    #[test]
+    fn a_frame_anchored_at_the_published_tip_is_taken_before_the_writer_sends_that_tip() {
+        founded(|founded| async move {
+            let published = Arc::new(Current::new());
+            published.views.store(Some(founded.next.clone()));
+            let mut based = Based {
+                mempool: founded.mempool,
+                base: founded.first,
+                published,
+                applied: Arc::new(AtomicU64::new(0)),
+            };
+            let anchor = founded.next.tip();
+            let frame = Frame::sign(&founded.key, NETWORK, anchor, None, "valset", Vec::new());
+            let checked = node::admissible(frame.encode(), NETWORK).unwrap();
+            let taken = take(&mut based, checked, Source::Client, Preconfirm::Off).await;
+            match taken {
+                Ok(Ok(Taken::New(_))) => {}
+                Ok(Ok(Taken::Held(_))) => panic!("a frame never sent before was held already"),
+                Ok(Err(refusal)) => panic!("refused: {}: {}", refusal.reason, refusal.sentence),
+                Err(error) => panic!("the pool failed: {error}"),
+            }
+            assert_eq!(based.base.tip(), anchor);
+        });
     }
 }

@@ -183,3 +183,123 @@ impl<E: Context> Views<E> {
         crate::millis(&self.clock)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+
+    use abi::role::{self, halo, validators};
+    use commonware_cryptography::{Signer as _, ed25519};
+    use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
+    use consensus::{Network, Timeouts};
+    use fixture_wasm::{ACCESS, AWAITS, BLOBS, HALO, IDENTITY, PROGRAMS, VALSET};
+    use host::{Founding, Genesis, Limits};
+    use node::{Mempool, Node};
+    use tokio::sync::watch;
+
+    use super::{Facts, View};
+    use crate::workspace::Descriptor;
+
+    pub(crate) const NETWORK: &[u8] = b"net";
+    pub(crate) const TIME: u64 = 1_700_000_000;
+    const NAME: &str = "net";
+    const EPOCH_LENGTH: u64 = 2;
+    const BLOCK_TIME_MS: u64 = 1_000;
+
+    pub(crate) struct Founded {
+        pub(crate) first: Arc<View<runtime::Context>>,
+        pub(crate) next: Arc<View<runtime::Context>>,
+        pub(crate) mempool: Mempool<runtime::Context>,
+        pub(crate) key: ed25519::PrivateKey,
+    }
+
+    fn founding(program: &str, code: &[u8], params: Vec<u8>, roles: &[&str]) -> Founding {
+        Founding {
+            program: program.to_owned(),
+            code: code.to_vec(),
+            params,
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+        }
+    }
+
+    fn genesis(key: &ed25519::PrivateKey) -> Genesis {
+        let lanes = halo::Genesis { lanes: Vec::new() };
+        let validator = validators::Member {
+            key: key.public_key().as_ref().to_vec(),
+            address: Some("v1:1".to_owned()),
+            halo: "v1:1".to_owned(),
+        };
+        Genesis {
+            network: NETWORK.to_vec(),
+            validators: vec![validator],
+            programs: vec![
+                founding("programs", PROGRAMS, Vec::new(), &[role::PROGRAMS]),
+                founding("valset", VALSET, Vec::new(), &[role::VALIDATORS]),
+                founding(
+                    "identity",
+                    IDENTITY,
+                    abi::encode(&Vec::<(Vec<u8>, u64)>::new()),
+                    &[role::IDENTITY],
+                ),
+                founding("blobs", BLOBS, Vec::new(), &[role::BLOBS]),
+                founding("awaits", AWAITS, Vec::new(), &[role::AWAITS]),
+                founding("halo", HALO, abi::encode(&lanes), &[role::HALO]),
+                founding("access", ACCESS, Vec::new(), &[role::ACCESS]),
+            ],
+            views: Vec::new(),
+            hooks: Vec::new(),
+            limits: Limits::default(),
+            epoch_length: EPOCH_LENGTH,
+            time: TIME,
+            member_cap: 1,
+            queries: validators::QueryPolicy::Signed,
+        }
+    }
+
+    pub(crate) fn founded<F, R>(test: F)
+    where
+        F: FnOnce(Founded) -> R,
+        R: Future<Output = ()>,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let config = runtime::Config::new().with_storage_directory(path.join("runtime"));
+        runtime::Runner::new(config).start(|context| async move {
+            let key = ed25519::PrivateKey::from_seed(1);
+            let found = Node::found(context.child("node"), NAME, &path, genesis(&key)).await;
+            let (mut node, origin, _) = found.unwrap();
+            let descriptor = Descriptor {
+                network: NAME.to_owned(),
+                time: TIME,
+                block_time_ms: BLOCK_TIME_MS,
+            };
+            let network = Network {
+                epoch_length: EPOCH_LENGTH,
+                cadence: descriptor.cadence(Timeouts::default()).unwrap(),
+            };
+            let identity = key.public_key().as_ref().to_vec();
+            let (readers, _) = watch::channel(());
+            let facts = Facts {
+                descriptor: &descriptor,
+                network: &network,
+                identity: &identity,
+                readers: &readers,
+            };
+            let first = Arc::new(View::of(&node, &facts, None).unwrap());
+            let verified = node.verified();
+            let mempool = Mempool::new(context.child("mempool"), verified, first.snapshot());
+            let mut mempool = mempool.unwrap();
+            let block = mempool.build(origin.tip(), std::iter::empty(), TIME + BLOCK_TIME_MS);
+            node.apply(&block).await.unwrap();
+            let next = Arc::new(View::of(&node, &facts, None).unwrap());
+            test(Founded {
+                first,
+                next,
+                mempool,
+                key,
+            })
+            .await;
+        });
+    }
+}

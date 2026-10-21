@@ -16,12 +16,13 @@ struct Asking {
 
 pub(crate) async fn answer<E: Context>(
     source: &Source<'_, E>,
+    newest: &Source<'_, E>,
     query: Query,
     network: &[u8],
     time: u64,
 ) -> host::Result<Result<(ProgramId, host::Queried), Refusal>> {
     let asking = match query.ask {
-        Ask::Signed(frame) => signed_query(source, &frame, network)?,
+        Ask::Signed(frame) => signed_query(newest, &frame, network)?,
         Ask::Unsigned { target, payload } => {
             unsigned_query(source, query.layer, time, target, payload).await?
         }
@@ -114,4 +115,35 @@ async fn query_policy<E: Context>(
                 "the validators program answered QueryPolicy with another reply",
             )),
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use abi::role::validators;
+    use host::Layer;
+    use node::Frame;
+
+    use super::answer;
+    use crate::view::tests::{NETWORK, TIME, founded};
+    use crate::wire::{Ask, Query};
+
+    #[test]
+    fn a_query_anchored_at_the_newest_tip_is_answered_over_a_layer_a_block_behind() {
+        founded(|founded| async move {
+            let asked = abi::encode(&validators::Query::QueryPolicy);
+            let anchor = founded.next.tip();
+            let frame = Frame::sign_query(&founded.key, NETWORK, anchor, "valset", asked);
+            let query = Query {
+                layer: Layer::Preconfirmed,
+                ask: Ask::Signed(frame.encode()),
+            };
+            let behind = founded.first.source();
+            let newest = founded.next.source();
+            match answer(&behind, &newest, query, NETWORK, TIME).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(refusal)) => panic!("refused: {}: {}", refusal.reason, refusal.sentence),
+                Err(error) => panic!("the query failed: {error}"),
+            }
+        });
+    }
 }
