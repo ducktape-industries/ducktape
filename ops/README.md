@@ -677,7 +677,8 @@ one up for another network.
   ```
 
 - `k8s/toolchain/deploy` builds `k8s/toolchain/Containerfile`, the image
-  agents build ducktape, programs and the app with, pushes it to the
+  agents build ducktape, programs and the app with (and run the app in,
+  under Xvfb and xdotool), pushes it to the
   cluster node's registry and prints its reference.
 - `k8s/git-remote-duck DEST` is the one pin of git-remote-duck that every
   image takes (toolchain, pods, mac, forge-mirror, and the build stage of
