@@ -378,7 +378,7 @@ async fn a_refused_service_whose_expiry_is_unknown_fails_at_once() {
     let Answer::Failed(why) = ask(&serving, &request, b"").await else {
         panic!("a closed port answered");
     };
-    assert!(why.contains("refused"), "{why}");
+    assert!(why.contains("refused the connection after "), "{why}");
 }
 
 #[tokio::test]
@@ -390,5 +390,55 @@ async fn a_base_that_takes_the_connection_and_never_answers_fails_its_reach_at_t
     let Reached::Failed(why) = reached else {
         panic!("{reached:?}");
     };
-    assert!(why.contains("did not answer within 1 ms"), "{why}");
+    let said = format!("{base} sent no answer in ");
+    assert!(why.starts_with(&said), "{why}");
+    assert!(
+        why.ends_with(" ms, the 1 ms egress waits for a request"),
+        "{why}"
+    );
+}
+
+#[test]
+fn an_unanswered_call_says_what_failed_and_after_how_long() {
+    use std::io::ErrorKind;
+    let kinds = [
+        (Some(ErrorKind::TimedOut), true, Unanswered::Silent),
+        (
+            Some(ErrorKind::ConnectionRefused),
+            false,
+            Unanswered::Refused,
+        ),
+        (Some(ErrorKind::ConnectionReset), false, Unanswered::Reset),
+        (Some(ErrorKind::ConnectionAborted), false, Unanswered::Reset),
+        (None, true, Unanswered::Waited),
+        (Some(ErrorKind::Other), false, Unanswered::Other),
+    ];
+    for (kind, timeout, read) in kinds {
+        assert_eq!(unanswered(kind, timeout), read, "{kind:?} {timeout}");
+    }
+    let base = Url::parse("http://10.43.80.80:8080/").unwrap();
+    let took = Duration::from_millis(30510);
+    let wait = Some(Duration::from_millis(64000));
+    assert_eq!(
+        said(
+            &base,
+            Unanswered::Silent,
+            took,
+            wait,
+            "Connection timed out"
+        ),
+        "http://10.43.80.80:8080/ timed out after 30510 ms: nothing answered, not even a refusal: Connection timed out"
+    );
+    assert_eq!(
+        said(&base, Unanswered::Waited, took, wait, "operation timed out"),
+        "http://10.43.80.80:8080/ sent no answer in 30510 ms, the 64000 ms egress waits for a request"
+    );
+    assert_eq!(
+        said(&base, Unanswered::Reset, took, None, "reset by peer"),
+        "http://10.43.80.80:8080/ reset the connection after 30510 ms: reset by peer"
+    );
+    assert_eq!(
+        said(&base, Unanswered::Other, took, None, "dns"),
+        "the target was not reached after 30510 ms: dns"
+    );
 }

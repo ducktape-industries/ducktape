@@ -3,7 +3,7 @@
 //! refused connection is tried again each block until its request's expiry. Used by `mod.rs`.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use abi::role::egress::http::{Head, Response};
 use abi::role::egress::{Answer, Delivery, HTTP, Request, StreamEnd};
@@ -71,18 +71,12 @@ impl Clients {
     }
 
     pub async fn reach(&self, base: &Url, wait: Duration) -> Reached {
+        let started = Instant::now();
         let error = match self.services.get(base.clone()).timeout(wait).send().await {
             Ok(response) => return Reached::Answered(response.status().as_u16()),
             Err(error) => error,
         };
-        let failed = match error.is_timeout() {
-            true => format!(
-                "{base} did not answer within {} ms, the wait egress gives a request",
-                wait.as_millis()
-            ),
-            false => unreached(base, error),
-        };
-        Reached::Failed(failed)
+        Reached::Failed(unreached(base, error, started.elapsed(), Some(wait)))
     }
 }
 
@@ -170,17 +164,71 @@ fn end_to_end(headers: Vec<(String, String)>) -> Vec<(String, String)> {
         .collect()
 }
 
-fn unreached(url: &Url, error: reqwest::Error) -> String {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unanswered {
+    Silent,
+    Refused,
+    Reset,
+    Waited,
+    Other,
+}
+
+fn unanswered(kind: Option<std::io::ErrorKind>, timeout: bool) -> Unanswered {
+    match kind {
+        Some(std::io::ErrorKind::TimedOut) => Unanswered::Silent,
+        Some(std::io::ErrorKind::ConnectionRefused) => Unanswered::Refused,
+        Some(std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {
+            Unanswered::Reset
+        }
+        _ if timeout => Unanswered::Waited,
+        _ => Unanswered::Other,
+    }
+}
+
+fn said(
+    url: &Url,
+    unanswered: Unanswered,
+    took: Duration,
+    wait: Option<Duration>,
+    causes: &str,
+) -> String {
+    let took = took.as_millis();
+    match (unanswered, wait) {
+        (Unanswered::Silent, _) => {
+            format!(
+                "{url} timed out after {took} ms: nothing answered, not even a refusal: {causes}"
+            )
+        }
+        (Unanswered::Refused, _) => {
+            format!("{url} refused the connection after {took} ms: {causes}")
+        }
+        (Unanswered::Reset, _) => format!("{url} reset the connection after {took} ms: {causes}"),
+        (Unanswered::Waited, Some(wait)) => format!(
+            "{url} sent no answer in {took} ms, the {} ms egress waits for a request",
+            wait.as_millis()
+        ),
+        (Unanswered::Waited, None) => format!("{url} sent no answer in {took} ms: {causes}"),
+        (Unanswered::Other, _) => {
+            format!("the target was not reached after {took} ms: {causes}")
+        }
+    }
+}
+
+fn unreached(url: &Url, error: reqwest::Error, took: Duration, wait: Option<Duration>) -> String {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     let mut causes = Vec::new();
+    let mut kind = None;
     while let Some(cause) = source {
         if cause.downcast_ref::<NotPublic>().is_some() {
             return format!("{url} is not a public address");
         }
+        let io = cause.downcast_ref::<std::io::Error>();
+        kind = kind.or(io.map(std::io::Error::kind));
         causes.push(cause.to_string());
         source = cause.source();
     }
-    format!("the target was not reached: {}", causes.join(": "))
+    let unanswered = unanswered(kind, error.is_timeout());
+    said(url, unanswered, took, wait, &causes.join(": "))
 }
 
 fn refused(error: &reqwest::Error) -> bool {
@@ -392,12 +440,14 @@ async fn send(
         if !body.is_empty() {
             request = request.body(body.clone());
         }
+        let started = Instant::now();
         let error = match request.send().await {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
+        let took = started.elapsed();
         if !refused(&error) || !again(blocks).await {
-            return Err(unreached(&url, error));
+            return Err(unreached(&url, error, took, None));
         }
     }
 }
