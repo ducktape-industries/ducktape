@@ -199,7 +199,9 @@ impl statesync::Exchange for Held {
             statesync::Response::Refused(refusal) if refusal.reason == reason::STALE => {
                 self.gate.stale.fetch_add(1, Ordering::SeqCst);
             }
-            statesync::Response::Sync(_) | statesync::Response::Refused(_) => {}
+            statesync::Response::Sync(_)
+            | statesync::Response::Refused(_)
+            | statesync::Response::Released => {}
         }
         Ok(response)
     }

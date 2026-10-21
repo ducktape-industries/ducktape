@@ -7,7 +7,7 @@ use futures::{SinkExt as _, Stream, StreamExt as _};
 use host::{ANCHOR_WINDOW, Layer, RECENT, SubmissionId};
 use node::{Frame, Preconfirm};
 use reqwest::StatusCode;
-use statesync::{Ending, Exchange, Failure, Fault, Request, Response};
+use statesync::{Ending, Exchange, Failure, Fault, Held, Request, Response};
 use tokio::io::AsyncWriteExt as _;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -406,7 +406,7 @@ impl Exchange for Client {
         self.post(route::SYNC, &request).await.map_err(without_url)
     }
 
-    async fn hold(&self) -> Result<(Response, Ending)> {
+    async fn hold(&self) -> Result<Held> {
         held(self).await.map_err(without_url)
     }
 
@@ -431,7 +431,7 @@ fn without_url(error: Error) -> Error {
     }
 }
 
-async fn held(client: &Client) -> Result<(Response, Ending)> {
+async fn held(client: &Client) -> Result<Held> {
     let response = client
         .http
         .post(client.url(route::SYNC_HOLD))
@@ -443,13 +443,18 @@ async fn held(client: &Client) -> Result<(Response, Ending)> {
         let body = response.bytes().await?;
         return Err(unanswered(status, &body));
     }
+    let hold = response
+        .headers()
+        .get(crate::wire::HOLD_HEADER)
+        .and_then(|number| number.to_str().ok())
+        .and_then(|number| number.parse().ok());
     let mut body: Body = Box::pin(response.bytes_stream());
     let mut read = Vec::new();
     loop {
         if let Some(head) = framed_head(&read)? {
-            let holding: Ending =
+            let ending: Ending =
                 Box::pin(async move { while let Some(Ok(_)) = body.next().await {} });
-            return Ok((head, holding));
+            return Ok(Held { head, hold, ending });
         }
         match body.next().await {
             Some(Ok(bytes)) => read.extend_from_slice(&bytes),

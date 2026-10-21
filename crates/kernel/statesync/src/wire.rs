@@ -15,6 +15,11 @@ pub enum Request {
         program: ProgramId,
         request: Vec<u8>,
     },
+    /// The joiner holding `hold` has synced `program`, so the hold lets go of it.
+    Release {
+        hold: u64,
+        program: ProgramId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -22,6 +27,8 @@ pub enum Response {
     Head(Head),
     Sync(Vec<u8>),
     Refused(Refusal),
+    /// A release was taken; one naming no live hold changes nothing.
+    Released,
 }
 
 #[derive(Clone, Debug, PartialEq)]

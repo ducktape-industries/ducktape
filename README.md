@@ -325,7 +325,11 @@ syncs the state, `join` holds the head it read open (`POST /v1/sync/hold`):
 the node it joins through keeps serving that head, past its own prunes, until
 the hold closes: once the state is synced, or when the hold's connection drops (the
 joiner stops, or a proxy between them closes it), so a busy network cannot
-prune past a slow join. The joiner reads the hold's answer as it comes, one
+prune past a slow join. The hold's answer names the hold in its
+`ducktape-hold` header, and once the joiner has synced a program it sends
+`Release` for it on `/v1/sync`: the source then lets go of that program,
+and of the journal sections it pruned under it, so a join pins only the
+programs it still has to sync. The joiner reads the hold's answer as it comes, one
 line per block the source applies; when that answer ends or breaks, the join
 drops the request it is waiting on and reads the head again under a new hold.
 A hold the source let go of while its connection stays open shows as the next

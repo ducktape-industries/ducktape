@@ -1146,13 +1146,15 @@ async fn sync_hold<E: Context>(ctx: Ctx<E>) -> Response {
     let Some(held) = held else {
         return (StatusCode::OK, head).into_response();
     };
+    let number = held.number.to_string();
     let open = Open {
         tips: ctx.tips(),
         held: Held::new(held, opened, ctx.holds_ended()),
     };
     let heights = futures::stream::unfold(open, applied);
     let answer = futures::stream::once(async move { Ok::<_, std::io::Error>(head) }).chain(heights);
-    (StatusCode::OK, Body::from_stream(answer)).into_response()
+    let named = [(crate::wire::HOLD_HEADER, number)];
+    (StatusCode::OK, named, Body::from_stream(answer)).into_response()
 }
 
 async fn applied(mut open: Open) -> Option<(std::io::Result<Bytes>, Open)> {
@@ -1450,6 +1452,7 @@ mod tests {
     fn open(tips: tokio::sync::watch::Receiver<u64>, height: u64, tally: &Arc<AtomicU64>) -> Open {
         let held = crate::HeldHead {
             height,
+            number: 0,
             hold: Box::new(()),
         };
         Open {

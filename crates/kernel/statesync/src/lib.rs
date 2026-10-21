@@ -67,6 +67,13 @@ pub type Holding = Box<dyn std::any::Any + Send>;
 
 pub type Ending = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// A source's head and the number of the hold it keeps on it while `ending` is pending.
+pub struct Held {
+    pub head: Response,
+    pub hold: Option<u64>,
+    pub ending: Ending,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
     Transient(&'static str),
@@ -91,13 +98,15 @@ pub trait Exchange: Clone + Send + Sync + 'static {
         request: Request,
     ) -> impl Future<Output = std::result::Result<Response, Self::Error>> + Send;
 
-    fn hold(
-        &self,
-    ) -> impl Future<Output = std::result::Result<(Response, Ending), Self::Error>> + Send {
+    fn hold(&self) -> impl Future<Output = std::result::Result<Held, Self::Error>> + Send {
         async move {
             let head = self.exchange(Request::Head).await?;
             let unheld: Ending = Box::pin(futures::future::pending());
-            Ok((head, unheld))
+            Ok(Held {
+                head,
+                hold: None,
+                ending: unheld,
+            })
         }
     }
 
@@ -209,12 +218,12 @@ async fn adopted_head<E: Context, X: Exchange>(
     let mut retargets: u64 = 0;
     let mut ended: u64 = 0;
     loop {
-        let (head, hold) = held_head(asking).await?;
+        let (head, number, hold) = held_head(asking).await?;
         let anchor_names_the_tip = head.anchor.names(head.tip);
         if !anchor_names_the_tip {
             return Err(Error::Head);
         }
-        let syncing = synced_to(context, name, asking, &head.targets);
+        let syncing = synced_to(context, name, asking, &head.targets, number);
         let Some(synced) = while_held(syncing, hold).await else {
             retargets += 1;
             ended += 1;
@@ -264,6 +273,7 @@ async fn synced_to<E: Context, X: Exchange>(
     name: &str,
     asking: &Asking<E, X>,
     targets: &BTreeMap<ProgramId, SyncTarget>,
+    hold: Option<u64>,
 ) -> Result<BTreeMap<ProgramId, Commitment<E>>> {
     let mut commitments = BTreeMap::new();
     for (synced, (program, target)) in targets.iter().enumerate() {
@@ -293,8 +303,36 @@ async fn synced_to<E: Context, X: Exchange>(
             programs = targets.len(),
             "the join synced a program's commitment"
         );
+        release(asking, hold, program);
     }
     Ok(commitments)
+}
+
+fn release<E: Context, X: Exchange>(asking: &Asking<E, X>, hold: Option<u64>, program: &ProgramId) {
+    let Some(hold) = hold else {
+        return;
+    };
+    let release = Request::Release {
+        hold,
+        program: program.clone(),
+    };
+    let exchange = asking.exchange.clone();
+    let program = program.clone();
+    let sent = asking.context.child("release").spawn(move |_| async move {
+        let answered = exchange.exchange(release).await;
+        let taken = matches!(answered, Ok(Response::Released));
+        if taken {
+            return;
+        }
+        tracing::debug!(
+            target: "ducktape::sync",
+            event = "join_release_untaken",
+            program = program.as_str(),
+            hold,
+            "the source did not take the release of a program the join synced; its hold keeps it until the join ends"
+        );
+    });
+    drop(sent);
 }
 
 fn pruned_past(error: &Error) -> bool {
@@ -328,10 +366,12 @@ async fn head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<Head> {
     }
 }
 
-async fn held_head<E: Context, X: Exchange>(asking: &Asking<E, X>) -> Result<(Head, Ending)> {
-    let (answer, hold) = asking.held().await?;
-    match answer {
-        Response::Head(head) => Ok((head, hold)),
+async fn held_head<E: Context, X: Exchange>(
+    asking: &Asking<E, X>,
+) -> Result<(Head, Option<u64>, Ending)> {
+    let held = asking.held().await?;
+    match held.head {
+        Response::Head(head) => Ok((head, held.hold, held.ending)),
         Response::Refused(refusal) => Err(Error::Refused(refusal)),
         other => Err(Error::Answer(Box::new(other))),
     }
@@ -490,7 +530,7 @@ impl<E: Context, X: Exchange> Asking<E, X> {
         }
     }
 
-    async fn held(&self) -> Result<(Response, Ending)> {
+    async fn held(&self) -> Result<Held> {
         let mut attempts: u64 = 0;
         loop {
             let error = match self.exchange.hold().await {

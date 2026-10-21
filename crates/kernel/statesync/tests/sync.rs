@@ -252,17 +252,22 @@ impl Exchange for Loopback {
         Ok(abi::decode(&abi::encode(&response)).unwrap())
     }
 
-    async fn hold(&self) -> Result<(Response, statesync::Ending), Infallible> {
+    async fn hold(&self) -> Result<statesync::Held, Infallible> {
         let node = self.0.node.lock().await;
         let published = Arc::new(statesync::Published::of(&node, None).unwrap());
         drop(node);
         let (served, hold) = statesync::held(published, &self.0.holds);
+        let number = hold.as_ref().map(statesync::Hold::number);
         let response = anchored(served, &*self.0).await;
-        let holding: statesync::Ending = Box::pin(async move {
+        let ending: statesync::Ending = Box::pin(async move {
             let _hold = hold;
             futures::future::pending::<()>().await
         });
-        Ok((abi::decode(&abi::encode(&response)).unwrap(), holding))
+        Ok(statesync::Held {
+            head: abi::decode(&abi::encode(&response)).unwrap(),
+            hold: number,
+            ending,
+        })
     }
 
     fn stream_blobs(
@@ -1245,25 +1250,32 @@ impl Exchange for Pruning {
             Response::Refused(refusal) if refusal.reason == abi::reason::STALE => {
                 self.stale.fetch_add(1, Ordering::SeqCst);
             }
-            Response::Sync(_) | Response::Refused(_) => {}
+            Response::Sync(_) | Response::Refused(_) | Response::Released => {}
         }
         Ok(response)
     }
 
-    async fn hold(&self) -> Result<(Response, statesync::Ending), Infallible> {
+    async fn hold(&self) -> Result<statesync::Held, Infallible> {
         if self.hold == Hold::Unheld {
             let head = self.exchange(Request::Head).await?;
             let unheld: statesync::Ending = Box::pin(futures::future::pending());
-            return Ok((head, unheld));
+            return Ok(statesync::Held {
+                head,
+                hold: None,
+                ending: unheld,
+            });
         }
         self.heads.fetch_add(1, Ordering::SeqCst);
-        let (head, holding) = self.source.hold().await?;
+        let held = self.source.hold().await?;
         if self.hold == Hold::Held {
-            return Ok((head, holding));
+            return Ok(held);
         }
-        self.kept.lock().unwrap().push(holding);
+        self.kept.lock().unwrap().push(held.ending);
         let restartable: statesync::Ending = Box::pin(futures::future::pending());
-        Ok((head, restartable))
+        Ok(statesync::Held {
+            ending: restartable,
+            ..held
+        })
     }
 
     fn stream_blobs(
@@ -1875,19 +1887,20 @@ impl Exchange for Unholding {
         self.source.exchange(request).await
     }
 
-    async fn hold(&self) -> Result<(Response, statesync::Ending), Infallible> {
-        let (head, held) = self.source.hold().await?;
+    async fn hold(&self) -> Result<statesync::Held, Infallible> {
+        let held = self.source.hold().await?;
         let ends = self.holds.fetch_add(1, Ordering::SeqCst) < self.ending;
         if !ends {
-            return Ok((head, held));
+            return Ok(held);
         }
         let (end, ended) = futures::channel::oneshot::channel();
         *self.ends.lock().unwrap() = Some(end);
+        let holding = held.ending;
         let ending: statesync::Ending = Box::pin(async move {
-            let _held = held;
+            let _held = holding;
             let _ = ended.await;
         });
-        Ok((head, ending))
+        Ok(statesync::Held { ending, ..held })
     }
 
     fn stream_blobs(
@@ -1956,6 +1969,239 @@ fn a_join_whose_holds_keep_ending_reads_the_head_once_a_pause() {
         );
         let source = network.source.node.lock().await;
         assert_eq!(joined.node.tip().unwrap(), source.tip().unwrap());
+    });
+}
+
+/// Serves from the source. Once the join releases probe, it churns probe's
+/// floor past where probe's first sync started, asks that first request
+/// again and sends the answer on `asked_again`.
+#[derive(Clone)]
+struct Releasing {
+    source: Loopback,
+    keys: Vec<ed25519::PrivateKey>,
+    members: Vec<validators::Member>,
+    first_probe_sync: Arc<Mutex<Option<Request>>>,
+    asked_again: Arc<Mutex<Option<futures::channel::oneshot::Sender<Response>>>>,
+}
+
+impl Releasing {
+    async fn probe_floor(&self) -> u64 {
+        let node = self.source.0.node.lock().await;
+        let commitment = node.host().store().commitment("probe").unwrap();
+        *commitment.db().unwrap().sync_boundary()
+    }
+
+    async fn ask_probe_again_past_its_floor(&self) {
+        let first = self.first_probe_sync.lock().unwrap().clone().unwrap();
+        let start = sync_start(&first).unwrap();
+        let section = state::Tuning::default().items_per_section.get();
+        for round in 0..CHURN_ROUNDS {
+            let floor_passed = self.probe_floor().await > start + section;
+            if floor_passed {
+                break;
+            }
+            advance(&self.source.0, &self.keys, &self.members, churn(round)).await;
+        }
+        let Ok(answered) = self.source.exchange(first).await;
+        let asked_again = self.asked_again.lock().unwrap().take();
+        if let Some(asked_again) = asked_again {
+            asked_again.send(answered).unwrap();
+        }
+    }
+}
+
+impl Exchange for Releasing {
+    type Error = Infallible;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Infallible> {
+        let first_probe =
+            probe_sync(Asked::Request(&request)) && self.first_probe_sync.lock().unwrap().is_none();
+        if first_probe {
+            *self.first_probe_sync.lock().unwrap() = Some(request.clone());
+        }
+        let releases_probe =
+            matches!(&request, Request::Release { program, .. } if program == "probe");
+        let response = self.source.exchange(request).await?;
+        if releases_probe {
+            self.ask_probe_again_past_its_floor().await;
+        }
+        Ok(response)
+    }
+
+    async fn hold(&self) -> Result<statesync::Held, Infallible> {
+        self.source.hold().await
+    }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Infallible>> + Send {
+        self.source.stream_blobs(ids)
+    }
+}
+
+#[test]
+fn a_join_lets_go_of_each_program_it_synced_and_holds_the_rest() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let first = network.advance(churn(CHURN_ROUNDS)).await;
+        let (asked_again, answered) = futures::channel::oneshot::channel();
+        let releasing = Releasing {
+            source: network.exchange(),
+            keys: network.keys.clone(),
+            members: network.members.clone(),
+            first_probe_sync: Arc::default(),
+            asked_again: Arc::new(Mutex::new(Some(asked_again))),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            releasing.clone(),
+        )
+        .await
+        .unwrap();
+
+        drop(releasing);
+        assert_eq!(joined.node.tip().unwrap(), first);
+        let asked_again = answered.await.ok();
+        let pruned = matches!(
+            &asked_again,
+            Some(Response::Refused(refusal)) if refusal.reason == abi::reason::STALE
+        );
+        assert!(
+            pruned,
+            "probe, synced and let go, is no longer held below the source's floor: {asked_again:?}"
+        );
+    });
+}
+
+/// How a source from before releases answers them.
+#[derive(Clone, Copy)]
+enum Unknown {
+    /// It names no hold, so the join sends no release.
+    NamesNoHold,
+    /// It names a hold and refuses a release as a request it cannot read.
+    Refuses,
+    /// It names a hold and fails a release, as an old node's HTTP 400 does.
+    Fails,
+    /// It names a hold and never answers a release.
+    Hangs,
+}
+
+/// A source from before releases; it tells `released` of each release it is sent.
+#[derive(Clone)]
+struct Unreleasing {
+    source: Loopback,
+    unknown: Unknown,
+    released: UnboundedSender<()>,
+}
+
+impl Exchange for Unreleasing {
+    type Error = Outage;
+
+    async fn exchange(&self, request: Request) -> Result<Response, Outage> {
+        let release = matches!(request, Request::Release { .. });
+        if !release {
+            let Ok(response) = self.source.exchange(request).await;
+            return Ok(response);
+        }
+        let _ = self.released.unbounded_send(());
+        match self.unknown {
+            Unknown::NamesNoHold | Unknown::Refuses => Ok(Response::Refused(abi::Refusal::new(
+                abi::reason::PROTOCOL,
+                "a request this source cannot read",
+            ))),
+            Unknown::Fails => Err(Outage(Failure::Definite)),
+            Unknown::Hangs => futures::future::pending().await,
+        }
+    }
+
+    async fn hold(&self) -> Result<statesync::Held, Outage> {
+        let Ok(held) = self.source.hold().await;
+        let names_its_hold = !matches!(self.unknown, Unknown::NamesNoHold);
+        let hold = held.hold.filter(|_| names_its_hold);
+        Ok(statesync::Held { hold, ..held })
+    }
+
+    fn stream_blobs(
+        &self,
+        ids: Vec<BlobId>,
+    ) -> impl Stream<Item = Result<Option<Vec<u8>>, Outage>> + Send {
+        self.source
+            .stream_blobs(ids)
+            .map(|read| -> Result<Option<Vec<u8>>, Outage> {
+                let Ok(framed) = read;
+                Ok(framed)
+            })
+    }
+}
+
+async fn joined_from_unreleasing(context: &Ctx, unknown: Unknown) -> UnboundedReceiver<()> {
+    let network = found(context).await;
+    let (released, heard) = unbounded();
+    let unreleasing = Unreleasing {
+        source: network.exchange(),
+        unknown,
+        released,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let joined = join(
+        context.child("joiner"),
+        "joiner",
+        dir.path(),
+        NETWORK.to_vec(),
+        PAUSE,
+        unreleasing.clone(),
+    )
+    .await
+    .unwrap();
+    let source = network.source.node.lock().await;
+    assert_eq!(joined.node.tip().unwrap(), source.tip().unwrap());
+    assert_eq!(
+        joined.node.host().root().unwrap(),
+        source.host().root().unwrap()
+    );
+    drop(unreleasing);
+    heard
+}
+
+#[test]
+fn a_join_from_a_source_that_names_no_hold_sends_no_release_and_adopts_its_head() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut heard = joined_from_unreleasing(&context, Unknown::NamesNoHold).await;
+        assert_eq!(heard.next().await, None, "the join sent no release");
+    });
+}
+
+#[test]
+fn a_join_from_a_source_that_refuses_its_releases_goes_on_and_adopts_its_head() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut heard = joined_from_unreleasing(&context, Unknown::Refuses).await;
+        let asked = heard.next().await;
+        assert_eq!(asked, Some(()), "the join asked to release what it synced");
+    });
+}
+
+#[test]
+fn a_join_from_a_source_that_never_answers_its_releases_goes_on_and_adopts_its_head() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut heard = joined_from_unreleasing(&context, Unknown::Hangs).await;
+        let asked = heard.next().await;
+        assert_eq!(asked, Some(()), "the join asked to release what it synced");
+    });
+}
+
+#[test]
+fn a_join_from_a_source_that_fails_its_releases_goes_on_and_adopts_its_head() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut heard = joined_from_unreleasing(&context, Unknown::Fails).await;
+        let asked = heard.next().await;
+        assert_eq!(asked, Some(()), "the join asked to release what it synced");
     });
 }
 

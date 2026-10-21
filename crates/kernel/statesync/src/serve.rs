@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use abi::{ProgramId, Refusal, reason};
 use arc_swap::ArcSwap;
@@ -65,13 +66,27 @@ impl<E: Context> Published<E> {
 }
 
 pub struct Holds<E: Context> {
-    held: Arc<ArcSwap<Vec<Weak<Published<E>>>>>,
+    held: Arc<ArcSwap<Vec<Weak<Pinned<E>>>>>,
+    numbered: Arc<AtomicU64>,
+}
+
+/// A held head's programs a joiner has not synced yet, by the hold's number.
+struct Pinned<E: Context> {
+    number: u64,
+    programs: Mutex<BTreeMap<ProgramId, Arc<Serving<E>>>>,
+}
+
+impl<E: Context> Pinned<E> {
+    fn programs(&self) -> std::sync::MutexGuard<'_, BTreeMap<ProgramId, Arc<Serving<E>>>> {
+        self.programs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl<E: Context> Default for Holds<E> {
     fn default() -> Holds<E> {
         Holds {
             held: Arc::default(),
+            numbered: Arc::default(),
         }
     }
 }
@@ -80,13 +95,18 @@ impl<E: Context> Clone for Holds<E> {
     fn clone(&self) -> Holds<E> {
         Holds {
             held: self.held.clone(),
+            numbered: self.numbered.clone(),
         }
     }
 }
 
 impl<E: Context> Holds<E> {
-    pub fn hold(&self, published: Arc<Published<E>>) -> Hold<E> {
-        let mine = Arc::downgrade(&published);
+    pub fn hold(&self, published: &Published<E>) -> Hold<E> {
+        let pinned = Arc::new(Pinned {
+            number: self.numbered.fetch_add(1, Ordering::Relaxed),
+            programs: Mutex::new(published.programs.clone()),
+        });
+        let mine = Arc::downgrade(&pinned);
         self.held.rcu(|held| {
             let mut kept: Vec<_> = held
                 .iter()
@@ -97,9 +117,22 @@ impl<E: Context> Holds<E> {
             kept
         });
         Hold {
-            published,
+            pinned,
             holds: self.clone(),
         }
+    }
+
+    pub fn release(&self, hold: u64, program: &str) {
+        let pinned = self
+            .held
+            .load()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|pinned| pinned.number == hold);
+        let Some(pinned) = pinned else {
+            return;
+        };
+        pinned.programs().remove(program);
     }
 
     fn covering(&self, program: &str, request: &SyncRequest) -> Option<Arc<Serving<E>>> {
@@ -107,8 +140,9 @@ impl<E: Context> Holds<E> {
             .load()
             .iter()
             .filter_map(Weak::upgrade)
-            .find_map(|published| {
-                let serving = published.programs.get(program)?;
+            .find_map(|pinned| {
+                let programs = pinned.programs();
+                let serving = programs.get(program)?;
                 let bounds = serving.reader.bounds();
                 let covers = bounds.start <= *request.start() && *request.size() <= bounds.end;
                 covers.then(|| serving.clone())
@@ -117,13 +151,19 @@ impl<E: Context> Holds<E> {
 }
 
 pub struct Hold<E: Context> {
-    published: Arc<Published<E>>,
+    pinned: Arc<Pinned<E>>,
     holds: Holds<E>,
+}
+
+impl<E: Context> Hold<E> {
+    pub fn number(&self) -> u64 {
+        self.pinned.number
+    }
 }
 
 impl<E: Context> Drop for Hold<E> {
     fn drop(&mut self) {
-        let mine = Arc::downgrade(&self.published);
+        let mine = Arc::downgrade(&self.pinned);
         self.holds.held.rcu(|held| {
             held.iter()
                 .filter(|other| other.strong_count() > 0 && !other.ptr_eq(&mine))
@@ -150,6 +190,10 @@ pub async fn serve<E: Context>(
         Request::Head => head(published),
         Request::Sync { program, request } => {
             Served::Answered(sync(published, holds, &program, &request).await)
+        }
+        Request::Release { hold, program } => {
+            holds.release(hold, &program);
+            Served::Answered(Response::Released)
         }
     }
 }
@@ -178,7 +222,7 @@ pub fn held<E: Context>(
 ) -> (Served, Option<Hold<E>>) {
     let served = head(&published);
     let headed = matches!(&served, Served::Unanchored { targets: Ok(_), .. });
-    let hold = headed.then(|| holds.hold(published));
+    let hold = headed.then(|| holds.hold(&published));
     (served, hold)
 }
 

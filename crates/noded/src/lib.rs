@@ -199,6 +199,7 @@ pub struct Daemon<E: Context> {
 
 pub struct HeldHead {
     pub height: u64,
+    pub number: u64,
     pub hold: statesync::Holding,
 }
 
@@ -264,6 +265,7 @@ impl<E: Context> Daemon<E> {
         let (served, hold) = statesync::held(view.sync().clone(), &self.holds);
         let held = hold.map(|hold| HeldHead {
             height,
+            number: hold.number(),
             hold: Box::new(hold),
         });
         Ok((statesync::anchored(served, &**view.sync()).await, held))

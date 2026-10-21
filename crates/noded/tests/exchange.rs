@@ -207,8 +207,12 @@ fn a_hold_whose_head_arrives_in_pieces_takes_it_whole() {
         framed.extend_from_slice(&encoded);
         let chunks = framed.chunks(3).map(<[u8]>::to_vec).collect();
         let base = streaming(chunks).await;
-        let (head, _holding) = Client::new(base).hold().await.unwrap();
-        assert_eq!(abi::encode(&head), encoded);
+        let held = Client::new(base).hold().await.unwrap();
+        assert_eq!(abi::encode(&held.head), encoded);
+        assert_eq!(
+            held.hold, None,
+            "an answer with no hold header names no hold"
+        );
     });
 }
 
@@ -226,7 +230,27 @@ fn a_hold_reads_each_line_after_its_head_and_ends_when_its_answer_does() {
             chunks.push(line);
         }
         let base = streaming(chunks).await;
-        let (_, holding) = Client::new(base).hold().await.unwrap();
-        holding.await;
+        let held = Client::new(base).hold().await.unwrap();
+        held.ending.await;
+    });
+}
+
+#[test]
+fn a_hold_takes_its_number_from_the_answer_header() {
+    runtime().block_on(async {
+        let refusal = abi::Refusal::new(abi::reason::NOT_FOUND, "a numbered head");
+        let encoded = abi::encode(&Response::Refused(refusal));
+        let mut framed = (encoded.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&encoded);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new().fallback(move || {
+            let framed = framed.clone();
+            async move { ([("ducktape-hold", "42")], framed) }
+        });
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let held = Client::new(base).hold().await.unwrap();
+        assert_eq!(abi::encode(&held.head), encoded);
+        assert_eq!(held.hold, Some(42));
     });
 }

@@ -7,6 +7,7 @@ use node::Preconfirm;
 pub const NODE_CONTRACT: u32 = 10;
 pub const ADMIN: &str = "$admin";
 pub const EGRESS: &str = "$egress";
+pub const HOLD_HEADER: &str = "ducktape-hold";
 
 pub mod route {
     pub const STATUS: &str = "/v1/status";
