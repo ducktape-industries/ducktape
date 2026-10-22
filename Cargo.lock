@@ -12,12 +12,12 @@ dependencies = [
 [[package]]
 name = "access"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "borsh",
  "describe",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "store",
 ]
 
@@ -487,12 +487,12 @@ dependencies = [
 [[package]]
 name = "borsh-json"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "borsh",
  "design",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "serde_json",
 ]
 
@@ -1454,13 +1454,13 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "crosspond"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "borsh",
  "commonware-codec",
  "describe",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "state-proof",
  "store",
 ]
@@ -1647,7 +1647,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 [[package]]
 name = "describe"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "borsh",
 ]
@@ -1655,7 +1655,7 @@ dependencies = [
 [[package]]
 name = "design"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "sha2 0.10.9",
@@ -1899,7 +1899,7 @@ dependencies = [
 [[package]]
 name = "error"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "borsh",
 ]
@@ -1945,14 +1945,14 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "files"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "access",
  "borsh",
  "describe",
  "ownership",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "programs",
  "store",
  "unicode-normalization",
@@ -2724,14 +2724,14 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "identity"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "access",
  "borsh",
  "describe",
  "design",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "store",
 ]
 
@@ -3122,7 +3122,7 @@ dependencies = [
  "live-wire",
  "node",
  "noded",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "serde",
@@ -3171,7 +3171,7 @@ dependencies = [
  "keyscheme",
  "live-wire",
  "node",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "quinn",
  "rand_core 0.10.1",
  "rcgen",
@@ -3464,14 +3464,14 @@ dependencies = [
 [[package]]
 name = "ownership"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "access",
  "borsh",
  "describe",
  "design",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "store",
 ]
 
@@ -3783,7 +3783,7 @@ dependencies = [
 [[package]]
 name = "program"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "blob",
@@ -3796,7 +3796,7 @@ dependencies = [
 [[package]]
 name = "program-derive"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3806,13 +3806,13 @@ dependencies = [
 [[package]]
 name = "programs"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "blob",
  "borsh",
  "describe",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "store",
 ]
 
@@ -4761,7 +4761,7 @@ dependencies = [
 [[package]]
 name = "state-proof"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "commonware-codec",
@@ -4802,11 +4802,11 @@ dependencies = [
 [[package]]
 name = "store"
 version = "0.1.0"
-source = "git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674#0974c0a1682fb10f2fd4267f3ac2e70003628674"
+source = "git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63#0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63"
 dependencies = [
  "abi",
  "borsh",
- "program 0.1.0 (git+duck://duckpond-725bcad1/forge/programs?rev=0974c0a1682fb10f2fd4267f3ac2e70003628674)",
+ "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "serde",
 ]
 
