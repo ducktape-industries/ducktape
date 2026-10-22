@@ -108,8 +108,9 @@ or through a member node's halo forward.
   ends every stream it holds. A wait (a pod's or a build runner's) answers with
   `ducktape-reattach: request`, so a node that serves egress (core `README.md`, the service
   request section) sends the same request again to the new pod, which waits on the same pod
-  and ends with its real end; a wait's events before its end are only alive beats, so the new
-  one starts afresh whatever `ducktape-heard` says. An exec stream carries no such mark and
+  and ends with its real end; a wait's events before its end are alive beats and at most one
+  `note` that its pod can't be placed yet, so the new one starts afresh whatever
+  `ducktape-heard` says, and notes a pod still unplaced once more. An exec stream carries no such mark and
   is still cut; the command it ran goes on in its pod.
 
 - **A Kubernetes namespace and ServiceAccount.** `pods.yaml` makes namespace `pods`, which

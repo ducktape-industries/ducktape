@@ -459,16 +459,45 @@ def exec_key(asked):
     return asked["chain"], asked["program"], asked["request"]
 
 
+class Hearing:
+    def __init__(self, execution):
+        self.execution = execution
+        self.told = False
+
+    def fresh(self):
+        return self.execution.noted is not None and not self.told
+
+    def get(self, timeout=None):
+        running = self.execution
+        with running.changed:
+            if not running.changed.wait_for(lambda: self.fresh() or running.ended.is_set(), timeout):
+                raise queue.Empty
+            if self.fresh():
+                self.told = True
+                return "note", running.noted
+            return "ended", running.result
+
+
 class Execution:
     def __init__(self, asked):
         self.asked = asked
         self.ended = threading.Event()
         self.result = None
         self.unswept = 0
+        self.noted = None
+        self.changed = threading.Condition()
 
     def end(self, result):
-        self.result = result
-        self.ended.set()
+        with self.changed:
+            self.result = result
+            self.ended.set()
+            self.changed.notify_all()
+
+    def note(self, line):
+        with self.changed:
+            if self.noted is None:
+                self.noted = line
+                self.changed.notify_all()
 
     def get(self, timeout=None):
         if not self.ended.wait(timeout):
@@ -1764,15 +1793,24 @@ def unscheduled(status):
     return held[0].get("message") if held else None
 
 
-def pending_said(pod):
+def unplaced(pod):
     status = pod.get("status", {})
     held = [entry for entry in status.get("conditions", []) if entry.get("type") == "PodScheduled" and entry.get("status") == "False" and entry.get("reason") == UNSCHEDULABLE]
-    placed = status.get("phase") != "Pending" or not held
-    if placed:
+    return held[0].get("message") if held and status.get("phase") == "Pending" else None
+
+
+def pending_line(name, pod):
+    message = unplaced(pod)
+    return None if message is None else f"pod {name} is pending, waiting to be placed: {message}"
+
+
+def pending_said(pod):
+    message = unplaced(pod)
+    if message is None:
         return None
     meta = pod["metadata"]
     name = meta["name"]
-    detail = f"pending, waiting to be placed: {held[0].get('message')}"
+    detail = f"pending, waiting to be placed: {message}"
     return {"group": name, "subject": f"pod {name}", "status": "note", "detail": detail, "concerns": concerning(requester_of(meta.get("labels") or {}))}
 
 
@@ -3821,7 +3859,7 @@ class Service:
             running = self.execs[key] = Execution(asked)
 
         def run():
-            running.end(outcome(lambda: self.executed(asked, name, container, command, alive=alive)))
+            running.end(outcome(lambda: self.executed(asked, name, container, command, alive=alive, note=running.note)))
             self.swept.set()
 
         threading.Thread(target=run, daemon=True).start()
@@ -3886,7 +3924,7 @@ class Service:
             except Exception as error:
                 say("pods_sweep_failed", detail=json.dumps(repr(error)))
 
-    def executed(self, asked, name, container, command, again=False, alive=None):
+    def executed(self, asked, name, container, command, again=False, alive=None, note=None):
         if name in self.runners:
             try:
                 return self.runners[name].ran(command, alive)
@@ -3901,7 +3939,7 @@ class Service:
         while True:
             ran = self.through_apiserver(asked, name, lambda: self.retried(asked, attempt, failed) if again else attempt())
             waited = unstarted(ran, container)
-            if waited is None or not self.started(asked, name, waited.container):
+            if waited is None or not self.started(asked, name, waited.container, note):
                 return ran
 
     def through_apiserver(self, asked, name, attempt):
@@ -3921,7 +3959,7 @@ class Service:
             self.pause(pause)
             pause *= 2
 
-    def started(self, asked, name, container):
+    def started(self, asked, name, container, note=None):
         process = None
         try:
             while True:
@@ -3943,6 +3981,9 @@ class Service:
                 start = start_of(item, watched)
                 if start == "ended":
                     return False
+                line = pending_line(name, item.get("object") or {})
+                if line is not None and note is not None:
+                    note(line)
                 if not self.waiting(asked):
                     raise Refused(502, f"container {watched} of pod {name} had not started when request {asked['request']}, which asked for this, was gone, so nothing ran")
                 if start == "running":
@@ -4629,6 +4670,7 @@ class Service:
         ended = ended_event(pod)
         beat = Beat(every) if log is None else Beat(every, LogReads(lambda: self.log_said(name, log)).said)
         process = None
+        noted = False
         try:
             while ended is None:
                 if process is None:
@@ -4638,6 +4680,10 @@ class Service:
                 match kind:
                     case "event":
                         ended = watch_ended(name, item)
+                        line = None if noted or ended is not None else pending_line(name, item.get("object") or {})
+                        if line is not None:
+                            noted = True
+                            yield sse("note", {"line": line})
                     case "closed":
                         process = None
                         ended = self.reread(name, item)
@@ -4723,7 +4769,10 @@ class Service:
         return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
 
     def exec_waited(self, asked, name, container, command, every):
-        ran = yield from Beat(every).heard(self.execution(asked, name, container, command, alive=every))
+        beat, hearing = Beat(every), Hearing(self.execution(asked, name, container, command, alive=every))
+        while (heard := (yield from beat.heard(hearing)))[0] == "note":
+            yield sse("note", {"line": heard[1]})
+        ran = heard[1]
         try:
             answer = "ended", exec_answer(name, answered(ran))
         except Refused as refusal:

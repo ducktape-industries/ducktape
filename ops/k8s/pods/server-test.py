@@ -506,6 +506,12 @@ class Streamed(Served):
             pass
         return heard
 
+    def told(self, response):
+        said = [self.past_alive(response)]
+        while said[-1][0] not in ("ended", "refused"):
+            said.append(self.past_alive(response))
+        return said
+
 
 class Wait(Streamed):
     def test_a_wait_on_an_ended_pod_answers_ended_at_once(self):
@@ -627,6 +633,30 @@ class Wait(Streamed):
         self.kube.watches.append(watch)
         kind, data = self.event(self.stream("/v1/pods/duckpond-9/wait?every=30"))
         self.assertEqual((kind, data["line"], data["pod"]), ("ended", "pod duckpond-9 is gone", None))
+
+    def test_a_wait_on_a_pod_the_scheduler_cannot_place_notes_why_once_while_it_waits(self):
+        self.kube.answer("get", ran(pod_json()))
+        watch = Watch()
+        self.kube.watches.append(watch)
+        watch.send("ADDED", unschedulable(pod_json()))
+        watch.send("MODIFIED", unschedulable(pod_json()))
+        response = self.stream("/v1/pods/duckpond-41/wait?every=1")
+        self.assertEqual(self.past_alive(response), ("note", {"line": f"pod duckpond-41 is pending, waiting to be placed: {UNSCHEDULABLE}"}))
+        watch.send("MODIFIED", unschedulable(pod_json()))
+        watch.send("MODIFIED", pod_json(state=ENDED, phase="Succeeded"))
+        kind, data = self.past_alive(response)
+        self.assertEqual((kind, data["exit_code"]), ("ended", 0))
+
+    def test_a_wait_on_a_pod_only_gated_or_not_yet_placed_notes_nothing(self):
+        for pending in (unschedulable(pod_json(), reason="SchedulingGated"), pod_json()):
+            with self.subTest(conditions=pending["status"].get("conditions")):
+                self.kube.answer("get", ran(pod_json()))
+                watch = Watch()
+                self.kube.watches = [watch]
+                watch.send("ADDED", pending)
+                watch.send("MODIFIED", pod_json(state=ENDED, phase="Succeeded"))
+                said = self.told(self.stream("/v1/pods/duckpond-41/wait?every=30"))
+                self.assertEqual([kind for kind, _ in said], ["ended"], said)
 
 
 class Framing(Streamed):
@@ -2126,6 +2156,17 @@ class Unstarted(Streamed):
         self.kube.answer("get", ran(pod_json(state=FETCHING_STATE, init=RUNNING)))
         response = self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"], "every": 1})
         self.assertEqual(self.event(response), ("alive", {}))
+        self.watch.send("MODIFIED", pod_json(state=RUNNING, phase="Running", init=ENDED))
+        self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
+        self.assertEqual(self.kube.verbs().count("exec"), 2)
+
+    def test_a_streamed_exec_on_a_pod_the_scheduler_cannot_place_notes_why_once_while_it_waits(self):
+        self.kube.answer("exec", ran(code=1, err=UNPLACED), ran(b"built\n"))
+        self.kube.answer("get", ran(unschedulable(pod_json())))
+        self.watch.send("ADDED", unschedulable(pod_json()))
+        response = self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"], "every": 1})
+        self.assertEqual(self.past_alive(response), ("note", {"line": f"pod duckpond-41 is pending, waiting to be placed: {UNSCHEDULABLE}"}))
+        self.watch.send("MODIFIED", unschedulable(pod_json()))
         self.watch.send("MODIFIED", pod_json(state=RUNNING, phase="Running", init=ENDED))
         self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
         self.assertEqual(self.kube.verbs().count("exec"), 2)
