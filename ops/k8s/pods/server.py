@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane run again on each Preview forge-reach asks the service's account for again, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
-# ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
+# ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, `server.py fetch` is each pod's input fetcher, and `server.py hardcap` prints the agents quota k8s/pods/deploy applies.
 import base64
 import binascii
 import copy
@@ -5190,6 +5190,44 @@ def shared(target):
         path.chmod(mode | (0o777 if runnable else 0o666))
 
 
+HARDCAP = ("cpu", "memory")
+HELD_PHASES = ("Running", "Pending")
+GIB = 1 << 30
+
+
+def request_of(holder, name):
+    return ((holder.get("resources") or {}).get("requests") or {}).get(name)
+
+
+def pod_requests(pod):
+    spec = pod.get("spec") or {}
+    stated = {name: request_of(spec, name) for name in HARDCAP}
+    return {
+        name: quantity(stated[name]) if stated[name] is not None else sum((quantity(request_of(container, name)) for container in spec.get("containers") or [] if request_of(container, name) is not None), Fraction(0))
+        for name in HARDCAP
+    }
+
+
+def hardcap(nodes, pods, namespace):
+    free = {name: sum((quantity(node["status"]["allocatable"][name]) for node in nodes["items"]), Fraction(0)) for name in HARDCAP}
+    for pod in pods["items"]:
+        if pod["metadata"]["namespace"] == namespace or (pod.get("status") or {}).get("phase") not in HELD_PHASES:
+            continue
+        for name, value in pod_requests(pod).items():
+            free[name] -= value
+    return f"{math.floor(free['cpu'] * 1000)}m", f"{math.floor(free['memory'] / GIB)}Gi"
+
+
+def hardcap_main():
+    kubectl = shlex.split(os.environ.get("PODS_KUBECTL", "kubectl"))
+    listed = [json.loads(subprocess.run([*kubectl, "get", *kind, "-o", "json"], check=True, stdout=subprocess.PIPE, text=True).stdout) for kind in (["nodes"], ["pods", "--all-namespaces"])]
+    try:
+        cpu, memory = hardcap(*listed, os.environ.get("PODS_NAMESPACE", "agents"))
+    except Refused as refusal:
+        sys.exit(refusal.sentence)
+    print(cpu, memory)
+
+
 def fetch_main():
     ducktape = shlex.split(os.environ.get("PODS_DUCKTAPE_CLI", "ducktape"))
     fetcher = Fetcher(ducktape, os.environ["PODS_NODE"], os.environ["PODS_FORGE"], Path(tempfile.mkdtemp()), block_ms=int(os.environ["PODS_BLOCK_MS"]))
@@ -5266,7 +5304,9 @@ if __name__ == "__main__":
     match sys.argv[1:]:
         case ["fetch"]:
             fetch_main()
+        case ["hardcap"]:
+            hardcap_main()
         case []:
             main()
         case other:
-            sys.exit(f"usage: server.py [fetch], not {' '.join(other)}")
+            sys.exit(f"usage: server.py [fetch|hardcap], not {' '.join(other)}")

@@ -13,6 +13,7 @@ import os
 import pathlib
 import queue
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -6035,6 +6036,53 @@ class Keys(unittest.TestCase):
             (keys / "password").write_text("p\n")
             self.assertTrue(signer.held())
             self.assertEqual(signer.env()["DUCKTAPE_PASSWORD"], "p")
+
+
+def cluster_pod(namespace, phase, containers, level=None):
+    spec = {"containers": [{"name": f"c{at}", **({"resources": {"requests": asks}} if asks is not None else {})} for at, asks in enumerate(containers)]}
+    if level is not None:
+        spec["resources"] = {"requests": level}
+    return {"metadata": {"namespace": namespace}, "spec": spec, "status": {"phase": phase}}
+
+
+FABRICS = {"items": [{"status": {"allocatable": {"cpu": "56", "memory": "127142520Ki", "pods": "110"}}}]}
+CLUSTER = {
+    "items": [
+        cluster_pod("duckpond", "Running", [{"cpu": "12", "memory": "6Gi"}, {"cpu": "312m", "memory": "500Mi"}]),
+        cluster_pod("duckpond", "Pending", [{"cpu": "9", "memory": "9Gi"}], level={"cpu": "4", "memory": "1Gi"}),
+        cluster_pod("kube-system", "Running", [{"cpu": "7", "memory": "312Mi"}], level={"cpu": "1"}),
+        cluster_pod("pods", "Running", [None, {}]),
+        cluster_pod("duckpond", "Succeeded", [{"cpu": "20", "memory": "20Gi"}]),
+        cluster_pod("duckpond", "Failed", [{"cpu": "20", "memory": "20Gi"}]),
+        cluster_pod("agents", "Running", [{"cpu": "16500m", "memory": "109Gi"}]),
+        cluster_pod("agents", "Pending", [{"cpu": "1", "memory": "1Gi"}]),
+    ]
+}
+
+
+class Hardcap(unittest.TestCase):
+    def test_every_running_or_pending_pod_outside_agents_comes_off_the_allocatable(self):
+        self.assertEqual(server.hardcap(FABRICS, CLUSTER, "agents"), ("38688m", "113Gi"))
+
+    def test_a_pod_level_request_stands_for_its_containers_one_resource_at_a_time(self):
+        pod = cluster_pod("duckpond", "Running", [{"cpu": "7", "memory": "312Mi"}], level={"cpu": "1"})
+        self.assertEqual(server.pod_requests(pod), {"cpu": 1, "memory": 312 * 1024 * 1024})
+
+    def test_server_py_hardcap_prints_what_kubectl_lists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = pathlib.Path(temp)
+            (folder / "nodes.json").write_text(json.dumps(FABRICS))
+            (folder / "pods.json").write_text(json.dumps(CLUSTER))
+            fake = folder / "kubectl.py"
+            fake.write_text(
+                "import sys\n"
+                "folder, *asked = sys.argv[1:]\n"
+                "known = {'get nodes -o json': 'nodes', 'get pods --all-namespaces -o json': 'pods'}\n"
+                "sys.stdout.write(open(f'{folder}/{known[\" \".join(asked)]}.json').read())\n"
+            )
+            kubectl = " ".join(shlex.quote(word) for word in (sys.executable, str(fake), temp))
+            done = subprocess.run([sys.executable, str(HERE / "server.py"), "hardcap"], env={**os.environ, "PODS_KUBECTL": kubectl}, capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "38688m 113Gi\n", ""))
 
 
 if __name__ == "__main__":

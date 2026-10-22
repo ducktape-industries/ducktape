@@ -15,6 +15,10 @@ or through a member node's halo forward.
 - `server-test.py` covers the service over real HTTP against a recording kubectl, ducktape
   and kubelet: `python3 ops/k8s/pods/server-test.py` (also part of `make test`).
 - `server.py fetch` is each pod's init container, which fetches its inputs.
+- `server.py hardcap` prints the cpu and memory `deploy` gives the quota `hardcap`: the
+  nodes' allocatable minus the requests of every Running or Pending pod outside `agents`
+  (its pod-level request where it states one, else its containers' summed), read with
+  `PODS_KUBECTL` (`kubectl` when unset).
 - The requester of what `POST /v1/pods` and `POST /v1/manifests` make is the account egress
   says sent the request (egress `Sender`, asked once per create), or a fleet call's asker. A
   body naming a `requester` is refused 400; a create egress could not be asked about is refused

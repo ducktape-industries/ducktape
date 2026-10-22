@@ -653,9 +653,13 @@ one up for another network.
 - Namespace `agents` holds the ResourceQuota `hardcap`, the operator's
   ceiling: `requests.storage` 500Gi, and `requests.cpu` and
   `requests.memory` at the allocatable cpu and memory of the cluster's
-  nodes minus what the duckpond node, ccs and tunnel Deployments request,
-  summed over their containers and replicas. `k8s/pods/deploy` reads these
-  from the cluster and prints the two values before it applies. It
+  nodes minus what every Running or Pending pod outside `agents` requests
+  (its pod-level request where it states one, else its containers' summed),
+  cpu in whole millicores and memory in whole Gi, both rounded down.
+  `k8s/pods/deploy` reads these from the cluster with `k8s/pods/server.py
+  hardcap` and prints the two values before it applies;
+  `PODS_KUBECTL="kubectl --context fabrics-1" python3
+  ops/k8s/pods/server.py hardcap` prints them without applying. It
   caps what pods are guaranteed, not what they burst to. Kubernetes enforces every quota in a
   namespace, so agents add their own quotas and LimitRanges beside it and
   none exceeds it. The service's
