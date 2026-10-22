@@ -172,6 +172,9 @@ class Kube:
     def apply(self, objects, dry):
         return self.ran("apply", objects, dry)
 
+    def held(self, objects):
+        return self.ran("held", objects)
+
     def trial(self, pod):
         return self.ran("trial", pod)
 
@@ -2126,8 +2129,8 @@ class Manifests(Served):
         self.signer.sender = sent_by(17)
         status, answer = self.call("POST", "/v1/manifests", {"manifests": [deployment()]})
         self.assertEqual((status, answer), (200, {"applied": [{"kind": "Deployment", "name": "web"}]}))
-        self.assertEqual(self.kube.verbs(), ["cluster_kinds", "trial", "apply", "apply"])
-        trial = self.kube.calls[1][1]
+        self.assertEqual(self.kube.verbs(), ["cluster_kinds", "held", "trial", "apply", "apply"])
+        trial = self.kube.calls[2][1]
         self.assertEqual(trial["kind"], "Pod")
         self.assertEqual(trial["metadata"]["generateName"], "web-")
         self.assertEqual(trial["metadata"]["labels"]["app"], "web")
@@ -2223,6 +2226,47 @@ class Manifests(Served):
             self.refused("DELETE", "/v1/manifests", {"kind": kind, "name": "x"}, 403, ["is refused"])
         self.assertEqual(self.kube.verbs().count("objects"), 1)
         self.assertEqual([call[:2] for call in self.api.calls], [("DELETE", "/apis/apps/v1/namespaces/agents/deployments/web")])
+
+    def test_apply_cannot_transfer_an_existing_objects_delete_permission(self):
+        theirs = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "victim", "uid": "u-victim", "labels": {"ducktape.industries/requester": "21"}}, "data": {"a": "1"}}
+        self.kube.answer("held", ran(theirs))
+        self.kube.answer("objects", ran(theirs))
+        self.signer.sender = sent_by(17)
+        taking = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "victim"}, "data": {"a": "2"}}
+        self.refused("POST", "/v1/manifests", {"manifests": [taking]}, 403, ["manifest 0 (ConfigMap victim) is account 21's", "re-applies or deletes it", "this call is account 17's"])
+        self.assertNotIn("apply", self.kube.verbs())
+        self.refused("DELETE", "/v1/manifests", {"kind": "configmap", "name": "victim"}, 403, ["is account 21's"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_apply_refuses_an_existing_object_that_names_no_requester(self):
+        unnamed = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web", "uid": "u-web", "labels": {"app": "web"}}}
+        self.kube.answer("held", ran({"apiVersion": "v1", "kind": "List", "items": [unnamed]}))
+        self.signer.sender = sent_by(17)
+        self.refused("POST", "/v1/manifests", {"manifests": [deployment()]}, 403, ["manifest 0 (Deployment web) names no requester"])
+        self.assertNotIn("apply", self.kube.verbs())
+
+    def test_the_requester_applies_over_its_own_object_held_to_its_uid_after_one_read_of_every_object(self):
+        mine = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web", "uid": "u-web", "labels": {"ducktape.industries/requester": "17"}}}
+        self.kube.answer("held", ran({"apiVersion": "v1", "kind": "List", "items": [mine]}))
+        self.signer.sender = sent_by(17)
+        config = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "web"}, "data": {}}
+        status, answer = self.call("POST", "/v1/manifests", {"manifests": [deployment(), config]})
+        self.assertEqual(status, 200, answer)
+        (_, objects, _), (_, again, _) = self.applied()
+        self.assertEqual(objects[0]["metadata"].get("uid"), "u-web")
+        self.assertNotIn("uid", objects[1]["metadata"])
+        self.assertEqual(objects, again)
+        reads = [call[1] for call in self.kube.calls if call[0] == "held"]
+        self.assertEqual([[(item["kind"], item["metadata"]["name"]) for item in read] for read in reads], [[("Deployment", "web"), ("ConfigMap", "web")]])
+
+    def test_a_read_that_finds_nothing_applies_and_a_failed_read_applies_nothing(self):
+        self.signer.sender = sent_by(17)
+        self.kube.answer("held", ran(b""))
+        self.assertEqual(self.call("POST", "/v1/manifests", {"manifests": [deployment()]})[0], 200)
+        self.kube.calls = []
+        self.kube.answer("held", ran(code=1, err='Error from server (Forbidden): deployments.apps "web" is forbidden'))
+        self.refused("POST", "/v1/manifests", {"manifests": [deployment()]}, 403, ["whose they are could not be told", "is forbidden"])
+        self.assertNotIn("apply", self.kube.verbs())
 
     def test_reading_returns_one_object_or_every_object_of_a_kind(self):
         self.kube.answer("objects", ran({"kind": "Deployment", "metadata": {"name": "web"}}), ran({"items": [{"metadata": {"name": "web"}}]}))

@@ -764,6 +764,10 @@ class Kube:
         tried = ["--dry-run=server"] if dry else []
         return self.call("apply", *tried, "--filename", "-", "--output", "json", stdin=written(listed).encode())
 
+    def held(self, objects):
+        listed = {"apiVersion": "v1", "kind": "List", "items": objects}
+        return self.call("get", "--ignore-not-found", "--filename", "-", "--output", "json", stdin=written(listed).encode())
+
     def trial(self, pod):
         return self.call("create", "--dry-run=server", "--filename", "-", "--output", "name", stdin=written(pod).encode())
 
@@ -1690,6 +1694,15 @@ def owned_only(query, caller):
     chosen = [value for key, value in pairs if key == "labelSelector" and value]
     kept_pairs = [(key, value) for key, value in pairs if key != "labelSelector"]
     return urlencode([*kept_pairs, ("labelSelector", ",".join([*chosen, f"{REQUESTER}={caller}"]))])
+
+
+def listed_items(answer):
+    return [mapping(item) for item in listing(answer.get("items"))] if answer.get("kind") == "List" else [answer]
+
+
+def object_key(manifest):
+    group = str(manifest.get("apiVersion", "")).rpartition("/")[0]
+    return group, manifest.get("kind"), mapping(manifest.get("metadata")).get("name")
 
 
 def api_refusal(answered, what):
@@ -4438,14 +4451,14 @@ class Service:
         meta = mapping(mapping(held).get("metadata"))
         holder = account_number(str(mapping(meta.get("labels")).get(REQUESTER, "")))
         if holder is None:
-            raise Refused(403, f"{what} names no requester, so no call deletes it: the operator removes it with kubectl")
+            raise Refused(403, f"{what} names no requester, so no call re-applies or deletes it: the operator removes it with kubectl")
         caller = self.requester(asked)
         if caller != holder:
             calling = "no account" if caller is None else f"account {caller}"
-            raise Refused(403, f"{what} is account {holder}'s: only the account whose request made it deletes it (a call {FLEET_PROGRAM} relays: its run's asker), and this call is {calling}'s")
+            raise Refused(403, f"{what} is account {holder}'s: only the account whose request made it re-applies or deletes it (a call {FLEET_PROGRAM} relays: its run's asker), and this call is {calling}'s")
         uid = meta.get("uid")
         if not isinstance(uid, str):
-            raise Refused(502, f"{what} was read with no uid, so its delete could not be held to it")
+            raise Refused(502, f"{what} was read with no uid, so the call could not be held to it")
         return uid
 
     def object_at(self, path, what):
@@ -4637,6 +4650,7 @@ class Service:
             confined.append(made)
         reading = self.schemas.reading()
         objects = [reading.object(manifest, f"manifest {index}") for index, manifest in enumerate(confined)]
+        self.owned(asked, objects)
         for index, manifest in enumerate(objects):
             self.tried(manifest, f"manifest {index}")
         tried = self.kube.apply(objects, dry=True)
@@ -4648,6 +4662,18 @@ class Service:
         applied = json.loads(ran.out)
         items = applied.get("items", [applied]) if applied.get("kind") == "List" else [applied]
         return 200, {"applied": [{"kind": item.get("kind"), "name": item["metadata"]["name"]} for item in items]}
+
+    def owned(self, asked, objects):
+        found = self.kube.held(objects)
+        if found.code != 0:
+            raise kube_refusal(found, "the manifests' objects were not read, so whose they are could not be told")
+        answer = mapping(json.loads(found.out)) if found.out.strip() else {"kind": "List"}
+        held = {object_key(item): item for item in listed_items(answer)}
+        for index, manifest in enumerate(objects):
+            current = held.get(object_key(manifest))
+            if current is not None:
+                what = f"manifest {index} ({manifest['kind']} {manifest['metadata'].get('name', '')})"
+                manifest["metadata"]["uid"] = self.whose(asked, current, what)
 
     def readable(self, kind, name):
         if refused_kind(kind) in REFUSED:

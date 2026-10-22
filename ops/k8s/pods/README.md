@@ -37,7 +37,12 @@ or through a member node's halo forward.
   own account, which is that pod's requester. An object with no requester label (made before pods
   stamped one) is deleted by no call: the operator removes it with kubectl. The service reads the
   object, then sends the delete held to the uid it read, so an object made again under the same
-  name in between is not deleted. A `/v1/k8s/` DELETE of a collection deletes only the caller's
+  name in between is not deleted. `POST /v1/manifests` keeps that rule for an object that is
+  already there: it reads every object its manifests name in one `kubectl get`, and applies
+  over an existing one only for that object's requester (anyone else, and any call over an
+  object with no requester label, is refused 403 before anything applies), with the manifest
+  held to the uid it read. So no apply moves an object's requester label to another account,
+  and with it the right to delete it. A `/v1/k8s/` DELETE of a collection deletes only the caller's
   own: its `labelSelector` gains `ducktape.industries/requester=<caller>`. A `/v1/k8s/` POST
   stamps the sender as requester too, as `/v1/pods` and `/v1/manifests` do.
 - A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and
