@@ -748,7 +748,10 @@ one up for another network.
 - `k8s/toolchain/deploy` builds `k8s/toolchain/Containerfile`, the image
   agents build ducktape, programs and the app with (and run the app in,
   under Xvfb and xdotool), pushes it to the
-  cluster node's registry and prints its reference.
+  cluster node's registry and prints its reference. The image includes
+  cargo-mutants 27.1.0 as `/usr/local/bin/cargo-mutants` (`cargo mutants`),
+  installed from the x86_64 Linux release archive after its pinned SHA-256
+  is checked. The image build verifies the installed command's version.
 - `k8s/git-remote-duck DEST` is the one pin of git-remote-duck that every
   image takes (toolchain, pods, mac, forge-mirror, and the build stage of
   every image that builds ducktape, which fetches fluent31 from forge): a
