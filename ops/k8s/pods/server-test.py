@@ -4922,6 +4922,15 @@ class Builds(Streamed):
         self.built("wait", f"{WARM}:w1", request=42)
         self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "wait", "w1"])])
 
+    def test_failures_and_diag_read_the_run_on_the_machine_its_id_names(self):
+        self.gate.answers["exec"] = ran(b"== r1/test.log\ntest a ... FAILED\n")
+        status, answer = self.built("failures", "desktop:r1")
+        self.assertEqual((status, answer["stdout"]), (200, "== r1/test.log\ntest a ... FAILED\n"))
+        self.assertTrue(answer["stderr"].startswith("builds: on desktop"))
+        self.assertEqual(self.gate.words(), [["exec", "failures", "r1"]])
+        self.built("diag", f"{WARM}:w1", request=42)
+        self.assertEqual(self.warm_execs(), [(WARM, None, ["sh", BUILD, "diag", "w1"])])
+
     def test_each_run_a_call_names_on_its_machine_goes_without_the_machine(self):
         self.kube.answer("exec", ran(b"stopped w1 (job j-1)\nstopped w2 (job j-1)\n"))
         self.assertEqual(self.built("stop", f"{WARM}:w1", f"{WARM}:w2", "w3")[0], 200)

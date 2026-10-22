@@ -341,7 +341,7 @@ one up for another network.
   answers 404 names the warm pod `PODS_WARM_POD` names now, when that is
   another pod (`if pod X was the warm pod, it has been replaced: the warm
   pod is now Y`), so a caller holding a replaced warm pod's name learns
-  the new one. `status`, `log`, `stop`, `wait` and
+  the new one. `status`, `log`, `failures`, `diag`, `stop`, `wait` and
   `requeue` name their run as `<machine>:<run>` and go to that machine, or
   by its bare id (as build.sh's `read it with:` line and NOTIFY name it),
   and go to the first machine, the runners in order then the warm pod, whose
