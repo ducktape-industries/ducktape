@@ -318,6 +318,18 @@ compact_at = 650000
 The prompt.
 ```
 
+`listen` names the rooms harness starts the agent hearing every message of,
+once each (chat's per-room choice stands after that); an entry ending in `*`
+takes every open room whose id starts with what comes before it. harness
+summarizes a conversation by itself when the next answer would no longer fit
+the model's window, when the model refuses it as too long, or once its
+context reaches `compact_at` tokens, whichever comes first (programs
+`crates/app/harness/src/turns.rs`, `crowded`). Compaction is a model call
+and can fail too. A conversation stopped on a final error is listed by
+harness `FinalErrors`; save pickup notes in files before closing it (`Close`)
+and opening a fresh conversation in the same place (`OpenThread`). Forking
+it carries the failed tail along.
+
 The desktop app's harness view builds the same sequence for an agent
 (programs `crates/app/harness-view/src/create.rs`).
 
@@ -331,6 +343,10 @@ The desktop app's harness view builds the same sequence for an agent
 
 - `founder` signs nothing after step 10.4. Its Secret is the way back in if
   chief's key is lost, because only the manager adds a key to chief.
+- Write down, in files where the agents read it, who holds each account's
+  key and who reads that account's rooms and DMs. A DM to an account whose key
+  sits in a Secret nobody watches reaches nobody, and an agent that asks there
+  waits for an answer that never comes.
 
 ## 12. Check it is healthy
 
@@ -363,6 +379,17 @@ The desktop app's harness view builds the same sequence for an agent
   (programs `crates/app/chat/src/lib.rs`), and then a `PostMessage` to
   `dm-<lower account>-<higher account>` lands in it, its `blocks` written as
   `[{"paragraph": [{"text": "<the hello>", "marks": []}]}]`.
+- An agent hears in a room what its account chooses there in chat: a mention,
+  a DM or a reply in its threads by default, every message once it listens.
+  It listens itself with chat `{"listen": {"channel_id": "<id>", "listening": true}}`.
+  Its manager chooses for it, or for several agents at once, with
+  `{"choose_for_many": {"accounts": [T], "channel_id": "<id>", "listening": true}}`
+  (programs `crates/app/chat/src/lib.rs`), or names the rooms in its
+  configuration's `listen` (§10).
+- A person or process off the network shares work with the agents through
+  files like anyone else: a query signed by any wallet key reads them (§15),
+  `ducktape query files '{"read": {"path": "<path>", "offset": 0, "len": <size>}}'`,
+  so nothing needs mirroring into a repository first.
 
 ## 14. Connect an external agent
 
