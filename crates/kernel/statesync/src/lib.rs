@@ -138,11 +138,10 @@ pub async fn join<E: Context, X: Exchange>(
         exchange,
         pause,
     };
-    let parts = host::Parts::open(dir)?;
     adopting(
         context,
         name,
-        parts,
+        Over::Dir(dir),
         Adoption::default(),
         network,
         &asking,
@@ -186,13 +185,38 @@ pub async fn readopt<E: Context, X: Exchange>(
         exchange,
         pause,
     };
-    adopting(context, name, parts, adoption, network, &asking, Some(past)).await
+    adopting(
+        context,
+        name,
+        Over::Parts(parts),
+        adoption,
+        network,
+        &asking,
+        Some(past),
+    )
+    .await
+}
+
+enum Over<'a> {
+    Dir(&'a Path),
+    Parts(host::Parts),
+}
+
+impl Over<'_> {
+    fn opened(&mut self) -> Result<host::Parts> {
+        let parts = match self {
+            Over::Dir(dir) => host::Parts::open(dir)?,
+            Over::Parts(parts) => return Ok(parts.clone()),
+        };
+        *self = Over::Parts(parts.clone());
+        Ok(parts)
+    }
 }
 
 async fn adopting<E: Context, X: Exchange>(
     mut context: E,
     name: &str,
-    parts: host::Parts,
+    mut over: Over<'_>,
     mut adoption: Adoption,
     network: Vec<u8>,
     asking: &Asking<E, X>,
@@ -209,7 +233,7 @@ async fn adopting<E: Context, X: Exchange>(
         let mut node = Node::adopt_over(
             context.child("node"),
             name,
-            parts.clone(),
+            over.opened()?,
             synced,
             &mut adoption,
         )
