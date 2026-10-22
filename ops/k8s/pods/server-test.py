@@ -175,6 +175,9 @@ class Kube:
             self.gate.wait()
         return self.ran("exec", name, container, command)
 
+    def keep(self, name, container, path, data):
+        return self.ran("keep", name, container, path, data)
+
     def annotate(self, name, key, value):
         return self.ran("annotate", name, key, value)
 
@@ -718,6 +721,13 @@ class StreamedExec(Streamed):
         self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
         self.assertEqual(response.read(), b"")
         self.assertEqual(self.kube.calls[-1], ("exec", "duckpond-41", None, ["make"]))
+
+    def test_a_streamed_exec_past_its_inline_bytes_ends_with_where_its_output_was_kept(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        self.kube.answer("exec", ran(b"built\n"))
+        response = self.stream("/v1/pods/duckpond-41/exec", "POST", {"command": ["make"], "every": 30, "inline": 2})
+        kept = {"stdout": {"path": "/tmp/pods-exec/41/stdout", "bytes": 6, "lines": 1}, "stderr": {"path": "/tmp/pods-exec/41/stderr", "bytes": 0, "lines": 0}}
+        self.assertEqual(self.past_alive(response), ("ended", {"exit_code": 0, "kept": kept}))
 
     def test_an_exec_stream_is_not_marked_for_another_pick_up(self):
         self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
@@ -1625,6 +1635,39 @@ class Exec(Served):
         self.refused("POST", "/v1/pods/duckpond-41/exec", {"command": ["true"], "script": "true"}, 400, ["not both"])
         self.refused("POST", "/v1/pods/duckpond-41/exec", {"script": ""}, 400, ["script holds shell text"])
         self.refused("POST", "/v1/pods/duckpond-41/exec", {"script": ["true"]}, 400, ["script is a JSON str"])
+        self.assertEqual(self.kube.calls, [])
+
+    def test_an_exec_past_its_inline_bytes_keeps_its_output_in_the_pod_and_answers_where(self):
+        self.kube.answer("exec", ran(b"a\nb\n", err="w"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"], "inline": 4})
+        kept = {"stdout": {"path": "/tmp/pods-exec/41/stdout", "bytes": 4, "lines": 2}, "stderr": {"path": "/tmp/pods-exec/41/stderr", "bytes": 1, "lines": 0}}
+        self.assertEqual((status, answer), (200, {"exit_code": 0, "kept": kept}))
+        self.assertEqual(self.kube.calls[1:], [("keep", "duckpond-41", None, "/tmp/pods-exec/41/stdout", b"a\nb\n"), ("keep", "duckpond-41", None, "/tmp/pods-exec/41/stderr", b"w")])
+
+    def test_a_kept_outputs_lines_are_its_newlines_as_wc_counts_them(self):
+        self.kube.answer("exec", ran(b"a\rb\rc\nd"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["git", "clone"], "inline": 0})
+        self.assertEqual((status, answer["kept"]["stdout"]["lines"]), (200, 1))
+
+    def test_an_exec_within_its_inline_bytes_answers_whole(self):
+        self.kube.answer("exec", ran(b"a\nb\n", err="w"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"], "inline": 5})
+        self.assertEqual((status, answer), (200, {"exit_code": 0, "stdout": "a\nb\n", "stderr": "w"}))
+        self.assertNotIn("keep", self.kube.verbs())
+
+    def test_an_exec_keeps_its_output_in_the_container_it_ran_in(self):
+        self.kube.answer("exec", ran(b"built\n"))
+        self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"], "container": "out", "inline": 0})
+        self.assertEqual([call[2] for call in self.kube.calls if call[0] == "keep"], ["out", "out"])
+
+    def test_an_exec_whose_output_the_pod_could_not_keep_answers_whole(self):
+        self.kube.answer("exec", ran(b"built\n"))
+        self.kube.answer("keep", ran(code=1, err="sh: read-only file system"))
+        status, answer = self.call("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"], "inline": 0})
+        self.assertEqual((status, answer), (200, {"exit_code": 0, "stdout": "built\n", "stderr": ""}))
+
+    def test_an_execs_inline_is_a_whole_number_of_bytes_from_0(self):
+        self.refused("POST", "/v1/pods/duckpond-41/exec", {"command": ["make"], "inline": -1}, 400, ["inline is a whole number of bytes"])
         self.assertEqual(self.kube.calls, [])
 
 
@@ -4886,6 +4929,12 @@ class DesktopRunner(Streamed):
         self.assertEqual(status, 403, answer)
         self.assertIn("build runner", answer["error"])
         self.assertEqual(self.kube.calls, [])
+
+    def test_a_build_runner_answers_whole_whatever_its_inline(self):
+        self.gate.answers["exec"] = ran(b"run r1\n")
+        status, answer = self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", BUILD, "busy"], "inline": 0})
+        self.assertEqual((status, answer["stdout"]), (200, "run r1\n"))
+        self.assertNotIn("keep", self.kube.verbs())
 
     def notified(self, line):
         self.gate.answers["exec"] = ran(b"run r1\n")

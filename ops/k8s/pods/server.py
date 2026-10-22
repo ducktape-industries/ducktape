@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends, when the scheduler first can't place a notified pod, or when a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane started by itself on each merge queue front's Preview that waits on the service's account, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs (output past the bytes an exec names as inline kept in the pod and answered by path), logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends, when the scheduler first can't place a notified pod, or when a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane started by itself on each merge queue front's Preview that waits on the service's account, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, `server.py fetch` is each pod's input fetcher, and `server.py hardcap` prints the agents quota k8s/pods/deploy applies, refusing one below what agents' pods already hold.
 import base64
 import binascii
@@ -95,7 +95,9 @@ FORGE = {"repo": str, "commit": str}
 FILES = {"path": str, "snapshot": str}
 BLOB = {"path": str, "paths": list, "kind": str, "container": str}
 FILE = {"path": str, "to": str, "message": str, "container": str}
-EXEC = {"command": list, "script": str, "container": str, "every": int}
+EXEC = {"command": list, "script": str, "container": str, "every": int, "inline": int}
+EXEC_KEPT = "/tmp/pods-exec"
+EXEC_KEEPS = 'mkdir -p "$(dirname "$1")" && cat > "$1"'
 PUSH = {"path": str, "ref": str, "have": list, "container": str, "branch": str, "heads": list, "allow_stack": bool}
 READ = {"path": str, "offset": int, "length": int, "container": str}
 REPORT = {"report": str, "push": dict}
@@ -794,6 +796,10 @@ class Kube:
     def exec(self, name, container, command):
         chosen = ["--container", container] if container else []
         return self.call("exec", name, *chosen, "--", *command)
+
+    def keep(self, name, container, path, data):
+        chosen = ["--container", container] if container else []
+        return self.call("exec", "--stdin", name, *chosen, "--", "sh", "-c", EXEC_KEEPS, "sh", path, stdin=data)
 
     def annotate(self, name, key, value):
         return self.call("annotate", "pod", name, f"{key}={value}", "--overwrite")
@@ -2357,9 +2363,21 @@ def git_output(name, ran, doing):
     return ran.out
 
 
+def exec_streams(name, ran):
+    return {"stdout": ran.out, "stderr": reached(name, ran).encode()}
+
+
 def exec_answer(name, ran):
-    stderr = reached(name, ran)
-    return {"exit_code": ran.code, **text_or_hex(ran.out, "stdout"), **text_or_hex(stderr.encode(), "stderr")}
+    streams = exec_streams(name, ran)
+    return {"exit_code": ran.code, **text_or_hex(streams["stdout"], "stdout"), **text_or_hex(streams["stderr"], "stderr")}
+
+
+def exec_inline(asked):
+    if "inline" not in asked:
+        return None
+    if asked["inline"] < 0:
+        raise Refused(400, "inline is a whole number of bytes from 0: the most output an exec answers whole")
+    return asked["inline"]
 
 
 def read_answer(name, path, offset, ran):
@@ -4780,27 +4798,51 @@ class Service:
 
     def exec(self, name, asked_by, body, headers):
         asked = checked(body, EXEC, "an exec")
+        inline = exec_inline(asked)
         every = exec_every(asked, headers)
         command = self.called(asked_by, name, exec_command(asked))
         container = asked.get("container")
         if name in self.runners and any(word.startswith("NOTIFY=") and word != "NOTIFY=" for word in runner_words(command, name)):
             self.follow(name)
         if every is None:
-            return 200, exec_answer(name, answered(self.execution(asked_by, name, container, command).get()))
+            return 200, self.exec_within(asked_by, name, container, inline, answered(self.execution(asked_by, name, container, command).get()))
         if name not in self.runners and name != BUILDS:
             self.pod(name)
-        return 200, Stream(self.exec_waited(asked_by, name, container, command, every))
+        return 200, Stream(self.exec_waited(asked_by, name, container, command, every, inline))
 
-    def exec_waited(self, asked, name, container, command, every):
+    def exec_waited(self, asked, name, container, command, every, inline):
         beat, hearing = Beat(every), Hearing(self.execution(asked, name, container, command, alive=every))
         while (heard := (yield from beat.heard(hearing)))[0] == "note":
             yield sse("note", {"line": heard[1]})
         ran = heard[1]
         try:
-            answer = "ended", exec_answer(name, answered(ran))
+            answer = "ended", self.exec_within(asked, name, container, inline, answered(ran))
         except Refused as refusal:
             answer = "refused", {"status": refusal.status, "error": refusal.sentence}
         yield sse(*answer)
+
+    def exec_within(self, asked, name, container, inline, ran):
+        streams = exec_streams(name, ran)
+        fits_inline = inline is None or sum(len(data) for data in streams.values()) <= inline
+        runs_on_a_build_runner = name in self.runners or name == BUILDS
+        answered_whole = fits_inline or runs_on_a_build_runner
+        if answered_whole:
+            return exec_answer(name, ran)
+        kept = self.exec_kept(asked, name, container, streams)
+        if kept is None:
+            return exec_answer(name, ran)
+        return {"exit_code": ran.code, "kept": kept}
+
+    def exec_kept(self, asked, name, container, streams):
+        kept = {}
+        for stream, data in streams.items():
+            path = f"{EXEC_KEPT}/{asked['request']}/{stream}"
+            ran = self.kube.keep(name, container, path, data)
+            if ran.code != 0:
+                say("pods_exec_unkept", pod=name, detail=json.dumps(ran.err.strip()))
+                return None
+            kept[stream] = {"path": path, "bytes": len(data), "lines": data.count(b"\n")}
+        return kept
 
     def blob(self, name, asked_by, body):
         asked = checked(body, BLOB, "a blob")

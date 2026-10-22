@@ -401,7 +401,7 @@ one up for another network.
   event is sent, so one the service stops before then (a restart, a crash)
   reaches the node broken (`stream_broken`), never as a whole end; one that
   fails inside ends with `refused` `{status: 500, error}`. A wait ends when the pod's run container ends, the pod fails or is
-  deleted, with `{line, exit_code, pod}`; an exec ends with its whole
+  deleted, with `{line, exit_code, pod}`; an exec ends with its
   answer, or `refused` with `{status, error}` when the cluster refused it.
   So a build that outlives a request's `wait` still answers. `every` is the
   caller's: only it knows its request's `wait` and the time an event takes
@@ -443,6 +443,12 @@ one up for another network.
   runner (`desktop`) refuses it as it refuses any exec that is not build.sh.
 - An exec names its `command` (a list, run as it is) or its `script`
   (shell text, run with `sh -c`), never both.
+- An exec that names `inline` (bytes, from 0) and whose stdout and stderr
+  together pass it answers `{exit_code, kept: {stdout, stderr}}`, each
+  `{path, bytes, lines}`: the service writes both under
+  `/tmp/pods-exec/<request>/` in the container that ran the command, for
+  `pods/NAME/read`. A streamed exec ends the same way. A build runner and
+  `builds` answer whole, and so does output the pod could not keep.
 - `pods/NAME/blob` `{path | paths, kind, container}` puts a file the pod
   wrote as a blob of `kind` and answers its `blob` id and `size`; with
   `paths` it puts every one of them in one bundle and answers `blobs`, a
