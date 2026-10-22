@@ -2724,9 +2724,25 @@ def volume_disks(pods, summaries, namespace):
     return disks
 
 
-def made_for_a_pod(claim):
+def owning_pod(claim):
     owners = (claim.get("metadata") or {}).get("ownerReferences") or []
-    return any(owner.get("kind") == "Pod" and owner.get("controller") for owner in owners)
+    return next((owner.get("name") for owner in owners if owner.get("kind") == "Pod" and owner.get("controller")), None)
+
+
+def rootfs_read_at(entry):
+    times = [(container.get("rootfs") or {}).get("time") for container in entry.get("containers") or []]
+    return min(times) if times and all(times) else None
+
+
+def claim_row(claim, phases):
+    pod = owning_pod(claim)
+    return {
+        "claim": claim["metadata"]["name"],
+        "requester": requester_of(claim["metadata"].get("labels") or {}),
+        "storage_requested_bytes": int(quantity(((claim.get("spec") or {}).get("resources") or {}).get("requests", {}).get("storage", "0"))),
+        "pod": pod,
+        "phase": phases.get(pod),
+    }
 
 
 def usage_of(pods, claims, summaries, quotas, namespace):
@@ -2751,24 +2767,19 @@ def usage_of(pods, claims, summaries, quotas, namespace):
                 "cpu_nanocores": (entry.get("cpu") or {}).get("usageNanoCores") or 0,
                 "memory_bytes": (entry.get("memory") or {}).get("workingSetBytes") or 0,
                 "disk_bytes": (entry.get("ephemeral-storage") or {}).get("usedBytes") or 0,
+                "disk_read_at": rootfs_read_at(entry),
             }
         )
-    held = [
-        {
-            "claim": claim["metadata"]["name"],
-            "requester": requester_of(claim["metadata"].get("labels") or {}),
-            "storage_requested_bytes": int(quantity(((claim.get("spec") or {}).get("resources") or {}).get("requests", {}).get("storage", "0"))),
-        }
-        for claim in claims
-        if not made_for_a_pod(claim)
-    ]
+    phases = {pod["metadata"]["name"]: pod.get("status", {}).get("phase") for pod in pods}
+    held = [claim_row(claim, phases) for claim in claims]
     totals = {}
     fields = ("cpu_limit", "memory_limit_bytes", "cpu_nanocores", "memory_bytes", "disk_bytes", "storage_requested_bytes")
-    for row in rows + held:
-        total = totals.setdefault(row["requester"], {"requester": row["requester"], "pods": 0, "claims": 0, **{field: 0 for field in fields}})
-        total["pods" if "pod" in row else "claims"] += 1
-        for field in fields:
-            total[field] += row.get(field, 0)
+    for kind, listed in (("pods", rows), ("claims", held)):
+        for row in listed:
+            total = totals.setdefault(row["requester"], {"requester": row["requester"], "pods": 0, "claims": 0, **{field: 0 for field in fields}})
+            total[kind] += 1
+            for field in fields:
+                total[field] += row.get(field, 0)
     ordered = sorted(totals.values(), key=lambda total: (total["requester"] is None, total["requester"] or 0))
     quota = {item["metadata"]["name"]: {"hard": item.get("status", {}).get("hard", {}), "used": item.get("status", {}).get("used", {})} for item in quotas}
     return {"quota": quota, "requesters": ordered, "pods": rows, "claims": held, "volume_disks": volume_disks(pods, summaries, namespace)}

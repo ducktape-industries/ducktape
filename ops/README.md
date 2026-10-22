@@ -526,9 +526,18 @@ one up for another network.
   own bytes, so `usage` gives no pod's share of that disk. A pod's
   `disk_bytes` is the kubelet's ephemeral-storage figure for it: its
   containers' writable layers, its logs and its emptyDirs. It leaves out
-  the pod's inputs and `/out`. `volume_disks` holds, once per node, the used and
-  capacity bytes of the disk under the pods' inputs and `/out`. `claims`
-  lists only the claims no pod owns.
+  the pod's inputs and `/out`. A writable layer's bytes are containerd's
+  last good measure of it: containerd walks each one every
+  `stats_collect_period` (10 s by default) and keeps the old figure when a
+  walk fails, which a file removed during the walk makes it do, so a pod
+  that keeps creating and removing files can read far below what it holds.
+  `disk_read_at` is the oldest of its containers' `rootfs.time`, the moment
+  containerd last measured, and null when a container has none.
+  `volume_disks` holds, once per node, the used and capacity bytes of the
+  disk under the pods' inputs and `/out`. `claims` lists every claim with
+  its requested bytes, and for one Kubernetes made for a pod's volume its
+  `pod` and that pod's `phase` (null once the pod is gone; both null for a
+  claim no pod owns). A claim's use shows only in `volume_disks`.
 - A `scratch` input (`{"path", "scratch": {"medium": "Memory", "size"}}`)
   is an empty directory in the pod's memory (an `emptyDir` of medium
   `Memory`): nothing is fetched into it, and what is written there never

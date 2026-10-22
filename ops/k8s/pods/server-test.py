@@ -2816,7 +2816,8 @@ class Usage(Served):
                     "podRef": {"name": "b", "namespace": "agents"},
                     "cpu": {"usageNanoCores": 900},
                     "memory": {"workingSetBytes": 1000},
-                    "ephemeral-storage": {"usedBytes": 50},
+                    "ephemeral-storage": {"usedBytes": 50, "time": "2026-10-22T03:21:07Z"},
+                    "containers": [{"name": "run", "rootfs": {"time": "2026-10-22T03:21:00Z", "usedBytes": 40}}, {"name": "out", "rootfs": {"time": "2026-10-22T03:20:55Z", "usedBytes": 0}}],
                     "volume": [
                         {"name": "out", **whole_disk, "pvcRef": {"name": "b-out", "namespace": "agents"}},
                         {"name": "in-0", **whole_disk, "pvcRef": {"name": "b-in-0", "namespace": "agents"}},
@@ -2848,24 +2849,61 @@ class Usage(Served):
         self.assertEqual((second["requester"], second["cpu_limit"], second["memory_limit_bytes"]), (None, 1, 1536 * 2**20))
         self.assertEqual([row["pod"] for row in answer["pods"]], ["b", "d", "u", "w"])
         self.assertEqual((answer["pods"][2]["cpu_limit"], answer["pods"][2]["memory_limit_bytes"]), (0, 0))
-        self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30}])
+        self.assertEqual([row["disk_read_at"] for row in answer["pods"]], ["2026-10-22T03:20:55Z", None, None, None])
+        self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30, "pod": None, "phase": None}])
         self.assertEqual(answer["volume_disks"], [{"node": "fabrics-1", "used_bytes": 211394891776, "capacity_bytes": 887466962944}])
 
-    def test_usage_lists_no_claim_kubernetes_made_for_a_pods_volume(self):
+    def test_usage_lists_each_claim_kubernetes_made_for_a_pods_volume_with_its_pod_and_phase(self):
         building = pod_json(name="b", phase="Running", requester="15")
         building["spec"]["volumes"] = [claimed("out", {}), {"name": "cache", "persistentVolumeClaim": {"claimName": "cache"}}]
+        ended = pod_json(name="e", phase="Succeeded", requester="15")
         labels = {"ducktape.industries/requester": "15"}
-        made = {"metadata": {"name": "b-out", "labels": labels, "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "b", "controller": True}]}, "spec": {"resources": {"requests": {"storage": "1"}}}}
+        made = lambda name, pod, storage: {"metadata": {"name": name, "labels": labels, "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": pod, "controller": True}]}, "spec": {"resources": {"requests": {"storage": storage}}}}
         cache = {"metadata": {"name": "cache", "labels": labels}, "spec": {"resources": {"requests": {"storage": "10Gi"}}}}
-        self.kube.answer("list", ran({"items": [building]}))
-        self.kube.answer("claims", ran({"items": [made, cache]}))
+        self.kube.answer("list", ran({"items": [building, ended]}))
+        self.kube.answer("claims", ran({"items": [made("b-out", "b", "1"), made("e-out", "e", "1"), made("g-out", "g", "2"), cache]}))
         self.kube.answer("quotas", ran({"items": []}))
         status, answer = self.call("GET", "/v1/usage")
         self.assertEqual(status, 200)
-        self.assertEqual(answer["claims"], [{"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30}])
+        self.assertEqual(
+            answer["claims"],
+            [
+                {"claim": "b-out", "requester": 15, "storage_requested_bytes": 1, "pod": "b", "phase": "Running"},
+                {"claim": "e-out", "requester": 15, "storage_requested_bytes": 1, "pod": "e", "phase": "Succeeded"},
+                {"claim": "g-out", "requester": 15, "storage_requested_bytes": 2, "pod": "g", "phase": None},
+                {"claim": "cache", "requester": 15, "storage_requested_bytes": 10 * 2**30, "pod": None, "phase": None},
+            ],
+        )
         (total,) = answer["requesters"]
-        self.assertEqual((total["pods"], total["claims"], total["storage_requested_bytes"]), (1, 1, 10 * 2**30))
+        self.assertEqual((total["pods"], total["claims"], total["storage_requested_bytes"]), (2, 4, 10 * 2**30 + 4))
         self.assertEqual(answer["volume_disks"], [])
+
+    def test_a_pods_disk_reading_says_when_containerd_last_measured_its_writable_layers(self):
+        churning = pod_json(name="c", phase="Running", requester="15")
+        churning["status"]["hostIP"] = "192.168.75.48"
+        unread = pod_json(name="n", phase="Running", requester="15")
+        unread["status"]["hostIP"] = "192.168.75.48"
+        self.kube.answer("list", ran({"items": [churning, unread]}))
+        self.kube.answer("claims", ran({"items": []}))
+        self.kube.answer("quotas", ran({"items": []}))
+        self.stats.summaries["192.168.75.48"] = {
+            "node": {"nodeName": "fabrics-1"},
+            "pods": [
+                {
+                    "podRef": {"name": "c", "namespace": "agents"},
+                    "ephemeral-storage": {"usedBytes": 8800000, "time": "2026-10-22T03:15:00Z"},
+                    "containers": [{"name": "run", "rootfs": {"time": "2026-10-21T16:58:00Z", "usedBytes": 8790000}}, {"name": "out", "rootfs": {"time": "2026-10-22T03:14:58Z", "usedBytes": 4096}}],
+                },
+                {
+                    "podRef": {"name": "n", "namespace": "agents"},
+                    "ephemeral-storage": {"usedBytes": 4096, "time": "2026-10-22T03:15:00Z"},
+                    "containers": [{"name": "run"}, {"name": "out", "rootfs": {"time": "2026-10-22T03:14:58Z", "usedBytes": 4096}}],
+                },
+            ],
+        }
+        status, answer = self.call("GET", "/v1/usage")
+        self.assertEqual(status, 200)
+        self.assertEqual([(row["pod"], row["disk_bytes"], row["disk_read_at"]) for row in answer["pods"]], [("c", 8800000, "2026-10-21T16:58:00Z"), ("n", 4096, None)])
 
     def test_quantities_read_every_suffix(self):
         self.assertEqual(server.quantity("250m"), 0.25)
