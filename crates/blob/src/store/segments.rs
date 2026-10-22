@@ -2,7 +2,7 @@
 // put and tombstones naming the put a removal killed, and the copies a tidy round writes beside them,
 // with the index the records rebuild at open and the bookkeeping that says when to compact a segment.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, Read, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -87,6 +87,13 @@ pub(super) struct Origin {
 }
 
 type Put = (BlobId, Origin);
+
+#[cfg(test)]
+pub(super) struct Indexed {
+    pub(super) tombs: usize,
+    pub(super) targets: usize,
+    pub(super) disagreements: Vec<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stream {
@@ -409,6 +416,10 @@ struct Segment {
     tombs: u64,
     whole: u64,
     damaged: Option<u64>,
+    held: BTreeMap<u64, BlobId>,
+    kept_tombs: BTreeMap<u64, Put>,
+    targeted_by: HashSet<Put>,
+    left_by: HashSet<BlobId>,
 }
 
 impl Segment {
@@ -423,10 +434,15 @@ impl Segment {
             tombs: 0,
             whole: 0,
             damaged: None,
+            held: BTreeMap::new(),
+            kept_tombs: BTreeMap::new(),
+            targeted_by: HashSet::new(),
+            left_by: HashSet::new(),
         }
     }
 }
 
+#[derive(Clone)]
 struct Kept {
     segment: u64,
     at: u64,
@@ -440,6 +456,7 @@ pub(super) struct Plan {
     records: Vec<(BlobId, Logged, String)>,
     tombs: Vec<(Put, u64, u64)>,
     pub(super) bytes: u64,
+    pub(super) drains: bool,
 }
 
 #[derive(Default)]
@@ -926,12 +943,17 @@ impl Log {
     fn resolve(&mut self, found: Found) {
         for (put, segment, at, size) in found.tombs {
             self.segment_mut(segment).dead += size;
-            self.tombs.entry(put).or_insert(Kept {
-                segment,
-                at,
-                size,
-                targets: Vec::new(),
-            });
+            let fresh = !self.tombs.contains_key(&put);
+            if fresh {
+                let kept = Kept {
+                    segment,
+                    at,
+                    size,
+                    targets: Vec::new(),
+                };
+                self.tombs.insert(put, kept);
+                self.index_tomb(put);
+            }
         }
         let mut live: HashMap<BlobId, Vec<Logged>> = HashMap::new();
         for (id, logged) in found.records {
@@ -999,6 +1021,7 @@ impl Log {
                 self.stray(id, old.origin, old.segment);
             }
         }
+        self.segment_mut(logged.segment).held.insert(logged.at, id);
     }
 
     fn dropped(&mut self, old: &Logged) {
@@ -1007,6 +1030,7 @@ impl Log {
         segment.dead += old.size();
         segment.records -= 1;
         segment.whole -= u64::from(old.frame == 0);
+        segment.held.remove(&old.at);
     }
 
     fn kill(&mut self, id: &BlobId) {
@@ -1022,6 +1046,9 @@ impl Log {
                 let left = self.left.entry(id).or_default();
                 if !left.contains(&segment) {
                     left.push(segment);
+                }
+                if let Some(stray) = self.segments.get_mut(&segment) {
+                    stray.left_by.insert(id);
                 }
             }
             false => self.need((id, origin), segment),
@@ -1039,6 +1066,9 @@ impl Log {
         let first = kept.targets.is_empty();
         kept.targets.push(target);
         let (segment, size) = (kept.segment, kept.size);
+        if let Some(target) = self.segments.get_mut(&target) {
+            target.targeted_by.insert(put);
+        }
         if first {
             let segment = self.segment_mut(segment);
             segment.dead = segment.dead.saturating_sub(size);
@@ -1149,6 +1179,11 @@ impl Log {
             return Ok(());
         };
         let mut targets = self.left.remove(id).unwrap_or_default();
+        for left in &targets {
+            if let Some(left) = self.segments.get_mut(left) {
+                left.left_by.remove(id);
+            }
+        }
         targets.push(logged.segment);
         self.kill(id);
         self.entomb(*id, logged.origin, targets)
@@ -1180,7 +1215,9 @@ impl Log {
         let was = self.tombs.insert((id, origin), kept);
         if let Some(was) = was {
             self.unkeep(&was);
+            self.unindex_tomb((id, origin), &was);
         }
+        self.index_tomb((id, origin));
         let segment = self.segment_mut(segment);
         match needed {
             true => {
@@ -1190,6 +1227,35 @@ impl Log {
             false => segment.dead += size,
         }
         Ok(())
+    }
+
+    fn index_tomb(&mut self, put: Put) {
+        let Some(kept) = self.tombs.get(&put) else {
+            return;
+        };
+        let (segment, at, targets) = (kept.segment, kept.at, kept.targets.clone());
+        if let Some(segment) = self.segments.get_mut(&segment) {
+            segment.kept_tombs.insert(at, put);
+        }
+        for target in targets {
+            if let Some(target) = self.segments.get_mut(&target) {
+                target.targeted_by.insert(put);
+            }
+        }
+    }
+
+    fn unindex_tomb(&mut self, put: Put, kept: &Kept) {
+        if let Some(segment) = self.segments.get_mut(&kept.segment) {
+            let this_tomb = segment.kept_tombs.get(&kept.at) == Some(&put);
+            if this_tomb {
+                segment.kept_tombs.remove(&kept.at);
+            }
+        }
+        for target in &kept.targets {
+            if let Some(target) = self.segments.get_mut(target) {
+                target.targeted_by.remove(&put);
+            }
+        }
     }
 
     fn unkeep(&mut self, kept: &Kept) {
@@ -1223,15 +1289,15 @@ impl Log {
         if n == self.active {
             self.roll()?;
         }
-        let mut records: Vec<(BlobId, Logged)> = self
-            .index
-            .iter()
-            .filter_map(|(id, held)| match held {
-                Held::Logged(logged) if logged.segment == n => Some((*id, *logged)),
+        let records: Vec<(BlobId, Logged)> = self
+            .segment(n)
+            .held
+            .values()
+            .filter_map(|id| match self.index.get(id) {
+                Some(Held::Logged(logged)) if logged.segment == n => Some((*id, *logged)),
                 _ => None,
             })
             .collect();
-        records.sort_by_key(|(_, logged)| logged.at);
         let mut bytes = 0u64;
         let mut taken = Vec::new();
         let fits =
@@ -1246,15 +1312,20 @@ impl Log {
             taken.push((id, logged, kind));
         }
         let mut tombs = Vec::new();
+        let mut tombs_all_taken = false;
         let records_all_taken = taken.len() as u64 == self.segment(n).records;
         if records_all_taken {
-            let mut kept: Vec<(Put, u64, u64)> = self
-                .tombs
-                .iter()
-                .filter(|(_, kept)| kept.segment == n && !kept.targets.is_empty())
-                .map(|(put, kept)| (*put, kept.at, kept.size))
+            let kept: Vec<(Put, u64, u64)> = self
+                .segment(n)
+                .kept_tombs
+                .values()
+                .filter_map(|put| {
+                    let kept = self.tombs.get(put)?;
+                    let needed_here = kept.segment == n && !kept.targets.is_empty();
+                    needed_here.then_some((*put, kept.at, kept.size))
+                })
                 .collect();
-            kept.sort_by_key(|(_, at, _)| *at);
+            let needed = kept.len();
             for (put, at, size) in kept {
                 if !fits(bytes, size) {
                     break;
@@ -1262,6 +1333,7 @@ impl Log {
                 bytes += size;
                 tombs.push((put, at, size));
             }
+            tombs_all_taken = tombs.len() == needed;
         }
         Ok(Plan {
             segment: n,
@@ -1269,6 +1341,7 @@ impl Log {
             records: taken,
             tombs,
             bytes,
+            drains: tombs_all_taken,
         })
     }
 
@@ -1350,11 +1423,15 @@ impl Log {
             self.segment_mut(to.0).dead += size;
             return;
         }
+        if let Some(was) = self.tombs.get(&put).cloned() {
+            self.unindex_tomb(put, &was);
+        }
         let kept = self.tombs.get_mut(&put).expect("a moving tomb is kept");
         kept.segment = to.0;
         kept.at = to.1;
         kept.targets.retain(|target| *target != to.0);
         let needed = !kept.targets.is_empty();
+        self.index_tomb(put);
         let old = self.segment_mut(from.0);
         old.live = old.live.saturating_sub(size);
         old.dead += size;
@@ -1379,18 +1456,39 @@ impl Log {
     }
 
     fn retire(&mut self, n: u64) -> PathBuf {
-        self.segments.remove(&n);
+        let retired = self.segments.remove(&n);
         self.dirty.remove(&n);
-        for left in self.left.values_mut() {
-            left.retain(|segment| *segment != n);
+        let Some(retired) = retired else {
+            return self.path(n);
+        };
+        for id in &retired.left_by {
+            let emptied = self.left.get_mut(id).is_some_and(|left| {
+                left.retain(|segment| *segment != n);
+                left.is_empty()
+            });
+            if emptied {
+                self.left.remove(id);
+            }
         }
-        self.left.retain(|_, left| !left.is_empty());
-        self.tombs.retain(|_, kept| kept.segment != n);
+        for put in retired.kept_tombs.values() {
+            let Some(kept) = self.tombs.remove(put) else {
+                continue;
+            };
+            for target in &kept.targets {
+                if let Some(target) = self.segments.get_mut(target) {
+                    target.targeted_by.remove(put);
+                }
+            }
+        }
         let mut freed = Vec::new();
-        for kept in self.tombs.values_mut() {
+        for put in &retired.targeted_by {
+            let Some(kept) = self.tombs.get_mut(put) else {
+                continue;
+            };
             let had = !kept.targets.is_empty();
             kept.targets.retain(|target| *target != n);
-            if had && kept.targets.is_empty() {
+            let freed_now = had && kept.targets.is_empty();
+            if freed_now {
                 freed.push((kept.segment, kept.size));
             }
         }
@@ -1401,6 +1499,72 @@ impl Log {
             segment.tombs -= 1;
         }
         self.path(n)
+    }
+
+    #[cfg(test)]
+    pub(super) fn segment_of(&self, id: &BlobId) -> Option<u64> {
+        match self.index.get(id)? {
+            Held::Logged(logged) => Some(logged.segment),
+            Held::Framed { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn tomb_of(&self, id: &BlobId) -> Option<(u64, Vec<u64>)> {
+        self.tombs
+            .iter()
+            .find(|((tombed, _), _)| tombed == id)
+            .map(|(_, kept)| (kept.segment, kept.targets.clone()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn indexed(&self) -> Indexed {
+        let mut from_maps = BTreeSet::new();
+        let mut from_segments = BTreeSet::new();
+        for (id, held) in &self.index {
+            if let Held::Logged(logged) = held {
+                from_maps.insert(format!("record {} {} {id:?}", logged.segment, logged.at));
+            }
+        }
+        for (put, kept) in &self.tombs {
+            from_maps.insert(format!("tomb {} {} {put:?}", kept.segment, kept.at));
+            for target in &kept.targets {
+                from_maps.insert(format!("target {target} {put:?}"));
+            }
+        }
+        for (id, left) in &self.left {
+            for segment in left {
+                from_maps.insert(format!("left {segment} {id:?}"));
+            }
+        }
+        for (n, segment) in &self.segments {
+            for (at, id) in &segment.held {
+                from_segments.insert(format!("record {n} {at} {id:?}"));
+            }
+            for (at, put) in &segment.kept_tombs {
+                from_segments.insert(format!("tomb {n} {at} {put:?}"));
+            }
+            for put in &segment.targeted_by {
+                from_segments.insert(format!("target {n} {put:?}"));
+            }
+            for id in &segment.left_by {
+                from_segments.insert(format!("left {n} {id:?}"));
+            }
+        }
+        let count = |kind: &str| {
+            from_maps
+                .iter()
+                .filter(|line| line.starts_with(kind))
+                .count()
+        };
+        Indexed {
+            tombs: count("tomb "),
+            targets: count("target "),
+            disagreements: from_maps
+                .symmetric_difference(&from_segments)
+                .cloned()
+                .collect(),
+        }
     }
 
     pub(super) fn dirty(&mut self) -> (Vec<Arc<fs::File>>, bool) {

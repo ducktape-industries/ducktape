@@ -412,8 +412,13 @@ impl Blobs {
                             break;
                         }
                         let plan = self.log().plan(n, budget, whole)?;
+                        planned();
                         budget = budget.saturating_sub(plan.bytes);
+                        let leaves_records = !plan.drains;
                         plans.push(plan);
+                        if leaves_records {
+                            break;
+                        }
                     }
                     let batch = self.legacy_batch(&mut moving, budget, whole)?;
                     (plans, batch)
@@ -1136,7 +1141,16 @@ fn not_kept(_: &fs::File, _: u64, _: u64) -> std::io::Result<()> {
 #[cfg(test)]
 thread_local! {
     static INFLATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PLANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+#[cfg(test)]
+fn planned() {
+    PLANNED.with(|planned| planned.set(planned.get() + 1));
+}
+
+#[cfg(not(test))]
+fn planned() {}
 
 #[cfg(test)]
 fn inflated(bytes: usize) {
@@ -2191,6 +2205,116 @@ mod tests {
         INFLATED.with(std::cell::Cell::get)
     }
 
+    fn planned_so_far() -> u64 {
+        PLANNED.with(std::cell::Cell::get)
+    }
+
+    fn segment_file(dir: &Path, n: u64) -> PathBuf {
+        dir.join(SEGMENTS).join(format!("{n:020}"))
+    }
+
+    #[test]
+    fn a_tidy_moves_a_needed_tomb_and_frees_it_once_the_put_it_names_is_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        let put = |seed: u64| {
+            let mut stage = Stage::default();
+            let id = stage
+                .put(HashKind::Sha256, "part", &noise(300, seed))
+                .unwrap();
+            blobs.promote(stage).unwrap();
+            id
+        };
+        let agrees = |blobs: &Blobs, when: &str| {
+            let indexed = blobs.log().indexed();
+            assert!(
+                indexed.disagreements.is_empty(),
+                "{when}: {:?}",
+                indexed.disagreements
+            );
+        };
+        let removed = put(1000);
+        let first = blobs.log().segment_of(&removed).unwrap();
+        let mut keepers = Vec::new();
+        loop {
+            let id = put(1001 + keepers.len() as u64);
+            let rolled = blobs.log().segment_of(&id) != Some(first);
+            keepers.push(id);
+            if rolled {
+                break;
+            }
+        }
+        blobs.remove(&removed).unwrap();
+        blobs.promote(Stage::default()).unwrap();
+        let (tombed, targets) = blobs.log().tomb_of(&removed).unwrap();
+        assert_ne!(tombed, first);
+        assert_eq!(
+            targets,
+            vec![first],
+            "the tomb names the segment its put still lies in"
+        );
+        let mut fillers = Vec::new();
+        loop {
+            let id = put(2000 + fillers.len() as u64);
+            let rolled = blobs.log().segment_of(&id) != Some(tombed);
+            fillers.push(id);
+            if rolled {
+                break;
+            }
+        }
+        let in_the_tombs_segment = keepers.pop().unwrap();
+        for id in fillers.iter().chain([&in_the_tombs_segment]) {
+            blobs.remove(id).unwrap();
+        }
+        blobs.promote(Stage::default()).unwrap();
+        agrees(&blobs, "worn");
+        assert!(blobs.log().worn().contains(&tombed));
+        assert!(!blobs.log().worn().contains(&first));
+        let short = blobs.log().plan(tombed, 1, SMALL.segment).unwrap();
+        assert!(
+            !short.drains,
+            "a plan that leaves a needed tomb behind does not drain its segment"
+        );
+
+        blobs.tidy().unwrap();
+        agrees(&blobs, "after the round that moves the tomb");
+        let (moved, targets) = blobs.log().tomb_of(&removed).unwrap();
+        assert_ne!(moved, tombed, "the round moved the needed tomb");
+        assert_eq!(targets, vec![first]);
+        assert!(
+            !segment_file(dir.path(), tombed).exists(),
+            "the segment the tomb left is retired"
+        );
+        assert_eq!(blobs.get(&removed).unwrap(), None);
+
+        for id in &keepers {
+            blobs.remove(id).unwrap();
+        }
+        blobs.promote(Stage::default()).unwrap();
+        for round in 0..fillers.len() + keepers.len() {
+            blobs.tidy().unwrap();
+            agrees(&blobs, &format!("round {round}"));
+        }
+        assert!(
+            !segment_file(dir.path(), first).exists(),
+            "the segment the removed put lay in is retired"
+        );
+        let freed = blobs
+            .log()
+            .tomb_of(&removed)
+            .is_none_or(|(_, targets)| targets.is_empty());
+        assert!(freed, "the tomb names no segment once its put is retired");
+        assert_eq!(blobs.get(&removed).unwrap(), None);
+        drop(blobs);
+
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        agrees(&blobs, "reopened");
+        assert_eq!(blobs.get(&removed).unwrap(), None);
+        for id in &keepers {
+            assert_eq!(blobs.get(id).unwrap(), None);
+        }
+    }
+
     #[test]
     fn a_range_of_a_segment_record_inflates_only_the_frames_it_covers() {
         let dir = tempfile::tempdir().unwrap();
@@ -2369,6 +2493,252 @@ mod tests {
             }
             offset = end;
         }
+    }
+
+    #[test]
+    fn a_round_plans_no_segment_past_one_its_budget_leaves_records_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..120 {
+            let mut stage = Stage::default();
+            ids.push(stage.put(HashKind::Sha256, "part", &noise(300, i)).unwrap());
+            blobs.promote(stage).unwrap();
+        }
+        for (i, id) in ids.iter().enumerate() {
+            if !i.is_multiple_of(5) {
+                blobs.remove(id).unwrap();
+            }
+        }
+        blobs.promote(Stage::default()).unwrap();
+        let worn = blobs.log().worn();
+        assert!(worn.len() > 2, "removals wore several segments: {worn:?}");
+        let first = blobs.log().plan(worn[0], 1, SMALL.segment).unwrap();
+        assert!(
+            !first.drains,
+            "a budget of one byte leaves the segment's records"
+        );
+        assert_eq!(first.bytes, 0);
+        let whole = blobs
+            .log()
+            .plan(worn[0], SMALL.segment, SMALL.segment)
+            .unwrap();
+        assert!(whole.drains, "a whole budget drains one worn segment");
+
+        let worn = blobs.log().worn().len() as u64;
+        let before = every_file(&dir.path().join(SEGMENTS));
+        let planned_before = planned_so_far();
+        let tidied = blobs.tidy().unwrap();
+        let planned = planned_so_far() - planned_before;
+        let after = every_file(&dir.path().join(SEGMENTS));
+        let retired = before
+            .keys()
+            .filter(|path| !after.contains_key(*path))
+            .count() as u64;
+        assert!(retired > 0, "a round retires the worn segments it drains");
+        assert_eq!(tidied.retired, retired);
+        assert_eq!(
+            planned,
+            retired + 1,
+            "a round plans the segments it drains and the one its budget stops in, and no more"
+        );
+        assert!(
+            planned < worn,
+            "worn segments past the stop wait for the next round: {planned} of {worn}"
+        );
+        for _ in 0..ids.len() {
+            blobs.tidy().unwrap();
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let want = i.is_multiple_of(5).then(|| noise(300, i as u64));
+            assert_eq!(
+                blobs.get(id).unwrap().map(|blob| blob.body),
+                want,
+                "blob {i}"
+            );
+        }
+        drop(blobs);
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let want = i.is_multiple_of(5).then(|| noise(300, i as u64));
+            assert_eq!(
+                blobs.get(id).unwrap().map(|blob| blob.body),
+                want,
+                "blob {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_segment_lists_exactly_the_records_and_tombs_the_log_holds_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, ids) = worn(dir.path());
+        let agrees = |blobs: &Blobs, when: &str| {
+            let indexed = blobs.log().indexed();
+            assert!(
+                indexed.disagreements.is_empty(),
+                "{when}: {:?}",
+                indexed.disagreements
+            );
+            indexed
+        };
+        let first = agrees(&blobs, "worn");
+        assert!(first.tombs > 0, "removals logged tombs");
+        assert!(
+            first.targets > 0,
+            "a tomb names a segment its put still lies in"
+        );
+        for round in 0..ids.len() {
+            blobs.tidy().unwrap();
+            agrees(&blobs, &format!("after round {round}"));
+        }
+        let mut stage = Stage::default();
+        stage.put(HashKind::Sha256, "page", &text(7)).unwrap();
+        blobs.promote(stage).unwrap();
+        blobs.remove(&ids[3]).unwrap();
+        blobs.promote(Stage::default()).unwrap();
+        agrees(&blobs, "after a put and a removal");
+        drop(blobs);
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        agrees(&blobs, "reopened");
+        for round in 0..ids.len() {
+            blobs.tidy().unwrap();
+            agrees(&blobs, &format!("after reopened round {round}"));
+        }
+    }
+
+    const BENCH: Sizes = Sizes {
+        segment: 1 << 20,
+        frame: 64 << 10,
+    };
+
+    fn bench_dir() -> Option<PathBuf> {
+        std::env::var_os("BLOB_BENCH_STORE").map(PathBuf::from)
+    }
+
+    fn bench_env(name: &str) -> Option<usize> {
+        std::env::var(name).ok().map(|value| value.parse().unwrap())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bench_place(cpu: Option<usize>, nice: i32) {
+        if let Some(cpu) = cpu {
+            let mut set = rustix::thread::CpuSet::new();
+            set.set(cpu);
+            rustix::thread::sched_setaffinity(None, &set).unwrap();
+        }
+        let thread = rustix::thread::gettid();
+        rustix::process::setpriority_process(Some(thread), nice).unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn bench_place(_: Option<usize>, _: i32) {}
+
+    fn resident() -> u64 {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .unwrap();
+        let kib: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        kib << 10
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_a_store_of_worn_segments() {
+        let Some(dir) = bench_dir() else {
+            return;
+        };
+        let held: u64 = std::env::var("BLOB_BENCH_HELD").unwrap().parse().unwrap();
+        let blobs = Blobs::sized(&dir, BENCH).unwrap();
+        let mut stage = Stage::default();
+        for i in 0..3 * held {
+            stage.put(HashKind::Sha256, "part", &noise(100, i)).unwrap();
+        }
+        let written: Vec<BlobId> = stage.ids().copied().collect();
+        blobs.promote(stage).unwrap();
+        for (i, id) in written.iter().enumerate() {
+            if !i.is_multiple_of(3) {
+                blobs.remove(id).unwrap();
+            }
+        }
+        blobs.promote(Stage::default()).unwrap();
+        let worn = blobs.log().worn().len();
+        println!("bench: built {held} held blobs over {worn} worn segments");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_one_tidy_round_beside_commits() {
+        let Some(dir) = bench_dir() else {
+            return;
+        };
+        let before = resident();
+        let blobs = Blobs::sized(&dir, BENCH).unwrap();
+        let grew = resident().saturating_sub(before);
+        let held = blobs.log().ids().len() as u64;
+        let worn = blobs.log().worn().len();
+        let tidy_cpu = bench_env("BLOB_BENCH_TIDY_CPU");
+        let commit_cpu = bench_env("BLOB_BENCH_COMMIT_CPU");
+        let nice = bench_env("BLOB_BENCH_TIDY_NICE").unwrap_or(0) as i32;
+        let spinners = bench_env("BLOB_BENCH_SPINNERS").unwrap_or(0);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spinning: Vec<_> = (0..spinners)
+            .map(|_| {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    bench_place(tidy_cpu, 0);
+                    while !done.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let committing = std::thread::spawn({
+            let (blobs, done) = (blobs.clone(), done.clone());
+            move || {
+                bench_place(commit_cpu, 0);
+                let mut longest = std::time::Duration::ZERO;
+                let mut commits = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    let mut stage = Stage::default();
+                    stage.put(HashKind::Sha256, "page", &text(commits)).unwrap();
+                    let began = std::time::Instant::now();
+                    blobs.promote(stage).unwrap();
+                    longest = longest.max(began.elapsed());
+                    commits += 1;
+                }
+                (commits, longest)
+            }
+        });
+        let tidying = std::thread::spawn({
+            let blobs = blobs.clone();
+            move || {
+                bench_place(tidy_cpu, nice);
+                let began = std::time::Instant::now();
+                let tidied = blobs.tidy().unwrap();
+                (tidied, began.elapsed())
+            }
+        });
+        let (tidied, round) = tidying.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        let (commits, longest) = committing.join().unwrap();
+        for spinner in spinning {
+            spinner.join().unwrap();
+        }
+        println!(
+            "bench: tidy on cpu {tidy_cpu:?} at nice {nice} beside {spinners} nice-0 spinners, \
+             commits on cpu {commit_cpu:?}"
+        );
+        println!(
+            "bench: {held} held, {worn} worn segments, opening grew resident memory {grew} bytes \
+             ({} a held blob), one round {round:?} copied {} bytes and retired {}, {commits} \
+             commits beside it, the longest {longest:?}",
+            grew / held.max(1),
+            tidied.copied,
+            tidied.retired
+        );
     }
 
     #[test]
