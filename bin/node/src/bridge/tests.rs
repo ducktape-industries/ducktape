@@ -31,12 +31,8 @@ struct Net {
     seen: UnboundedSender<Seen>,
     rows: RefCell<BTreeMap<String, Value>>,
     changes: RefCell<BTreeMap<u64, Value>>,
-    busy: RefCell<BTreeSet<(String, u64)>>,
-    holds: RefCell<BTreeSet<(String, u64)>>,
     drafts: RefCell<BTreeSet<String>>,
     deaf: RefCell<BTreeSet<u64>>,
-    wakes: RefCell<u64>,
-    released: RefCell<Option<(usize, usize)>>,
     follow: RefCell<Option<UnboundedReceiver<u64>>>,
 }
 
@@ -46,12 +42,8 @@ impl Net {
             seen,
             rows: RefCell::default(),
             changes: RefCell::default(),
-            busy: RefCell::default(),
-            holds: RefCell::default(),
             drafts: RefCell::default(),
             deaf: RefCell::default(),
-            wakes: RefCell::default(),
-            released: RefCell::default(),
             follow: RefCell::default(),
         }
     }
@@ -101,17 +93,6 @@ impl Net {
             json!({ "seq": change, "kind": "added", "detail": detail, "source": source }),
         );
     }
-
-    fn standing(&self) -> (usize, usize) {
-        (self.holds.borrow().len(), self.drafts.borrow().len())
-    }
-}
-
-fn place(op: &Value) -> (String, u64) {
-    (
-        op["channel_id"].as_str().unwrap().to_owned(),
-        op["thread"].as_u64().unwrap(),
-    )
 }
 
 impl Chain for Net {
@@ -152,19 +133,6 @@ impl Chain for Net {
         let (name, body) = op.as_object().unwrap().iter().next().unwrap();
         let applied = Sent::Applied(Value::Null);
         Ok(match (program, name.as_str()) {
-            ("chat", "take") if self.busy.borrow().contains(&place(body)) => Sent::Rejected {
-                reason: "busy".into(),
-                sentence: "account 9 holds it".into(),
-            },
-            ("chat", "take") => {
-                self.holds.borrow_mut().insert(place(body));
-                applied
-            }
-            ("chat", "release") => {
-                self.holds.borrow_mut().remove(&place(body));
-                *self.released.borrow_mut() = Some(self.standing());
-                applied
-            }
             ("chat", "drafting") => {
                 let channel = body["channel_id"].as_str().unwrap().to_owned();
                 self.drafts.borrow_mut().insert(channel);
@@ -184,18 +152,12 @@ impl Chain for Net {
                         sentence: "a message has that id".into(),
                     });
                 }
-                let (channel, thread) = place(body);
-                self.holds.borrow_mut().remove(&(channel.clone(), thread));
+                let channel = body["channel_id"].as_str().unwrap().to_owned();
                 self.drafts.borrow_mut().remove(&channel);
                 let row =
                     json!({ "message_id": id, "channel_id": channel, "author": { "account": ME } });
                 self.rows.borrow_mut().insert(id, row);
                 applied
-            }
-            ("wake", "wake_on") => {
-                let mut wakes = self.wakes.borrow_mut();
-                *wakes += 1;
-                Sent::Applied(json!(*wakes))
             }
             _ => panic!("{program} was sent {op}"),
         })
@@ -331,10 +293,6 @@ fn at(thread: u64) -> Where {
     }
 }
 
-fn take(thread: u64) -> Value {
-    json!({ "take": { "channel_id": ROOM, "thread": thread } })
-}
-
 fn post(seq: u64, thread: u64, text: &str) -> Value {
     json!({ "post": {
         "channel_id": ROOM,
@@ -362,7 +320,7 @@ fn said(seen: Seen, wanted: &str) {
 }
 
 #[test]
-fn a_mention_is_taken_drafted_and_posted_and_input_mid_turn_waits_for_the_answer_then_goes_to_the_same_session()
+fn a_mention_is_drafted_and_posted_and_input_mid_turn_waits_for_the_answer_then_goes_to_the_same_session()
  {
     let mut world = world();
     let heard = world.net.listen();
@@ -390,8 +348,11 @@ fn a_mention_is_taken_drafted_and_posted_and_input_mid_turn_waits_for_the_answer
             net.message(3, "m3", 9, None, 7, "elsewhere");
             heard.unbounded_send(2).unwrap();
             heard.unbounded_send(3).unwrap();
-            assert_eq!(op(seen).await, take(9), "m2 waits for the turn's answer");
-            assert_eq!(next(seen).await, Seen::Started(at(9), None));
+            assert_eq!(
+                next(seen).await,
+                Seen::Started(at(9), None),
+                "m2 waits for the turn's answer"
+            );
             said(next(seen).await, "elsewhere");
             script.play(0, Event::Answer("first".into()));
             said(
@@ -414,7 +375,7 @@ fn a_mention_is_taken_drafted_and_posted_and_input_mid_turn_waits_for_the_answer
     assert_eq!(kept.last, 4);
     let place = &kept.places["chat/room/5"];
     assert_eq!(place.session.as_deref(), Some("s1"));
-    assert!(place.held);
+    assert!(!place.held, "no draft stands");
     let open: Vec<u64> = place.open.iter().map(|input| input.seq).collect();
     assert_eq!(open, [4]);
 }
@@ -442,11 +403,10 @@ fn an_adapter_that_folds_queued_messages_into_one_answer_still_answers_each_and_
                 heard.unbounded_send(seq).unwrap();
             }
             assert_eq!(
-                op(seen).await,
-                take(9),
+                next(seen).await,
+                Seen::Started(at(9), None),
                 "neither m2 nor m3 is said mid-turn"
             );
-            assert_eq!(next(seen).await, Seen::Started(at(9), None));
             said(next(seen).await, "elsewhere");
             script.play(0, Event::Answer("all at once".into()));
             said(next(seen).await, "two");
@@ -460,7 +420,7 @@ fn an_adapter_that_folds_queued_messages_into_one_answer_still_answers_each_and_
             script.play(0, Event::Ended("exit status: 0".into()));
         },
     );
-    assert_eq!(world.net.holds.borrow().len(), 1, "only thread 9 is held");
+    assert!(world.net.drafts.borrow().is_empty());
 }
 
 #[test]
@@ -536,23 +496,23 @@ fn an_adapter_that_always_dies_after_init_answers_each_input_as_ended_once_and_l
             said(next(seen).await, "elsewhere");
             die(0);
             assert_eq!(op(seen).await, post(5, 5, ended));
-            assert_eq!(op(seen).await, take(5), "m2's turn");
-            assert_eq!(next(seen).await, Seen::Started(at(5), Some("s1".into())));
+            assert_eq!(
+                next(seen).await,
+                Seen::Started(at(5), Some("s1".into())),
+                "m2's turn"
+            );
             said(next(seen).await, "two");
             die(2);
             assert_eq!(op(seen).await, post(6, 5, ended));
             net.message(4, "m4", 11, None, 7, "after");
             heard.unbounded_send(4).unwrap();
             assert_eq!(
-                op(seen).await,
-                take(11),
-                "nothing was said or taken again in thread 5"
+                next(seen).await,
+                Seen::Started(at(11), None),
+                "nothing was said again in thread 5"
             );
         },
     );
-    let holds = world.net.holds.borrow().clone();
-    let others = BTreeSet::from([(ROOM.to_owned(), 9), (ROOM.to_owned(), 11)]);
-    assert_eq!(holds, others, "thread 5 is let go");
     let kept = kept::load(&world.path).unwrap().unwrap();
     assert!(kept.places["chat/room/5"].open.is_empty());
 }
@@ -578,12 +538,12 @@ fn a_session_that_dies_before_it_starts_answers_that_it_ended() {
             assert_eq!(op(seen).await, post(5, 5, ended));
         },
     );
-    assert_eq!(world.net.standing(), (0, 0));
+    assert!(world.net.drafts.borrow().is_empty());
 }
 
 #[test]
-fn a_busy_place_is_waited_on_with_a_clear_wake_and_a_wake_the_model_armed_comes_back_to_its_place()
-{
+fn a_mention_starts_at_once_whoever_else_answers_there_and_a_wake_the_model_armed_comes_back_to_its_place()
+ {
     let mut world = world();
     let heard = world.net.listen();
     let (net, script, seen, armed) = (&world.net, &world.script, &mut world.seen, &world.armed);
@@ -593,18 +553,9 @@ fn a_busy_place_is_waited_on_with_a_clear_wake_and_a_wake_the_model_armed_comes_
         &world.path,
         world.heard_armed.take().unwrap(),
         async {
-            net.busy.borrow_mut().insert((ROOM.into(), 5));
+            net.drafts.borrow_mut().insert(ROOM.into());
             net.message(1, "m1", 5, None, 7, "hello");
             heard.unbounded_send(1).unwrap();
-            assert_eq!(op(seen).await, take(5));
-            assert_eq!(
-                op(seen).await,
-                json!({ "wake_on": { "event": { "clear": { "channel_id": ROOM, "thread": 5 } } } })
-            );
-            net.busy.borrow_mut().clear();
-            net.woke(2, 1);
-            heard.unbounded_send(2).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "hello");
             script.play(0, Event::Answer("one".into()));
@@ -612,25 +563,23 @@ fn a_busy_place_is_waited_on_with_a_clear_wake_and_a_wake_the_model_armed_comes_
             assert_eq!(op(seen).await, post(5, 5, "one"));
             script.play(0, Event::Ended("exit status: 0".into()));
             armed.unbounded_send((7, "chat/room/5".into())).unwrap();
-            net.woke(3, 7);
-            heard.unbounded_send(3).unwrap();
-            assert_eq!(op(seen).await, take(5));
+            net.woke(2, 7);
+            heard.unbounded_send(2).unwrap();
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "Wake 7 is over.");
             script.play(1, Event::Answer("two".into()));
             assert_eq!(next(seen).await, Seen::Finished);
             let wake = json!({ "post": {
-            "channel_id": ROOM,
-            "message_id": format!("bridge-{ME}-wake-7"),
-            "text": "two",
-            "thread": 5,
-        } });
+                "channel_id": ROOM,
+                "message_id": format!("bridge-{ME}-wake-7"),
+                "text": "two",
+                "thread": 5,
+            } });
             assert_eq!(op(seen).await, wake);
             script.play(1, Event::Ended("exit status: 0".into()));
-            net.woke(4, 8);
-            heard.unbounded_send(4).unwrap();
+            net.woke(3, 8);
+            heard.unbounded_send(3).unwrap();
             armed.unbounded_send((8, "chat/room/5".into())).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "Wake 8 is over.");
         },
@@ -638,7 +587,7 @@ fn a_busy_place_is_waited_on_with_a_clear_wake_and_a_wake_the_model_armed_comes_
 }
 
 #[test]
-fn a_bridge_killed_mid_turn_lets_go_of_its_place_on_restart_and_resumes_the_open_input() {
+fn a_bridge_killed_mid_turn_takes_its_draft_down_on_restart_and_resumes_the_open_input() {
     let mut world = world();
     let heard = world.net.listen();
     {
@@ -660,11 +609,7 @@ fn a_bridge_killed_mid_turn_lets_go_of_its_place_on_restart_and_resumes_the_open
             },
         );
     }
-    assert_eq!(
-        world.net.standing(),
-        (1, 1),
-        "the kill left a hold and a draft"
-    );
+    assert_eq!(world.net.drafts.borrow().len(), 1, "the kill left a draft");
     let heard = world.net.listen();
     let (sender, mut seen) = mpsc::unbounded();
     let script = Script {
@@ -682,15 +627,9 @@ fn a_bridge_killed_mid_turn_lets_go_of_its_place_on_restart_and_resumes_the_open
             op(&mut seen).await,
             json!({ "undraft": { "channel_id": ROOM } })
         );
-        assert_eq!(
-            op(&mut seen).await,
-            json!({ "release": { "channel_id": ROOM, "thread": 5 } })
-        );
-        assert_eq!(op(&mut seen).await, take(5));
-        assert_eq!(
-            *net.released.borrow(),
-            Some((0, 0)),
-            "the place is clear before anything else"
+        assert!(
+            net.drafts.borrow().is_empty(),
+            "the draft is down before anything else"
         );
         assert_eq!(
             next(&mut seen).await,
@@ -744,7 +683,7 @@ fn a_fresh_bridge_starts_after_the_accounts_history() {
         async {
             net.message(2, "m2", 6, None, 7, "new");
             heard.unbounded_send(2).unwrap();
-            assert_eq!(op(seen).await, take(6));
+            assert_eq!(next(seen).await, Seen::Started(at(6), None));
         },
     );
 }

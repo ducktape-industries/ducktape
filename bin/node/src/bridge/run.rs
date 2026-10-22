@@ -1,5 +1,5 @@
 //! The bridge's one loop: what attribution tells the account, settled in seq order into places,
-//! and in each place a turn taken, drafted and posted in chat, one op at a time, with the state
+//! and in each place a turn started, drafted and posted in chat, one op at a time, with the state
 //! file kept after every step so a restart lets go of what it held and hands open input again.
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -14,22 +14,17 @@ use super::adapter::{Adapter, Event, Turn};
 use super::chain::{Chain, Sent};
 use super::heard::{self, Heard};
 use super::kept::{self, Input, Kept, KeptPlace, Wake, Where};
-use super::{ATTRIBUTION, CHAT, WAKE};
+use super::{ATTRIBUTION, CHAT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
-    Taking,
-    Waiting,
     Running,
     Ending,
 }
 
 enum Op {
     Undraft,
-    Release,
-    Take,
-    Clear,
     Draft { text: String, doing: Option<String> },
     Post { key: String, text: String },
 }
@@ -38,9 +33,6 @@ impl Op {
     fn name(&self) -> &'static str {
         match self {
             Op::Undraft => "undraft",
-            Op::Release => "release",
-            Op::Take => "take",
-            Op::Clear => "WakeOn Clear",
             Op::Draft { .. } => "drafting",
             Op::Post { .. } => "post",
         }
@@ -50,18 +42,6 @@ impl Op {
         let (channel, thread) = (&at.channel, at.thread);
         match self {
             Op::Undraft => (CHAT, json!({ "undraft": { "channel_id": channel } })),
-            Op::Release => (
-                CHAT,
-                json!({ "release": { "channel_id": channel, "thread": thread } }),
-            ),
-            Op::Take => (
-                CHAT,
-                json!({ "take": { "channel_id": channel, "thread": thread } }),
-            ),
-            Op::Clear => (
-                WAKE,
-                json!({ "wake_on": { "event": { "clear": { "channel_id": channel, "thread": thread } } } }),
-            ),
             Op::Draft { text, doing } => (
                 CHAT,
                 json!({ "drafting": {
@@ -128,15 +108,8 @@ impl<T> Place<T> {
             .chain(&self.waiting)
     }
 
-    fn take(&mut self) {
-        self.phase = Phase::Taking;
-        self.held = true;
-        self.ops.push_back(Op::Take);
-    }
-
     fn let_go(&mut self) {
         self.ops.push_back(Op::Undraft);
-        self.ops.push_back(Op::Release);
     }
 
     fn draft(&mut self, text: String, doing: Option<String>) {
@@ -161,9 +134,7 @@ impl<T> Place<T> {
     }
 
     fn holds_next(&self) -> bool {
-        self.ops
-            .iter()
-            .any(|op| matches!(op, Op::Take | Op::Draft { .. }))
+        self.ops.iter().any(|op| matches!(op, Op::Draft { .. }))
     }
 
     fn post(&mut self, input: Input, text: String) {
@@ -389,7 +360,6 @@ impl<'a, C: Chain, A: Adapter> Bridge<'a, C, A> {
                 }
             }
             Heard::Woke { wake, input } => match self.wakes.remove(&wake) {
-                Some(Wake::Clear(place)) => self.cleared(&place),
                 Some(Wake::Model(place)) => self.woke(&place, input).await,
                 None => {
                     self.unclaimed.insert(wake, input);
@@ -416,16 +386,6 @@ impl<'a, C: Chain, A: Adapter> Bridge<'a, C, A> {
         }
     }
 
-    fn cleared(&mut self, key: &str) {
-        let Some(place) = self.places.get_mut(key) else {
-            return;
-        };
-        if place.phase == Phase::Waiting {
-            place.take();
-            self.pump(key);
-        }
-    }
-
     async fn hand(&mut self, at: Where, input: Input) {
         let key = at.key();
         let place = self
@@ -433,8 +393,9 @@ impl<'a, C: Chain, A: Adapter> Bridge<'a, C, A> {
             .entry(key.clone())
             .or_insert_with(|| Place::new(at));
         place.waiting.push_back(input);
-        if place.phase == Phase::Idle {
-            place.take();
+        let idle = place.phase == Phase::Idle;
+        if idle {
+            self.start(&key).await;
         }
         self.pump(&key);
     }
@@ -473,37 +434,12 @@ impl<'a, C: Chain, A: Adapter> Bridge<'a, C, A> {
                 op.name()
             );
         }
-        let mut start = false;
-        match (op, sent) {
-            (Op::Take, Sent::Applied(_)) => {
-                place.held = true;
-                start = true;
-            }
-            (Op::Take, Sent::Rejected { reason, .. }) if reason == "busy" => {
-                place.phase = Phase::Waiting;
-                place.ops.push_back(Op::Clear);
-            }
-            (Op::Clear, Sent::Applied(wake)) => match wake.as_u64() {
-                Some(wake) if self.unclaimed.remove(&wake).is_some() => place.take(),
-                Some(wake) => {
-                    self.wakes.insert(wake, Wake::Clear(key.to_owned()));
-                }
-                None => eprintln!("bridge: wake answered WakeOn in {key} with no id"),
-            },
-            (Op::Take | Op::Clear, Sent::Rejected { .. }) => {
-                place.waiting.clear();
-                place.phase = Phase::Idle;
-                place.held = false;
-            }
-            (Op::Post { key: answer, .. }, _) => {
+        match op {
+            Op::Post { key: answer, .. } => {
                 place.posting.retain(|input| input.key != answer);
                 place.held = place.holds_next();
             }
-            (Op::Release, _) => place.held = place.holds_next(),
-            (Op::Undraft | Op::Draft { .. }, _) => {}
-        }
-        if start {
-            self.start(key).await;
+            Op::Undraft | Op::Draft { .. } => {}
         }
         self.pump(key);
     }
@@ -540,6 +476,7 @@ impl<'a, C: Chain, A: Adapter> Bridge<'a, C, A> {
         let Some(place) = self.places.get_mut(key) else {
             return Ok(());
         };
+        let mut again = false;
         match event {
             Event::Session(session) => {
                 place.session = Some(session);
@@ -586,11 +523,12 @@ impl<'a, C: Chain, A: Adapter> Bridge<'a, C, A> {
                 if place.waiting.is_empty() && place.held && place.posting.is_empty() {
                     place.let_go();
                 }
-                match place.waiting.is_empty() {
-                    true => place.phase = Phase::Idle,
-                    false => place.take(),
-                }
+                place.phase = Phase::Idle;
+                again = !place.waiting.is_empty();
             }
+        }
+        if again {
+            self.start(key).await;
         }
         self.pump(key);
         self.save()

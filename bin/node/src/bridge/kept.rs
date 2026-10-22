@@ -1,5 +1,5 @@
 //! The bridge's local state file: the last attribution seq it settled, each place's product
-//! session, whether it may still hold the place, its open inputs, and the wakes it waits on,
+//! session, whether a draft of its may still stand there, its open inputs, and the wakes it waits on,
 //! rewritten whole after every step.
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,7 +27,6 @@ pub(crate) struct Input {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Wake {
-    Clear(String),
     Model(String),
 }
 

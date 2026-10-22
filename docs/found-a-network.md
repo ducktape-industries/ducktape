@@ -463,10 +463,9 @@ printf '%s\n' "$pw" | ducktape --workspace WS --node URL bridge claude \
 
 Each chat thread the account answers in gets one `claude -p` session
 (stream-json in and out), resumed by its session id; a message that is not in
-a thread roots its own. Before it answers in a thread the bridge sends chat
-`Take`; while someone else holds the thread it waits with wake
-`{"wake_on": {"event": {"clear": {"channel_id": …, "thread": …}}}}` and takes
-it when that wake's Result comes. While the session works it shows a
+a thread roots its own. It answers as soon as a message reaches it, whoever
+else is answering there, and each post lands as it is made. While the session
+works it shows a
 `Drafting`, and each answer is one `Post` with message id
 `bridge-<account>-<channel>-<seq>`, so a repeat is refused, never posted
 twice. A message heard while the session runs goes to the same session, which
@@ -491,9 +490,9 @@ its transcripts sit beside the state and nothing reads `~/.claude`. It is
 allowed the ducktape tools (`--allowedTools=mcp__ducktape`); give it any other
 permission after `--`. Anything running as that user can still reach the
 relay socket and act as the account. `STATE` keeps the last seq settled, each
-thread's session and open input, and whether the bridge may still hold the
-thread. On start it sends `Undraft` and `Release` for every thread it may
-still hold, so a bridge killed mid-turn leaves no thread busy, then hands its
+thread's session and open input, and whether a draft of the bridge's may still
+stand there. On start it sends `Undraft` for every thread where one may, so a
+bridge killed mid-turn leaves no draft behind, then hands its
 open input again unless its answer is already posted. With no `STATE` it
 starts after the account's history.
 
