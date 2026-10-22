@@ -1367,7 +1367,6 @@ where
             (Outcome::Applied { .. }, false) => return Ok(None),
             (Outcome::Applied { .. }, true) => {
                 overlay.restore(checkpoint);
-                unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
                 Refusal::new(reason::UNSUPPORTED, "a hook sends no messages")
             }
         };
@@ -1632,7 +1631,6 @@ where
                 Box::pin(self.gate(program, payload, &env, overlay, stage, frame)).await?
         {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             return Ok(Run::finished(rejected(program, refusal)));
         }
         let segment =
@@ -1640,7 +1638,6 @@ where
         let refused = matches!(segment.receipt.outcome, Outcome::Rejected(_));
         if refused {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
         }
         let start = Start {
             frame: None,
@@ -1752,7 +1749,6 @@ where
         let guarded = Box::pin(self.guard(program, env, writes, overlay, stage, frame)).await?;
         if let Err(refusal) = guarded {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             receipt.outcome = Outcome::Rejected(refusal);
             return Ok(Segment::finished(receipt));
         }
@@ -1769,7 +1765,6 @@ where
         .await?;
         if let Some(outcome) = refused {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             receipt.outcome = outcome;
             return Ok(Segment::finished(receipt));
         }
@@ -2130,7 +2125,6 @@ where
                     // rejected unit's writes are undone
                     if rejected {
                         overlay.restore(checkpoint);
-                        unit::discard_unrostered(self.store.storage(), overlay, stage)?;
                     }
                 }
             }
@@ -2468,7 +2462,7 @@ where
         &mut self,
         tip: Tip,
         mut overlay: Overlay,
-        stage: Stage,
+        mut stage: Stage,
         admissions: Vec<Receipt>,
         submissions: Vec<Receipt>,
         records: Vec<hook::Record>,
@@ -2491,6 +2485,7 @@ where
             namespace::INDEXED_AT.to_vec(),
             namespace::height(tip.height),
         );
+        unit::discard_unrostered(self.store.storage(), &overlay, &mut stage)?;
         let mut writes = overlay.into_writes();
         let local = std::mem::take(&mut writes.local);
         self.blobs.promote(stage)?;

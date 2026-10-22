@@ -804,7 +804,14 @@ impl Inner {
                 }
             }
             if worth_a_line {
-                tracing::warn!(target: "ducktape::blob", event = "blob_unfetched", ?id, attempts = rounds, reason = missed, "no member gave a blob this node needs; it asks again");
+                match rounds {
+                    1 => {
+                        tracing::warn!(target: "ducktape::blob", event = "blob_unfetched", ?id, attempts = rounds, reason = missed, "no member gave a blob this node needs; it asks again")
+                    }
+                    _ => {
+                        tracing::error!(target: "ducktape::blob", event = "blob_unfetched", ?id, attempts = rounds, reason = missed, "no member gave a blob this node needs; it asks again")
+                    }
+                }
             }
             tokio::time::sleep(pause(rounds)).await;
         }

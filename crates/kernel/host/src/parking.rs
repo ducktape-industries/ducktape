@@ -164,7 +164,6 @@ where
             let refused = matches!(receipt.outcome, Outcome::Rejected(_));
             if refused {
                 overlay.restore(start.checkpoint);
-                unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             }
         }
     }
@@ -342,7 +341,6 @@ where
         depth: u32,
     ) -> Result<Run> {
         overlay.restore(start.checkpoint);
-        unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
         receipt.outcome = Outcome::Rejected(refusal);
         Box::pin(self.finish(
             program, env, start, receipt, false, overlay, stage, frame, depth,

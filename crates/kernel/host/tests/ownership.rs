@@ -201,6 +201,64 @@ fn write(key: &[u8], claimed: Option<&str>, existed: bool, kept: bool) -> Write 
 }
 
 #[test]
+fn a_refused_replacement_keeps_the_blob_written_earlier_in_the_same_block() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, dir.path(), Vec::new()).await;
+        let blob = |body: &[u8]| {
+            blob::id_of(abi::HashKind::Sha256, &blob::frame("tree", body).unwrap()).unwrap()
+        };
+        let put = |body: &[u8]| {
+            Step::Op(HostOp::put(
+                abi::HashKind::Sha256,
+                "tree".to_owned(),
+                body.to_vec(),
+                Some(b"root".to_vec()),
+            ))
+        };
+        let original = blob(b"original");
+        let replacement = blob(b"replacement");
+        let deny = Op::Deny {
+            program: "probe".to_owned(),
+            key: b"o/root".to_vec(),
+        };
+        let receipts = apply(
+            &mut host,
+            1,
+            vec![
+                ownership(1, &deny),
+                probe(2, vec![put(b"original")]),
+                probe(3, vec![put(b"replacement"), claim(b"o/root")]),
+                probe(4, vec![Step::Op(HostOp::BlobGet(original))]),
+            ],
+        )
+        .await;
+        applied(&receipts[0]);
+        applied(&receipts[1]);
+        assert_eq!(refusal(&receipts[2]).reason, reason::UNAUTHORIZED);
+        applied(&receipts[3]);
+        let Outcome::Applied { output } = &receipts[3].outcome else {
+            unreachable!();
+        };
+        let replies: Vec<fixture_probe::Reply> = abi::decode(output).unwrap();
+        assert_eq!(
+            replies,
+            vec![fixture_probe::Reply::Host(abi::HostReply::Blob(Some(
+                abi::Blob {
+                    kind: "tree".to_owned(),
+                    body: b"original".to_vec(),
+                },
+            )))],
+        );
+        assert!(host.blobs().has(&original));
+        assert!(!host.blobs().has(&replacement));
+        assert!(stored(&host, host::BLOBS, &abi::encode(&original)).is_some());
+        assert!(stored(&host, host::BLOBS, &abi::encode(&replacement)).is_none());
+        assert!(stored(&host, "probe", b"o/root").is_none());
+    });
+}
+
+#[test]
 fn a_claimed_create_asks_once_and_its_record_guards_every_later_write() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();

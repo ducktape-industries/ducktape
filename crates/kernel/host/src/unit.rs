@@ -1195,7 +1195,6 @@ where
         },
         Outcome::Rejected(_) => {
             overlay.restore(checkpoint);
-            discard_unrostered(world.store.reads(), overlay, stage)?;
             Effects::default()
         }
     };

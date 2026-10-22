@@ -146,7 +146,6 @@ where
             .await?;
         if let Outcome::Rejected(_) = receipt.outcome {
             overlay.restore(checkpoint);
-            unit::discard_unrostered(self.store.storage(), overlay, stage)?;
         }
         Ok(receipt)
     }
