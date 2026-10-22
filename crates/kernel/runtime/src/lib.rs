@@ -115,12 +115,25 @@ impl Runtime {
             .wasm_backtrace_max_frames(None)
             .wasm_backtrace_details(WasmBacktraceDetails::Disable)
             .cranelift_nan_canonicalization(true)
+            .wasm_reference_types(true)
+            .wasm_bulk_memory(true)
+            .wasm_multi_value(true)
+            .wasm_extended_const(true)
+            .wasm_memory64(true)
             .wasm_simd(false)
             .wasm_relaxed_simd(false)
             .wasm_threads(false)
-            .wasm_gc(false)
+            .wasm_shared_everything_threads(false)
             .wasm_tail_call(false)
             .wasm_multi_memory(false)
+            .wasm_function_references(false)
+            .wasm_gc(false)
+            .wasm_exceptions(false)
+            .wasm_wide_arithmetic(false)
+            .wasm_custom_page_sizes(false)
+            .wasm_stack_switching(false)
+            .wasm_branch_hinting(false)
+            .wasm_component_model(false)
             .with_host_stack(Arc::new(stacks::Stacks::default()));
         Runtime {
             engine: Engine::new(&config).expect("a fixed wasmtime configuration"),
@@ -133,7 +146,7 @@ impl Runtime {
     }
 
     pub fn load(&self, bytes: &[u8]) -> Result<Code, Fault> {
-        let module = Module::new(&self.engine, bytes).map_err(load)?;
+        let module = Module::new(&self.engine, bytes).map_err(load(NOT_A_MODULE))?;
         let linked = linker(&self.engine)
             .ok()
             .and_then(|linker| linker.instantiate_pre(&module).ok());
@@ -240,17 +253,20 @@ impl Runtime {
         );
         store.limiter(|data| &mut data.limiter);
         if let Some(fuel) = *fuel {
-            store.set_fuel(fuel).map_err(load)?;
+            store.set_fuel(fuel).map_err(load(FUEL_UNSET))?;
         }
         let instance = match &code.linked {
-            Some(linked) => linked.instantiate_async(&mut store).await.map_err(load),
+            Some(linked) => linked
+                .instantiate_async(&mut store)
+                .await
+                .map_err(instantiation),
             None => linker(&self.engine)?
                 .instantiate_async(&mut store, &code.module)
                 .await
-                .map_err(load),
+                .map_err(instantiation),
         };
         if fuel.is_some() {
-            *fuel = Some(store.get_fuel().map_err(load)?);
+            *fuel = Some(store.get_fuel().map_err(load(FUEL_UNREAD))?);
         }
         let instance = instance?;
         let memory = instance
@@ -276,7 +292,7 @@ async fn drive(
         return Err(Fault::Trap(OUT_OF_FUEL.into()));
     }
     if let Some(fuel) = *fuel {
-        suspended.store.set_fuel(fuel).map_err(load)?;
+        suspended.store.set_fuel(fuel).map_err(load(FUEL_UNSET))?;
     }
     suspended.store.data_mut().parked = false;
     let Suspended {
@@ -304,7 +320,7 @@ async fn drive(
         }
     };
     if fuel.is_some() {
-        *fuel = Some(store.get_fuel().map_err(load)?);
+        *fuel = Some(store.get_fuel().map_err(load(FUEL_UNREAD))?);
     }
     verdict
 }
@@ -315,7 +331,7 @@ fn linker(engine: &Engine) -> Result<Linker<Data>, Fault> {
         .func_wrap_async("ducktape", "host_call", host_call)
         .and_then(|linker| linker.func_wrap("ducktape", "host_take", host_take))
         .and_then(|linker| linker.func_wrap("ducktape", "host_park", host_park))
-        .map_err(load)?;
+        .map_err(load("the kernel's host functions do not link"))?;
     Ok(linker)
 }
 
@@ -331,10 +347,10 @@ async fn call(
 ) -> Result<ProgramReply, Fault> {
     let alloc = instance
         .get_typed_func::<u32, u32>(&mut *store, "alloc")
-        .map_err(load)?;
+        .map_err(load("program exports no alloc(len) -> ptr"))?;
     let entry = instance
         .get_typed_func::<(u32, u32), u64>(&mut *store, "call")
-        .map_err(load)?;
+        .map_err(load("program exports no call(ptr, len) -> reply"))?;
     let request = abi::encode(&invocation);
     let ptr = alloc
         .call_async(&mut *store, request.len() as u32)
@@ -342,13 +358,13 @@ async fn call(
         .map_err(trap)?;
     memory
         .write(&mut *store, ptr as usize, &request)
-        .map_err(|e| Fault::Protocol(format!("alloc handed back {ptr}: {e}")))?;
+        .map_err(|_| Fault::Protocol(format!("alloc handed back {ptr}, outside its memory")))?;
     let packed = entry
         .call_async(&mut *store, (ptr, request.len() as u32))
         .await
         .map_err(trap)?;
     let reply = read(&memory, &*store, (packed >> 32) as u32, packed as u32)
-        .map_err(|e| Fault::Protocol(format!("reply out of memory: {e}")))?;
+        .map_err(|_| Fault::Protocol("the reply lies outside the program's memory".into()))?;
     abi::decode::<ProgramReply>(&reply).map_err(|r| Fault::Protocol(r.sentence))
 }
 
@@ -358,15 +374,29 @@ fn restore(store: &mut Store<Data>, memory: Memory, restored: &[u8]) -> Result<(
     let pages = restored.len().div_ceil(WASM_PAGE_BYTES) as u64;
     let have = memory.size(&*store);
     if pages > have {
-        memory.grow(&mut *store, pages - have).map_err(load)?;
+        memory
+            .grow(&mut *store, pages - have)
+            .map_err(load(IMAGE_TOO_BIG))?;
     }
     memory
         .write(&mut *store, 0, restored)
-        .map_err(|e| Fault::Protocol(format!("the image does not fit its memory: {e}")))
+        .map_err(|_| Fault::Protocol(IMAGE_TOO_BIG.into()))
 }
 
-fn load(error: wasmtime::Error) -> Fault {
-    Fault::Load(format!("{error:#}"))
+const NOT_A_MODULE: &str = "the code is not a wasm module this network runs";
+const FUEL_UNSET: &str = "the run's fuel could not be set";
+const FUEL_UNREAD: &str = "the run's fuel could not be read";
+const IMAGE_TOO_BIG: &str = "the image does not fit its memory";
+
+fn load(sentence: &'static str) -> impl FnOnce(wasmtime::Error) -> Fault {
+    move |_| Fault::Load(sentence.into())
+}
+
+fn instantiation(error: wasmtime::Error) -> Fault {
+    match error.downcast_ref::<wasmtime::Trap>() {
+        Some(_) => trap(error),
+        None => Fault::Load("the program does not instantiate on this network".into()),
+    }
 }
 
 /// A trap's sentence is the kernel's, keyed on the trap kind alone: it can

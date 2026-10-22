@@ -1,0 +1,95 @@
+probe env: spent 33564 crossings [23101] verdict Ok(Ok(()))
+probe env on 33477: spent 33477 crossings [23101] verdict Ok(Ok(()))
+probe env on 33476: spent 33476 crossings [23101] verdict Err(Trap("the run spent its fuel"))
+probe state: spent 68994 crossings [29445, 34142, 36348, 45273, 47463, 62626] verdict Ok(Ok(()))
+probe state on 68909: spent 68909 crossings [29445, 34142, 36348, 45273, 47463, 62626] verdict Ok(Ok(()))
+probe state on 68908: spent 68908 crossings [29445, 34142, 36348, 45273, 47463, 62626] verdict Err(Trap("the run spent its fuel"))
+probe query: spent 28997 crossings [17141, 21098] verdict Ok(Ok(()))
+probe query on 28912: spent 28912 crossings [17141, 21098] verdict Ok(Ok(()))
+probe query on 28911: spent 28911 crossings [17141, 21098] verdict Err(Trap("the run spent its fuel"))
+probe crypto: spent 47049 crossings [37326, 40885] verdict Ok(Ok(()))
+probe crypto on 46964: spent 46964 crossings [37326, 40885] verdict Ok(Ok(()))
+probe crypto on 46963: spent 46963 crossings [37326, 40885] verdict Err(Trap("the run spent its fuel"))
+probe grow: spent 1070926 crossings [1065322] verdict Ok(Ok(()))
+probe grow on 1070839: spent 1070839 crossings [1065322] verdict Ok(Ok(()))
+probe grow on 1070838: spent 1070838 crossings [1065322] verdict Err(Trap("the run spent its fuel"))
+probe fail: spent 22418 crossings [] verdict Ok(Err(Refusal { reason: "probe", sentence: "no" }))
+probe fail on 22333: spent 22333 crossings [] verdict Ok(Err(Refusal { reason: "probe", sentence: "no" }))
+probe fail on 22332: spent 22332 crossings [] verdict Err(Trap("the run spent its fuel"))
+probe mixed: spent 621668 crossings [53935, 58366, 60538, 69399, 72031, 74245, 82813] verdict Ok(Err(Refusal { reason: "probe", sentence: "the ledger's refusal" }))
+probe mixed on 621606: spent 621606 crossings [53935, 58366, 60538, 69399, 72031, 74245, 82813] verdict Ok(Err(Refusal { reason: "probe", sentence: "the ledger's refusal" }))
+probe mixed on 621605: spent 621605 crossings [53935, 58366, 60538, 69399, 72031, 74245, 82813] verdict Err(Trap("the run spent its fuel"))
+probe spin on 1000000: spent 1000000 crossings [] verdict Err(Trap("the run spent its fuel"))
+fixture_access init: spent 20172 crossings [] verdict Ok(Ok(()))
+fixture_access execute: spent 21202 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_access query: spent 21198 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_awaiter init: spent 22619 crossings [] verdict Ok(Ok(()))
+fixture_awaiter execute: spent 26181 crossings [] verdict Ok(Err(Refusal { reason: "invalid_input", sentence: "Unexpected length of input" }))
+fixture_awaiter query: spent 23715 crossings [] verdict Ok(Err(Refusal { reason: "unsupported", sentence: "this program answers no query" }))
+fixture_awaits init: spent 20172 crossings [] verdict Ok(Ok(()))
+fixture_awaits execute: spent 21208 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_awaits query: spent 21202 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_blobs init: spent 20172 crossings [] verdict Ok(Ok(()))
+fixture_blobs execute: spent 21194 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_blobs query: spent 21202 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_crosspond init: spent 21225 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_crosspond execute: spent 21218 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_crosspond query: spent 21202 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_crosspond_probe init: spent 20172 crossings [] verdict Ok(Ok(()))
+fixture_crosspond_probe execute: spent 21218 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_crosspond_probe query: spent 21754 crossings [14595, 16303] verdict Ok(Ok(()))
+fixture_egress init: spent 20187 crossings [] verdict Ok(Ok(()))
+fixture_egress execute: spent 21219 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_egress query: spent 21219 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_halo init: spent 21230 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_halo execute: spent 20872 crossings [] verdict Ok(Err(Refusal { reason: "unauthorized", sentence: "only the validators' vote changes the lanes" }))
+fixture_halo query: spent 21192 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_identity init: spent 21209 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_identity execute: spent 21268 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_identity query: spent 21206 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_oracle init: spent 20172 crossings [] verdict Ok(Ok(()))
+fixture_oracle execute: spent 21215 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_oracle query: spent 21754 crossings [14595, 16303] verdict Ok(Ok(()))
+fixture_ownership init: spent 20200 crossings [] verdict Ok(Ok(()))
+fixture_ownership execute: spent 21230 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_ownership query: spent 20200 crossings [] verdict Ok(Ok(()))
+fixture_probe init: spent 21263 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_probe execute: spent 21263 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_probe query: spent 21236 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_probe_batch init: spent 16387 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_probe_batch execute: spent 16388 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_probe_batch query: spent 16330 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_programs init: spent 21223 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_programs execute: spent 21204 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_programs query: spent 21201 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_relay init: spent 20172 crossings [] verdict Ok(Ok(()))
+fixture_relay execute: spent 21228 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_relay query: spent 21754 crossings [14595, 16303] verdict Ok(Ok(()))
+fixture_scheduler init: spent 20172 crossings [] verdict Ok(Ok(()))
+fixture_scheduler execute: spent 21206 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_scheduler query: spent 21208 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_valset init: spent 21242 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
+fixture_valset execute: spent 25203 crossings [14777, 16539, 18297] verdict Ok(Err(Refusal { reason: "not_found", sentence: "the fixture valset holds no query policy" }))
+fixture_valset query: spent 25198 crossings [14772, 16534, 18292] verdict Ok(Err(Refusal { reason: "not_found", sentence: "the fixture valset holds no query policy" }))
+proposal mvp: loads
+proposal mutable-global: loads
+proposal sign-extension: loads
+proposal saturating-float-to-int: loads
+proposal multi-value: loads
+proposal bulk-memory: loads
+proposal reference-types: loads
+proposal extended-const: loads
+proposal simd: refused
+proposal relaxed-simd: refused
+proposal threads: refused
+proposal tail-call: refused
+proposal multi-memory: refused
+proposal memory64: loads
+proposal function-references: refused
+proposal gc: refused
+proposal exceptions: refused
+proposal wide-arithmetic: refused
+proposal custom-page-sizes: refused
+proposal stack-switching: refused
+proposal shared-everything-threads: refused
+descent: the longest input that does not exhaust the stack is 10689 bytes

@@ -115,7 +115,7 @@ borsh = { version = "1", default-features = false, features = ["derive", "std", 
 # host. pinned EXACTLY: the runtime IS the program execution semantics, so it
 # is consensus-affecting and every validator must run the identical build;
 # changing it is a binary upgrade, never a live program swap.
-wasmtime = "=46.0.3"
+wasmtime = "=48.0.7"
 wasmparser = "0.251"
 zstd = "=0.13.3"
 zstd-safe = { version = "=7.2.4", default-features = false }
