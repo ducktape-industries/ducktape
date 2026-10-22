@@ -67,6 +67,12 @@ WEBSOCKET = "error: error reading from error stream: websocket: close 1006 (abno
 UNPLACED = "error: unable to upgrade connection: pod duckpond-41 does not have a host assigned"
 FETCHING_STATE = {"waiting": {"reason": "PodInitializing"}}
 FAILED = {"terminated": {"exitCode": 128, "reason": "Error", "message": "clone failed"}}
+UNSCHEDULABLE = "0/1 nodes are available: 1 Insufficient memory. no new claims to deallocate, preemption: not eligible due to preemptionPolicy=Never."
+
+
+def unschedulable(pod, reason="Unschedulable"):
+    pod["status"]["conditions"] = [{"type": "PodScheduled", "status": "False", "reason": reason, "message": UNSCHEDULABLE}]
+    return pod
 
 
 def asked(request):
@@ -3654,6 +3660,35 @@ class Posts(unittest.TestCase):
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes={**NOTIFY, "ducktape.industries/notified": "ended"}))
         self.assertEqual(len(self.signer.submits), 1)
 
+    def test_a_pod_the_scheduler_cannot_place_posts_its_reason_once_and_still_posts_its_end(self):
+        self.notifier.seen(unschedulable(pod_json(notes=NOTIFY)))
+        said = {"group": "duckpond-41", "subject": "pod duckpond-41", "status": "note", "detail": f"pending, waiting to be placed: {UNSCHEDULABLE}", "concerns": [17]}
+        self.assertEqual(self.signer.submits, [("chat", server.notice_message("builds", "pods-duckpond-41-pending", None, said))])
+        self.assertEqual(self.kube.calls, [("annotate", "duckpond-41", "ducktape.industries/notified-pending", "posted")])
+        marked = {**NOTIFY, "ducktape.industries/notified-pending": "posted"}
+        self.notifier.seen(unschedulable(pod_json(notes=marked)))
+        self.assertEqual(len(self.signer.submits), 1)
+        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=marked))
+        self.assertEqual(self.signer.submits[1:], [("chat", POSTED)])
+
+    def test_a_pending_pod_the_scheduler_has_not_refused_or_with_no_room_to_post_in_posts_nothing(self):
+        self.notifier.seen(pod_json(notes=NOTIFY))
+        self.notifier.seen(unschedulable(pod_json(notes=NOTIFY), reason="SchedulingGated"))
+        self.notifier.seen(unschedulable(pod_json()))
+        self.assertEqual((self.signer.submits, self.kube.calls), ([], []))
+
+    def test_a_pending_notice_chat_refuses_is_not_marked_so_the_next_event_posts_it_again(self):
+        self.signer.submitted = ran(POOLED + b"landed 961 rejected invalid_input: there is no account 17\n")
+        self.notifier.seen(unschedulable(pod_json(notes=NOTIFY)))
+        self.assertEqual((len(self.signer.submits), self.kube.calls), (1, []))
+        self.notifier.seen(unschedulable(pod_json(notes=NOTIFY)))
+        self.assertEqual(len(self.signer.submits), 2)
+
+    def test_a_pod_that_ended_unplaced_posts_its_end_and_no_pending_notice(self):
+        pod = unschedulable(pod_json(phase="Failed", notes=NOTIFY))
+        self.notifier.seen(pod)
+        self.assertEqual(self.signer.submits, [("chat", server.notice_message("builds", "pods-duckpond-41-ended", None, server.ended_said(pod)))])
+
     def test_a_pod_still_running_or_asking_for_no_post_is_not_posted(self):
         self.notifier.spawn = lambda target, *args: target(*args)
         self.notifier.seen(pod_json(state={"running": {}}, phase="Running", notes=NOTIFY))
@@ -6358,11 +6393,15 @@ class Keys(unittest.TestCase):
             self.assertEqual(signer.env()["DUCKTAPE_PASSWORD"], "p")
 
 
-def cluster_pod(namespace, phase, containers, level=None):
+def cluster_pod(namespace, phase, containers, level=None, name="p"):
     spec = {"containers": [{"name": f"c{at}", **({"resources": {"requests": asks}} if asks is not None else {})} for at, asks in enumerate(containers)]}
     if level is not None:
         spec["resources"] = {"requests": level}
-    return {"metadata": {"namespace": namespace}, "spec": spec, "status": {"phase": phase}}
+    return {"metadata": {"namespace": namespace, "name": name}, "spec": spec, "status": {"phase": phase}}
+
+
+def hardcap_quota(cpu, memory, hard_cpu="56", hard_memory="121Gi"):
+    return {"metadata": {"name": "hardcap", "namespace": "agents"}, "status": {"hard": {"requests.cpu": hard_cpu, "requests.memory": hard_memory}, "used": {"requests.cpu": cpu, "requests.memory": memory, "requests.storage": "0"}}}
 
 
 FABRICS = {"items": [{"status": {"allocatable": {"cpu": "56", "memory": "127142520Ki", "pods": "110"}}}]}
@@ -6374,10 +6413,11 @@ CLUSTER = {
         cluster_pod("pods", "Running", [None, {}]),
         cluster_pod("duckpond", "Succeeded", [{"cpu": "20", "memory": "20Gi"}]),
         cluster_pod("duckpond", "Failed", [{"cpu": "20", "memory": "20Gi"}]),
-        cluster_pod("agents", "Running", [{"cpu": "16500m", "memory": "109Gi"}]),
-        cluster_pod("agents", "Pending", [{"cpu": "1", "memory": "1Gi"}]),
+        cluster_pod("agents", "Running", [{"cpu": "16500m", "memory": "109Gi"}], name="duckpond-warm"),
+        cluster_pod("agents", "Pending", [{"cpu": "1", "memory": "1Gi"}], name="duckpond-370000"),
     ]
 }
+CROWDED = {"items": [*CLUSTER["items"], cluster_pod("agents", "Pending", [{"cpu": "16", "memory": "10Gi"}], name="duckpond-374148"), cluster_pod("agents", "Succeeded", [{"memory": "50Gi"}], name="duckpond-360000")]}
 
 
 class Hardcap(unittest.TestCase):
@@ -6388,21 +6428,70 @@ class Hardcap(unittest.TestCase):
         pod = cluster_pod("duckpond", "Running", [{"cpu": "7", "memory": "312Mi"}], level={"cpu": "1"})
         self.assertEqual(server.pod_requests(pod), {"cpu": 1, "memory": 312 * 1024 * 1024})
 
-    def test_server_py_hardcap_prints_what_kubectl_lists(self):
+    def hardcap_ran(self, pods, quota, refused=None):
         with tempfile.TemporaryDirectory() as temp:
             folder = pathlib.Path(temp)
             (folder / "nodes.json").write_text(json.dumps(FABRICS))
-            (folder / "pods.json").write_text(json.dumps(CLUSTER))
+            (folder / "pods.json").write_text(json.dumps(pods))
+            if quota is not None:
+                (folder / "quota.json").write_text(json.dumps(quota))
+            if refused is not None:
+                (folder / "quota.err").write_text(refused)
             fake = folder / "kubectl.py"
             fake.write_text(
-                "import sys\n"
+                "import os, sys\n"
                 "folder, *asked = sys.argv[1:]\n"
-                "known = {'get nodes -o json': 'nodes', 'get pods --all-namespaces -o json': 'pods'}\n"
-                "sys.stdout.write(open(f'{folder}/{known[\" \".join(asked)]}.json').read())\n"
+                "known = {'get nodes -o json': 'nodes', 'get pods --all-namespaces -o json': 'pods', 'get resourcequota hardcap --namespace agents -o json': 'quota'}\n"
+                "path = f'{folder}/{known[\" \".join(asked)]}.json'\n"
+                "if os.path.exists(path[:-5] + '.err'):\n"
+                "    sys.exit(open(path[:-5] + '.err').read())\n"
+                "if not os.path.exists(path):\n"
+                "    sys.exit('Error from server (NotFound): resourcequotas \"hardcap\" not found')\n"
+                "sys.stdout.write(open(path).read())\n"
             )
             kubectl = " ".join(shlex.quote(word) for word in (sys.executable, str(fake), temp))
-            done = subprocess.run([sys.executable, str(HERE / "server.py"), "hardcap"], env={**os.environ, "PODS_KUBECTL": kubectl}, capture_output=True, text=True)
+            return subprocess.run([sys.executable, str(HERE / "server.py"), "hardcap"], env={**os.environ, "PODS_KUBECTL": kubectl}, capture_output=True, text=True)
+
+    def test_server_py_hardcap_prints_what_kubectl_lists(self):
+        done = self.hardcap_ran(CLUSTER, hardcap_quota("17500m", "110Gi"))
         self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "38688m 113Gi\n", ""))
+
+    def test_a_first_deploy_with_no_hardcap_yet_prints_the_cap(self):
+        done = self.hardcap_ran(CLUSTER, None)
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "38688m 113Gi\n", ""))
+
+    def test_a_cap_equal_to_what_agents_holds_is_printed(self):
+        done = self.hardcap_ran(CROWDED, hardcap_quota("38688m", "113Gi"))
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "38688m 113Gi\n", ""))
+
+    def test_a_cap_below_what_agents_holds_is_refused_naming_the_pods_holding_it(self):
+        done = self.hardcap_ran(CROWDED, hardcap_quota("33500m", "120Gi"))
+        said = (
+            "hardcap's requests.memory would drop to 113Gi, below the 120Gi that pods in agents hold now (its status.used), so deploy applies nothing; "
+            "those pods hold, largest first: duckpond-warm (Running) 109Gi, duckpond-374148 (Pending) 10Gi, duckpond-370000 (Pending) 1Gi. "
+            "Deploy again once enough of them end.\n"
+        )
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (1, "", said))
+
+    def test_a_cpu_cap_below_what_agents_holds_is_refused_in_cpu(self):
+        done = self.hardcap_ran(CROWDED, hardcap_quota("40", "110Gi"))
+        said = (
+            "hardcap's requests.cpu would drop to 38688m, below the 40 that pods in agents hold now (its status.used), so deploy applies nothing; "
+            "those pods hold, largest first: duckpond-warm (Running) 16500m, duckpond-374148 (Pending) 16, duckpond-370000 (Pending) 1. "
+            "Deploy again once enough of them end.\n"
+        )
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (1, "", said))
+
+    def test_a_cap_that_raises_or_keeps_a_hard_already_below_what_agents_holds_is_printed(self):
+        for hard in ("100Gi", "113Gi"):
+            done = self.hardcap_ran(CROWDED, hardcap_quota("33500m", "120Gi", hard_memory=hard))
+            self.assertEqual((hard, done.returncode, done.stdout, done.stderr), (hard, 0, "38688m 113Gi\n", ""))
+
+    def test_a_quota_read_that_fails_otherwise_than_not_found_stops_the_deploy(self):
+        refused = 'Error from server (Forbidden): resourcequotas "hardcap" is forbidden'
+        done = self.hardcap_ran(CLUSTER, hardcap_quota("17500m", "110Gi"), refused=refused)
+        said = f"hardcap in agents was not read, so what its pods hold is unknown and deploy applies nothing: {refused}\n"
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (1, "", said))
 
 
 if __name__ == "__main__":

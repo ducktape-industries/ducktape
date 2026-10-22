@@ -18,7 +18,9 @@ or through a member node's halo forward.
 - `server.py hardcap` prints the cpu and memory `deploy` gives the quota `hardcap`: the
   nodes' allocatable minus the requests of every Running or Pending pod outside `agents`
   (its pod-level request where it states one, else its containers' summed), read with
-  `PODS_KUBECTL` (`kubectl` when unset).
+  `PODS_KUBECTL` (`kubectl` when unset). It refuses a cap that lowers `hardcap` below what its
+  `status.used` says agents' pods already hold (a raise still applies), naming the pods holding it, so `deploy`
+  stops before it builds.
 - The requester of what `POST /v1/pods` and `POST /v1/manifests` make is the account egress
   says sent the request (egress `Sender`, asked once per create), or a fleet call's asker. A
   body naming a `requester` is refused 400; a create egress could not be asked about is refused

@@ -630,7 +630,13 @@ one up for another network.
   it) gets one chat notice there when it ends (chat `Notify`: kind `pod`,
   group and subject the pod, status passed or failed by the run container's
   exit), for its `requester` alone: the run container's exit code, or why
-  fetching its inputs or the pod failed. While its run container runs, each
+  fetching its inputs or the pod failed. Before that, the first time the
+  scheduler reports it Pending and unplaced (`PodScheduled` False, reason
+  `Unschedulable`), it gets one notice there too, status note, detail
+  `pending, waiting to be placed: <the scheduler's message>` (id
+  `pods-<pod>-pending`, marked said by the annotation
+  `ducktape.industries/notified-pending`), so whoever waits on it sees why; the pod
+  keeps waiting for room. While its run container runs, each
   line it prints that reads `ducktape-notify <channel> <text>` is a notice
   for the requester in that channel too, with the pod as its subject and
   `<text>` as its detail, grouped by the run the text names (`<pod>:<run>`
@@ -666,7 +672,11 @@ one up for another network.
   `k8s/pods/deploy` reads these from the cluster with `k8s/pods/server.py
   hardcap` and prints the two values before it applies;
   `PODS_KUBECTL="kubectl --context fabrics-1" python3
-  ops/k8s/pods/server.py hardcap` prints them without applying. It
+  ops/k8s/pods/server.py hardcap` prints them without applying. Neither
+  lowers `hardcap` below what its `status.used` says agents' pods already
+  hold (a cap that raises its hard, or keeps it, still applies): then it prints, for each resource that would drop below,
+  every Running or Pending pod in `agents` holding it, largest first, and
+  exits 1, so deploy stops before it builds or applies anything. It
   caps what pods are guaranteed, not what they burst to. Kubernetes enforces every quota in a
   namespace, so agents add their own quotas and LimitRanges beside it and
   none exceeds it. The service's

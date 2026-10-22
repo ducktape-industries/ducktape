@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane started by itself on each merge queue front's Preview that waits on the service's account, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
-# ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, `server.py fetch` is each pod's input fetcher, and `server.py hardcap` prints the agents quota k8s/pods/deploy applies.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends, when the scheduler first can't place a notified pod, or when a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane started by itself on each merge queue front's Preview that waits on the service's account, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
+# ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, `server.py fetch` is each pod's input fetcher, and `server.py hardcap` prints the agents quota k8s/pods/deploy applies, refusing one below what agents' pods already hold.
 import base64
 import binascii
 import copy
@@ -60,6 +60,8 @@ ATTEMPT_LABEL = NOTE + FLEET_ATTEMPT
 NOTIFY_CHANNEL = NOTE + "notify-channel"
 NOTIFY_THREAD = NOTE + "notify-thread"
 NOTIFIED = NOTE + "notified"
+NOTIFIED_PENDING = NOTE + "notified-pending"
+UNSCHEDULABLE = "Unschedulable"
 REATTACH = "ducktape-reattach"
 REATTACH_BY = "request"
 NOTIFY_LINE = "ducktape-notify "
@@ -1762,6 +1764,18 @@ def unscheduled(status):
     return held[0].get("message") if held else None
 
 
+def pending_said(pod):
+    status = pod.get("status", {})
+    held = [entry for entry in status.get("conditions", []) if entry.get("type") == "PodScheduled" and entry.get("status") == "False" and entry.get("reason") == UNSCHEDULABLE]
+    placed = status.get("phase") != "Pending" or not held
+    if placed:
+        return None
+    meta = pod["metadata"]
+    name = meta["name"]
+    detail = f"pending, waiting to be placed: {held[0].get('message')}"
+    return {"group": name, "subject": f"pod {name}", "status": "note", "detail": detail, "concerns": concerning(requester_of(meta.get("labels") or {}))}
+
+
 def notify_of(notes):
     channel = notes.get(NOTIFY_CHANNEL)
     if channel is None:
@@ -3459,6 +3473,10 @@ class Notifier:
         self.last_read(pod)
         meta = pod["metadata"]
         notes = meta.get("annotations") or {}
+        pending = pending_said(pod)
+        unsaid = pending is not None and NOTIFY_CHANNEL in notes and NOTIFIED_PENDING not in notes
+        if unsaid:
+            self.said_pending(pod, pending)
         ended = ended_said(pod)
         watched = ended is not None and NOTIFY_CHANNEL in notes
         if not watched:
@@ -3475,6 +3493,12 @@ class Notifier:
             self.kube.annotate(name, NOTIFIED, "ended")
             with self.lock:
                 self.posted.pop(name, None)
+
+    def said_pending(self, pod, said):
+        meta = pod["metadata"]
+        name = meta["name"]
+        if self.post(meta.get("annotations") or {}, requester_of(meta.get("labels") or {}), f"pods-{name}-pending", said):
+            self.kube.annotate(name, NOTIFIED_PENDING, "posted")
 
     def event(self, event):
         kind = event.get("type")
@@ -5427,13 +5451,58 @@ def hardcap(nodes, pods, namespace):
     return f"{math.floor(free['cpu'] * 1000)}m", f"{math.floor(free['memory'] / GIB)}Gi"
 
 
+def shown(name, value):
+    if name == "cpu":
+        return f"{value}" if value.denominator == 1 else f"{math.floor(value * 1000)}m"
+    for unit, size in (("Gi", GIB), ("Mi", 1 << 20), ("Ki", 1 << 10)):
+        if value % size == 0:
+            return f"{value // size}{unit}"
+    return f"{value}"
+
+
+def under_held(caps, quota, pods, namespace):
+    status = mapping(mapping(quota).get("status"))
+    used, hard = mapping(status.get("used")), mapping(status.get("hard"))
+    said = []
+    for name in HARDCAP:
+        key = f"requests.{name}"
+        cap = quantity(caps[name])
+        held = used.get(key)
+        lowered = hard.get(key) is None or cap < quantity(hard[key])
+        refused = held is not None and cap < quantity(held) and lowered
+        if not refused:
+            continue
+        ours = [pod for pod in pods["items"] if pod["metadata"]["namespace"] == namespace and (pod.get("status") or {}).get("phase") in HELD_PHASES]
+        holding = sorted(((pod_requests(pod)[name], pod["metadata"]["name"], pod["status"]["phase"]) for pod in ours), key=lambda row: (-row[0], row[1]))
+        listed = ", ".join(f"{pod} ({phase}) {shown(name, value)}" for value, pod, phase in holding if value > 0)
+        said.append(
+            f"hardcap's {key} would drop to {caps[name]}, below the {held} that pods in {namespace} hold now (its status.used), so deploy applies nothing; "
+            f"those pods hold, largest first: {listed}. Deploy again once enough of them end."
+        )
+    return said
+
+
+def held_quota(kubectl, namespace):
+    ran = subprocess.run([*kubectl, "get", "resourcequota", "hardcap", "--namespace", namespace, "-o", "json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if ran.returncode == 0:
+        return json.loads(ran.stdout)
+    if "(NotFound)" in ran.stderr:
+        return None
+    sys.exit(f"hardcap in {namespace} was not read, so what its pods hold is unknown and deploy applies nothing: {ran.stderr.strip() or f'kubectl exited {ran.returncode}'}")
+
+
 def hardcap_main():
     kubectl = shlex.split(os.environ.get("PODS_KUBECTL", "kubectl"))
+    namespace = os.environ.get("PODS_NAMESPACE", "agents")
     listed = [json.loads(subprocess.run([*kubectl, "get", *kind, "-o", "json"], check=True, stdout=subprocess.PIPE, text=True).stdout) for kind in (["nodes"], ["pods", "--all-namespaces"])]
+    quota = held_quota(kubectl, namespace)
     try:
-        cpu, memory = hardcap(*listed, os.environ.get("PODS_NAMESPACE", "agents"))
+        cpu, memory = hardcap(*listed, namespace)
     except Refused as refusal:
         sys.exit(refusal.sentence)
+    refused = under_held({"cpu": cpu, "memory": memory}, quota, listed[1], namespace)
+    if refused:
+        sys.exit(" ".join(refused))
     print(cpu, memory)
 
 
