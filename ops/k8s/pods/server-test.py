@@ -12,11 +12,13 @@ import json
 import os
 import pathlib
 import queue
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -4796,10 +4798,13 @@ def status(network, block_ms):
     return server.borsh_text(network) + server.u64(1) + server.u64(block_ms) + server.u64(10) + server.u64(500) + b"the rest of the status"
 
 
+NODE_BLOCK_MS = 1000
+
+
 class Node(BaseHTTPRequestHandler):
     def do_GET(self):
         named = self.headers.get("User-Agent") == "pods"
-        body = status("duckpond", 1000) if self.path == "/v1/status" and named else b""
+        body = status("duckpond", NODE_BLOCK_MS) if self.path == "/v1/status" and named else b""
         self.send_response(200 if body else 404)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
@@ -5827,6 +5832,53 @@ else:
 """
 
 
+STOPS_WITHIN = int(re.search(r"^default_wait=(\d+)$", (HERE / "deploy").read_text(), re.M).group(1)) * NODE_BLOCK_MS / 1000
+
+
+class Heard:
+    def __init__(self, process):
+        self.process = process
+        self.lines = queue.Queue()
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self):
+        with self.process.stderr:
+            for line in self.process.stderr:
+                self.lines.put(line)
+        self.lines.put("")
+
+    def next(self, until):
+        try:
+            return self.lines.get(timeout=None if until is None else max(0.0, until - time.monotonic()))
+        except queue.Empty:
+            return None
+
+    def line(self, word, until=None):
+        while True:
+            line = self.next(until)
+            if line is None:
+                raise AssertionError(f"the service wrote no {word} line in the {STOPS_WITHIN:g} s after its SIGTERM that Kubernetes gives it past its preStop before it kills it")
+            if not line:
+                raise AssertionError(f"the service's stderr ended before any {word} line")
+            if word in line:
+                return line
+
+    def rest(self, until):
+        said = []
+        while True:
+            line = self.next(until)
+            if line is None:
+                raise AssertionError(f"the service still ran {STOPS_WITHIN:g} s after its SIGTERM, when Kubernetes would kill it, having said since: {''.join(said)[-4000:]}")
+            if not line:
+                return "".join(said)
+            said.append(line)
+
+
+def terminated(process):
+    process.send_signal(signal.SIGTERM)
+    return time.monotonic() + STOPS_WITHIN
+
+
 class Stopped(unittest.TestCase):
     def node(self):
         served = ThreadingHTTPServer(("127.0.0.1", 0), Node)
@@ -5848,11 +5900,9 @@ class Stopped(unittest.TestCase):
             env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=self.node(), PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
             process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
             self.addCleanup(process.kill)
-            serving = next(line for line in iter(process.stderr.readline, "") if "event=pods_serving" in line)
-            self.assertIn("namespace=agents", serving)
-            process.send_signal(signal.SIGTERM)
-            said = process.stderr.read()
-            process.stderr.close()
+            heard = Heard(process)
+            self.assertIn("namespace=agents", heard.line("event=pods_serving"))
+            said = heard.rest(terminated(process))
             self.assertEqual(process.wait(), 0, said)
             self.assertIn("event=pods_stopping signal=SIGTERM", said)
 
@@ -5861,8 +5911,8 @@ class Stopped(unittest.TestCase):
             env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=self.node(), PODS_FORGE="duck://chain/forge", PODS_KUBECTL="false", PODS_LISTEN="127.0.0.1:0", PODS_KEYS=keys)
             process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
             self.addCleanup(process.kill)
-            lines = iter(process.stderr.readline, "")
-            serving = next(line for line in lines if "event=pods_serving" in line)
+            heard = Heard(process)
+            serving = heard.line("event=pods_serving")
             port = int(serving.split("listen=127.0.0.1:")[1].split()[0])
             stopped = threading.Event()
 
@@ -5879,15 +5929,15 @@ class Stopped(unittest.TestCase):
             clients = [threading.Thread(target=asking) for _ in range(os.cpu_count())]
             for client in clients:
                 client.start()
-            logged = (line for line in lines if "event=pods_request" in line)
             for _ in range(len(clients)):
-                next(logged)
-            process.send_signal(signal.SIGTERM)
-            said = process.stderr.read()
-            process.stderr.close()
-            stopped.set()
-            for client in clients:
-                client.join()
+                heard.line("event=pods_request")
+            try:
+                said = heard.rest(terminated(process))
+            finally:
+                stopped.set()
+                process.kill()
+                for client in clients:
+                    client.join()
             self.assertEqual(process.wait(), 0, said)
             self.assertIn("event=pods_stopping signal=SIGTERM", said)
 
@@ -5908,8 +5958,8 @@ class Stopped(unittest.TestCase):
                 unblock(place)
 
     def drained(self, process, place):
-        lines = iter(process.stderr.readline, "")
-        serving = next(line for line in lines if "event=pods_serving" in line)
+        heard = Heard(process)
+        serving = heard.line("event=pods_serving")
         port = int(serving.split("listen=127.0.0.1:")[1].split()[0])
         waiting = http.client.HTTPConnection("127.0.0.1", port)
         waiting.request("GET", "/v1/pods/duckpond-41/wait?every=3600", headers=ASKED)
@@ -5927,27 +5977,36 @@ class Stopped(unittest.TestCase):
         caller = threading.Thread(target=call)
         caller.start()
         (place / "started").read_text()
-        process.send_signal(signal.SIGTERM)
-        next(line for line in lines if "event=pods_stopping" in line)
+        until = terminated(process)
+        heard.line("event=pods_stopping", until)
         with self.assertRaises(http.client.IncompleteRead):
             stream.read()
         with self.assertRaises(ConnectionRefusedError):
             socket.create_connection(("127.0.0.1", port))
         (place / "release").write_text("once\n")
         caller.join()
-        said = process.stderr.read()
-        process.stderr.close()
+        said = heard.rest(until)
         self.assertEqual(process.wait(), 0, said)
         self.assertEqual(answers, [(200, {"exit_code": 0, "stdout": "built once\n", "stderr": ""})])
         self.assertIn("event=pods_drained", said)
 
-    def test_a_signal_while_a_line_is_being_written_writes_nothing_itself(self):
+    def test_a_sigterm_heard_inside_a_finalizer_or_a_line_being_written_still_stops_the_service_and_writes_nothing(self):
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        self.addCleanup(signal.set_wakeup_fd, signal.set_wakeup_fd(-1))
+        signals = server.Signals(signal.SIGTERM)
+        self.addCleanup(signals.said.close)
+        self.addCleanup(signals.heard.close)
+
+        class Dropped:
+            def __del__(self):
+                signal.raise_signal(signal.SIGTERM)
+
         written = io.StringIO()
-        with contextlib.redirect_stderr(written), self.assertRaises(server.Stopping) as stopped:
+        with contextlib.redirect_stderr(written):
             print("event=pods_serving", end="", file=sys.stderr)
-            server.exit_on_signal(signal.SIGTERM, None)
-        self.assertEqual(stopped.exception.args, ("SIGTERM",))
+            Dropped()
         self.assertEqual(written.getvalue(), "event=pods_serving")
+        self.assertEqual(signals.wait(), "SIGTERM")
 
 
 class Signing(unittest.TestCase):

@@ -5201,12 +5201,24 @@ def fetch_main():
         sys.exit(1)
 
 
-class Stopping(BaseException):
+def signal_woken(number, frame):
     pass
 
 
-def exit_on_signal(number, frame):
-    raise Stopping(signal.Signals(number).name)
+class Signals:
+    def __init__(self, *numbers):
+        self.numbers = set(numbers)
+        self.heard, self.said = socket.socketpair()
+        self.said.setblocking(False)
+        signal.set_wakeup_fd(self.said.fileno(), warn_on_full_buffer=False)
+        for number in numbers:
+            signal.signal(number, signal_woken)
+
+    def wait(self):
+        while True:
+            number = self.heard.recv(1)[0]
+            if number in self.numbers:
+                return signal.Signals(number).name
 
 
 def main():
@@ -5236,18 +5248,18 @@ def main():
     host, port = os.environ.get("PODS_LISTEN", "0.0.0.0:8080").rsplit(":", 1)
     drain = Drain()
     server = ThreadingHTTPServer((host, int(port)), handler(service, drain))
-    try:
-        signal.signal(signal.SIGTERM, exit_on_signal)
-        bound, at = server.server_address[:2]
-        say("pods_serving", namespace=kube.namespace, listen=f"{bound}:{at}", keyed=signer.held())
-        server.serve_forever()
-    except Stopping as stopping:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        server.server_close()
-        say("pods_stopping", signal=stopping.args[0])
-        cut = drain.stop()
-        say("pods_drained", cut=cut)
-        os._exit(0)
+    signals = Signals(signal.SIGTERM)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bound, at = server.server_address[:2]
+    say("pods_serving", namespace=kube.namespace, listen=f"{bound}:{at}", keyed=signer.held())
+    stopping = signals.wait()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    server.shutdown()
+    server.server_close()
+    say("pods_stopping", signal=stopping)
+    cut = drain.stop()
+    say("pods_drained", cut=cut)
+    os._exit(0)
 
 
 if __name__ == "__main__":
