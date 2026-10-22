@@ -71,6 +71,7 @@ fn config(base: &str, reach: Reach) -> Config {
         http: true,
         reach,
         services: BTreeMap::from([("ccs".to_owned(), upstream)]),
+        crosspond: BTreeMap::new(),
     }
 }
 
@@ -100,6 +101,21 @@ fn post(service: &str, target: &str, headers: Vec<(&str, &str)>) -> Request {
     }
 }
 
+struct Relayed;
+
+impl Crosspond for Relayed {
+    async fn relay(
+        &mut self,
+        name: &str,
+        peer: &Peer,
+        link: &NetworkId,
+        _: &mut (impl Blocks + Send),
+    ) -> Answer {
+        let relayed = format!("{name} {} {}", peer.base, abi::hex(link));
+        Answer::Output(relayed.into_bytes())
+    }
+}
+
 async fn ask(serving: &Serving, request: &Request, body: &[u8]) -> Answer {
     ask_at(serving, request, body, &mut Unretried).await
 }
@@ -108,7 +124,7 @@ async fn ask_at(
     serving: &Serving,
     request: &Request,
     body: &[u8],
-    blocks: &mut impl Blocks,
+    blocks: &mut (impl Blocks + Send),
 ) -> Answer {
     let delivery = Delivery::Whole;
     let unstreamed = |data| panic!("a whole request streamed {data:?}");
@@ -119,6 +135,7 @@ async fn ask_at(
         &delivery,
         body.to_vec(),
         blocks,
+        &mut Relayed,
         unstreamed,
     )
     .await;
@@ -183,6 +200,19 @@ async fn the_relay_answers_empty_and_a_node_answers_only_what_it_serves() {
         note: b"toolu_1".to_vec(),
     };
     assert_eq!(ask(&serving, &relay, b"").await, Answer::Output(Vec::new()));
+    let crosspond = Request::Crosspond { link: [5; 32] };
+    let unserved = ask(&serving, &crosspond, b"").await;
+    assert!(matches!(unserved, Answer::Failed(_)), "{unserved:?}");
+    let peer = Peer {
+        network: [5; 32],
+        base: Url::parse(&base).unwrap(),
+    };
+    serving.config.crosspond.insert("pond".into(), peer);
+    let relayed = format!("pond {base}/ {}", "05".repeat(32));
+    assert_eq!(
+        ask(&serving, &crosspond, b"").await,
+        Answer::Output(relayed.into_bytes())
+    );
     serving.config.relay = false;
     serving.config.http = false;
     let internet = post(HTTP, &format!("{base}/v1/messages"), Vec::new());

@@ -5,13 +5,14 @@ use std::path::Path;
 
 use abi::role::scheduler::{self, Entry, EntryId};
 use abi::role::{self, halo, identity, validators};
-use abi::{Cause, HostOp, HostReply, Message, Origin, Outcome, Principal, Receipt, reason};
+use abi::{Cause, HostOp, HostReply, Message, Origin, Outcome, Principal, Receipt, Scan, reason};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_awaiter::{ANSWERS, Plan};
+use fixture_oracle::Ask;
 use fixture_probe::{Reply, Step};
 use fixture_wasm::{
-    ACCESS, AWAITER, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, SCHEDULER,
-    VALSET,
+    ACCESS, AWAITER, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, ORACLE, PROBE, PROGRAMS,
+    SCHEDULER, VALSET,
 };
 use host::{Applied, Block, BlockId, Founding, Genesis, Host, Layer, Limits, Submission, Tip};
 
@@ -65,6 +66,7 @@ fn genesis(bound: bool) -> Genesis {
             founding("awaiter", AWAITER, Vec::new()),
             founding("other", AWAITER, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
+            founding("oracle", ORACLE, Vec::new()),
             founding(
                 "halo",
                 HALO,
@@ -439,6 +441,65 @@ fn a_scheduled_run_can_schedule_a_later_entry() {
         apply(&mut host, 5, Vec::new()).await;
         assert_eq!(stored(&host, "probe", b"later"), Some(b"yes".to_vec()));
         replies(&receipt(&host, first + 1).await);
+    });
+}
+
+fn owed(host: &Host<Ctx>) -> Vec<abi::role::awaits::Ticket> {
+    let prefix = b"owed/";
+    let scan = Scan {
+        lo: prefix.to_vec(),
+        hi: abi::prefix_end(prefix),
+        reverse: false,
+        limit: None,
+    };
+    host.view(Layer::Confirmed)
+        .scan("oracle", &scan)
+        .unwrap()
+        .into_iter()
+        .map(|entry| {
+            let ticket = entry.key[prefix.len()..].try_into().unwrap();
+            u64::from_be_bytes(ticket)
+        })
+        .collect()
+}
+
+#[test]
+fn a_scheduled_run_parks_on_a_call_and_resumes_when_it_is_answered() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context.child("found"), dir.path(), true).await;
+        let waits = Plan {
+            target: "oracle".into(),
+            acting: None,
+            asks: vec![abi::encode(&Ask::Later)],
+            together: false,
+            kept: 0,
+            fail: false,
+        };
+        let later = abi::encode(&scheduler::Op::Schedule {
+            height: 3,
+            target: "awaiter".into(),
+            payload: abi::encode(&waits),
+        });
+        apply(&mut host, 1, vec![asks("other", vec![later])]).await;
+        let [id] = scheduled(&host, "other")[..] else {
+            panic!("one entry was scheduled");
+        };
+        until(&mut host, 2, 3).await;
+        let [ticket] = owed(&host)[..] else {
+            panic!("the scheduled run's call waits on the oracle");
+        };
+        assert_eq!(stored(&host, "awaiter", ANSWERS), None);
+        let parked = receipt(&host, id).await;
+        assert!(matches!(parked.outcome, Outcome::Applied { .. }));
+
+        let answer = fixture_oracle::Op::Answer {
+            ticket,
+            answer: Ok(b"answered".to_vec()),
+        };
+        apply(&mut host, 4, vec![submit("oracle", abi::encode(&answer))]).await;
+        assert_eq!(answers(&host, "awaiter"), [Ok(b"answered".to_vec())]);
+        assert!(owed(&host).is_empty());
     });
 }
 

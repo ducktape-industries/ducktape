@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use abi::Receipt;
+use abi::role::crosspond::Acked;
 use abi::{BlobId, Entry, ProgramId, Refusal, Scan, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::{SinkExt as _, Stream, StreamExt as _};
@@ -13,8 +14,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Forwarded, Get, HaloSelf, Located, Network,
-    Page, Play, Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
+    AcksAsk, Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Forwarded, Get, HaloSelf, Head,
+    Located, Network, Page, Play, Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
 };
 use crate::{Error, Result};
 
@@ -290,15 +291,26 @@ impl Client {
         Ok(response.error_for_status()?.text().await?)
     }
 
+    pub async fn crosspond_acks(&self, ask: &AcksAsk) -> Result<Acked> {
+        self.post(route::CROSSPOND_ACKS, ask).await
+    }
+
     pub async fn changes(
         &self,
         program: &str,
     ) -> Result<impl Stream<Item = Result<Change>> + Unpin> {
-        let url = format!(
-            "{}{}/{program}",
-            self.base.replacen("http", "ws", 1),
-            route::CHANGES
-        );
+        self.socket(format!("{}/{program}", route::CHANGES)).await
+    }
+
+    pub async fn heads(&self) -> Result<impl Stream<Item = Result<Head>> + Unpin> {
+        self.socket(route::HEADS.to_owned()).await
+    }
+
+    async fn socket<T: BorshDeserialize + Send + 'static>(
+        &self,
+        path: String,
+    ) -> Result<impl Stream<Item = Result<T>> + Unpin + use<T>> {
+        let url = format!("{}{path}", self.base.replacen("http", "ws", 1));
         let unbounded = WebSocketConfig {
             max_message_size: None,
             max_frame_size: None,
@@ -389,23 +401,23 @@ pub struct Upload {
     pub path: std::path::PathBuf,
 }
 
-struct Changes {
-    received: tokio::sync::mpsc::UnboundedReceiver<Result<Change>>,
+struct Changes<T> {
+    received: tokio::sync::mpsc::UnboundedReceiver<Result<T>>,
     reading: tokio::task::AbortHandle,
 }
 
-impl Stream for Changes {
-    type Item = Result<Change>;
+impl<T> Stream for Changes<T> {
+    type Item = Result<T>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Change>>> {
+    ) -> std::task::Poll<Option<Result<T>>> {
         self.received.poll_recv(cx)
     }
 }
 
-impl Drop for Changes {
+impl<T> Drop for Changes<T> {
     fn drop(&mut self) {
         self.reading.abort();
     }
@@ -414,9 +426,9 @@ impl Drop for Changes {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn read_changes(
+async fn read_changes<T: BorshDeserialize>(
     mut socket: Socket,
-    heard: tokio::sync::mpsc::UnboundedSender<Result<Change>>,
+    heard: tokio::sync::mpsc::UnboundedSender<Result<T>>,
 ) {
     while let Some(message) = socket.next().await {
         let change = match message {

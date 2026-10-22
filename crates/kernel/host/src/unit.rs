@@ -6,7 +6,7 @@ use abi::role::awaits::{Answer, FrameId, Ticket};
 use abi::role::identity::AccountNumber;
 use abi::role::ownership::{self, Write};
 use abi::{
-    BlobId, Cause, Env, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
+    BlobId, Cause, Env, Foreign, HostOp, HostReply, Invocation, ItemRef, Message, Origin, Outcome,
     ProgramCall, ProgramId, Receipt, Refusal, Roles, reason, role,
 };
 use blob::{Blobs, Layered, Stage};
@@ -462,6 +462,7 @@ where
             | HostOp::BlobPut { .. }
             | HostOp::BlobReleaseLines { .. }
             | HostOp::Emit(_)
+            | HostOp::EmitForeign { .. }
             | HostOp::Event(_)
             | HostOp::Output(_)
             | HostOp::Respond(_) => {
@@ -745,9 +746,23 @@ pub struct Resumed {
     pub answer: Answer,
 }
 
+pub struct Emitted {
+    pub item: ItemRef,
+    pub message: Message,
+    pub foreign: Option<Foreign>,
+}
+
+impl Emitted {
+    pub fn as_its_emitter(&self) -> bool {
+        let sent_as_a_foreign_user = self.foreign.is_some();
+        let acts_as_another_account = self.message.acting.is_some();
+        !(sent_as_a_foreign_user || acts_as_another_account)
+    }
+}
+
 #[derive(Default)]
 pub struct Effects {
-    pub emitted: Vec<(ItemRef, Message)>,
+    pub emitted: Vec<Emitted>,
     pub calls: Vec<Called>,
     pub resumes: Vec<Resumed>,
     pub deferred: bool,
@@ -928,13 +943,17 @@ where
     }
 
     /// Keeps the message for the frame to run once this handler returns.
-    fn emit(&mut self, message: Message) -> HostReply {
+    fn emit(&mut self, message: Message, foreign: Option<Foreign>) -> HostReply {
         let item = ItemRef {
             source: self.env.me.clone(),
             item: self.frame.next_item,
         };
         self.frame.next_item += 1;
-        self.effects.emitted.push((item.clone(), message));
+        self.effects.emitted.push(Emitted {
+            item: item.clone(),
+            message,
+            foreign,
+        });
         HostReply::Item(item)
     }
 
@@ -1026,7 +1045,11 @@ where
             HostOp::BlobReleaseLines { prefix } => self.release_lines(&prefix),
             HostOp::Emit(message) => {
                 *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
-                Ok(self.emit(message))
+                Ok(self.emit(message, None))
+            }
+            HostOp::EmitForeign { message, foreign } => {
+                *fuel = fuel.map(|left| left.saturating_sub(EMIT_FUEL));
+                Ok(self.emit(message, Some(foreign)))
             }
             HostOp::Await {
                 target,

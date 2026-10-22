@@ -14,7 +14,11 @@ pub fn program_id_shaped(id: &str) -> bool {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+pub const BLOCK_BYTES: usize = 16 << 20;
+
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub struct Root(pub [u8; 32]);
 
 impl Root {
@@ -110,9 +114,26 @@ impl Origin {
     }
 }
 
-/// Who a frame acts as, resolved by the host once per frame through the
-/// identity role: an account (the one a signer's key holds, or the account
-/// of the program that sent a message), or the chain itself.
+pub type NetworkId = [u8; 32];
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
+pub struct Foreign {
+    pub network: NetworkId,
+    pub account: role::identity::AccountNumber,
+}
+
 #[derive(
     Clone,
     Debug,
@@ -128,6 +149,7 @@ impl Origin {
 pub enum Principal {
     Account(role::identity::AccountNumber),
     System,
+    Foreign(Foreign),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
@@ -466,6 +488,10 @@ pub enum HostOp {
         prefix: Vec<u8>,
     },
     Client,
+    EmitForeign {
+        message: Message,
+        foreign: Foreign,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -531,7 +557,8 @@ impl HostOp {
             | HostOp::SetOwned { .. }
             | HostOp::BlobRelease(_)
             | HostOp::BlobReleaseLines { .. }
-            | HostOp::Client => None,
+            | HostOp::Client
+            | HostOp::EmitForeign { .. } => None,
         }
     }
 }
@@ -603,6 +630,7 @@ pub mod role {
     pub const HALO: &str = "halo";
     pub const ACCESS: &str = "access";
     pub const OWNERSHIP: &str = "ownership";
+    pub const CROSSPOND: &str = "crosspond";
     pub const REQUIRED: &[&str] = &[PROGRAMS, VALIDATORS, IDENTITY, BLOBS, AWAITS, HALO];
 
     /// Which code runs at a height.
@@ -1100,13 +1128,14 @@ pub mod role {
     pub mod egress {
         use crate::role::identity::AccountNumber;
         use crate::role::scheduler::EntryId;
-        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
+        use crate::{BlobId, BorshDeserialize, BorshSchema, BorshSerialize, NetworkId, ProgramId};
 
         pub const DEFAULT_WAIT: u64 = 64;
 
         pub const HTTP: &str = "http";
         pub const RELAY: &str = "relay";
-        pub const RESERVED: [&str; 2] = [HTTP, RELAY];
+        pub const CROSSPOND: &str = "crosspond";
+        pub const RESERVED: [&str; 3] = [HTTP, RELAY, CROSSPOND];
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
         pub enum Op {
@@ -1153,6 +1182,9 @@ pub mod role {
                 head: http::Head,
                 body: Vec<BlobId>,
             },
+            Crosspond {
+                link: NetworkId,
+            },
         }
 
         impl Request {
@@ -1160,12 +1192,13 @@ pub mod role {
                 match self {
                     Request::Relay { .. } => RELAY,
                     Request::Http { service, .. } => service,
+                    Request::Crosspond { .. } => CROSSPOND,
                 }
             }
 
             pub fn parts(&self) -> &[BlobId] {
                 match self {
-                    Request::Relay { .. } => &[],
+                    Request::Relay { .. } | Request::Crosspond { .. } => &[],
                     Request::Http { body, .. } => body,
                 }
             }
@@ -1474,7 +1507,7 @@ pub mod role {
 
     pub mod access {
         use crate::role::identity::AccountNumber;
-        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, ProgramId};
+        use crate::{BorshDeserialize, BorshSchema, BorshSerialize, Foreign, ProgramId};
 
         #[derive(
             Clone,
@@ -1491,20 +1524,28 @@ pub mod role {
         pub enum Party {
             Account(AccountNumber),
             Program(ProgramId),
+            Foreign(Foreign),
         }
 
         impl Party {
             pub fn account(&self) -> Option<AccountNumber> {
                 match self {
                     Party::Account(number) => Some(*number),
-                    Party::Program(_) => None,
+                    Party::Program(_) | Party::Foreign(_) => None,
                 }
             }
 
             pub fn program(&self) -> Option<&ProgramId> {
                 match self {
-                    Party::Account(_) => None,
+                    Party::Account(_) | Party::Foreign(_) => None,
                     Party::Program(program) => Some(program),
+                }
+            }
+
+            pub fn foreign(&self) -> Option<&Foreign> {
+                match self {
+                    Party::Account(_) | Party::Program(_) => None,
+                    Party::Foreign(foreign) => Some(foreign),
                 }
             }
         }
@@ -1758,6 +1799,283 @@ pub mod role {
                 .filter(|count| *count > 0)?;
             let index = usize::try_from(id % count).ok()?;
             members.get(index).map(Vec::as_slice)
+        }
+    }
+
+    pub mod crosspond {
+        use std::collections::BTreeMap;
+
+        use crate::role::identity::AccountNumber;
+        use crate::{
+            BLOCK_BYTES, BorshDeserialize, BorshSchema, BorshSerialize, Foreign, NetworkId,
+            ProgramId, Refusal, Root,
+        };
+
+        pub const BORSH_U64: usize = 8;
+        pub const BORSH_LENGTH: usize = 4;
+        pub const BORSH_TAG: usize = 1;
+        pub const DIGEST: usize = 32;
+        pub const WIDEST_VARINT: usize = varint_len(u64::MAX);
+        pub const NODE_KEY: usize = 32;
+        pub const NODE_SIGNATURE: usize = 64;
+        pub const PROGRAM_ID: usize = 64;
+
+        pub const SETTLED_TAG: usize = b"\xffducktape:settled".len();
+        pub const SETTLED_FRAME: usize = SETTLED_TAG + BORSH_U64 + DIGEST;
+        pub const BLOCK_FRAMES: u64 = 2;
+        pub const BLOCK_ENVELOPE: usize = WIDEST_VARINT
+            + DIGEST
+            + WIDEST_VARINT
+            + varint_len(BLOCK_FRAMES)
+            + varint_len(SETTLED_FRAME as u64)
+            + SETTLED_FRAME
+            + varint_len(BLOCK_BYTES as u64);
+
+        pub const FRAME_SCHEME: usize = BORSH_TAG;
+        pub const FRAME_SIGNER: usize = BORSH_LENGTH + NODE_KEY;
+        pub const FRAME_NETWORK: usize = BORSH_LENGTH;
+        pub const FRAME_ANCHOR: usize = BORSH_U64 + DIGEST;
+        pub const FRAME_SALT: usize = BORSH_TAG;
+        pub const FRAME_TARGET: usize = BORSH_LENGTH;
+        pub const FRAME_PAYLOAD: usize = BORSH_LENGTH;
+        pub const FRAME_CLIENT: usize = BORSH_TAG;
+        pub const FRAME_PROOF: usize = BORSH_LENGTH + NODE_SIGNATURE;
+        pub const FRAME_ENVELOPE: usize = FRAME_SCHEME
+            + FRAME_SIGNER
+            + FRAME_NETWORK
+            + FRAME_ANCHOR
+            + FRAME_SALT
+            + FRAME_TARGET
+            + FRAME_PAYLOAD
+            + FRAME_CLIENT
+            + FRAME_PROOF;
+
+        pub const DELIVER_HEAD: usize = BORSH_TAG + DIGEST + BORSH_U64 + BORSH_TAG + BORSH_LENGTH;
+        pub const PROVEN_FIELDS: usize = BORSH_U64 + BORSH_LENGTH;
+        pub const DELIVER_FIELDS: usize = DELIVER_HEAD + PROVEN_FIELDS;
+
+        pub const OP_PROOF_DIGESTS: usize = 122;
+        pub const OP_PROOF_LEAVES: u64 = 1 << 62;
+        pub const LONGEST_OP_PROOF: usize = varint_len(OP_PROOF_LEAVES)
+            + WIDEST_VARINT
+            + varint_len(OP_PROOF_DIGESTS as u64)
+            + OP_PROOF_DIGESTS * DIGEST;
+
+        pub const RELAY_FRAME_ROOM: usize =
+            BLOCK_ENVELOPE + FRAME_ENVELOPE + PROGRAM_ID + DELIVER_FIELDS + LONGEST_OP_PROOF;
+
+        pub fn max_packet(network: &str) -> usize {
+            BLOCK_BYTES.saturating_sub(RELAY_FRAME_ROOM.saturating_add(network.len()))
+        }
+
+        pub const fn varint_len(value: u64) -> usize {
+            let bits = (u64::BITS - value.leading_zeros()) as usize;
+            match bits {
+                0 => 1,
+                bits => bits.div_ceil(7),
+            }
+        }
+
+        pub fn commitment_key(destination: &NetworkId, seq: u64) -> Vec<u8> {
+            [b"out/".as_slice(), destination, &seq.to_be_bytes()].concat()
+        }
+
+        pub fn settled_key(source: &NetworkId, seq: u64) -> Vec<u8> {
+            [b"settled/".as_slice(), source, &seq.to_be_bytes()].concat()
+        }
+
+        pub fn low_key(destination: &NetworkId, n: u64) -> Vec<u8> {
+            [b"low/".as_slice(), destination, &n.to_be_bytes()].concat()
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Packet {
+            pub source: NetworkId,
+            pub destination: NetworkId,
+            pub seq: u64,
+            pub from: AccountNumber,
+            pub name: String,
+            pub via: Option<String>,
+            pub port: String,
+            pub op: Vec<u8>,
+            pub sent: u64,
+            pub deadline: Option<u64>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct StateProof {
+            pub location: u64,
+            pub proof: Vec<u8>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Proven {
+            pub packet: Packet,
+            pub proof: StateProof,
+        }
+
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+        )]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum CertificateKind {
+            /// Ed25519 signatures over `<network>_FINALIZE`, as a simplex finalization certificate.
+            Ed25519SimplexFinalize = 0,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Header {
+            pub kind: CertificateKind,
+            pub block: Vec<u8>,
+            pub certificate: Vec<u8>,
+            pub roots: Vec<(ProgramId, Root)>,
+            pub validators: Vec<Vec<u8>>,
+            pub validators_proof: StateProof,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Ack {
+            pub seq: u64,
+            pub result: Result<Vec<u8>, Refusal>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Receipt {
+            pub seq: u64,
+            pub result: Option<Result<Vec<u8>, Refusal>>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Settled {
+            pub source: NetworkId,
+            pub destination: NetworkId,
+            pub seq: u64,
+            pub packet: [u8; 32],
+            pub result: Result<Vec<u8>, Refusal>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct ProvenAck {
+            pub settled: Settled,
+            pub proof: StateProof,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Acked {
+            pub epoch: u64,
+            pub header: Option<Header>,
+            pub acks: Vec<ProvenAck>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct ProvenLow {
+            pub n: u64,
+            pub proof: StateProof,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum Status {
+            Pending = 0,
+            Refused { reason: String } = 1,
+            Done(Result<Vec<u8>, Refusal>) = 2,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Link {
+            pub name: String,
+            pub epoch_length: u64,
+            pub trusted: u64,
+            pub header: Option<u64>,
+            pub next_in: u64,
+            pub next_out: u64,
+            pub refused: Option<String>,
+            pub closed: bool,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum Op {
+            Open {
+                network: NetworkId,
+                name: String,
+                epoch_length: u64,
+                epoch: u64,
+                kind: CertificateKind,
+                validators: Vec<Vec<u8>>,
+            } = 0,
+            Repin {
+                network: NetworkId,
+                epoch: u64,
+                kind: CertificateKind,
+                validators: Vec<Vec<u8>>,
+            } = 1,
+            Close {
+                network: NetworkId,
+            } = 2,
+            Port {
+                role: String,
+                from: Vec<NetworkId>,
+            } = 3,
+            Send {
+                to: NetworkId,
+                port: String,
+                op: Vec<u8>,
+                deadline: Option<u64>,
+            } = 4,
+            SendFor {
+                to: NetworkId,
+                port: String,
+                op: Vec<u8>,
+                deadline: Option<u64>,
+                account: AccountNumber,
+            } = 5,
+            Pump {
+                to: NetworkId,
+            } = 6,
+            Header {
+                from: NetworkId,
+                header: Header,
+            } = 7,
+            DeliverProven {
+                from: NetworkId,
+                epoch: u64,
+                low: Option<ProvenLow>,
+                packets: Vec<Proven>,
+            } = 9,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum Query {
+            Link { network: NetworkId } = 0,
+            Outbound { to: NetworkId, after: u64 } = 1,
+            Receipts { from: NetworkId, after: u64 } = 2,
+            Status { to: NetworkId, seq: u64 } = 3,
+            Ports = 4,
+            Name(Foreign) = 5,
+            Named { network: NetworkId, name: String } = 6,
+            Home = 7,
+            Linked { name: String } = 8,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        #[borsh(use_discriminant = true)]
+        #[repr(u8)]
+        pub enum Reply {
+            Link(Option<Link>) = 0,
+            Outbound(Vec<Packet>) = 1,
+            Receipts(Vec<Receipt>) = 2,
+            Status(Option<Status>) = 3,
+            Ports(BTreeMap<String, Vec<NetworkId>>) = 4,
+            Name(Option<String>) = 5,
+            Named(Vec<AccountNumber>) = 6,
+            Home(NetworkId) = 7,
+            Linked(Vec<NetworkId>) = 8,
         }
     }
 }

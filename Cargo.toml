@@ -147,11 +147,12 @@ halo = { path = "crates/networking/halo" }
 # publish and subscribe to tracks; a client links this and nothing of the node.
 live-wire = { path = "crates/networking/live-wire" }
 blob = { path = "crates/blob", default-features = false }
-borsh-json = { git = "https://github.com/ducktape-industries/programs", rev = "e0748dd5a8a703f0e5b1557ac70ee2423280d45e" }
-files = { git = "https://github.com/ducktape-industries/programs", rev = "e0748dd5a8a703f0e5b1557ac70ee2423280d45e" }
-identity = { git = "https://github.com/ducktape-industries/programs", rev = "e0748dd5a8a703f0e5b1557ac70ee2423280d45e" }
-programs-sdk = { package = "program", git = "https://github.com/ducktape-industries/programs", rev = "e0748dd5a8a703f0e5b1557ac70ee2423280d45e" }
-store = { git = "https://github.com/ducktape-industries/programs", rev = "e0748dd5a8a703f0e5b1557ac70ee2423280d45e" }
+borsh-json = { git = "duck://duckpond-725bcad1/forge/programs", rev = "0974c0a1682fb10f2fd4267f3ac2e70003628674" }
+crosspond = { git = "duck://duckpond-725bcad1/forge/programs", rev = "0974c0a1682fb10f2fd4267f3ac2e70003628674" }
+files = { git = "duck://duckpond-725bcad1/forge/programs", rev = "0974c0a1682fb10f2fd4267f3ac2e70003628674" }
+identity = { git = "duck://duckpond-725bcad1/forge/programs", rev = "0974c0a1682fb10f2fd4267f3ac2e70003628674" }
+programs-sdk = { package = "program", git = "duck://duckpond-725bcad1/forge/programs", rev = "0974c0a1682fb10f2fd4267f3ac2e70003628674" }
+store = { git = "duck://duckpond-725bcad1/forge/programs", rev = "0974c0a1682fb10f2fd4267f3ac2e70003628674" }
 
 # the rng bounds commonware-runtime 2026.9.0 depends on (a different
 # semver-major would be a different trait).
@@ -160,7 +161,7 @@ rand_core = "0.10.1"
 [patch.crates-io]
 commonware-storage = { path = "vendor/commonware-storage" }
 
-[patch."https://github.com/ducktape-industries/ducktape"]
+[patch."duck://duckpond-725bcad1/forge/core"]
 abi = { path = "crates/kernel/abi" }
 blob = { path = "crates/blob" }
 

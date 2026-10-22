@@ -11,7 +11,7 @@ use abi::Scan;
 use abi::role;
 use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
 use blob::contract::{BUNDLES, Bundle};
-use commonware_codec::DecodeExt as _;
+use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
 use commonware_p2p::authenticated::lookup::{Oracle, Receiver};
@@ -679,6 +679,7 @@ async fn start<E: Context>(
         }
         false => (None, None),
     };
+    let crosspond = crate::crosspond::Closes::load(history.clone())?;
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         current,
@@ -713,6 +714,7 @@ async fn start<E: Context>(
         halo,
         live,
         egress,
+        crosspond,
         answered,
         queried,
         key: identity.clone(),
@@ -817,7 +819,8 @@ async fn start<E: Context>(
     if let Some(handle) = rpc.handle() {
         crate::egress::lane::spawn(daemon.clone(), handle, load.egress_lane_backlog)?;
     }
-    let egressing = crate::egress::spawn(daemon.clone());
+    let anchors = marshal.as_ref().map(|marshal| marshal.mailbox().clone());
+    let egressing = crate::egress::spawn(daemon.clone(), anchors);
     let reading = crate::reads::spawn(daemon.clone());
     let dialing = context.child("halo_self").spawn({
         let daemon = daemon.clone();
@@ -1564,13 +1567,26 @@ async fn applied<E: Context>(
         Some(Anchor::Genesis(_)) | None => None,
     };
     published(node, daemon, anchor);
+    let closes = daemon.network.closes_an_epoch(block.height);
+    let replayed = matches!(sequenced, Sequenced::Replayed);
+    let opens_an_epoch = !replayed && closes;
+    let relays = !daemon.egress.current().config.crosspond.is_empty();
+    let linked = relays || node.host().role(role::CROSSPOND).is_ok();
+    let kept = closes && linked;
+    if kept {
+        record_close(daemon, node, block.height)?;
+    }
+    let opening = block
+        .height
+        .checked_sub(1)
+        .is_some_and(|last| daemon.network.closes_an_epoch(last));
+    if opening && linked {
+        record_opening(daemon, node, block, finalization.as_ref(), relays)?;
+    }
     let id = block.digest();
     daemon.votes.applied(id, block.height);
     daemon.tips.send_replace(block.height);
     phases.publishing = lap.lap();
-    let closes = daemon.network.closes_an_epoch(block.height);
-    let replayed = matches!(sequenced, Sequenced::Replayed);
-    let opens_an_epoch = !replayed && closes;
     let members_written = match sequenced {
         Sequenced::Applied {
             mut applied,
@@ -1679,6 +1695,37 @@ async fn applied<E: Context>(
         phases.snapshotting = lap.lap();
     }
     Ok(Flow::Writing)
+}
+
+fn record_close<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64) -> Result<()> {
+    let at_the_tip = node.tip()?.height == height;
+    if !at_the_tip {
+        return Ok(());
+    }
+    daemon.crosspond.close(node, &daemon.network, height)
+}
+
+fn record_opening<E: Context>(
+    daemon: &Daemon<E>,
+    node: &Node<E>,
+    block: &Block,
+    finalization: Option<&consensus::Certificate>,
+    relays: bool,
+) -> Result<()> {
+    let at_the_tip = node.tip()?.height == block.height;
+    let Some(certificate) = finalization.filter(|_| at_the_tip) else {
+        return Ok(());
+    };
+    let epoch = daemon.network.epoch_after(block.height - 1);
+    daemon.crosspond.open(crate::crosspond::Opened {
+        epoch,
+        block: block.encode().to_vec(),
+        certificate: certificate.encode().to_vec(),
+    })?;
+    if relays {
+        return Ok(());
+    }
+    daemon.crosspond.forget_before(epoch)
 }
 
 #[cfg(test)]

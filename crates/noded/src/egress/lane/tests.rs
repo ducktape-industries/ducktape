@@ -51,9 +51,12 @@ fn key() -> PrivateKey {
 }
 
 fn server(base: &str) -> (tempfile::TempDir, Server) {
+    server_of(&format!("[services.{SERVICE}]\nbase = \"{base}\"\n"))
+}
+
+fn server_of(text: &str) -> (tempfile::TempDir, Server) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::at(dir.path());
-    let text = format!("[services.{SERVICE}]\nbase = \"{base}\"\n");
     std::fs::write(workspace.dir().join("egress.toml"), text).unwrap();
     let station = Station::open(workspace).unwrap();
     (dir, Server::new(key(), station))
@@ -182,6 +185,36 @@ async fn a_box_answers_its_assigned_request_whole_with_a_frame_it_signs_at_the_r
         let (anchor, op) = relay.op(Verdict::Pending).await;
         assert_eq!(anchor, tip(5));
         heard(1, "ping", op);
+    };
+    let (served, ()) = tokio::join!(server.session(stream), relaying);
+    assert!(served);
+}
+
+#[tokio::test]
+async fn a_box_whose_egress_links_a_network_neither_offers_crosspond_nor_relays_to_it() {
+    let (base, _chunks, _) = service().await;
+    let link = [5; 32];
+    let linked = format!(
+        "[services.{SERVICE}]\nbase = \"{base}\"\n\n[crosspond.pond]\nnetwork = \"{}\"\nbase = \"{base}\"\n",
+        abi::hex(&link)
+    );
+    let (_dir, mut server) = server_of(&linked);
+    let (mut relay, stream) = Relay::new();
+    let relaying = async move {
+        relay.hello().await;
+        relay.body(1, "").await;
+        let mut crosspond = whole(1);
+        crosspond.request = Request::Crosspond { link };
+        relay.reading(5, vec![crosspond]).await;
+        let (_, op) = relay.op(Verdict::Pending).await;
+        let failed = matches!(
+            op,
+            Op::Answer {
+                id: 1,
+                answer: Answer::Failed(_)
+            }
+        );
+        assert!(failed, "{op:?}");
     };
     let (served, ()) = tokio::join!(server.session(stream), relaying);
     assert!(served);

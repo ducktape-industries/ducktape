@@ -172,6 +172,7 @@ fn told(applied: &host::Applied) -> Vec<String> {
                 match env.sender {
                     Some(Principal::Account(account)) => format!("as {account}"),
                     Some(Principal::System) => "as the system".to_owned(),
+                    Some(Principal::Foreign(_)) => "as a user of another network".to_owned(),
                     None => "as no one".to_owned(),
                 }
             }

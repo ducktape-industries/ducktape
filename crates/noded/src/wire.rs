@@ -41,6 +41,10 @@ pub mod route {
     pub const SYNC_HOLD: &str = "/v1/sync/hold";
     pub const SNAPSHOT: &str = "/v1/snapshot";
     pub const NETWORK: &str = "/v1/network";
+    /// `POST` an `AcksAsk`: this network's settled rows for the packets the asking network
+    /// names, each with its op proof at one epoch close, and that close's header unless the
+    /// asker holds it.
+    pub const CROSSPOND_ACKS: &str = "/v1/crosspond/acks";
     pub const HALO_SELF: &str = "/v1/halo/self";
     pub const FORWARD: &str = "/v1/forward";
     pub const FORK_AS: &str = "/v1/fork/as";
@@ -226,6 +230,13 @@ pub struct Page {
 pub enum BlockRef {
     Height(u64),
     Id([u8; 32]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct AcksAsk {
+    pub from: abi::NetworkId,
+    pub seqs: Vec<u64>,
+    pub held: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

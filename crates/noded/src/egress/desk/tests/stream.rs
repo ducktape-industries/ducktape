@@ -12,9 +12,23 @@ use futures::channel::mpsc;
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::egress::call::{self, Blocks, Caller, Clients, Unretried};
-use crate::egress::config::{Config, Reach, Upstream};
+use crate::egress::call::{self, Blocks, Caller, Clients, Crosspond, Unretried};
+use crate::egress::config::{Config, Peer, Reach, Upstream};
 use crate::egress::station::Serving;
+
+struct Unrelayed;
+
+impl Crosspond for Unrelayed {
+    async fn relay(
+        &mut self,
+        name: &str,
+        _peer: &Peer,
+        _link: &abi::NetworkId,
+        _blocks: &mut (impl Blocks + Send),
+    ) -> Answer {
+        panic!("a stream test relayed to {name}")
+    }
+}
 
 type Chunks = mpsc::UnboundedSender<std::io::Result<Bytes>>;
 
@@ -78,6 +92,7 @@ fn call(row: &RequestRow) -> mpsc::UnboundedReceiver<Called> {
             http: true,
             reach: Reach::Private,
             services: BTreeMap::new(),
+            crosspond: BTreeMap::new(),
         };
         let clients = Clients::new(config.reach).unwrap();
         let serving = Serving { config, clients };
@@ -96,6 +111,7 @@ fn call(row: &RequestRow) -> mpsc::UnboundedReceiver<Called> {
             delivery,
             Vec::new(),
             &mut blocks,
+            &mut Unrelayed,
             event,
         )
         .await;
@@ -221,6 +237,7 @@ fn pods_serving(base: &str) -> Serving {
         http: true,
         reach: Reach::Private,
         services: BTreeMap::from([("pods".to_owned(), upstream)]),
+        crosspond: BTreeMap::new(),
     };
     let clients = Clients::new(config.reach).unwrap();
     Serving { config, clients }
@@ -249,6 +266,7 @@ async fn rejoined(
         &row.delivery,
         Vec::new(),
         blocks,
+        &mut Unrelayed,
         told,
     )
     .await

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 pub use abi::Roles;
 use abi::{
-    BlobId, Cause, Env, HashKind, Invocation, ItemRef, Message, Origin, Outcome, Principal,
+    BlobId, Cause, Env, Foreign, HashKind, Invocation, ItemRef, Origin, Outcome, Principal,
     ProgramCall, ProgramId, Receipt, Refusal, Root, Scan, hook, reason,
     role::{self, access, identity, ownership, programs, validators},
 };
@@ -34,9 +34,11 @@ use state::{
 use crate::parked::Waiter;
 use crate::parking::{Run, Segment, Start, Status};
 use crate::reads::Recorder;
-use crate::unit::{Frame, Loaded, World, refusal_of};
+use crate::unit::{Emitted, Frame, Loaded, World, refusal_of};
 
-pub use namespace::{BLOBS, INDEXED_AT, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT};
+pub use namespace::{
+    BLOBS, INDEXED_AT, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT, epoch_validators,
+};
 pub use parking::PAGE_FUEL;
 pub use reads::{ReadSet, Written};
 pub use runtime::{Limits, OUT_OF_FUEL};
@@ -51,7 +53,7 @@ const CODE_KIND: &str = "program";
 /// each message, or reply, one deeper than the run that emitted it.
 pub const MAX_DEPTH: u32 = 8;
 pub const ANCHOR_WINDOW: u64 = 256;
-pub const BLOCK_BYTES: usize = 16 << 20;
+pub use abi::BLOCK_BYTES;
 const _: () = assert!(blob::SEGMENT_BYTES == BLOCK_BYTES as u64);
 pub const HOOK_FUEL: u64 = 2_000_000;
 const STREAK_LOG_EVERY: u64 = 64;
@@ -1796,7 +1798,7 @@ where
         &self,
         program: &str,
         env: &Env,
-        emitted: Vec<(ItemRef, Message)>,
+        emitted: Vec<Emitted>,
         receipt: &mut Receipt,
         overlay: &mut Overlay,
         stage: &mut Stage,
@@ -1805,23 +1807,32 @@ where
     ) -> Result<Option<Outcome>> {
         let (height, time) = (env.height, env.time);
         // the emitter's account, asked once for all its messages
-        let as_itself = emitted.iter().any(|(_, message)| message.acting.is_none());
+        let as_itself = emitted.iter().any(Emitted::as_its_emitter);
         let emitter = self
             .own_sender(program, as_itself, height, time, overlay, stage, frame)
             .await?;
-        for (item, message) in emitted {
-            let sender = self
-                .sender(
-                    program,
-                    message.acting,
-                    &emitter,
-                    height,
-                    time,
-                    overlay,
-                    stage,
-                    frame,
-                )
-                .await?;
+        for Emitted {
+            item,
+            message,
+            foreign,
+        } in emitted
+        {
+            let sender = match foreign {
+                Some(foreign) => foreign_sender(program, env, message.acting, foreign),
+                None => {
+                    self.sender(
+                        program,
+                        message.acting,
+                        &emitter,
+                        height,
+                        time,
+                        overlay,
+                        stage,
+                        frame,
+                    )
+                    .await?
+                }
+            };
             let ran = match sender {
                 Err(refusal) => Run::finished(rejected(&message.target, refusal)),
                 Ok(sender) => {
@@ -2612,9 +2623,30 @@ fn needs_of(program: &str, bytes: &[u8]) -> std::result::Result<Vec<access::Need
     })
 }
 
+fn foreign_sender(
+    program: &str,
+    env: &Env,
+    acting: Option<identity::AccountNumber>,
+    foreign: Foreign,
+) -> Sender {
+    let bound_to_crosspond = env.roles.get(role::CROSSPOND).map(String::as_str) == Some(program);
+    match (bound_to_crosspond, acting) {
+        (false, _) => Err(Refusal::new(
+            reason::UNAUTHORIZED,
+            "only the program bound to the crosspond role sends as a foreign user",
+        )),
+        (true, Some(account)) => Err(Refusal::new(
+            reason::INVALID_INPUT,
+            format!("a message sent as a foreign user cannot also act as account {account}"),
+        )),
+        (true, None) => Ok(Some(Principal::Foreign(foreign))),
+    }
+}
+
 fn actor_of(env: &Env) -> Vec<access::Party> {
     let account = match env.sender {
         Some(Principal::Account(number)) => Some(access::Party::Account(number)),
+        Some(Principal::Foreign(foreign)) => Some(access::Party::Foreign(foreign)),
         Some(Principal::System) | None => None,
     };
     let program = match &env.origin {

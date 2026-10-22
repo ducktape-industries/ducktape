@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use abi::reason;
-use abi::role::egress::{HTTP, RELAY, RESERVED};
+use abi::role::egress::{CROSSPOND, HTTP, RELAY, RESERVED};
+use abi::{NetworkId, reason};
 use serde::Deserialize;
 use url::Url;
 
@@ -19,6 +19,15 @@ struct File {
     private: bool,
     #[serde(default)]
     services: BTreeMap<String, Service>,
+    #[serde(default)]
+    crosspond: BTreeMap<String, Linked>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Linked {
+    network: String,
+    base: String,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +81,12 @@ pub enum Refused {
     },
     #[error("{service}'s base is an http or https URL with no query, fragment or credentials")]
     Unfit { service: String },
+    #[error(
+        "crosspond.{name}'s network is not a genesis digest: 64 hex characters, as `ducktape status` shows it"
+    )]
+    Network { name: String },
+    #[error("crosspond.{first} and crosspond.{second} name the same network")]
+    Twice { first: String, second: String },
     #[error("the HTTP client does not build: {0}")]
     Client(#[source] reqwest::Error),
     #[error("egress.toml was not written: {0}")]
@@ -87,7 +102,9 @@ impl Refused {
             Refused::Unparsed(_)
             | Refused::Reserved { .. }
             | Refused::Base { .. }
-            | Refused::Unfit { .. } => reason::INVALID_INPUT,
+            | Refused::Unfit { .. }
+            | Refused::Network { .. }
+            | Refused::Twice { .. } => reason::INVALID_INPUT,
             Refused::Client(_) | Refused::Unwritten(_) => reason::UNSUPPORTED,
         }
     }
@@ -138,12 +155,19 @@ pub struct Upstream {
     pub secrets: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Peer {
+    pub network: NetworkId,
+    pub base: Url,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub relay: bool,
     pub http: bool,
     pub reach: Reach,
     pub services: BTreeMap<String, Upstream>,
+    pub crosspond: BTreeMap<String, Peer>,
 }
 
 impl Config {
@@ -181,11 +205,20 @@ impl Config {
             http: file.http,
             reach,
             services,
+            crosspond: peers(file.crosspond)?,
         })
     }
 
+    pub fn peer(&self, network: &NetworkId) -> Option<(&str, &Peer)> {
+        self.crosspond
+            .iter()
+            .find(|(_, peer)| &peer.network == network)
+            .map(|(name, peer)| (name.as_str(), peer))
+    }
+
     pub fn served(&self) -> Vec<String> {
-        let own = [(self.relay, RELAY), (self.http, HTTP)];
+        let linked = !self.crosspond.is_empty();
+        let own = [(self.relay, RELAY), (self.http, HTTP), (linked, CROSSPOND)];
         let mut served: Vec<String> = own
             .into_iter()
             .filter(|(on, _)| *on)
@@ -220,6 +253,32 @@ fn reveal(
             }),
         },
     }
+}
+
+fn peers(linked: BTreeMap<String, Linked>) -> Result<BTreeMap<String, Peer>, Refused> {
+    let mut peers: BTreeMap<String, Peer> = BTreeMap::new();
+    for (
+        name,
+        Linked {
+            network,
+            base: text,
+        },
+    ) in linked
+    {
+        let unnamed = || Refused::Network { name: name.clone() };
+        let bytes = hex::decode(&network).map_err(|_| unnamed())?;
+        let network = NetworkId::try_from(bytes).map_err(|_| unnamed())?;
+        let twice = peers.iter().find(|(_, peer)| peer.network == network);
+        if let Some((first, _)) = twice {
+            return Err(Refused::Twice {
+                first: first.clone(),
+                second: name,
+            });
+        }
+        let base = base(&format!("crosspond.{name}"), &text)?;
+        peers.insert(name, Peer { network, base });
+    }
+    Ok(peers)
 }
 
 fn base(name: &str, text: &str) -> Result<Url, Refused> {

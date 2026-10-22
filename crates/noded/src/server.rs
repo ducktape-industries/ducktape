@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use abi::Receipt;
+use abi::role::crosspond::Acked;
 use abi::{BlobId, ProgramId, Refusal, reason, role};
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -25,8 +26,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::changes::{self, Fanout, Published, Subscription};
 use crate::ctx::{Ctx, EgressSigner};
 use crate::wire::{
-    Admin, BlockAsk, Blocks, EgressPlan, EgressSet, Finalized, Get, Located, Network, Page, Play,
-    Query, Range, Submit, Submitted, TxAsk, route,
+    AcksAsk, Admin, BlockAsk, Blocks, EgressPlan, EgressSet, Finalized, Get, Located, Network,
+    Page, Play, Query, Range, Submit, Submitted, TxAsk, route,
 };
 use crate::{Context, Daemon, cores, offload};
 
@@ -193,6 +194,7 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::PROGRAMS, get(programs::<E>))
         .route(route::BLOCKS, post(blocks::<E>))
         .route(route::BLOCK, post(block::<E>))
+        .route(route::CROSSPOND_ACKS, post(crosspond_acks::<E>))
         .route(route::TX, post(tx::<E>))
         .route(route::ACTIVITY, post(activity::<E>))
         .route(route::LOGS, get(logs::<E>))
@@ -979,6 +981,18 @@ async fn block<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Fina
     };
     match ctx.block(ask).await {
         Ok(block) => Reply::Answered(block),
+        Err(error) => failed(error),
+    }
+}
+
+async fn crosspond_acks<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Acked> {
+    let ask: AcksAsk = match abi::decode(&body) {
+        Ok(ask) => ask,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match ctx.crosspond_acks(ask).await {
+        Ok(Ok(acked)) => Reply::Answered(acked),
+        Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }
 }

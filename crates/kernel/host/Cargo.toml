@@ -24,6 +24,7 @@ blob = { workspace = true, features = ["testkit"] }
 commonware-utils = { workspace = true }
 fixture-access = { path = "../fixtures/access" }
 fixture-awaiter = { path = "../fixtures/awaiter" }
+fixture-crosspond-probe = { path = "../fixtures/crosspond-probe" }
 fixture-identity = { path = "../fixtures/identity" }
 fixture-oracle = { path = "../fixtures/oracle" }
 fixture-ownership = { path = "../fixtures/ownership" }

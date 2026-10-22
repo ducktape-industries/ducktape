@@ -11,8 +11,8 @@ use commonware_runtime::{Clock, Spawner};
 use commonware_storage::Context;
 
 pub use commitment::{
-    Commitment, Db, Family, Op, Reader, Serving, SyncTarget, Tuning, codec_config, digest,
-    partition_prefix,
+    Commitment, Db, Family, Op, OpProof, Reader, Serving, SyncTarget, Tuning, codec_config, digest,
+    holds, partition_prefix,
 };
 pub use overlay::{Checkpoint, Overlay, Slot};
 pub use storage::{RESERVED_PREFIX, Reads, Storage, reserved, valid_program_id};

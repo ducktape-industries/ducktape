@@ -141,6 +141,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixture-crosspond"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
+]
+
+[[package]]
+name = "fixture-crosspond-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "borsh",
+ "program",
+]
+
+[[package]]
 name = "fixture-egress"
 version = "0.1.0"
 dependencies = [

@@ -174,3 +174,28 @@ fn a_tally_counts_names_added_removed_and_services_whose_upstream_changed() {
         }
     );
 }
+
+#[test]
+fn a_reload_serves_crosspond_while_the_file_links_a_network_and_counts_a_moved_base() {
+    let (_dir, workspace) = workspace();
+    let station = Station::open(workspace.clone()).unwrap();
+    let network = "11".repeat(32);
+    let linked =
+        |base: &str| format!("[crosspond.peer]\nnetwork = \"{network}\"\nbase = \"{base}\"\n");
+    write(&workspace, &linked("http://127.0.0.1:1"));
+    station.reload().unwrap();
+    assert_eq!(served(&station), ["crosspond"]);
+    let moved = station.plan(linked("http://127.0.0.1:2")).unwrap();
+    assert_eq!(
+        moved.tally,
+        Tally {
+            served: 1,
+            added: 0,
+            removed: 0,
+            changed: 1,
+        }
+    );
+    write(&workspace, "relay = true\n");
+    station.reload().unwrap();
+    assert_eq!(served(&station), ["relay"]);
+}

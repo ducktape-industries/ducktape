@@ -3,6 +3,7 @@
 mod call;
 mod calls;
 mod config;
+mod crosspond;
 mod desk;
 pub mod lane;
 mod station;
@@ -14,6 +15,7 @@ use abi::role::egress::{Answer, Op, Query, Reply, RequestRow};
 use abi::role::scheduler;
 use abi::{BlobId, Origin, ProgramId, Refusal, reason, role};
 use commonware_runtime::Handle;
+use consensus::MarshalMailbox;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{Layer, Tip};
@@ -25,6 +27,7 @@ pub use station::{Planned, Station, Tally};
 
 use crate::egress::call::Caller;
 use crate::egress::calls::{Call, Calls};
+use crate::egress::crosspond::Relay;
 use crate::egress::desk::{Called, Desk, Purpose, Reading, Sent, Step};
 use crate::{Context, Daemon, Error, Result};
 
@@ -32,19 +35,24 @@ const TARGET: &str = "ducktape::egress";
 
 struct Worker<E: Context> {
     daemon: Arc<Daemon<E>>,
+    anchors: Option<MarshalMailbox>,
     answers: mpsc::UnboundedSender<(u64, Called)>,
 }
 
-pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>) -> Handle<()> {
-    daemon.context.child("egress").spawn(move |_| work(daemon))
+pub fn spawn<E: Context>(daemon: Arc<Daemon<E>>, anchors: Option<MarshalMailbox>) -> Handle<()> {
+    daemon
+        .context
+        .child("egress")
+        .spawn(move |_| work(daemon, anchors))
 }
 
-async fn work<E: Context>(daemon: Arc<Daemon<E>>) {
+async fn work<E: Context>(daemon: Arc<Daemon<E>>, anchors: Option<MarshalMailbox>) {
     let (answers, mut answered) = mpsc::unbounded();
     let mut reloads = daemon.egress.subscribe();
     let mut desk = Desk::new(reloads.borrow_and_update().config.served());
     let worker = Worker {
         daemon: daemon.clone(),
+        anchors,
         answers,
     };
     let mut calls = Calls::default();
@@ -323,6 +331,7 @@ impl<E: Context> Window for Worker<E> {
 
     fn call(&self, row: RequestRow) -> Handle<()> {
         let daemon = self.daemon.clone();
+        let anchors = self.anchors.clone();
         let serving = self.daemon.egress.current();
         let answers = self.answers.clone();
         tracing::debug!(
@@ -354,6 +363,8 @@ impl<E: Context> Window for Worker<E> {
                             expiry: row.expiry,
                         };
                         let blocks = &mut blocks;
+                        let links = serving.config.crosspond.values().map(|peer| peer.network);
+                        let mut relay = Relay::new(daemon.clone(), anchors, links.collect());
                         call::answer(
                             serving.as_ref(),
                             &caller,
@@ -361,6 +372,7 @@ impl<E: Context> Window for Worker<E> {
                             delivery,
                             body,
                             blocks,
+                            &mut relay,
                             event,
                         )
                         .await

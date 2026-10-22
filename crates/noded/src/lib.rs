@@ -6,6 +6,7 @@ mod changes;
 mod client;
 mod config;
 mod cores;
+mod crosspond;
 mod ctx;
 mod egress;
 mod endpoint;
@@ -195,6 +196,7 @@ pub struct Daemon<E: Context> {
     halo: Arc<halo::Halo>,
     pub live: Arc<live::Relay<E>>,
     egress: egress::Station,
+    crosspond: crosspond::Closes,
     answered: tokio::sync::mpsc::UnboundedSender<server::Answered>,
     queried: tokio::sync::mpsc::UnboundedSender<census::Queried>,
     key: commonware_cryptography::ed25519::PrivateKey,

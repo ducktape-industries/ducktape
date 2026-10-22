@@ -3,12 +3,13 @@ use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use abi::{Entry, Root};
-use commonware_codec::RangeCfg;
+use commonware_codec::{Decode as _, Encode as _, RangeCfg};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Spawner, buffer::paged::CacheRef};
 use commonware_storage::{
-    Context, journal,
+    Context,
+    journal::{self, contiguous::Contiguous as _},
     merkle::{self, Location},
     qmdb::{
         self,
@@ -19,7 +20,7 @@ use commonware_storage::{
                 variable::{Db as Qmdb, Operation},
             },
         },
-        sync::{self, EngineError, SourceFor, Target, engine::Config as SyncConfig},
+        sync::{self, EngineError, Source as _, SourceFor, Target, engine::Config as SyncConfig},
     },
     translator::EightCap,
 };
@@ -43,6 +44,90 @@ pub type Reader<E> = journal::authenticated::Reader<
 pub struct Serving<E: Context> {
     pub target: Option<SyncTarget>,
     pub reader: Reader<E>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpProof {
+    pub location: u64,
+    pub proof: Vec<u8>,
+}
+
+impl<E: Context> Serving<E> {
+    pub fn size(&self) -> u64 {
+        *self.reader.size()
+    }
+
+    pub async fn op_proof(&self, size: u64, key: &[u8], value: &[u8]) -> Result<Option<OpProof>> {
+        let bounds = self.reader.bounds();
+        let held = bounds.start < size && size <= bounds.end;
+        if !held {
+            return Ok(None);
+        }
+        let wanted = update_of(key, value);
+        let page = Tuning::default().sync_apply_batch.get();
+        let mut end = size;
+        while end > bounds.start {
+            let start = end.saturating_sub(page).max(bounds.start);
+            let positions: Vec<u64> = (start..end).collect();
+            let ops = self
+                .reader
+                .read_many(&positions)
+                .await
+                .map_err(qmdb::Error::<Family>::from)?;
+            let found = positions
+                .iter()
+                .zip(&ops)
+                .rev()
+                .find(|(_, op)| **op == wanted);
+            if let Some((location, _)) = found {
+                return self.proven(size, *location).await.map(Some);
+            }
+            end = start;
+        }
+        Ok(None)
+    }
+
+    async fn proven(&self, size: u64, location: u64) -> Result<OpProof> {
+        let request = sync::Request::Operations {
+            size: Location::new(size),
+            start: Location::new(location),
+            max_ops: NonZeroU64::MIN,
+        };
+        let (response, _) = self.reader.serve(request).await?;
+        match response {
+            sync::Response::Operations { proof, .. } => Ok(OpProof {
+                location,
+                proof: proof.encode().to_vec(),
+            }),
+            sync::Response::Boundary { .. } => Err(Error::Corrupt(
+                "the op log answered an operations request with a boundary".into(),
+            )),
+        }
+    }
+}
+
+pub fn holds(root: &Root, proven: &OpProof, key: &[u8], value: &[u8]) -> bool {
+    let Ok(proof) = merkle::Proof::<Family, Digest>::decode_cfg(
+        proven.proof.as_slice(),
+        &merkle::MAX_PROOF_DIGESTS_PER_ELEMENT,
+    ) else {
+        return false;
+    };
+    let hasher = qmdb::hasher::<Sha256>();
+    proof.verify_range_inclusion(
+        &hasher,
+        &[update_of(key, value).encode()],
+        Location::new(proven.location),
+        &Digest(root.0),
+    )
+}
+
+fn update_of(key: &[u8], value: &[u8]) -> Op {
+    let leaf = abi::encode(&Entry {
+        key: key.to_vec(),
+        value: value.to_vec(),
+    });
+    Op::Update(Update(digest(key), leaf))
 }
 
 pub struct Tuning {

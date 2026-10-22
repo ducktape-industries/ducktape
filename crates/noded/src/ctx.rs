@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use abi::{ProgramId, Refusal};
+use abi::role::crosspond::{Acked, settled_key};
+use abi::{NetworkId, ProgramId, Refusal, reason, role};
 use axum::extract::FromRequestParts;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
@@ -12,8 +13,9 @@ use host::Layer;
 use node::{Preconfirm, Source, Taken};
 
 use crate::changes::Subscription;
+use crate::crosspond::{Asked, Unbuilt};
 use crate::view::{Reading, View};
-use crate::wire::{BlockAsk, Blocks, Finalized, Located, Network, Page, TxAsk, activity};
+use crate::wire::{AcksAsk, BlockAsk, Blocks, Finalized, Located, Network, Page, TxAsk, activity};
 use crate::{Context, Daemon, Error, Result};
 
 pub(crate) struct Ctx<E: Context> {
@@ -132,6 +134,42 @@ impl<E: Context> Ctx<E> {
 
     pub(crate) async fn block(&self, ask: BlockAsk) -> Result<Option<Finalized>> {
         self.daemon.block(ask).await
+    }
+
+    pub(crate) async fn crosspond_acks(
+        &self,
+        ask: AcksAsk,
+    ) -> std::result::Result<std::result::Result<Acked, Refusal>, String> {
+        let Some(program) = self.view.source().roles().get(role::CROSSPOND).cloned() else {
+            return Ok(Err(Refusal::new(
+                reason::NOT_FOUND,
+                format!(
+                    "this network binds no program to its {} role",
+                    role::CROSSPOND
+                ),
+            )));
+        };
+        let view = self.view.clone();
+        let read = program.clone();
+        let AcksAsk { from, seqs, held } = ask;
+        let rows = crate::offload(move || settled_rows(&view, &read, &from, &seqs))
+            .await
+            .map_err(|error| error.to_string())??;
+        let sync = self.view.sync().clone();
+        let serving = |program: &str| sync.serving(program).cloned();
+        let asked = Asked {
+            program: &program,
+            held,
+            rows,
+        };
+        match crate::crosspond::acked(&self.daemon.crosspond, &serving, asked).await {
+            Ok(acked) => Ok(Ok(acked)),
+            Err(Unbuilt::Unopened) => Ok(Err(Refusal::new(
+                reason::NOT_YET,
+                Unbuilt::Unopened.to_string(),
+            ))),
+            Err(unbuilt) => Err(unbuilt.to_string()),
+        }
     }
 
     pub(crate) async fn tx(&self, ask: TxAsk) -> Result<Option<Located>> {
@@ -263,4 +301,27 @@ impl<E: Context> Ctx<E> {
     pub(crate) fn halo_self(&self) -> crate::wire::HaloSelf {
         self.daemon.halo_self.borrow().clone()
     }
+}
+
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn settled_rows<E: Context>(
+    view: &View<E>,
+    program: &str,
+    from: &NetworkId,
+    seqs: &[u64],
+) -> std::result::Result<Rows, String> {
+    let source = view.source();
+    let state = source.view(Layer::Confirmed);
+    let mut rows = Vec::new();
+    for seq in seqs {
+        let key = settled_key(from, *seq);
+        let value = state
+            .get(program, &key)
+            .map_err(|error| error.to_string())?;
+        if let Some(value) = value {
+            rows.push((key, value));
+        }
+    }
+    Ok(rows)
 }

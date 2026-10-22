@@ -5,13 +5,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use abi::NetworkId;
 use abi::role::egress::http::{Head, Response};
 use abi::role::egress::{Answer, Delivery, HTTP, Request, StreamEnd};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use url::Url;
 
-use crate::egress::config::{Config, Reach, Refused, Upstream};
+use crate::egress::config::{Config, Peer, Reach, Refused, Upstream};
 use crate::egress::desk::Called;
 use crate::egress::station::Serving;
 use crate::egress::stream::Splitter;
@@ -44,7 +45,7 @@ impl Blocks for Unretried {
     }
 }
 
-async fn again(blocks: &mut impl Blocks) -> bool {
+pub(crate) async fn again(blocks: &mut impl Blocks) -> bool {
     let Some(expiry) = blocks.expiry().await else {
         return false;
     };
@@ -53,6 +54,16 @@ async fn again(blocks: &mut impl Blocks) -> bool {
         return false;
     }
     blocks.changed().await
+}
+
+pub trait Crosspond {
+    fn relay(
+        &mut self,
+        name: &str,
+        peer: &Peer,
+        link: &NetworkId,
+        blocks: &mut (impl Blocks + Send),
+    ) -> impl Future<Output = Answer> + Send;
 }
 
 pub struct Clients {
@@ -262,19 +273,30 @@ impl Caller<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn answer(
     serving: &Serving,
     caller: &Caller<'_>,
     request: &Request,
     delivery: &Delivery,
     body: Vec<u8>,
-    blocks: &mut impl Blocks,
+    blocks: &mut (impl Blocks + Send),
+    crosspond: &mut impl Crosspond,
     mut event: impl FnMut(Vec<u8>),
 ) -> Called {
     let Serving { config, clients } = serving;
     let body = bytes::Bytes::from(body);
     let sent = match request {
         Request::Relay { .. } => return Called::Whole(relay(config)),
+        Request::Crosspond { link } => {
+            let answered = match config.peer(link) {
+                Some((name, peer)) => crosspond.relay(name, peer, link, blocks).await,
+                None => {
+                    Answer::Failed(format!("this node relays to no network {}", abi::hex(link)))
+                }
+            };
+            return Called::Whole(answered);
+        }
         Request::Http { service, head, .. } => match service.as_str() {
             HTTP => to_internet(clients, config, head, body.clone()).await,
             named => to_service(serving, caller, named, head, body.clone(), None, blocks).await,

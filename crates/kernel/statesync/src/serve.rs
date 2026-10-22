@@ -63,6 +63,10 @@ impl<E: Context> Published<E> {
     pub fn tip(&self) -> Tip {
         self.tip
     }
+
+    pub fn serving(&self, program: &str) -> Option<&Arc<Serving<E>>> {
+        self.programs.get(program)
+    }
 }
 
 pub struct Holds<E: Context> {

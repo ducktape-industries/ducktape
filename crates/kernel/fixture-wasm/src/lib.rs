@@ -12,6 +12,8 @@ fixtures! {
     AWAITER => "fixture_awaiter",
     AWAITS => "fixture_awaits",
     BLOBS => "fixture_blobs",
+    CROSSPOND => "fixture_crosspond",
+    CROSSPOND_PROBE => "fixture_crosspond_probe",
     EGRESS => "fixture_egress",
     HALO => "fixture_halo",
     IDENTITY => "fixture_identity",

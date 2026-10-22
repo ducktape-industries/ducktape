@@ -38,6 +38,7 @@ mod program {
     fn actor_of(env: &Env) -> Vec<Party> {
         let account = match env.sender {
             Some(Principal::Account(number)) => Some(Party::Account(number)),
+            Some(Principal::Foreign(foreign)) => Some(Party::Foreign(foreign)),
             Some(Principal::System) | None => None,
         };
         let program = match &env.origin {

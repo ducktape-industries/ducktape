@@ -153,15 +153,17 @@ impl Tally {
     pub fn between(was: &Config, now: &Config) -> Tally {
         let before: BTreeSet<String> = was.served().into_iter().collect();
         let after: BTreeSet<String> = now.served().into_iter().collect();
-        let changed = now
-            .services
-            .iter()
-            .filter(|(name, upstream)| {
-                was.services
-                    .get(*name)
-                    .is_some_and(|earlier| earlier != *upstream)
-            })
-            .count();
+        let services = now.services.iter().filter(|(name, upstream)| {
+            was.services
+                .get(*name)
+                .is_some_and(|earlier| earlier != *upstream)
+        });
+        let peers = now.crosspond.iter().filter(|(name, peer)| {
+            was.crosspond
+                .get(*name)
+                .is_some_and(|earlier| earlier != *peer)
+        });
+        let changed = services.count() + peers.count();
         Tally {
             served: after.len(),
             added: after.difference(&before).count(),

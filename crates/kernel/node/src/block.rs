@@ -97,7 +97,11 @@ impl Block {
     }
 
     pub fn carries(frame: &[u8]) -> bool {
-        let Ok(length) = u32::try_from(frame.len()) else {
+        Block::carries_length(frame.len())
+    }
+
+    pub fn carries_length(frame: usize) -> bool {
+        let Ok(length) = u32::try_from(frame) else {
             return false;
         };
         let widest = Tip {
@@ -110,7 +114,7 @@ impl Block {
             root: [0; 32],
         });
         let counted = 2usize.encode_size() - 1usize.encode_size();
-        sealed.encode_size() + counted + UInt(length).encode_size() + frame.len() <= BLOCK_BYTES
+        sealed.encode_size() + counted + UInt(length).encode_size() + frame <= BLOCK_BYTES
     }
 
     pub fn settle(&mut self, settled: Settled) {

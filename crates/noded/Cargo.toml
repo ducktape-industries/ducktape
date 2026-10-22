@@ -52,7 +52,9 @@ zstd = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+crosspond = { workspace = true, features = ["program"] }
 fixture-awaiter = { path = "../kernel/fixtures/awaiter" }
+fixture-crosspond = { path = "../kernel/fixtures/crosspond" }
 fixture-egress = { path = "../kernel/fixtures/egress" }
 fixture-oracle = { path = "../kernel/fixtures/oracle" }
 fixture-programs = { path = "../kernel/fixtures/programs" }

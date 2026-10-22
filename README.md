@@ -478,7 +478,56 @@ secrets = { x-api-key = "CCS_KEY" }   # header = the environment variable holdin
 [services.pods]
 base = "http://10.0.0.5:8080"
 secrets = { authorization = { file = "pods.key" } }   # header = a file, under the workspace
+
+[crosspond.duckpond]          # a network this node relays crosspond packets to, under the operator's name for it
+network = "725bcad1…"         # that network's genesis digest, all 64 hex
+base = "http://10.43.199.205:8844"   # a node of that network, its API
 ```
+
+With a `[crosspond.<name>]` entry the node serves `crosspond`, and each entry
+names one network by its genesis digest; two entries naming one network are
+refused. When egress elects the node for a `Crosspond { link }` request, the
+node reads the packets its network's crosspond program owes that network. It
+checks that `base` answers `/v1/status` with the configured digest, and fails
+the request naming the network it found there otherwise. While its
+`egress.toml` has a `[crosspond.*]` entry, or its network binds the
+`crosspond` role, the node records, at each block that closes an epoch, the
+program roots, the commitments' log sizes and the next epoch's validators, and
+at the next block, the epoch's first, that block and its certificate. It keeps
+the records in its block history (`history/` in the workspace), so they
+survive a restart, and records the close block again when a restart replays it.
+A node that starts recording records from the next close on; it holds no record
+of an earlier close. It proves the owed packets against
+the newest such record whose first block is final, waiting for the next close
+when the packets are newer. If the other network holds an older header of this
+one, the node lands a `Header` there first. Each header the node builds names
+the certificate kind its validators sign with, `Ed25519SimplexFinalize`: ed25519
+signatures over `<network>_FINALIZE` in a simplex finalization certificate,
+the one kind the crosspond abi names. When that network refuses a header
+`not_yet`, because too few of the validators it trusts signed, the node lands
+the header of each recorded epoch in between, then that one again. Then it
+lands one `DeliverProven` with as many proven packets as one block there
+carries, and with its network's newest low-water row for that network proven
+at the same close when that row's write is in the close's log and fits beside
+the first packet. It then follows the other network's `/v1/heads` until that
+network has settled every packet it took and can prove each settled row on
+`/v1/crosspond/acks`, and answers with those rows and their proofs, as many
+as one answer carries. The node checks none of them: the crosspond program
+that reads the answer does. A frame the other network refuses ends the request
+`Failed` with that network's reason. A base that is not reached is tried again
+at each block while an answer still lands before the request's expiry. A
+relaying node drops a record once every linked network holds a header of its
+epoch or later; a node with no `[crosspond.*]` entry keeps only its newest
+close and opening. A node does not serve `crosspond` through
+`ducktape egress serve`: that server has no node of its own to prove from.
+
+`/v1/crosspond/acks` takes a borsh `AcksAsk { from, seqs, held }` and answers
+a borsh `Acked { epoch, header, acks }`: the crosspond program's settled row
+for each packet from `from` among `seqs` that it holds, each with an op proof
+at the newest epoch close whose opening block the node recorded, and that
+close's header unless `held` names its epoch. It reads only the node's own
+records and state. With no such close recorded yet it refuses `not_yet`; with
+no program bound to `crosspond`, `not_found`.
 
 A secret is the name of an environment variable or `{ file = "<path>" }`, a
 file read whole with its surrounding whitespace trimmed; a relative path is
@@ -1155,8 +1204,11 @@ block's summary, where each transaction first landed and the payload of each
 transaction a block ran) in a store of its own under `history/` in the
 workspace: keeping a block lets go of the one 1025 below it, so `/v1/blocks`
 lists from the window's bottom (`listed_from`) and `/v1/block` and `/v1/tx`
-answer not found below it. Only the block writer writes it, and the
-block read routes read it from snapshots, so no read can hold up a block. The
+answer not found below it. The same store keeps crosspond's epoch-close and
+epoch-opening records, which the window does not drop: the block writer deletes
+the ones a node with no linked network no longer needs, and the crosspond relay
+deletes the ones no linked network needs. The block read routes read it from
+snapshots, so no read can hold up a block. The
 node keeps its blocks in a compressed archive (zstd's default level). Each start copies
 into both whatever the archives of an older build hold that they lack, into
 history only inside the window, lets go of what history holds below the window,

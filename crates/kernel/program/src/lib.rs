@@ -1,6 +1,6 @@
 pub use abi;
 pub use abi::{
-    Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, HashKind, HostOp,
+    Blob, BlobHeader, BlobId, Cause, CryptoOp, CryptoReply, Entry, Env, Foreign, HashKind, HostOp,
     HostReply, Invocation, ItemRef, Message, Origin, Outcome, ProgramCall, ProgramId, ProgramReply,
     Refusal, Root, Scan, Scheme, reason,
     role::access::{Need, Resource},
@@ -418,6 +418,13 @@ mod context {
 
         pub fn send(&mut self, message: Message) -> ItemRef {
             match host(&HostOp::Emit(message)) {
+                HostReply::Item(item) => item,
+                other => protocol("item", other),
+            }
+        }
+
+        pub fn emit_foreign(&mut self, foreign: Foreign, message: Message) -> ItemRef {
+            match host(&HostOp::EmitForeign { message, foreign }) {
                 HostReply::Item(item) => item,
                 other => protocol("item", other),
             }

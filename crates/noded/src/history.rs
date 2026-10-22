@@ -1,6 +1,6 @@
-// The block history this node keeps of its newest blocks, a window back from its tip: each block's
-// summary, where each tx first landed and the payload of each tx a block ran. Only the writer writes
-// it; a read clones a version of the store and drops its lock before any I/O.
+// The block history this node keeps of its newest blocks, a window back from its tip, and crosspond's
+// epoch-close and epoch-opening records, which the window keeps. The writer writes the blocks; the
+// writer and the crosspond relay prune the records. A read drops the store's lock before any I/O.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -17,6 +17,8 @@ const SUMMARY: &[u8] = b"s/";
 const ID: &[u8] = b"i/";
 const PLACE: &[u8] = b"t/";
 const PAYLOAD: &[u8] = b"p/";
+const CLOSE: &[u8] = b"c/";
+const OPENING: &[u8] = b"o/";
 
 pub(crate) const WINDOW: u64 = 1024;
 
@@ -176,6 +178,61 @@ impl History {
     pub(crate) fn span(&self) -> Option<(u64, u64)> {
         self.span.load().as_deref().copied()
     }
+
+    pub(crate) fn keep_close(&self, epoch: u64, record: Vec<u8>) -> Result<()> {
+        Ok(self.db.put(close_key(epoch), record)?)
+    }
+
+    pub(crate) fn closes(&self) -> Result<Vec<Vec<u8>>> {
+        let end = abi::prefix_end(CLOSE);
+        let mut closes = Vec::new();
+        for entry in self.db.iter(Some(CLOSE), end.as_deref(), false)? {
+            let (_, record) = entry?;
+            closes.push(record);
+        }
+        Ok(closes)
+    }
+
+    pub(crate) fn keep_opening(&self, epoch: u64, record: Vec<u8>) -> Result<()> {
+        Ok(self.db.put(opening_key(epoch), record)?)
+    }
+
+    pub(crate) fn openings(&self) -> Result<Vec<Vec<u8>>> {
+        let end = abi::prefix_end(OPENING);
+        let mut openings = Vec::new();
+        for entry in self.db.iter(Some(OPENING), end.as_deref(), false)? {
+            let (_, record) = entry?;
+            openings.push(record);
+        }
+        Ok(openings)
+    }
+
+    pub(crate) fn forget_closes_before(&self, epoch: u64) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        for entry in self.db.iter(Some(CLOSE), Some(&close_key(epoch)), false)? {
+            let (key, _) = entry?;
+            batch.delete(key);
+        }
+        for entry in self
+            .db
+            .iter(Some(OPENING), Some(&opening_key(epoch)), false)?
+        {
+            let (key, _) = entry?;
+            batch.delete(key);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        Ok(self.db.write(batch)?)
+    }
+}
+
+fn close_key(epoch: u64) -> Vec<u8> {
+    [CLOSE, &epoch.to_be_bytes()].concat()
+}
+
+fn opening_key(epoch: u64) -> Vec<u8> {
+    [OPENING, &epoch.to_be_bytes()].concat()
 }
 
 fn summary_key(height: u64) -> Vec<u8> {

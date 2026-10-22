@@ -6,9 +6,9 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use abi::role::egress::{Answer, Op, RequestRow};
+use abi::role::egress::{Answer, CROSSPOND, Op, RequestRow};
 use abi::role::{self, validators};
-use abi::{BlobId, ProgramId, Refusal};
+use abi::{BlobId, NetworkId, ProgramId, Refusal};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use futures::channel::{mpsc, oneshot};
@@ -19,8 +19,9 @@ use node::{BLOCK_BYTES, Frame, Preconfirm, Source};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::task::{AbortHandle, JoinSet};
 
-use crate::egress::call::{self, Caller};
+use crate::egress::call::{self, Blocks, Caller, Crosspond};
 use crate::egress::calls::Calls;
+use crate::egress::config::{Config, Peer};
 use crate::egress::desk::{Called, Desk, Reading, Sent, Step};
 use crate::egress::station::Serving;
 use crate::egress::{Station, TARGET, Window, execute};
@@ -510,7 +511,7 @@ struct Server {
 impl Server {
     fn new(key: PrivateKey, station: Station) -> Server {
         let (answers, answered) = mpsc::unbounded();
-        let desk = Desk::new(station.current().config.served());
+        let desk = Desk::new(offered(&station.current().config));
         Server {
             key,
             station,
@@ -601,7 +602,7 @@ impl Server {
                 member,
             } => {
                 if self.role.as_ref() != Some(&role) {
-                    let served = self.station.current().config.served();
+                    let served = offered(&self.station.current().config);
                     self.calls.renew(&mut self.desk, served);
                     self.role = Some(role);
                 }
@@ -616,7 +617,7 @@ impl Server {
             }
             ToBox::Unbound => {
                 if self.role.take().is_some() {
-                    let served = self.station.current().config.served();
+                    let served = offered(&self.station.current().config);
                     self.calls.renew(&mut self.desk, served);
                 }
             }
@@ -648,6 +649,28 @@ struct Link<W> {
     waiting: Mutex<Option<HashMap<u64, oneshot::Sender<Verdict>>>>,
     tags: AtomicU64,
     took: AtomicBool,
+}
+
+fn offered(config: &Config) -> Vec<String> {
+    let mut served = config.served();
+    served.retain(|service| service != CROSSPOND);
+    served
+}
+
+struct Nodeless;
+
+impl Crosspond for Nodeless {
+    async fn relay(
+        &mut self,
+        name: &str,
+        _: &Peer,
+        _: &NetworkId,
+        _: &mut (impl Blocks + Send),
+    ) -> Answer {
+        Answer::Failed(format!(
+            "an egress box has no node of its own to relay crosspond packets to {name} from"
+        ))
+    }
 }
 
 struct Remote<'a, W> {
@@ -690,6 +713,7 @@ impl<W: AsyncWrite + Unpin + Send> Window for Remote<'_, W> {
                         delivery,
                         body,
                         unretried,
+                        &mut Nodeless,
                         event,
                     )
                     .await
