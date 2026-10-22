@@ -38,6 +38,7 @@ async fn filled(client: &Client) -> bool {
 
 #[test]
 fn a_joined_node_fills_its_blobs_from_its_source_and_keeps_none_released_on_the_way() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seats: Vec<Seat> = (0..4)
         .map(|i| Seat::new(root.path(), &format!("n{i}")))
@@ -127,6 +128,7 @@ fn a_joined_node_fills_its_blobs_from_its_source_and_keeps_none_released_on_the_
 
 #[test]
 fn a_read_of_a_blob_no_member_gives_is_answered_and_a_stream_goes_on_past_it() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -178,6 +180,7 @@ async fn sourced_blobs(
 
 #[test]
 fn a_block_whose_blob_no_member_gives_over_halo_applies_with_the_blob_from_the_join_source() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let validator = Seat::unreachable(root.path(), "n0");
     let mut resident = Seat::unreachable(root.path(), "n1");
@@ -253,6 +256,7 @@ fn a_block_whose_blob_no_member_gives_over_halo_applies_with_the_blob_from_the_j
 
 #[test]
 fn a_blob_a_block_puts_again_after_the_fill_found_it_unnamed_keeps_its_file() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -304,6 +308,7 @@ fn a_blob_a_block_puts_again_after_the_fill_found_it_unnamed_keeps_its_file() {
 
 #[test]
 fn a_blob_found_unnamed_keeps_its_file_while_the_newest_view_lags_the_tip() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -355,6 +360,7 @@ fn a_blob_found_unnamed_keeps_its_file_while_the_newest_view_lags_the_tip() {
 
 #[test]
 fn blocks_finalize_while_dropping_unnamed_blobs_waits_for_an_rpc_blocking_thread() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -421,6 +427,7 @@ fn blocks_finalize_while_dropping_unnamed_blobs_waits_for_an_rpc_blocking_thread
 
 #[test]
 fn blobs_held_answers_each_id_as_a_read_would_and_a_released_one_is_not_held() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -462,6 +469,7 @@ fn blobs_held_answers_each_id_as_a_read_would_and_a_released_one_is_not_held() {
 
 #[test]
 fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the_head() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let validator = Seat::new(root.path(), "n0");
     let mut resident = Seat::new(root.path(), "n1");
@@ -578,6 +586,7 @@ fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the
 
 #[test]
 fn a_follower_whose_state_lost_its_height_joins_again_from_its_source_when_it_starts() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let validator = Seat::new(root.path(), "n0");
     let mut resident = Seat::new(root.path(), "n1");

@@ -4,6 +4,7 @@ use super::*;
 
 #[test]
 fn a_node_answers_reads_from_its_last_applied_block_while_its_writer_is_held() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -39,6 +40,7 @@ fn a_node_answers_reads_from_its_last_applied_block_while_its_writer_is_held() {
 
 #[test]
 fn the_writer_counts_the_commands_waiting_for_it() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -70,6 +72,7 @@ fn the_writer_counts_the_commands_waiting_for_it() {
 
 #[test]
 fn a_sync_is_answered_from_the_last_applied_block_while_the_writer_is_held() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -112,6 +115,7 @@ fn a_sync_is_answered_from_the_last_applied_block_while_the_writer_is_held() {
 
 #[test]
 fn a_preconfirmed_submit_is_answered_while_the_writer_is_held_and_lands_after() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -149,6 +153,7 @@ fn a_preconfirmed_submit_is_answered_while_the_writer_is_held_and_lands_after() 
 #[test]
 fn many_submits_are_answered_while_the_writer_is_held_and_the_next_blocks_take_them_from_the_pool()
 {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);

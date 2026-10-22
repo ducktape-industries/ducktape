@@ -4,6 +4,7 @@ use super::*;
 
 #[test]
 fn an_unsigned_query_reads_as_no_key_and_is_answered_only_while_the_network_opens_them() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -146,6 +147,7 @@ where
 
 #[test]
 fn a_watched_query_is_answered_at_once_and_again_only_with_a_block_that_writes_what_it_read() {
+    apart!();
     use noded::wire::Outcome as Watched;
     use noded::wire::{Pushed, Watch};
 
@@ -253,6 +255,7 @@ fn a_watched_query_is_answered_at_once_and_again_only_with_a_block_that_writes_w
 
 #[test]
 fn a_watch_ask_signed_as_a_query_runs_as_its_signer_and_the_same_frame_is_no_op() {
+    apart!();
     use noded::wire::Outcome as Watched;
     use noded::wire::{Pushed, Watch};
 
@@ -303,6 +306,7 @@ fn a_watch_ask_signed_as_a_query_runs_as_its_signer_and_the_same_frame_is_no_op(
 
 #[test]
 fn a_watch_ask_signed_as_an_op_is_refused_so_no_standing_ask_doubles_as_a_transaction() {
+    apart!();
     use noded::wire::Outcome as Watched;
     use noded::wire::{Pushed, Watch};
 
@@ -348,6 +352,7 @@ fn a_watch_ask_signed_as_an_op_is_refused_so_no_standing_ask_doubles_as_a_transa
 #[test]
 fn a_watch_ask_unsigned_or_on_a_network_that_meters_no_fuel_is_refused_and_a_frame_that_is_no_watch_ends_the_socket()
  {
+    apart!();
     use noded::wire::Outcome as Watched;
     use noded::wire::{Pushed, Watch};
     use tokio_tungstenite::tungstenite::Message;

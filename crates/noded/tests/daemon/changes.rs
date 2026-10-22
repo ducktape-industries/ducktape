@@ -16,6 +16,7 @@ fn rebound(seat: &Seat) -> Listeners {
 
 #[test]
 fn a_changes_subscriber_that_closes_is_answered() {
+    apart!();
     use tokio_tungstenite::tungstenite::Message;
 
     let root = tempfile::tempdir().unwrap();
@@ -46,6 +47,7 @@ fn a_changes_subscriber_that_closes_is_answered() {
 
 #[test]
 fn a_changes_socket_asked_for_keys_carries_none_of_the_values_and_a_quiet_one_is_pinged() {
+    apart!();
     use tokio_tungstenite::tungstenite::Message;
 
     let root = tempfile::tempdir().unwrap();
@@ -91,6 +93,7 @@ fn a_changes_socket_asked_for_keys_carries_none_of_the_values_and_a_quiet_one_is
 
 #[test]
 fn a_changes_socket_that_drains_but_answers_no_ping_stays_open() {
+    apart!();
     use ::tokio::io::AsyncReadExt as _;
 
     let root = tempfile::tempdir().unwrap();
@@ -136,6 +139,7 @@ fn kernel_buffer_most(name: &str) -> usize {
 
 #[test]
 fn a_changes_socket_that_stops_draining_is_cut_an_epoch_after_its_write_stalls() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -191,6 +195,7 @@ fn a_changes_socket_that_stops_draining_is_cut_an_epoch_after_its_write_stalls()
 
 #[test]
 fn a_heads_socket_opened_on_a_restarted_node_before_its_first_block_opens_on_its_tip() {
+    apart!();
     use tokio_tungstenite::tungstenite::Message;
 
     let root = tempfile::tempdir().unwrap();
@@ -233,6 +238,7 @@ fn a_heads_socket_opened_on_a_restarted_node_before_its_first_block_opens_on_its
 
 #[test]
 fn a_heads_socket_carries_each_block_as_its_record_names_it_and_closes_on_shutdown() {
+    apart!();
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
@@ -301,6 +307,7 @@ fn a_heads_socket_carries_each_block_as_its_record_names_it_and_closes_on_shutdo
 
 #[test]
 fn a_changes_socket_keeps_no_view_of_a_block_it_was_opened_at() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -334,6 +341,7 @@ fn a_changes_socket_keeps_no_view_of_a_block_it_was_opened_at() {
 
 #[test]
 fn a_changes_stream_left_unread_past_two_epochs_stays_open_and_misses_no_block() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);

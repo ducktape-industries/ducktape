@@ -56,6 +56,7 @@ async fn route_status(client: &Client, route: &str) -> u16 {
 
 #[test]
 fn a_consensus_node_serves_no_fork_route_and_refuses_a_frame_whose_proof_does_not_bind() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "validator");
     seat.init(&founding(root.path(), &[&seat], EPOCH_LENGTH));
@@ -84,6 +85,7 @@ fn a_consensus_node_serves_no_fork_route_and_refuses_a_frame_whose_proof_does_no
 
 #[test]
 fn a_fork_runs_alone_takes_an_op_as_any_signer_and_serves_no_join() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let parent = Seat::new(root.path(), "parent");
     parent.init(&founding(root.path(), &[&parent], EPOCH_LENGTH));
@@ -103,7 +105,7 @@ fn a_fork_runs_alone_takes_an_op_as_any_signer_and_serves_no_join() {
     assert!(!fork.workspace.dir().join("egress.toml").exists());
 
     let refused = runner(&to.runtime_dir()).start(|context| async move {
-        let logs = Logs::install("info").unwrap();
+        let logs = logs();
         let cadence = to
             .descriptor()
             .unwrap()

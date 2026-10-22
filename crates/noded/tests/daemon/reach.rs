@@ -4,6 +4,7 @@ use super::*;
 
 #[test]
 fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read_by_a_program() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let taker = Seat::new(root.path(), "n0");
     let gatherer = Seat::new(root.path(), "n1");
@@ -133,6 +134,7 @@ fn a_bundle_put_on_one_validator_is_gathered_over_quic_held_by_a_quorum_and_read
 /// later put is gathered over it and held.
 #[test]
 fn a_lane_the_validators_vote_open_is_served_from_its_block() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let taker = Seat::new(root.path(), "n0");
     let gatherer = Seat::new(root.path(), "n1");
@@ -200,6 +202,7 @@ async fn dialed_self(client: &Client) -> noded::wire::HaloSelf {
 
 #[test]
 fn a_node_reports_whether_it_reaches_itself_at_its_registered_halo_address() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let reachable = Seat::new(root.path(), "n0");
     let unreachable = Seat::unreachable(root.path(), "n1");
@@ -233,6 +236,7 @@ fn a_node_reports_whether_it_reaches_itself_at_its_registered_halo_address() {
 
 #[test]
 fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_dials_and_held() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let first = Seat::new(root.path(), "n0");
     let second = Seat::new(root.path(), "n1");
@@ -273,6 +277,7 @@ fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_di
 
 #[test]
 fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
+    apart!();
     const EPOCH: u64 = 400;
     let root = tempfile::tempdir().unwrap();
     let moving = Seat::unreachable(root.path(), "n0");
@@ -323,6 +328,7 @@ fn a_member_that_moves_its_halo_address_is_dialed_there_within_the_epoch() {
 
 #[test]
 fn members_no_one_can_reach_over_udp_link_over_halo_carried_on_one_members_http_and_gather() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let mut served = Seat::unreachable(root.path(), "n0");
     let mut hidden = Seat::unreachable(root.path(), "n1");

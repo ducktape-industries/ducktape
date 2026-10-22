@@ -66,6 +66,47 @@ const BLOCK_TIME_MS: u64 = 250;
 /// Room for the four seats the largest test founds.
 const MEMBER_CAP: u32 = 4;
 
+const APART: &str = "DAEMON_TEST_APART";
+
+macro_rules! apart {
+    () => {
+        if ran_apart() {
+            return;
+        }
+    };
+}
+
+fn ran_apart() -> bool {
+    let thread = std::thread::current();
+    let test = thread
+        .name()
+        .expect("libtest names each test's thread after the test");
+    if std::env::var_os(APART).is_some_and(|apart| apart == test) {
+        return false;
+    }
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--include-ignored", "--test-threads", "1"])
+        .env(APART, test)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&child.stdout);
+    let passed = said.contains("test result: ok. 1 passed");
+    if !passed {
+        print!("{said}");
+    }
+    assert!(passed, "{test} in a process of its own: {}", child.status);
+    true
+}
+
+fn logs() -> Logs {
+    assert!(
+        std::env::var_os(APART).is_some(),
+        "a daemon test opens with apart!(), so the nodes it starts log to a ring of their own"
+    );
+    Logs::install("info").unwrap()
+}
+
 fn runner(dir: &Path) -> tokio::Runner {
     tokio::Runner::new(tokio::Config::new().with_storage_directory(dir))
 }
@@ -224,7 +265,7 @@ impl Seat {
         let bound = held.unwrap_or_else(listeners);
         let thread = std::thread::spawn(move || {
             runner(&workspace.runtime_dir()).start(|context| async move {
-                let logs = Logs::install("info").unwrap();
+                let logs = logs();
                 let cadence = workspace
                     .descriptor()
                     .unwrap()
@@ -611,6 +652,7 @@ mod fork;
 mod forward;
 mod http;
 mod load;
+mod logs;
 mod members;
 mod query;
 mod reach;

@@ -8,6 +8,7 @@ use super::*;
 /// quorum of two and stop it at that epoch's first block.
 #[test]
 fn an_offline_resident_leaves_the_chain_finalizing() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -46,6 +47,7 @@ fn an_offline_resident_leaves_the_chain_finalizing() {
 /// listeners it binds afresh.
 #[test]
 fn a_resident_follows_at_the_tip() {
+    apart!();
     // long enough that the resident joins and the chain stops inside one
     // epoch
     const EPOCH: u64 = 100;
@@ -140,6 +142,7 @@ fn clones(dir: &Path) -> bool {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_resident_snapshots_each_epoch_where_its_directory_clones_and_a_validator_never_tries() {
+    apart!();
     let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let seat = Seat::new(root.path(), "n0");
     let mut resident = Seat::new(root.path(), "n1");
@@ -250,6 +253,7 @@ fn opens_at_its_targets(runtime: &Path, manifest: statesync::Manifest) {
 /// effect.
 #[test]
 fn a_shrunk_set_finalizes_without_the_removed_member() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seats: Vec<Seat> = (0..3)
         .map(|i| Seat::new(root.path(), &format!("n{i}")))
@@ -295,7 +299,7 @@ fn refused_start(seat: &Seat) -> String {
         let started = noded::run_on(
             context,
             &workspace,
-            Logs::install("info").unwrap(),
+            logs(),
             listeners(),
             HaloConfig::default(),
             LoadConfig::default(),
@@ -320,6 +324,7 @@ fn rolled(seat: &Seat, height: u64) -> Result<noded::Rolled, String> {
 
 #[test]
 fn a_node_stopped_before_the_roll_runs_again_only_once_roll_syncs_it_to_a_head_past_it() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let validator = Seat::new(root.path(), "n0");
     let mut resident = Seat::new(root.path(), "n1");
@@ -425,6 +430,7 @@ fn a_node_stopped_before_the_roll_runs_again_only_once_roll_syncs_it_to_a_head_p
 
 #[test]
 fn a_late_validator_joins_by_state_sync_and_follows() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seats: Vec<Seat> = (0..4)
         .map(|i| Seat::new(root.path(), &format!("n{i}")))
@@ -506,6 +512,7 @@ async fn spent_in(
 
 #[test]
 fn a_resident_hands_every_frame_a_client_gives_it_to_the_validators() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seats: Vec<Seat> = (0..3)
         .map(|i| Seat::new(root.path(), &format!("n{i}")))

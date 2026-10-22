@@ -279,6 +279,7 @@ async fn agreed(clients: &[Client]) -> Vec<u64> {
 
 #[test]
 fn parked_state_prunes_while_a_restart_and_two_joins_reach_the_same_root() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let mut seats: Vec<Seat> = (0..4)
         .map(|i| Seat::new(root.path(), &format!("n{i}")))
@@ -456,6 +457,7 @@ fn sync_flood(
 #[test]
 fn blocks_finalize_under_a_submit_flood_with_every_rpc_blocking_thread_held_then_under_an_answered_sync_flood()
  {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);

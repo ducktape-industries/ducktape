@@ -10,6 +10,7 @@ const ASKER_SEED: u64 = 41;
 
 #[test]
 fn a_node_answers_a_read_with_the_blob_of_the_bytes_its_query_answers_and_resumes_the_caller() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding_with(

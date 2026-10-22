@@ -44,6 +44,7 @@ async fn pinged(
 
 #[test]
 fn a_running_node_serves_what_each_egress_reload_reads_and_keeps_its_services_on_a_bad_file() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -119,6 +120,7 @@ fn served_file(seat: &Seat) -> Option<String> {
 #[test]
 fn an_egress_set_from_a_granted_key_serves_its_text_after_a_dry_run_that_says_whether_each_base_answers()
  {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -377,6 +379,7 @@ async fn racing<T>(gone: &mut oneshot::Receiver<()>, waited: impl Future<Output 
 
 #[test]
 fn a_box_with_no_node_serves_egress_through_a_relay_and_its_stream_ends_unserved_when_it_dies() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let (seats, live) = box_network(root.path(), true);
     let client = live[0].client.clone();
@@ -453,6 +456,7 @@ fn a_box_with_no_node_serves_egress_through_a_relay_and_its_stream_ends_unserved
 #[test]
 fn a_box_whose_lane_is_unlisted_reads_again_only_when_halo_changes_and_serves_once_the_vote_opens_it()
  {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let (seats, live) = box_network(root.path(), false);
     let client = live[0].client.clone();
@@ -494,6 +498,7 @@ fn a_box_whose_lane_is_unlisted_reads_again_only_when_halo_changes_and_serves_on
 
 #[test]
 fn a_box_sends_an_answer_larger_than_a_block_carries_as_a_failure() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let (seats, live) = box_network(root.path(), true);
     let client = live[0].client.clone();
@@ -554,6 +559,7 @@ fn a_box_sends_an_answer_larger_than_a_block_carries_as_a_failure() {
 
 #[test]
 fn a_box_answers_a_request_whose_body_no_member_holds_failed_and_serves_the_rest() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let (seats, live) = box_network(root.path(), true);
     let client = live[0].client.clone();

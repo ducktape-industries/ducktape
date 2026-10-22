@@ -13,6 +13,7 @@ fn block_at(height: u64, most: u32) -> BlockAsk {
 
 #[test]
 fn a_validator_serves_its_network_over_http() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -65,6 +66,7 @@ fn a_validator_serves_its_network_over_http() {
             "the founding pins the lane blocks are applied over"
         );
 
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
         let landing = frame(&client, &alice, vec![Step::Fail("landed".into())]).await;
         let (height, receipt) = client
             .land(&Frame::decode(&landing).unwrap())
@@ -78,7 +80,6 @@ fn a_validator_serves_its_network_over_http() {
         );
 
         let mut changes = client.changes("probe").await.unwrap();
-        let mut blocks = client.changes(host::RECENT).await.unwrap();
         let failed = frame(&client, &alice, vec![Step::Fail("no".into())]).await;
         let rejected = preconfirmed(&client, failed.clone()).await;
         let Outcome::Rejected(refusal) = &rejected.outcome else {
@@ -90,6 +91,8 @@ fn a_validator_serves_its_network_over_http() {
             matches!(receipt.outcome, Outcome::Applied { .. }),
             "{receipt:?}"
         );
+        let change = changes.next().await.unwrap().unwrap();
+        assert_eq!(change.writes, vec![(b"a".to_vec(), Some(b"1".to_vec()))]);
         assert_eq!(
             client
                 .get(Layer::Preconfirmed, "probe", b"a")
@@ -97,8 +100,6 @@ fn a_validator_serves_its_network_over_http() {
                 .unwrap(),
             Some(b"1".to_vec())
         );
-        let change = changes.next().await.unwrap().unwrap();
-        assert_eq!(change.writes, vec![(b"a".to_vec(), Some(b"1".to_vec()))]);
         assert_eq!(
             client.get(Layer::Confirmed, "probe", b"a").await.unwrap(),
             Some(b"1".to_vec())
@@ -112,8 +113,10 @@ fn a_validator_serves_its_network_over_http() {
         assert!(status.height >= change.height);
         // a block may land after the change's; the status names the root its
         // own height published, and every block publishes its height
+        let mut roots = BTreeMap::new();
         let at_status = loop {
             let block = blocks.next().await.unwrap().unwrap();
+            roots.insert(block.height, block.root);
             if block.height >= status.height {
                 break block;
             }
@@ -238,7 +241,6 @@ fn a_validator_serves_its_network_over_http() {
         assert_eq!(opened.tx.payload, Some(large_payload.clone()));
         assert_eq!(opened.tx.receipt, listed.receipt);
 
-        let fails = |tx: &&noded::wire::Tx| tx.hash == submission(&failed).id();
         let holding = client
             .blocks(page(Some(block.height + 1), 3, WHOLE))
             .await
@@ -248,26 +250,38 @@ fn a_validator_serves_its_network_over_http() {
             Some(0),
             "a founding node lists from genesis"
         );
-        let (holder, rejected_tx) = holding
-            .blocks
-            .iter()
-            .find_map(|seen| Some((seen, seen.txs.iter().find(fails)?)))
+        let rejected_at = client
+            .tx(TxAsk {
+                tx: TxRef::Hash(submission(&failed).id()),
+                most: 0,
+            })
+            .await
+            .unwrap()
             .expect("the rejected frame rides a block");
-        let kept = rejected_tx.receipt.as_ref().expect("its receipt is kept");
+        let holder = client
+            .block(block_at(rejected_at.height, WHOLE))
+            .await
+            .unwrap()
+            .unwrap();
+        let kept = rejected_at
+            .tx
+            .receipt
+            .as_ref()
+            .expect("its receipt is kept");
         assert_eq!(kept.outcome, Outcome::Rejected(refusal.clone()));
-        // the receipts ride beside the block: its id is the digest of its
-        // header and frames alone
         let frames: Vec<Vec<u8>> = if holder.height == block.height {
             vec![failed.clone(), submitted.clone()]
         } else {
             vec![submitted.clone()]
         };
-        let parent = host::Tip {
-            height: block.height - 1,
-            id: block.parent,
-        };
+        let before = block.height - 1;
+        let opens_an_epoch = block.height.is_multiple_of(EPOCH_LENGTH);
+        let close = opens_an_epoch.then(|| node::Settled {
+            height: before,
+            root: roots[&before].0,
+        });
         assert_eq!(
-            node::Block::next(parent, block.time, frames).digest().0,
+            block_from_transactions(&block, frames, close).digest().0,
             block.id
         );
         assert_eq!(
@@ -414,6 +428,7 @@ fn a_validator_serves_its_network_over_http() {
 
 #[test]
 fn a_node_that_lost_its_history_summarizes_every_block_it_holds_again() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -473,6 +488,7 @@ fn a_node_that_lost_its_history_summarizes_every_block_it_holds_again() {
 
 #[test]
 fn an_older_build_finds_every_block_and_summary_in_the_archives_restore_writes_back() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -529,6 +545,7 @@ fn an_older_build_finds_every_block_and_summary_in_the_archives_restore_writes_b
 
 #[test]
 fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -547,7 +564,7 @@ fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
     };
     let workspace = seat.workspace.clone();
     let refused = runner(&workspace.runtime_dir()).start(|context| async move {
-        let logs = Logs::install("info").unwrap();
+        let logs = logs();
         let cadence = workspace
             .descriptor()
             .unwrap()
@@ -576,6 +593,7 @@ fn a_node_whose_live_socket_is_taken_names_it_and_does_not_start() {
 
 #[test]
 fn a_node_run_without_live_names_no_live_port() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     seat.held.lock().unwrap().as_mut().unwrap().live = None;
@@ -615,6 +633,7 @@ fn continued(stream: &mut TcpStream) {
 
 #[test]
 fn a_second_upload_is_read_while_the_first_is_in_flight() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -652,6 +671,7 @@ fn json(status: u16, body: &[u8]) -> serde_json::Value {
 
 #[test]
 fn a_node_says_in_one_json_answer_how_fast_its_chain_goes_and_what_slowed_it() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let seat = Seat::new(root.path(), "n0");
     let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
@@ -743,4 +763,63 @@ fn a_node_says_in_one_json_answer_how_fast_its_chain_goes_and_what_slowed_it() {
         seat.admin(&client, Admin::Shutdown).await;
     });
     live.thread.join().unwrap();
+}
+
+fn block_from_transactions(
+    block: &noded::wire::Finalized,
+    frames: Vec<Vec<u8>>,
+    close: Option<node::Settled>,
+) -> node::Block {
+    let parent = Tip {
+        height: block.height - 1,
+        id: block.parent,
+    };
+    let mut rebuilt = node::Block::next(parent, block.time, frames);
+    if let Some(close) = close {
+        rebuilt.settle(close);
+    }
+    rebuilt
+}
+
+#[test]
+fn an_epochs_first_block_is_its_transactions_and_the_previous_epochs_close() {
+    apart!();
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let mut blocks = live.client.changes(host::RECENT).await.unwrap();
+        let mut previous = blocks.next().await.unwrap().unwrap();
+        let close = loop {
+            let next = blocks.next().await.unwrap().unwrap();
+            let opens_an_epoch = next.height.is_multiple_of(EPOCH_LENGTH);
+            let follows = previous.height + 1 == next.height;
+            let closes_the_epoch_before = opens_an_epoch && follows;
+            if closes_the_epoch_before {
+                break previous;
+            }
+            previous = next;
+        };
+        let opening = live
+            .client
+            .block(block_at(close.height + 1, WHOLE))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            opening.txs.is_empty(),
+            "the test sent no transaction: {:?}",
+            opening.txs
+        );
+        let settled = node::Settled {
+            height: close.height,
+            root: close.root.0,
+        };
+        let rebuilt = block_from_transactions(&opening, Vec::new(), Some(settled));
+        assert_eq!(rebuilt.digest().0, opening.id);
+    });
+    shut_down(&runtime, &[&seat], vec![live]);
 }

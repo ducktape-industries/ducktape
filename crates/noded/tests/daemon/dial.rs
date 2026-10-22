@@ -44,21 +44,25 @@ fn dialed_at(address: impl FnOnce(&Seat) -> String) {
 
 #[test]
 fn a_validator_is_dialed_over_tcp_at_its_name() {
+    apart!();
     dialed_at(|seat| format!("tcp://localhost:{}", seat.p2p.port()));
 }
 
 #[test]
 fn a_validator_is_dialed_over_tls() {
+    apart!();
     dialed_at(|seat| format!("tls://localhost:{}", seat.tls.port()));
 }
 
 #[test]
 fn a_validator_is_dialed_over_a_websocket_on_its_http_port() {
+    apart!();
     dialed_at(|seat| format!("ws://localhost:{}", seat.http.port()));
 }
 
 #[test]
 fn a_validator_is_dialed_over_wss_through_a_tls_terminator() {
+    apart!();
     let root = tempfile::tempdir().unwrap();
     let runtime = client_runtime();
     let mut dialer = Seat::new(root.path(), "n0");
