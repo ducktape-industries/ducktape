@@ -24,6 +24,7 @@ MAC = 41
 PODS = 42
 STRANGER = 43
 KEY = bytes(range(32))
+CAPACITY = "query or operation exceeds its configured work/byte bound"
 TOOL = """
 import json, os, pathlib, sys
 inputs, out = map(pathlib.Path, sys.argv[1:])
@@ -91,6 +92,9 @@ class Fake:
         self.files_answers = []
         self.ref_refused = False
         self.pushed = None
+        self.uncountable = set()
+        self.misanswered = False
+        self.forge_asked = []
 
     def key(self):
         return KEY
@@ -98,6 +102,8 @@ class Fake:
     def query(self, program, request):
         if self.down:
             return ran(code=1, err="ducktape: IO error: the node is not reachable")
+        if program == signer.FORGE:
+            self.forge_asked.append(request[0])
         if program == signer.IDENTITY:
             reader = signer.Reader(request)
             assert reader.u8() == 0
@@ -105,6 +111,23 @@ class Fake:
         if program == signer.FILES:
             assert request == signer.files_head()
             return ran(signer.u8(0) + b"\x01" + signer.blob_id("sha256:" + "cd" * 32))
+        if program == signer.FORGE and request[0] == 26:
+            reader = signer.Reader(request)
+            reader.u8()
+            assert reader.text() == "app"
+            assert reader.u8() == 1
+            commit = reader.text()
+            compared = []
+            for kind, name in reader.vec(lambda: (reader.u8(), reader.bytes())):
+                assert kind == 0
+                branch = name.decode().removeprefix("refs/heads/")
+                behind = 0 if commit in self.on.get(branch, set()) else 1
+                counted = signer.u8(0) + text("f" * 40) + text(commit) + b"\x00" + signer.u64(0) + signer.u64(behind) + b"\x02"
+                tally = signer.u8(1) + text(CAPACITY) if branch in self.uncountable else counted
+                compared.append(signer.u8(0) + signer.borsh_bytes(name) + tally)
+            if self.misanswered:
+                compared.reverse()
+            return ran(signer.u8(23) + signer.u64(9) + text(commit) + signer.borsh_vec(compared))
         if program == signer.FORGE and request[0] == 16:
             reader = signer.Reader(request)
             reader.u8()
@@ -112,17 +135,6 @@ class Fake:
             prefix = reader.text()
             items = [text(name) + text(oid) for name, oid in sorted(self.refs.items()) if name.startswith(prefix)]
             return ran(signer.u8(14) + signer.u64(9) + signer.u64(9) + signer.borsh_vec(items) + b"\x00")
-        if program == signer.FORGE:
-            reader = signer.Reader(request)
-            assert reader.u8() == 9
-            reader.text()
-            assert reader.u8() == 1
-            commit = reader.text()
-            assert reader.u8() == 0
-            branch = reader.bytes().decode().removeprefix("refs/heads/")
-            ahead = 0 if commit in self.on.get(branch, set()) else 1
-            reply = signer.u8(7) + signer.u64(9) + text(commit) + text("f" * 40) + b"\x00" + signer.u64(ahead) + signer.u64(0) + b"\x02"
-            return ran(reply)
         tag, check = request[0], int.from_bytes(request[1:9], "little")
         match tag:
             case 2:
@@ -388,6 +400,30 @@ class Signing(unittest.TestCase):
         self.asks(5, steps=("release-manifest",), env=(("CHANNEL", "nightly"),))
         self.signer.pull()
         self.assertEqual(self.ended(5), ("passed", f"release-manifest for app at {COMMIT} (dev)"))
+
+    def test_a_branch_forge_cannot_count_leaves_another_allowed_branch_to_prove_the_commit_in_one_read(self):
+        self.fake.on = {"main": set(), "dev": {COMMIT}}
+        self.fake.uncountable = {"main"}
+        self.asks(5)
+        self.signer.pull()
+        self.assertEqual(self.ended(5), ("passed", f"developer-id for app at {COMMIT} (dev)"))
+        self.assertEqual(self.fake.forge_asked, [26], "every allowed branch in one Compares")
+
+    def test_a_commit_no_allowed_branch_proves_errs_naming_each_branch_forge_could_not_count(self):
+        self.fake.on = {"main": {COMMIT}, "dev": set()}
+        self.fake.uncountable = {"main"}
+        self.asks(5)
+        self.signer.pull()
+        self.assertEqual(self.ended(5), ("errored", f"commit {COMMIT} is on none of app's main, dev; forge could not count main: {CAPACITY}"))
+        self.assertEqual((self.fake.puts, self.sent(7)), ([], []), "nothing was signed")
+
+    def test_an_answer_for_other_branches_than_asked_proves_nothing(self):
+        self.fake.on = {"main": {COMMIT}, "dev": set()}
+        self.fake.misanswered = True
+        self.asks(5)
+        self.signer.pull()
+        self.assertEqual(self.ended(5), ("errored", "forge answered Compares for other branches than main, dev"))
+        self.assertEqual((self.fake.puts, self.sent(7)), ([], []), "nothing was signed")
 
     def test_a_tool_that_fails_fails_the_check_and_keeps_its_words_on_the_mac(self):
         self.asks(5, env=(("FAIL", "1"),))

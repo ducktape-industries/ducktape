@@ -1229,8 +1229,11 @@ one up for another network.
   `tools`: `developer-id`, `testflight` or `release-manifest`. Before any
   tool runs it checks, from the network alone, that the check's commit is
   reachable from a branch the config allows for that repo and operation
-  (forge `Compare { from: commit, into: refs/heads/<branch> }` with
-  `ahead` 0; `release-manifest` takes the branches of the channel the job's
+  (one forge `Compares { into: commit, from: [refs/heads/<branch>, …] }`
+  read of every allowed branch, the first in the config's order counted
+  with `behind` 0; a branch forge refuses to count, past its walk bound,
+  proves nothing and leaves the others to prove it, and an errored check
+  names each such refusal; `release-manifest` takes the branches of the channel the job's
   `CHANNEL` names: stable from `main`, nightly from `main` or `dev`, chief's
   ruling), that every job it needs (`Query::Needs`) was met by a passed
   check of the same run and commit reported by a builder the config

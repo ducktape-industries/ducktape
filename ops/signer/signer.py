@@ -194,10 +194,9 @@ def pkt_line(text):
     return f"{len(data) + 4:04x}".encode() + data
 
 
-def forge_compare(repo, commit, branch):
+def forge_compares(repo, commit, refs):
     revision_oid = u8(1) + borsh_text(commit)
-    revision_ref = u8(0) + borsh_bytes(f"refs/heads/{branch}".encode())
-    return u8(9) + borsh_text(repo) + revision_oid + revision_ref
+    return u8(26) + borsh_text(repo) + revision_oid + borsh_vec([u8(0) + borsh_bytes(ref) for ref in refs])
 
 
 class Reader:
@@ -256,6 +255,21 @@ class Reader:
     def page(self, read):
         self.u64()
         return self.vec(read), self.option(self.bytes)
+
+    def revision(self):
+        return self.u8(), self.bytes()
+
+    def tally(self):
+        match self.u8():
+            case 0:
+                self.text(), self.text(), self.option(self.text), self.u64()
+                commits_the_branch_lacks = self.u64()
+                self.u8()
+                return {"lacks": commits_the_branch_lacks}
+            case 1:
+                return {"refused": self.text()}
+            case tag:
+                raise Refused(f"a reply names tally {tag}")
 
 
 class Ran:
@@ -561,14 +575,18 @@ class Signer:
         return operation, policy
 
     def reachable(self, check, branches):
-        for branch in branches:
-            reader = self.asked(FORGE, forge_compare(check["repo"], check["commit"], branch), "Compare", 7)
-            reader.u64()
-            reader.text(), reader.text(), reader.option(reader.text)
-            ahead = reader.u64()
-            if ahead == 0:
+        refs = [f"refs/heads/{branch}".encode() for branch in branches]
+        reader = self.asked(FORGE, forge_compares(check["repo"], check["commit"], refs), "Compares", 23)
+        reader.u64(), reader.text()
+        compared = reader.vec(lambda: (reader.revision(), reader.tally()))
+        if [revision for revision, _ in compared] != [(0, ref) for ref in refs]:
+            raise Refused(f"forge answered Compares for other branches than {', '.join(branches)}")
+        tallies = [(branch, tally) for branch, (_, tally) in zip(branches, compared)]
+        for branch, tally in tallies:
+            if tally.get("lacks") == 0:
                 return branch
-        raise Refused(f"commit {check['commit']} is on none of {check['repo']}'s {', '.join(branches)}")
+        refusals = [f"forge could not count {branch}: {tally['refused']}" for branch, tally in tallies if "refused" in tally]
+        raise Refused("; ".join([f"commit {check['commit']} is on none of {check['repo']}'s {', '.join(branches)}", *refusals]))
 
     def inputs(self, check, root):
         reader = self.asked(ACTIONS, actions_needs(check["id"]), "Needs", 6)
