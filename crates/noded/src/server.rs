@@ -767,10 +767,23 @@ async fn blob_put<E: Context>(ctx: Ctx<E>, request: Request) -> Reply<Submitted>
         Ok(entries) => entries,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    if let Err(refusal) = ctx.blobs().stage(&entries, &mut body).await {
+    let fresh = match ctx.view().source().fresh(&submission) {
+        Ok(fresh) => fresh,
+        Err(error) => return failed(error),
+    };
+    if let Err(refusal) = fresh {
         return Reply::Refused(refusal);
     }
-    taken(ctx.submit(frame, Preconfirm::Off).await)
+    let last_landing = submission.anchor.height + host::ANCHOR_WINDOW;
+    let staged = match ctx.blobs().stage(&entries, &mut body, last_landing).await {
+        Ok(staged) => staged,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    let submitted = ctx.submit(frame, Preconfirm::Off).await;
+    if let Ok(Err(_)) = &submitted {
+        staged.refused();
+    }
+    taken(submitted)
 }
 
 async fn framed_put(body: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<u8>, Refusal> {

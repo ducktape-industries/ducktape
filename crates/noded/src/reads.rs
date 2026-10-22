@@ -9,19 +9,25 @@ use abi::{Origin, Refusal, reason};
 use commonware_runtime::Handle;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::Layer;
+use host::{ANCHOR_WINDOW, Layer};
 use node::{Frame, Preconfirm, Source, Taken};
 
 use crate::{Context, Daemon, Error, Result, offload};
 
 const TARGET: &str = "ducktape::reads";
 
-type Answered = (u64, Option<Op>);
+type Answered = (u64, Option<(Op, Option<Framed>)>);
+
+struct Framed {
+    entry: blob::contract::Entry,
+    framed: Vec<u8>,
+}
 
 #[derive(Default)]
 struct Slot {
     asking: Option<Handle<()>>,
     op: Option<Op>,
+    reply: Option<Framed>,
     frame: Option<Vec<u8>>,
     refused: bool,
 }
@@ -70,12 +76,14 @@ async fn tipped<E: Context>(
 }
 
 async fn took<E: Context>(daemon: &Daemon<E>, slots: &mut BTreeMap<u64, Slot>, heard: Answered) {
-    let (id, op) = heard;
+    let (id, answer) = heard;
     let Some(slot) = slots.get_mut(&id) else {
         return;
     };
     slot.asking = None;
+    let (op, reply) = answer.unzip();
     slot.op = op;
+    slot.reply = reply.flatten();
     slot.frame = None;
     send(daemon, id, slot).await;
 }
@@ -119,6 +127,7 @@ async fn pass<E: Context>(
                         continue;
                     }
                     slot.op = Some(Op::Ready { id });
+                    slot.reply = None;
                     slot.frame = None;
                     slot.refused = false;
                 }
@@ -138,8 +147,8 @@ fn ask<E: Context>(
     tracing::debug!(target: TARGET, event = "read_asked", id, program = %row.target);
     let reader = daemon.clone();
     daemon.context.child("read").spawn(move |_| async move {
-        let op = match answer(&reader, row).await {
-            Ok((at, outcome)) => Some(Op::Answer { id, at, outcome }),
+        let answered = match answer(&reader, row).await {
+            Ok((at, outcome, reply)) => Some((Op::Answer { id, at, outcome }, reply)),
             Err(error) => {
                 tracing::warn!(
                     target: TARGET,
@@ -152,14 +161,14 @@ fn ask<E: Context>(
                 None
             }
         };
-        let _ = answers.unbounded_send((id, op));
+        let _ = answers.unbounded_send((id, answered));
     })
 }
 
 async fn answer<E: Context>(
     daemon: &Daemon<E>,
     row: Row,
-) -> Result<(u64, std::result::Result<Entry, Refusal>)> {
+) -> Result<(u64, std::result::Result<Entry, Refusal>, Option<Framed>)> {
     let view = daemon.view()?;
     let at = view.tip().height;
     let time = daemon.now();
@@ -189,38 +198,60 @@ async fn answer<E: Context>(
     });
     let reply = match queried.answer {
         Ok(reply) => reply,
-        Err(refusal) => return Ok((at, Err(refusal))),
+        Err(refusal) => return Ok((at, Err(refusal), None)),
     };
     let framed = match blob::frame(reads::KIND, &reply) {
         Ok(framed) => framed,
-        Err(refusal) => return Ok((at, Err(refusal))),
+        Err(refusal) => return Ok((at, Err(refusal), None)),
     };
     let entry = blob::contract::Entry::of(&framed)
         .ok_or_else(|| Error::Corrupt("a framed reply names no blob".into()))?;
-    daemon
-        .blobs
-        .stage(std::slice::from_ref(&entry), &mut framed.as_slice())
-        .await
-        .map_err(Error::Refused)?;
-    let entry = Entry {
+    let read = Entry {
         id: entry.id,
         len: entry.len,
-        kind: entry.kind,
+        kind: entry.kind.clone(),
     };
-    Ok((at, Ok(entry)))
+    Ok((at, Ok(read), Some(Framed { entry, framed })))
 }
 
-fn sign<E: Context>(daemon: &Daemon<E>, op: &Op) -> Result<Vec<u8>> {
+fn sign<E: Context>(daemon: &Daemon<E>, op: &Op) -> Result<(Vec<u8>, u64)> {
     let view = daemon.view()?;
+    let anchor = view.tip();
     let frame = Frame::sign(
         &daemon.key,
         &daemon.descriptor.id(),
-        view.tip(),
+        anchor,
         None,
         reads::PROGRAM,
         abi::encode(op),
     );
-    Ok(frame.encode())
+    let last_landing = anchor.height.saturating_add(ANCHOR_WINDOW);
+    Ok((frame.encode(), last_landing))
+}
+
+async fn staged<E: Context>(
+    daemon: &Daemon<E>,
+    reply: Option<&Framed>,
+    last_landing: u64,
+) -> std::result::Result<Option<blob::service::Staged>, Refusal> {
+    let Some(Framed { entry, framed }) = reply else {
+        return Ok(None);
+    };
+    let staged = daemon
+        .blobs
+        .stage(
+            std::slice::from_ref(entry),
+            &mut framed.as_slice(),
+            last_landing,
+        )
+        .await?;
+    Ok(Some(staged))
+}
+
+fn unstage(staged: Option<blob::service::Staged>) {
+    if let Some(staged) = staged {
+        staged.refused();
+    }
 }
 
 async fn send<E: Context>(daemon: &Daemon<E>, id: u64, slot: &mut Slot) {
@@ -230,22 +261,40 @@ async fn send<E: Context>(daemon: &Daemon<E>, id: u64, slot: &mut Slot) {
     if slot.refused {
         return;
     }
-    let frame = match slot.frame.take() {
-        Some(frame) => frame,
-        None => match sign(daemon, op) {
-            Ok(frame) => frame,
-            Err(error) => {
-                tracing::debug!(
-                    target: TARGET,
-                    event = "read_unsigned",
-                    id,
-                    reason = "node_stopped",
-                    %error,
-                    "the reads worker could not anchor a frame"
-                );
-                return;
+    let (frame, staged) = match slot.frame.take() {
+        Some(frame) => (frame, None),
+        None => {
+            let (frame, last_landing) = match sign(daemon, op) {
+                Ok(signed) => signed,
+                Err(error) => {
+                    tracing::debug!(
+                        target: TARGET,
+                        event = "read_unsigned",
+                        id,
+                        reason = "node_stopped",
+                        %error,
+                        "the reads worker could not anchor a frame"
+                    );
+                    return;
+                }
+            };
+            match staged(daemon, slot.reply.as_ref(), last_landing).await {
+                Ok(staged) => (frame, staged),
+                Err(refusal) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        event = "read_unstaged",
+                        id,
+                        reason = %refusal.reason,
+                        sentence = %refusal.sentence,
+                        "the node could not stage a read's reply; it asks again next block"
+                    );
+                    slot.op = None;
+                    slot.reply = None;
+                    return;
+                }
             }
-        },
+        }
     };
     let taken = daemon
         .submit(frame.clone(), Source::Client, Preconfirm::Off)
@@ -257,7 +306,10 @@ async fn send<E: Context>(daemon: &Daemon<E>, id: u64, slot: &mut Slot) {
         }
         Ok(Ok(Taken::Held(_))) => Some(frame),
         Ok(Err(refusal)) => match refusal.reason.as_str() {
-            reason::ANCHOR => None,
+            reason::ANCHOR => {
+                unstage(staged);
+                None
+            }
             reason::DUPLICATE => Some(frame),
             _ => {
                 tracing::warn!(
@@ -268,6 +320,7 @@ async fn send<E: Context>(daemon: &Daemon<E>, id: u64, slot: &mut Slot) {
                     sentence = %refusal.sentence,
                     "the node refused a reads frame of its own"
                 );
+                unstage(staged);
                 slot.refused = true;
                 None
             }

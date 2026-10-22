@@ -183,6 +183,8 @@ struct Inner {
     work: Notify,
     pulls: Mutex<Pulls>,
     uploads: AtomicU64,
+    staged_uploads: Mutex<HashMap<BlobId, BTreeMap<u64, u64>>>,
+    applied: watch::Sender<u64>,
     landed: watch::Sender<u64>,
 }
 
@@ -223,6 +225,8 @@ impl Service {
                 ..Pulls::default()
             }),
             uploads: AtomicU64::new(0),
+            staged_uploads: Mutex::default(),
+            applied: watch::Sender::new(0),
             landed: watch::Sender::new(0),
         });
         for (n, bundle) in bundles {
@@ -246,6 +250,8 @@ impl Service {
             self.inner.record(n, bundle);
         }
         self.inner.unsent(height);
+        self.inner.unstage_unlandable(height);
+        self.inner.applied.send_replace(height);
         self.inner.due()
     }
 
@@ -295,19 +301,30 @@ impl Service {
         &self,
         entries: &[Entry],
         body: &mut (impl AsyncRead + Unpin),
-    ) -> Result<(), Refusal> {
-        for entry in entries {
-            self.inner.stage(entry, body).await?;
-        }
-        let mut past = [0u8; 1];
-        let trailing = body.read(&mut past).await.map_err(unread)?;
-        if trailing > 0 {
-            return Err(Refusal::new(
-                reason::INVALID_INPUT,
-                "the upload carries bytes past the blobs its put names",
-            ));
-        }
-        Ok(())
+        last_landing: u64,
+    ) -> Result<Staged, Refusal> {
+        let mut staging = Staging(Staged {
+            inner: self.inner.clone(),
+            uploads: Vec::new(),
+        });
+        let staged = {
+            let staging_all =
+                self.inner
+                    .stage_all(entries, body, last_landing, &mut staging.0.uploads);
+            tokio::select! {
+                biased;
+                () = landing_passed(&self.inner.applied, last_landing) => Err(Refusal::new(
+                    reason::ANCHOR,
+                    "the upload's put can no longer land",
+                )),
+                staged = staging_all => staged,
+            }
+        };
+        staged?;
+        Ok(Staged {
+            inner: self.inner.clone(),
+            uploads: std::mem::take(&mut staging.0.uploads),
+        })
     }
 
     pub fn store(&self) -> &Blobs {
@@ -316,6 +333,58 @@ impl Service {
 
     pub fn landed(&self) -> watch::Receiver<u64> {
         self.inner.landed.subscribe()
+    }
+}
+
+pub struct Staged {
+    inner: Arc<Inner>,
+    uploads: Vec<(BlobId, u64)>,
+}
+
+impl Staged {
+    pub fn refused(self) {
+        self.unclaim();
+    }
+
+    fn unclaim(&self) {
+        for (id, upload) in &self.uploads {
+            self.inner.unclaim(id, *upload);
+        }
+    }
+}
+
+struct Staging(Staged);
+
+async fn landing_passed(applied: &watch::Sender<u64>, last_landing: u64) {
+    let mut applied = applied.subscribe();
+    let _ = applied.wait_for(|height| *height >= last_landing).await;
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        self.0.unclaim();
+    }
+}
+
+struct Temp {
+    path: PathBuf,
+}
+
+impl Temp {
+    fn create(path: PathBuf) -> std::io::Result<(Temp, tokio::fs::File)> {
+        let temp = Temp { path };
+        let file = std::fs::File::create(&temp.path)?;
+        Ok((temp, tokio::fs::File::from_std(file)))
+    }
+
+    fn rename(self, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, to)
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -458,9 +527,8 @@ impl Inner {
     }
 
     fn local(&self, entry: &Entry) -> Local {
-        let staged = self.store.staged(&entry.id);
-        let in_staging = !self.store.has(&entry.id) && staged.is_file();
-        if in_staging && self.store.adopt(&entry.id, &staged).is_err() {
+        let staged_unadopted = !self.adopt_staged(&entry.id);
+        if staged_unadopted {
             return Local::Absent;
         }
         let Ok(Some(header)) = self.store.stat(&entry.id) else {
@@ -473,6 +541,76 @@ impl Inner {
             return Local::Matches;
         }
         Local::Mismatched
+    }
+
+    fn adopt_staged(&self, id: &BlobId) -> bool {
+        let mut staged_uploads = self.staged_uploads();
+        let staged = self.store.staged(id);
+        if !staged.is_file() {
+            return true;
+        }
+        let held = self.store.has(id) || self.store.adopt(id, &staged).is_ok();
+        if !held {
+            return false;
+        }
+        staged_uploads.remove(id);
+        self.unstage(id);
+        true
+    }
+
+    fn staged_uploads(&self) -> MutexGuard<'_, HashMap<BlobId, BTreeMap<u64, u64>>> {
+        self.staged_uploads
+            .lock()
+            .expect("the staged uploads lock is never poisoned")
+    }
+
+    fn claim(&self, id: BlobId, upload: u64, last_landing: u64, temp: Temp) -> std::io::Result<()> {
+        let mut staged_uploads = self.staged_uploads();
+        temp.rename(&self.store.staged(&id))?;
+        staged_uploads
+            .entry(id)
+            .or_default()
+            .insert(upload, last_landing);
+        Ok(())
+    }
+
+    fn unclaim(&self, id: &BlobId, upload: u64) {
+        let mut staged_uploads = self.staged_uploads();
+        let Some(uploads) = staged_uploads.get_mut(id) else {
+            return;
+        };
+        uploads.remove(&upload);
+        if uploads.is_empty() {
+            staged_uploads.remove(id);
+            self.unstage(id);
+        }
+    }
+
+    fn unstage_unlandable(&self, height: u64) {
+        let mut staged_uploads = self.staged_uploads();
+        let mut unlandable = Vec::new();
+        staged_uploads.retain(|id, uploads| {
+            uploads.retain(|_, last_landing| *last_landing > height);
+            let still_landable = !uploads.is_empty();
+            if !still_landable {
+                unlandable.push(*id);
+            }
+            still_landable
+        });
+        for id in unlandable {
+            self.unstage(&id);
+        }
+    }
+
+    fn unstage(&self, id: &BlobId) {
+        let removed = std::fs::remove_file(self.store.staged(id));
+        let Err(error) = removed else {
+            return;
+        };
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        tracing::warn!(target: "ducktape::blob", event = "blob_unstaged", ?id, %error, reason = "staging_unremoved", "a staged upload no put waits for any more could not be removed");
     }
 
     fn record(&self, n: u64, bundle: Bundle) {
@@ -932,20 +1070,46 @@ impl Inner {
         Ok(Kept::Landed)
     }
 
+    async fn stage_all(
+        &self,
+        entries: &[Entry],
+        body: &mut (impl AsyncRead + Unpin),
+        last_landing: u64,
+        uploads: &mut Vec<(BlobId, u64)>,
+    ) -> Result<(), Refusal> {
+        for entry in entries {
+            let upload = self.stage(entry, body, last_landing).await?;
+            uploads.extend(upload.map(|upload| (entry.id, upload)));
+        }
+        let mut past = [0u8; 1];
+        let trailing = body.read(&mut past).await.map_err(unread)?;
+        if trailing > 0 {
+            return Err(Refusal::new(
+                reason::INVALID_INPUT,
+                "the upload carries bytes past the blobs its put names",
+            ));
+        }
+        Ok(())
+    }
+
     async fn stage(
         &self,
         entry: &Entry,
         body: &mut (impl AsyncRead + Unpin),
-    ) -> Result<(), Refusal> {
+        last_landing: u64,
+    ) -> Result<Option<u64>, Refusal> {
         let upload = self.uploads.fetch_add(1, Ordering::Relaxed);
-        let temp = self.store.staging(&entry.id, upload).map_err(unstored)?;
-        let mut file = tokio::fs::File::create(&temp).await.map_err(unstored)?;
+        let path = self.store.staging(&entry.id, upload).map_err(unstored)?;
+        let (temp, mut file) = tokio::task::spawn_blocking(move || Temp::create(path))
+            .await
+            .map_err(unstored)?
+            .map_err(unstored)?;
         let copied = tokio::io::copy(&mut body.take(entry.len), &mut file).await;
         let flushed = file.flush().await;
         drop(file);
         let whole = copied.is_ok_and(|len| len == entry.len) && flushed.is_ok();
         let checked = match whole {
-            true => checked(&temp, &entry.id, Some(entry)).await,
+            true => checked(&temp.path, &entry.id, Some(entry)).await,
             false => Checked::Misnamed,
         };
         let refusal = match checked {
@@ -960,12 +1124,14 @@ impl Inner {
             Checked::Collision(collision) => Some(collision.into()),
         };
         if let Some(refusal) = refusal {
-            let _ = tokio::fs::remove_file(&temp).await;
             return Err(refusal);
         }
-        tokio::fs::rename(&temp, self.store.staged(&entry.id))
-            .await
-            .map_err(unstored)
+        if self.store.has(&entry.id) {
+            return Ok(None);
+        }
+        self.claim(entry.id, upload, last_landing, temp)
+            .map_err(unstored)?;
+        Ok(Some(upload))
     }
 }
 

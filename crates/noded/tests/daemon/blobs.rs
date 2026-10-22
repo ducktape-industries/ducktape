@@ -425,6 +425,123 @@ fn blocks_finalize_while_dropping_unnamed_blobs_waits_for_an_rpc_blocking_thread
     live.thread.join().unwrap();
 }
 
+fn staged(staging: &Path) -> Vec<String> {
+    let listed = std::fs::read_dir(staging);
+    let entries = match listed {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("the staging folder reads: {error}"),
+    };
+    entries
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect()
+}
+
+async fn landed_page(client: &Client, path: &Path, salt: u64) -> u64 {
+    let status = client.status().await.unwrap();
+    let entry = blob::file_entry("page", path).unwrap();
+    let upload = Upload {
+        kind: "page".into(),
+        path: path.to_path_buf(),
+    };
+    let put = put_frame(&status, vec![entry], salt);
+    let (height, receipt) = client.land_blobs(&put, vec![upload]).await.unwrap();
+    assert!(
+        matches!(receipt.outcome, Outcome::Applied { .. }),
+        "the put applies: {receipt:?}"
+    );
+    height
+}
+
+#[test]
+fn an_upload_leaves_nothing_staged_once_its_put_lands_names_a_held_blob_or_is_refused() {
+    apart!();
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let live = seat.start();
+    let client = live.client.clone();
+    let staging = seat.workspace.dir().join(host::BLOBS_DIR).join(".staging");
+    let page = root.path().join("page");
+    std::fs::write(&page, b"put twice").unwrap();
+
+    client_runtime().block_on(async {
+        reach(&client, 1).await;
+        let first = landed_page(&client, &page, 1).await;
+        reach(&client, first + 1).await;
+        let left = staged(&staging);
+        assert!(
+            left.is_empty(),
+            "a put that landed leaves nothing staged: {left:?}"
+        );
+        let again = landed_page(&client, &page, 2).await;
+        reach(&client, again + 1).await;
+        let left = staged(&staging);
+        assert!(
+            left.is_empty(),
+            "a put of a blob the node holds leaves nothing staged: {left:?}"
+        );
+
+        let framed = blob::frame("page", b"refused").unwrap();
+        let entry = Entry::of(&framed).unwrap();
+        let status = client.status().await.unwrap();
+        let stale = Tip {
+            height: 0,
+            id: [7; 32],
+        };
+        let put = Frame::sign(
+            &ed25519::PrivateKey::from_seed(PUTTER_SEED),
+            NETWORK.as_bytes(),
+            stale,
+            Some(3),
+            status.roles.get(role::BLOBS).unwrap(),
+            abi::encode(&blob::contract::Op::Put { blobs: vec![entry] }),
+        );
+        let refused = client.put_framed(&put, vec![framed]).await;
+        let Err(noded::Error::Refused(_)) = refused else {
+            panic!("a put anchored to no recent block is refused");
+        };
+        let left = staged(&staging);
+        assert!(
+            left.is_empty(),
+            "a refused put leaves nothing staged: {left:?}"
+        );
+
+        let framed = blob::frame("page", b"anchored above the tip").unwrap();
+        let entry = Entry::of(&framed).unwrap();
+        let status = client.status().await.unwrap();
+        let above = Tip {
+            height: status.height + host::ANCHOR_WINDOW,
+            id: [7; 32],
+        };
+        let put = Frame::sign(
+            &ed25519::PrivateKey::from_seed(PUTTER_SEED),
+            NETWORK.as_bytes(),
+            above,
+            Some(4),
+            status.roles.get(role::BLOBS).unwrap(),
+            abi::encode(&blob::contract::Op::Put { blobs: vec![entry] }),
+        );
+        let unread = client.put_framed(&put, Vec::new()).await;
+        let Err(noded::Error::Refused(refusal)) = unread else {
+            panic!("a put anchored above the tip is refused");
+        };
+        assert_eq!(
+            refusal.reason,
+            reason::ANCHOR,
+            "a put anchored above the tip is refused before its body is read"
+        );
+        let left = staged(&staging);
+        assert!(
+            left.is_empty(),
+            "a put anchored above the tip claims nothing: {left:?}"
+        );
+        seat.admin(&client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+}
+
 #[test]
 fn blobs_held_answers_each_id_as_a_read_would_and_a_released_one_is_not_held() {
     apart!();
