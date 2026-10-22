@@ -333,7 +333,6 @@ fn a_mention_is_drafted_and_posted_and_input_mid_turn_waits_for_the_answer_then_
         async {
             net.message(1, "m1", 5, None, 7, "hello");
             heard.unbounded_send(1).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "<@7> wrote message 5 in #room:\nhello");
             script.play(0, Event::Session("s1".into()));
@@ -366,7 +365,6 @@ fn a_mention_is_drafted_and_posted_and_input_mid_turn_waits_for_the_answer_then_
             script.play(0, Event::Ended("exit status: 0".into()));
             net.message(4, "m4", 10, Some(5), 7, "later");
             heard.unbounded_send(4).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), Some("s1".into())));
             said(next(seen).await, "later");
         },
@@ -393,7 +391,6 @@ fn an_adapter_that_folds_queued_messages_into_one_answer_still_answers_each_and_
         async {
             net.message(1, "m1", 5, None, 7, "one");
             heard.unbounded_send(1).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "one");
             net.message(2, "m2", 6, Some(5), 7, "two");
@@ -437,7 +434,6 @@ fn a_session_that_dies_answers_its_turn_as_ended_and_hands_the_waiting_input_to_
         async {
             net.message(1, "m1", 5, None, 7, "one");
             heard.unbounded_send(1).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "one");
             script.play(0, Event::Session("s1".into()));
@@ -447,15 +443,13 @@ fn a_session_that_dies_answers_its_turn_as_ended_and_hands_the_waiting_input_to_
             for seq in 2..=4 {
                 heard.unbounded_send(seq).unwrap();
             }
-            assert_eq!(op(seen).await, take(9));
             assert_eq!(next(seen).await, Seen::Started(at(9), None));
             said(next(seen).await, "elsewhere");
             script.play(0, Event::Ended("signal: 9 (SIGKILL)".into()));
             let ended = "My session here ended (signal: 9 (SIGKILL)) before it answered.";
-            assert_eq!(op(seen).await, post(5, 5, ended));
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), Some("s1".into())));
             said(next(seen).await, "two");
+            assert_eq!(op(seen).await, post(5, 5, ended));
             script.play(2, Event::Answer("b".into()));
             said(next(seen).await, "three");
             assert_eq!(op(seen).await, post(6, 5, "b"));
@@ -484,24 +478,22 @@ fn an_adapter_that_always_dies_after_init_answers_each_input_as_ended_once_and_l
         async {
             net.message(1, "m1", 5, None, 7, "one");
             heard.unbounded_send(1).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "one");
             net.message(2, "m2", 6, Some(5), 7, "two");
             net.message(3, "m3", 9, None, 7, "elsewhere");
             heard.unbounded_send(2).unwrap();
             heard.unbounded_send(3).unwrap();
-            assert_eq!(op(seen).await, take(9));
             assert_eq!(next(seen).await, Seen::Started(at(9), None));
             said(next(seen).await, "elsewhere");
             die(0);
-            assert_eq!(op(seen).await, post(5, 5, ended));
             assert_eq!(
                 next(seen).await,
                 Seen::Started(at(5), Some("s1".into())),
                 "m2's turn"
             );
             said(next(seen).await, "two");
+            assert_eq!(op(seen).await, post(5, 5, ended));
             die(2);
             assert_eq!(op(seen).await, post(6, 5, ended));
             net.message(4, "m4", 11, None, 7, "after");
@@ -530,7 +522,6 @@ fn a_session_that_dies_before_it_starts_answers_that_it_ended() {
         async {
             net.message(1, "m1", 5, None, 7, "one");
             heard.unbounded_send(1).unwrap();
-            assert_eq!(op(seen).await, take(5));
             assert_eq!(next(seen).await, Seen::Started(at(5), None));
             said(next(seen).await, "one");
             script.play(0, Event::Ended("exit status: 1".into()));
@@ -600,7 +591,6 @@ fn a_bridge_killed_mid_turn_takes_its_draft_down_on_restart_and_resumes_the_open
             async {
                 net.message(1, "m1", 5, None, 7, "hello");
                 heard.unbounded_send(1).unwrap();
-                assert_eq!(op(seen).await, take(5));
                 assert_eq!(next(seen).await, Seen::Started(at(5), None));
                 said(next(seen).await, "hello");
                 script.play(0, Event::Session("s1".into()));
@@ -623,19 +613,22 @@ fn a_bridge_killed_mid_turn_takes_its_draft_down_on_restart_and_resumes_the_open
     let (_, armed) = mpsc::unbounded();
     play(&net, &script, &world.path, armed, async {
         let _keep = &heard;
-        assert_eq!(
-            op(&mut seen).await,
-            json!({ "undraft": { "channel_id": ROOM } })
-        );
+        let mut three = Vec::new();
+        for _ in 0..3 {
+            three.push(next(&mut seen).await);
+        }
+        let (ops, session): (Vec<Seen>, Vec<Seen>) = three
+            .into_iter()
+            .partition(|seen| matches!(seen, Seen::Op(_)));
+        let undraft = Seen::Op(json!({ "undraft": { "channel_id": ROOM } }));
+        assert_eq!(ops, [undraft]);
+        let [started, hello] = <[Seen; 2]>::try_from(session).unwrap();
+        assert_eq!(started, Seen::Started(at(5), Some("s1".into())));
+        said(hello, "hello");
         assert!(
             net.drafts.borrow().is_empty(),
-            "the draft is down before anything else"
+            "the draft is down before the session drafts anything"
         );
-        assert_eq!(
-            next(&mut seen).await,
-            Seen::Started(at(5), Some("s1".into()))
-        );
-        said(next(&mut seen).await, "hello");
     });
 }
 
@@ -658,7 +651,6 @@ fn the_bridge_answers_one_input_per_message_and_none_for_whom_it_does_not_answer
             for seq in 1..=4 {
                 heard.unbounded_send(seq).unwrap();
             }
-            assert_eq!(op(seen).await, take(6));
             assert_eq!(next(seen).await, Seen::Started(at(6), None));
             said(next(seen).await, "hello");
             script.play(0, Event::Answer("hi".into()));
