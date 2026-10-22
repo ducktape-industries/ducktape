@@ -36,7 +36,6 @@ RUN = {
     "script": dict,
     "device": dict,
     "to": str,
-    "requester": int,
     "notify": dict,
 }
 BUILT = ("repo", "commit", "build")
@@ -90,6 +89,8 @@ VIEWED = (
     "outputs",
 )
 CHAT = "chat"
+EGRESS = "egress"
+EGRESS_SENDER = 7
 FILES_PROGRAM = "files"
 CHUNK = "chunk"
 CHUNK_SIZE = 1 << 20
@@ -313,6 +314,17 @@ class Reader:
         return self.vec(read), self.option(self.bytes)
 
 
+def egress_sender(request):
+    return u8(EGRESS_SENDER) + u64(request)
+
+
+def sender_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != EGRESS_SENDER:
+        raise Refused(502, "egress answered a sender with something else")
+    return reader.u64() if reader.u8() == 1 else None
+
+
 def mention(account):
     return borsh_text(f"<@{account}>") + borsh_vec([u8(3) + u8(0) + u64(account)])
 
@@ -462,14 +474,19 @@ def notify_of(given):
     return notify
 
 
+def unrequested(body, what):
+    if isinstance(body, dict) and "requester" in body:
+        raise Refused(400, f"{what} names no requester: the mac relay takes the requester from the account egress says sent the request, so drop the field")
+    return body
+
+
 def spec_of(body):
-    body = checked(body, RUN, "a run")
+    body = checked(unrequested(body, "a run"), RUN, "a run")
     named(body, ["to"], "a run")
     spec = source_of(body)
     spec["to"] = absolute(body["to"], "to")
     spec["vars"] = vars_of(body.get("vars", {}))
     spec["device"] = checked(body.get("device", {}), DEVICE, "device")
-    spec["requester"] = from_zero(body["requester"], "requester") if "requester" in body else None
     spec["notify"] = notify_of(body["notify"]) if "notify" in body else None
     return spec
 
@@ -973,6 +990,7 @@ class Service:
             if spec["from"] is not None:
                 self.known(spec["from"])
         script, inputs = self.scripted(body.get("script"))
+        requester = self.sender(asked)
         with self.changed:
             if name in self.runs:
                 return 200, {"run": view(self.runs[name]), "mac": self.presence()}
@@ -982,6 +1000,7 @@ class Service:
                 (folder / str(index)).write_bytes(data)
             record = {
                 **spec,
+                "requester": requester,
                 "id": name,
                 "created": self.clock(),
                 "state": QUEUED,
@@ -999,6 +1018,13 @@ class Service:
             self.offer(record)
             self.saved()
             return 201, {"run": view(record), "mac": self.presence()}
+
+    def sender(self, asked):
+        reply = self.signer.query(EGRESS, egress_sender(int(asked["request"])))
+        why = failed(reply)
+        if why is not None:
+            raise Refused(502, f"egress was not asked who sent request {asked['request']}: {why}")
+        return sender_of(reply.out)
 
     def listed(self):
         self.again(list(self.runs))

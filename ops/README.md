@@ -1030,7 +1030,10 @@ one up for another network.
   is answered at once and its run waits in the queue. A run's script and
   `media` files are read from files when the run is asked for, its outputs
   go into files at `<to>/<run>/` in one commit when it ends, and one chat
-  post says it ended. It signs as the account `mac`, with the Secret
+  post says it ended, mentioning the run's requester: the account egress
+  says sent the request (egress `Sender`, asked once per new run; a run
+  egress could not be asked about is refused 502 and makes nothing). A body
+  that names `requester` is refused 400. It signs as the account `mac`, with the Secret
   `mac-key` (files `key` and `password`). Its state (`runs.json`, each
   run's inputs and outputs until written, mirrors of the repositories the
   Mac builds) is on the claim `state`. `relay-test.py` covers it.

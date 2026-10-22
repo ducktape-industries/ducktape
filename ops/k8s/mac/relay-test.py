@@ -50,6 +50,8 @@ class Signer:
         self.submits = []
         self.queries = []
         self.answers = []
+        self.sender = 21
+        self.told = ran(relay.u8(7) + relay.u8(1) + relay.u64(21))
 
     def held(self):
         return self.keyed
@@ -65,6 +67,8 @@ class Signer:
 
     def query(self, program, request):
         self.queries.append((program, request))
+        if program == "egress":
+            return self.told
         if request[0] == 0:
             return ran(relay.u8(0) + relay.u8(1) + relay.blob_id(HEAD))
         path, snapshot = read_path(request)
@@ -134,7 +138,7 @@ class Relay(unittest.TestCase):
             self.service.changed.wait_for(holds)
 
     def test_a_run_is_queued_while_the_mac_is_away_and_a_repeat_answers_it_again(self):
-        status, body = self.agent("POST", "/v1/runs", {**BUILD, "script": SCRIPT, "requester": 21})
+        status, body = self.agent("POST", "/v1/runs", {**BUILD, "script": SCRIPT})
         self.assertEqual(status, 201)
         run = body["run"]
         self.assertEqual((run["id"], run["state"], run["steps"], run["requester"]), ("duckpond-41", "queued", 2, 21))
@@ -153,7 +157,7 @@ class Relay(unittest.TestCase):
             ({k: v for k, v in BUILD.items() if k != "to"}, "names its to"),
             ({**BUILD, "vars": {"A B": "1"}}, "not a make variable"),
             ({**BUILD, "device": {"fresh": "yes"}}, "fresh is a JSON boolean"),
-            ({**BUILD, "requester": True}, "requester is a JSON number"),
+            ({**BUILD, "requester": True}, "names no requester"),
             ({**BUILD, "script": {"steps": [{"tap": {}}]}}, "step 1 is tap, not a step"),
             ({**BUILD, "script": {"steps": [{"screenshot": "../x"}]}}, "names its output"),
             ({**BUILD, "script": {"steps": [{"system": {"tap": "Photo"}}]}}, "names its deadline_ms"),
@@ -168,6 +172,30 @@ class Relay(unittest.TestCase):
             self.assertIn(words, answer["error"])
         self.assertEqual(self.agent("GET", "/v1/runs")[1]["runs"], [])
 
+    def test_a_runs_requester_is_the_account_egress_says_sent_it(self):
+        status, body = self.agent("POST", "/v1/runs", BUILD)
+        self.assertEqual((status, body["run"]["requester"]), (201, 21))
+        self.assertEqual(self.signer.queries, [("egress", bytes([7]) + (41).to_bytes(8, "little"))])
+        self.signer.told = ran(relay.u8(7) + relay.u8(0))
+        status, body = self.agent("POST", "/v1/runs", BUILD, request=42)
+        self.assertEqual((status, body["run"]["requester"]), (201, None))
+
+    def test_a_body_requester_is_refused_whoever_it_names(self):
+        for named in (21, 17):
+            status, body = self.agent("POST", "/v1/runs", {**BUILD, "requester": named})
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], "a run names no requester: the mac relay takes the requester from the account egress says sent the request, so drop the field")
+        self.assertEqual(self.agent("GET", "/v1/runs")[1]["runs"], [])
+        self.assertEqual(self.signer.queries, [])
+
+    def test_a_run_egress_was_not_asked_about_is_refused_and_makes_nothing(self):
+        self.signer.told = ran(code=1, err="error sending request: connection reset by peer")
+        status, body = self.agent("POST", "/v1/runs", BUILD)
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"], "egress was not asked who sent request 41: error sending request: connection reset by peer")
+        self.assertEqual(self.agent("GET", "/v1/runs")[1]["runs"], [])
+        self.assertFalse(self.store.run_dir("duckpond-41").exists())
+
     def test_a_relay_without_its_key_takes_no_run(self):
         self.signer.keyed = False
         status, body = self.agent("POST", "/v1/runs", BUILD)
@@ -179,6 +207,7 @@ class Relay(unittest.TestCase):
         status, body = self.agent("POST", "/v1/runs", {**BUILD, "script": {"files": {"path": "/shared/s.json", "snapshot": SNAPSHOT}}})
         self.assertEqual((status, body["run"]["steps"]), (201, 2))
         self.assertEqual(read_path(self.signer.queries[0][1]), ("/shared/s.json", "sha256:" + SNAPSHOT))
+        self.assertEqual([program for program, _ in self.signer.queries], ["files", "files", "egress"])
         connection, answer = self.work()
         kind, handed = self.event(answer)
         self.assertEqual(kind, "run")
@@ -193,7 +222,7 @@ class Relay(unittest.TestCase):
         self.assertEqual((status, body["error"]), (422, "files did not read /nope.json: not_found: /nope.json"))
 
     def test_the_mac_pulls_runs_reports_them_and_its_outputs_land_in_one_commit(self):
-        self.agent("POST", "/v1/runs", {**BUILD, "script": SCRIPT, "requester": 21, "notify": {"channel": "j-089"}})
+        self.agent("POST", "/v1/runs", {**BUILD, "script": SCRIPT, "notify": {"channel": "j-089"}})
         connection, answer = self.work()
         self.assertEqual(self.event(answer)[0], "run")
         self.assertTrue(self.agent("GET", "/v1/mac")[1]["mac"]["connected"])

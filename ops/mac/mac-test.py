@@ -227,6 +227,8 @@ class Signer:
         return relay.Ran(0, b"preconfirmed applied 0a", "")
 
     def query(self, program, request):
+        if program == "egress":
+            return relay.Ran(0, relay.u8(7) + relay.u8(1) + relay.u64(21), "")
         if request[0] == 0:
             return relay.Ran(0, relay.u8(0) + relay.u8(1) + relay.u8(0) + b"\xab" * 32, "")
         reader = relay.Reader(request)
