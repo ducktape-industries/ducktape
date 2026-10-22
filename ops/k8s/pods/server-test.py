@@ -4048,18 +4048,80 @@ class KeptRuns(unittest.TestCase):
         ])
 
 
-WANTED = "5e" * 20
-LANE_ROOM = "forge:programs:5"
+LANE = "a96fa67643795cf0b5359e416e31a55232d0e79a"
+LANE_ROOM = "forge:programs:561"
+DEV = b"refs/heads/dev"
+LIVE_REQUIRED = bytes.fromhex(
+    "12b8cd050000000000b8cd050000000000010000000e000000726566732f68656164732f646576003c00000000000000020000000900000035362f7265766965771000000032332f6275696c642e7368236c616e6500"
+)
+LIVE_QUEUE = bytes.fromhex(
+    "13b9cd050000000000b9cd050000000000010000003102000000000000280000003664633235343263353365626363383437623434373363623032396137346532613434623535633600110000000000000081ad0500000000000155000000987f00000000000021000000150800000070726f6772616d730e000000726566732f68656164732f646576000024000000652f70726f6772616d730000726566732f68656164732f64657600000000000000000091"
+)
+LIVE_PREVIEW = bytes.fromhex(
+    "10bacd05000000000001310200000000000028000000323539366235616665343765633237656266393862336137666539336636346532653461356632332800000036646332353432633533656263633834376234343733636230323961373465326134346235356336280000006139366661363736343337393563663062353335396534313665333161353532333264306537396158c4050000000000"
+)
+LIVE_STATUSES = bytes.fromhex(
+    "11bacd050000000000bacd05000000000002000000003c000000000000001000000032332f6275696c642e7368236c616e65000058c4050000000000003c000000000000000900000035362f72657669657701012b0000006475636b3a2f2f6475636b706f6e642d37323562636164312f666f7267652f70726f6772616d732f35363158c405000000000000"
+)
+LIVE_REPOS = bytes.fromhex(
+    "004fd50500000000004fd5050000000000020000000800000070726f6772616d73010012000000000000000f000000726566732f68656164732f6d61696e0000bf030000000000003ed505000000000004000000636f7265010012000000000000000f000000726566732f68656164732f6d61696e00001c02000000000000dfd4050000000000012300000086800000000000000300000000000010000000612ffffffffffffa2b20636f72650000"
+)
+ASK_REQUIRED = server.forge_required("programs", None)
+ASK_FRONT = server.forge_queue_front("programs", DEV)
+ASK_PREVIEW = server.forge_preview("programs", 561)
+ASK_STATUSES = server.forge_statuses("programs", LANE, None)
+MOVED_PREVIEW = "7e" * 20
 
 
-def wanted_reply(rows, after=None):
-    items = [server.borsh_text(repo) + server.u64(n) + server.borsh_text(commit) + server.borsh_text(context) for repo, n, commit, context in rows]
-    return server.u8(2) + server.u64(1) + server.borsh_vec(items) + server.borsh_option(after, server.borsh_bytes)
+def principal(account):
+    return server.u8(0) + server.u64(account)
 
 
-class Wanting:
-    def __init__(self, pages, account=23):
-        self.pages = pages
+def forge_page(tag, items, after=None):
+    return server.u8(tag) + server.u64(1) + server.u64(1) + server.borsh_vec(items) + server.borsh_option(after, server.borsh_bytes)
+
+
+def required_reply(*contexts, after=None):
+    item = server.borsh_bytes(DEV) + principal(60) + server.borsh_vec([server.borsh_text(context) for context in contexts])
+    return forge_page(18, [item], after)
+
+
+def queue_reply(*changes):
+    return forge_page(19, [server.u64(n) + server.borsh_text("4e" * 20) + principal(17) + server.u64(1) for n in changes])
+
+
+def preview_reply(n, merge):
+    info = server.u64(n) + server.borsh_text("1e" * 20) + server.borsh_text("2e" * 20) + server.borsh_text(merge) + server.u64(1)
+    return server.u8(16) + server.u64(1) + server.borsh_option(info, bytes)
+
+
+def repos_reply(*names):
+    return forge_page(0, [server.borsh_text(name) + server.u8(1) + principal(21) + server.borsh_bytes(b"refs/heads/main") + server.u8(0) + server.u8(0) + server.u64(1) + server.u64(1) for name in names])
+
+
+def check_status(context, state, reporter=60):
+    return principal(reporter) + server.borsh_text(context) + server.u8(server.CHECK_STATES.index(state)) + server.borsh_option(None, server.borsh_text) + server.u64(1)
+
+
+def statuses_reply(*items, after=None):
+    return forge_page(17, list(items), after)
+
+
+def forge_key(table, repo):
+    return (table + repo.encode() + b"\x00\x00" + b"rest").hex()
+
+
+def required_repo(request):
+    return server.Reader(request[1:]).bytes().decode()
+
+
+def lane_of(command):
+    return command[-3:-1]
+
+
+class Forging:
+    def __init__(self, answers, account=23):
+        self.answers = answers
         self.account = account
         self.queries = []
         self.follows = []
@@ -4072,7 +4134,9 @@ class Wanting:
         self.queries.append((program, request))
         if program == "identity":
             return ran(server.u8(0) + server.borsh_option(self.account, server.u64))
-        return ran(self.pages[request])
+        if program == "forge-reach":
+            return ran(server.u8(2) + server.u64(1) + server.borsh_vec([]) + server.borsh_option(None, server.borsh_bytes))
+        return ran(self.answers[request])
 
     def follow(self, program):
         self.follows.append(program)
@@ -4082,96 +4146,248 @@ class Wanting:
 class Reruns(unittest.TestCase):
     def setUp(self):
         self.kube = Kube()
-        lane = ("programs", 5, WANTED, "build.sh#lane")
-        review = ("programs", 6, "6e" * 20, "review")
-        self.signer = Wanting({server.reach_wanted(23, None): wanted_reply([lane, review])})
+        self.signer = Forging({ASK_REQUIRED: LIVE_REQUIRED, ASK_FRONT: LIVE_QUEUE, ASK_PREVIEW: LIVE_PREVIEW, ASK_STATUSES: LIVE_STATUSES})
         self.launched = []
-        self.answer = ran(b"run desktop:r1\nread it with: build.sh status r1\n")
+        self.answers = [ran(b"run desktop:r1\nread it with: build.sh status r1\n")]
+        self.posts = []
+        self.spawned = []
+        self.pauses = []
         self.rerunner = self.fresh()
 
     def fresh(self):
-        rerunner = server.Rerunner(self.signer, self.kube, self.launch, 1)
+        rerunner = server.Rerunner(self.signer, self.kube, self.launch, 1, self.post)
         rerunner.reporter = 23
+        rerunner.spawn = lambda target, *args: self.spawned.append((target, args))
+        rerunner.pause = self.pauses.append
         return rerunner
 
     def launch(self, command):
         self.launched.append((command, dict(self.kube.kept)))
-        if isinstance(self.answer, server.Refused):
-            raise self.answer
-        return self.answer
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, server.Refused):
+            raise answer
+        return answer
+
+    def post(self, channel, message_id, said):
+        self.posts.append((channel, message_id, said["detail"]))
+        return True
 
     def record(self, **more):
-        return json.dumps({"repo": "programs", "n": 5, "commit": WANTED, **more})
+        return json.dumps({"repo": "programs", "n": 561, "commit": LANE, **more})
 
-    def test_a_wanted_lane_is_kept_first_then_run_once_through_builds_in_its_change_room(self):
-        self.rerunner.settle()
-        self.rerunner.settle()
-        key = server.rerun_key("programs", WANTED)
-        command = ["sh", server.BUILD_SH, f"JOB={LANE_ROOM}", f"NOTIFY={LANE_ROOM}", "programs", WANTED, "lane"]
+    def asked(self):
+        return [request for program, request in self.signer.queries if program == "forge"]
+
+    def test_the_live_forge_replies_read_as_the_queue_front_and_its_previews_statuses(self):
+        self.assertEqual(server.required_of(LIVE_REQUIRED), ([{"branch": DEV, "reporter": ("account", 60), "contexts": ["56/review", "23/build.sh#lane"]}], None))
+        self.assertEqual(server.queue_front_of(LIVE_QUEUE), 561)
+        self.assertEqual(server.preview_of(LIVE_PREVIEW), LANE)
+        statuses, after = server.statuses_of(LIVE_STATUSES)
+        read = [(found["reporter"], found["context"], found["state"]) for found in statuses]
+        self.assertEqual((read, after), ([(("account", 60), "23/build.sh#lane", "pending"), (("account", 60), "56/review", "passed")], None))
+        names, after = server.repos_of(LIVE_REPOS)
+        self.assertEqual((names, after is not None), (["programs", "core"], True))
+
+    def test_its_forge_queries_are_the_bytes_forge_reads(self):
+        programs = server.borsh_text("programs")
+        self.assertEqual(ASK_REQUIRED, b"\x14" + programs + b"\x00\x00")
+        self.assertEqual(ASK_FRONT, b"\x15" + programs + server.borsh_bytes(DEV) + b"\x00\x01" + server.u64(1))
+        self.assertEqual(ASK_PREVIEW, b"\x12" + programs + server.u64(561))
+        self.assertEqual(ASK_STATUSES, b"\x13" + programs + server.borsh_text(LANE) + b"\x00\x00")
+
+    def test_the_queue_fronts_pending_lane_is_kept_first_then_run_once_through_builds_in_its_change_room(self):
+        self.rerunner.settle("programs")
+        self.rerunner.settle("programs")
+        key = server.rerun_key("programs", LANE)
+        command = ["sh", server.BUILD_SH, f"JOB={LANE_ROOM}", f"NOTIFY={LANE_ROOM}", "programs", LANE, "lane"]
         self.assertEqual(self.launched, [(command, {key: self.record()})])
         self.assertEqual(self.kube.kept, {key: self.record(run="desktop:r1")})
+        self.assertEqual((self.posts, self.spawned), ([], []))
 
-    def test_a_restarted_service_starts_no_second_lane_for_a_preview_it_kept(self):
-        self.kube.kept[server.rerun_key("programs", WANTED)] = self.record()
-        self.fresh().settle()
+    def test_a_front_no_lane_ever_reported_on_gets_its_lane(self):
+        self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("56/review", "passed"))
+        self.rerunner.settle("programs")
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
+
+    def test_only_the_queues_front_is_read_and_laned(self):
+        self.signer.answers[ASK_FRONT] = queue_reply(561, 577)
+        self.rerunner.settle("programs")
+        self.assertEqual(self.asked(), [ASK_REQUIRED, ASK_FRONT, ASK_PREVIEW, ASK_STATUSES])
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
+
+    def test_a_front_whose_review_is_pending_waits_for_it_then_gets_its_lane(self):
+        self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("23/build.sh#lane", "pending"), check_status("56/review", "pending"))
+        self.rerunner.settle("programs")
+        self.assertEqual(self.launched, [])
+        self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("23/build.sh#lane", "pending"), check_status("56/review", "passed"))
+        self.rerunner.settle("programs")
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
+
+    def test_a_front_whose_lane_has_a_result_starts_nothing(self):
+        for state in ("passed", "failed", "errored"):
+            self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("23/build.sh#lane", state), check_status("56/review", "passed"))
+            self.rerunner.settle("programs")
         self.assertEqual(self.launched, [])
 
-    def test_a_preview_no_longer_wanted_drops_its_key_and_leaves_the_runs_it_does_not_own(self):
-        self.signer.pages = {server.reach_wanted(23, None): wanted_reply([])}
-        other = server.kept_key("duckpond-41", "r1")
-        self.kube.kept = {server.rerun_key("programs", WANTED): self.record(run="desktop:r1"), other: "{}"}
-        self.rerunner.settle()
-        self.assertEqual((self.kube.kept, self.launched), ({other: "{}"}, []))
+    def test_only_the_required_reporters_statuses_count(self):
+        self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("23/build.sh#lane", "passed", reporter=23), check_status("56/review", "passed"))
+        self.rerunner.settle("programs")
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
+        self.kube.kept = {}
+        self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("56/review", "passed", reporter=56))
+        self.fresh().settle("programs")
+        self.assertEqual(len(self.launched), 1)
 
-    def test_wanted_is_read_page_by_page(self):
-        later = "7e" * 20
-        self.signer.pages = {
-            server.reach_wanted(23, None): wanted_reply([("programs", 5, WANTED, "build.sh#lane")], after=b"c"),
-            server.reach_wanted(23, b"c"): wanted_reply([("app", 7, later, "build.sh#lane")]),
-        }
-        self.rerunner.settle()
-        self.assertEqual([command[4:6] for command, _ in self.launched], [["programs", WANTED], ["app", later]])
-        self.assertEqual(self.signer.queries, [("forge-reach", server.reach_wanted(23, None)), ("forge-reach", server.reach_wanted(23, b"c"))])
+    def test_a_repo_that_asks_no_lane_of_the_services_account_is_read_no_further_nor_its_kept_runs(self):
+        self.signer.answers[ASK_REQUIRED] = required_reply("56/review", "24/build.sh#lane")
+        self.kube.kept_load = lambda: self.fail("the ConfigMap was read for a repo that asks no lane")
+        self.rerunner.settle("programs")
+        self.assertEqual((self.asked(), self.launched), ([ASK_REQUIRED], []))
+
+    def test_an_empty_queue_or_a_front_with_no_preview_starts_nothing(self):
+        self.signer.answers[ASK_FRONT] = queue_reply()
+        self.rerunner.settle("programs")
+        self.signer.answers[ASK_FRONT] = LIVE_QUEUE
+        self.signer.answers[ASK_PREVIEW] = server.u8(16) + server.u64(1) + b"\x00"
+        self.rerunner.settle("programs")
+        self.assertEqual(self.launched, [])
+
+    def test_required_and_statuses_are_read_page_by_page(self):
+        more_required = server.forge_required("programs", b"c")
+        more_statuses = server.forge_statuses("programs", LANE, b"d")
+        self.signer.answers[ASK_REQUIRED] = required_reply("56/review", after=b"c")
+        self.signer.answers[more_required] = LIVE_REQUIRED
+        self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("56/review", "passed"), after=b"d")
+        self.signer.answers[more_statuses] = statuses_reply(check_status("23/build.sh#lane", "passed"))
+        self.rerunner.settle("programs")
+        self.assertEqual(self.asked(), [ASK_REQUIRED, more_required, ASK_FRONT, ASK_PREVIEW, ASK_STATUSES, more_statuses])
+        self.assertEqual(self.launched, [])
+
+    def test_a_restarted_service_starts_no_second_lane_for_a_front_it_kept(self):
+        self.kube.kept[server.rerun_key("programs", LANE)] = self.record(run="desktop:r1")
+        self.fresh().settle("programs")
+        self.assertEqual((self.launched, self.spawned), ([], []))
+
+    def test_a_kept_preview_no_longer_its_queues_front_is_dropped_and_other_repos_and_runs_stay(self):
+        former = server.rerun_key("programs", MOVED_PREVIEW)
+        app = server.rerun_key("app", "8e" * 20)
+        other = server.kept_key("duckpond-41", "r1")
+        app_record = json.dumps({"repo": "app", "n": 3, "commit": "8e" * 20})
+        self.kube.kept = {former: json.dumps({"repo": "programs", "n": 559, "commit": MOVED_PREVIEW, "run": "desktop:r0"}), app: app_record, other: "{}"}
+        self.rerunner.settle("programs")
+        self.assertEqual(self.kube.kept, {app: app_record, other: "{}", server.rerun_key("programs", LANE): self.record(run="desktop:r1")})
 
     def test_a_key_the_configmap_would_not_take_starts_no_lane(self):
         self.kube.kept_change = lambda data: ran(code=1, err="Error from server (Forbidden): configmaps is forbidden")
-        self.rerunner.settle()
+        self.rerunner.settle("programs")
         self.assertEqual(self.launched, [])
 
-    def test_a_refused_lane_is_kept_with_its_reason_and_not_asked_again_for_that_preview(self):
-        self.answer = server.Refused(503, "no build runner is free")
-        self.rerunner.settle()
-        self.rerunner.settle()
+    def test_a_refused_lane_is_kept_with_its_reason_its_room_told_and_left_to_its_retry(self):
+        self.answers = [server.Refused(503, "no build runner is free")]
+        self.rerunner.settle("programs")
+        self.rerunner.settle("programs")
         self.assertEqual(len(self.launched), 1)
-        self.assertEqual(self.kube.kept, {server.rerun_key("programs", WANTED): self.record(unstarted="no build runner is free")})
+        self.assertEqual(self.kube.kept, {server.rerun_key("programs", LANE): self.record(unstarted="no build runner is free")})
+        self.assertEqual([(channel, detail) for channel, _, detail in self.posts], [(LANE_ROOM, f"the lane on Preview {LANE} did not start: no build runner is free. The pods service asks again from one block, doubling, while that Preview is its queue's front.")])
+        self.assertEqual([(target, args) for target, args in self.spawned], [(self.rerunner.retry, ("programs", server.rerun_key("programs", LANE)))])
 
     def test_a_lane_build_sh_did_not_start_is_kept_with_its_exit(self):
-        self.answer = ran(code=2, err="build.sh: usage")
-        self.rerunner.settle()
-        self.assertEqual(self.kube.kept, {server.rerun_key("programs", WANTED): self.record(unstarted="build.sh answered exit 2 with no run")})
+        self.answers = [ran(code=2, err="build.sh: usage")]
+        self.rerunner.settle("programs")
+        self.assertEqual(self.kube.kept, {server.rerun_key("programs", LANE): self.record(unstarted="build.sh answered exit 2 with no run")})
+        self.assertEqual(len(self.spawned), 1)
 
-    def test_it_follows_forge_reach_and_reads_wanted_once_per_block_that_changes_a_wanted_row(self):
-        rows = b"w/".hex()
-        lines = [f"10\t{b'r/x'.hex()}\t00\n", f"11\t{rows}aa\t01\n", f"11\t{rows}bb\t-\n", f"12\t{rows}cc\t01\n"]
-        self.signer.streams = ["".join(lines).encode()]
+    def test_an_unstarted_lane_is_tried_again_from_one_block_doubling_and_its_room_told_once_per_reason(self):
+        busy = server.Refused(503, "no build runner is free")
+        self.answers = [busy, busy, server.Refused(502, "the warm pod's name was not read"), ran(b"run desktop:r2\n")]
+        self.rerunner.settle("programs")
+        target, args = self.spawned[0]
+        target(*args)
+        self.assertEqual((len(self.launched), self.pauses), (4, [1, 2, 4]))
+        self.assertEqual(self.kube.kept, {server.rerun_key("programs", LANE): self.record(run="desktop:r2")})
+        self.assertEqual(len({message for _, message, _ in self.posts}), 2)
+        self.assertEqual((len(self.spawned), self.rerunner.retrying), (1, set()))
+
+    def test_a_retry_stops_as_soon_as_the_front_moves(self):
+        self.answers = [server.Refused(503, "no build runner is free")]
+        self.rerunner.settle("programs")
+        self.signer.answers[ASK_FRONT] = queue_reply(577)
+        self.signer.answers[server.forge_preview("programs", 577)] = preview_reply(577, MOVED_PREVIEW)
+        self.signer.answers[server.forge_statuses("programs", MOVED_PREVIEW, None)] = statuses_reply(check_status("56/review", "pending"))
+        target, args = self.spawned[0]
+        target(*args)
+        self.assertEqual((len(self.launched), self.pauses, self.rerunner.retrying), (1, [1], set()))
+
+    def test_a_retry_stops_once_the_fronts_lane_is_no_longer_wanted(self):
+        self.answers = [server.Refused(503, "no build runner is free"), ran(b"run desktop:r2\n")]
+        self.rerunner.settle("programs")
+        self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("23/build.sh#lane", "pending"), check_status("56/review", "pending"))
+        target, args = self.spawned[0]
+        target(*args)
+        self.assertEqual((len(self.launched), self.pauses, self.rerunner.retrying), (1, [1], set()))
+
+    def test_a_retry_stops_once_its_key_holds_a_run(self):
+        self.answers = [server.Refused(503, "no build runner is free"), ran(b"run desktop:r2\n")]
+        self.rerunner.settle("programs")
+        key = server.rerun_key("programs", LANE)
+        self.kube.kept[key] = self.record(run="desktop:r9")
+        target, args = self.spawned[0]
+        target(*args)
+        self.assertEqual((len(self.launched), self.pauses, self.kube.kept[key]), (1, [1], self.record(run="desktop:r9")))
+
+    def test_a_restarted_service_tries_an_unstarted_front_again(self):
+        self.kube.kept[server.rerun_key("programs", LANE)] = self.record(unstarted="no build runner is free")
+        rerunner = self.fresh()
+        rerunner.settle("programs")
+        self.assertEqual((self.launched, [args for _, args in self.spawned]), ([], [("programs", server.rerun_key("programs", LANE))]))
+        rerunner.settle("programs")
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_it_follows_forge_and_settles_every_queued_repo_as_it_opens_and_a_repo_once_per_block_that_writes_its_queue_statuses_previews_or_requirements(self):
+        for repo in ("app", "core"):
+            self.signer.answers[server.forge_required(repo, None)] = required_reply("56/review")
+        self.signer.answers[server.forge_repos(None)] = repos_reply("app", "programs")
+        lines = [
+            f"10\t{forge_key(b'r/', 'programs')}\t00\n",
+            f"11\t{forge_key(b'e/', 'programs')}\t01\n",
+            f"12\t{forge_key(b's/', 'programs')}\t-\n",
+            f"13\t{forge_key(b'm/', 'core')}\t01\n",
+            f"13\t{forge_key(b'm/', 'core')}\t02\n",
+            f"14\t{forge_key(b'q/', 'programs')}\t01\n",
+            "15\tzz\t01\n",
+        ]
+        self.signer.streams = ["".join(lines).encode(), b""]
 
         class Stop(BaseException):
             pass
 
-        def stop(pause):
-            raise Stop()
+        def pause(seconds):
+            self.pauses.append(seconds)
+            if len(self.pauses) == 2:
+                raise Stop()
 
-        rerunner = server.Rerunner(self.signer, self.kube, self.launch, 1)
-        rerunner.pause = stop
+        rerunner = server.Rerunner(self.signer, self.kube, self.launch, 1, self.post)
+        rerunner.pause = pause
         with self.assertRaises(Stop):
             rerunner.watch()
-        wanted = ("forge-reach", server.reach_wanted(23, None))
-        self.assertEqual(self.signer.queries, [("identity", server.identity_of_key(b"k" * 32)), wanted, wanted, wanted])
-        self.assertEqual((self.signer.follows, len(self.launched)), (["forge-reach"], 1))
+        settled = [required_repo(request) for request in self.asked() if request[:1] == b"\x14"]
+        self.assertEqual(settled, ["app", "programs", "programs", "programs", "core", "programs", "app", "programs"])
+        self.assertEqual((self.signer.follows, len(self.launched)), (["forge", "forge"], 1))
+        self.assertEqual([request for request in self.asked() if request[:1] == b"\x00"], [server.forge_repos(None)] * 2)
+
+    def test_every_repository_forge_lists_is_settled_a_page_at_a_time_as_the_stream_opens(self):
+        _, after = server.repos_of(LIVE_REPOS)
+        self.signer.answers[server.forge_repos(None)] = LIVE_REPOS
+        self.signer.answers[server.forge_repos(after)] = repos_reply("app")
+        for repo in ("app", "core"):
+            self.signer.answers[server.forge_required(repo, None)] = required_reply("56/review")
+        self.rerunner.reopened()
+        settled = [required_repo(request) for request in self.asked() if request[:1] == b"\x14"]
+        self.assertEqual((settled, [lane_of(command) for command, _ in self.launched]), (["programs", "core", "app"], [["programs", LANE]]))
 
     def test_a_key_no_account_acts_as_follows_nothing(self):
         self.signer.account = None
-        server.Rerunner(self.signer, self.kube, self.launch, 1).watch()
+        server.Rerunner(self.signer, self.kube, self.launch, 1, self.post).watch()
         self.assertEqual((self.signer.follows, self.launched), ([], []))
 
     def test_the_service_key_line_names_its_public_key(self):
@@ -4182,13 +4398,12 @@ class Reruns(unittest.TestCase):
             server.public_key("ducktape-user-key-v1:AAAA\n")
 
     def test_the_runs_the_notifier_resumes_leave_the_rerun_keys_alone(self):
-        key = server.rerun_key("programs", WANTED)
+        key = server.rerun_key("programs", LANE)
         self.kube.kept[key] = self.record(run="desktop:r1")
         self.kube.answer("list", ran({"items": []}))
         notifier = server.Notifier(self.kube, Signer(), 1)
         notifier.resume()
         self.assertEqual((notifier.open, notifier.pending, self.kube.kept), ({}, {}, {key: self.record(run="desktop:r1")}))
-
 
 class Encodings(unittest.TestCase):
     def test_blob_ids_encode_their_hash_kind_then_digest(self):

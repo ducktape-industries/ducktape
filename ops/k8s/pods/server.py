@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane run again on each Preview forge-reach asks the service's account for again, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane started by itself on each merge queue front's Preview that waits on the service's account, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, `server.py fetch` is each pod's input fetcher, and `server.py hardcap` prints the agents quota k8s/pods/deploy applies.
 import base64
 import binascii
@@ -165,7 +165,9 @@ USER_KEY_LEN = 16 + 12 + 24 + 32 + 32 + 16
 PUBKEY_AT = 16 + 12 + 24
 LANE_CONTEXT = "build.sh#lane"
 RERUN = "rerun-"
-WANTED_KEYS = b"w/".hex()
+FORGE_PROGRAM = "forge"
+FRONT_KEYS = tuple(table.hex() for table in (b"e/", b"s/", b"m/", b"q/"))
+CHECK_STATES = ("pending", "passed", "failed", "errored")
 REPORT_LINE = "ducktape-report "
 FILES_LINE = "ducktape-files "
 REPORT_STATES = {"passed": 1, "failed": 2}
@@ -1959,23 +1961,123 @@ def account_of(reply):
     return reader.u64() if reader.u8() == 1 else None
 
 
-def reach_wanted(reporter, after):
-    return u8(2) + u64(reporter) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+def forge_repos(after):
+    return u8(0) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
 
 
-def wanted_of(reply):
+def forge_required(repo, after):
+    return u8(20) + borsh_text(repo) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+
+
+def forge_queue_front(repo, branch):
+    return u8(21) + borsh_text(repo) + borsh_bytes(branch) + borsh_option(None, borsh_bytes) + borsh_option(1, u64)
+
+
+def forge_preview(repo, n):
+    return u8(18) + borsh_text(repo) + u64(n)
+
+
+def forge_statuses(repo, commit, after):
+    return u8(19) + borsh_text(repo) + borsh_text(commit) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+
+
+def forge_answer(reply, tag, query, paged):
     reader = Reader(reply)
-    if reader.u8() != 2:
-        raise Refused(502, "forge-reach answered Wanted with something else")
+    if reader.u8() != tag:
+        raise Refused(502, f"forge answered {query} with something else")
     reader.u64()
-    rows = []
-    for _ in range(int.from_bytes(reader.take(4), "little")):
-        repo = reader.bytes().decode(errors="replace")
-        n = reader.u64()
-        commit = reader.bytes().decode(errors="replace")
-        context = reader.bytes().decode(errors="replace")
-        rows.append({"repo": repo, "n": n, "commit": commit, "context": context})
-    return rows, reader.bytes() if reader.u8() == 1 else None
+    if paged:
+        reader.u64()
+    return reader
+
+
+def page_count(reader):
+    return int.from_bytes(reader.take(4), "little")
+
+
+def page_next(reader):
+    return reader.bytes() if reader.u8() == 1 else None
+
+
+def text_at(reader):
+    return reader.bytes().decode(errors="replace")
+
+
+def forge_principal(reader):
+    match reader.u8():
+        case 0:
+            return ("account", reader.u64())
+        case 1:
+            return ("root",)
+        case 2:
+            return ("foreign", reader.take(32).hex(), reader.u64())
+        case other:
+            raise Refused(502, f"a reply names principal kind {other}")
+
+
+def repos_of(reply):
+    reader = forge_answer(reply, 0, "Repos", True)
+    names = []
+    for _ in range(page_count(reader)):
+        names.append(text_at(reader))
+        reader.u8()
+        forge_principal(reader)
+        reader.bytes()
+        reader.take(2)
+        reader.u64()
+        reader.u64()
+    return names, page_next(reader)
+
+
+def required_of(reply):
+    reader = forge_answer(reply, 18, "Required", True)
+    branches = []
+    for _ in range(page_count(reader)):
+        branch = reader.bytes()
+        reporter = forge_principal(reader)
+        contexts = [text_at(reader) for _ in range(page_count(reader))]
+        branches.append({"branch": branch, "reporter": reporter, "contexts": contexts})
+    return branches, page_next(reader)
+
+
+def queue_front_of(reply):
+    reader = forge_answer(reply, 19, "Queue", True)
+    return reader.u64() if page_count(reader) > 0 else None
+
+
+def preview_of(reply):
+    reader = forge_answer(reply, 16, "Preview", False)
+    if reader.u8() != 1:
+        return None
+    reader.u64()
+    text_at(reader)
+    text_at(reader)
+    return text_at(reader)
+
+
+def statuses_of(reply):
+    reader = forge_answer(reply, 17, "Statuses", True)
+    found = []
+    for _ in range(page_count(reader)):
+        reporter = forge_principal(reader)
+        context = text_at(reader)
+        state = reader.u8()
+        if state >= len(CHECK_STATES):
+            raise Refused(502, f"forge names check state {state}")
+        if reader.u8() == 1:
+            reader.bytes()
+        reader.u64()
+        found.append({"reporter": reporter, "context": context, "state": CHECK_STATES[state]})
+    return found, page_next(reader)
+
+
+def repo_of_key(word):
+    try:
+        key = bytes.fromhex(word)
+    except ValueError:
+        return None
+    repo, end, _ = key[2:].partition(b"\x00\x00")
+    return repo.decode(errors="replace") if end and repo else None
 
 
 def rerun_key(repo, commit):
@@ -1988,9 +2090,12 @@ def rerun_command(row):
     return ["sh", BUILD_SH, f"JOB={room}", f"NOTIFY={room}", *first_limit, row["repo"], row["commit"], "lane"]
 
 
-def wanted_at(line):
+def front_touched(line):
     words = line.decode(errors="replace").rstrip("\r\n").split("\t")
-    return words[0] if len(words) == 3 and words[1].startswith(WANTED_KEYS) else None
+    if len(words) != 3 or not words[1].startswith(FRONT_KEYS):
+        return None
+    repo = repo_of_key(words[1])
+    return None if repo is None else (words[0], repo)
 
 
 def run_lines(stream):
@@ -3404,12 +3509,16 @@ class Notifier:
 
 
 class Rerunner:
-    def __init__(self, signer, kube, launch, retry_pause):
+    def __init__(self, signer, kube, launch, retry_pause, post):
         self.signer = signer
         self.kube = kube
         self.launch = launch
         self.retry_pause = retry_pause
+        self.post = post
         self.reporter = None
+        self.lock = threading.RLock()
+        self.retrying = set()
+        self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
         self.pause = time.sleep
 
     def asked(self, program, request):
@@ -3435,10 +3544,10 @@ class Rerunner:
                 self.pause(pause)
                 pause *= 2
 
-    def wanted(self):
+    def pages(self, ask, read):
         rows, after = [], None
         while True:
-            found, after = wanted_of(self.asked(FORGE_REACH, reach_wanted(self.reporter, after)))
+            found, after = read(self.asked(FORGE_PROGRAM, ask(after)))
             rows += found
             if after is None:
                 return rows
@@ -3449,41 +3558,111 @@ class Rerunner:
             say("pods_unkept", reason="kubectl_failed", keys=len(changes), detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
         return ran.code == 0
 
-    def settle(self):
-        rows = {rerun_key(row["repo"], row["commit"]): row for row in self.wanted() if row["context"] == LANE_CONTEXT and FULL_COMMIT.fullmatch(row["commit"])}
-        kept = self.kube.kept_load()
-        gone = {key: None for key in kept if key.startswith(RERUN) and key not in rows}
-        if gone:
-            self.keep(gone)
-        for key, row in rows.items():
-            if key not in kept:
-                self.rerun(key, row)
+    def front(self, repo, required, lane):
+        n = queue_front_of(self.asked(FORGE_PROGRAM, forge_queue_front(repo, required["branch"])))
+        if n is None:
+            return None
+        merge = preview_of(self.asked(FORGE_PROGRAM, forge_preview(repo, n)))
+        if merge is None or not FULL_COMMIT.fullmatch(merge):
+            return None
+        statuses = self.pages(lambda after: forge_statuses(repo, merge, after), statuses_of)
+        states = {found["context"]: found["state"] for found in statuses if found["reporter"] == required["reporter"]}
+        ready = all(states.get(context) == "passed" for context in required["contexts"] if context != lane)
+        waiting = states.get(lane, "pending") == "pending"
+        return {"repo": repo, "n": n, "commit": merge, "wanted": ready and waiting}
+
+    def fronts(self, repo):
+        lane = f"{self.reporter}/{LANE_CONTEXT}"
+        asking = [required for required in self.pages(lambda after: forge_required(repo, after), required_of) if lane in required["contexts"]]
+        fronts = {}
+        for required in asking:
+            front = self.front(repo, required, lane)
+            if front is not None:
+                fronts[rerun_key(repo, front["commit"])] = front
+        return bool(asking), fronts
+
+    def settle(self, repo):
+        with self.lock:
+            asking, fronts = self.fronts(repo)
+            if not asking:
+                return
+            kept = self.kube.kept_load()
+            gone = {key: None for key, value in kept.items() if key.startswith(RERUN) and key not in fronts and json.loads(value).get("repo") == repo}
+            if gone:
+                self.keep(gone)
+            for key, front in fronts.items():
+                if not front["wanted"]:
+                    continue
+                if key not in kept:
+                    self.rerun(key, front)
+                elif "unstarted" in json.loads(kept[key]):
+                    self.retry_later(repo, key)
 
     def rerun(self, key, row):
         record = {"repo": row["repo"], "n": row["n"], "commit": row["commit"]}
         if not self.keep({key: json.dumps(record)}):
-            return
+            return False
         try:
             ran = self.launch(rerun_command(row))
         except Refused as refused:
-            say("pods_rerun_unstarted", repo=row["repo"], n=row["n"], commit=row["commit"], detail=json.dumps(refused.sentence))
-            self.keep({key: json.dumps({**record, "unstarted": refused.sentence})})
-            return
+            return self.unstarted(key, row, record, refused.sentence)
         started = STARTED.search(ran.out)
         if started is None:
-            why = f"build.sh answered exit {ran.code} with no run"
-            say("pods_rerun_unstarted", repo=row["repo"], n=row["n"], commit=row["commit"], detail=json.dumps(why))
-            self.keep({key: json.dumps({**record, "unstarted": why})})
-            return
+            return self.unstarted(key, row, record, f"build.sh answered exit {ran.code} with no run")
         run = started.group(1).decode(errors="replace")
         say("pods_rerun", repo=row["repo"], n=row["n"], commit=row["commit"], run=json.dumps(run))
         self.keep({key: json.dumps({**record, "run": run})})
+        return True
 
-    def settled(self):
+    def unstarted(self, key, row, record, why):
+        say("pods_rerun_unstarted", repo=row["repo"], n=row["n"], commit=row["commit"], detail=json.dumps(why))
+        self.keep({key: json.dumps({**record, "unstarted": why})})
+        told = hashlib.sha256(f"{row['repo']}\n{row['commit']}\n{why}".encode()).hexdigest()
+        detail = f"the lane on Preview {row['commit']} did not start: {why}. The pods service asks again from one block, doubling, while that Preview is its queue's front."
+        said = {"group": f"lane {row['commit']}", "subject": f"the lane of {row['repo']} #{row['n']}", "status": "failed", "detail": detail, "concerns": []}
+        self.post(f"forge:{row['repo']}:{row['n']}", f"pods-rerun-{told}", said)
+        self.retry_later(row["repo"], key)
+        return False
+
+    def retry_later(self, repo, key):
+        if key not in self.retrying:
+            self.retrying.add(key)
+            self.spawn(self.retry, repo, key)
+
+    def retry(self, repo, key):
+        pause = self.retry_pause
         try:
-            self.settle()
+            while True:
+                self.pause(pause)
+                pause *= 2
+                with self.lock:
+                    _, fronts = self.fronts(repo)
+                    front = fronts.get(key)
+                    record = self.kube.kept_load().get(key)
+                    if front is None or not front["wanted"] or record is None or "unstarted" not in json.loads(record):
+                        return
+                    if self.rerun(key, front):
+                        return
         except Exception as error:
-            say("pods_rerun_unsettled", detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+            say("pods_rerun_unsettled", repo=repo, detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+        finally:
+            with self.lock:
+                self.retrying.discard(key)
+
+    def settled(self, repo):
+        try:
+            self.settle(repo)
+        except Exception as error:
+            say("pods_rerun_unsettled", repo=repo, detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+
+    def reopened(self):
+        try:
+            repos = self.pages(forge_repos, repos_of)
+        except Exception as error:
+            say("pods_rerun_unsettled", detail=json.dumps(f"forge's repositories were not listed: {error.sentence if isinstance(error, Refused) else repr(error)}"))
+            return
+        for repo in repos:
+            self.settled(repo)
 
     def watch(self):
         try:
@@ -3497,16 +3676,21 @@ class Rerunner:
         say("pods_rerunning", reporter=self.reporter)
         pause = self.retry_pause
         while True:
-            process = self.signer.follow(FORGE_REACH)
-            self.settled()
-            heard, at = False, None
+            process = self.signer.follow(FORGE_PROGRAM)
+            self.reopened()
+            heard, at, settled = False, None, set()
             with process.stdout:
                 for line in process.stdout:
                     heard = True
-                    height = wanted_at(line)
-                    if height is not None and height != at:
-                        at = height
-                        self.settled()
+                    touched = front_touched(line)
+                    if touched is None:
+                        continue
+                    height, repo = touched
+                    if height != at:
+                        at, settled = height, set()
+                    if repo not in settled:
+                        settled.add(repo)
+                        self.settled(repo)
             say("pods_rerun_unfollowed", code=process.wait(), heard=heard)
             if heard:
                 pause = self.retry_pause
@@ -3557,10 +3741,13 @@ class Service:
         self.swept = threading.Event()
         self.rerouting = threading.Lock()
         self.launched = {}
-        self.rerunner = Rerunner(signer, kube, lambda command: self.routed(None, command, None), self.retry_pause)
+        self.rerunner = Rerunner(signer, kube, lambda command: self.routed(None, command, None), self.retry_pause, self.tell_room)
 
     def machines(self):
         return ", ".join(f"pod {name}" for name in self.runners)
+
+    def tell_room(self, channel, message_id, said):
+        return self.notifier.post({NOTIFY_CHANNEL: channel}, None, message_id, said, unvouched=True)
 
     def pod(self, name):
         ran = self.kube.get(name)

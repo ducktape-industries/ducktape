@@ -597,13 +597,19 @@ one up for another network.
   machine's own files, so the check trusts anyone who can run commands on the
   build machines: it guards against mistakes, not against a forged run
   directory.
-- A lane forge-reach asks the service's account for again (forge-reach
-  `Wanted`: a Preview whose passed lane went Pending only because its target
-  moved, with every other required context passed) runs by itself, once per
-  Preview: the service follows forge-reach's changes, keeps a `rerun-` key in
-  the ConfigMap `runs` before it starts each one, and starts it as a `builds`
-  call would, notifying the change's room `forge:<repo>:<n>`
-  (`pods_rerun run=`, or `pods_rerun_unstarted` with why). Its report then
+- The lane a merge queue's front waits on runs by itself, once per Preview,
+  and only the front's: the service follows forge's changes, settles every
+  repository forge lists each time the stream opens, and on each block that
+  writes a repository's queue, statuses, Previews or required checks reads
+  that repository's branches that require `<the service's
+  account>/build.sh#lane`, each one's queue front and that front's Preview
+  statuses. When the lane there is Pending or missing and every other
+  required context passed (a front whose review is Pending waits for it), it
+  keeps a `rerun-` key in the ConfigMap `runs`, then starts the lane as a
+  `builds` call would, notifying the change's room `forge:<repo>:<n>`
+  (`pods_rerun run=`). A lane that doesn't start is posted in that room once
+  per reason (`pods_rerun_unstarted` with why) and asked again from one block
+  time, doubling, while that Preview is still the front. Its report then
   lands as above and carries the Preview.
 - Each line a followed pod (or a build runner) prints that reads
   `ducktape-files <run> <tar> <folder>` (build.sh's `shot` run with `TO`)

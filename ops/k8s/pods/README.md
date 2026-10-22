@@ -72,16 +72,25 @@ or through a member node's halo forward.
 - A build.sh call sent to a pod by name (the warm pod, not `builds` or a build runner) goes with
   `PINNED=1` added to its settings, unless it names that itself. build.sh's `movable` then keeps
   the run, so `builds`' reroute never moves it to another machine.
-- A lane that forge-reach asks the service's own account for again (`Wanted { reporter }`: a
-  Preview whose passed lane went Pending only because the target branch moved) runs once per
-  Preview, by itself. With a key, a thread finds the account the key acts as (identity
-  `OfKey`), follows `ducktape changes forge-reach`, and reads `Wanted` page by page as it
-  starts and on each block that changes a `w/` row. For each `build.sh#lane` row it first keeps
+- The lane a merge queue's front waits on starts by itself, once per Preview, and only the
+  front's. With a key, a thread finds the account the key acts as (identity `OfKey`) and
+  follows `ducktape changes forge`. Each time the stream opens it reads forge `Repos` a page at
+  a time and settles every repository it lists (so any repository with a queue); then it
+  settles a repository once per block that writes its queue (`e/`), statuses (`s/`), Previews
+  (`m/`) or required checks (`q/`). A settle reads forge `Required`, and for each branch whose contexts
+  hold `<the service's account>/build.sh#lane` its `Queue` front, that change's `Preview` and
+  the Preview commit's `Statuses`; a repository with such a branch also has the ConfigMap `runs`
+  read once. When the branch's reporter has that lane Pending or nothing there, and every other
+  required context Passed (a front whose review is Pending waits for it), it first keeps
   `rerun-<sha256(repo, commit)>` in the ConfigMap `runs`, then calls build.sh
-  `JOB=forge:<repo>:<n> NOTIFY=forge:<repo>:<n> [FIRST_LIMIT=<minutes>] <repo> <commit> lane` as a `builds` call goes
-  (with no request behind it), and records the run, or why none started, under the key. A
-  restart never starts a second lane for a Preview it kept, a key whose row is gone is dropped,
-  and the lane's report reaches forge-reach as any lane's does.
+  `JOB=forge:<repo>:<n> NOTIFY=forge:<repo>:<n> [FIRST_LIMIT=<minutes>] <repo> <commit> lane`
+  as a `builds` call goes (with no request behind it), and records the run under the key. A
+  lane that doesn't start is recorded with why, posted in the change's room once per distinct
+  reason, and asked again after one block time, then two, four and so on, while that Preview is
+  still its queue's front; it stops as soon as the front moves. A restart never starts a second
+  lane for a Preview it kept (it takes up the retries of the ones that didn't start), a key whose
+  Preview is no longer its queue's front is dropped, and the lane's report reaches forge-reach
+  as any lane's does.
 
 ## What it needs
 
