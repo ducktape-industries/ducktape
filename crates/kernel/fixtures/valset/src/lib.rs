@@ -136,6 +136,10 @@ mod program {
         }
 
         fn execute(ctx: &mut Execute, env: &Env, payload: &[u8]) -> Result<(), Refusal> {
+            let completed = matches!(env.cause, abi::Cause::Completion { .. });
+            if completed {
+                return Ok(());
+            }
             let Origin::External(signer) = &env.origin else {
                 return Err(Refusal::new(reason::UNAUTHORIZED, "a key signs every op"));
             };
@@ -168,7 +172,7 @@ mod program {
                 }
                 Op::Vote(motion) => {
                     if let Some(Forwarded { role, op }) = roster.enact(motion)? {
-                        ctx.emit(env.roles.bound(&role)?.clone(), op, false);
+                        ctx.emit(env.roles.bound(&role)?.clone(), op, true);
                     }
                     ctx.output(abi::encode(&Voted::Enacted));
                 }

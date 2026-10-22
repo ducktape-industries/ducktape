@@ -10,7 +10,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use abi::role::validators::{Grant, Invite, Motion, Op, QueryPolicy, Voted};
-use abi::{BlobId, HashKind, Outcome, Scan, Scheme, role};
+use abi::{BlobId, HashKind, Outcome, Receipt, Scan, Scheme, role};
 use clap::{Args, Parser, Subcommand};
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::Runner as _;
@@ -1568,7 +1568,23 @@ async fn membership(
     );
     let (height, receipt) = client.land(&frame).await.sentence()?;
     match receipt.outcome {
-        Outcome::Applied { output } => Ok((height, output)),
+        Outcome::Applied { output } => {
+            if let (
+                Op::Vote(Motion::Role { .. }),
+                Some(Receipt {
+                    program,
+                    outcome: Outcome::Rejected(refusal),
+                    ..
+                }),
+            ) = (&op, receipt.nested.first())
+            {
+                return Err(format!(
+                    "refused at block {height}: {program}: {}: {}",
+                    refusal.reason, refusal.sentence
+                ));
+            }
+            Ok((height, output))
+        }
         Outcome::Rejected(refusal) => Err(format!(
             "refused at block {height}: {}: {}",
             refusal.reason, refusal.sentence

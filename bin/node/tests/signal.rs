@@ -187,6 +187,127 @@ fn a_node_stops_on_sigterm_and_opens_again_with_nothing_to_replay() {
 }
 
 #[test]
+fn role_votes_report_the_enacted_operations_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = founded(root.path());
+    let node = run(&workspace, "127.0.0.1:0", "role-votes");
+    let runtime = runtime();
+    let client = Client::new(format!("http://{}", node.http));
+    let roles = runtime.block_on(client.status()).unwrap().roles;
+    let payload = root.path().join("refused-op");
+    std::fs::write(&payload, [0xff]).unwrap();
+    let mut answers = Vec::new();
+    for (role, program) in roles.iter() {
+        let output = ducktape(&workspace)
+            .args(["--node", client.base(), "vote", "role", role])
+            .arg(&payload)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let height: u64 = text
+            .split_once("block ")
+            .unwrap_or_else(|| panic!("{role}: {text}"))
+            .1
+            .split(|character: char| !character.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let block = runtime
+            .block_on(client.block(noded::wire::BlockAsk {
+                by: noded::wire::BlockRef::Height(height),
+                most: 0,
+            }))
+            .unwrap()
+            .unwrap();
+        let receipt = block
+            .txs
+            .into_iter()
+            .filter_map(|tx| tx.receipt)
+            .find(|receipt| receipt.nested.iter().any(|ran| &ran.program == program))
+            .unwrap_or_else(|| panic!("{role}: no enacted receipt at {height}"));
+        let abi::Outcome::Applied { output: voted } = receipt.outcome else {
+            panic!("{role}: vote itself refused");
+        };
+        assert_eq!(
+            abi::decode::<abi::role::validators::Voted>(&voted).unwrap(),
+            abi::role::validators::Voted::Enacted
+        );
+        let ran = receipt
+            .nested
+            .into_iter()
+            .find(|ran| &ran.program == program)
+            .unwrap();
+        let abi::Outcome::Rejected(refusal) = ran.outcome else {
+            panic!("{role}: malformed enacted operation was not refused");
+        };
+        answers.push((role.to_owned(), program.clone(), height, refusal, output));
+    }
+    let (status, log) = terminated(node);
+    assert_eq!(status.code(), Some(0), "{log}");
+    for (role, program, height, refusal, output) in answers {
+        assert!(!output.status.success(), "{role}: {output:?}");
+        assert!(output.stdout.is_empty(), "{role}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!("block {height}")),
+            "{role}: {stderr}"
+        );
+        assert!(stderr.contains(&program), "{role}: {stderr}");
+        assert!(stderr.contains(&refusal.reason), "{role}: {stderr}");
+        assert!(stderr.contains(&refusal.sentence), "{role}: {stderr}");
+    }
+}
+
+#[test]
+fn successful_role_and_membership_votes_stay_successful() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = founded(root.path());
+    let node = run(&workspace, "127.0.0.1:0", "successful-votes");
+    let endpoint = format!("http://{}", node.http);
+    let payload = root.path().join("open-lane");
+    std::fs::write(
+        &payload,
+        abi::encode(&halo::Op::Open {
+            name: "vote-success".to_owned(),
+            cap: halo::Class::Client,
+        }),
+    )
+    .unwrap();
+    let role = ducktape(&workspace)
+        .args(["--node", &endpoint, "vote", "role", abi::role::HALO])
+        .arg(&payload)
+        .output()
+        .unwrap();
+    let queries = ducktape(&workspace)
+        .args(["--node", &endpoint, "vote", "queries", "open"])
+        .output()
+        .unwrap();
+    let absent = ducktape(&workspace)
+        .args(["--node", &endpoint, "vote", "role", "unbound"])
+        .arg(&payload)
+        .output()
+        .unwrap();
+    let (status, log) = terminated(node);
+    assert_eq!(status.code(), Some(0), "{log}");
+    for output in [role, queries] {
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let height = stdout.strip_prefix("enacted at block ").unwrap().trim();
+        assert!(height.parse::<u64>().unwrap() > 0, "{stdout}");
+    }
+    assert!(!absent.status.success(), "{absent:?}");
+    assert!(absent.stdout.is_empty(), "{absent:?}");
+    let stderr = String::from_utf8(absent.stderr).unwrap();
+    assert!(stderr.contains(abi::reason::UNSUPPORTED), "{stderr}");
+    assert!(stderr.contains("unbound"), "{stderr}");
+}
+
+#[test]
 fn submit_land_answers_with_the_block_that_carried_the_frame() {
     let root = tempfile::tempdir().unwrap();
     let workspace = founded(root.path());

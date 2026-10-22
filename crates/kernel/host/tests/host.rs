@@ -822,13 +822,14 @@ fn dropping_a_program_drops_every_role_it_filled_in_the_same_block() {
     });
 }
 
-/// The validators' vote on `op` at `height`, through the fixture valset: its receipt.
 async fn halo_vote(host: &mut Host<Ctx>, height: u64, op: &halo::Op) -> Receipt {
     let motion = validators::Motion::Role {
         role: role::HALO.into(),
         op: abi::encode(op),
     };
-    vote(host, height, motion).await
+    let receipt = vote(host, height, motion).await;
+    output(&receipt);
+    receipt.nested.into_iter().next().unwrap()
 }
 
 #[test]
