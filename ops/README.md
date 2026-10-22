@@ -862,6 +862,25 @@ one up for another network.
     to its `reset`, cover one more read of every kind of run; between
     reads it keeps the last readings. A refused or unreadable answer (a
     spent limit answers 403) is unread.
+  - once a UTC day, each app release channel `WATCH_CHANGELOG` names: the
+    desktop nightly and stable by the `sequence` and the `display` commit
+    of `dl.ducktape.industries/app/<channel>.json`, which GitHub's
+    `release.yml` and the forge release workflows both publish, and
+    TestFlight by its newest `refs/tags/testflight-<build>`, read from
+    GitHub's git `info/refs` (not the API, so not its limit). When a
+    channel has moved past the commit its last entry named, one forge
+    `Log` from the channel's branch, less that commit, gives the squashes
+    in between. Each one's `Release note:` line (its title when it has
+    none; `none` leaves it out) goes into one entry in chat channel
+    `release`, with the commits and change numbers in its thread, posted
+    once the entry is in a block. A day whose changes all say `none`
+    posts nothing. A row's `since` and `since_sequence` name where a fresh
+    claim starts; with none, the first read only marks where the channel
+    is. Entries keep an outbox of their own, flushed after the alerts' one,
+    so an entry chat refuses (watch with no seat in `release`) never
+    holds an alert back; they never go to the pager, and a
+    channel that does not read logs `changelog_unread` once and is read
+    again at the next sample.
 - A check it cannot read changes nothing, and logs `check_unread` once as
   it turns unread: with the node down, the rate and the public URL are
   unread. It saves what it decided to its claim `state` before it posts,

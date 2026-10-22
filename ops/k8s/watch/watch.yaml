@@ -153,6 +153,12 @@ spec:
               value: >-
                 [{"check": "release-nightly", "label": "desktop nightly", "repo": "ducktape-industries/app", "workflow": "release.yml", "runs": [{"branch": "dev", "event": "push"}, {"event": "schedule"}, {"event": "workflow_dispatch"}]},
                 {"check": "release-stable", "label": "desktop stable", "repo": "ducktape-industries/app", "workflow": "release.yml", "runs": [{"branch": "main", "event": "push"}]}]
+            - name: WATCH_CHANGELOG
+              value: >-
+                {"channel": "release", "repo": "app", "channels": [
+                {"check": "nightly", "label": "Desktop nightly", "tags": "#app", "emoji": "🌙", "branch": "dev", "manifest": "https://dl.ducktape.industries/app/nightly.json", "since": "1708042bce09e9cf10f80c6271ea9df96ed48687", "since_sequence": 1792644023},
+                {"check": "stable", "label": "Desktop stable", "tags": "#app", "emoji": "🦆", "branch": "main", "manifest": "https://dl.ducktape.industries/app/stable.json", "since": "437f74979ebcfc3445e2330a13842eb2f4a59eca", "since_sequence": 1792490372},
+                {"check": "testflight", "label": "TestFlight", "tags": "#mobile", "emoji": "📱", "branch": "dev", "refs": "https://github.com/ducktape-industries/app.git", "prefix": "testflight-", "since": "21d5fa9e2d12422151c43ea6a858fc7c2b767d38", "since_sequence": 1792645567}]}
             - {name: WATCH_STATE, value: /state}
             - {name: WATCH_KEYS, value: /keys}
             - {name: WATCH_WORKSPACE, value: /tmp/ducktape}

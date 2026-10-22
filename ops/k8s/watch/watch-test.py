@@ -26,6 +26,7 @@ WARM_PATH = f"/api/v1/namespaces/agents/pods/{WARM}"
 SNAPSHOT = {"sha256": "a3cce76a042711ab8d3bad219c9d95a1e32ea3ce754c7d25fe17ff0a24a0c8e3"}
 RUNNING = {"running": {"startedAt": "2026-10-21T07:45:12Z"}}
 OOM = {"terminated": {"exitCode": 137, "reason": "OOMKilled", "startedAt": "2026-10-20T08:02:41Z", "finishedAt": "2026-10-21T07:30:06Z", "containerID": "containerd://5e1c"}}
+FORGE_PAGE = 2
 NOT_FOUND = json.dumps({"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure", "message": f'pods "{WARM}" not found', "reason": "NotFound", "details": {"name": WARM, "kind": "pods"}, "code": 404}).encode()
 
 
@@ -128,9 +129,11 @@ class FakeKube:
 
 
 class FakeCli:
-    def __init__(self, budget=BUDGET, files=None):
+    def __init__(self, budget=BUDGET, files=None, forge=None):
         self.budget = budget
         self.files = {} if files is None else files
+        self.forge = {} if forge is None else forge
+        self.logs = []
         self.reads = []
         self.asked = []
         self.posted = {}
@@ -139,6 +142,7 @@ class FakeCli:
         self.landing_unseen = False
         self.dying = False
         self.stalled = False
+        self.refusing = set()
 
     def query(self, program, query, confirmed=False):
         if program == "harness":
@@ -150,8 +154,21 @@ class FakeCli:
             return {"budget_facts": {"budget": self.budget, "facts": []}}
         if program == "files":
             return self.files_answer(query)
-        found = self.posted.get(query["message_by_id"]["message_id"])
-        return {"message": None if found is None else {"text": found}}
+        if program == "forge":
+            return self.forge_answer(query["log"])
+        named = query["message_by_id"]["message_id"]
+        found = self.posted.get(named)
+        return {"message": None if found is None else {"text": found, "seq": list(self.posted).index(named) + 1}}
+
+    def forge_answer(self, log):
+        self.logs.append(log)
+        rows = self.forge[bytes.fromhex(log["from"]["ref"]).decode()]
+        if log["exclude"] is not None:
+            rows = rows[: [commit for commit, _ in rows].index(log["exclude"]["oid"])]
+        start = int(log["page"]["after"] or "0")
+        items = [{"oid": commit, "message": text.encode().hex(), "parents": [], "tree": ""} for commit, text in rows[start : start + FORGE_PAGE]]
+        more = start + FORGE_PAGE < len(rows)
+        return {"log": {"height": 1, "page": {"height": 1, "items": items, "next": str(start + FORGE_PAGE) if more else None}, "tip": rows[0][0]}}
 
     def files_answer(self, query):
         if isinstance(self.files, Exception):
@@ -167,18 +184,21 @@ class FakeCli:
 
     def op(self, program, op):
         self.ops.append(op)
-        posted = op["post_message"]
+        posted = op.get("post_message") or op["post"]
+        text = posted["text"] if "post" in op else posted["blocks"][0]["paragraph"][0]["text"]
+        if posted["channel_id"] in self.refusing:
+            raise watch.Unread(f"chat: refused: {posted['channel_id']} is members-only")
         if self.dying:
-            self.posted[posted["message_id"]] = posted["blocks"][0]["paragraph"][0]["text"]
+            self.posted[posted["message_id"]] = text
             raise Killed()
         if self.landing_unseen:
-            self.posted[posted["message_id"]] = posted["blocks"][0]["paragraph"][0]["text"]
+            self.posted[posted["message_id"]] = text
             raise watch.Unread("the answer was lost")
         if self.failing:
             raise watch.Unread("unlanded")
         if self.stalled:
             return {"pooled": posted["message_id"]}
-        self.posted[posted["message_id"]] = posted["blocks"][0]["paragraph"][0]["text"]
+        self.posted[posted["message_id"]] = text
         return {"pooled": posted["message_id"]}
 
 
@@ -864,6 +884,215 @@ class Whole(unittest.TestCase):
             "🔴 desktop nightly: release.yml's push run on dev at 4c70294b failed: https://github.com/ducktape-industries/app/actions/runs/39649540423",
             "🟢 desktop nightly is good again: release.yml's schedule run on main at 437f7497 passed: https://github.com/ducktape-industries/app/actions/runs/39700000000",
         ])
+
+
+def oid(n):
+    return str(n) * 40
+
+
+def squash(subject, number, *body):
+    return "\n".join([f"{subject} (change {number})", "", "What it does, for reviewers.", *body, ""])
+
+
+NIGHTLY_JSON = "https://dl.ducktape.industries/app/nightly.json"
+REFS = "https://github.com/ducktape-industries/app.git"
+REFS_URL = REFS + watch.UPLOAD_PACK
+NIGHTLY_CHANNEL = {"check": "nightly", "label": "Desktop nightly", "tags": "#app", "emoji": "🌙", "branch": "dev", "manifest": NIGHTLY_JSON}
+TESTFLIGHT_CHANNEL = {"check": "testflight", "label": "TestFlight", "tags": "#mobile", "emoji": "📱", "branch": "dev", "refs": REFS, "prefix": "testflight-"}
+DEV = [
+    (oid(5), squash("host: a long press opens the menu", 205, "Release note: A long press on a message opens its menu.")),
+    (oid(4), squash("phone tests: seat a program of their own", 204, "Release note: none")),
+    (oid(3), squash("host: pictures drawn at the window's pixels", 203)),
+    (oid(2), squash("phone: the OS edit menu over a selection", 202, "Release note: Selecting text brings up Copy and Paste.")),
+    (oid(1), squash("release: fetch cmake", 201, "Release note: none.")),
+    (oid(0), "app: the first commit\n"),
+]
+
+
+def manifest(sequence, commit, at="2026-10-22T05:02:38Z"):
+    signed = {"schema": 1, "channel": "nightly", "sequence": sequence, "published_at": at, "release": {"sha256_id": "acf9", "display": f"0.1.0+{commit[:7]}", "notes_url": f"https://github.com/ducktape-industries/app/releases/tag/bin-{commit}"}, "artifacts": {}, "successor_key": None}
+    return (200, json.dumps({"manifest": json.dumps(signed), "signature": "00"}).encode())
+
+
+def pkt(text):
+    return f"{len(text) + 4:04x}".encode() + text
+
+
+def advertisement(refs):
+    lines = [pkt(b"# service=git-upload-pack\n"), b"0000"]
+    for at, (name, sha) in enumerate(refs):
+        caps = b"\0multi_ack thin-pack side-band ofs-delta" if at == 0 else b""
+        lines.append(pkt(f"{sha} {name}".encode() + caps + b"\n"))
+    return (200, b"".join(lines) + b"0000")
+
+
+def changelog_watch(path, http, cli, clock, *channels):
+    changelog = watch.Changelog.of({"channel": "release", "repo": "app", "channels": list(channels)})
+    config = watch.Config(NODE, PUBLIC, "", "alerts", (), (), changelog=changelog)
+    http.answers.setdefault(NODE + "/v1/status", (200, status(1)))
+    http.answers.setdefault(PUBLIC + "/v1/status", (200, status(1)))
+    return watch.Watch(config, http, ready_kube(), cli, watch.Store(path), watch.Pager([]), clock)
+
+
+DAY = 86_400
+
+
+class Notes(unittest.TestCase):
+    def test_a_note_line_wins_over_the_title_none_drops_the_change_and_no_line_falls_back_to_the_title_without_its_change_mark(self):
+        self.assertEqual([watch.note_of(text) for _, text in DEV], [
+            ("205", "A long press on a message opens its menu."),
+            ("204", None),
+            ("203", "host: pictures drawn at the window's pixels"),
+            ("202", "Selecting text brings up Copy and Paste."),
+            ("201", None),
+            (None, "app: the first commit"),
+        ])
+
+    def test_a_manifest_names_its_sequence_version_time_and_commit_prefix(self):
+        http = FakeHttp({NIGHTLY_JSON: manifest(1792644023, "1708042bce09e9cf10f80c6271ea9df96ed48687")})
+        self.assertEqual(watch.manifest_published(http, NIGHTLY_JSON), watch.Published(1792644023, "1708042", "0.1.0+1708042", "2026-10-22T05:02:38Z"))
+
+    def test_the_newest_build_tag_names_the_build_and_an_annotated_one_its_peeled_commit(self):
+        refs = [("HEAD", oid(9)), ("refs/heads/dev", oid(9)), ("refs/tags/bin-" + oid(8), oid(8)), ("refs/tags/testflight-1792636487", oid(7)), ("refs/tags/testflight-1792645567", oid(6)), ("refs/tags/testflight-1792645567^{}", oid(5)), ("refs/tags/testflight-x", oid(4))]
+        channel = watch.Channel.of(TESTFLIGHT_CHANNEL)
+        self.assertEqual(watch.tags_published(FakeHttp({REFS_URL: advertisement(refs)}), channel), watch.Published(1792645567, oid(5), "build 1792645567", ""))
+        with self.assertRaises(watch.Unread):
+            watch.tags_published(FakeHttp({REFS_URL: advertisement(refs[:3])}), channel)
+
+    def test_a_channel_names_one_of_a_manifest_and_tags(self):
+        for row in ({**NIGHTLY_CHANNEL, "refs": REFS}, {key: value for key, value in NIGHTLY_CHANNEL.items() if key != "manifest"}):
+            with self.assertRaises(ValueError):
+                watch.Channel.of(row)
+
+
+class ChangelogPosts(unittest.TestCase):
+    def test_a_channel_posts_one_entry_a_day_with_every_note_since_its_last_and_the_details_in_its_thread(self):
+        seeded = {**NIGHTLY_CHANNEL, "since": oid(0), "since_sequence": 100}
+        http = FakeHttp({NIGHTLY_JSON: manifest(300, oid(4))})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        clock = Clock()
+        clock.now = 1792627200
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, clock, seeded)
+            watcher.tick()
+            http.answers[NIGHTLY_JSON] = manifest(400, oid(5))
+            for _ in range(3):
+                clock.now += watch.SAMPLE_S
+                watcher.tick()
+            self.assertEqual(http.asked.count(NIGHTLY_JSON), 1)
+            self.assertEqual([log["exclude"] for log in cli.logs], [{"oid": oid(0)}] * 3)
+            self.assertEqual([(op["post"]["message_id"], op["post"]["thread"]) for op in cli.ops], [(f"release-nightly-{oid(4)[:12]}", None), (f"release-nightly-{oid(4)[:12]}-details", 1)])
+            self.assertEqual(cli.ops[0]["post"]["channel_id"], "release")
+            self.assertEqual(cli.ops[0]["post"]["text"], "\n".join([
+                "#app 🌙 **Desktop nightly 0.1.0+4444444: what's new**",
+                "• host: pictures drawn at the window's pixels",
+                "• Selecting text brings up Copy and Paste.",
+                "*published 2026-10-22T05:02:38Z · rollback: the previous build · posted by watch*",
+            ]))
+            self.assertEqual(cli.ops[1]["post"]["text"].splitlines()[1:], [
+                "• Channel: Desktop nightly, 0.1.0+4444444, sequence 300",
+                f"• Source: app dev `{oid(4)}`",
+                f"• Since: `{oid(0)}`",
+                "• Changes: 203, 202",
+                "• Left out, release note none: 204, 201",
+            ])
+            clock.now += DAY
+            watcher.tick()
+            self.assertEqual(cli.logs[-1]["exclude"], {"oid": oid(4)})
+            self.assertEqual([op["post"]["message_id"] for op in cli.ops[2:]], [f"release-nightly-{oid(5)[:12]}", f"release-nightly-{oid(5)[:12]}-details"])
+            self.assertEqual(cli.ops[2]["post"]["text"].splitlines()[1:-1], ["• A long press on a message opens its menu."])
+            self.assertEqual(json.loads(watcher.store.path.read_text())["changelog"]["nightly"], {"sequence": 400, "commit": oid(5), "read": "2026-10-23"})
+
+    def test_a_day_whose_changes_all_say_none_posts_nothing_and_moves_on(self):
+        seeded = {**NIGHTLY_CHANNEL, "since": oid(3), "since_sequence": 300}
+        http = FakeHttp({NIGHTLY_JSON: manifest(400, oid(4))})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, Clock(), seeded)
+            watcher.tick()
+            self.assertEqual(cli.ops, [])
+            self.assertEqual(watcher.state["changelog"]["nightly"]["commit"], oid(4))
+
+    def test_without_a_seed_the_first_read_marks_where_the_channel_is_and_posts_nothing(self):
+        refs = [("refs/tags/testflight-1792645567", oid(3))]
+        http = FakeHttp({REFS_URL: advertisement(refs)})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, Clock(), TESTFLIGHT_CHANNEL)
+            watcher.tick()
+        self.assertEqual((cli.ops, watcher.state["changelog"]["testflight"]), ([], {"sequence": 1792645567, "commit": oid(3), "read": "1970-01-01"}))
+        self.assertEqual(cli.logs[-1]["exclude"], None)
+
+    def test_an_entry_that_landed_before_the_pod_stopped_is_not_posted_again_and_its_details_follow_once(self):
+        seeded = {**NIGHTLY_CHANNEL, "since": oid(0), "since_sequence": 100}
+        http = FakeHttp({NIGHTLY_JSON: manifest(300, oid(4))})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        cli.dying = True
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "state.json"
+            with self.assertRaises(Killed):
+                changelog_watch(path, http, cli, Clock(), seeded).tick()
+            cli.dying = False
+            watcher = changelog_watch(path, http, cli, Clock(), seeded)
+            watcher.tick()
+            watcher.tick()
+        self.assertEqual([op["post"]["message_id"] for op in cli.ops], [f"release-nightly-{oid(4)[:12]}", f"release-nightly-{oid(4)[:12]}-details"])
+        self.assertEqual(cli.ops[1]["post"]["thread"], 1)
+        self.assertEqual(http.asked.count(NIGHTLY_JSON), 1)
+
+    def test_details_wait_for_their_root_to_be_in_a_block(self):
+        seeded = {**NIGHTLY_CHANNEL, "since": oid(0), "since_sequence": 100}
+        http = FakeHttp({NIGHTLY_JSON: manifest(300, oid(4))})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        cli.stalled = True
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, Clock(), seeded)
+            watcher.tick()
+            self.assertEqual([op["post"]["message_id"] for op in cli.ops], [f"release-nightly-{oid(4)[:12]}"])
+            cli.stalled = False
+            watcher.tick()
+            watcher.tick()
+        self.assertEqual([op["post"]["thread"] for op in cli.ops], [None, None, 1])
+
+    def test_an_unread_channel_changes_nothing_logs_once_and_is_read_again_at_the_next_sample(self):
+        seeded = {**NIGHTLY_CHANNEL, "since": oid(0), "since_sequence": 100}
+        http = FakeHttp({NIGHTLY_JSON: (503, b"")})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        logged = []
+        watch.say = lambda event, **fields: logged.append(event)
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, Clock(), seeded)
+                watcher.tick()
+                http.answers[NIGHTLY_JSON] = (200, b"<html>")
+                watcher.tick()
+                self.assertEqual((watcher.state["changelog"], cli.ops), ({}, []))
+                http.answers[NIGHTLY_JSON] = manifest(300, oid(4))
+                watcher.tick()
+        finally:
+            watch.say = lambda event, **fields: None
+        self.assertEqual(logged.count("changelog_unread"), 1)
+        self.assertEqual(len(cli.ops), 2)
+        self.assertEqual(watcher.state["changelog_unread"], [])
+
+    def test_an_entry_chat_refuses_never_holds_back_a_later_alert_and_pages_nobody(self):
+        seeded = {**NIGHTLY_CHANNEL, "since": oid(0), "since_sequence": 100}
+        http = FakeHttp({NIGHTLY_JSON: manifest(300, oid(4))})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        cli.refusing = {"release"}
+        runner = FakePager()
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, Clock(), seeded)
+            watcher.pager = watch.Pager(["page"], runner)
+            watcher.tick()
+            http.answers[NODE + "/v1/status"] = watch.Unread("down")
+            watcher.tick()
+            watcher.tick()
+        alerts = [op["post_message"]["message_id"] for op in cli.ops if "post_message" in op]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn(alerts[0], cli.posted)
+        self.assertEqual(runner.pages, [])
+        self.assertEqual([item["id"] for item in watcher.state["posts"]], [f"release-nightly-{oid(4)[:12]}", f"release-nightly-{oid(4)[:12]}-details"])
 
 
 if __name__ == "__main__":

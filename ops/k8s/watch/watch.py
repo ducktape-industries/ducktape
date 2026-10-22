@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# watch: duckpond's alarms, off the chain and read-only. Each sample reads the block rate, the node's and the public /v1/status, ccs, harness's model budget, the Kubernetes API, the disks, the Deployments duckpond runs on, the run container of the warm pod /shared/tools/warm-pod names and GitHub's newest finished run of each release WATCH_RELEASES names.
-# It posts to chat channel `alerts` when a check turns bad and when it is good again, never waiting on a block, and hands an alert that no block carries by the next sample to the pager command `WATCH_PAGER` names.
+# watch: duckpond's alarms, off the chain and read-only. Each sample reads the block rate, the node's and the public /v1/status, ccs, harness's model budget, the Kubernetes API, the disks, the Deployments duckpond runs on, the run container of the warm pod /shared/tools/warm-pod names and GitHub's newest finished run of each release WATCH_RELEASES names; once a UTC day it reads what each app release channel WATCH_CHANGELOG names has published.
+# It posts to chat channel `alerts` when a check turns bad and when it is good again, never waiting on a block, and hands an alert that no block carries by the next sample to the pager command `WATCH_PAGER` names; a channel that published posts one entry of the release notes merged since its last one to the changelog's channel.
 # ops/k8s/watch/watch.yaml runs it on fabrics-1, watch-test.py tests it, and `watch.py once` prints one sample.
 import json
 import os
@@ -32,6 +32,8 @@ SHAPE_ERRORS = (AttributeError, KeyError, TypeError, ValueError)
 WARM_POD_RUN = "run"
 GITHUB = "https://api.github.com"
 DECIDED = ("success", "failure")
+NOTE = "Release note:"
+UPLOAD_PACK = "/info/refs?service=git-upload-pack"
 
 
 class Unread(Exception):
@@ -399,6 +401,190 @@ def releases_read(http, releases, now_ms):
     return readings, next_read_ms(now_ms, headers, sum(len(release.runs) for release in releases))
 
 
+@dataclass(frozen=True)
+class Channel:
+    check: str
+    label: str
+    tags: str
+    emoji: str
+    branch: str
+    manifest: str = ""
+    refs: str = ""
+    prefix: str = ""
+    since: str = ""
+    since_sequence: int = 0
+
+    @staticmethod
+    def of(row):
+        fields = (row.get(name, "") for name in ("manifest", "refs", "prefix", "since"))
+        channel = Channel(row["check"], row["label"], row["tags"], row["emoji"], row["branch"], *fields, int(row.get("since_sequence", 0)))
+        names_one = bool(channel.manifest) != bool(channel.refs)
+        if not names_one:
+            raise ValueError(f"changelog channel {channel.check} names one of manifest and refs")
+        return channel
+
+    def seeded(self):
+        return {"sequence": self.since_sequence, "commit": self.since, "read": ""} if self.since else None
+
+
+@dataclass(frozen=True)
+class Changelog:
+    channel: str
+    repo: str
+    channels: tuple
+
+    @staticmethod
+    def of(row):
+        return Changelog(row["channel"], row["repo"], tuple(Channel.of(each) for each in row["channels"]))
+
+
+@dataclass(frozen=True)
+class Published:
+    sequence: int
+    commit: str
+    version: str
+    at: str
+
+
+def answered(http, url):
+    code, body = http.get(url)
+    if code != 200:
+        raise Unread(f"{url} answered {code}")
+    return body
+
+
+def manifest_published(http, url):
+    manifest = json.loads(json.loads(answered(http, url))["manifest"])
+    display = manifest["release"]["display"]
+    commit = display.rpartition("+")[2]
+    named = bool(commit) and not commit.strip("0123456789abcdef")
+    if not named:
+        raise Unread(f"{url} names no commit in {display!r}")
+    return Published(int(manifest["sequence"]), commit, display, manifest["published_at"])
+
+
+def advertised(body):
+    refs, at = {}, 0
+    while at + 4 <= len(body):
+        size = int(body[at : at + 4], 16)
+        line = body[at + 4 : at + size].split(b"\0")[0].rstrip(b"\n")
+        at += max(size, 4)
+        sha, _, name = line.decode(errors="replace").partition(" ")
+        if len(sha) == 40:
+            refs[name.removesuffix("^{}")] = sha
+    return refs
+
+
+def tags_published(http, channel):
+    marked = f"refs/tags/{channel.prefix}"
+    refs = advertised(answered(http, channel.refs + UPLOAD_PACK))
+    builds = [(int(name[len(marked) :]), sha) for name, sha in refs.items() if name.startswith(marked) and name[len(marked) :].isdigit()]
+    if not builds:
+        raise Unread(f"{channel.refs} holds no {marked}<build>")
+    build, sha = max(builds)
+    return Published(build, sha, f"build {build}", "")
+
+
+def published_by(http, channel):
+    return manifest_published(http, channel.manifest) if channel.manifest else tags_published(http, channel)
+
+
+def log_query(repo, branch, since, after):
+    exclude = None if since is None else {"oid": since}
+    return {"log": {"repo": repo, "from": {"ref": f"refs/heads/{branch}".encode().hex()}, "exclude": exclude, "page": {"after": after, "limit": None}}}
+
+
+def commits_to(cli, repo, branch, commit, since):
+    found, after = [], None
+    while True:
+        page = cli.query("forge", log_query(repo, branch, since, after))["log"]["page"]
+        for row in page["items"]:
+            if found or row["oid"].startswith(commit):
+                found.append((row["oid"], bytes.fromhex(row["message"]).decode(errors="replace")))
+        after = page["next"]
+        settled = after is None or (since is None and found)
+        if settled:
+            break
+    if not found:
+        raise Unread(f"{repo}'s {branch} holds no {commit} past {since}")
+    return found
+
+
+def change_of(subject):
+    head, mark, tail = subject.rpartition(" (change ")
+    number = tail.removesuffix(")")
+    numbered = bool(mark) and tail.endswith(")") and number.isdigit()
+    return (head, number) if numbered else (subject, None)
+
+
+def note_of(message):
+    subject, *body = message.splitlines() or [""]
+    title, number = change_of(subject)
+    said = next((line[len(NOTE) :].strip() for line in body if line.startswith(NOTE)), "") or title
+    return number, None if said.rstrip(".").lower() == "none" else said
+
+
+def digest(changelog, channel, published, commits, since):
+    notes = [(oid, *note_of(message)) for oid, message in commits]
+    said = [note for _, _, note in notes if note is not None]
+    if not said:
+        return []
+    root = f"release-{channel.check}-{commits[0][0][:12]}"
+    seen = f"published {published.at}" if published.at else f"uploaded as {published.version}"
+    text = [f"{channel.tags} {channel.emoji} **{channel.label} {published.version}: what's new**", *(f"• {note}" for note in said), f"*{seen} · rollback: the previous build · posted by watch*"]
+    named = ", ".join(number or oid[:8] for oid, number, note in notes if note is not None)
+    quiet = ", ".join(number or oid[:8] for oid, number, note in notes if note is None)
+    details = [
+        "**Deploy details**",
+        f"• Channel: {channel.label}, {published.version}, sequence {published.sequence}",
+        f"• Source: {changelog.repo} {channel.branch} `{commits[0][0]}`",
+        f"• Since: `{since}`",
+        f"• Changes: {named}",
+        *([f"• Left out, release note none: {quiet}"] if quiet else []),
+    ]
+    item = {"channel": changelog.channel, "markdown": True, "paged": True, "tried": 0}
+    return [{**item, "id": root, "text": "\n".join(text)}, {**item, "id": f"{root}-details", "under": root, "text": "\n".join(details)}]
+
+
+def channel_read(http, cli, repo, channel, held):
+    published = published_by(http, channel)
+    moved = held is None or published.sequence > held["sequence"]
+    since = None if held is None else held["commit"]
+    return published, commits_to(cli, repo, channel.branch, published.commit, since) if moved else []
+
+
+def changelog_failed(failing, channel, why):
+    if channel.check not in failing:
+        say("changelog_unread", channel=channel.check, detail=why)
+    return failing | {channel.check}
+
+
+def changelog_step(state, changelog, http, cli, now_ms):
+    day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
+    kept = dict(state["changelog"])
+    failing = set(state["changelog_unread"])
+    posts = list(state["posts"])
+    for channel in changelog.channels:
+        held = kept.get(channel.check) or channel.seeded()
+        if held is not None and held["read"] == day:
+            continue
+        try:
+            published, commits = channel_read(http, cli, changelog.repo, channel, held)
+        except Unread as error:
+            failing = changelog_failed(failing, channel, str(error))
+            continue
+        except SHAPE_ERRORS as error:
+            failing = changelog_failed(failing, channel, f"answered in another shape: {error!r}")
+            continue
+        failing.discard(channel.check)
+        entry = digest(changelog, channel, published, commits, held["commit"]) if held is not None and commits else []
+        posts.extend(entry)
+        top = commits[0][0] if commits else held["commit"]
+        kept[channel.check] = {"sequence": published.sequence, "commit": top, "read": day}
+        say("changelog_read", channel=channel.check, sequence=published.sequence, commit=top, posts=len(entry))
+    return {**state, "changelog": kept, "changelog_unread": sorted(failing), "posts": posts}
+
+
 class Cli:
     def __init__(self, ducktape, node, workspace, keys, runner=subprocess.run):
         self.ducktape = ducktape
@@ -452,6 +638,7 @@ class Config:
     warm_pod_file: str = ""
     warm_pod_namespace: str = ""
     releases: tuple = ()
+    changelog: object = None
 
     @staticmethod
     def from_env(env):
@@ -465,11 +652,12 @@ class Config:
             warm_pod_file=env["WATCH_WARM_POD_FILE"],
             warm_pod_namespace=env["WATCH_WARM_POD_NAMESPACE"],
             releases=tuple(Release.of(row) for row in json.loads(env.get("WATCH_RELEASES", "[]"))),
+            changelog=Changelog.of(json.loads(env["WATCH_CHANGELOG"])) if env.get("WATCH_CHANGELOG") else None,
         )
 
 
 def fresh_state():
-    return {"checks": {}, "unread": [], "streaks": {}, "outbox": []}
+    return {"checks": {}, "unread": [], "streaks": {}, "outbox": [], "posts": [], "changelog": {}, "changelog_unread": []}
 
 
 def message_text(reading):
@@ -519,6 +707,19 @@ def post_op(channel, item):
     return {"post_message": {"channel_id": channel, "message_id": item["id"], "blocks": [paragraph], "thread": None}}
 
 
+def post_of(channel, item, thread):
+    if not item.get("markdown"):
+        return post_op(channel, item)
+    return {"post": {"channel_id": item["channel"], "message_id": item["id"], "text": item["text"], "thread": thread}}
+
+
+def thread_of(cli, item):
+    if "under" not in item:
+        return True, None
+    found = cli.query("chat", {"message_by_id": {"message_id": item["under"]}}, confirmed=True).get("message")
+    return found is not None, None if found is None else found["seq"]
+
+
 def posted_already(cli, item):
     found = cli.query("chat", {"message_by_id": {"message_id": item["id"]}}, confirmed=True)
     return found.get("message") is not None
@@ -558,7 +759,11 @@ def flush(cli, channel, outbox, pager):
                 say("alert_posted", id=item["id"])
                 continue
             sent_before = item.get("sent", False)
-            cli.op("chat", post_op(channel, item))
+            ready, thread = thread_of(cli, item)
+            if not ready:
+                left.append(item)
+                continue
+            cli.op("chat", post_of(channel, item, thread))
             item = {**item, "sent": True}
             problem = "sent, and no block carries it yet" if sent_before else None
         except Unread as error:
@@ -623,8 +828,12 @@ class Watch:
     def tick(self):
         now_ms = int(self.clock() * 1000)
         self.state = decide(self.state, self.sample(now_ms), now_ms)
+        if self.config.changelog is not None:
+            self.state = changelog_step(self.state, self.config.changelog, self.http, self.cli, now_ms)
         self.store.save(self.state)
         self.state = {**self.state, "outbox": flush(self.cli, self.config.channel, self.state["outbox"], self.pager)}
+        self.store.save(self.state)
+        self.state = {**self.state, "posts": flush(self.cli, self.config.channel, self.state["posts"], self.pager)}
         self.store.save(self.state)
 
     def run(self, pause=time.sleep):
