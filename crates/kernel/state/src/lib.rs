@@ -351,6 +351,15 @@ where
         (self.storage, self.commitments)
     }
 
+    pub fn release(&mut self) -> Result<Adoption> {
+        let mut adoption = Adoption::default();
+        for (program, commitment) in std::mem::take(&mut self.commitments) {
+            let end = commitment.end()?;
+            adoption.adopted.insert(program, Adopted { end });
+        }
+        Ok(adoption)
+    }
+
     pub fn root(&self, program: &str) -> Result<Option<Root>> {
         self.commitments
             .get(program)

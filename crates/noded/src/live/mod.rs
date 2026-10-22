@@ -232,6 +232,15 @@ impl<E: crate::Context> Relay<E> {
         }
     }
 
+    pub fn readopted(&self, programs: Vec<ProgramId>) {
+        self.grants.identity_moved();
+        self.grants.moved();
+        self.send(Event::Moved(Dirty {
+            programs: programs.into_iter().collect(),
+            identity: true,
+        }));
+    }
+
     /// The grant read for one request, with the generation it was read at, so a block that
     /// moved grants while the request was decided re-reads it.
     async fn decided(&self, account: Account, namespace: &str) -> Decided {

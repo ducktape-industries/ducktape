@@ -11,6 +11,7 @@ use abi::Scan;
 use abi::role;
 use abi::role::validators::{self, Grant, INVITE_NAMESPACE, Invite, Member, Op};
 use blob::contract::{BUNDLES, Bundle};
+use blob::service::Fetched;
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_cryptography::{Digestible as _, Signer as _};
@@ -440,6 +441,38 @@ async fn seated(source: &Client, key: &[u8]) -> Result<()> {
     }
 }
 
+async fn opened<E: Context>(
+    context: &E,
+    workspace: &Workspace,
+    descriptor: &Descriptor,
+) -> Result<Node<E>> {
+    let opened = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await;
+    let Err(node::Error::Host(host::Error::Unfounded)) = opened else {
+        return Ok(opened?);
+    };
+    let Some(source) = workspace.source()? else {
+        return Err(node::Error::Host(host::Error::Unfounded).into());
+    };
+    let joined = Box::pin(statesync::join(
+        context.child("rejoin"),
+        &descriptor.network,
+        workspace.dir(),
+        descriptor.id(),
+        Duration::from_millis(descriptor.block_time_ms),
+        Client::new(source),
+    ))
+    .await?;
+    workspace.write_anchor(&joined.anchor)?;
+    tracing::warn!(
+        target: "ducktape::node",
+        event = "state_rejoined",
+        height = joined.node.tip()?.height,
+        reason = "state_unmarked",
+        "the state records no height, as a stop while the node re-adopted it leaves it; the node joined again from its source"
+    );
+    Ok(joined.node)
+}
+
 async fn start<E: Context>(
     context: E,
     workspace: &Workspace,
@@ -454,7 +487,7 @@ async fn start<E: Context>(
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
     let egress = crate::egress::Station::open(workspace.clone())?;
-    let mut node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
+    let mut node = opened(&context, workspace, &descriptor).await?;
     node.meter_queries(load.query_fuel.map(NonZeroU64::get));
     crate::roll::admits(workspace.stamp()?, node.tip()?.height)?;
     let solo = node.host().parent().is_some();
@@ -789,6 +822,9 @@ async fn start<E: Context>(
             tracker,
             tally,
             source: source.clone(),
+            query_fuel: load.query_fuel.map(NonZeroU64::get),
+            unmarked: None,
+            workspace: workspace.clone(),
         };
         move |_| write(writing, deliveries)
     });
@@ -1111,6 +1147,9 @@ struct Writing<E: Context> {
     tracker: Tracker,
     tally: Tally,
     source: Option<Client>,
+    query_fuel: Option<u64>,
+    unmarked: Option<u64>,
+    workspace: Workspace,
 }
 
 struct Consensus<E: Context> {
@@ -1432,6 +1471,7 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
         commands,
         consensus,
         tracker,
+        unmarked,
         ..
     } = writing;
     daemon.hang_up().await;
@@ -1442,10 +1482,15 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
         consensus.membership.stop().await;
     }
     drop(tracker);
-    let synced = node.close().await;
-    let closed = synced
-        .map_err(Error::from)
-        .and_then(|()| Ok(node.tip()?.height));
+    let closed = match unmarked {
+        Some(height) => Ok(height),
+        None => {
+            let synced = node.close().await;
+            synced
+                .map_err(Error::from)
+                .and_then(|()| Ok(node.tip()?.height))
+        }
+    };
     daemon.readers.closed().await;
     drop(node);
     let _ = closer.send(closed);
@@ -1482,7 +1527,7 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
         );
         let daemon = writing.daemon.clone();
         let source = writing.source.clone();
-        let fetched = async {
+        let fetching = async {
             match &source {
                 Some(source) => {
                     daemon
@@ -1493,10 +1538,10 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
                 None => daemon.blobs.fetch(id, halo::Class::Critical).await,
             }
         };
-        futures::pin_mut!(fetched);
-        loop {
+        futures::pin_mut!(fetching);
+        let fetched = loop {
             let command = tokio::select! {
-                () = &mut fetched => break,
+                fetched = &mut fetching => break fetched,
                 command = writing.commands.next() => command,
             };
             match asked(&mut writing.tally, &daemon.context, command).await {
@@ -1504,8 +1549,163 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
                 Flow::Closing(closer) => return Ok(Held::Closing(closer)),
                 Flow::Unasked => return Ok(Held::Unasked),
             }
+        };
+        let Fetched::Unheld = fetched else {
+            continue;
+        };
+        let Some(source) = writing.source.clone() else {
+            continue;
+        };
+        let past = writing.node.tip()?.height;
+        let pause = Duration::from_millis(daemon.descriptor.block_time_ms);
+        let waiting = Box::pin(statesync::ahead(
+            daemon.context.child("readopt"),
+            pause,
+            source.clone(),
+            past,
+        ));
+        match racing(writing, waiting).await {
+            Raced::Done(ahead) => ahead?,
+            Raced::Held(held) => return Ok(held),
+        }
+        let (parts, adoption) = writing.node.release().await?;
+        writing.unmarked = Some(past);
+        let adopting = Box::pin(statesync::readopt(
+            daemon.context.child("readopt"),
+            &daemon.descriptor.network,
+            parts,
+            adoption,
+            daemon.descriptor.id(),
+            pause,
+            source.clone(),
+            past,
+        ));
+        let joined = match racing(writing, adopting).await {
+            Raced::Done(joined) => joined?,
+            Raced::Held(held) => return Ok(held),
+        };
+        writing.node = joined.node;
+        writing.unmarked = None;
+        let tip = writing.node.tip()?;
+        let head = match racing(writing, Box::pin(head_at(&source, tip))).await {
+            Raced::Done(head) => head,
+            Raced::Held(held) => return Ok(held),
+        };
+        Box::pin(readopted(writing, joined.anchor, head, past, block, id)).await?;
+    }
+}
+
+async fn head_at(source: &Client, tip: host::Tip) -> Option<crate::wire::Head> {
+    let ask = crate::wire::BlockAsk {
+        by: crate::wire::BlockRef::Height(tip.height),
+        most: 0,
+    };
+    let block = source.block(ask).await.ok().flatten()?;
+    let named = block.id == tip.id;
+    named.then_some(crate::wire::Head {
+        height: block.height,
+        id: block.id,
+        time: block.time,
+    })
+}
+
+enum Raced<T> {
+    Done(T),
+    Held(Held),
+}
+
+async fn racing<E: Context, T>(
+    writing: &mut Writing<E>,
+    work: impl Future<Output = T>,
+) -> Raced<T> {
+    let clock = writing.daemon.clone();
+    futures::pin_mut!(work);
+    loop {
+        let command = tokio::select! {
+            done = &mut work => return Raced::Done(done),
+            command = writing.commands.next() => command,
+        };
+        match asked(&mut writing.tally, &clock.context, command).await {
+            Flow::Writing => {}
+            Flow::Closing(closer) => return Raced::Held(Held::Closing(closer)),
+            Flow::Unasked => return Raced::Held(Held::Unasked),
         }
     }
+}
+
+async fn readopted<E: Context>(
+    writing: &mut Writing<E>,
+    anchor: Anchor,
+    head: Option<crate::wire::Head>,
+    past: u64,
+    block: &Block,
+    blob: abi::BlobId,
+) -> Result<()> {
+    let daemon = writing.daemon.clone();
+    let Writing {
+        node,
+        consensus,
+        tracker,
+        query_fuel,
+        ..
+    } = writing;
+    node.meter_queries(*query_fuel);
+    let tip = node.tip()?;
+    tracing::warn!(
+        target: "ducktape::node",
+        event = "state_readopted",
+        height = tip.height,
+        block = block.height,
+        ?blob,
+        reason = "blob_unheld",
+        "the block reads a blob that no member gave and the source no longer serves; the node re-adopted the state at the source's head and goes on from there"
+    );
+    writing.workspace.write_anchor(&anchor)?;
+    published(node, &daemon, Some(anchor.clone()));
+    daemon.tips.send_replace(tip.height);
+    let programs: Vec<abi::ProgramId> = node.host().store().programs().cloned().collect();
+    daemon.readopted(programs, head).await;
+    let blobs_role = node.host().role(role::BLOBS)?;
+    let bundles: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> = node
+        .view(Layer::Confirmed)
+        .scan(blobs_role, &Scan::prefix(BUNDLES))
+        .map_err(host::Error::from)?
+        .into_iter()
+        .map(|entry| (entry.key, Some(entry.value)))
+        .collect();
+    daemon.blobs.applied(tip.height, &bundles);
+    retable_halo(&daemon, node, tip.height).await;
+    let Some(consensus) = consensus.as_mut() else {
+        daemon.pool.offer(Offer::Every);
+        return Ok(());
+    };
+    for (epoch, keys) in recorded_epochs(node)? {
+        let keys = validators_of(&keys).ok_or(Error::Corrupt(format!(
+            "epoch {epoch} seats an undecodable key"
+        )))?;
+        consensus.membership.roster().seat(epoch, keys);
+    }
+    reseat_halo(&daemon, node, tip.height).await;
+    let epoch = daemon.network.epoch_after(tip.height);
+    let crossed = epoch != daemon.network.epoch_after(past);
+    if crossed {
+        let unrecorded =
+            || Error::Corrupt(format!("the re-adopted state records no epoch {epoch}"));
+        let members = node.epoch_members(epoch)?.ok_or_else(unrecorded)?;
+        let validators = node.epoch_validators(epoch)?.ok_or_else(unrecorded)?;
+        let seated = validators_of(&validators).ok_or(Error::Corrupt(format!(
+            "epoch {epoch} seats an undecodable key"
+        )))?;
+        daemon.relay.seat(seated.as_ref());
+        tracker.track(epoch, &members);
+        consensus.membership.anchored(anchor);
+        consensus
+            .membership
+            .seat(tip, node.host().root()?, &validators)
+            .await?;
+    }
+    daemon.pool.offer(Offer::Every);
+    Ok(())
 }
 
 fn receipts_for<E: Context>(

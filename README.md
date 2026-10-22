@@ -1079,7 +1079,23 @@ over every member brings nothing, a joined node asks the node it joined
 through (the workspace's `source`) for it on `/v1/blobs`, keeps it only if its
 bytes hash to its id, and logs `blob_from_source` as an error once for that
 blob, since halo is not reaching the members. Until one of them gives it, the
-node asks the members and then the source again after each pause. A read of
+node asks the members and then the source again after each pause. When one
+pass has asked every member and none gave it, and the source answers that it
+does not serve it, the blob was released after the block that reads it: the
+node waits until the source's head has applied that block, re-adopts the
+state at that head through the join's own sync (each program's op log
+resumes from what the node holds, so only what changed is fetched), logs
+`state_readopted` with the height, the block and the blob, and goes on: the
+blocks up to that head are replayed, not applied. It ends every
+`/v1/changes`, `/v1/heads` and `/v1/watch` socket then, since the blocks it
+skipped are told to none of them, so a follower subscribes again and reads at
+the new head (a heads socket opens on it, as the source names it), and the live relay re-reads every grant and key it admitted. A
+stop asked while it waits or re-adopts is answered at once. A stop while it re-adopts
+leaves a state with no height: when the node starts again, it joins again
+from its source by itself, writes the anchor it joined at, and logs
+`state_rejoined`. A re-adoption that ends writes its anchor too, so a plain
+restart starts marshal from the adopted head, which marshal's own archive
+may not reach. A read of
 such a blob (`/v1/blob/get`, `/v1/blobs`) asks every member once, or none
 when the node already asks in the background: if none gives it, `/v1/blob/get` refuses it as not found and `/v1/blobs` answers it as
 not served and goes on to the next id, while the node keeps asking in the

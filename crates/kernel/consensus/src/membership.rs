@@ -110,6 +110,10 @@ where
         &self.roster
     }
 
+    pub fn anchored(&mut self, anchor: Anchor) {
+        self.anchor = anchor;
+    }
+
     /// The finalize votes the engines this membership seats hear.
     pub fn votes(&self) -> &Votes {
         &self.votes

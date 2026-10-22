@@ -179,6 +179,29 @@ where
         Node::over(context, host)
     }
 
+    pub async fn adopt_over(
+        context: E,
+        name: &str,
+        parts: host::Parts,
+        synced: Synced<E>,
+        adoption: &mut state::Adoption,
+    ) -> Result<Node<E>> {
+        let host = Host::adopt_over(
+            context.child("host"),
+            name,
+            parts,
+            synced.height,
+            synced.commitments,
+            adoption,
+        )
+        .await?;
+        Node::over(context, host)
+    }
+
+    pub async fn release(&mut self) -> Result<(host::Parts, state::Adoption)> {
+        Ok(self.host.release().await?)
+    }
+
     fn over(context: E, host: Host<E>) -> Result<Node<E>> {
         let network = host.network().to_vec();
         let verified = Verified::new(&network);

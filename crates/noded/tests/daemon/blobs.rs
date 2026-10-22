@@ -459,3 +459,168 @@ fn blobs_held_answers_each_id_as_a_read_would_and_a_released_one_is_not_held() {
     });
     live.thread.join().unwrap();
 }
+
+#[test]
+fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the_head() {
+    let root = tempfile::tempdir().unwrap();
+    let validator = Seat::new(root.path(), "n0");
+    let mut resident = Seat::new(root.path(), "n1");
+    resident.address = None;
+    let founding = founding(root.path(), &[&validator], EPOCH_LENGTH);
+    validator.init(&founding);
+    let live = validator.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let runtime = client_runtime();
+    let lost = part(b"lost");
+
+    runtime.block_on(async {
+        reach(&client, 1).await;
+        let mut changes = client.changes("probe").await.unwrap();
+        let put = frame(&client, &alice, vec![put_part(b"lost"), set(b"put", b"1")]).await;
+        client.submit(put, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"put"]).await;
+    });
+    resident.join(&client);
+
+    let read = runtime.block_on(async {
+        let mut changes = client.changes("probe").await.unwrap();
+        let steps = vec![Step::Op(HostOp::BlobGet(lost)), set(b"read", b"1")];
+        let get = frame(&client, &alice, steps).await;
+        client.submit(get, Preconfirm::Off).await.unwrap();
+        let read = landed(&mut changes, &[b"read"]).await[0];
+        let steps = vec![Step::Op(HostOp::BlobRelease(lost)), set(b"released", b"1")];
+        let release = frame(&client, &alice, steps).await;
+        client.submit(release, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"released"]).await;
+        let later = frame(&client, &alice, vec![set(b"later", b"1")]).await;
+        client.submit(later, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"later"]).await;
+        assert_eq!(
+            client.blobs(&[lost]).await.unwrap(),
+            [None],
+            "the source no longer serves the released part"
+        );
+        read
+    });
+
+    let follower = resident.start();
+    runtime.block_on(async {
+        let named = format!("{lost:?}");
+        let tip = client.status().await.unwrap().height;
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        let mut readopted = BTreeSet::new();
+        loop {
+            let caught_up = follower.client.status().await.unwrap().height >= tip;
+            let lines = follower.client.logs().await.unwrap();
+            let asked_again: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.contains("blob_unfetched") && line.contains(&named))
+                .collect();
+            assert!(
+                asked_again.is_empty(),
+                "the follower asks again for a part no member holds: {asked_again:?}"
+            );
+            readopted.extend(
+                lines
+                    .into_iter()
+                    .filter(|line| line.contains("state_readopted") && line.contains(&named)),
+            );
+            if caught_up {
+                break;
+            }
+            blocks.next().await.unwrap().unwrap();
+        }
+        let readopted: Vec<String> = readopted.into_iter().collect();
+        assert_eq!(readopted.len(), 1, "{readopted:?}");
+        assert!(
+            readopted[0].contains(&format!("block={read}")),
+            "the line names the block that reads the part: {readopted:?}"
+        );
+        let after = frame(&client, &alice, vec![set(b"after", b"1")]).await;
+        client.submit(after, Preconfirm::Off).await.unwrap();
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        while follower
+            .client
+            .get(Layer::Confirmed, "probe", b"after")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            blocks.next().await.unwrap().unwrap();
+        }
+        resident.admin(&follower.client, Admin::Shutdown).await;
+    });
+    follower.thread.join().unwrap();
+
+    let follower = resident.start();
+    runtime.block_on(async {
+        let mut changes = client.changes("probe").await.unwrap();
+        let again = frame(&client, &alice, vec![set(b"again", b"1")]).await;
+        client.submit(again, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"again"]).await;
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        while follower
+            .client
+            .get(Layer::Confirmed, "probe", b"again")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            blocks.next().await.unwrap().unwrap();
+        }
+        validator.admin(&client, Admin::Shutdown).await;
+        resident.admin(&follower.client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+    follower.thread.join().unwrap();
+}
+
+#[test]
+fn a_follower_whose_state_lost_its_height_joins_again_from_its_source_when_it_starts() {
+    let root = tempfile::tempdir().unwrap();
+    let validator = Seat::new(root.path(), "n0");
+    let mut resident = Seat::new(root.path(), "n1");
+    resident.address = None;
+    let founding = founding(root.path(), &[&validator], EPOCH_LENGTH);
+    validator.init(&founding);
+    let live = validator.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let runtime = client_runtime();
+
+    resident.join(&client);
+    let follower = resident.start();
+    runtime.block_on(async {
+        let height = client.status().await.unwrap().height;
+        reach(&follower.client, height).await;
+        resident.admin(&follower.client, Admin::Shutdown).await;
+    });
+    follower.thread.join().unwrap();
+    let storage = state::Storage::open(&resident.workspace.dir().join(host::STATE_DIR)).unwrap();
+    storage.unmark().unwrap();
+    storage.flush().unwrap();
+    drop(storage);
+
+    let follower = resident.start();
+    runtime.block_on(async {
+        let mut changes = client.changes("probe").await.unwrap();
+        let after = frame(&client, &alice, vec![set(b"after", b"1")]).await;
+        client.submit(after, Preconfirm::Off).await.unwrap();
+        landed(&mut changes, &[b"after"]).await;
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        while follower
+            .client
+            .get(Layer::Confirmed, "probe", b"after")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            blocks.next().await.unwrap().unwrap();
+        }
+        validator.admin(&client, Admin::Shutdown).await;
+        resident.admin(&follower.client, Admin::Shutdown).await;
+    });
+    live.thread.join().unwrap();
+    follower.thread.join().unwrap();
+}

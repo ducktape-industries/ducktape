@@ -328,6 +328,11 @@ impl<E: Context> Daemon<E> {
         self.changes.hang_up().await;
     }
 
+    pub(crate) async fn readopted(&self, programs: Vec<ProgramId>, head: Option<wire::Head>) {
+        self.live.readopted(programs);
+        self.changes.cut(head).await;
+    }
+
     pub fn publish(&self, applied: &Applied, head: Head) {
         self.live.invalidate(&applied.writes);
         let view = self

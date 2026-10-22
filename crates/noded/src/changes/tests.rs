@@ -46,6 +46,7 @@ fn step(fanout: &mut Fanout<E>) {
             Event::Take(take) => taken(fanout, take),
             Event::HangUp(_) | Event::Unasked => Flow::Closed,
             Event::Opened(head) => opened(fanout, head),
+            Event::Cut(head, reply) => cut_every(fanout, head, reply),
         };
     }
 }
@@ -261,4 +262,48 @@ fn a_watch_socket_that_pulls_late_gets_every_block_since_merged_into_one_then_wa
         assert_eq!(merged.height, 3);
         assert!(merged.writes.is_empty());
     });
+}
+
+#[test]
+fn a_cut_ends_every_socket_and_the_fanout_goes_on_for_the_next() {
+    let (changes, mut fanout) = Changes::<E>::new(network());
+    let mut heads = changes.subscribe(Follows::Heads);
+    let mut program = changes.subscribe(Follows::Program {
+        program: "probe".into(),
+        keys: false,
+    });
+    changes.wrote(wrote(8, None));
+    step(&mut fanout);
+    assert_eq!(heard(&mut heads), ["head 8"]);
+    assert_eq!(heard(&mut program), ["ping 8"]);
+    let cutting = changes.cut(Some(head(12)));
+    futures::pin_mut!(cutting);
+    assert!(cutting.as_mut().now_or_never().is_none());
+    step(&mut fanout);
+    assert_eq!(cutting.now_or_never(), Some(()));
+    assert_eq!((&mut heads.cut).now_or_never(), Some(Ok(())));
+    assert_eq!((&mut program.cut).now_or_never(), Some(Ok(())));
+    assert!(heard(&mut heads).is_empty());
+    assert!(heard(&mut program).is_empty());
+    let mut later = changes.subscribe(Follows::Heads);
+    step(&mut fanout);
+    assert_eq!(
+        heard(&mut later),
+        ["head 12"],
+        "a socket after the cut opens on the cut's head"
+    );
+    changes.wrote(wrote(13, None));
+    step(&mut fanout);
+    assert_eq!(heard(&mut later), ["head 13"]);
+    let unheaded = changes.cut(None);
+    futures::pin_mut!(unheaded);
+    assert!(unheaded.as_mut().now_or_never().is_none());
+    step(&mut fanout);
+    assert_eq!(unheaded.now_or_never(), Some(()));
+    let mut last = changes.subscribe(Follows::Heads);
+    step(&mut fanout);
+    assert!(
+        heard(&mut last).is_empty(),
+        "a cut with no head leaves no stale one to greet with"
+    );
 }

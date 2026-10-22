@@ -16,6 +16,7 @@ const PUT_COST: u64 = 32;
 const DELETE_COST: u64 = 16;
 pub const RESERVED_PREFIX: char = '$';
 
+#[derive(Clone)]
 pub struct Storage {
     reads: Reads,
 }
@@ -200,7 +201,7 @@ impl Storage {
         self.mark(height)
     }
 
-    fn unmark(&self) -> Result<()> {
+    pub fn unmark(&self) -> Result<()> {
         let mut batch = WriteBatch::new();
         batch.delete(HEIGHT);
         batch.delete(PENDING);

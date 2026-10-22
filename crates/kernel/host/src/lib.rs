@@ -230,6 +230,21 @@ where
     measured_depth_from: u64,
 }
 
+#[derive(Clone)]
+pub struct Parts {
+    pub storage: Storage,
+    pub blobs: Blobs,
+}
+
+impl Parts {
+    pub fn open(dir: &Path) -> Result<Parts> {
+        Ok(Parts {
+            storage: Storage::open(&dir.join(STATE_DIR))?,
+            blobs: Blobs::open(&dir.join(BLOBS_DIR))?,
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct Preconfirmed {
     pub(crate) overlay: Overlay,
@@ -611,11 +626,34 @@ where
         commitments: BTreeMap<ProgramId, Commitment<E>>,
         adoption: &mut state::Adoption,
     ) -> Result<Host<E>> {
-        let storage = Storage::open(&dir.join(STATE_DIR))?;
+        let parts = Parts::open(dir)?;
+        Host::adopt_over(context, name, parts, height, commitments, adoption).await
+    }
+
+    pub async fn adopt_over(
+        context: E,
+        name: &str,
+        parts: Parts,
+        height: u64,
+        commitments: BTreeMap<ProgramId, Commitment<E>>,
+        adoption: &mut state::Adoption,
+    ) -> Result<Host<E>> {
         let store =
-            Store::adopt_from(context, name, storage, height, commitments, adoption).await?;
-        let blobs = Blobs::open(&dir.join(BLOBS_DIR))?;
-        Host::assemble(store, blobs)
+            Store::adopt_from(context, name, parts.storage, height, commitments, adoption).await?;
+        Host::assemble(store, parts.blobs)
+    }
+
+    pub async fn release(&mut self) -> Result<(Parts, state::Adoption)> {
+        self.close().await?;
+        let adoption = self.store.release()?;
+        let storage = self.store.storage().clone();
+        storage.unmark()?;
+        storage.flush()?;
+        let parts = Parts {
+            storage,
+            blobs: self.blobs.clone(),
+        };
+        Ok((parts, adoption))
     }
 
     fn assemble(store: Store<E>, blobs: Blobs) -> Result<Host<E>> {

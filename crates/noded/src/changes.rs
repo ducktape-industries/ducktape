@@ -114,6 +114,7 @@ pub(crate) enum Event<E: Context> {
     HangUp(oneshot::Sender<()>),
     Unasked,
     Opened(Head),
+    Cut(Option<Head>, oneshot::Sender<()>),
 }
 
 enum Flow {
@@ -219,6 +220,13 @@ impl<E: Context> Changes<E> {
             let _ = hung_up.await;
         }
     }
+
+    pub(crate) async fn cut(&self, head: Option<Head>) {
+        let (reply, cut) = oneshot::channel();
+        if self.inbox.send(Event::Cut(head, reply)).is_ok() {
+            let _ = cut.await;
+        }
+    }
 }
 
 impl<E: Context> Pull<E> {
@@ -250,6 +258,7 @@ pub(crate) async fn fan<E: Context>(mut fanout: Fanout<E>) {
             Event::HangUp(reply) => Flow::HangingUp(reply),
             Event::Unasked => Flow::Closed,
             Event::Opened(head) => opened(&mut fanout, head),
+            Event::Cut(head, reply) => cut_every(&mut fanout, head, reply),
         };
         match flow {
             Flow::Fanning => {}
@@ -270,6 +279,19 @@ fn subscribed<E: Context>(fanout: &mut Fanout<E>, subscriber: Subscriber<E>) -> 
         return Flow::Fanning;
     }
     fanout.subscribers.insert(subscriber.socket, subscriber);
+    Flow::Fanning
+}
+
+fn cut_every<E: Context>(
+    fanout: &mut Fanout<E>,
+    head: Option<Head>,
+    reply: oneshot::Sender<()>,
+) -> Flow {
+    fanout.head = head;
+    for subscriber in std::mem::take(&mut fanout.subscribers).into_values() {
+        let _ = subscriber.cut.send(());
+    }
+    let _ = reply.send(());
     Flow::Fanning
 }
 

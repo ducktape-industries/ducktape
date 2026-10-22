@@ -126,7 +126,7 @@ fn a_client_pull_whose_request_is_dropped_mid_answer_runs_to_its_end_and_lands()
         let inbound = {
             let client = service.fetch(id, Class::Client);
             tokio::select! {
-                () = client => panic!("the client's fetch ends before any member answers"),
+                _ = client => panic!("the client's fetch ends before any member answers"),
                 inbound = lane.accept() => inbound.unwrap(),
             }
         };
@@ -449,6 +449,56 @@ fn bytes_a_source_offers_that_do_not_hash_to_the_id_are_refused_and_the_fetch_as
         );
         assert_eq!(*source.asked.lock().unwrap(), vec![id]);
         assert_eq!(service.store().framed(&id).unwrap(), Some(framed));
+        assert_eq!(partials_left(&service), 0);
+    });
+}
+
+struct Unserving {
+    asked: std::sync::Mutex<Vec<abi::BlobId>>,
+}
+
+impl Source for Unserving {
+    async fn blob(&self, id: abi::BlobId) -> Result<Option<Vec<u8>>, &'static str> {
+        self.asked.lock().unwrap().push(id);
+        Ok(None)
+    }
+}
+
+#[test]
+fn a_fetch_no_member_gives_and_its_source_does_not_serve_is_unheld_after_one_round() {
+    runtime::Runner::default().start(|context| async move {
+        let (holder, holder_seat) = member(&context.child("holder"), 1);
+        let (asker, asker_seat) = member(&context.child("asker"), 2);
+        for halo in [&holder, &asker] {
+            halo.seat(vec![holder_seat.clone(), asker_seat.clone()]);
+        }
+        let held = tempfile::tempdir().unwrap();
+        let store = Blobs::open(held.path()).unwrap();
+        let framed = frame("part", b"released").unwrap();
+        let id = id_of(abi::HashKind::Sha256, &framed).unwrap();
+        let lane = holder
+            .plane()
+            .streams(LANE, Config::default().backlog.get())
+            .unwrap();
+        let fetching = tempfile::tempdir().unwrap();
+        let service = Service::start(
+            asker,
+            Blobs::open(fetching.path()).unwrap(),
+            Vec::new(),
+            Config::default(),
+        )
+        .unwrap();
+        let source = Unserving {
+            asked: std::sync::Mutex::default(),
+        };
+        let lacked = async {
+            let inbound = lane.accept().await.unwrap();
+            assert_eq!(answer(&store, inbound).await, Err("lacks"));
+        };
+        let (fetched, ()) = tokio::join!(service.fetch_or(id, Class::Critical, &source), lacked);
+        assert_eq!(fetched, super::Fetched::Unheld);
+        assert_eq!(*source.asked.lock().unwrap(), vec![id]);
+        assert!(!service.store().has(&id));
         assert_eq!(partials_left(&service), 0);
     });
 }

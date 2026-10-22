@@ -126,7 +126,7 @@ pub struct Joined<E: Context> {
 }
 
 pub async fn join<E: Context, X: Exchange>(
-    mut context: E,
+    context: E,
     name: &str,
     dir: &Path,
     network: Vec<u8>,
@@ -138,17 +138,82 @@ pub async fn join<E: Context, X: Exchange>(
         exchange,
         pause,
     };
+    let parts = host::Parts::open(dir)?;
+    adopting(
+        context,
+        name,
+        parts,
+        Adoption::default(),
+        network,
+        &asking,
+        None,
+    )
+    .await
+}
+
+pub async fn ahead<E: Context, X: Exchange>(
+    context: E,
+    pause: Duration,
+    exchange: X,
+    past: u64,
+) -> Result<()> {
+    let asking = Asking {
+        context,
+        exchange,
+        pause,
+    };
+    let mut now = crate::head(&asking).await?;
+    while now.tip.height <= past {
+        asking.context.sleep(asking.pause).await;
+        now = crate::head(&asking).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn readopt<E: Context, X: Exchange>(
+    context: E,
+    name: &str,
+    parts: host::Parts,
+    adoption: Adoption,
+    network: Vec<u8>,
+    pause: Duration,
+    exchange: X,
+    past: u64,
+) -> Result<Joined<E>> {
+    let asking = Asking {
+        context: context.child("ask"),
+        exchange,
+        pause,
+    };
+    adopting(context, name, parts, adoption, network, &asking, Some(past)).await
+}
+
+async fn adopting<E: Context, X: Exchange>(
+    mut context: E,
+    name: &str,
+    parts: host::Parts,
+    mut adoption: Adoption,
+    network: Vec<u8>,
+    asking: &Asking<E, X>,
+    past: Option<u64>,
+) -> Result<Joined<E>> {
     let mut retargets: u64 = 0;
-    let mut adoption = Adoption::default();
     let mut fetched = BTreeSet::new();
     loop {
-        let (head, commitments) = adopted_head(&context, name, &asking).await?;
+        let (head, commitments) = adopted_head(&context, name, asking, past).await?;
         let synced = Synced {
             height: head.tip.height,
             commitments,
         };
-        let mut node =
-            Node::adopt_from(context.child("node"), name, dir, synced, &mut adoption).await?;
+        let mut node = Node::adopt_over(
+            context.child("node"),
+            name,
+            parts.clone(),
+            synced,
+            &mut adoption,
+        )
+        .await?;
         let state_names_this_network = node.network() == network;
         if !state_names_this_network {
             return Err(Error::Network);
@@ -165,7 +230,7 @@ pub async fn join<E: Context, X: Exchange>(
             node: &mut node,
             fetched: &mut fetched,
         };
-        let unserved = installed(&asking, code, &mut joining).await?;
+        let unserved = installed(asking, code, &mut joining).await?;
         let Some(&blob) = unserved.first() else {
             if retargets > 0 {
                 node.host().drop_unnamed(&fetched, node.now()).await?;
@@ -175,7 +240,7 @@ pub async fn join<E: Context, X: Exchange>(
                 anchor: head.anchor,
             });
         };
-        let now = crate::head(&asking).await?;
+        let now = crate::head(asking).await?;
         let source_moved = now.tip != head.tip;
         if !source_moved {
             return Err(Error::Blob(blob));
@@ -214,6 +279,7 @@ async fn adopted_head<E: Context, X: Exchange>(
     context: &E,
     name: &str,
     asking: &Asking<E, X>,
+    past: Option<u64>,
 ) -> Result<(Head, BTreeMap<ProgramId, Commitment<E>>)> {
     let mut retargets: u64 = 0;
     let mut ended: u64 = 0;
@@ -222,6 +288,11 @@ async fn adopted_head<E: Context, X: Exchange>(
         let anchor_names_the_tip = head.anchor.names(head.tip);
         if !anchor_names_the_tip {
             return Err(Error::Head);
+        }
+        let behind = past.is_some_and(|past| head.tip.height <= past);
+        if behind {
+            asking.context.sleep(asking.pause).await;
+            continue;
         }
         let syncing = synced_to(context, name, asking, &head.targets, number);
         let Some(synced) = while_held(syncing, hold).await else {

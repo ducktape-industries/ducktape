@@ -154,6 +154,12 @@ pub enum Kept {
     Elsewhere,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fetched {
+    Landed,
+    Unheld,
+}
+
 pub trait Source {
     fn blob(
         &self,
@@ -269,11 +275,11 @@ impl Service {
         }
     }
 
-    pub async fn fetch(&self, id: BlobId, class: Class) {
+    pub async fn fetch(&self, id: BlobId, class: Class) -> Fetched {
         self.inner.fetch(id, class, None::<&Nowhere>).await
     }
 
-    pub async fn fetch_or(&self, id: BlobId, class: Class, source: &impl Source) {
+    pub async fn fetch_or(&self, id: BlobId, class: Class, source: &impl Source) -> Fetched {
         self.inner.fetch(id, class, Some(source)).await
     }
 
@@ -626,29 +632,37 @@ impl Inner {
         Err(NO_MEMBER_GAVE_IT)
     }
 
-    async fn fetch(self: &Arc<Self>, id: BlobId, class: Class, source: Option<&impl Source>) {
+    async fn fetch(
+        self: &Arc<Self>,
+        id: BlobId,
+        class: Class,
+        source: Option<&impl Source>,
+    ) -> Fetched {
         let declared = self.declared(&id);
         let mut rounds = 0u32;
         loop {
             if self.store.has(&id) {
-                return;
+                return Fetched::Landed;
             }
             let Err(missed) = self.round(&id, declared.as_ref(), class).await else {
-                return;
+                return Fetched::Landed;
             };
             rounds += 1;
             let worth_a_line = rounds == 1 || rounds.is_multiple_of(10);
             if let Some(source) = source {
-                match self.sourced(id, class, source).await {
-                    Ok(Kept::Landed) => {
+                let every_member_asked = missed == NO_MEMBER_GAVE_IT;
+                let unsourced = match self.sourced(id, class, source).await {
+                    Ok(Some(Kept::Landed)) => {
                         tracing::error!(target: "ducktape::blob", event = "blob_from_source", ?id, attempts = rounds, reason = missed, "no member gave a blob this node needs over halo, so it took the blob from its source: halo does not reach the members");
-                        return;
+                        return Fetched::Landed;
                     }
-                    Ok(Kept::Elsewhere) => {}
-                    Err(unsourced) if worth_a_line => {
-                        tracing::warn!(target: "ducktape::blob", event = "blob_unsourced", ?id, attempts = rounds, reason = unsourced, "the source did not give a blob this node needs either; it asks again");
-                    }
-                    Err(_) => {}
+                    Ok(Some(Kept::Elsewhere)) => None,
+                    Ok(None) if every_member_asked => return Fetched::Unheld,
+                    Ok(None) => Some("unserved"),
+                    Err(unsourced) => Some(unsourced),
+                };
+                if let Some(unsourced) = unsourced.filter(|_| worth_a_line) {
+                    tracing::warn!(target: "ducktape::blob", event = "blob_unsourced", ?id, attempts = rounds, reason = unsourced, "the source did not give a blob this node needs either; it asks again");
                 }
             }
             if worth_a_line {
@@ -663,9 +677,11 @@ impl Inner {
         id: BlobId,
         class: Class,
         source: &impl Source,
-    ) -> Result<Kept, &'static str> {
-        let framed = source.blob(id).await?.ok_or("unserved")?;
-        self.keep(id, framed, class).await
+    ) -> Result<Option<Kept>, &'static str> {
+        let Some(framed) = source.blob(id).await? else {
+            return Ok(None);
+        };
+        self.keep(id, framed, class).await.map(Some)
     }
 
     async fn seek(self: &Arc<Self>, id: BlobId) -> bool {
