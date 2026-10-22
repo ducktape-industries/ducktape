@@ -74,6 +74,35 @@ fn tidy_threads_cpus() -> Vec<Vec<usize>> {
     placed
 }
 
+async fn put_lost(client: &Client, alice: &ed25519::PrivateKey) {
+    reach(client, 1).await;
+    let mut changes = client.changes("probe").await.unwrap();
+    let put = frame(client, alice, vec![put_part(b"lost"), set(b"put", b"1")]).await;
+    client.submit(put, Preconfirm::Off).await.unwrap();
+    landed(&mut changes, &[b"put"]).await;
+}
+
+async fn read_then_released(client: &Client, alice: &ed25519::PrivateKey, lost: BlobId) -> u64 {
+    let mut changes = client.changes("probe").await.unwrap();
+    let steps = vec![Step::Op(HostOp::BlobGet(lost)), set(b"read", b"1")];
+    let get = frame(client, alice, steps).await;
+    client.submit(get, Preconfirm::Off).await.unwrap();
+    let read = landed(&mut changes, &[b"read"]).await[0];
+    let steps = vec![Step::Op(HostOp::BlobRelease(lost)), set(b"released", b"1")];
+    let release = frame(client, alice, steps).await;
+    client.submit(release, Preconfirm::Off).await.unwrap();
+    landed(&mut changes, &[b"released"]).await;
+    let later = frame(client, alice, vec![set(b"later", b"1")]).await;
+    client.submit(later, Preconfirm::Off).await.unwrap();
+    landed(&mut changes, &[b"later"]).await;
+    assert_eq!(
+        client.blobs(&[lost]).await.unwrap(),
+        [None],
+        "the source no longer serves the released part"
+    );
+    read
+}
+
 async fn filled(client: &Client) -> bool {
     let logs = client.logs().await.unwrap();
     logs.iter().any(|line| line.contains("blobs_filled"))
@@ -650,35 +679,9 @@ fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the
     let runtime = client_runtime();
     let lost = part(b"lost");
 
-    runtime.block_on(async {
-        reach(&client, 1).await;
-        let mut changes = client.changes("probe").await.unwrap();
-        let put = frame(&client, &alice, vec![put_part(b"lost"), set(b"put", b"1")]).await;
-        client.submit(put, Preconfirm::Off).await.unwrap();
-        landed(&mut changes, &[b"put"]).await;
-    });
+    runtime.block_on(put_lost(&client, &alice));
     resident.join(&client);
-
-    let read = runtime.block_on(async {
-        let mut changes = client.changes("probe").await.unwrap();
-        let steps = vec![Step::Op(HostOp::BlobGet(lost)), set(b"read", b"1")];
-        let get = frame(&client, &alice, steps).await;
-        client.submit(get, Preconfirm::Off).await.unwrap();
-        let read = landed(&mut changes, &[b"read"]).await[0];
-        let steps = vec![Step::Op(HostOp::BlobRelease(lost)), set(b"released", b"1")];
-        let release = frame(&client, &alice, steps).await;
-        client.submit(release, Preconfirm::Off).await.unwrap();
-        landed(&mut changes, &[b"released"]).await;
-        let later = frame(&client, &alice, vec![set(b"later", b"1")]).await;
-        client.submit(later, Preconfirm::Off).await.unwrap();
-        landed(&mut changes, &[b"later"]).await;
-        assert_eq!(
-            client.blobs(&[lost]).await.unwrap(),
-            [None],
-            "the source no longer serves the released part"
-        );
-        read
-    });
+    let read = runtime.block_on(read_then_released(&client, &alice, lost));
 
     let follower = resident.start_with(rpc_on(&rpc));
     runtime.block_on(async {
@@ -757,6 +760,63 @@ fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the
     });
     live.thread.join().unwrap();
     follower.thread.join().unwrap();
+}
+
+#[test]
+fn a_readopting_follower_names_the_head_it_readopted_only_once_it_serves_that_heads_lanes_and_seats()
+ {
+    apart!();
+    let root = tempfile::tempdir().unwrap();
+    let validator = Seat::new(root.path(), "n0");
+    let mut resident = Seat::new(root.path(), "n1");
+    resident.address = None;
+    let founding = founding(root.path(), &[&validator], EPOCH_LENGTH);
+    validator.init(&founding);
+    let live = validator.start();
+    let client = live.client.clone();
+    let alice = ed25519::PrivateKey::from_seed(11);
+    let runtime = client_runtime();
+    let lost = part(b"lost");
+
+    runtime.block_on(put_lost(&client, &alice));
+    resident.join(&client);
+    let read = runtime.block_on(read_then_released(&client, &alice, lost));
+    let tip = runtime.block_on(async { client.status().await.unwrap().height });
+
+    let (follower, (daemon, retabling, reseating)) =
+        resident.start_handing(LoadConfig::default(), |running| {
+            (
+                running.daemon.clone(),
+                running.daemon.retabling.arm(),
+                running.daemon.reseating.arm(),
+            )
+        });
+    runtime.block_on(async {
+        let (_past_the_read, until) = ::tokio::sync::watch::channel(read + 1);
+        let (retabled, readopted) = futures::join!(
+            served_before_announced(&follower.client, retabling, read, until.clone()),
+            served_before_announced(&follower.client, reseating, read, until),
+        );
+        assert_eq!(
+            retabled, readopted,
+            "the follower retables and reseats at the head it readopted"
+        );
+        assert!(
+            readopted >= tip,
+            "the follower served block {readopted}, short of the source's head {tip} it readopts"
+        );
+        daemon
+            .tips
+            .subscribe()
+            .wait_for(|height| *height >= readopted)
+            .await
+            .unwrap();
+        resident.admin(&follower.client, Admin::Shutdown).await;
+        validator.admin(&client, Admin::Shutdown).await;
+    });
+    drop(daemon);
+    follower.thread.join().unwrap();
+    live.thread.join().unwrap();
 }
 
 #[test]

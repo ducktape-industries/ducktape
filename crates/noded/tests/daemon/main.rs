@@ -458,6 +458,39 @@ async fn reach(client: &Client, height: u64) {
     }
 }
 
+async fn served_before_announced(
+    client: &Client,
+    mut parking: ::tokio::sync::mpsc::UnboundedReceiver<noded::testkit::Parked>,
+    announced: u64,
+    mut until: ::tokio::sync::watch::Receiver<u64>,
+) -> u64 {
+    let mut last = 0;
+    loop {
+        let reached = last >= *until.borrow_and_update();
+        if reached {
+            return last;
+        }
+        let parked = ::tokio::select! {
+            parked = parking.recv() => parked.unwrap(),
+            changed = until.changed() => {
+                changed.unwrap();
+                continue;
+            }
+        };
+        let named = client.status().await.unwrap().height;
+        last = parked.height;
+        parked.release();
+        let replayed = last <= announced;
+        if replayed {
+            continue;
+        }
+        assert!(
+            named < last,
+            "status named block {named} while the node still served what block {last} changed from before it"
+        );
+    }
+}
+
 fn page(before: Option<u64>, limit: u32, most: u32) -> Blocks {
     Blocks {
         before,

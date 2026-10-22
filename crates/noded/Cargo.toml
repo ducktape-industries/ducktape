@@ -62,7 +62,11 @@ fixture-probe = { path = "../kernel/fixtures/probe" }
 fixture-relay = { path = "../kernel/fixtures/relay" }
 fixture-valset = { path = "../kernel/fixtures/valset" }
 fixture-wasm = { workspace = true }
+noded = { path = ".", features = ["testkit"] }
 programs-sdk = { workspace = true }
 store = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[features]
+testkit = []

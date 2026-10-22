@@ -102,7 +102,7 @@ fn a_listed_signer_reaches_a_members_forwarded_service_through_any_node_and_no_r
         };
         let height = membership(through, &calling.identity, Op::Vote(motion)).await;
         for node in &live {
-            reach(&node.client, height + 1).await;
+            reach(&node.client, height).await;
         }
 
         let unlisted = call(through, &live[1].client, &stranger, &at, "echo", b"hi").await;
@@ -270,5 +270,63 @@ fn a_member_node_checks_a_call_itself_and_refuses_one_sent_straight_down_the_lan
     );
     assert_eq!(reasons.len(), 5);
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    shut_down(&runtime, &[&calling, &serving], live);
+}
+
+#[test]
+fn a_node_names_a_block_in_its_status_only_once_it_serves_the_lane_and_seats_of_that_block() {
+    apart!();
+    let root = tempfile::tempdir().unwrap();
+    let calling = Seat::new(root.path(), "n0");
+    let serving = Seat::new(root.path(), "n1");
+    let founding = founding(root.path(), &[&calling, &serving], EPOCH_LENGTH);
+    calling.init(&founding);
+    serving.init(&founding);
+    let (through, daemon) =
+        calling.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let live = vec![through, serving.start()];
+    let caller = ed25519::PrivateKey::from_seed(CALLER_SEED);
+    let stranger = ed25519::PrivateKey::from_seed(STRANGER_SEED);
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let echo = echo().await;
+        offer(&serving, echo.address, &caller);
+        let through = &live[0].client;
+        let at = serving.key();
+        let open = halo::Op::Open {
+            name: noded::FORWARD_LANE.into(),
+            cap: halo::Class::Client,
+        };
+        let motion = Motion::Role {
+            role: role::HALO.into(),
+            op: abi::encode(&open),
+        };
+        let announced = through.status().await.unwrap().height;
+        let retabling = daemon.retabling.arm();
+        let reseating = daemon.reseating.arm();
+        let (voted_at, voted) = ::tokio::sync::watch::channel(u64::MAX);
+        let voting = async {
+            let height = membership(through, &calling.identity, Op::Vote(motion)).await;
+            voted_at.send_replace(height);
+            height
+        };
+        let (height, retabled, reseated) = futures::join!(
+            voting,
+            served_before_announced(through, retabling, announced, voted.clone()),
+            served_before_announced(through, reseating, announced, voted),
+        );
+        assert_eq!(
+            (retabled, reseated),
+            (height, height),
+            "the node retables and reseats at the block that lands the vote"
+        );
+        for node in &live {
+            reach(&node.client, height).await;
+        }
+        let unlisted = call(through, &live[1].client, &stranger, &at, "echo", b"hi").await;
+        assert_eq!(refusal_reason(unlisted), reason::NOT_FOUND);
+        assert_eq!(echo.accepted.load(Ordering::SeqCst), 0);
+    });
+    drop(daemon);
     shut_down(&runtime, &[&calling, &serving], live);
 }

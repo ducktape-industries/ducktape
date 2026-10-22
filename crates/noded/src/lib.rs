@@ -31,6 +31,8 @@ mod run;
 mod server;
 mod snapshot;
 mod standing;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 mod transport;
 mod view;
 pub mod wire;
@@ -207,6 +209,10 @@ pub struct Daemon<E: Context> {
     halo_self: watch::Sender<wire::HaloSelf>,
     forward: forward::Forwarding,
     solo: Option<fork::Solo>,
+    #[cfg(feature = "testkit")]
+    pub retabling: testkit::Gate,
+    #[cfg(feature = "testkit")]
+    pub reseating: testkit::Gate,
 }
 
 pub struct HeldHead {

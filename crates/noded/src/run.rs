@@ -760,6 +760,10 @@ async fn start<E: Context>(
         halo_self,
         forward,
         solo: solo_handle,
+        #[cfg(feature = "testkit")]
+        retabling: Default::default(),
+        #[cfg(feature = "testkit")]
+        reseating: Default::default(),
     });
     let unrecorded = steered
         .as_ref()
@@ -1022,6 +1026,8 @@ async fn retable_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u6
             "halo keeps its lane table: the node could not read the halo program's lanes"
         ),
     }
+    #[cfg(feature = "testkit")]
+    daemon.retabling.pass(height).await;
 }
 
 /// Has halo serve `lanes`, the halo role's table at `height`, from now on, and says so.
@@ -1070,6 +1076,8 @@ async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64
             "halo keeps its seating: the node could not read the validators program's members"
         ),
     }
+    #[cfg(feature = "testkit")]
+    daemon.reseating.pass(height).await;
 }
 
 pub fn seats(members: &[Member], validators: &[Vec<u8>]) -> Vec<Seat> {
@@ -1670,6 +1678,11 @@ async fn readopted<E: Context>(
         "the block reads a blob that no member gave and the source no longer serves; the node re-adopted the state at the source's head and goes on from there"
     );
     writing.workspace.write_anchor(&anchor)?;
+    retable_halo(&daemon, node, tip.height).await;
+    let consenting = consensus.is_some();
+    if consenting {
+        reseat_halo(&daemon, node, tip.height).await;
+    }
     published(node, &daemon, Some(anchor.clone()));
     daemon.tips.send_replace(tip.height);
     let programs: Vec<abi::ProgramId> = node.host().store().programs().cloned().collect();
@@ -1683,7 +1696,6 @@ async fn readopted<E: Context>(
         .map(|entry| (entry.key, Some(entry.value)))
         .collect();
     daemon.blobs.applied(tip.height, &bundles);
-    retable_halo(&daemon, node, tip.height).await;
     let Some(consensus) = consensus.as_mut() else {
         daemon.pool.offer(Offer::Every);
         return Ok(());
@@ -1694,7 +1706,6 @@ async fn readopted<E: Context>(
         )))?;
         consensus.membership.roster().seat(epoch, keys);
     }
-    reseat_halo(&daemon, node, tip.height).await;
     let epoch = daemon.network.epoch_after(tip.height);
     let crossed = epoch != daemon.network.epoch_after(past);
     if crossed {
@@ -1775,8 +1786,28 @@ async fn applied<E: Context>(
         Some(Anchor::Finalized(certificate)) => Some(certificate.clone()),
         Some(Anchor::Genesis(_)) | None => None,
     };
-    published(node, daemon, anchor.clone());
     let closes = daemon.network.closes_an_epoch(block.height);
+    let (members_written, lanes_written) = match &sequenced {
+        Sequenced::Applied { applied, .. } => {
+            let validators = node.host().role(role::VALIDATORS)?;
+            let members_written = applied
+                .writes
+                .programs
+                .get(validators)
+                .is_some_and(|writes| !writes.is_empty());
+            let halo = node.host().role(role::HALO)?;
+            (members_written, rewrites(&applied.writes, halo))
+        }
+        Sequenced::Replayed => (false, false),
+    };
+    if lanes_written {
+        retable_halo(daemon, node, block.height).await;
+    }
+    let reseats = consenting && (members_written || closes);
+    if reseats {
+        reseat_halo(daemon, node, block.height).await;
+    }
+    published(node, daemon, anchor.clone());
     let replayed = matches!(sequenced, Sequenced::Replayed);
     let opens_an_epoch = !replayed && closes;
     let relays = !daemon.egress.current().config.crosspond.is_empty();
@@ -1796,7 +1827,7 @@ async fn applied<E: Context>(
     daemon.votes.applied(id, block.height);
     daemon.tips.send_replace(block.height);
     phases.publishing = lap.lap();
-    let members_written = match sequenced {
+    match sequenced {
         Sequenced::Applied {
             mut applied,
             carried,
@@ -1829,17 +1860,6 @@ async fn applied<E: Context>(
                     time: block.time,
                 },
             );
-            let validators = node.host().role(role::VALIDATORS)?;
-            let members_written = applied
-                .writes
-                .programs
-                .get(validators)
-                .is_some_and(|writes| !writes.is_empty());
-            let halo = node.host().role(role::HALO)?;
-            let lanes_written = rewrites(&applied.writes, halo);
-            if lanes_written {
-                retable_halo(daemon, node, block.height).await;
-            }
             let blobs = node.host().role(role::BLOBS)?;
             let writes = applied.writes.programs.get(blobs).cloned();
             let due = daemon
@@ -1850,19 +1870,13 @@ async fn applied<E: Context>(
                 receipts_for(daemon, node, block.height, due, reseated)?;
             }
             phases.receipting = lap.lap();
-            members_written
         }
         Sequenced::Replayed => {
             daemon
                 .record_unrecorded(node, block, id, finalization)
                 .await?;
             phases.recording = lap.lap();
-            false
         }
-    };
-    let reseats = consenting && (members_written || closes);
-    if reseats {
-        reseat_halo(daemon, node, block.height).await;
     }
     if !opens_an_epoch {
         daemon.pool.offer(Offer::Due);

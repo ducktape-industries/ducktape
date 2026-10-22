@@ -798,7 +798,9 @@ Halo carries lanes, each a named kind of traffic (blobs ride `ducktape/blobs`). 
 role's program holds the lane table: each lane's name, the id its streams and datagrams carry
 on the wire, the highest class it is served at, whether it is served, and whether it is pinned.
 A node reads the table at start and again after any block that writes it or swaps the halo
-program's code, so every node changes lanes at the same block. Only the validators' vote
+program's code, so every node changes lanes at the same block. It installs the lane table
+and updates the member seats before its status, tips or change streams announce that block.
+It does the same before announcing a state it re-adopted. Only the validators' vote
 changes it (`ducktape vote role halo <op>`, an `abi::role::halo::Op`): it opens a lane at the next
 id, sets a lane's class or pauses it, or closes one; an id is never handed out twice. A lane is pinned only at founding, and no
 vote pauses or closes a pinned lane. Pin `ducktape/blobs`: a node fetches the blobs a block

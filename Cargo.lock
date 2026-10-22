@@ -3171,6 +3171,7 @@ dependencies = [
  "keyscheme",
  "live-wire",
  "node",
+ "noded",
  "program 0.1.0 (git+https://github.com/ducktape-industries/programs?rev=0ea8dc72ea2e53d5474d6d04fab33abc2f3acc63)",
  "quinn",
  "rand_core 0.10.1",
