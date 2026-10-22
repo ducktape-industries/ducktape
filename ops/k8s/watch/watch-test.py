@@ -902,6 +902,7 @@ STABLE_JSON = "https://dl.ducktape.industries/app/stable.json"
 STABLE_CHANNEL = {"check": "stable", "label": "Desktop stable", "tags": "#app", "emoji": "🦆", "branch": "main", "manifest": STABLE_JSON}
 MERGED_BACK = "release: main reaches dev again: merge of the squashed stable cut with dev, dev tree unchanged\n"
 CUTS = [
+    (oid(2), "release: stable from dev 6666666\n\nmain reaches dev by a merge commit with dev's own tree.\n\nRelease note: The cut that is a merge.\n", [oid(9), oid(6)]),
     (oid(9), MERGED_BACK, [oid(8), oid(7)]),
     (oid(8), squash("release: stable from dev 7777777", 210, "**What people get**", "- Menus: a long press opens one (#209).", "- Pictures: lighter (#208).", "", "Release note: A long press opens a message's menu, and pictures cost less memory."), [oid(5)]),
     (oid(7), squash("host: a long press opens the menu", 209, "Release note: A long press on a message opens its menu."), [oid(6)]),
@@ -1028,6 +1029,16 @@ class ChangelogPosts(unittest.TestCase):
         self.assertEqual(cli.ops[0]["post"]["text"].splitlines()[1:-1], ["• A long press opens a message's menu, and pictures cost less memory."])
         self.assertEqual(cli.ops[1]["post"]["text"].splitlines()[2:5], [f"• Source: app main `{oid(9)}`", f"• Since: `{oid(5)}`", "• Changes: 210"])
         self.assertEqual(watcher.state["changelog"]["stable"]["commit"], oid(9))
+
+    def test_a_stable_cut_made_as_a_merge_posts_its_own_note(self):
+        seeded = {**STABLE_CHANNEL, "since": oid(9), "since_sequence": 200}
+        http = FakeHttp({STABLE_JSON: manifest(300, oid(2))})
+        cli = FakeCli(forge={"refs/heads/main": CUTS})
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, Clock(), seeded)
+            watcher.tick()
+        self.assertEqual(cli.ops[0]["post"]["text"].splitlines()[1:-1], ["• The cut that is a merge."])
+        self.assertEqual(cli.ops[1]["post"]["text"].splitlines()[4], f"• Changes: {oid(2)[:8]}")
 
     def test_a_day_whose_changes_all_say_none_posts_nothing_and_moves_on(self):
         seeded = {**NIGHTLY_CHANNEL, "since": oid(3), "since_sequence": 300}

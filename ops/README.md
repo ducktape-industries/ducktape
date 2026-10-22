@@ -871,9 +871,10 @@ one up for another network.
     channel has moved past the commit its last entry named, one forge
     `Log` from the channel's branch, less that commit, gives the commits
     in between, and watch walks their first-parent chain from the
-    published commit, leaving merges out: a stable cut (dev squashed onto
-    `main`, then merged back with dev) brings only the cut's own note,
-    while dev's changes stay in the nightly's entries. Each one's
+    published commit, leaving out merges that carry no `Release note:`
+    line: a stable cut (dev squashed onto `main` and merged back with dev,
+    or a merge of dev that holds its own note) brings only the cut's own
+    note, while dev's changes stay in the nightly's entries. Each one's
     `Release note:` line (its title when it has
     none; `none` leaves it out) goes into one entry in chat channel
     `release`, with the commits and change numbers in its thread, posted

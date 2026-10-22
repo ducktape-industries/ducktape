@@ -511,7 +511,9 @@ def commits_to(cli, repo, branch, commit, since):
     found, at = [], tip
     while at in rows:
         row = rows[at]
-        found.append((at, bytes.fromhex(row["message"]).decode(errors="replace"), len(row["parents"]) > 1))
+        message = bytes.fromhex(row["message"]).decode(errors="replace")
+        noted = any(line.startswith(NOTE) for line in message.splitlines())
+        found.append((at, message, len(row["parents"]) > 1 and not noted))
         if since is None:
             break
         at = row["parents"][0] if row["parents"] else None
