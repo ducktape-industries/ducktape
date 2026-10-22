@@ -1,6 +1,6 @@
 # The mac relay: namespace mac, its state claim, its Deployment and its fixed-address Service, whose port 8080 only the duckpond node reaches
 # (the egress service `mac`) and whose port 8081 the Mac dials out to at http://100.65.253.102:8081, fabrics-1's tailnet address, one TCP connection end to end.
-# Applied by ops/k8s/mac/deploy, which substitutes @IMAGE@, @NODE_URL@ and @FORGE@; the key it signs with is the Secret `mac-key`, the Mac's token the Secret `mac-token`.
+# Applied by ops/k8s/mac/deploy, which substitutes @IMAGE@ and @FORGE@; the key it signs with is the Secret `mac-key`, the Mac's token the Secret `mac-token`.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -62,7 +62,7 @@ spec:
           image: "@IMAGE@"
           env:
             - {name: MAC_DUCKTAPE, value: "ducktape --workspace /home/mac --node http://node-http.duckpond.svc:8844"}
-            - {name: MAC_NODE, value: "@NODE_URL@"}
+            - {name: MAC_NODE, value: "http://node-http.duckpond.svc:8844"}
             - {name: MAC_FORGE, value: "@FORGE@"}
             - {name: MAC_KEYS, value: /keys}
             - {name: MAC_TOKEN, value: /token/token}

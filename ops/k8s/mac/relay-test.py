@@ -726,6 +726,7 @@ class Manifest(unittest.TestCase):
         text = (HERE / "mac.yaml").read_text()
         env = dict(re.findall(r'- \{name: (MAC_\w+), value: "?([^"}]*)"?\}', text))
         self.assertEqual(env["MAC_DUCKTAPE"], "ducktape --workspace /home/mac --node http://node-http.duckpond.svc:8844")
+        self.assertEqual(env["MAC_NODE"], "http://node-http.duckpond.svc:8844")
 
 
 if __name__ == "__main__":

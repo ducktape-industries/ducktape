@@ -1193,11 +1193,11 @@ one up for another network.
 - When the Mac connects, the relay sends it every queued run again. It marks
   `interrupted` each run it believed the Mac held that the Mac no longer
   lists, and tells the Mac to forget the runs deleted while it was away.
-- `k8s/mac/deploy NODE_URL FORGE COMMIT` builds `k8s/mac/Containerfile`
+- `k8s/mac/deploy FORGE COMMIT` builds `k8s/mac/Containerfile`
   around the ducktape CLI built from `git archive COMMIT` and
   git-remote-duck, pushes it to the cluster node's registry, and applies
-  `k8s/mac/mac.yaml`. The relay's own calls (`MAC_DUCKTAPE`) go to the node inside the
-  cluster at `http://node-http.duckpond.svc:8844`, as the pods service's do.
+  `k8s/mac/mac.yaml`. The relay's own calls (`MAC_DUCKTAPE`) and its forge reads
+  (`MAC_NODE`) go to the node inside the cluster at `http://node-http.duckpond.svc:8844`.
 - `mac/mac.py` is the Mac's side, kept running by the LaunchAgent
   `mac/com.ducktape.mac.plist`. It needs Python 3.11 or later, Xcode with an
   iOS simulator runtime, XcodeGen, rustup's cargo first on `PATH` (so the

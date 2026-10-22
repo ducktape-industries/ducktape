@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Builds the mac relay's image around the ducktape CLI built from the source of DUCKTAPE_COMMIT and git-remote-duck, pushes it to the cluster node's registry, and applies mac.yaml.
-# Usage: ops/k8s/mac/deploy NODE_URL FORGE DUCKTAPE_COMMIT
+# Usage: ops/k8s/mac/deploy FORGE DUCKTAPE_COMMIT
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-usage="usage: ops/k8s/mac/deploy NODE_URL FORGE DUCKTAPE_COMMIT"
-node_url=${1:?$usage}
-forge=${2:?$usage}
-commit=$(git -C "$here" rev-parse --verify "${3:?$usage}^{commit}")
+usage="usage: ops/k8s/mac/deploy FORGE DUCKTAPE_COMMIT"
+forge=${1:?$usage}
+commit=$(git -C "$here" rev-parse --verify "${2:?$usage}^{commit}")
 node=${DEPLOY_NODE:-fabrics@fabrics-1}
 context=${DEPLOY_CONTEXT:-fabrics-1}
 tunnel_port=35313
@@ -24,7 +23,7 @@ nice -n 19 podman build --file "$here/Containerfile" --build-arg COMMIT="$commit
 ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "127.0.0.1:$tunnel_port:127.0.0.1:5000" "$node"
 podman push --tls-verify=false --digestfile "$stage/digest" "localhost:$tunnel_port/mac:$tag"
 image="localhost:5000/mac:$tag@$(cat "$stage/digest")"
-sed -e "s#@IMAGE@#$image#g" -e "s#@NODE_URL@#$node_url#g" -e "s#@FORGE@#$forge#g" \
+sed -e "s#@IMAGE@#$image#g" -e "s#@FORGE@#$forge#g" \
   "$here/mac.yaml" | kubectl --context "$context" apply -f -
 kubectl --context "$context" -n mac rollout status deployment/mac
 echo "$image"
