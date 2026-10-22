@@ -380,6 +380,7 @@ CORE_V1 = {
             CORE + "ResourceQuotaSpec": {"type": "object", "properties": {"hard": amounts()}},
             CORE + "ResourceQuota": kind_of("", "v1", "ResourceQuota", spec=ref(CORE + "ResourceQuotaSpec", True)),
             "io.k8s.api.policy.v1.Eviction": kind_of("policy", "v1", "Eviction"),
+            "io.k8s.api.authentication.v1.TokenRequest": kind_of("authentication.k8s.io", "v1", "TokenRequest", spec={"type": "object"}),
             CORE + "Binding": kind_of("", "v1", "Binding", target={"type": "object"}),
         }
     },
@@ -393,6 +394,7 @@ CORE_V1 = {
         "/api/v1/namespaces/{namespace}/configmaps/{name}": operations(CORE + "ConfigMap", "put", "patch"),
         "/api/v1/namespaces/{namespace}/services/{name}": operations(CORE + "Service", "put", "patch"),
         "/api/v1/namespaces/{namespace}/pods/{name}/binding": operations(CORE + "Binding", "post"),
+        "/api/v1/namespaces/{namespace}/serviceaccounts/{name}/token": operations("io.k8s.api.authentication.v1.TokenRequest", "post"),
         "/api/v1/namespaces/{namespace}/pods/{name}/exec": unbodied("get", "post"),
         "/api/v1/namespaces/{namespace}/pods/{name}/proxy": unbodied("post", "put", "patch"),
         "/api/v1/namespaces/{namespace}/pods/{name}/proxy/{path}": unbodied("post", "put", "patch"),
@@ -1464,6 +1466,95 @@ class Owned(Served):
             for words in ("configmaps m is not there", "a POST to /v1/k8s/api/v1/namespaces/agents/configmaps", "POST /v1/manifests"):
                 self.assertIn(words, answer["error"])
             self.assertEqual([call[:2] for call in self.api.calls], [("GET", path)])
+
+    def test_an_exec_attach_portforward_or_proxy_is_its_objects_requesters_alone_whatever_its_method(self):
+        pod = "/api/v1/namespaces/agents/pods/p"
+        service = "/api/v1/namespaces/agents/services/s"
+        labels = {"ducktape.industries/requester": "21"}
+        held = {
+            pod: {"kind": "Pod", "metadata": {"name": "p", "uid": "u-p", "labels": labels}},
+            service: {"kind": "Service", "metadata": {"name": "s", "uid": "u-s", "labels": labels}},
+        }
+        raw = {**ASKED, "content-type": "application/octet-stream"}
+        cases = (
+            ("POST", pod, "/exec", "command=sh&stdin=true", b""),
+            ("GET", pod, "/exec", "command=sh", b""),
+            ("POST", pod, "/attach", "stdin=true", b""),
+            ("GET", pod, "/attach", "stdout=true", b""),
+            ("POST", pod, "/portforward", "ports=8080", b""),
+            ("GET", pod, "/portforward", "ports=8080", b""),
+            ("GET", pod, "/proxy/a/b", "c=d", b""),
+            ("POST", pod, "/proxy/a", "", b"\x00 raw"),
+            ("DELETE", pod, "/proxy/a", "", b"\x00 raw"),
+            ("GET", service, "/proxy", "", b""),
+            ("DELETE", service, "/proxy/a", "c=d", b""),
+        )
+        for sender, words in ((sent_by(15), "account 15's"), (NOBODY, "no account's")):
+            self.signer.sender = sender
+            for method, read, tail, query, body in cases:
+                self.api.calls, self.api.answers = [], [answered(200, held[read]), answered(200, {"kind": "Status"})]
+                code, answer = self.call(method, "/v1/k8s" + read + tail + (f"?{query}" if query else ""), body, headers=raw)
+                self.assertEqual(code, 403, (method, tail, words, answer))
+                kind, name = read.rsplit("/", 2)[1:]
+                for word in (f"{kind} {name} is account 21's", "changes or deletes it", words):
+                    self.assertIn(word, answer["error"])
+                self.assertEqual([call[:2] for call in self.api.calls], [("GET", read)], (method, tail))
+        self.signer.sender = sent_by(21)
+        for method, read, tail, query, body in cases:
+            self.api.calls, self.api.answers = [], [answered(200, held[read]), answered(200, {"kind": "Status"})]
+            code, answer = self.call(method, "/v1/k8s" + read + tail + (f"?{query}" if query else ""), body, headers=raw)
+            self.assertEqual((code, answer), (200, {"kind": "Status"}), (method, tail))
+            sent = [("GET", read, "", b"", None), (method, read + tail, query, body, "application/octet-stream")]
+            self.assertEqual(self.api.calls, sent, (method, tail))
+
+    def test_a_proxy_is_judged_by_the_object_its_name_names_as_kubernetes_splits_it(self):
+        labels = {"ducktape.industries/requester": "21"}
+        held = {
+            "pods": {"kind": "Pod", "metadata": {"name": "p", "uid": "u-p", "labels": labels}},
+            "services": {"kind": "Service", "metadata": {"name": "p", "uid": "u-s", "labels": labels}},
+        }
+        named = [(kind, segment) for kind in held for segment in ("p", "p:8080", "https:p:443", ":p:80")]
+        self.signer.sender = sent_by(15)
+        for kind, segment in named:
+            self.api.calls, self.api.answers = [], [answered(200, held[kind])]
+            self.refused("GET", f"/v1/k8s/api/v1/namespaces/agents/{kind}/{segment}/proxy/a", None, 403, [f"{kind} p is account 21's"])
+            self.assertEqual([call[:2] for call in self.api.calls], [("GET", f"/api/v1/namespaces/agents/{kind}/p")], (kind, segment))
+        self.signer.sender = sent_by(21)
+        for kind, segment in named:
+            self.api.calls, self.api.answers = [], [answered(200, held[kind]), answered(200, {"kind": "Status"})]
+            self.assertEqual(self.call("GET", f"/v1/k8s/api/v1/namespaces/agents/{kind}/{segment}/proxy/a"), (200, {"kind": "Status"}), (kind, segment))
+            read, forwarded = f"/api/v1/namespaces/agents/{kind}/p", f"/api/v1/namespaces/agents/{kind}/{segment}/proxy/a"
+            self.assertEqual([call[:2] for call in self.api.calls], [("GET", read), ("GET", forwarded)], (kind, segment))
+        for segment in ("p:1:2:3", "ftp:p:80", ":80", "http::80"):
+            self.api.calls = []
+            self.refused("GET", PODS + f"/{segment}/proxy", None, 400, [f"names its object as {segment}", "NAME:PORT"])
+            self.assertEqual(self.api.calls, [], segment)
+
+    def test_a_post_to_a_named_objects_subresource_is_its_objects_requesters_alone(self):
+        pod = "/api/v1/namespaces/agents/pods/p"
+        account = "/api/v1/namespaces/agents/serviceaccounts/a"
+        labels = {"ducktape.industries/requester": "21"}
+        held = {
+            pod: {"kind": "Pod", "metadata": {"name": "p", "uid": "u-p", "labels": labels}},
+            account: {"kind": "ServiceAccount", "metadata": {"name": "a", "uid": "u-a", "labels": labels}},
+        }
+        binding = {"apiVersion": "v1", "kind": "Binding", "metadata": {"name": "p"}, "target": {"name": "n"}}
+        token = {"apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest", "spec": {"audiences": ["a"]}}
+        cases = ((pod, "/binding", binding), (pod, "/binding", None), (account, "/token", token), (account, "/token", None))
+        for sender, words in ((sent_by(15), "account 15's"), (NOBODY, "no account's")):
+            self.signer.sender = sender
+            for read, tail, body in cases:
+                self.api.calls, self.api.answers = [], [answered(200, held[read]), answered(201, {"kind": "Status"})]
+                kind, name = read.rsplit("/", 2)[1:]
+                self.refused("POST", "/v1/k8s" + read + tail, body, 403, [f"{kind} {name} is account 21's", "changes or deletes it", words])
+                self.assertEqual([call[:2] for call in self.api.calls], [("GET", read)], (tail, body))
+        self.signer.sender = sent_by(21)
+        for read, tail, body in cases:
+            self.api.calls, self.api.answers = [], [answered(200, held[read]), answered(201, {"kind": "Status"})]
+            self.assertEqual(self.call("POST", "/v1/k8s" + read + tail, body), (201, {"kind": "Status"}), (tail, body))
+            self.assertEqual([call[:2] for call in self.api.calls], [("GET", read), ("POST", read + tail)], (tail, body))
+            sent = self.api.calls[1][3]
+            self.assertEqual(json.loads(sent) if body else sent, body or b"", (tail, body))
 
 
 class Exec(Served):
@@ -2754,10 +2845,10 @@ class Kinds(Holder):
             self.assertEqual(cpu_of(sent["spec"]), cpu, patch)
 
     def test_a_subresource_body_is_read_as_its_kind_with_the_rest_from_its_endpoint(self):
-        sent = json.loads(self.sent("POST", PODS + "/p/binding", {"kind": "Pod", "metadata": {"name": "p"}, "spec": LIMITED}))
+        sent = json.loads(self.sent("POST", PODS + "/p/binding", {"kind": "Pod", "metadata": {"name": "p"}, "spec": LIMITED}, None, [PLACED]))
         self.assertEqual((typed(sent), cpu_of(sent["spec"])), ({"kind": "Pod"}, "1e-9"))
         binding = {"apiVersion": "v1", "kind": "Binding", "metadata": {"name": "p"}, "target": {"name": "n"}}
-        self.assertEqual(json.loads(self.sent("POST", PODS + "/p/binding", binding)), binding)
+        self.assertEqual(json.loads(self.sent("POST", PODS + "/p/binding", binding, None, [PLACED])), binding)
         for body in ({"kind": 5}, {"apiVersion": "v1", "Kind": ["Pod"]}):
             self.refused("POST", PODS + "/p/binding", body, 400, ["is not a string"])
         self.refused("POST", PODS + "/p/binding", {"apiVersion": "a/b/c"}, 400, ["not GROUP/VERSION"])
@@ -2815,8 +2906,8 @@ class Kinds(Holder):
             (PODS + "/p/exec", b'{"Kind": 5}', None),
         )
         for path, body, media in bodies:
-            self.assertEqual(self.sent("POST", path, body, media), body)
-        self.assertEqual([call[4] for call in self.api.calls], [None])
+            self.assertEqual(self.sent("POST", path, body, media, [PLACED]), body)
+        self.assertEqual(self.api.calls[-1][4], None)
 
 
 STAMPED = {

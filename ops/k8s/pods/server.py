@@ -207,6 +207,8 @@ SCHEMA_REF = "#/components/schemas/"
 OPENAPI = "/openapi/v3"
 WRITES = ("POST", "PUT", "PATCH")
 CHANGES = ("PUT", "PATCH")
+CONNECTS = ("attach", "exec", "portforward", "proxy")
+PROXY_SCHEMES = ("", "http", "https")
 JSON_PATCH = "application/json-patch+json"
 MERGE_PATCH = "application/merge-patch+json"
 STRATEGIC_PATCH = "application/strategic-merge-patch+json"
@@ -1603,7 +1605,19 @@ def target_of(segments, namespace):
     if not inside:
         raise outside
     named = "/" + "/".join(segments[: len(segments) - len(rest) + 1]) if rest else None
-    return Target(path, resource, rest[1] if len(rest) > 1 else None, named)
+    subresource = rest[1] if len(rest) > 1 else None
+    if subresource == "proxy":
+        named = named.rsplit("/", 1)[0] + "/" + proxied_name(rest[0], path)
+    return Target(path, resource, subresource, named)
+
+
+def proxied_name(segment, path):
+    parts = segment.split(":")
+    scheme, name = (parts[0], parts[1]) if len(parts) == 3 else ("", parts[0])
+    valid = len(parts) <= 3 and bool(name) and scheme in PROXY_SCHEMES
+    if not valid:
+        raise Refused(400, f"{path} names its object as {segment}, and a proxy names it NAME, NAME:PORT or SCHEME:NAME:PORT with scheme http or https, as Kubernetes reads it")
+    return name
 
 
 def object_named(target):
@@ -4718,10 +4732,13 @@ class Service:
         target = target_of(segments, self.kube.namespace)
         self.readable(target.resource, None)
         kind = headers.get("content-type")
-        if method == "DELETE":
+        connecting = target.subresource in CONNECTS
+        if method == "DELETE" and not connecting:
             return self.passed_delete(asked, target, query, body, kind)
-        if target.resource == "pods" and target.subresource == "eviction":
+        evicted = target.resource == "pods" and target.subresource == "eviction"
+        if evicted:
             body = written(evicting(kept(body), self.owned_at(asked, target, method)[1])).encode()
+        judged = target.named is not None and not evicted and (method in WRITES or connecting)
         whole = target.subresource in (None, "ephemeralcontainers")
         operation = None
         if method in WRITES and (whole or body):
@@ -4740,10 +4757,12 @@ class Service:
                 given = stamps(made)
             before, version = ({}, None) if method == "POST" else self.current(asked, target, method)
             unmoved(before, given, "the body")
+            if method == "POST" and judged:
+                self.owned_at(asked, target, method)
             if whole:
                 self.tried(made, "the object")
             body = written(held_to(made, version, None, "the body")).encode()
-        elif method in CHANGES:
+        elif judged:
             self.owned_at(asked, target, method)
         answered = self.api.call(method, target.path, query, body, kind)
         return answered.status, answered

@@ -36,10 +36,13 @@ or through a member node's halo forward.
   object as the requester check below read it (for a subresource, the object it belongs to), so a
   write that lands in between makes Kubernetes refuse it 409.
 - A change or a delete is the object's requester's alone: `DELETE /v1/pods/NAME`, `DELETE
-  /v1/manifests` and a `/v1/k8s/` PUT, PATCH, DELETE or pod eviction (a subresource's write, and a
+  /v1/manifests` and a `/v1/k8s/` PUT, PATCH or DELETE of an object, or a POST to one's subresource
+  (a pod's eviction or binding, a service account's token; a subresource's write, and a
   body Kubernetes forwards unread such as `proxy`, judged by the object it belongs to, which the
-  service reads itself) go through only when the account egress
-  says sent the request (a call fleet relays: its run's asker) is the object's `requester` label,
+  service reads itself), and a `/v1/k8s/` call of any method to a pod's or service's `exec`,
+  `attach`, `portforward` or `proxy` (judged by that pod or service, a proxy's `NAME:PORT` or
+  `SCHEME:NAME:PORT` split as Kubernetes splits it and any other form refused 400, then sent on
+  as it came, its body and query unread) go through only when the account egress says sent the request (a call fleet relays: its run's asker) is the object's `requester` label,
   and anyone else is refused 403 naming whose it is. The program that made a pod deletes it as its
   own account, which is that pod's requester. An object with no requester label (made before pods
   stamped one) is changed or deleted by no call: the operator removes it with kubectl. The service
