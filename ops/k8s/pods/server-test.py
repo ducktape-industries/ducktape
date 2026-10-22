@@ -116,7 +116,7 @@ def pod_json(name="duckpond-41", state=None, phase="Pending", notes=None, reason
     if requester is not None:
         labels["ducktape.industries/requester"] = requester
     return {
-        "metadata": {"name": name, "creationTimestamp": "2026-10-18T12:00:00Z", "labels": labels, "annotations": notes or {}},
+        "metadata": {"name": name, "uid": f"uid-{name}", "creationTimestamp": "2026-10-18T12:00:00Z", "labels": labels, "annotations": notes or {}},
         "spec": {
             "containers": [{"name": "run", "image": "toolchain", "command": ["make"], "args": ["wasm"]}, {"name": "out", "image": "pods"}],
         },
@@ -161,9 +161,6 @@ class Kube:
     def logs(self, name, options):
         return self.ran("logs", name, options)
 
-    def delete(self, name):
-        return self.ran("delete", name)
-
     def exec(self, name, container, command):
         if self.gate is not None:
             self.gate.wait()
@@ -186,9 +183,6 @@ class Kube:
 
     def quotas(self):
         return self.ran("quotas")
-
-    def remove(self, kind, name):
-        return self.ran("remove", kind, name)
 
     def cluster_kinds(self):
         return self.ran("cluster_kinds")
@@ -1010,7 +1004,17 @@ class Fleeted(Served):
         self.kube.answer("get", ran(self.fleet_pod()))
         status, answer = self.call("DELETE", "/v1/pods/duckpond-41", headers=FLEETED)
         self.assertEqual((status, answer), (200, {"deleted": "duckpond-41"}))
-        self.assertIn("delete", self.kube.verbs())
+        self.assertEqual([call[:2] for call in self.api.calls], [("DELETE", "/api/v1/namespaces/agents/pods/duckpond-41")])
+        self.assertEqual(self.signer.senders, [])
+
+    def test_a_call_fleet_relays_deletes_its_runs_pod_only_while_its_asker_requested_it(self):
+        pod = self.fleet_pod()
+        pod["metadata"]["labels"]["ducktape.industries/requester"] = "15"
+        self.kube.answer("get", ran(pod))
+        status, answer = self.call("DELETE", "/v1/pods/duckpond-41", headers=FLEETED)
+        self.assertEqual(status, 403, answer)
+        self.assertIn("pod duckpond-41 is account 15's", answer["error"])
+        self.assertEqual(self.api.calls, [])
 
     def test_a_call_fleet_relays_reaches_no_other_runs_pod(self):
         routes = (("DELETE", "/v1/pods/duckpond-41", None), ("GET", "/v1/pods/duckpond-41", None), ("GET", "/v1/pods/duckpond-41/wait?every=5", None), ("POST", "/v1/pods/duckpond-41/exec", {"command": ["true"]}), ("POST", "/v1/pods/duckpond-41/blob", {"path": "/out/x", "kind": "chunk"}))
@@ -1200,12 +1204,134 @@ class Read(Served):
 
 class Delete(Served):
     def test_delete_removes_the_pod_without_waiting(self):
+        self.kube.answer("get", ran(pod_json()))
+        self.signer.sender = sent_by(17)
         self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-41"), (200, {"deleted": "duckpond-41"}))
-        self.assertEqual(self.kube.calls, [("delete", "duckpond-41")])
+        self.assertEqual(self.kube.calls, [("get", "duckpond-41")])
+        self.assertEqual([call[:2] for call in self.api.calls], [("DELETE", "/api/v1/namespaces/agents/pods/duckpond-41")])
 
     def test_deleting_a_missing_pod_is_not_found(self):
-        self.kube.answer("delete", ran(code=1, err=NOT_FOUND))
+        self.kube.answer("get", ran(code=1, err=NOT_FOUND))
         self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-9")[0], 404)
+        self.assertEqual(self.api.calls, [])
+
+
+NOBODY = ran(server.u8(server.EGRESS_SENDER) + server.u8(0))
+
+
+class Owned(Served):
+    def test_a_pods_requester_deletes_it_held_to_the_uid_it_was_read_at(self):
+        self.kube.answer("get", ran(pod_json(requester="21")))
+        self.signer.sender = sent_by(21)
+        self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-41"), (200, {"deleted": "duckpond-41"}))
+        ((method, path, query, body, kind),) = self.api.calls
+        self.assertEqual((method, path, query, kind), ("DELETE", "/api/v1/namespaces/agents/pods/duckpond-41", "", "application/json"))
+        self.assertEqual(json.loads(body), {"preconditions": {"uid": "uid-duckpond-41"}})
+        self.assertEqual(self.kube.verbs(), ["get"])
+
+    def test_no_other_account_deletes_a_pod(self):
+        self.kube.answer("get", ran(pod_json(requester="21")))
+        for sender, words in ((sent_by(15), "account 15's"), (sent_by(17), "account 17's"), (NOBODY, "no account's")):
+            with self.subTest(words=words):
+                self.signer.sender = sender
+                self.refused("DELETE", "/v1/pods/duckpond-41", None, 403, ["pod duckpond-41 is account 21's", words])
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(set(self.kube.verbs()), {"get"})
+
+    def test_a_pod_that_names_no_requester_is_deleted_by_no_call(self):
+        self.kube.answer("get", ran(pod_json(requester=None)))
+        self.signer.sender = sent_by(21)
+        self.refused("DELETE", "/v1/pods/duckpond-41", None, 403, ["names no requester", "kubectl"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_the_program_that_made_a_pod_deletes_it_as_its_own_account(self):
+        pod = pod_json(requester="38")
+        pod["metadata"]["labels"]["ducktape.industries/program"] = "actions-pods"
+        self.kube.answer("get", ran(pod))
+        self.signer.sender = sent_by(38)
+        status, answer = self.call("DELETE", "/v1/pods/duckpond-41", headers={**ASKED, "ducktape-program": "actions-pods"})
+        self.assertEqual((status, answer), (200, {"deleted": "duckpond-41"}))
+        self.assertEqual([call[0] for call in self.api.calls], ["DELETE"])
+
+    def test_egress_not_saying_who_sent_a_delete_deletes_nothing(self):
+        self.kube.answer("get", ran(pod_json(requester="21")))
+        self.signer.sender = ran(code=1, err="egress: no such query")
+        self.refused("DELETE", "/v1/pods/duckpond-41", None, 502, ["who sent request 41"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_kubernetes_refusing_the_delete_answers_its_refusal(self):
+        self.kube.answer("get", ran(pod_json(requester="21")))
+        self.signer.sender = sent_by(21)
+        self.api.answers = [answered(409, {"kind": "Status", "message": "Precondition failed: UID in precondition: uid-duckpond-41, UID in object meta: other", "code": 409})]
+        self.refused("DELETE", "/v1/pods/duckpond-41", None, 409, ["pod duckpond-41 was not deleted", "Precondition failed"])
+
+    def test_a_manifest_is_deleted_by_its_requester_alone_held_to_its_uid(self):
+        web = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web", "uid": "u-web", "labels": {"ducktape.industries/requester": "21"}}}
+        self.kube.answer("objects", ran(web))
+        self.signer.sender = sent_by(15)
+        self.refused("DELETE", "/v1/manifests", {"kind": "deployment", "name": "web"}, 403, ["deployment web is account 21's"])
+        self.assertEqual(self.api.calls, [])
+        self.signer.sender = sent_by(21)
+        self.assertEqual(self.call("DELETE", "/v1/manifests", {"kind": "deployment", "name": "web"}), (200, {"deleted": "deployment.apps/web"}))
+        ((method, path, _, body, _),) = self.api.calls
+        self.assertEqual((method, path), ("DELETE", "/apis/apps/v1/namespaces/agents/deployments/web"))
+        self.assertEqual(json.loads(body), {"preconditions": {"uid": "u-web"}})
+        self.assertEqual(self.kube.verbs(), ["objects", "objects"])
+
+    def test_a_manifest_that_names_no_requester_is_deleted_by_no_call(self):
+        self.kube.answer("objects", ran({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m", "uid": "u-m"}}))
+        self.signer.sender = sent_by(21)
+        self.refused("DELETE", "/v1/manifests", {"kind": "configmap", "name": "m"}, 403, ["configmap m names no requester"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_a_passthrough_delete_is_its_objects_requesters_alone_held_to_its_uid(self):
+        path = "/api/v1/namespaces/agents/configmaps/m"
+        mine = {"kind": "ConfigMap", "metadata": {"name": "m", "uid": "u-m", "labels": {"ducktape.industries/requester": "21"}}}
+        self.api.answers = [answered(200, mine)]
+        self.signer.sender = sent_by(15)
+        self.refused("DELETE", "/v1/k8s" + path, None, 403, ["configmaps m is account 21's"])
+        self.assertEqual([call[:2] for call in self.api.calls], [("GET", path)])
+        self.api.calls, self.api.answers = [], [answered(200, mine), answered(200, {"kind": "Status", "status": "Success"})]
+        self.signer.sender = sent_by(21)
+        status, answer = self.call("DELETE", "/v1/k8s" + path, {"propagationPolicy": "Background"})
+        self.assertEqual((status, answer), (200, {"kind": "Status", "status": "Success"}))
+        (_, (method, target, _, body, _)) = self.api.calls
+        self.assertEqual((method, target), ("DELETE", path))
+        self.assertEqual(json.loads(body), {"propagationPolicy": "Background", "preconditions": {"uid": "u-m"}})
+        self.api.calls, self.api.answers = [], [answered(200, mine)]
+        self.refused("DELETE", "/v1/k8s" + path, {"preconditions": {"uid": "u-other"}}, 409, ["uid u-other"])
+        self.assertEqual([call[0] for call in self.api.calls], ["GET"])
+
+    def test_a_passthrough_delete_of_a_collection_deletes_only_the_callers_own(self):
+        self.signer.sender = sent_by(21)
+        self.assertEqual(self.call("DELETE", PODS + "?labelSelector=app%3Dweb")[0], 200)
+        ((method, target, query, _, _),) = self.api.calls
+        self.assertEqual((method, target), ("DELETE", "/api/v1/namespaces/agents/pods"))
+        self.assertEqual(server.parse_qs(query), {"labelSelector": ["app=web,ducktape.industries/requester=21"]})
+        self.signer.sender = NOBODY
+        self.refused("DELETE", PODS, None, 403, ["only the caller's own"])
+        self.assertEqual(len(self.api.calls), 1)
+
+    def test_an_eviction_is_its_pods_requesters_alone_held_to_its_uid(self):
+        pod = {"kind": "Pod", "metadata": {"name": "p", "uid": "u-p", "labels": {"ducktape.industries/requester": "21"}}}
+        eviction = {"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": "p"}}
+        self.api.answers = [answered(200, pod)]
+        self.signer.sender = sent_by(15)
+        self.refused("POST", PODS + "/p/eviction", eviction, 403, ["pods p is account 21's"])
+        self.assertEqual([call[0] for call in self.api.calls], ["GET"])
+        self.api.calls, self.api.answers = [], [answered(200, pod)]
+        self.signer.sender = sent_by(21)
+        self.assertEqual(self.call("POST", PODS + "/p/eviction", eviction)[0], 200)
+        ((_, read, _, _, _), (method, target, _, body, _)) = self.api.calls
+        self.assertEqual((read, method, target), ("/api/v1/namespaces/agents/pods/p", "POST", "/api/v1/namespaces/agents/pods/p/eviction"))
+        self.assertEqual(json.loads(body)["deleteOptions"], {"preconditions": {"uid": "u-p"}})
+
+    def test_an_object_made_through_the_passthrough_is_requested_by_its_sender(self):
+        self.signer.sender = sent_by(21)
+        self.call("POST", "/v1/k8s/api/v1/namespaces/agents/configmaps", {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m"}})
+        ((method, _, _, body, _),) = self.api.calls
+        self.assertEqual(method, "POST")
+        self.assertEqual(json.loads(body)["metadata"]["labels"].get("ducktape.industries/requester"), "21")
 
 
 class Exec(Served):
@@ -2048,12 +2174,15 @@ class Manifests(Served):
             self.refused("POST", "/v1/manifests", {"manifests": [manifest]}, 403, ["host namespace"])
 
     def test_delete_removes_a_kind_by_name_and_refuses_the_refused_kinds_by_any_name(self):
-        self.kube.answer("remove", ran(b"deployment.apps/web\n"))
+        web = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web", "uid": "u-web", "labels": {"ducktape.industries/requester": "17"}}}
+        self.kube.answer("objects", ran(web))
+        self.signer.sender = sent_by(17)
         self.assertEqual(self.call("DELETE", "/v1/manifests", {"kind": "deployment", "name": "web"}), (200, {"deleted": "deployment.apps/web"}))
-        self.assertEqual(self.kube.calls[-1], ("remove", "deployment", "web"))
+        self.assertEqual(self.kube.calls[-1], ("objects", "deployment", "web"))
         for kind in ("secrets", "Secret", "netpol", "networkpolicies.networking.k8s.io", "roles", "ing"):
             self.refused("DELETE", "/v1/manifests", {"kind": kind, "name": "x"}, 403, ["is refused"])
-        self.assertEqual(self.kube.verbs().count("remove"), 1)
+        self.assertEqual(self.kube.verbs().count("objects"), 1)
+        self.assertEqual([call[:2] for call in self.api.calls], [("DELETE", "/apis/apps/v1/namespaces/agents/deployments/web")])
 
     def test_reading_returns_one_object_or_every_object_of_a_kind(self):
         self.kube.answer("objects", ran({"kind": "Deployment", "metadata": {"name": "web"}}), ran({"items": [{"metadata": {"name": "web"}}]}))
@@ -2148,9 +2277,12 @@ class Passthrough(Served):
         self.assertEqual([call[0] for call in self.api.calls], ["GET", "PATCH"])
 
     def test_a_subresource_is_read_for_quantities_but_not_confined(self):
+        pod = {"kind": "Pod", "metadata": {"name": "p", "uid": "u-p", "labels": {"ducktape.industries/requester": "17"}}}
+        self.api.answers = [answered(200, {}), answered(200, {}), answered(200, {}), answered(200, pod)]
+        self.signer.sender = sent_by(17)
         self.call("PATCH", DEPLOYMENTS + "/web/scale", b'{"spec": {"replicas": 0}}', headers=MERGE)
         self.call("POST", "/v1/k8s/api/v1/namespaces/agents/pods/p/eviction", {"apiVersion": "policy/v1", "kind": "Eviction"})
-        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("PATCH", "dryRun=All"), ("PATCH", ""), ("POST", "")])
+        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("PATCH", "dryRun=All"), ("PATCH", ""), ("GET", ""), ("POST", "")])
         self.assertEqual(self.kube.calls, [])
 
 

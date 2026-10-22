@@ -33,7 +33,7 @@ from decimal import Decimal
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit
 
 RUN = "run"
 OUT = "out"
@@ -744,9 +744,6 @@ class Kube:
     def logs(self, name, options):
         return self.call("logs", name, *options)
 
-    def delete(self, name):
-        return self.call("delete", "pod", name, "--wait=false")
-
     def exec(self, name, container, command):
         chosen = ["--container", container] if container else []
         return self.call("exec", name, *chosen, "--", *command)
@@ -770,9 +767,6 @@ class Kube:
 
     def quotas(self):
         return self.call("get", "resourcequotas", "--output", "json")
-
-    def remove(self, kind, name):
-        return self.call("delete", kind, name, "--wait=false", "--output", "name")
 
     def cluster_kinds(self):
         return run([*self.kubectl, "api-resources", "--namespaced=false", "--no-headers"])
@@ -1572,6 +1566,7 @@ class Target:
     path: str
     resource: str
     subresource: str | None
+    named: str | None
 
 
 def target_of(segments, namespace):
@@ -1588,7 +1583,8 @@ def target_of(segments, namespace):
             raise outside
     if not inside:
         raise outside
-    return Target(path, resource, rest[1] if len(rest) > 1 else None)
+    named = "/" + "/".join(segments[: len(segments) - len(rest) + 1]) if rest else None
+    return Target(path, resource, rest[1] if len(rest) > 1 else None, named)
 
 
 def forced_holds(manifest):
@@ -1655,6 +1651,39 @@ def held_to(body, version, media, what):
         shown = named if isinstance(named, str) else written(named)
         raise Refused(409, f"{what} names resourceVersion {shown}, and the object is at {version}: read it again")
     return {**body, "metadata": {**meta, "resourceVersion": version}}
+
+
+def preconditioned(options, uid, what):
+    if not isinstance(options, dict):
+        raise Refused(400, f"{what} is not a JSON object, so the delete could not be held to the object's uid")
+    held = mapping(options.get("preconditions"))
+    named = held.get("uid", uid)
+    if named != uid:
+        shown = named if isinstance(named, str) else written(named)
+        raise Refused(409, f"{what} names uid {shown}, and the object's uid is {uid}: read it again")
+    return {**options, "preconditions": {**held, "uid": uid}}
+
+
+def evicting(eviction, uid):
+    if not isinstance(eviction, dict):
+        raise Refused(400, "an eviction is a JSON object, so it could not be held to the pod's uid")
+    options = eviction.get("deleteOptions")
+    return {**eviction, "deleteOptions": preconditioned({} if options is None else options, uid, "the eviction's deleteOptions")}
+
+
+def owned_only(query, caller):
+    pairs = parse_qsl(query, keep_blank_values=True)
+    chosen = [value for key, value in pairs if key == "labelSelector" and value]
+    kept_pairs = [(key, value) for key, value in pairs if key != "labelSelector"]
+    return urlencode([*kept_pairs, ("labelSelector", ",".join([*chosen, f"{REQUESTER}={caller}"]))])
+
+
+def api_refusal(answered, what):
+    try:
+        said = mapping(json.loads(answered.body)).get("message")
+    except ValueError:
+        said = None
+    return Refused(answered.status, f"{what}: Kubernetes answered {answered.status}" + (f": {said}" if said else ""))
 
 
 def confined_as_given(manifest, what, cluster_kinds, namespace, labels):
@@ -2465,6 +2494,15 @@ class Reading:
         if name is None:
             raise Refused(400, f"{what} is a {api_version(kind)} {named}, which the API server publishes no schema for")
         return published, name
+
+    def named_path(self, kind, name, namespace, what):
+        group, version, _ = kind
+        published = self.published(f"apis/{group}/{version}" if group else f"api/{version}")
+        paths = [template for template, found in published.operations if "PUT" in found and found["PUT"].kind == kind and len(template) > 3 and template[-1] == "{name}" and template[-3] == "{namespace}"]
+        if not paths:
+            raise Refused(400, f"the API server publishes no path for {what}, a {api_version(kind)} {kind[2]}, so it could not be deleted")
+        filled = {"{namespace}": namespace, "{name}": quote(name, safe="")}
+        return "/" + "/".join(filled.get(part, part) for part in paths[0])
 
     def object(self, manifest, what):
         group, _, version = manifest["apiVersion"].rpartition("/")
@@ -4143,13 +4181,39 @@ class Service:
             return None
         return ended_event(json.loads(ran.out))
 
-    def delete(self, name):
+    def delete(self, asked, name):
         if name in self.runners:
             raise Refused(403, f"pod {name} is a build runner, a machine and not a pod, so nothing deletes it")
-        ran = self.kube.delete(name)
-        if ran.code != 0:
-            raise kube_refusal(ran, f"pod {name} was not deleted")
+        what = f"pod {name}"
+        uid = self.whose(asked, self.pod(name), what)
+        answered = self.unmade(f"/api/v1/namespaces/{self.kube.namespace}/pods/{quote(name, safe='')}", "", {}, uid, what)
+        if not 200 <= answered.status < 300:
+            raise api_refusal(answered, f"{what} was not deleted")
         return 200, {"deleted": name}
+
+    def whose(self, asked, held, what):
+        meta = mapping(mapping(held).get("metadata"))
+        holder = account_number(str(mapping(meta.get("labels")).get(REQUESTER, "")))
+        if holder is None:
+            raise Refused(403, f"{what} names no requester, so no call deletes it: the operator removes it with kubectl")
+        caller = self.requester(asked)
+        if caller != holder:
+            calling = "no account" if caller is None else f"account {caller}"
+            raise Refused(403, f"{what} is account {holder}'s: only the account whose request made it deletes it (a call {FLEET_PROGRAM} relays: its run's asker), and this call is {calling}'s")
+        uid = meta.get("uid")
+        if not isinstance(uid, str):
+            raise Refused(502, f"{what} was read with no uid, so its delete could not be held to it")
+        return uid
+
+    def object_at(self, path, what):
+        answered = self.api.call("GET", path, "", b"", None)
+        if not 200 <= answered.status < 300:
+            raise api_refusal(answered, f"{what} was not read, so whose it is could not be told")
+        return json.loads(answered.body)
+
+    def unmade(self, path, query, options, uid, what):
+        body = written(preconditioned(options, uid, f"the delete options of {what}")).encode()
+        return self.api.call("DELETE", path, query, body, "application/json")
 
     def exec(self, name, asked_by, body, headers):
         asked = checked(body, EXEC, "an exec")
@@ -4354,18 +4418,32 @@ class Service:
         found = json.loads(ran.out)
         return 200, {"items": found["items"]} if name is None else {"object": found}
 
-    def remove(self, body):
+    def remove(self, asked_by, body):
         asked = named(checked(body, DELETE, "a delete"), ["kind", "name"], "a delete")
         self.readable(asked["kind"], asked["name"])
-        ran = self.kube.remove(asked["kind"], asked["name"])
+        what = f"{asked['kind']} {asked['name']}"
+        ran = self.kube.objects(asked["kind"], asked["name"])
         if ran.code != 0:
-            raise kube_refusal(ran, f"{asked['kind']} {asked['name']} was not deleted")
-        return 200, {"deleted": ran.out.decode().strip()}
+            raise kube_refusal(ran, f"{what} was not deleted")
+        held = mapping(json.loads(ran.out))
+        uid = self.whose(asked_by, held, what)
+        group, _, version = str(held.get("apiVersion", "")).rpartition("/")
+        kind = (group, version, str(held.get("kind", "")))
+        path = self.schemas.reading().named_path(kind, asked["name"], self.kube.namespace, what)
+        answered = self.unmade(path, "", {}, uid, what)
+        if not 200 <= answered.status < 300:
+            raise api_refusal(answered, f"{what} was not deleted")
+        return 200, {"deleted": f"{kind[2].lower()}{'.' + group if group else ''}/{asked['name']}"}
 
     def passthrough(self, method, segments, query, asked, headers, body):
         target = target_of(segments, self.kube.namespace)
         self.readable(target.resource, None)
         kind = headers.get("content-type")
+        if method == "DELETE":
+            return self.passed_delete(asked, target, query, body, kind)
+        if target.resource == "pods" and target.subresource == "eviction":
+            what = f"pods {target.named.rsplit('/', 1)[-1]}"
+            body = written(evicting(kept(body), self.whose(asked, self.object_at(target.named, what), what))).encode()
         whole = target.subresource in (None, "ephemeralcontainers")
         if method in WRITES and (whole or body):
             reading = self.schemas.reading()
@@ -4375,7 +4453,8 @@ class Service:
                 if method == "PATCH":
                     return self.patched(target, query, whole, kind, media, reading.body(home, operation, media, kept(body)))
                 if whole:
-                    made, given = confined_as_given(kept(body), "the object", self.cluster_kinds(), self.kube.namespace, labels_for(asked, None))
+                    requester = self.requester(asked) if method == "POST" else None
+                    made, given = confined_as_given(kept(body), "the object", self.cluster_kinds(), self.kube.namespace, labels_for(asked, requester))
                     made, kind = reading.object(made, "the object"), "application/json"
                 else:
                     made = reading.body(home, operation, media, kept(body))
@@ -4386,6 +4465,18 @@ class Service:
                     self.tried(made, "the object")
                 body = written(held_to(made, version, None, "the body")).encode()
         answered = self.api.call(method, target.path, query, body, kind)
+        return answered.status, answered
+
+    def passed_delete(self, asked, target, query, body, kind):
+        if target.named is None:
+            caller = self.requester(asked)
+            if caller is None:
+                raise Refused(403, f"a delete of every {target.resource} a query selects deletes only the caller's own, and egress names no account for this request")
+            answered = self.api.call("DELETE", target.path, owned_only(query, caller), body, kind)
+            return answered.status, answered
+        what = f"{target.resource} {target.named.rsplit('/', 1)[-1]}"
+        uid = self.whose(asked, self.object_at(target.named, what), what)
+        answered = self.unmade(target.path, query, kept(body), uid, what)
         return answered.status, answered
 
     def current(self, path):
@@ -4499,11 +4590,11 @@ class Service:
             case ("POST", "pods", name, "push"):
                 return self.push(name, asked, parsed(body))
             case ("DELETE", "pods", name):
-                return self.delete(name)
+                return self.delete(asked, name)
             case ("POST", "manifests"):
                 return self.apply(asked, body)
             case ("DELETE", "manifests"):
-                return self.remove(parsed(body))
+                return self.remove(asked, parsed(body))
             case ("GET", "manifests", kind):
                 return self.read(kind, None)
             case ("GET", "manifests", kind, name):

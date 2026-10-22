@@ -30,6 +30,16 @@ or through a member node's halo forward.
   PATCH of any type is judged by its dry run against that read. Both cover the object, its pod
   template and its claim templates. The write is then sent held to the `resourceVersion` it was
   judged at, so a write that lands in between makes Kubernetes refuse it 409.
+- A delete is the deleted object's requester's alone: `DELETE /v1/pods/NAME`, `DELETE
+  /v1/manifests` and a `/v1/k8s/` DELETE or pod eviction go through only when the account egress
+  says sent the request (a call fleet relays: its run's asker) is the object's `requester` label,
+  and anyone else is refused 403 naming whose it is. The program that made a pod deletes it as its
+  own account, which is that pod's requester. An object with no requester label (made before pods
+  stamped one) is deleted by no call: the operator removes it with kubectl. The service reads the
+  object, then sends the delete held to the uid it read, so an object made again under the same
+  name in between is not deleted. A `/v1/k8s/` DELETE of a collection deletes only the caller's
+  own: its `labelSelector` gains `ducktape.industries/requester=<caller>`. A `/v1/k8s/` POST
+  stamps the sender as requester too, as `/v1/pods` and `/v1/manifests` do.
 - A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and
   never ends (`ducktape-run done <run>`) is posted `run <run> lost with pod <pod>: <why>` in
   its channel, once, when the pod ends, when it is deleted, or when the service finds it gone
