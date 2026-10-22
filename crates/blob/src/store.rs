@@ -395,17 +395,31 @@ impl Blobs {
         if into_worn {
             copier.roll()?;
         }
-        let mut budget = whole;
-        let mut plans = Vec::new();
-        for n in worn {
-            if budget == 0 {
-                break;
+        let (plans, batch) = {
+            let mut moving = self
+                .shared
+                .moving
+                .lock()
+                .expect("the legacy listing is never poisoned");
+            let waiting = moving.waiting.take_if(|_| !worn.is_empty());
+            match waiting {
+                Some(legacy) => (Vec::new(), vec![legacy]),
+                None => {
+                    let mut budget = whole;
+                    let mut plans = Vec::new();
+                    for n in worn {
+                        if budget == 0 {
+                            break;
+                        }
+                        let plan = self.log().plan(n, budget, whole)?;
+                        budget = budget.saturating_sub(plan.bytes);
+                        plans.push(plan);
+                    }
+                    let batch = self.legacy_batch(&mut moving, budget, whole)?;
+                    (plans, batch)
+                }
             }
-            let plan = self.log().plan(n, budget, whole)?;
-            budget = budget.saturating_sub(plan.bytes);
-            plans.push(plan);
-        }
-        let batch = self.legacy_batch(budget, whole)?;
+        };
         let mut round = Round::default();
         let mut framed = Vec::new();
         let copied = self.copy(plans, batch, &mut copier, &mut round, &mut framed);
@@ -517,12 +531,7 @@ impl Blobs {
         Ok(())
     }
 
-    fn legacy_batch(&self, budget: u64, whole: u64) -> Result<Vec<Legacy>> {
-        let mut moving = self
-            .shared
-            .moving
-            .lock()
-            .expect("the legacy listing is never poisoned");
+    fn legacy_batch(&self, moving: &mut Moving, budget: u64, whole: u64) -> Result<Vec<Legacy>> {
         let mut batch = Vec::new();
         let mut bytes = 0u64;
         let fits = |bytes: u64, len: u64| bytes + len <= budget || (bytes == 0 && budget == whole);
@@ -1587,14 +1596,26 @@ mod tests {
         let bodies = [noise(10_000, 7), text(5), text(6)];
         let ids: Vec<BlobId> = bodies
             .iter()
-            .map(|body| {
+            .enumerate()
+            .map(|(i, body)| {
                 let framed = frame("page", body).unwrap();
                 let id = id_of(HashKind::Sha256, &framed).unwrap();
-                fs::write(dir.path().join(name_of(&id)), &framed).unwrap();
+                if i != 0 {
+                    fs::write(dir.path().join(name_of(&id)), &framed).unwrap();
+                }
                 id
             })
             .collect();
         assert_eq!(ids[2], twice);
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        assert_eq!(blobs.tidy().unwrap().moved, 2);
+        assert!(!blobs.log().worn().is_empty());
+        drop(blobs);
+        fs::write(
+            dir.path().join(name_of(&ids[0])),
+            frame("page", &bodies[0]).unwrap(),
+        )
+        .unwrap();
         let left = || {
             ids.iter()
                 .filter(|id| dir.path().join(name_of(id)).is_file())
@@ -1611,14 +1632,36 @@ mod tests {
         };
 
         let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        let (extra, _) = put_each(&blobs, dir.path(), 60);
+        for (i, id) in extra.iter().enumerate() {
+            if !i.is_multiple_of(3) {
+                blobs.remove(id).unwrap();
+            }
+        }
         reads(&blobs);
-        let mut was = left();
-        while was > 0 {
-            blobs.tidy().unwrap();
-            let now = left();
-            assert!(now < was, "a commit moved no legacy file: {now} left");
-            reads(&blobs);
-            was = now;
+        assert_eq!(left(), 1);
+        let first = blobs.tidy().unwrap();
+        assert!(first.copied > 0, "compaction gets the first round");
+        assert_eq!(first.moved, 0);
+        let worn = blobs.log().worn();
+        assert!(!worn.is_empty(), "more compaction is pending");
+        reads(&blobs);
+
+        let second = blobs.tidy().unwrap();
+        assert_eq!(second.copied, 0, "the waiting file gets its own round");
+        assert_eq!(second.retired, 0);
+        assert_eq!(second.moved, 1, "the big file moves within two rounds");
+        assert_eq!(left(), 0);
+        assert_eq!(blobs.log().worn(), worn, "compaction waits for its turn");
+        reads(&blobs);
+
+        let third = blobs.tidy().unwrap();
+        assert!(third.copied > 0, "compaction resumes after the file moves");
+        assert_eq!(third.moved, 0);
+        reads(&blobs);
+        for (i, id) in extra.iter().enumerate() {
+            let want = i.is_multiple_of(3).then(|| noise(300, i as u64));
+            assert_eq!(blobs.get(id).unwrap().map(|blob| blob.body), want);
         }
         assert!(dir.path().join(FRAMED).join(name_of(&ids[0])).is_file());
         drop(blobs);
