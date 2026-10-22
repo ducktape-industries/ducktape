@@ -654,8 +654,8 @@ The top level says where the node is reached, what it logs and which CPUs
 its block threads run on. With `block_cpus` set (a Linux CPU list such as
 `0-5` or `0-3,8`), `ducktape run` pins its first thread to those CPUs before
 the block runtime starts, so every thread that orders, applies and stores
-blocks inherits them, and the RPC runtime takes every other CPU the process
-may use. Fence the same CPUs off from everything else on the host (a cpuset,
+blocks inherits them, and the RPC runtime and the blob store's tidy thread
+take every other CPU the process may use. Fence the same CPUs off from everything else on the host (a cpuset,
 or the static CPU manager for a Guaranteed pod), or other work still lands
 on them. A CPU the process may not use stops the node. `[load]`
 says how much work the node takes on at once and how fast it sends over

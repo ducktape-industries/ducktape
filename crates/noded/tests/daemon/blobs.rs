@@ -31,6 +31,49 @@ async fn gated_blobs(
     abi::encode(&answers)
 }
 
+fn cpus_in(status: &str) -> Vec<usize> {
+    let listed = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .unwrap();
+    noded::CpuList::parse(listed.trim())
+        .unwrap()
+        .cpus()
+        .to_vec()
+}
+
+fn an_rpc_cpu() -> Option<Vec<usize>> {
+    let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
+    let cpus = cpus_in(&status);
+    let several = cpus.len() > 1;
+    several.then(|| vec![cpus[cpus.len() - 1]])
+}
+
+fn rpc_on(cpus: &Option<Vec<usize>>) -> LoadConfig {
+    LoadConfig {
+        rpc_cpus: cpus.clone(),
+        ..LoadConfig::default()
+    }
+}
+
+fn tidy_threads_cpus() -> Vec<Vec<usize>> {
+    let mut placed = Vec::new();
+    for task in std::fs::read_dir("/proc/self/task").unwrap() {
+        let task = task.unwrap().path();
+        let Ok(name) = std::fs::read_to_string(task.join("comm")) else {
+            continue;
+        };
+        if name.trim() != "blob-tidy" {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(task.join("status")) else {
+            continue;
+        };
+        placed.push(cpus_in(&status));
+    }
+    placed
+}
+
 async fn filled(client: &Client) -> bool {
     let logs = client.logs().await.unwrap();
     logs.iter().any(|line| line.contains("blobs_filled"))
@@ -593,7 +636,15 @@ fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the
     resident.address = None;
     let founding = founding(root.path(), &[&validator], EPOCH_LENGTH);
     validator.init(&founding);
-    let live = validator.start();
+    let rpc = an_rpc_cpu();
+    let live = validator.start_with(rpc_on(&rpc));
+    if let Some(cpus) = &rpc {
+        assert_eq!(
+            tidy_threads_cpus(),
+            vec![cpus.clone()],
+            "a started node's blob tidy runs on its rpc cpus"
+        );
+    }
     let client = live.client.clone();
     let alice = ed25519::PrivateKey::from_seed(11);
     let runtime = client_runtime();
@@ -629,7 +680,7 @@ fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the
         read
     });
 
-    let follower = resident.start();
+    let follower = resident.start_with(rpc_on(&rpc));
     runtime.block_on(async {
         let named = format!("{lost:?}");
         let tip = client.status().await.unwrap().height;
@@ -673,6 +724,13 @@ fn a_follower_whose_block_reads_a_blob_no_member_holds_readopts_the_state_at_the
             .is_none()
         {
             blocks.next().await.unwrap().unwrap();
+        }
+        if let Some(cpus) = &rpc {
+            assert_eq!(
+                tidy_threads_cpus(),
+                vec![cpus.clone(); 2],
+                "the blob tidy of a node that re-adopted its state runs on its rpc cpus"
+            );
         }
         resident.admin(&follower.client, Admin::Shutdown).await;
     });

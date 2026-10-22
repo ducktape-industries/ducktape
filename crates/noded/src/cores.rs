@@ -73,6 +73,19 @@ pub(crate) fn beside_blocks<T: Send + 'static>(
     })?
 }
 
+pub(crate) fn onto_the_rpc_cpus(rpc: Vec<usize>) -> impl FnOnce() + Send + 'static {
+    move || {
+        if let Err(error) = pin(&rpc) {
+            tracing::warn!(
+                target: "ducktape::blobs",
+                event = "blob_tidy_unplaced",
+                %error,
+                "the blob store's tidy thread stays on the CPUs it started with"
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn past_every_cpu() -> Result<usize, String> {
     Ok(rustix::thread::CpuSet::MAX_CPU)
@@ -173,6 +186,46 @@ mod tests {
         .unwrap();
         assert_eq!(cpus, all[1..].to_vec());
         assert_eq!(priority, 19);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tidy_round_runs_on_the_rpc_cpus_at_its_own_priority_once_placed() {
+        let all = usable().unwrap();
+        if all.len() < 2 {
+            return;
+        }
+        let rest: Vec<usize> = all[1..].to_vec();
+        let block = CpuList(vec![all[0]]);
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = blob::Blobs::open(dir.path()).unwrap();
+        let (said, heard) = std::sync::mpsc::channel();
+        let tidier = std::thread::spawn(move || {
+            pin_block_threads(&block).unwrap();
+            blob::Tidier::spawn(blobs, move |_, _| {
+                let thread = rustix::thread::gettid();
+                let priority = rustix::process::getpriority_process(Some(thread)).unwrap();
+                let _ = said.send((usable().unwrap(), priority));
+            })
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        tidier.wake();
+        let (cpus, started_at) = heard.recv().unwrap();
+        assert_eq!(
+            cpus,
+            vec![all[0]],
+            "a tidy thread opened on the block cpus starts there"
+        );
+        tidier.place(onto_the_rpc_cpus(rest.clone()));
+        tidier.wake();
+        let (cpus, priority) = heard.recv().unwrap();
+        assert_eq!(cpus, rest);
+        assert_eq!(
+            priority, started_at,
+            "a tidy thread holds the lock commits take, so it keeps its priority"
+        );
     }
 
     #[cfg(target_os = "linux")]

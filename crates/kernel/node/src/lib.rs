@@ -221,6 +221,10 @@ where
         self.host.meter_queries(fuel);
     }
 
+    pub fn place_tidy(&self, step_aside: impl FnOnce() + Send + 'static) {
+        self.host.place_tidy(step_aside);
+    }
+
     pub fn network(&self) -> &[u8] {
         &self.network
     }

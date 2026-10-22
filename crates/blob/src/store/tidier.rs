@@ -1,5 +1,6 @@
 // The thread a node's blob store tidies on: each wake asks for one more round of one segment's
-// budget, wakes heard while a round runs fold into that one, and a drop lets the round in hand end.
+// budget, wakes heard while a round runs fold into that one, a placement runs on the thread before
+// its next round while its caller waits for it, and a drop lets the round in hand end.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -29,6 +30,8 @@ struct Bell {
 struct Rung {
     due: bool,
     stop: bool,
+    placing: Option<Box<dyn FnOnce() + Send>>,
+    placed: u64,
     #[cfg(test)]
     running: bool,
     #[cfg(test)]
@@ -68,6 +71,20 @@ impl Tidier {
         self.bell.rung.notify_all();
     }
 
+    pub fn place(&self, step_aside: impl FnOnce() + Send + 'static) {
+        let mut state = self.bell.state();
+        state.placing = Some(Box::new(step_aside));
+        let wanted = state.placed + 1;
+        self.bell.rung.notify_all();
+        loop {
+            let ended = state.placed >= wanted || state.stop;
+            if ended {
+                return;
+            }
+            state = self.bell.wait(state);
+        }
+    }
+
     #[cfg(test)]
     fn settled(&self) -> u64 {
         let mut state = self.bell.state();
@@ -91,11 +108,18 @@ impl Drop for Tidier {
 fn tidying(blobs: &Blobs, bell: &Bell, said: &mut impl FnMut(&Tidied, Duration)) {
     loop {
         let mut state = bell.state();
-        while !state.due && !state.stop {
+        while !state.due && !state.stop && state.placing.is_none() {
             state = bell.wait(state);
         }
         if state.stop {
             return;
+        }
+        if let Some(step_aside) = state.placing.take() {
+            drop(state);
+            step_aside();
+            bell.state().placed += 1;
+            bell.rung.notify_all();
+            continue;
         }
         state.due = false;
         #[cfg(test)]
@@ -175,5 +199,24 @@ mod tests {
             2,
             "each round says what it did"
         );
+    }
+
+    #[test]
+    fn a_placement_has_run_on_the_tidy_thread_once_place_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let (told, heard) = std::sync::mpsc::channel();
+        let rounds = told.clone();
+        let tidier = Tidier::spawn(blobs, move |_, _| {
+            let _ = rounds.send("a round".to_owned());
+        })
+        .unwrap();
+        tidier.place(move || {
+            let thread = std::thread::current();
+            let _ = told.send(thread.name().unwrap_or_default().to_owned());
+        });
+        assert_eq!(heard.try_recv().unwrap(), "blob-tidy");
+        tidier.wake();
+        assert_eq!(heard.recv().unwrap(), "a round");
     }
 }

@@ -96,8 +96,8 @@ duckpond holds `100.65.253.102:8844`; sealpond took `8845` and UDP `9101`.
 
 Two nodes on one machine share its CPUs with no isolation between them. Each
 node runs its RPC threads at nice 19, and with `block_cpus` set in its
-`node.toml` it pins its block threads to those CPUs and its RPC threads to the
-rest (`crates/noded/src/cores.rs`). Give each node its own `block_cpus`, and
+`node.toml` it pins its block threads to those CPUs and its RPC threads and
+blob store's tidy thread to the rest (`crates/noded/src/cores.rs`). Give each node its own `block_cpus`, and
 fence them off from the other node and from every other pod, or the block
 threads compete for the same CPUs like any other processes.
 

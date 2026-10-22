@@ -877,6 +877,10 @@ where
         &self.blobs
     }
 
+    pub fn place_tidy(&self, step_aside: impl FnOnce() + Send + 'static) {
+        self.tidier.place(step_aside);
+    }
+
     pub async fn readable(&self, id: &BlobId, time: u64) -> Result<bool> {
         self.source().readable(id, time).await
     }

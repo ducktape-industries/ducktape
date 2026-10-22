@@ -561,6 +561,7 @@ async fn start<E: Context>(
         Some(cpus) => cpus.clone(),
         None => crate::cores::usable()?,
     };
+    node.place_tidy(crate::cores::onto_the_rpc_cpus(rpc_cpus.clone()));
     let indexed = workspace.dir().join(crate::activity::DIR);
     let lag = crate::activity::Lag {
         from: tip.height,
@@ -570,7 +571,7 @@ async fn start<E: Context>(
         let dir = workspace.dir().join(crate::snapshot::DIR);
         move || crate::snapshot::Removals::start(dir)
     })??;
-    let activity = crate::cores::beside_blocks(rpc_cpus, move || {
+    let activity = crate::cores::beside_blocks(rpc_cpus.clone(), move || {
         crate::activity::Index::open(&indexed, lag, move || seed_of(&seeding))
     })??;
 
@@ -824,6 +825,7 @@ async fn start<E: Context>(
             tally,
             source: source.clone(),
             query_fuel: load.query_fuel.map(NonZeroU64::get),
+            rpc_cpus,
             unmarked: None,
             workspace: workspace.clone(),
         };
@@ -1149,6 +1151,7 @@ struct Writing<E: Context> {
     tally: Tally,
     source: Option<Client>,
     query_fuel: Option<u64>,
+    rpc_cpus: Vec<usize>,
     unmarked: Option<u64>,
     workspace: Workspace,
 }
@@ -1648,9 +1651,11 @@ async fn readopted<E: Context>(
         consensus,
         tracker,
         query_fuel,
+        rpc_cpus,
         ..
     } = writing;
     node.meter_queries(*query_fuel);
+    node.place_tidy(crate::cores::onto_the_rpc_cpus(rpc_cpus.clone()));
     let tip = node.tip()?;
     tracing::warn!(
         target: "ducktape::node",
