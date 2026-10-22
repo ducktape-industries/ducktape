@@ -131,8 +131,10 @@ fn a_preconfirmed_submit_is_answered_while_the_writer_is_held_and_lands_after() 
             matches!(receipt.outcome, Outcome::Applied { .. }),
             "{receipt:?}"
         );
+        let blocks = client.changes(host::RECENT).await.unwrap();
         held.release();
-        let (_, landed) = client.land(&Frame::decode(&given).unwrap()).await.unwrap();
+        let frame = Frame::decode(&given).unwrap();
+        let (_, landed) = client.landed(&frame, blocks).await.unwrap();
         assert!(
             matches!(landed.outcome, Outcome::Applied { .. }),
             "{landed:?}"
