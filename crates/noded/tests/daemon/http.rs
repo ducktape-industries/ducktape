@@ -91,8 +91,6 @@ fn a_validator_serves_its_network_over_http() {
             matches!(receipt.outcome, Outcome::Applied { .. }),
             "{receipt:?}"
         );
-        let change = changes.next().await.unwrap().unwrap();
-        assert_eq!(change.writes, vec![(b"a".to_vec(), Some(b"1".to_vec()))]);
         assert_eq!(
             client
                 .get(Layer::Preconfirmed, "probe", b"a")
@@ -100,6 +98,8 @@ fn a_validator_serves_its_network_over_http() {
                 .unwrap(),
             Some(b"1".to_vec())
         );
+        let change = changes.next().await.unwrap().unwrap();
+        assert_eq!(change.writes, vec![(b"a".to_vec(), Some(b"1".to_vec()))]);
         assert_eq!(
             client.get(Layer::Confirmed, "probe", b"a").await.unwrap(),
             Some(b"1".to_vec())

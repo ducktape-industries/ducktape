@@ -334,7 +334,9 @@ fn rebase_onto<E: Context>(based: &mut Based<E>, view: Arc<View<E>>) {
     based
         .applied
         .store(based.mempool.applied().height, Ordering::Release);
-    publish(based);
+    if !based.mempool.replaying() {
+        publish(based);
+    }
 }
 
 async fn caught_up<E: Context>(based: &mut Based<E>) {
@@ -491,9 +493,12 @@ mod tests {
 
     use abi::{HostOp, HostReply, Outcome};
     use fixture_probe::{Reply, Step};
+    use host::{Layer, Tip};
     use node::{Frame, Preconfirm, Source, Taken};
 
-    use super::{Answer, Based, Event, Offer, Receipt, Reposted, Wakes, next, take};
+    use super::{
+        Answer, Based, Event, Offer, Receipt, Reposted, Wakes, next, rebase_onto, replay_one, take,
+    };
     use crate::view::Current;
     use crate::view::tests::{NETWORK, founded};
 
@@ -626,6 +631,91 @@ mod tests {
                     output: read_the_held_write
                 }
             );
+        });
+    }
+
+    fn preconfirmed(published: &Current<Context>, key: &[u8]) -> Option<Vec<u8>> {
+        let layer = published
+            .speculative
+            .load_full()
+            .expect("the pool publishes a preconfirmed layer");
+        let source = layer.source();
+        let place = source.place_of("probe").expect("probe is founded");
+        source.view(Layer::Preconfirmed).get(&place, key).unwrap()
+    }
+
+    fn preconfirmed_over(published: &Current<Context>) -> Option<Tip> {
+        let layer = published.speculative.load_full()?;
+        Some(layer.source().tip().unwrap())
+    }
+
+    #[test]
+    fn a_preconfirmed_read_between_a_block_and_the_replay_of_the_held_frames_sees_their_writes() {
+        founded(|founded| async move {
+            let published = Arc::new(Current::new());
+            published.views.store(Some(founded.first.clone()));
+            let mut based = Based {
+                mempool: founded.mempool,
+                base: founded.first.clone(),
+                published: published.clone(),
+                applied: Arc::new(AtomicU64::new(0)),
+            };
+            let set = HostOp::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            };
+            let held = Frame::sign(
+                &founded.key,
+                NETWORK,
+                founded.first.tip(),
+                None,
+                "probe",
+                abi::encode(&vec![Step::Op(set)]),
+            );
+            let checked = node::admissible(held.encode(), NETWORK).unwrap();
+            let taken = take(&mut based, checked, Source::Client, Preconfirm::On).await;
+            assert!(
+                matches!(taken, Ok(Ok(Taken::New(Some(_))))),
+                "taken: {taken:?}"
+            );
+            assert_eq!(preconfirmed(&published, b"k"), Some(b"v".to_vec()));
+            published.views.store(Some(founded.next.clone()));
+            rebase_onto(&mut based, founded.next.clone());
+            assert!(
+                based.mempool.replaying(),
+                "the held frame waits to be predicted again over the new block"
+            );
+            assert_eq!(
+                preconfirmed(&published, b"k"),
+                Some(b"v".to_vec()),
+                "a preconfirmed read after a block, before the pool replays what it holds over it"
+            );
+            while based.mempool.replaying() {
+                replay_one(&mut based).await;
+            }
+            assert_eq!(preconfirmed_over(&published), Some(founded.next.tip()));
+            assert_eq!(preconfirmed(&published, b"k"), Some(b"v".to_vec()));
+        });
+    }
+
+    #[test]
+    fn a_new_block_with_nothing_held_publishes_its_preconfirmed_layer_at_once() {
+        founded(|founded| async move {
+            let published = Arc::new(Current::new());
+            published.views.store(Some(founded.next.clone()));
+            let mut based = Based {
+                mempool: founded.mempool,
+                base: founded.first.clone(),
+                published: published.clone(),
+                applied: Arc::new(AtomicU64::new(0)),
+            };
+            rebase_onto(&mut based, founded.next.clone());
+            assert!(
+                !based.mempool.replaying(),
+                "the pool holds nothing to replay"
+            );
+            assert_eq!(preconfirmed_over(&published), Some(founded.next.tip()));
+            assert_eq!(preconfirmed(&published, b"k"), None);
         });
     }
 }
