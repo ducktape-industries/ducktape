@@ -512,7 +512,7 @@ class Wait(Streamed):
         self.assertEqual((kind, data["exit_code"]), ("ended", 0))
 
     def test_a_wait_names_every_in_whole_seconds_from_one(self):
-        for query, words in (("", "names every"), ("?every=0", "from 1"), ("?every=1.5", "whole number"), ("?every=5&tail=3", "no tail")):
+        for query, words in (("", "names every"), ("?every=0", "from 1"), ("?every=1.5", "whole number"), ("?every=5&tail=3", "no tail; it takes every and log")):
             self.refused("GET", f"/v1/pods/duckpond-41/wait{query}", None, 400, [words])
         self.assertNotIn("get", self.kube.verbs())
 
@@ -546,6 +546,46 @@ class Wait(Streamed):
         self.assertEqual((kind, data["exit_code"]), ("ended", 0))
         self.assertEqual(response.read(), b"")
         self.assertTrue(watch.killed)
+
+    def test_a_wait_naming_a_log_carries_its_size_and_last_line_in_each_alive_beat(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        unread = "sh: can't open /out/log: no such file\ncommand terminated with exit code 2"
+        self.kube.answer("exec", ran(b"5120\n$ make check\n"), ran(b"  9000\ntest words ... ok"), ran(code=2, err=unread))
+        watch = Watch()
+        self.kube.watches.append(watch)
+        watch.send("ADDED", pod_json(state=RUNNING, phase="Running"))
+        response = self.stream("/v1/pods/duckpond-41/wait?every=1", headers={**ASKED, "log": "/out/log"})
+        first = {"log": {"bytes": 5120, "line": "$ make check"}}
+        second = {"log": {"bytes": 9000, "line": "test words ... ok"}}
+        unread = {"log": {"error": "sh: can't open /out/log: no such file"}}
+        said = []
+        while unread not in said:
+            kind, data = self.event(response)
+            self.assertEqual(kind, "alive")
+            if data not in ({}, *said[-1:]):
+                said.append(data)
+        self.assertEqual(said, [first, second, unread])
+        watch.send("MODIFIED", pod_json(state=ENDED, phase="Succeeded"))
+        kind, data = self.past_alive(response)
+        self.assertEqual((kind, data["exit_code"]), ("ended", 0))
+        read = ("exec", "duckpond-41", "out", ["sh", "-c", server.LOG_READ, "sh", "/out/log"])
+        execs = [call for call in self.kube.calls if call[0] == "exec"]
+        self.assertGreaterEqual(len(execs), 3)
+        self.assertTrue(all(call == read for call in execs), execs)
+
+    def test_a_log_read_that_hangs_holds_back_no_beat_and_no_end(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
+        self.kube.gate = threading.Event()
+        self.addCleanup(self.kube.gate.set)
+        watch = Watch()
+        self.kube.watches.append(watch)
+        watch.send("ADDED", pod_json(state=RUNNING, phase="Running"))
+        response = self.stream("/v1/pods/duckpond-41/wait?every=1", headers={**ASKED, "log": "/out/log"})
+        self.assertEqual(self.event(response), ("alive", {}))
+        self.assertEqual(self.event(response), ("alive", {}))
+        watch.send("MODIFIED", pod_json(state=ENDED, phase="Succeeded"))
+        kind, data = self.past_alive(response)
+        self.assertEqual((kind, data["exit_code"]), ("ended", 0))
 
     def test_a_deleted_pod_ends_the_wait_with_a_line_saying_so(self):
         self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))
@@ -4600,6 +4640,10 @@ class DesktopRunner(Streamed):
     def test_a_wait_on_a_runner_that_is_not_up_is_refused_before_any_stream(self):
         self.gate.answers["ping"] = ran({"up": False, "state": "stopped"})
         self.refused("GET", "/v1/pods/desktop/wait?every=9", None, 503, ["not up"])
+
+    def test_a_wait_on_a_runner_reads_no_log(self):
+        self.refused("GET", "/v1/pods/desktop/wait?every=9&log=/out/log", None, 400, ["build runner", "no log"])
+        self.assertEqual(self.gate.calls, [])
 
     def test_it_is_never_deleted(self):
         self.refused("DELETE", "/v1/pods/desktop", None, 403, ["not a pod"])

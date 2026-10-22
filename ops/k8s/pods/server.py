@@ -100,7 +100,8 @@ REPORT = {"report": str, "push": dict}
 APPLY = {"manifests": list}
 DELETE = {"kind": str, "name": str}
 LOGS = {"tail", "since", "container"}
-WAIT = {"every"}
+WAIT = {"every", "log"}
+LOG_READ = 'wc -c < "$1" && tail -c 2048 "$1" | tail -n 1'
 ALIASES = {
     "secrets": "secret",
     "ingresses": "ingress",
@@ -2040,7 +2041,7 @@ def from_one(value, field):
 def wait_every(query, headers):
     unknown = sorted(set(query) - WAIT)
     if unknown:
-        raise Refused(400, f"a wait takes no {', '.join(unknown)}; it takes every")
+        raise Refused(400, f"a wait takes no {', '.join(unknown)}; it takes every and log")
     if "every" in query:
         return seconds(query["every"][-1], "every")
     every = header_every(headers)
@@ -2059,6 +2060,12 @@ def header_every(headers):
     if "every" not in headers:
         return None
     return seconds(headers["every"], "the every header")
+
+
+def wait_log(query, headers):
+    if "log" in query:
+        return query["log"][-1]
+    return headers.get("log")
 
 
 def exec_every(asked, headers):
@@ -2099,9 +2106,10 @@ LAST_CHUNK = b"0\r\n\r\n"
 
 
 class Beat:
-    def __init__(self, every):
+    def __init__(self, every, said=dict):
         self.every = every
         self.due = time.monotonic() + every
+        self.said = said
 
     def heard(self, events):
         while True:
@@ -2109,7 +2117,29 @@ class Beat:
                 return events.get(timeout=max(self.due - time.monotonic(), 0))
             except queue.Empty:
                 self.due += self.every
-                yield sse("alive", {})
+                yield sse("alive", self.said())
+
+
+class LogReads:
+    def __init__(self, read):
+        self.read = read
+        self.lock = threading.Lock()
+        self.latest = {}
+        self.reading = False
+        self.said()
+
+    def said(self):
+        with self.lock:
+            latest, idle = self.latest, not self.reading
+            self.reading = True
+        if idle:
+            threading.Thread(target=self.reread, daemon=True).start()
+        return latest
+
+    def reread(self):
+        answer = self.read()
+        with self.lock:
+            self.latest, self.reading = answer, False
 
 
 def relay(process, events):
@@ -4223,9 +4253,12 @@ class Service:
 
     def wait(self, name, query, headers):
         every = wait_every(query, headers)
+        log = wait_log(query, headers)
         if name in self.runners:
+            if log is not None:
+                raise Refused(400, f"{name} is a build runner, with no {OUT} container to read a log in, so its wait takes no log")
             return 200, Stream(self.runner_waited(name, self.runners[name].follow(every), every), reattach=True)
-        return 200, Stream(self.waited(name, self.pod(name), every), reattach=True)
+        return 200, Stream(self.waited(name, self.pod(name), every, log), reattach=True)
 
     def follow(self, name):
         with self.lock:
@@ -4346,9 +4379,9 @@ class Service:
         line = f"pod {name}'s log stream ended (ssh exit {code}): {why or 'it said nothing'}"
         yield sse("ended", {"line": line, "exit_code": None, "pod": None})
 
-    def waited(self, name, pod, every):
+    def waited(self, name, pod, every, log):
         ended = ended_event(pod)
-        beat = Beat(every)
+        beat = Beat(every) if log is None else Beat(every, LogReads(lambda: self.log_said(name, log)).said)
         process = None
         try:
             while ended is None:
@@ -4366,6 +4399,19 @@ class Service:
             if process is not None:
                 process.kill()
         yield sse("ended", ended)
+
+    def log_said(self, name, path):
+        try:
+            ran = self.kube.exec(name, OUT, ["sh", "-c", LOG_READ, "sh", path])
+            stderr = reached(name, ran)
+        except Refused as refused:
+            return {"log": {"error": refused.sentence}}
+        except Exception as error:
+            return {"log": {"error": f"{path} was not read: {error!r}"}}
+        size, _, line = ran.out.decode(errors="replace").partition("\n")
+        if ran.code != 0 or not size.strip().isdigit():
+            return {"log": {"error": stderr.strip() or f"{path} was not read: its read exited {ran.code}"}}
+        return {"log": {"bytes": int(size), "line": line.removesuffix("\n")}}
 
     def reread(self, name, code):
         if code != 0:
