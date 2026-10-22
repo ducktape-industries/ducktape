@@ -33,6 +33,8 @@ const LAYOUT_FROM: [(&[u8], Option<u64>); 2] =
     [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
 const READS_FROM: [(&[u8], Option<u64>); 2] =
     [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
+const MEASURED_DEPTH_FROM: [(&[u8], Option<u64>); 2] =
+    [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
 const HEIGHT_BYTES: usize = size_of::<u64>();
 const ID_BYTES: usize = size_of::<SubmissionId>();
 
@@ -40,6 +42,7 @@ const ID_BYTES: usize = size_of::<SubmissionId>();
 pub struct Activations {
     pub layout_from: u64,
     pub reads_from: u64,
+    pub measured_depth_from: u64,
 }
 
 impl Activations {
@@ -48,6 +51,7 @@ impl Activations {
         Activations {
             layout_from: announced(&LAYOUT_FROM, lineage),
             reads_from: announced(&READS_FROM, lineage),
+            measured_depth_from: announced(&MEASURED_DEPTH_FROM, lineage),
         }
     }
 }

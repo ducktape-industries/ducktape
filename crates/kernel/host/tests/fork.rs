@@ -4,11 +4,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use abi::role::{self, halo, validators};
-use abi::{Entry, Outcome, Scan};
+use abi::{Entry, Message, Outcome, Scan};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use fixture_probe::Step;
+use fixture_relay::Script;
 use fixture_wasm::{
-    ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, VALSET,
+    ACCESS, AWAITS, BLOBS as BLOBS_PROGRAM, HALO, IDENTITY, PROBE, PROGRAMS, RELAY, VALSET,
 };
 use host::{Block, BlockId, Error, Founding, Genesis, Host, Layer, Limits, SPENT, Submission, Tip};
 
@@ -57,6 +58,8 @@ fn genesis(network: &[u8]) -> Genesis {
             founding("blobs", BLOBS_PROGRAM, Vec::new()),
             founding("awaits", AWAITS, Vec::new()),
             founding("probe", PROBE, abi::encode(&Vec::<Step>::new())),
+            founding("ping", RELAY, Vec::new()),
+            founding("pong", RELAY, Vec::new()),
             founding(
                 "halo",
                 HALO,
@@ -126,6 +129,22 @@ async fn applied(host: &mut Host<Ctx>, height: u64) {
         .iter()
         .all(|outcome| matches!(outcome, Outcome::Applied { .. }));
     assert!(all_applied, "{outcomes:?}");
+}
+
+fn chain(depth: u32) -> Script {
+    if depth == 0 {
+        return Script::Note(b"end".to_vec());
+    }
+    let target = match depth % 2 {
+        0 => "ping",
+        _ => "pong",
+    };
+    Script::Send(vec![Message {
+        target: target.into(),
+        payload: abi::encode(&chain(depth - 1)),
+        reply: false,
+        acting: None,
+    }])
 }
 
 fn rows(host: &Host<Ctx>, program: &str) -> Vec<Entry> {
@@ -214,5 +233,32 @@ fn a_fork_of_a_fork_names_the_first_parent_and_a_fork_under_its_own_id_is_refuse
         let again = Host::fork(context.child("again"), dir.path(), "net-fork-3-b").await;
         let refused = matches!(again, Err(Error::Unrenamed(ref id)) if id == "net-fork-3-b");
         assert!(refused);
+    });
+}
+
+#[test]
+fn a_fork_of_a_network_that_nests_eight_deep_nests_eight_deep() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        drop(founded(context.child("found"), "duckpond", dir.path()).await);
+        let mut forked = Host::fork(context.child("fork"), dir.path(), "duckpond-fork-3-a")
+            .await
+            .unwrap();
+        let height = FORKED + 1;
+        let nine_deep = Submission {
+            target: "ping".to_owned(),
+            payload: abi::encode(&chain(9)),
+            ..frame(height)
+        };
+        let nine_deep_block = Block {
+            submissions: vec![nine_deep],
+            ..block(height)
+        };
+        let applied = forked.apply(nine_deep_block).await.unwrap();
+        let sentence = match &applied.submissions[0].outcome {
+            Outcome::Rejected(refusal) => refusal.sentence.clone(),
+            Outcome::Applied { .. } => "applied".to_owned(),
+        };
+        assert_eq!(sentence, "messages nest deeper than 8");
     });
 }

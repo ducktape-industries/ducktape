@@ -13,7 +13,7 @@ use state::{Checkpoint, Overlay};
 use crate::Source;
 use crate::parked::{self, Parked, Waiter};
 use crate::unit::{self, Called, Frame, Resumed, refusal_of};
-use crate::{MAX_DEPTH, Result, rejected};
+use crate::{Result, deepest_nesting, rejected};
 
 pub const PAGE_FUEL: u64 = 4_096;
 
@@ -112,13 +112,12 @@ where
         let mut placed = Placed::default();
         loop {
             let Some(instance) = suspended.take() else {
-                return self
-                    .finish(
-                        program, &env, start, receipt, deferred, overlay, stage, frame, depth,
-                    )
-                    .await;
+                return Box::pin(self.finish(
+                    program, &env, start, receipt, deferred, overlay, stage, frame, depth,
+                ))
+                .await;
             };
-            self.place(
+            Box::pin(self.place(
                 program,
                 &env,
                 calls,
@@ -128,37 +127,35 @@ where
                 stage,
                 frame,
                 depth,
-            )
+            ))
             .await?;
             let Some((ticket, answer)) = placed.ready.pop_front() else {
-                return self
-                    .park(
-                        program,
-                        &env,
-                        start,
-                        receipt,
-                        instance,
-                        placed.open,
-                        overlay,
-                        stage,
-                        frame,
-                        depth,
-                    )
-                    .await;
-            };
-            let resume = ProgramCall::Resume { ticket, answer };
-            let next = self
-                .segment(
+                return Box::pin(self.park(
                     program,
                     &env,
-                    Some(instance),
-                    resume,
+                    start,
+                    receipt,
+                    instance,
+                    placed.open,
                     overlay,
                     stage,
                     frame,
                     depth,
-                )
-                .await?;
+                ))
+                .await;
+            };
+            let resume = ProgramCall::Resume { ticket, answer };
+            let next = Box::pin(self.segment(
+                program,
+                &env,
+                Some(instance),
+                resume,
+                overlay,
+                stage,
+                frame,
+                depth,
+            ))
+            .await?;
             receipt.outcome = next.receipt.outcome.clone();
             receipt.nested.push(next.receipt);
             calls = next.calls;
@@ -189,11 +186,10 @@ where
             return Ok(());
         }
         let as_itself = calls.iter().any(|call| call.acting.is_none());
-        let caller = self
-            .own_sender(
-                program, as_itself, env.height, env.time, overlay, stage, frame,
-            )
-            .await?;
+        let caller = Box::pin(self.own_sender(
+            program, as_itself, env.height, env.time, overlay, stage, frame,
+        ))
+        .await?;
         for Called {
             ticket,
             target,
@@ -204,11 +200,10 @@ where
             let ran = if self.reads_at(&target, env.height) {
                 self.read_call(program, ticket, &payload, env.height, overlay)?
             } else {
-                let sender = self
-                    .sender(
-                        program, acting, &caller, env.height, env.time, overlay, stage, frame,
-                    )
-                    .await?;
+                let sender = Box::pin(self.sender(
+                    program, acting, &caller, env.height, env.time, overlay, stage, frame,
+                ))
+                .await?;
                 match sender {
                     Err(refusal) => Run::finished(rejected(&target, refusal)),
                     Ok(sender) => {
@@ -288,9 +283,9 @@ where
             program: program.to_owned(),
             calls,
         };
-        let told = self
-            .tell_awaits(Origin::System, park, env, overlay, stage, frame, depth + 1)
-            .await?;
+        let told =
+            Box::pin(self.tell_awaits(Origin::System, park, env, overlay, stage, frame, depth + 1))
+                .await?;
         let outcome = told.outcome.clone();
         receipt.nested.push(told);
         if let Outcome::Rejected(refusal) = outcome {
@@ -349,9 +344,9 @@ where
         overlay.restore(start.checkpoint);
         unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
         receipt.outcome = Outcome::Rejected(refusal);
-        self.finish(
+        Box::pin(self.finish(
             program, env, start, receipt, false, overlay, stage, frame, depth,
-        )
+        ))
         .await
     }
 
@@ -377,9 +372,16 @@ where
         };
         parked::remove(self.committed.reads(), overlay, id, program)?;
         let close = awaits::Op::Close { frame: id };
-        let closed = self
-            .tell_awaits(Origin::System, close, env, overlay, stage, frame, depth + 1)
-            .await?;
+        let closed = Box::pin(self.tell_awaits(
+            Origin::System,
+            close,
+            env,
+            overlay,
+            stage,
+            frame,
+            depth + 1,
+        ))
+        .await?;
         receipt.nested.push(closed);
         if !deferred {
             let outcome = receipt.outcome.clone();
@@ -415,7 +417,7 @@ where
         let answered = match waiter {
             Waiter::Nobody => return Ok(()),
             Waiter::Reply { emitter, item } => {
-                self.complete(
+                Box::pin(self.complete(
                     &emitter,
                     program,
                     item,
@@ -426,14 +428,14 @@ where
                     stage,
                     frame,
                     depth + 1,
-                )
+                ))
                 .await?
             }
             Waiter::Call { ticket } => {
                 let answer = answer_of(outcome);
                 let resolve = awaits::Op::Resolve { ticket, answer };
                 let origin = Origin::Program(program.to_owned());
-                self.tell_awaits(origin, resolve, env, overlay, stage, frame, depth + 1)
+                Box::pin(self.tell_awaits(origin, resolve, env, overlay, stage, frame, depth + 1))
                     .await?
             }
         };
@@ -455,7 +457,7 @@ where
         let role = self.role(role::AWAITS)?.clone();
         let sender = match &origin {
             Origin::Program(program) => {
-                self.account_of(program, env.height, env.time, overlay, stage, frame)
+                Box::pin(self.account_of(program, env.height, env.time, overlay, stage, frame))
                     .await?
             }
             Origin::System | Origin::External(_) => Ok(Some(Principal::System)),
@@ -556,11 +558,12 @@ where
             events: Vec::new(),
             nested: Vec::new(),
         };
-        let too_deep = depth > MAX_DEPTH;
+        let deepest = deepest_nesting(self.measured_depth_from, height);
+        let too_deep = depth > deepest;
         if too_deep {
             let refusal = Refusal::new(
                 reason::CAPACITY,
-                format!("messages nest deeper than {MAX_DEPTH}"),
+                format!("messages nest deeper than {deepest}"),
             );
             let ran = self
                 .fail(
@@ -607,21 +610,20 @@ where
             }
         };
         let resume = ProgramCall::Resume { ticket, answer };
-        let segment = self
-            .segment(
-                &program,
-                &env,
-                Some(suspended),
-                resume,
-                overlay,
-                stage,
-                frame,
-                depth,
-            )
-            .await?;
-        let ran = self
-            .follow(&program, env, start, segment, overlay, stage, frame, depth)
-            .await?;
+        let segment = Box::pin(self.segment(
+            &program,
+            &env,
+            Some(suspended),
+            resume,
+            overlay,
+            stage,
+            frame,
+            depth,
+        ))
+        .await?;
+        let ran =
+            Box::pin(self.follow(&program, env, start, segment, overlay, stage, frame, depth))
+                .await?;
         Ok(ran.receipt)
     }
 
@@ -656,11 +658,10 @@ where
             };
             let receipt = rejected(program, awaits::cancelled(program));
             let mut frame = self.open_frame(self.loaded.limits().fuel, None, overlay)?;
-            let ran = self
-                .finish(
-                    program, &env, start, receipt, false, overlay, stage, &mut frame, 0,
-                )
-                .await?;
+            let ran = Box::pin(self.finish(
+                program, &env, start, receipt, false, overlay, stage, &mut frame, 0,
+            ))
+            .await?;
             self.close_frame(overlay, &frame);
             receipts.push(ran.receipt);
         }

@@ -49,14 +49,21 @@ pub use unit::Places;
 pub const STATE_DIR: &str = "state";
 pub const BLOBS_DIR: &str = "blobs";
 const CODE_KIND: &str = "program";
-/// How deep messages nest in one frame: a submission runs at depth 0 and
-/// each message, or reply, one deeper than the run that emitted it.
-pub const MAX_DEPTH: u32 = 8;
+pub const MAX_DEPTH: u32 = 11;
+pub const UNMEASURED_DEPTH: u32 = 8;
 pub const ANCHOR_WINDOW: u64 = 256;
 pub use abi::BLOCK_BYTES;
 const _: () = assert!(blob::SEGMENT_BYTES == BLOCK_BYTES as u64);
 pub const HOOK_FUEL: u64 = 2_000_000;
 const STREAK_LOG_EVERY: u64 = 64;
+
+pub(crate) fn deepest_nesting(measured_depth_from: u64, height: u64) -> u32 {
+    let measured = height >= measured_depth_from;
+    match measured {
+        true => MAX_DEPTH,
+        false => UNMEASURED_DEPTH,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -220,6 +227,7 @@ where
     spent: Spent,
     layout_from: u64,
     reads_from: u64,
+    measured_depth_from: u64,
 }
 
 #[derive(Clone, Default)]
@@ -468,6 +476,7 @@ where
         let namespace::Activations {
             layout_from,
             reads_from,
+            measured_depth_from,
         } = namespace::Activations::of(&genesis.network, None);
         let mut host = Host {
             store,
@@ -484,6 +493,7 @@ where
             spent: Spent::default(),
             layout_from,
             reads_from,
+            measured_depth_from,
         };
         let mut receipts = Vec::new();
         for entry in role_entries {
@@ -562,9 +572,11 @@ where
         let namespace::Activations {
             layout_from,
             reads_from,
+            measured_depth_from,
         } = namespace::Activations::of(network.as_bytes(), Some(parent.as_slice()));
         host.layout_from = layout_from;
         host.reads_from = reads_from;
+        host.measured_depth_from = measured_depth_from;
         host.network = network.as_bytes().to_vec();
         host.parent = Some(parent);
         host.commit(
@@ -621,6 +633,7 @@ where
         let namespace::Activations {
             layout_from,
             reads_from,
+            measured_depth_from,
         } = namespace::Activations::of(&network, parent.as_deref());
         let tidier = tidier_of(&store, &blobs)?;
         let mut host = Host {
@@ -638,6 +651,7 @@ where
             spent: Spent::default(),
             layout_from,
             reads_from,
+            measured_depth_from,
         };
         host.sync_code()?;
         host.index()?;
@@ -708,6 +722,7 @@ where
             preconfirmed: None,
             layout_from: self.layout_from,
             reads_from: self.reads_from,
+            measured_depth_from: self.measured_depth_from,
         }
     }
 
@@ -737,6 +752,7 @@ where
             preconfirmed: Arc::default(),
             layout_from: self.layout_from,
             reads_from: self.reads_from,
+            measured_depth_from: self.measured_depth_from,
             context: std::marker::PhantomData,
         })
     }
@@ -1346,10 +1362,7 @@ where
         frame: &mut Frame,
     ) -> Result<Sender> {
         match asked {
-            true => {
-                self.account_of(program, height, time, overlay, stage, frame)
-                    .await
-            }
+            true => Box::pin(self.account_of(program, height, time, overlay, stage, frame)).await,
             false => Ok(Ok(None)),
         }
     }
@@ -1563,26 +1576,25 @@ where
         frame: &mut Frame,
         depth: u32,
     ) -> Result<Run> {
-        if depth > MAX_DEPTH {
+        let deepest = deepest_nesting(self.measured_depth_from, env.height);
+        if depth > deepest {
             let too_deep = Refusal::new(
                 reason::CAPACITY,
-                format!("messages nest deeper than {MAX_DEPTH}"),
+                format!("messages nest deeper than {deepest}"),
             );
             return Ok(Run::finished(rejected(program, too_deep)));
         }
         let checkpoint = overlay.checkpoint();
         if let Some(payload) = gated(&call, &env)
-            && let Err(refusal) = self
-                .gate(program, payload, &env, overlay, stage, frame)
-                .await?
+            && let Err(refusal) =
+                Box::pin(self.gate(program, payload, &env, overlay, stage, frame)).await?
         {
             overlay.restore(checkpoint);
             unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             return Ok(Run::finished(rejected(program, refusal)));
         }
-        let segment = self
-            .segment(program, &env, None, call, overlay, stage, frame, depth)
-            .await?;
+        let segment =
+            Box::pin(self.segment(program, &env, None, call, overlay, stage, frame, depth)).await?;
         let refused = matches!(segment.receipt.outcome, Outcome::Rejected(_));
         if refused {
             overlay.restore(checkpoint);
@@ -1593,8 +1605,7 @@ where
             waiter,
             checkpoint,
         };
-        self.follow(program, env, start, segment, overlay, stage, frame, depth)
-            .await
+        Box::pin(self.follow(program, env, start, segment, overlay, stage, frame, depth)).await
     }
 
     async fn gate(
@@ -1684,8 +1695,10 @@ where
             call,
         };
         let world = self.world(env.height, env.time);
-        let (mut receipt, effects) =
-            unit::execute(world, overlay, stage, frame, program, suspended, invocation).await?;
+        let (mut receipt, effects) = Box::pin(unit::execute(
+            world, overlay, stage, frame, program, suspended, invocation,
+        ))
+        .await?;
         let unit::Effects {
             emitted,
             calls,
@@ -1694,27 +1707,24 @@ where
             parked,
             writes,
         } = effects;
-        let guarded = self
-            .guard(program, env, writes, overlay, stage, frame)
-            .await?;
+        let guarded = Box::pin(self.guard(program, env, writes, overlay, stage, frame)).await?;
         if let Err(refusal) = guarded {
             overlay.restore(checkpoint);
             unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
             receipt.outcome = Outcome::Rejected(refusal);
             return Ok(Segment::finished(receipt));
         }
-        let refused = self
-            .deliver(
-                program,
-                env,
-                emitted,
-                &mut receipt,
-                overlay,
-                stage,
-                frame,
-                depth,
-            )
-            .await?;
+        let refused = Box::pin(self.deliver(
+            program,
+            env,
+            emitted,
+            &mut receipt,
+            overlay,
+            stage,
+            frame,
+            depth,
+        ))
+        .await?;
         if let Some(outcome) = refused {
             overlay.restore(checkpoint);
             unit::discard_unrostered(self.committed.reads(), overlay, stage)?;
@@ -1808,9 +1818,9 @@ where
         let (height, time) = (env.height, env.time);
         // the emitter's account, asked once for all its messages
         let as_itself = emitted.iter().any(Emitted::as_its_emitter);
-        let emitter = self
-            .own_sender(program, as_itself, height, time, overlay, stage, frame)
-            .await?;
+        let emitter =
+            Box::pin(self.own_sender(program, as_itself, height, time, overlay, stage, frame))
+                .await?;
         for Emitted {
             item,
             message,
@@ -1820,7 +1830,7 @@ where
             let sender = match foreign {
                 Some(foreign) => foreign_sender(program, env, message.acting, foreign),
                 None => {
-                    self.sender(
+                    Box::pin(self.sender(
                         program,
                         message.acting,
                         &emitter,
@@ -1829,7 +1839,7 @@ where
                         overlay,
                         stage,
                         frame,
-                    )
+                    ))
                     .await?
                 }
             };
@@ -1870,20 +1880,19 @@ where
                 (false, false) => continue,
                 (true, false) => outcome,
                 (_, true) => {
-                    let replied = self
-                        .complete(
-                            program,
-                            &message.target,
-                            item,
-                            outcome,
-                            height,
-                            time,
-                            overlay,
-                            stage,
-                            frame,
-                            depth + 1,
-                        )
-                        .await?;
+                    let replied = Box::pin(self.complete(
+                        program,
+                        &message.target,
+                        item,
+                        outcome,
+                        height,
+                        time,
+                        overlay,
+                        stage,
+                        frame,
+                        depth + 1,
+                    ))
+                    .await?;
                     let outcome = replied.outcome.clone();
                     receipt.nested.push(replied);
                     match outcome {
@@ -1911,13 +1920,11 @@ where
         frame: &mut Frame,
         depth: u32,
     ) -> Result<Receipt> {
-        let sender = match self
-            .account_of(by, height, time, overlay, stage, frame)
-            .await?
-        {
-            Err(refusal) => return Ok(rejected(emitter, refusal)),
-            Ok(sender) => sender,
-        };
+        let sender =
+            match Box::pin(self.account_of(by, height, time, overlay, stage, frame)).await? {
+                Err(refusal) => return Ok(rejected(emitter, refusal)),
+                Ok(sender) => sender,
+            };
         let cause = Cause::Completion { item, outcome };
         let env = self.env(emitter, by, sender, cause, height, time);
         let call = ProgramCall::Execute(Vec::new());

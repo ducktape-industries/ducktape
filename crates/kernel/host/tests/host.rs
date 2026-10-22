@@ -25,7 +25,7 @@ use fixture_wasm::{
 };
 use host::{
     ANCHOR_WINDOW, BLOBS, Block, BlockId, Error, Founding, FoundingView, Genesis, Host, Layer,
-    Limits, NETWORK, Queried, RECENT, Roles, SPENT, Snapshot, Submission, Tip,
+    Limits, MAX_DEPTH, NETWORK, Queried, RECENT, Roles, SPENT, Snapshot, Submission, Tip,
 };
 use keyscheme::testkit;
 use sha2::Digest as _;
@@ -36,6 +36,7 @@ const SIGNER: &[u8] = b"signer";
 const FRAME_FUEL: u64 = 150_000;
 const EPOCH_LENGTH: u64 = 4;
 const TIME: u64 = 1_700_000_000;
+const MERGE_NOTICE_TO_MODEL_CALL_DEPTH: u32 = 10;
 
 type Ctx = deterministic::Context;
 
@@ -1574,11 +1575,69 @@ fn chain(depth: u32) -> Script {
     Script::Send(vec![message(target, chain(depth - 1), false)])
 }
 
+fn innermost(receipt: &Receipt) -> (u32, &Receipt) {
+    let mut deepest = receipt;
+    let mut depth = 0;
+    while let Some(inner) = deepest.nested.first() {
+        deepest = inner;
+        depth += 1;
+    }
+    (depth, deepest)
+}
+
 #[test]
-fn messages_nest_at_most_eight_deep() {
+fn messages_nest_as_deep_as_the_measured_stack_allows() {
     deterministic::Runner::default().start(|context| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut host = found(context, "net", dir.path(), standard()).await;
+        let applied = host
+            .apply(block(
+                1,
+                vec![
+                    submit("ping", abi::encode(&chain(MAX_DEPTH))),
+                    submit("ping", abi::encode(&chain(MAX_DEPTH + 1))),
+                ],
+            ))
+            .await
+            .unwrap();
+        let (depth, deepest) = innermost(&applied.submissions[0]);
+        assert_eq!(depth, MAX_DEPTH);
+        assert_eq!(deepest, &receipt("pong", ok(b"dne"), vec![b"end"]));
+        let refusal = rejected(&applied.submissions[1]);
+        assert_eq!(refusal.reason, reason::CAPACITY);
+        assert_eq!(
+            refusal.sentence,
+            format!("messages nest deeper than {MAX_DEPTH}")
+        );
+    });
+}
+
+#[test]
+fn a_frame_as_deep_as_a_merge_notice_that_asks_a_model_applies() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = found(context, "net", dir.path(), standard()).await;
+        let deep = chain(MERGE_NOTICE_TO_MODEL_CALL_DEPTH);
+        let applied = host
+            .apply(block(1, vec![submit("ping", abi::encode(&deep))]))
+            .await
+            .unwrap();
+        output(&applied.submissions[0]);
+        let (depth, deepest) = innermost(&applied.submissions[0]);
+        assert_eq!(depth, MERGE_NOTICE_TO_MODEL_CALL_DEPTH);
+        assert_eq!(deepest, &receipt("pong", ok(b"dne"), vec![b"end"]));
+    });
+}
+
+#[test]
+fn duckpond_nests_eight_deep_until_a_roll_announces_its_measured_depth() {
+    deterministic::Runner::default().start(|context| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = Genesis {
+            network: b"duckpond".to_vec(),
+            ..standard()
+        };
+        let mut host = found(context, "net", dir.path(), genesis).await;
         let applied = host
             .apply(block(
                 1,
@@ -1589,16 +1648,9 @@ fn messages_nest_at_most_eight_deep() {
             ))
             .await
             .unwrap();
-        let mut deepest = &applied.submissions[0];
-        let mut depth = 0;
-        while let Some(inner) = deepest.nested.first() {
-            deepest = inner;
-            depth += 1;
-        }
+        let (depth, _) = innermost(&applied.submissions[0]);
         assert_eq!(depth, 8);
-        assert_eq!(deepest, &receipt("pong", ok(b"dne"), vec![b"end"]));
         let refusal = rejected(&applied.submissions[1]);
-        assert_eq!(refusal.reason, reason::CAPACITY);
         assert_eq!(refusal.sentence, "messages nest deeper than 8");
     });
 }
