@@ -869,8 +869,12 @@ one up for another network.
     TestFlight by its newest `refs/tags/testflight-<build>`, read from
     GitHub's git `info/refs` (not the API, so not its limit). When a
     channel has moved past the commit its last entry named, one forge
-    `Log` from the channel's branch, less that commit, gives the squashes
-    in between. Each one's `Release note:` line (its title when it has
+    `Log` from the channel's branch, less that commit, gives the commits
+    in between, and watch walks their first-parent chain from the
+    published commit, leaving merges out: a stable cut (dev squashed onto
+    `main`, then merged back with dev) brings only the cut's own note,
+    while dev's changes stay in the nightly's entries. Each one's
+    `Release note:` line (its title when it has
     none; `none` leaves it out) goes into one entry in chat channel
     `release`, with the commits and change numbers in its thread, posted
     once the entry is in a block. A day whose changes all say `none`

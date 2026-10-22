@@ -162,11 +162,12 @@ class FakeCli:
 
     def forge_answer(self, log):
         self.logs.append(log)
-        rows = self.forge[bytes.fromhex(log["from"]["ref"]).decode()]
+        held = self.forge[bytes.fromhex(log["from"]["ref"]).decode()]
+        rows = [(row[0], row[1], row[2] if len(row) > 2 else [next_row[0] for next_row in held[at + 1 : at + 2]]) for at, row in enumerate(held)]
         if log["exclude"] is not None:
-            rows = rows[: [commit for commit, _ in rows].index(log["exclude"]["oid"])]
+            rows = rows[: [commit for commit, _, _ in rows].index(log["exclude"]["oid"])]
         start = int(log["page"]["after"] or "0")
-        items = [{"oid": commit, "message": text.encode().hex(), "parents": [], "tree": ""} for commit, text in rows[start : start + FORGE_PAGE]]
+        items = [{"oid": commit, "message": text.encode().hex(), "parents": parents, "tree": ""} for commit, text, parents in rows[start : start + FORGE_PAGE]]
         more = start + FORGE_PAGE < len(rows)
         return {"log": {"height": 1, "page": {"height": 1, "items": items, "next": str(start + FORGE_PAGE) if more else None}, "tip": rows[0][0]}}
 
@@ -897,6 +898,19 @@ def squash(subject, number, *body):
 NIGHTLY_JSON = "https://dl.ducktape.industries/app/nightly.json"
 REFS = "https://github.com/ducktape-industries/app.git"
 REFS_URL = REFS + watch.UPLOAD_PACK
+STABLE_JSON = "https://dl.ducktape.industries/app/stable.json"
+STABLE_CHANNEL = {"check": "stable", "label": "Desktop stable", "tags": "#app", "emoji": "🦆", "branch": "main", "manifest": STABLE_JSON}
+MERGED_BACK = "release: main reaches dev again: merge of the squashed stable cut with dev, dev tree unchanged\n"
+CUTS = [
+    (oid(9), MERGED_BACK, [oid(8), oid(7)]),
+    (oid(8), squash("release: stable from dev 7777777", 210, "**What people get**", "- Menus: a long press opens one (#209).", "- Pictures: lighter (#208).", "", "Release note: A long press opens a message's menu, and pictures cost less memory."), [oid(5)]),
+    (oid(7), squash("host: a long press opens the menu", 209, "Release note: A long press on a message opens its menu."), [oid(6)]),
+    (oid(6), squash("host: pictures drawn at the window's pixels", 208, "Release note: Pictures cost less memory."), [oid(4)]),
+    (oid(5), MERGED_BACK, [oid(3), oid(4)]),
+    (oid(3), squash("release: stable from dev 4444444", 207, "Release note: The first cut."), [oid(1)]),
+    (oid(4), squash("host: the first change", 206, "Release note: The first change."), [oid(1)]),
+    (oid(1), "app: the first commit\n", []),
+]
 NIGHTLY_CHANNEL = {"check": "nightly", "label": "Desktop nightly", "tags": "#app", "emoji": "🌙", "branch": "dev", "manifest": NIGHTLY_JSON}
 TESTFLIGHT_CHANNEL = {"check": "testflight", "label": "TestFlight", "tags": "#mobile", "emoji": "📱", "branch": "dev", "refs": REFS, "prefix": "testflight-"}
 DEV = [
@@ -1002,6 +1016,18 @@ class ChangelogPosts(unittest.TestCase):
             self.assertEqual([op["post"]["message_id"] for op in cli.ops[2:]], [f"release-nightly-{oid(5)[:12]}", f"release-nightly-{oid(5)[:12]}-details"])
             self.assertEqual(cli.ops[2]["post"]["text"].splitlines()[1:-1], ["• A long press on a message opens its menu."])
             self.assertEqual(json.loads(watcher.store.path.read_text())["changelog"]["nightly"], {"sequence": 400, "commit": oid(5), "read": "2026-10-23"})
+
+    def test_a_stable_cut_merged_back_with_dev_posts_only_the_cuts_own_note(self):
+        seeded = {**STABLE_CHANNEL, "since": oid(5), "since_sequence": 100}
+        http = FakeHttp({STABLE_JSON: manifest(200, oid(9))})
+        cli = FakeCli(forge={"refs/heads/main": CUTS})
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, Clock(), seeded)
+            watcher.tick()
+        self.assertEqual([op["post"]["message_id"] for op in cli.ops], [f"release-stable-{oid(9)[:12]}", f"release-stable-{oid(9)[:12]}-details"])
+        self.assertEqual(cli.ops[0]["post"]["text"].splitlines()[1:-1], ["• A long press opens a message's menu, and pictures cost less memory."])
+        self.assertEqual(cli.ops[1]["post"]["text"].splitlines()[2:5], [f"• Source: app main `{oid(9)}`", f"• Since: `{oid(5)}`", "• Changes: 210"])
+        self.assertEqual(watcher.state["changelog"]["stable"]["commit"], oid(9))
 
     def test_a_day_whose_changes_all_say_none_posts_nothing_and_moves_on(self):
         seeded = {**NIGHTLY_CHANNEL, "since": oid(3), "since_sequence": 300}

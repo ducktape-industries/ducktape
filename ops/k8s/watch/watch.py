@@ -495,18 +495,26 @@ def log_query(repo, branch, since, after):
 
 
 def commits_to(cli, repo, branch, commit, since):
-    found, after = [], None
+    rows, tip, after = {}, None, None
     while True:
         page = cli.query("forge", log_query(repo, branch, since, after))["log"]["page"]
         for row in page["items"]:
-            if found or row["oid"].startswith(commit):
-                found.append((row["oid"], bytes.fromhex(row["message"]).decode(errors="replace")))
+            rows[row["oid"]] = row
+            if tip is None and row["oid"].startswith(commit):
+                tip = row["oid"]
         after = page["next"]
-        settled = after is None or (since is None and found)
+        settled = after is None or (since is None and tip is not None)
         if settled:
             break
-    if not found:
+    if tip is None:
         raise Unread(f"{repo}'s {branch} holds no {commit} past {since}")
+    found, at = [], tip
+    while at in rows:
+        row = rows[at]
+        found.append((at, bytes.fromhex(row["message"]).decode(errors="replace"), len(row["parents"]) > 1))
+        if since is None:
+            break
+        at = row["parents"][0] if row["parents"] else None
     return found
 
 
@@ -525,7 +533,7 @@ def note_of(message):
 
 
 def digest(changelog, channel, published, commits, since):
-    notes = [(oid, *note_of(message)) for oid, message in commits]
+    notes = [(oid, *note_of(message)) for oid, message, merge in commits if not merge]
     said = [note for _, _, note in notes if note is not None]
     if not said:
         return []
