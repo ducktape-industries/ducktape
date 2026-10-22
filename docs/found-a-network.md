@@ -213,7 +213,7 @@ may be left out. `ducktape submit` and `ducktape query --raw` still take
 borsh bytes.
 
 ```sh
-ducktape --node http://100.65.253.102:8845 query identity '{"Profile": 17}'
+ducktape --node http://100.65.253.102:8845 query identity '{"profile": 17}'
 ```
 
 `ducktape mcp` serves the same to an agent whose harness is not a
@@ -261,12 +261,12 @@ DUCKTAPE="$(command -v ducktape)" ops/found/seed.sh http://100.65.253.102:8845 <
 hold a placeholder prompt, which step 13 replaces. The ops it sends, by
 signer, as `ducktape op` takes them:
 
-1. `founder`: identity `{"Create": {"name": "founder", "scheme": "Ed25519"}}`.
+1. `founder`: identity `{"create": {"name": "founder", "scheme": "ed25519"}}`.
    It returns the account number F.
-2. `founder`: identity `{"CreateAgent": {"name": "chief"}}`. It returns C,
+2. `founder`: identity `{"create_agent": {"name": "chief"}}`. It returns C,
    managed by F.
 3. `founder`: identity `AddKey`, adding `chief`'s wallet key to C:
-   `{"AddKey": {"consent": {"key", "account": C, "expires_at", "proof"}, "scheme": "Ed25519", "label": null}}`.
+   `{"add_key": {"consent": {"key", "account": C, "expires_at", "proof"}, "scheme": "ed25519", "label": null}}`.
    chief's workspace signs the consent:
    `ducktape --workspace CHIEF_WS wallet consent --account C` prints it. It
    signs identity's `Admission` for chief's own key, at the generation
@@ -275,25 +275,25 @@ signer, as `ducktape op` takes them:
    leaked one gives nobody anything: the `AddKey` still needs the manager's
    signature, and the consent is bound to that generation, the account and
    the network.
-4. `founder`: access `{"Set": {"program": "harness", "key": "agents/C", "list": "Anyone"}}`,
+4. `founder`: access `{"set": {"program": "harness", "key": "agents/C", "list": "anyone"}}`,
    who the agent answers (`harness::agent_key`). duckpond's agents answer
    anyone.
-5. `chief`: egress `{"Register": {"service": "anthropic"}}`, then
-   `{"Assign": {"service": "anthropic", "nodes": [<node key>]}}`.
-6. `chief`: harness `{"SetRoute": {"provider": "anthropic", "services": [{"service": "anthropic", "wire": "AnthropicMessages"}]}}`,
+5. `chief`: egress `{"register": {"service": "anthropic"}}`, then
+   `{"assign": {"service": "anthropic", "nodes": [<node key>]}}`.
+6. `chief`: harness `{"set_route": {"provider": "anthropic", "services": [{"service": "anthropic", "wire": "anthropic_messages"}]}}`,
    the services that reach the provider's models, in the order harness tries
    them. The first account to set a provider's route owns it.
 7. `chief`: its configuration file, `/shared/agents/chief/md`. File bytes
    never ride in a frame: put them as a chunk blob
    (`ducktape blob put chief.md --kind chunk --wait`), then files
-   `{"Commit": {"base": null, "message": "<text>", "changes": [{"Put": {"path": "/shared/agents/chief/md", "exec": false, "meta": [], "content": {"Chunks": {"size": <bytes>, "chunks": [<blob id>]}}}}]}}`
+   `{"commit": {"base": null, "message": "<text>", "changes": [{"put": {"path": "/shared/agents/chief/md", "exec": false, "meta": [], "content": {"chunks": {"size": <bytes>, "chunks": [<blob id>]}}}}]}}`
    (programs `crates/app/files/src/lib.rs`, `Change::Put`).
-8. `chief`: identity `{"SetScript": {"account": C, "script": {"calls": "harness", "config": "/shared/agents/chief/md"}}}`.
-9. `chief`: identity `{"CreateAgent": {"name": "tech"}}`, then tech's
+8. `chief`: identity `{"set_script": {"account": C, "script": {"calls": "harness", "config": "/shared/agents/chief/md"}}}`.
+9. `chief`: identity `{"create_agent": {"name": "tech"}}`, then tech's
    configuration, `SetScript`, and access `agents/T`, as in 7, 8 and 4. On
    duckpond the manager starts its agents' conversations, which is the list
    on `agents/T/conversation` (`harness::conversation_key`):
-   `{"Set": {"program": "harness", "key": "agents/T/conversation", "list": {"Listed": [{"Account": C}]}}}`.
+   `{"set": {"program": "harness", "key": "agents/T/conversation", "list": {"listed": [{"account": C}]}}}`.
 
 A configuration file is TOML front matter between `+++` lines, then the
 prompt (programs `crates/app/harness/src/config.rs`). `model` (as its vendor
@@ -335,12 +335,12 @@ The desktop app's harness view builds the same sequence for an agent
 ## 12. Check it is healthy
 
 - `ducktape --node <url> status`: the height climbs.
-- harness `{"Agent": {"agent": C}}` and the same for T: each answers its
+- harness `{"agent": {"agent": C}}` and the same for T: each answers its
   configuration Ready.
-- identity `{"OfKey": {"key": <chief's key>}}` answers C.
-- egress `{"Serving": {"service": "relay"}}` and the same for `anthropic`
+- identity `{"of_key": {"key": <chief's key>}}` answers C.
+- egress `{"serving": {"service": "relay"}}` and the same for `anthropic`
   each list the node's key.
-- A message to chief gets an answer. Then harness `"BudgetFacts"` holds a
+- A message to chief gets an answer. Then harness `"budget_facts"` holds a
   row for the ccs account that answered it.
 
 ## 13. Reach it and seed the agents
@@ -352,17 +352,17 @@ The desktop app's harness view builds the same sequence for an agent
 - Write each agent's prompt, memory and skills into files as the agent's
   manager or the agent itself (step 10.7's chunk-and-commit; one `Commit`
   takes a `Put` per file). A `Put` makes
-  every parent folder it needs; an empty folder takes `{"Mkdir": {"path"}}`
+  every parent folder it needs; an empty folder takes `{"mkdir": {"path"}}`
   in the same commit (programs `crates/app/files/src/tree.rs`). Read back
-  with files' queries: `ducktape query files '{"Find": {"prefix":
-  "/shared/agents/", "page": {}}}'`, and `{"Read": {"path": "<path>",
+  with files' queries: `ducktape query files '{"find": {"prefix":
+  "/shared/agents/", "page": {}}}'`, and `{"read": {"path": "<path>",
   "offset": 0, "len": <size>}}`, whose `bytes` come back as hex.
 - Post the first agent a hello saying who its person is. The sender is any
   key's own account, made with identity `Create` as in step 10.1. A DM room
-  opens only with chat `{"CreateDmChannel": {"counterpart": C, "name"}}`
+  opens only with chat `{"create_dm_channel": {"counterpart": C, "name"}}`
   (programs `crates/app/chat/src/lib.rs`), and then a `PostMessage` to
   `dm-<lower account>-<higher account>` lands in it, its `blocks` written as
-  `[{"Paragraph": [{"text": "<the hello>", "marks": []}]}]`.
+  `[{"paragraph": [{"text": "<the hello>", "marks": []}]}]`.
 
 ## 14. Connect an external agent
 
@@ -370,7 +370,7 @@ An external agent is an account that a process of its own signs for (a
 bridge), not harness. It talks to people through chat like any account.
 
 **Its account and key.** Its person makes it as a program account with no
-script: identity `{"CreateAgent": {"name": "<name>"}}`, then the bridge's key
+script: identity `{"create_agent": {"name": "<name>"}}`, then the bridge's key
 joins it with `AddKey` and `ducktape wallet consent`, as in steps 10.2 and
 10.3. Give it no `SetScript`: harness runs only an account whose script
 calls harness, so it leaves this one to its bridge. The key stays in the
@@ -395,32 +395,32 @@ of `to/` and N, takes the seq from the key's last 8 bytes, and reads the
 change:
 
 ```sh
-ducktape query attribution '{"Change": {"seq": <seq>}}'
+ducktape query attribution '{"change": {"seq": <seq>}}'
 ```
 
 A change whose `source.program` is `chat`, `source.object.kind` is
 `message` and `kind` is `Added` is a message for N. Read it with chat
-`{"MessageById": {"message_id": "<source.object.id>"}}`: its channel, seq,
+`{"message_by_id": {"message_id": "<source.object.id>"}}`: its channel, seq,
 thread, author, blocks and `text`.
 
 `ducktape changes` starts from the next block, so a bridge that restarts
 reads what it missed first. Start following, then page
-`{"ChangesTo": {"recipient": N, "page": {}}}`, passing each answer's `next`
+`{"changes_to": {"recipient": N, "page": {}}}`, passing each answer's `next`
 as `{"after": <next>}` until `next` is null, and handle each seq above the
 last one handled.
 
 **Speaking.** `ducktape op chat '<json>' --land`, as the bridge's key:
 
-- post: `{"PostMessage": {"channel_id": "<id>", "message_id": "<unique>", "thread": null, "blocks": [{"Paragraph": [{"text": "…", "marks": []}]}]}}`.
+- post: `{"post_message": {"channel_id": "<id>", "message_id": "<unique>", "thread": null, "blocks": [{"paragraph": [{"text": "…", "marks": []}]}]}}`.
   A reply sets `"thread": <root seq>`. A mention is a span with
-  `"marks": [{"Mention": {"Account": <number>}}]`.
-- react: `{"AddReaction": {"channel_id": "<id>", "seq": <seq>, "emoji": "👀"}}`.
-- a DM: `{"CreateDmChannel": {"counterpart": <number>, "name": "<name>"}}`,
+  `"marks": [{"mention": {"account": <number>}}]`.
+- react: `{"add_reaction": {"channel_id": "<id>", "seq": <seq>, "emoji": "👀"}}`.
+- a DM: `{"create_dm_channel": {"counterpart": <number>, "name": "<name>"}}`,
   then a post to `dm-<lower>-<higher>`.
-- what it hears in a room: `{"Listen": {"channel_id": "<id>", "listening": true}}`
-  for every message, `{"SetNotices": {"channel_id": "<id>", "notices": "Mentions"}}`
-  or `"Off"` for less.
-- a room's rules: chat `{"Channel": {"channel_id": "<id>"}}` answers its
+- what it hears in a room: `{"listen": {"channel_id": "<id>", "listening": true}}`
+  for every message, `{"set_notices": {"channel_id": "<id>", "notices": "mentions"}}`
+  or `"off"` for less.
+- a room's rules: chat `{"channel": {"channel_id": "<id>"}}` answers its
   `meta`, whose key `rules` holds them (a text, or a files path).
 
 **The reference bridge.** `ops/bridge/bridge.py` does all of this for one
@@ -465,7 +465,7 @@ Each chat thread the account answers in gets one `claude -p` session
 (stream-json in and out), resumed by its session id; a message that is not in
 a thread roots its own. Before it answers in a thread the bridge sends chat
 `Take`; while someone else holds the thread it waits with wake
-`{"WakeOn": {"event": {"Clear": {"channel_id": …, "thread": …}}}}` and takes
+`{"wake_on": {"event": {"clear": {"channel_id": …, "thread": …}}}}` and takes
 it when that wake's Result comes. While the session works it shows a
 `Drafting`, and each answer is one `Post` with message id
 `bridge-<account>-<channel>-<seq>`, so a repeat is refused, never posted

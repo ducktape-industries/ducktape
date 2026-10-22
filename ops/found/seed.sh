@@ -44,7 +44,7 @@ put_config() {
   [ -e "$name.blob" ] || as "$who" blob put "$name.md" --kind chunk --wait > "$name.blob"
   local id; id=$(grep -oE '^sha256:[0-9a-f]{64}' "$name.blob" | head -1 | cut -d: -f2)
   local size; size=$(stat -c %s "$name.md")
-  land "$who" "$name-commit" files "{\"Commit\": {\"base\": null, \"message\": \"seed $path\", \"changes\": [{\"Put\": {\"path\": \"$path\", \"exec\": false, \"meta\": [], \"content\": {\"Chunks\": {\"size\": $size, \"chunks\": [{\"Sha256\": \"$id\"}]}}}}]}}"
+  land "$who" "$name-commit" files "{\"commit\": {\"base\": null, \"message\": \"seed $path\", \"changes\": [{\"put\": {\"path\": \"$path\", \"exec\": false, \"meta\": [], \"content\": {\"chunks\": {\"size\": $size, \"chunks\": [{\"sha256\": \"$id\"}]}}}}]}}"
 }
 
 for who in founder chief; do
@@ -58,25 +58,25 @@ chief=$(returned create-chief)
 
 if [ ! -e add-chief-key.landed ]; then
   consent=$(as chief wallet consent --account "$chief")
-  land founder add-chief-key identity "{\"AddKey\": {\"scheme\": \"Ed25519\", \"label\": \"chief\", \"consent\": $consent}}"
+  land founder add-chief-key identity "{\"add_key\": {\"scheme\": \"ed25519\", \"label\": \"chief\", \"consent\": $consent}}"
 fi
-land founder chief-answers access "{\"Set\": {\"program\": \"harness\", \"key\": \"agents/$chief\", \"list\": \"Anyone\"}}"
+land founder chief-answers access "{\"set\": {\"program\": \"harness\", \"key\": \"agents/$chief\", \"list\": \"anyone\"}}"
 
-land chief register-service egress "{\"Register\": {\"service\": \"$service\"}}"
-land chief assign-service egress "{\"Assign\": {\"service\": \"$service\", \"nodes\": [\"$node_key\"]}}"
-land chief set-route harness "{\"SetRoute\": {\"provider\": \"anthropic\", \"services\": [{\"service\": \"$service\", \"wire\": \"AnthropicMessages\"}]}}"
+land chief register-service egress "{\"register\": {\"service\": \"$service\"}}"
+land chief assign-service egress "{\"assign\": {\"service\": \"$service\", \"nodes\": [\"$node_key\"]}}"
+land chief set-route harness "{\"set_route\": {\"provider\": \"anthropic\", \"services\": [{\"service\": \"$service\", \"wire\": \"anthropic_messages\"}]}}"
 
 network=$(as chief status | awk '$1 == "network" {print $2}')
 [ -e chief.prompt ] || printf 'You are chief (account %s), the operator agent of the %s network. Your full prompt is still to be seeded.\n' "$chief" "$network" > chief.prompt
 put_config chief chief /shared/agents/chief/md
-land chief script-chief identity "{\"SetScript\": {\"account\": $chief, \"script\": {\"calls\": \"harness\", \"config\": \"/shared/agents/chief/md\"}}}"
+land chief script-chief identity "{\"set_script\": {\"account\": $chief, \"script\": {\"calls\": \"harness\", \"config\": \"/shared/agents/chief/md\"}}}"
 
 land chief create-tech identity '{"create_agent": {"name": "tech"}}'
 tech=$(returned create-tech)
 [ -e tech.prompt ] || printf 'You are tech (account %s), the engineer agent of the %s network, managed by chief (account %s). Your full prompt is still to be seeded.\n' "$tech" "$network" "$chief" > tech.prompt
 put_config chief tech /shared/agents/tech/md
-land chief script-tech identity "{\"SetScript\": {\"account\": $tech, \"script\": {\"calls\": \"harness\", \"config\": \"/shared/agents/tech/md\"}}}"
-land chief tech-answers access "{\"Set\": {\"program\": \"harness\", \"key\": \"agents/$tech\", \"list\": \"Anyone\"}}"
-land chief tech-conversations access "{\"Set\": {\"program\": \"harness\", \"key\": \"agents/$tech/conversation\", \"list\": {\"Listed\": [{\"Account\": $chief}]}}}"
+land chief script-tech identity "{\"set_script\": {\"account\": $tech, \"script\": {\"calls\": \"harness\", \"config\": \"/shared/agents/tech/md\"}}}"
+land chief tech-answers access "{\"set\": {\"program\": \"harness\", \"key\": \"agents/$tech\", \"list\": \"anyone\"}}"
+land chief tech-conversations access "{\"set\": {\"program\": \"harness\", \"key\": \"agents/$tech/conversation\", \"list\": {\"listed\": [{\"account\": $chief}]}}}"
 
 echo "founder $founder chief $chief tech $tech"

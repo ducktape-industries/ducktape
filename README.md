@@ -970,13 +970,13 @@ address-space limit on itself.
 ```sh
 ducktape status                         # height, tip, root, epoch, identity, role bindings
 ducktape wallet new alice               # a user key; DUCKTAPE_PASSWORD or a prompt
-ducktape op identity '{"CreateAgent": {"name": "chief"}}' --land  # an op as the JSON its program's schema reads; prints the block and what it returned
+ducktape op identity '{"create_agent": {"name": "chief"}}' --land  # an op as the JSON its program's schema reads; prints the block and what it returned
 ducktape submit ping request.bin        # sign a frame with the active wallet and pool it; --preconfirm prints its predicted receipt; --land waits for its block's receipt
 ducktape get ping 6b6579                # a key in hex, from the preconfirmed layer
 ducktape get ping 6b6579 --confirmed    # the committed layer
 ducktape scan ping --lo 6b               # a key range
 ducktape changes ping                   # follow a program's confirmed writes
-ducktape query files '"Head"'           # a signed read-only call, written and answered as JSON
+ducktape query files '"head"'           # a signed read-only call, written and answered as JSON
 ducktape query ping --raw request.bin   # the same with borsh bytes, from a file or stdin
 ducktape wallet consent --account 18    # the active key's consent to a key joining account 18, as AddKey's JSON
 ducktape mcp                            # the Model Context Protocol on stdio for any MCP client: network_schema, network_query, network_call, files_read, files_write, signed by the active key, which must act as an agent account

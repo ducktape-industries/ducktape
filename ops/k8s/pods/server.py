@@ -2105,7 +2105,7 @@ def forge_blob(blob):
     if blob is None:
         return None
     kind, _, digest = blob.partition(":")
-    return {kind.capitalize(): digest}
+    return {kind: digest}
 
 
 def branch_head(ref, heads):

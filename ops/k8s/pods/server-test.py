@@ -1638,7 +1638,7 @@ class Push(Served):
         line = f"{HAVE} {COMMIT} refs/heads/j-1/x".encode() + b"\0report-status"
         request = f"{len(line) + 4:04x}".encode() + line + b"0000"
         self.assertEqual((answer["branch"], answer["old"], answer["unchanged"], answer["commit"]), ("refs/heads/j-1/x", HAVE, False, COMMIT))
-        self.assertEqual(answer["forge"], {"request": request.hex(), "pack": {"Sha256": "cd" * 32}})
+        self.assertEqual(answer["forge"], {"request": request.hex(), "pack": {"sha256": "cd" * 32}})
         resolve, pack = self.execs()
         self.assertEqual((resolve[3][-2:], pack[3][-2:]), (["HEAD", HAVE], [COMMIT, HAVE]))
 
