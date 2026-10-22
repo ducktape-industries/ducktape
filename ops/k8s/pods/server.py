@@ -28,6 +28,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
@@ -370,9 +371,89 @@ def written(value):
             return json.dumps(value)
 
 
+class BackgroundStopped(BaseException):
+    pass
+
+
+BACKGROUND = threading.local()
+
+
+class Background:
+    def __init__(self):
+        self.stopping = threading.Event()
+        self.lock = threading.Lock()
+        self.threads = set()
+        self.processes = weakref.WeakSet()
+
+    def check(self):
+        if self.stopping.is_set():
+            raise BackgroundStopped()
+
+    def start(self, target, *args):
+        with self.lock:
+            if self.stopping.is_set():
+                return None
+            thread = threading.Thread(target=self.work, args=(target, args), daemon=True)
+            self.threads.add(thread)
+            thread.start()
+            return thread
+
+    def work(self, target, args):
+        BACKGROUND.owner = self
+        try:
+            self.check()
+            target(*args)
+        except BackgroundStopped:
+            pass
+        finally:
+            del BACKGROUND.owner
+            with self.lock:
+                self.threads.discard(threading.current_thread())
+
+    def popen(self, argv, **options):
+        with self.lock:
+            self.check()
+            process = subprocess.Popen(argv, start_new_session=True, **options)
+            self.processes.add(process)
+            return process
+
+    def pause(self, delay):
+        if getattr(BACKGROUND, "owner", None) is not self:
+            time.sleep(delay)
+            return
+        self.stopping.wait(delay)
+        self.check()
+
+    def stop(self):
+        with self.lock:
+            self.stopping.set()
+            processes, threads = list(self.processes), list(self.threads)
+            for process in processes:
+                if process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        for process in processes:
+            process.wait()
+        for thread in threads:
+            thread.join()
+
+
+def popen(argv, **options):
+    background = getattr(BACKGROUND, "owner", None)
+    if background is not None:
+        return background.popen(argv, **options)
+    return subprocess.Popen(argv, **options)
+
+
 def run(argv, stdin=None, env=None):
-    done = subprocess.run(argv, input=stdin, capture_output=True, env=env)
-    return Ran(done.returncode, done.stdout, done.stderr.decode(errors="replace").strip())
+    with popen(argv, stdin=subprocess.PIPE if stdin is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as process:
+        out, err = process.communicate(stdin)
+        background = getattr(BACKGROUND, "owner", None)
+        if background is not None:
+            background.check()
+        return Ran(process.returncode, out, err.decode(errors="replace").strip())
 
 
 def say(event, **fields):
@@ -835,15 +916,15 @@ class Kube:
 
     def watch(self):
         argv = self.argv("get", "pods", "--selector", "=".join(MANAGED), "--watch", "--output-watch-events", "--output", "json")
-        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def watch_pod(self, name):
         argv = self.argv("get", "pod", name, "--watch", "--output-watch-events", "--output", "json")
-        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def follow(self, name):
         argv = self.argv("logs", name, "--container", RUN, "--follow")
-        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def kept_call(self, *args):
         return run([*self.kubectl, "--namespace", self.kept_namespace, *args])
@@ -894,7 +975,7 @@ class Signer:
         return public_key((self.keys / "key").read_text())
 
     def follow(self, program):
-        return subprocess.Popen([*self.ducktape, "changes", program], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env())
+        return popen([*self.ducktape, "changes", program], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env())
 
 
 def plain_words(script):
@@ -1063,7 +1144,7 @@ def gate_run(argv, env=None):
 
 
 def gate_spawn(argv, env=None):
-    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    return popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
 
 
 class Runner:
@@ -3639,7 +3720,7 @@ class Notifier:
             if failures & (failures - 1) == 0:
                 detail = process.stderr.read().decode(errors="replace").strip()
                 say("pods_unwatched", attempts=failures, reason="kubectl_failed", detail=json.dumps(detail))
-            time.sleep(WATCH_PAUSE)
+            self.pause(WATCH_PAUSE)
 
 
 class Rerunner:
@@ -3894,10 +3975,32 @@ class Service:
         self.pause = time.sleep
         self.execs = {}
         self.lock = threading.Lock()
+        self.executing = threading.Condition(self.lock)
+        self.active_execs = {}
+        self.background = Background()
         self.swept = threading.Event()
         self.rerouting = threading.Lock()
         self.launched = {}
         self.rerunner = Rerunner(signer, kube, lambda command: self.routed(None, command, None), self.retry_pause, self.tell_room)
+        self.notifier.spawn = self.background.start
+        self.notifier.pause = self.background.pause
+        self.rerunner.spawn = self.background.start
+        self.rerunner.pause = self.background.pause
+
+    def stop_background(self):
+        self.background.stopping.set()
+        self.swept.set()
+        for wanted in self.wanted.values():
+            wanted.set()
+        self.background.stop()
+
+    def drain_execs(self):
+        with self.executing:
+            self.executing.wait_for(lambda: not self.active_execs)
+
+    def draining_execs(self):
+        with self.lock:
+            return [{"pod": name, "chain": key[0], "program": key[1], "request": key[2]} for key, name in self.active_execs.items()]
 
     def machines(self):
         return ", ".join(f"pod {name}" for name in self.runners)
@@ -3950,10 +4053,18 @@ class Service:
             if known is not None:
                 return known
             running = self.execs[key] = Execution(asked)
+            self.active_execs[key] = name
 
         def run():
-            running.end(outcome(lambda: self.executed(asked, name, container, command, alive=alive, note=running.note)))
-            self.swept.set()
+            try:
+                running.end(outcome(lambda: self.executed(asked, name, container, command, alive=alive, note=running.note)))
+            finally:
+                with self.executing:
+                    self.active_execs.pop(key, None)
+                    if self.background.stopping.is_set():
+                        say("pods_exec_drained", pod=name, chain=key[0], program=key[1], request=key[2])
+                    self.executing.notify_all()
+                self.swept.set()
 
         threading.Thread(target=run, daemon=True).start()
         self.swept.set()
@@ -4011,6 +4122,7 @@ class Service:
     def sweeper(self):
         while True:
             self.swept.wait()
+            self.background.check()
             self.swept.clear()
             try:
                 self.sweep()
@@ -4206,7 +4318,8 @@ class Service:
             finally:
                 self.rerouting.release()
 
-        threading.Thread(target=run, daemon=True).start()
+        if self.background.start(run) is None:
+            self.rerouting.release()
 
     def rerouted(self, asked, alive):
         warm = self.warm()
@@ -4643,8 +4756,7 @@ class Service:
     def follow(self, name):
         with self.lock:
             if name not in self.followers:
-                self.followers[name] = threading.Thread(target=self.followed, args=(name, self.clock(), self.wall()), daemon=True)
-                self.followers[name].start()
+                self.followers[name] = self.background.start(self.followed, name, self.clock(), self.wall())
         self.wanted[name].set()
 
     def followed(self, name, begun, wall):
@@ -5350,8 +5462,11 @@ class Drain:
 
     def opened(self, connection):
         with self.held:
-            if not self.stopping:
+            stopping = self.stopping
+            if not stopping:
                 self.idle.add(connection)
+        if stopping:
+            hang_up(connection)
 
     def closed(self, connection):
         with self.held:
@@ -5361,7 +5476,10 @@ class Drain:
     def called(self, connection):
         with self.held:
             self.idle.discard(connection)
+            if self.stopping:
+                return False
             self.whole += 1
+            return True
 
     def answered(self, connection):
         with self.held:
@@ -5371,7 +5489,9 @@ class Drain:
                 self.idle.add(connection)
             return not self.stopping
 
-    def streaming(self, connection):
+    def streaming(self, connection, reattach=True):
+        if not reattach:
+            return True
         with self.held:
             self.whole -= 1
             self.held.notify_all()
@@ -5379,15 +5499,17 @@ class Drain:
                 self.streams.add(connection)
             return not self.stopping
 
-    def stop(self):
+    def begin(self):
         with self.held:
             self.stopping = True
             cut, self.idle, self.streams = self.idle | self.streams, set(), set()
         for connection in cut:
             hang_up(connection)
+        return len(cut)
+
+    def wait(self):
         with self.held:
             self.held.wait_for(lambda: self.whole == 0)
-        return len(cut)
 
 
 def handler(service, drain=None):
@@ -5405,8 +5527,11 @@ def handler(service, drain=None):
             super().finish()
 
         def respond(self, method):
-            drain.called(self.connection)
-            streaming = False
+            if not drain.called(self.connection):
+                self.close_connection = True
+                hang_up(self.connection)
+                return
+            reattachable = False
             try:
                 length = int(self.headers.get("content-length") or 0)
                 body = self.rfile.read(length) if length else b""
@@ -5419,7 +5544,7 @@ def handler(service, drain=None):
                     say("pods_failed", reason="unexpected", detail=json.dumps(repr(error)))
                     status, answer = 500, {"error": f"the pods service failed: {error!r}"}
                 if isinstance(answer, Stream):
-                    streaming = True
+                    reattachable = answer.reattach
                     self.stream(status, answer)
                     return
                 match answer:
@@ -5438,13 +5563,13 @@ def handler(service, drain=None):
                 self.end_headers()
                 self.wfile.write(payload)
             finally:
-                kept = streaming or drain.answered(self.connection)
+                kept = reattachable or drain.answered(self.connection)
                 if not kept:
                     self.close_connection = True
 
         def stream(self, status, answer):
             events = answer.events
-            kept = drain.streaming(self.connection)
+            kept = drain.streaming(self.connection, answer.reattach)
             self.send_response(status)
             self.send_header("content-type", "text/event-stream")
             if answer.reattach:
@@ -5735,10 +5860,10 @@ def main():
     except ValueError as error:
         sys.exit(str(error))
     service = Service(kube, signer, fetching, Stats(), Api(), runners, os.environ.get("PODS_WARM_POD"))
-    threading.Thread(target=service.notifier.watch, daemon=True).start()
-    threading.Thread(target=service.sweeper, daemon=True).start()
+    service.background.start(service.notifier.watch)
+    service.background.start(service.sweeper)
     if signer.held():
-        threading.Thread(target=service.rerunner.watch, daemon=True).start()
+        service.background.start(service.rerunner.watch)
     for runner in runners:
         if runner.held():
             service.follow(runner.name)
@@ -5751,10 +5876,16 @@ def main():
     say("pods_serving", namespace=kube.namespace, listen=f"{bound}:{at}", keyed=signer.held())
     stopping = signals.wait()
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    cut = drain.begin()
+    service.background.stopping.set()
     server.shutdown()
     server.server_close()
     say("pods_stopping", signal=stopping)
-    cut = drain.stop()
+    say("pods_draining", whole=drain.whole, execs=json.dumps(service.draining_execs()))
+    service.stop_background()
+    say("pods_background_stopped")
+    drain.wait()
+    service.drain_execs()
     say("pods_drained", cut=cut)
     os._exit(0)
 

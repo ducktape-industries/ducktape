@@ -106,18 +106,20 @@ or through a member node's halo forward.
   its port, so the rollout stops the old pod only once the new one listens, and a five-second
   `preStop` sleep, so a call the Service routed to the old pod just before it left the
   endpoints still reaches it. At SIGTERM the service stops listening, hangs up its idle
-  connections and every stream it holds (an exec stream, a streamed wait), and answers each
-  whole call still open before it exits. `terminationGracePeriodSeconds` is the preStop plus
+  connections and reattachable waits, cancels and joins its background workers, and answers each
+  whole call and exec stream still open before it exits. An exec whose caller disconnected is
+  also drained. Shutdown logs how many whole calls and which pods' execs are still open, then
+  says when background work has stopped and when the drain has finished. `terminationGracePeriodSeconds` is the preStop plus
   egress's wait for a whole answer (`DEFAULT_WAIT`, 64 blocks, times the network's block time,
   which `deploy` reads from `NODE_URL`'s `/v1/status`), since egress gives up on a whole answer
-  then anyway. A stream has no such bound (egress's wait runs from its last event), so a roll
-  ends every stream it holds. A wait (a pod's or a build runner's) answers with
+  then anyway. A stream has no such bound (egress's wait runs from its last event); Kubernetes
+  still ends a command that outlives the Deployment's grace period. A wait (a pod's or a build runner's) answers with
   `ducktape-reattach: request`, so a node that serves egress (core `README.md`, the service
   request section) sends the same request again to the new pod, which waits on the same pod
   and ends with its real end; a wait's events before its end are alive beats and at most one
   `note` that its pod can't be placed yet, so the new one starts afresh whatever
-  `ducktape-heard` says, and notes a pod still unplaced once more. An exec stream carries no such mark and
-  is still cut; the command it ran goes on in its pod.
+  `ducktape-heard` says, and notes a pod still unplaced once more. An exec stream carries no such mark;
+  the stopping service keeps its connection through the command's final answer.
 
 - **A Kubernetes namespace and ServiceAccount.** `pods.yaml` makes namespace `pods`, which
   holds the service, and namespace `agents`, where agents' work runs. It also makes the

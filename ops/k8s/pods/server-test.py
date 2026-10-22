@@ -6794,5 +6794,170 @@ class Manifest(unittest.TestCase):
         self.assertEqual(self.env()["PODS_NODE"], "@NODE_URL@")
 
 
+class Lifecycle(unittest.TestCase):
+    node = Stopped.node
+
+    def test_sigterm_kills_and_reaps_the_background_kubectl_watch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            place = pathlib.Path(temp)
+            os.mkfifo(place / "background")
+            os.mkfifo(place / "hold")
+            kubectl = place / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+place = pathlib.Path(os.environ["FAKE_KUBE"])
+words = sys.argv[1:]
+if "configmap" in words:
+    print(json.dumps({"data": {}}))
+elif "pods" in words and "--watch" in words:
+    (place / "background").write_text(str(os.getpid()))
+    (place / "hold").read_text()
+else:
+    print(json.dumps({"items": []}))
+""")
+            kubectl.chmod(0o755)
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=self.node(), PODS_FORGE="duck://chain/forge", PODS_KUBECTL=str(kubectl), PODS_LISTEN="127.0.0.1:0", PODS_KEYS=temp, PODS_RUNNERS="", FAKE_KUBE=temp)
+            process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
+            heard = Heard(process)
+            child = None
+            try:
+                heard.line("event=pods_serving")
+                child = int((place / "background").read_text())
+                process.send_signal(signal.SIGTERM)
+                said = heard.rest(None)
+                self.assertEqual(process.wait(), 0, said)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child, 0)
+                self.assertIn("event=pods_background_stopped", said)
+                self.assertIn("event=pods_drained", said)
+            finally:
+                process.kill()
+                process.wait()
+                if child is not None:
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_background_stop_wakes_a_retry_and_refuses_new_workers(self):
+        background = server.Background()
+        entered = threading.Event()
+        continued = threading.Event()
+
+        def retry():
+            entered.set()
+            background.pause(None)
+            continued.set()
+
+        thread = background.start(retry)
+        entered.wait()
+        background.stop()
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(continued.is_set())
+        self.assertIsNone(background.start(continued.set))
+        with self.assertRaises(server.BackgroundStopped):
+            background.popen([sys.executable, "-c", "pass"])
+        self.assertFalse(continued.is_set())
+
+    def test_background_cancellation_does_not_cancel_a_foreground_retry(self):
+        background = server.Background()
+        background.stopping.set()
+        delay = FETCHING.block_ms / 1000
+        with unittest.mock.patch.object(server.time, "sleep") as pause:
+            background.pause(delay)
+        pause.assert_called_once_with(delay)
+
+    def test_an_exec_with_no_http_reader_still_drains(self):
+        service = server.Service(Kube(), Signer(), FETCHING, Stats(), Api(), [])
+        started = threading.Event()
+        release = threading.Event()
+        waiting = threading.Event()
+        drained = threading.Event()
+
+        def execute(*args, **kwargs):
+            started.set()
+            release.wait()
+            return ran(b"finished")
+
+        service.executed = execute
+        execution = service.execution({"chain": "duckpond", "program": "harness", "request": "41"}, "duckpond-41", None, ["make"])
+        started.wait()
+        wait_for = service.executing.wait_for
+
+        def checked(predicate):
+            self.assertFalse(predicate())
+            waiting.set()
+            return wait_for(predicate)
+
+        service.executing.wait_for = checked
+
+        def drain():
+            service.drain_execs()
+            drained.set()
+
+        thread = threading.Thread(target=drain)
+        thread.start()
+        try:
+            waiting.wait()
+            self.assertFalse(drained.is_set())
+            self.assertEqual(service.draining_execs(), [{"pod": "duckpond-41", "chain": "duckpond", "program": "harness", "request": "41"}])
+        finally:
+            release.set()
+            thread.join()
+        self.assertEqual(execution.get().out, b"finished")
+        self.assertTrue(drained.is_set())
+        self.assertEqual(service.draining_execs(), [])
+
+    def test_connections_admitted_after_drain_begins_do_not_start_calls(self):
+        drain = server.Drain()
+        left, right = socket.socketpair()
+        try:
+            self.assertEqual(drain.begin(), 0)
+            drain.opened(left)
+            self.assertEqual(right.recv(1), b"")
+            self.assertFalse(drain.called(left))
+            self.assertEqual(drain.whole, 0)
+            drain.wait()
+        finally:
+            left.close()
+            right.close()
+
+    def test_sigterm_preserves_an_exec_stream_until_its_command_answers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            place = pathlib.Path(temp)
+            for name in ("started", "release", "watching", "hold"):
+                os.mkfifo(place / name)
+            kubectl = place / "kubectl"
+            kubectl.write_text(FAKE_KUBECTL.replace("POD", repr(json.dumps(pod_json(state=RUNNING, phase="Running")))))
+            kubectl.chmod(0o755)
+            env = dict(os.environ, PODS_OUT_IMAGE="pods:test", PODS_NODE=self.node(), PODS_FORGE="duck://chain/forge", PODS_KUBECTL=str(kubectl), PODS_LISTEN="127.0.0.1:0", PODS_KEYS=temp, PODS_RUNNERS="", FAKE_KUBE=temp)
+            process = subprocess.Popen([sys.executable, str(HERE / "server.py")], env=env, stderr=subprocess.PIPE, text=True)
+            heard = Heard(process)
+            connection = None
+            try:
+                serving = heard.line("event=pods_serving")
+                port = int(serving.split("listen=127.0.0.1:")[1].split()[0])
+                connection = http.client.HTTPConnection("127.0.0.1", port)
+                connection.request("POST", "/v1/pods/duckpond-41/exec", body=json.dumps({"command": ["make"], "every": 1}), headers=ASKED)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                (place / "started").read_text()
+                process.send_signal(signal.SIGTERM)
+                heard.line("event=pods_stopping")
+                (place / "release").write_text("once\n")
+                events = response.read().decode()
+                self.assertIn('event: ended', events)
+                self.assertIn('"stdout": "built once\\n"', events)
+                said = heard.rest(None)
+                self.assertEqual(process.wait(), 0, said)
+                self.assertIn("event=pods_drained", said)
+            finally:
+                if connection is not None:
+                    connection.close()
+                process.kill()
+                process.wait()
+                unblock(place)
+
+
 if __name__ == "__main__":
     unittest.main()
