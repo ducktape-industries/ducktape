@@ -206,6 +206,7 @@ PATCH_SCHEMA = "io.k8s.apimachinery.pkg.apis.meta.v1.Patch"
 SCHEMA_REF = "#/components/schemas/"
 OPENAPI = "/openapi/v3"
 WRITES = ("POST", "PUT", "PATCH")
+CHANGES = ("PUT", "PATCH")
 JSON_PATCH = "application/json-patch+json"
 MERGE_PATCH = "application/merge-patch+json"
 STRATEGIC_PATCH = "application/strategic-merge-patch+json"
@@ -1603,6 +1604,10 @@ def target_of(segments, namespace):
         raise outside
     named = "/" + "/".join(segments[: len(segments) - len(rest) + 1]) if rest else None
     return Target(path, resource, rest[1] if len(rest) > 1 else None, named)
+
+
+def object_named(target):
+    return f"{target.resource} {target.named.rsplit('/', 1)[-1]}"
 
 
 def forced_holds(manifest):
@@ -4451,21 +4456,26 @@ class Service:
         meta = mapping(mapping(held).get("metadata"))
         holder = account_number(str(mapping(meta.get("labels")).get(REQUESTER, "")))
         if holder is None:
-            raise Refused(403, f"{what} names no requester, so no call re-applies or deletes it: the operator removes it with kubectl")
+            raise Refused(403, f"{what} names no requester, so no call changes or deletes it: the operator removes it with kubectl")
         caller = self.requester(asked)
         if caller != holder:
             calling = "no account" if caller is None else f"account {caller}"
-            raise Refused(403, f"{what} is account {holder}'s: only the account whose request made it re-applies or deletes it (a call {FLEET_PROGRAM} relays: its run's asker), and this call is {calling}'s")
+            raise Refused(403, f"{what} is account {holder}'s: only the account whose request made it changes or deletes it (a call {FLEET_PROGRAM} relays: its run's asker), and this call is {calling}'s")
         uid = meta.get("uid")
         if not isinstance(uid, str):
             raise Refused(502, f"{what} was read with no uid, so the call could not be held to it")
         return uid
 
-    def object_at(self, path, what):
-        answered = self.api.call("GET", path, "", b"", None)
+    def owned_at(self, asked, target, method):
+        what = object_named(target)
+        answered = self.api.call("GET", target.named, "", b"", None)
+        if answered.status == 404 and method in CHANGES:
+            made = f"a POST to /v1/k8s{target.named.rsplit('/', 1)[0]} or POST /v1/manifests"
+            raise Refused(404, f"{what} is not there, and a {method} changes only an object that is, for its requester: make it with {made}, which name the caller its requester")
         if not 200 <= answered.status < 300:
             raise api_refusal(answered, f"{what} was not read, so whose it is could not be told")
-        return json.loads(answered.body)
+        held = json.loads(answered.body)
+        return held, self.whose(asked, held, what)
 
     def unmade(self, path, query, options, uid, what):
         body = written(preconditioned(options, uid, f"the delete options of {what}")).encode()
@@ -4711,28 +4721,30 @@ class Service:
         if method == "DELETE":
             return self.passed_delete(asked, target, query, body, kind)
         if target.resource == "pods" and target.subresource == "eviction":
-            what = f"pods {target.named.rsplit('/', 1)[-1]}"
-            body = written(evicting(kept(body), self.whose(asked, self.object_at(target.named, what), what))).encode()
+            body = written(evicting(kept(body), self.owned_at(asked, target, method)[1])).encode()
         whole = target.subresource in (None, "ephemeralcontainers")
+        operation = None
         if method in WRITES and (whole or body):
             reading = self.schemas.reading()
             home, operation = reading.operation(segments, method)
-            if operation.body:
-                media = media_of(kind)
-                if method == "PATCH":
-                    return self.patched(target, query, whole, kind, media, reading.body(home, operation, media, kept(body)))
-                if whole:
-                    requester = self.requester(asked) if method == "POST" else None
-                    made, given = confined_as_given(kept(body), "the object", self.cluster_kinds(), self.kube.namespace, labels_for(asked, requester))
-                    made, kind = reading.object(made, "the object"), "application/json"
-                else:
-                    made = reading.body(home, operation, media, kept(body))
-                    given = stamps(made)
-                before, version = ({}, None) if method == "POST" else self.current(target.path)
-                unmoved(before, given, "the body")
-                if whole:
-                    self.tried(made, "the object")
-                body = written(held_to(made, version, None, "the body")).encode()
+        if operation is not None and operation.body:
+            media = media_of(kind)
+            if method == "PATCH":
+                return self.patched(asked, target, query, whole, kind, media, reading.body(home, operation, media, kept(body)))
+            if whole:
+                requester = self.requester(asked) if method == "POST" else None
+                made, given = confined_as_given(kept(body), "the object", self.cluster_kinds(), self.kube.namespace, labels_for(asked, requester))
+                made, kind = reading.object(made, "the object"), "application/json"
+            else:
+                made = reading.body(home, operation, media, kept(body))
+                given = stamps(made)
+            before, version = ({}, None) if method == "POST" else self.current(asked, target, method)
+            unmoved(before, given, "the body")
+            if whole:
+                self.tried(made, "the object")
+            body = written(held_to(made, version, None, "the body")).encode()
+        elif method in CHANGES:
+            self.owned_at(asked, target, method)
         answered = self.api.call(method, target.path, query, body, kind)
         return answered.status, answered
 
@@ -4743,23 +4755,24 @@ class Service:
                 raise Refused(403, f"a delete of every {target.resource} a query selects deletes only the caller's own, and egress names no account for this request")
             answered = self.api.call("DELETE", target.path, owned_only(query, caller), body, kind)
             return answered.status, answered
-        what = f"{target.resource} {target.named.rsplit('/', 1)[-1]}"
-        uid = self.whose(asked, self.object_at(target.named, what), what)
+        what = object_named(target)
+        uid = self.owned_at(asked, target, "DELETE")[1]
         answered = self.unmade(target.path, query, kept(body), uid, what)
         return answered.status, answered
 
-    def current(self, path):
-        answered = self.api.call("GET", path, "", b"", None)
-        if answered.status == 404:
-            return {}, None
-        if not 200 <= answered.status < 300:
-            raise Refused(answered.status, f"{path} was not read before the write, so its {NOTE}* labels and annotations could not be held as they are: Kubernetes answered {answered.status}")
-        held = json.loads(answered.body)
-        return stamps(held), mapping(mapping(held).get("metadata")).get("resourceVersion")
+    def current(self, asked, target, method):
+        held = self.owned_at(asked, target, method)[0]
+        version = mapping(mapping(held).get("metadata")).get("resourceVersion")
+        if target.path != target.named:
+            answered = self.api.call("GET", target.path, "", b"", None)
+            if not 200 <= answered.status < 300:
+                raise Refused(answered.status, f"{target.path} was not read before the write, so its {NOTE}* labels and annotations could not be held as they are: Kubernetes answered {answered.status}")
+            held = json.loads(answered.body)
+        return stamps(held), version
 
-    def patched(self, target, query, whole, kind, media, patch):
+    def patched(self, asked, target, query, whole, kind, media, patch):
         what = "the patch"
-        before, version = self.current(target.path)
+        before, version = self.current(asked, target, "PATCH")
         body = written(held_to(patch, version, media, what)).encode()
         tried = self.api.call("PATCH", target.path, dry_run(query), body, kind)
         if not 200 <= tried.status < 300:

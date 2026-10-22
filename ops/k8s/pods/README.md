@@ -28,16 +28,21 @@ or through a member node's halo forward.
   it is. A `/v1/manifests` manifest or a `/v1/k8s/` POST that names one is refused 403. A
   `/v1/k8s/` PUT must name exactly those the object holds, read from the same path first, and a
   PATCH of any type is judged by its dry run against that read. Both cover the object, its pod
-  template and its claim templates. The write is then sent held to the `resourceVersion` it was
-  judged at, so a write that lands in between makes Kubernetes refuse it 409.
-- A delete is the deleted object's requester's alone: `DELETE /v1/pods/NAME`, `DELETE
-  /v1/manifests` and a `/v1/k8s/` DELETE or pod eviction go through only when the account egress
+  template and its claim templates. The write is then sent held to the `resourceVersion` of the
+  object as the requester check below read it (for a subresource, the object it belongs to), so a
+  write that lands in between makes Kubernetes refuse it 409.
+- A change or a delete is the object's requester's alone: `DELETE /v1/pods/NAME`, `DELETE
+  /v1/manifests` and a `/v1/k8s/` PUT, PATCH, DELETE or pod eviction (a subresource's write, and a
+  body Kubernetes forwards unread such as `proxy`, judged by the object it belongs to, which the
+  service reads itself) go through only when the account egress
   says sent the request (a call fleet relays: its run's asker) is the object's `requester` label,
   and anyone else is refused 403 naming whose it is. The program that made a pod deletes it as its
   own account, which is that pod's requester. An object with no requester label (made before pods
-  stamped one) is deleted by no call: the operator removes it with kubectl. The service reads the
-  object, then sends the delete held to the uid it read, so an object made again under the same
-  name in between is not deleted. `POST /v1/manifests` keeps that rule for an object that is
+  stamped one) is changed or deleted by no call: the operator removes it with kubectl. The service
+  reads the object, then sends the delete held to the uid it read, so an object made again under
+  the same name in between is not deleted. A `/v1/k8s/` PUT or PATCH of an object that isn't there
+  is refused 404, naming the POSTs that make one (a `/v1/k8s/` POST to its collection, or `POST
+  /v1/manifests`), which stamp its requester. `POST /v1/manifests` keeps that rule for an object that is
   already there: it reads every object its manifests name in one `kubectl get`, and applies
   over an existing one only for that object's requester (anyone else, and any call over an
   object with no requester label, is refused 403 before anything applies), with the manifest

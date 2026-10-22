@@ -1376,6 +1376,92 @@ class Owned(Served):
         self.assertEqual(method, "POST")
         self.assertEqual(json.loads(body)["metadata"]["labels"].get("ducktape.industries/requester"), "21")
 
+    def test_a_passthrough_put_or_patch_is_its_objects_requesters_alone_held_to_the_version_judged(self):
+        path = "/api/v1/namespaces/agents/configmaps/m"
+        labels = {"ducktape.industries/requester": "21"}
+        mine = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m", "uid": "u-m", "resourceVersion": "7", "labels": labels}, "data": {"a": "b"}}
+        put = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m", "labels": labels}, "data": {"a": "c"}}
+        merge = b'{"data": {"a": "c"}}'
+        for sender, words in ((sent_by(15), "account 15's"), (NOBODY, "no account's")):
+            self.signer.sender = sender
+            for method, body, headers in (("PUT", put, ASKED), ("PATCH", merge, MERGE)):
+                self.api.calls, self.api.answers = [], [answered(200, mine), answered(200, mine), answered(200, mine)]
+                code, answer = self.call(method, "/v1/k8s" + path, body, headers=headers)
+                self.assertEqual(code, 403, (method, words, answer))
+                for word in ("configmaps m is account 21's", "changes or deletes it", words):
+                    self.assertIn(word, answer["error"])
+                self.assertEqual([call[:2] for call in self.api.calls], [("GET", path)])
+        self.signer.sender = sent_by(21)
+        self.api.calls, self.api.answers = [], [answered(200, mine)]
+        self.assertEqual(self.call("PUT", "/v1/k8s" + path, put)[0], 200)
+        self.assertEqual([call[:2] for call in self.api.calls], [("GET", path), ("PUT", path)])
+        self.assertEqual(json.loads(self.api.calls[1][3])["metadata"]["resourceVersion"], "7")
+        self.api.calls, self.api.answers = [], [answered(200, mine), answered(200, mine)]
+        self.assertEqual(self.call("PATCH", "/v1/k8s" + path, merge, headers=MERGE)[0], 200)
+        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("PATCH", "dryRun=All"), ("PATCH", "")])
+
+    def test_a_passthrough_put_or_patch_of_an_object_that_names_no_requester_changes_nothing(self):
+        path = "/api/v1/namespaces/agents/configmaps/m"
+        bare = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m", "uid": "u-m", "resourceVersion": "7"}}
+        self.signer.sender = sent_by(21)
+        for method, body, headers in (("PUT", {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m"}}, ASKED), ("PATCH", b'{"data": {}}', MERGE)):
+            self.api.calls, self.api.answers = [], [answered(200, bare), answered(200, bare), answered(200, bare)]
+            code, answer = self.call(method, "/v1/k8s" + path, body, headers=headers)
+            self.assertEqual(code, 403, (method, answer))
+            self.assertIn("configmaps m names no requester", answer["error"])
+            self.assertEqual([call[0] for call in self.api.calls], ["GET"])
+
+    def test_a_subresource_put_or_patch_is_judged_by_its_objects_requester_and_held_to_that_read(self):
+        web = "/apis/apps/v1/namespaces/agents/deployments/web"
+        mine = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web", "uid": "u-web", "resourceVersion": "7", "labels": {"ducktape.industries/requester": "21"}}}
+        scale = {"apiVersion": "autoscaling/v1", "kind": "Scale", "metadata": {"name": "web", "resourceVersion": "8"}, "spec": {"replicas": 1}}
+        replicas = b'{"spec": {"replicas": 0}}'
+        self.signer.sender = sent_by(15)
+        for method, headers in (("PUT", ASKED), ("PATCH", MERGE)):
+            self.api.calls, self.api.answers = [], [answered(200, mine), answered(200, scale), answered(200, scale)]
+            code, answer = self.call(method, DEPLOYMENTS + "/web/scale", replicas, headers=headers)
+            self.assertEqual(code, 403, (method, answer))
+            self.assertIn("deployments web is account 21's", answer["error"])
+            self.assertEqual([call[:2] for call in self.api.calls], [("GET", web)])
+        self.signer.sender = sent_by(21)
+        self.api.calls, self.api.answers = [], [answered(200, mine), answered(200, scale), answered(200, scale), answered(200, scale)]
+        self.assertEqual(self.call("PATCH", DEPLOYMENTS + "/web/scale", replicas, headers=MERGE)[0], 200)
+        self.assertEqual([call[:3] for call in self.api.calls], [("GET", web, ""), ("GET", web + "/scale", ""), ("PATCH", web + "/scale", "dryRun=All"), ("PATCH", web + "/scale", "")])
+        self.assertEqual(json.loads(self.api.calls[-1][3]), {"spec": {"replicas": 0}, "metadata": {"resourceVersion": "7"}})
+
+    def test_a_put_or_patch_whose_body_is_not_read_is_judged_by_its_objects_requester_too(self):
+        pod = "/api/v1/namespaces/agents/pods/p"
+        mine = {"kind": "Pod", "metadata": {"name": "p", "uid": "u-p", "labels": {"ducktape.industries/requester": "21"}}}
+        cases = (
+            ("PUT", PODS + "/p/proxy/a/b", b"raw", {**ASKED, "content-type": "application/octet-stream"}, pod),
+            ("PATCH", DEPLOYMENTS + "/web/scale", b"", MERGE, "/apis/apps/v1/namespaces/agents/deployments/web"),
+        )
+        self.signer.sender = sent_by(15)
+        for method, path, body, headers, read in cases:
+            self.api.calls, self.api.answers = [], [answered(200, mine)]
+            code, answer = self.call(method, path, body, headers=headers)
+            self.assertEqual(code, 403, (path, answer))
+            self.assertIn("is account 21's", answer["error"])
+            self.assertEqual([call[:2] for call in self.api.calls], [("GET", read)])
+        self.signer.sender = sent_by(21)
+        self.api.calls, self.api.answers = [], [answered(200, mine)]
+        method, path, body, headers, _ = cases[0]
+        self.assertEqual(self.call(method, path, body, headers=headers)[0], 200)
+        self.assertEqual([call[:4] for call in self.api.calls], [("GET", pod, "", b""), ("PUT", pod + "/proxy/a/b", "", b"raw")])
+
+    def test_a_put_or_patch_of_an_absent_object_is_refused_naming_the_posts_that_make_one(self):
+        path = "/api/v1/namespaces/agents/configmaps/m"
+        made = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "m"}}
+        missing = {"kind": "Status", "status": "Failure", "reason": "NotFound", "code": 404}
+        self.signer.sender = sent_by(21)
+        for method, media in (("PUT", "application/json"), ("PATCH", "application/apply-patch+yaml"), ("PATCH", "application/merge-patch+json")):
+            self.api.calls, self.api.answers = [], [answered(404, missing), answered(201, made), answered(201, made)]
+            code, answer = self.call(method, "/v1/k8s" + path + "?fieldManager=me", json.dumps(made).encode(), headers={**ASKED, "content-type": media})
+            self.assertEqual(code, 404, (method, media, answer))
+            for words in ("configmaps m is not there", "a POST to /v1/k8s/api/v1/namespaces/agents/configmaps", "POST /v1/manifests"):
+                self.assertIn(words, answer["error"])
+            self.assertEqual([call[:2] for call in self.api.calls], [("GET", path)])
+
 
 class Exec(Served):
     def test_exec_answers_the_commands_output_and_exit_code(self):
@@ -2233,7 +2319,7 @@ class Manifests(Served):
         self.kube.answer("objects", ran(theirs))
         self.signer.sender = sent_by(17)
         taking = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "victim"}, "data": {"a": "2"}}
-        self.refused("POST", "/v1/manifests", {"manifests": [taking]}, 403, ["manifest 0 (ConfigMap victim) is account 21's", "re-applies or deletes it", "this call is account 17's"])
+        self.refused("POST", "/v1/manifests", {"manifests": [taking]}, 403, ["manifest 0 (ConfigMap victim) is account 21's", "changes or deletes it", "this call is account 17's"])
         self.assertNotIn("apply", self.kube.verbs())
         self.refused("DELETE", "/v1/manifests", {"kind": "configmap", "name": "victim"}, 403, ["is account 21's"])
         self.assertEqual(self.api.calls, [])
@@ -2284,9 +2370,21 @@ def answered(status, body):
     return server.Answered(status, "application/json", json.dumps(body).encode())
 
 
-class Passthrough(Served):
+def owned(manifest, requester="21"):
+    meta = manifest.get("metadata") or {}
+    labels = {**(meta.get("labels") or {}), "ducktape.industries/requester": requester}
+    return {**manifest, "metadata": {**meta, "uid": f"u-{meta.get('name', '')}", "labels": labels}}
+
+
+class Holder(Served):
+    def setUp(self):
+        super().setUp()
+        self.signer.sender = sent_by(21)
+
+
+class Passthrough(Holder):
     def forced(self, **template_spec):
-        return deployment(priorityClassName="agents", automountServiceAccountToken=False, **template_spec)
+        return owned(deployment(priorityClassName="agents", automountServiceAccountToken=False, **template_spec))
 
     def test_a_read_reaches_its_path_in_the_namespace_and_answers_kubernetes_verbatim(self):
         missing = {"kind": "Status", "status": "Failure", "reason": "NotFound", "code": 404}
@@ -2346,7 +2444,7 @@ class Passthrough(Served):
 
     def test_a_patch_whose_result_breaks_a_rule_is_refused_after_the_dry_run(self):
         results = (
-            (deployment(), ["would run outside priority class agents", "PUT"]),
+            (owned(deployment()), ["would run outside priority class agents", "PUT"]),
             (self.forced(volumes=[{"name": "h", "hostPath": {"path": "/"}}]), ["hostPath"]),
         )
         for result, words in results:
@@ -2362,16 +2460,16 @@ class Passthrough(Served):
 
     def test_a_subresource_is_read_for_quantities_but_not_confined(self):
         pod = {"kind": "Pod", "metadata": {"name": "p", "uid": "u-p", "labels": {"ducktape.industries/requester": "17"}}}
-        self.api.answers = [answered(200, {}), answered(200, {}), answered(200, {}), answered(200, pod)]
+        self.api.answers = [answered(200, owned(deployment(), "17")), answered(200, {}), answered(200, {}), answered(200, {}), answered(200, pod)]
         self.signer.sender = sent_by(17)
         self.call("PATCH", DEPLOYMENTS + "/web/scale", b'{"spec": {"replicas": 0}}', headers=MERGE)
         self.call("POST", "/v1/k8s/api/v1/namespaces/agents/pods/p/eviction", {"apiVersion": "policy/v1", "kind": "Eviction"})
-        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("PATCH", "dryRun=All"), ("PATCH", ""), ("GET", ""), ("POST", "")])
+        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("GET", ""), ("PATCH", "dryRun=All"), ("PATCH", ""), ("GET", ""), ("POST", "")])
         self.assertEqual(self.kube.calls, [])
 
 
 PODS = "/v1/k8s/api/v1/namespaces/agents/pods"
-PLACED = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}, "spec": {"priorityClassName": "agents", "automountServiceAccountToken": False}}
+PLACED = owned({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}, "spec": {"priorityClassName": "agents", "automountServiceAccountToken": False}})
 
 
 def numbered(body, numerals):
@@ -2381,7 +2479,7 @@ def numbered(body, numerals):
     return text.encode()
 
 
-class Quantities(Served):
+class Quantities(Holder):
     def test_each_quantity_is_written_as_kubernetes_writes_it(self):
         cases = {
             "0": "0",
@@ -2492,6 +2590,7 @@ class Quantities(Served):
     def test_a_created_or_resized_pod_reaches_kubernetes_as_kubernetes_writes_it(self):
         pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "image": "i", "resources": {"limits": {"memory": ZEROS}}}], "overhead": {"cpu": "0.5"}}}
         resized = {"spec": {"containers": [{"name": "c", "resources": {"requests": {"cpu": "@cpu@"}}}]}}
+        self.api.answers = [answered(200, {}), answered(200, PLACED), answered(200, {})]
         self.assertEqual(self.call("POST", PODS, pod)[0], 200)
         self.assertEqual(self.call("PUT", PODS + "/p/resize", numbered(resized, {"@cpu@": "1e-10000000"}))[0], 200)
         created, resize = (json.loads(call[3]) for call in self.api.calls if call[0] != "GET")
@@ -2594,7 +2693,7 @@ class Quantities(Served):
 
 
 CONFIGMAPS = "/v1/k8s/api/v1/namespaces/agents/configmaps"
-CONFIGMAP = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "x"}}
+CONFIGMAP = owned({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "x"}})
 SLOW = "1e-2147483648"
 LIMITED = {"containers": [{"name": "c", "image": "i", "resources": {"limits": {"cpu": SLOW}}}]}
 
@@ -2607,7 +2706,7 @@ def typed(sent):
     return {key: value for key, value in sent.items() if key.casefold() in ("apiversion", "kind")}
 
 
-class Kinds(Served):
+class Kinds(Holder):
     def sent(self, method, path, body, media=None, answers=()):
         self.api.calls, self.api.answers = [], [answered(200, answer) for answer in answers]
         headers = ASKED if media is None else {**ASKED, "content-type": media}
@@ -2616,7 +2715,7 @@ class Kinds(Served):
         return self.api.calls[-1][3]
 
     def test_a_strategic_patch_is_read_as_its_endpoints_kind_whatever_kind_it_states(self):
-        forced = deployment(priorityClassName="agents", automountServiceAccountToken=False)
+        forced = owned(deployment(priorityClassName="agents", automountServiceAccountToken=False))
         patch = {"apiVersion": "v1", "kind": "ConfigMap", "spec": {"template": {"spec": LIMITED}}}
         sent = json.loads(self.sent("PATCH", DEPLOYMENTS + "/web", patch, "application/strategic-merge-patch+json", [forced, forced]))
         self.assertEqual(typed(sent), {"apiVersion": "v1", "kind": "ConfigMap"})
@@ -2731,21 +2830,21 @@ def held_pod(labels=None, notes=None, claims=None):
     return {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": "p", "resourceVersion": "7", "labels": dict(STAMPED if labels is None else labels), "annotations": dict(notes or {})},
+        "metadata": {"name": "p", "uid": "u-p", "resourceVersion": "7", "labels": dict(STAMPED if labels is None else labels), "annotations": dict(notes or {})},
         "spec": {"priorityClassName": "agents", "automountServiceAccountToken": False, "volumes": [claimed("out", dict(STAMPED if claims is None else claims))]},
     }
 
 
 def held_deployment(template_labels):
     made = deployment(priorityClassName="agents", automountServiceAccountToken=False)
-    made["metadata"].update({"resourceVersion": "7", "labels": dict(STAMPED)})
+    made["metadata"].update({"uid": "u-web", "resourceVersion": "7", "labels": dict(STAMPED)})
     made["spec"]["template"]["metadata"]["labels"] = {"app": "web", **template_labels}
     return made
 
 
-class Stamped(Served):
-    def patched(self, path, patch, media, current, result):
-        self.api.calls, self.api.answers = [], [answered(200, current), answered(200, result), answered(200, result)]
+class Stamped(Holder):
+    def patched(self, path, patch, media, current, result, reads=1):
+        self.api.calls, self.api.answers = [], [answered(200, current)] * reads + [answered(200, result), answered(200, result)]
         return self.call("PATCH", path, json.dumps(patch).encode(), headers={**ASKED, "content-type": media})
 
     def test_a_patch_setting_a_requester_on_ones_own_pod_is_refused_and_nothing_changes(self):
@@ -2770,10 +2869,11 @@ class Stamped(Served):
             (DEPLOYMENTS + "/web", held_deployment({}), held_deployment(MOVED), "label ducktape.industries/requester on its pod template"),
         )
         for path, current, result, words in cases:
-            code, answer = self.patched(path, {"metadata": {}}, "application/merge-patch+json", current, result)
+            reads = 2 if path.endswith("/resize") else 1
+            code, answer = self.patched(path, {"metadata": {}}, "application/merge-patch+json", current, result, reads)
             self.assertEqual(code, 403, (path, words, answer))
             self.assertIn(words, answer["error"])
-            self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("PATCH", "dryRun=All")], words)
+            self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", "")] * reads + [("PATCH", "dryRun=All")], words)
 
     def test_a_patch_that_leaves_the_stamps_is_sent_held_to_the_version_it_was_judged_at(self):
         merge = {"spec": {"activeDeadlineSeconds": 5}}
@@ -2826,24 +2926,22 @@ class Stamped(Served):
         self.assertEqual((sent["metadata"]["resourceVersion"], sent["metadata"]["labels"]), ("7", STAMPED))
         dropped = held_pod(labels={key: value for key, value in STAMPED.items() if key != "ducktape.industries/requester"})
         relabelled = held_pod(labels={**STAMPED, **MOVED})
-        for path, body in ((PODS + "/p", dropped), (PODS + "/p/resize", relabelled)):
-            self.api.calls, self.api.answers = [], [answered(200, current)]
+        for path, body, reads in ((PODS + "/p", dropped, 1), (PODS + "/p/resize", relabelled, 2)):
+            self.api.calls, self.api.answers = [], [answered(200, current)] * reads
             self.refused("PUT", path, body, 403, ["label ducktape.industries/requester on the object"])
-            self.assertEqual([call[0] for call in self.api.calls], ["GET"], path)
+            self.assertEqual([call[0] for call in self.api.calls], ["GET"] * reads, path)
 
-    def test_a_write_to_an_object_that_could_not_be_read_is_refused_and_an_absent_one_holds_none(self):
+    def test_a_write_to_an_object_or_its_subresource_that_could_not_be_read_is_refused(self):
         self.api.answers = [answered(403, {"kind": "Status", "code": 403})]
         code, answer = self.call("PATCH", PODS + "/p", b'{"spec": {}}', headers=MERGE)
         self.assertEqual(code, 403, answer)
-        self.assertIn("was not read before the write", answer.get("error", ""))
+        self.assertIn("pods p was not read, so whose it is could not be told", answer.get("error", ""))
         self.assertEqual([call[0] for call in self.api.calls], ["GET"])
-        applied = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p", "labels": MOVED}}
-        self.api.calls, self.api.answers = [], [answered(404, {"kind": "Status", "code": 404}), answered(201, held_pod(labels=MOVED, claims={}))]
-        code, answer = self.call("PATCH", PODS + "/p?fieldManager=me", json.dumps(applied).encode(), headers={**ASKED, "content-type": "application/apply-patch+yaml"})
+        self.api.calls, self.api.answers = [], [answered(200, held_pod()), answered(403, {"kind": "Status", "code": 403})]
+        code, answer = self.call("PATCH", PODS + "/p/resize", b'{"spec": {}}', headers=MERGE)
         self.assertEqual(code, 403, answer)
-        self.assertIn("label ducktape.industries/requester on the object", answer.get("error", ""))
-        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("PATCH", "fieldManager=me&dryRun=All")])
-        self.assertNotIn("resourceVersion", json.loads(self.api.calls[1][3])["metadata"])
+        self.assertIn("/api/v1/namespaces/agents/pods/p/resize was not read before the write", answer.get("error", ""))
+        self.assertEqual([call[0] for call in self.api.calls], ["GET", "GET"])
 
 
 class Logged(Served):
