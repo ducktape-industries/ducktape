@@ -798,7 +798,10 @@ is the service and whose payload is the member node's key. The caller opens the 
 signature, the network and the anchor (as fresh as a signed query's), opens a lane stream to
 the member and passes the frame on. The member's node checks the same again, that the frame
 names its own key, and that its own `forward.toml` offers the service and lists the signer,
-all before it connects. A signer the service does not list is refused `not_found`, the same
+all before it connects. A node that knows the anchor's block is finalized but has not applied
+it yet, such as a member a block behind the node the caller took its tip from, checks the anchor
+once it has; an anchor past every block it knows finalized is refused `anchor` at once.
+A signer the service does not list is refused `not_found`, the same
 as for a service the node does not offer, so no key learns what a member forwards:
 
 ```toml

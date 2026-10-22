@@ -191,6 +191,7 @@ pub struct Daemon<E: Context> {
     pub logs: Logs,
     pub shutdown: watch::Sender<bool>,
     pub tips: watch::Sender<u64>,
+    finalized: watch::Receiver<u64>,
     pub relay: Arc<relay::Relay<E>>,
     pub blobs: blob::service::Service,
     halo: Arc<halo::Halo>,

@@ -17,9 +17,11 @@ use host::Submission;
 use node::BLOCK_BYTES;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 
 use crate::egress::lane::{read, write};
+use crate::view::Current;
 use crate::wire::Forwarded;
 use crate::{Context, Daemon, Result};
 
@@ -112,7 +114,7 @@ async fn reached<E: Context>(
     daemon: &Daemon<E>,
     frame: &[u8],
 ) -> std::result::Result<Box<dyn Bytestream>, Refusal> {
-    let submission = verified(daemon, frame)?;
+    let submission = verified(daemon, frame).await?;
     let served_here = submission.payload == daemon.identity;
     if served_here {
         return Ok(Box::new(opened(daemon, frame).await?));
@@ -158,14 +160,36 @@ fn unopened(error: halo::Error) -> Refusal {
     }
 }
 
-fn verified<E: Context>(
+async fn verified<E: Context>(
     daemon: &Daemon<E>,
     frame: &[u8],
 ) -> std::result::Result<Submission, Refusal> {
     let submission = node::verify_forward(frame, &daemon.descriptor.id())?;
-    let view = daemon.view().map_err(unchecked)?;
-    view.source().fresh(&submission).map_err(unchecked)??;
+    let tips = daemon.tips.subscribe();
+    fresh(&daemon.current, tips, &daemon.finalized, &submission).await?;
     Ok(submission)
+}
+
+async fn fresh<E: Context>(
+    current: &Current<E>,
+    mut tips: watch::Receiver<u64>,
+    finalized: &watch::Receiver<u64>,
+    submission: &Submission,
+) -> std::result::Result<(), Refusal> {
+    loop {
+        tips.borrow_and_update();
+        let view = current.view().map_err(unchecked)?;
+        let anchored = submission.anchor.height;
+        let applied = view.tip().height >= anchored;
+        let unfinalized = anchored > *finalized.borrow();
+        let judged = applied || unfinalized;
+        if judged {
+            return view.source().fresh(submission).map_err(unchecked)?;
+        }
+        if tips.changed().await.is_err() {
+            return Err(unchecked(crate::Error::Stopped));
+        }
+    }
 }
 
 fn unchecked(error: impl std::fmt::Display) -> Refusal {
@@ -179,7 +203,7 @@ async fn opened<E: Context>(
     daemon: &Daemon<E>,
     frame: &[u8],
 ) -> std::result::Result<tokio::net::TcpStream, Refusal> {
-    let submission = verified(daemon, frame)?;
+    let submission = verified(daemon, frame).await?;
     let served_here = submission.payload == daemon.identity;
     if !served_here {
         return Err(Refusal::new(
@@ -281,3 +305,6 @@ async fn piped(socket: WebSocket, stream: Box<dyn Bytestream>) -> std::io::Resul
     let _ = sink.send(Message::Close(None)).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

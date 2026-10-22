@@ -737,6 +737,7 @@ async fn start<E: Context>(
         logs,
         shutdown,
         tips,
+        finalized: known.clone(),
         votes: steered
             .as_ref()
             .map_or_else(consensus::Votes::default, |(_, membership, _)| {
