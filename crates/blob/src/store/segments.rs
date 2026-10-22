@@ -522,6 +522,11 @@ impl Log {
         self.dir.join(format!("{n:020}"))
     }
 
+    pub(super) fn appended(&self) -> Vec<PathBuf> {
+        let streams = std::iter::once(self.active).chain(self.copying);
+        streams.map(|n| self.path(n)).collect()
+    }
+
     fn segment(&self, n: u64) -> &Segment {
         self.segments.get(&n).expect("an indexed segment is open")
     }

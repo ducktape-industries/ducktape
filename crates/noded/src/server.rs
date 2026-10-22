@@ -25,8 +25,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::changes::{self, Fanout, Published, Subscription};
 use crate::ctx::{Ctx, EgressSigner};
 use crate::wire::{
-    Admin, BlockAsk, Blocks, EgressPlan, EgressSet, Finalized, Get, Located, Network, Page, Query,
-    Range, Submit, Submitted, TxAsk, route,
+    Admin, BlockAsk, Blocks, EgressPlan, EgressSet, Finalized, Get, Located, Network, Page, Play,
+    Query, Range, Submit, Submitted, TxAsk, route,
 };
 use crate::{Context, Daemon, cores, offload};
 
@@ -179,7 +179,7 @@ enum Heard {
 }
 
 fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route(route::STATUS, get(status::<E>))
         .route(route::NETWORK, get(network::<E>))
         .route(route::HALO_SELF, get(halo_self::<E>))
@@ -199,9 +199,6 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::HEALTH, get(health::<E>))
         .route(route::ADMIN, post(admin::<E>))
         .route(route::EGRESS_SET, post(egress_set::<E>))
-        .route(route::SYNC, post(sync::<E>))
-        .route(route::SYNC_HOLD, post(sync_hold::<E>))
-        .route(route::SNAPSHOT, post(snapshot::<E>))
         .route(route::METRICS, get(metrics::<E>))
         .route(live_wire::PORT_ROUTE, get(live_port::<E>))
         .route(route::QUERY, post(query::<E>))
@@ -220,7 +217,17 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(live_wire::ROUTE, get(live_socket::<E>))
         .route(halo::RELAY_ROUTE, get(halo_relay::<E>))
         .route(halo::SEEN_ROUTE, get(seen))
-        .route(route::FORWARD, get(forward::<E>))
+        .route(route::FORWARD, get(forward::<E>));
+    let routes = match daemon.forked() {
+        true => routes
+            .route(route::FORK_AS, post(fork_as::<E>))
+            .route(route::FORK_ADVANCE, post(fork_advance::<E>)),
+        false => routes
+            .route(route::SYNC, post(sync::<E>))
+            .route(route::SYNC_HOLD, post(sync_hold::<E>))
+            .route(route::SNAPSHOT, post(snapshot::<E>)),
+    };
+    routes
         .layer(axum::middleware::from_fn_with_state(
             daemon.clone(),
             timed::<E>,
@@ -441,6 +448,28 @@ async fn submit<E: Context>(
         Err(refusal) => return Reply::Refused(refusal),
     };
     taken(ctx.submit(frame, preconfirm).await)
+}
+
+async fn fork_as<E: Context>(
+    ctx: Ctx<E>,
+    Capped(body): Capped<SUBMIT_BODY_BYTES>,
+) -> Reply<Submitted> {
+    let Play { body, preconfirm } = match abi::decode(&body) {
+        Ok(play) => play,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    taken(ctx.play(body, preconfirm).await)
+}
+
+async fn fork_advance<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<u64> {
+    let height: u64 = match abi::decode(&body) {
+        Ok(height) => height,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match ctx.advance(height).await {
+        Ok(reached) => Reply::Answered(reached),
+        Err(error) => failed(error),
+    }
 }
 
 fn taken(taken: crate::Result<Result<Taken, Refusal>>) -> Reply<Submitted> {

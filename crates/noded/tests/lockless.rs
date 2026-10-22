@@ -1,7 +1,7 @@
 // Source lint: the modules an RPC request runs through name no lock and never reach marshal's
 // mailbox, and a handler takes the request context, never the daemon.
 
-const REQUEST_PATH: [&str; 27] = [
+const REQUEST_PATH: [&str; 28] = [
     "server.rs",
     "query.rs",
     "ctx.rs",
@@ -29,6 +29,7 @@ const REQUEST_PATH: [&str; 27] = [
     "census.rs",
     "forward.rs",
     "health.rs",
+    "fork.rs",
 ];
 
 const LOCKS: [&str; 4] = ["Mutex", "RwLock", "Semaphore", ".lock("];
@@ -106,7 +107,7 @@ fn every_handler_takes_the_request_context_and_none_takes_the_daemon() {
     );
 }
 
-const DISPATCHES: [(&str, &str); 9] = [
+const DISPATCHES: [(&str, &str); 10] = [
     ("live/table.rs", "match event {"),
     ("pool.rs", "let flow = match event {"),
     ("changes.rs", "let flow = match event {"),
@@ -116,6 +117,7 @@ const DISPATCHES: [(&str, &str); 9] = [
     ("server.rs", "match heard {"),
     ("standing.rs", "let flow = match next {"),
     ("census.rs", "match heard {"),
+    ("fork.rs", "let flow = match heard {"),
 ];
 
 fn body_after(text: &str, head: &str) -> String {

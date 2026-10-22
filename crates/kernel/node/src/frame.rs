@@ -245,3 +245,25 @@ pub(crate) fn check(frame: Vec<u8>, network: &[u8]) -> Result<Checked, Refusal> 
     };
     Ok(Checked(Arc::new(verdict)))
 }
+
+pub(crate) fn unproven(body: Body, network: &[u8]) -> Result<Checked, Refusal> {
+    let on_this_network = body.network == network;
+    if !on_this_network {
+        return Err(Refusal::new(
+            reason::INVALID_INPUT,
+            "the frame names another network",
+        ));
+    }
+    let submission = body.submission();
+    let frame = Frame {
+        body,
+        proof: Vec::new(),
+    }
+    .encode();
+    let verdict = Verdict {
+        frame,
+        network: network.to_vec(),
+        submission,
+    };
+    Ok(Checked(Arc::new(verdict)))
+}

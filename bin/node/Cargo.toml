@@ -21,6 +21,7 @@ futures = { workspace = true }
 hex = "0.4"
 host = { workspace = true }
 identity = { workspace = true }
+keyscheme = { workspace = true }
 keystore = { workspace = true }
 node = { workspace = true }
 noded = { workspace = true }
@@ -36,7 +37,6 @@ wasmparser = { workspace = true }
 [dev-dependencies]
 borsh = { workspace = true }
 fixture-wasm = { workspace = true }
-keyscheme = { workspace = true }
 live-wire = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }

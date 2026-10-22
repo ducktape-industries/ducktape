@@ -98,6 +98,18 @@ impl<E: Context> Ctx<E> {
         taken
     }
 
+    pub(crate) async fn play(
+        &self,
+        body: node::Body,
+        preconfirm: Preconfirm,
+    ) -> Result<std::result::Result<Taken, Refusal>> {
+        self.daemon.play(body, preconfirm).await
+    }
+
+    pub(crate) async fn advance(&self, height: u64) -> Result<u64> {
+        self.daemon.advance(height).await
+    }
+
     pub(crate) async fn sync(&self, request: statesync::Request) -> Result<statesync::Response> {
         self.daemon.sync(request).await
     }

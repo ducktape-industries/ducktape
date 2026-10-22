@@ -43,6 +43,8 @@ pub mod route {
     pub const NETWORK: &str = "/v1/network";
     pub const HALO_SELF: &str = "/v1/halo/self";
     pub const FORWARD: &str = "/v1/forward";
+    pub const FORK_AS: &str = "/v1/fork/as";
+    pub const FORK_ADVANCE: &str = "/v1/fork/advance";
     pub const P2P: &str = "/v1/p2p";
     pub const METRICS: &str = "/metrics";
 }
@@ -95,6 +97,12 @@ impl Status {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Submit {
     pub frame: Vec<u8>,
+    pub preconfirm: Preconfirm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Play {
+    pub body: node::Body,
     pub preconfirm: Preconfirm,
 }
 

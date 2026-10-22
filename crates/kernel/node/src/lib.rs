@@ -62,14 +62,25 @@ fn millis(clock: &impl commonware_runtime::Clock) -> u64 {
 }
 
 pub fn admissible(frame: Vec<u8>, network: &[u8]) -> std::result::Result<Checked, Refusal> {
-    if !Block::carries(&frame) {
-        let sentence = format!(
-            "the frame is {} bytes and a block carries at most {BLOCK_BYTES}",
-            frame.len()
-        );
-        return Err(Refusal::new(reason::CAPACITY, sentence));
-    }
+    carried_whole(&frame)?;
     frame::check(frame, network)
+}
+
+pub fn played(body: Body, network: &[u8]) -> std::result::Result<Checked, Refusal> {
+    let checked = frame::unproven(body, network)?;
+    carried_whole(checked.frame())?;
+    Ok(checked)
+}
+
+fn carried_whole(frame: &[u8]) -> std::result::Result<(), Refusal> {
+    if Block::carries(frame) {
+        return Ok(());
+    }
+    let sentence = format!(
+        "the frame is {} bytes and a block carries at most {BLOCK_BYTES}",
+        frame.len()
+    );
+    Err(Refusal::new(reason::CAPACITY, sentence))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
     Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Forwarded, Get, HaloSelf, Located, Network,
-    Page, Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
+    Page, Play, Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
 };
 use crate::{Error, Result};
 
@@ -77,6 +77,24 @@ impl Client {
         let blocks = self.changes(RECENT).await?;
         self.put_framed(frame, framed).await?;
         self.landed(frame, blocks).await
+    }
+
+    pub async fn play(&self, body: node::Body, preconfirm: Preconfirm) -> Result<Submitted> {
+        self.post(route::FORK_AS, &Play { body, preconfirm }).await
+    }
+
+    pub async fn land_played(&self, body: &node::Body) -> Result<(u64, Receipt)> {
+        let blocks = self.changes(RECENT).await?;
+        self.play(body.clone(), Preconfirm::Off).await?;
+        let frame = Frame {
+            body: body.clone(),
+            proof: Vec::new(),
+        };
+        self.landed(&frame, blocks).await
+    }
+
+    pub async fn advance(&self, height: u64) -> Result<u64> {
+        self.post(route::FORK_ADVANCE, &height).await
     }
 
     pub async fn landed(
@@ -670,7 +688,8 @@ impl Fault for Error {
             | Error::Unrelayed
             | Error::MachineIsIdentity
             | Error::Unrolled(_)
-            | Error::Cut => Failure::Definite,
+            | Error::Cut
+            | Error::Unforked => Failure::Definite,
         }
     }
 }

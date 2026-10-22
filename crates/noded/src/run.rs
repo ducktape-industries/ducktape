@@ -47,7 +47,7 @@ use crate::writer::{Command, Hold, Writer};
 use crate::{Client, Context, Daemon, Error, Logs, Result, millis};
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-type Delivery = (Arc<Block>, Exact);
+pub(crate) type Delivery = (Arc<Block>, Exact);
 type Seating<E> =
     Membership<E, Outbound<E>, Receiver<PublicKey>, Oracle<PublicKey>, Participant<E>>;
 
@@ -191,7 +191,7 @@ pub struct Running<E: Context> {
     pub http: SocketAddr,
     pub p2p: SocketAddr,
     pub daemon: Arc<Daemon<E>>,
-    marshal: Marshal,
+    marshal: Option<Marshal>,
     mesh: Mesh<E>,
     tasks: Vec<Handle<()>>,
     rpc: crate::server::Rpc,
@@ -242,7 +242,9 @@ impl<E: Context> Running<E> {
         }
         daemon.hang_up().await;
         drop(rpc);
-        marshal.stop().await;
+        if let Some(marshal) = marshal {
+            marshal.stop().await;
+        }
         drop(mesh);
         daemon.activity.close().await;
         let flushed = daemon.history.close();
@@ -451,11 +453,14 @@ async fn start<E: Context>(
     let udp = listeners.halo.local_addr()?;
     let descriptor = workspace.descriptor()?;
     let identity = workspace.identity()?;
-    let anchor = workspace.anchor()?;
     let egress = crate::egress::Station::open(workspace.clone())?;
     let mut node = Node::open(context.child("node"), &descriptor.network, workspace.dir()).await?;
     node.meter_queries(load.query_fuel.map(NonZeroU64::get));
     crate::roll::admits(workspace.stamp()?, node.tip()?.height)?;
+    let solo = node.host().parent().is_some();
+    if solo {
+        loopback_only(&listeners)?;
+    }
     let network = Network {
         epoch_length: node.epoch_length()?,
         cadence,
@@ -493,7 +498,11 @@ async fn start<E: Context>(
         )
         .map_err(|error| Error::Address(format!("--halo {udp}: {error}")))?,
     );
-    halo.seat(halo_seats(&node, &network).await?);
+    let seats = match solo {
+        true => Vec::new(),
+        false => halo_seats(&node, &network).await?,
+    };
+    halo.seat(seats);
     tabled(&halo, halo_lanes(&node).await?, tip.height);
     let blobs = blob::service::Service::start(
         halo.clone(),
@@ -568,7 +577,9 @@ async fn start<E: Context>(
             member_cap,
             cadence,
         )?;
-    tracker.track(epoch, &members);
+    if !solo {
+        tracker.track(epoch, &members);
+    }
     let roster = Roster::new(descriptor.id(), Some(identity.clone()));
     for (epoch, validators) in &seated {
         let validators = validators_of(validators).ok_or(Error::Corrupt(format!(
@@ -596,40 +607,48 @@ async fn start<E: Context>(
     let (finalized, known) = watch::channel(tip.height);
     let chain = Participant {
         pool: pooling.clone(),
-        inbox,
+        inbox: inbox.clone(),
         finalized: Arc::new(finalized),
     };
-    let marshal = Marshal::start(
-        context.child("marshal"),
-        &descriptor.network,
-        &network,
-        roster.clone(),
-        anchor,
-        Transport {
-            me: identity.public_key(),
-            provider: mesh.oracle(),
-            blocker: mesh.oracle(),
-            lanes: marshal_lanes,
-        },
-        chain.clone(),
-    )
-    .await?;
-    let mux = EngineMux::start(context.child("lanes"), engine_channels, mesh.oracle());
-    let mut membership = Membership::new(
-        context.child("membership"),
-        descriptor.network.clone(),
-        network.clone(),
-        roster,
-        mux,
-        &marshal,
-        chain,
-    );
-    let standing = membership.seat(tip, root, &validators).await?;
+    let steered = match solo {
+        true => None,
+        false => {
+            let marshal = Marshal::start(
+                context.child("marshal"),
+                &descriptor.network,
+                &network,
+                roster.clone(),
+                workspace.anchor()?,
+                Transport {
+                    me: identity.public_key(),
+                    provider: mesh.oracle(),
+                    blocker: mesh.oracle(),
+                    lanes: marshal_lanes,
+                },
+                chain.clone(),
+            )
+            .await?;
+            let mux = EngineMux::start(context.child("lanes"), engine_channels, mesh.oracle());
+            let mut membership = Membership::new(
+                context.child("membership"),
+                descriptor.network.clone(),
+                network.clone(),
+                roster,
+                mux,
+                &marshal,
+                chain,
+            );
+            let standing = membership.seat(tip, root, &validators).await?;
+            Some((marshal, membership, standing))
+        }
+    };
+    let standing = steered.as_ref().map(|(_, _, standing)| standing);
     tracing::info!(
         target: "ducktape::node",
         event = "node_started",
         network = descriptor.network,
         epoch,
+        solo,
         ?standing,
         block_time_ms = cadence.block_time_ms(),
         leader_timeout_ms = cadence.leader_timeout().as_millis() as u64,
@@ -652,6 +671,14 @@ async fn start<E: Context>(
         load.forward_lane_backlog,
         workspace.forward_offers(),
     )?;
+    let block_time = Duration::from_millis(descriptor.block_time_ms);
+    let (solo_handle, driving) = match solo {
+        true => {
+            let (handle, driving) = crate::fork::solo(pooling.clone(), inbox, tip, block_time);
+            (Some(handle), Some(driving))
+        }
+        false => (None, None),
+    };
     let daemon = Arc::new(Daemon {
         context: context.child("daemon"),
         current,
@@ -676,7 +703,11 @@ async fn start<E: Context>(
         logs,
         shutdown,
         tips,
-        votes: membership.votes().clone(),
+        votes: steered
+            .as_ref()
+            .map_or_else(consensus::Votes::default, |(_, membership, _)| {
+                membership.votes().clone()
+            }),
         relay,
         blobs,
         halo,
@@ -688,34 +719,60 @@ async fn start<E: Context>(
         mesh: transport::loopback(p2p),
         halo_self,
         forward,
+        solo: solo_handle,
     });
-    let founding = tip.height == 0;
-    if let Anchor::Genesis(genesis) = marshal.anchor()
-        && founding
-    {
-        daemon
-            .record_unrecorded(&node, genesis, genesis.digest(), None)
-            .await?;
+    let unrecorded = steered
+        .as_ref()
+        .map(|(marshal, _, _)| (marshal.anchor(), marshal.mailbox().clone()));
+    if let Some((first, archived)) = unrecorded {
+        let founding = tip.height == 0;
+        if let Anchor::Genesis(genesis) = first
+            && founding
+        {
+            daemon
+                .record_unrecorded(&node, genesis, genesis.digest(), None)
+                .await?;
+        }
+        let applied_unsummarized = carried
+            .unsummarized
+            .into_iter()
+            .filter(|height| *height <= tip.height);
+        for height in applied_unsummarized {
+            let asked = commonware_consensus::types::Height::new(height);
+            let block = archived.get_block(asked).await.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "block {height} is archived and marshal does not read it"
+                ))
+            })?;
+            let finalization = archived.get_finalization(asked).await;
+            daemon
+                .record_unrecorded(&node, &block, block.digest(), finalization)
+                .await?;
+        }
     }
-    let applied_unsummarized = carried
-        .unsummarized
-        .into_iter()
-        .filter(|height| *height <= tip.height);
-    let archived = marshal.mailbox().clone();
-    for height in applied_unsummarized {
-        let asked = commonware_consensus::types::Height::new(height);
-        let block = archived.get_block(asked).await.ok_or_else(|| {
-            Error::Corrupt(format!(
-                "block {height} is archived and marshal does not read it"
-            ))
-        })?;
-        let finalization = archived.get_finalization(asked).await;
-        daemon
-            .record_unrecorded(&node, &block, block.digest(), finalization)
-            .await?;
-    }
-    let anchors = marshal.mailbox().clone();
-    published(&node, &daemon, anchors.anchor(tip).await);
+    let (marshal, consensus) = match steered {
+        Some((marshal, membership, _)) => {
+            let consensus = Consensus {
+                anchors: marshal.mailbox().clone(),
+                membership,
+                snapshots: crate::snapshot::Snapshots::new(
+                    workspace.dir().join(crate::snapshot::DIR),
+                    workspace.runtime_dir(),
+                    crate::snapshot::reflink,
+                    snapshot_removals,
+                    known,
+                    daemon.network.epoch_length,
+                ),
+            };
+            (Some(marshal), Some(consensus))
+        }
+        None => (None, None),
+    };
+    let anchor = match &consensus {
+        Some(consensus) => consensus.anchors.anchor(tip).await,
+        None => None,
+    };
+    published(&node, &daemon, anchor);
     if let Some(head) = daemon.head(tip.height).await? {
         daemon.changes.opened(head);
     }
@@ -724,20 +781,11 @@ async fn start<E: Context>(
     let pump = context.child("pump").spawn({
         let writing = Writing {
             daemon: daemon.clone(),
-            anchors,
             node,
             commands,
-            membership,
+            consensus,
             tracker,
             tally,
-            snapshots: crate::snapshot::Snapshots::new(
-                workspace.dir().join(crate::snapshot::DIR),
-                workspace.runtime_dir(),
-                crate::snapshot::reflink,
-                snapshot_removals,
-                known,
-                daemon.network.epoch_length,
-            ),
             source: source.clone(),
         };
         move |_| write(writing, deliveries)
@@ -776,6 +824,12 @@ async fn start<E: Context>(
         move |_| crate::halo_self::dialing(daemon)
     });
     let mut tasks = vec![pump, relayed, egressing, reading, dialing];
+    if let Some(driving) = driving {
+        let driven = context
+            .child("solo")
+            .spawn(move |context| crate::fork::drive(context, driving));
+        tasks.push(driven);
+    }
     if let Some((listener, acceptor)) = tls {
         let mesh = transport::loopback(p2p);
         tasks.push(
@@ -794,6 +848,32 @@ async fn start<E: Context>(
         tasks,
         rpc,
     })
+}
+
+fn loopback_only(listeners: &Listeners) -> Result<()> {
+    let mut bound = vec![
+        ("p2p", listeners.p2p.local_addr()?),
+        ("http", listeners.http.local_addr()?),
+        ("halo", listeners.halo.local_addr()?),
+    ];
+    if let Some(tls) = &listeners.tls {
+        bound.push(("tls", tls.local_addr()?));
+    }
+    if let Some(live) = &listeners.live {
+        bound.push(("live", live.local_addr()?));
+    }
+    let exposed: Vec<String> = bound
+        .iter()
+        .filter(|(_, address)| !address.ip().is_loopback())
+        .map(|(socket, address)| format!("{socket} {address}"))
+        .collect();
+    if exposed.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Address(format!(
+        "a fork takes ops as any signer, so it listens on loopback only, and {} is not",
+        exposed.join(", ")
+    )))
 }
 
 fn seed_of<E: Context>(view: &View<E>) -> Result<crate::activity::Seed> {
@@ -1022,14 +1102,18 @@ impl<E: Context> Chain for Participant<E> {
 
 struct Writing<E: Context> {
     daemon: Arc<Daemon<E>>,
-    anchors: MarshalMailbox,
     node: Node<E>,
     commands: mpsc::UnboundedReceiver<Command>,
-    membership: Seating<E>,
+    consensus: Option<Consensus<E>>,
     tracker: Tracker,
     tally: Tally,
-    snapshots: crate::snapshot::Snapshots,
     source: Option<Client>,
+}
+
+struct Consensus<E: Context> {
+    anchors: MarshalMailbox,
+    membership: Seating<E>,
+    snapshots: crate::snapshot::Snapshots,
 }
 
 struct Tally {
@@ -1343,7 +1427,7 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
         daemon,
         mut node,
         commands,
-        membership,
+        consensus,
         tracker,
         ..
     } = writing;
@@ -1351,7 +1435,9 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
     daemon.current.withdraw();
     daemon.pool.close().await;
     drop(commands);
-    membership.stop().await;
+    if let Some(consensus) = consensus {
+        consensus.membership.stop().await;
+    }
     drop(tracker);
     let synced = node.close().await;
     let closed = synced
@@ -1462,15 +1548,17 @@ async fn applied<E: Context>(
     phases.applying = lap.lap();
     let Writing {
         daemon,
-        anchors,
         node,
-        membership,
+        consensus,
         tracker,
-        snapshots,
         ..
     } = writing;
     let daemon: &Daemon<E> = daemon;
-    let anchor = anchors.anchor(node.tip()?).await;
+    let consenting = consensus.is_some();
+    let anchor = match consensus.as_mut() {
+        Some(consensus) => consensus.anchors.anchor(node.tip()?).await,
+        None => None,
+    };
     let finalization = match &anchor {
         Some(Anchor::Finalized(certificate)) => Some(certificate.clone()),
         Some(Anchor::Genesis(_)) | None => None,
@@ -1533,7 +1621,9 @@ async fn applied<E: Context>(
                 .blobs
                 .applied(block.height, &writes.unwrap_or_default());
             let reseated = members_written || closes;
-            receipts_for(daemon, node, block.height, due, reseated)?;
+            if consenting {
+                receipts_for(daemon, node, block.height, due, reseated)?;
+            }
             phases.receipting = lap.lap();
             members_written
         }
@@ -1545,7 +1635,7 @@ async fn applied<E: Context>(
             false
         }
     };
-    let reseats = members_written || closes;
+    let reseats = consenting && (members_written || closes);
     if reseats {
         reseat_halo(daemon, node, block.height).await;
     }
@@ -1567,6 +1657,15 @@ async fn applied<E: Context>(
         false => Offer::Due,
     };
     daemon.pool.offer(offer);
+    let Some(Consensus {
+        membership,
+        snapshots,
+        ..
+    }) = consensus.as_mut()
+    else {
+        phases.seating = lap.lap();
+        return Ok(Flow::Writing);
+    };
     // The mesh admits every member, so a resident follows the chain; only
     // the validators vote and propose.
     tracker.track(epoch, &members);

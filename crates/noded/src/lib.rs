@@ -10,6 +10,7 @@ mod ctx;
 mod egress;
 mod endpoint;
 mod fill;
+mod fork;
 mod forward;
 mod halo_self;
 mod health;
@@ -52,6 +53,7 @@ pub use config::{
 pub use cores::{CpuList, pin_block_threads};
 pub use egress::lane::{LANE as EGRESS_LANE, Seating, seating, serve_box};
 pub use endpoint::{Endpoint, Scheme};
+pub use fork::{Forked, fork};
 pub use forward::LANE as FORWARD_LANE;
 pub use logs::Logs;
 pub use mesh::Mesh;
@@ -155,6 +157,8 @@ pub enum Error {
     Unrolled(String),
     #[error("the forward ended before the far side's bytes did")]
     Cut,
+    #[error("this node runs consensus, and only a fork makes a block by hand")]
+    Unforked,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
@@ -199,6 +203,7 @@ pub struct Daemon<E: Context> {
     votes: Votes,
     halo_self: watch::Sender<wire::HaloSelf>,
     forward: forward::Forwarding,
+    solo: Option<fork::Solo>,
 }
 
 pub struct HeldHead {
@@ -257,6 +262,34 @@ impl<E: Context> Daemon<E> {
         preconfirm: Preconfirm,
     ) -> Result<std::result::Result<Taken, Refusal>> {
         self.pool.submit(checked, source, preconfirm).await
+    }
+
+    pub(crate) fn forked(&self) -> bool {
+        self.solo.is_some()
+    }
+
+    pub(crate) async fn play(
+        &self,
+        body: node::Body,
+        preconfirm: Preconfirm,
+    ) -> Result<std::result::Result<Taken, Refusal>> {
+        if !self.forked() {
+            let refusal = Refusal::new(
+                abi::reason::NOT_FOUND,
+                "only a fork takes a frame with no proof",
+            );
+            return Ok(Err(refusal));
+        }
+        let checked = match node::played(body, &self.descriptor.id()) {
+            Ok(checked) => checked,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        self.take(checked, Source::Client, preconfirm).await
+    }
+
+    pub(crate) async fn advance(&self, height: u64) -> Result<u64> {
+        let solo = self.solo.as_ref().ok_or(Error::Unforked)?;
+        solo.advance(height).await
     }
 
     pub async fn hold(&self) -> Result<Held> {

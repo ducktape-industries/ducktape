@@ -967,6 +967,25 @@ by a node on the new contract (the state from before goes to `pre-roll-<tip>/`
 in the workspace), then stamps from the head after it; one past R is refused, and
 joins again. So a binary never applies a block another contract produced.
 
+A fork is a throwaway copy of a stopped network's state that runs alone. With
+the parent's node stopped, `ducktape --workspace <new> fork new --from
+<stopped>` makes it: a fluent31 fork of `state/`, the blob store hard-linked
+(the segments it still appends to are copied), and `Host::fork`, which names
+the state `<parent>-fork-<height>-<nonce>` and writes `$network/parent`. Every
+commitment starts empty, and the parent's activation heights hold. `ducktape
+run` on that workspace sees the parent row and drives the chain itself: no
+marshal, membership, mesh peers or halo seats, a block from the pool every
+`block_time_ms`, and no `/v1/sync`, `/v1/sync/hold` or `/v1/snapshot`. Only
+there it serves `POST /v1/fork/as`, a frame body taken with no proof as any
+signer (`ducktape fork as <key> <program> <op>`; a validators vote is one per
+validator key), and `POST /v1/fork/advance`, blocks made back to back up to a
+height (`ducktape fork advance <height>`). A frame signed for the parent names
+another network and is refused, and a consensus node serves neither route.
+Since it takes any signer's ops, a fork listens on loopback only: `ducktape run`
+refuses one whose p2p, http, tls, halo or live socket is bound anywhere else.
+Forking opens the source's blob store, so the store of a source that crashed is
+recovered in place before it is linked: fork from a cleanly stopped node.
+
 A frame's body ends with `client`, the signer's own word for the software
 that signed it (`ducktape-cli/<version>` from the CLI, the app's
 `ducktape-app/<version>+<commit> (<os>; <features>)`), or none. It is signed

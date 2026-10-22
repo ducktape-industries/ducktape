@@ -233,6 +233,34 @@ impl Blobs {
         &self.shared.dir
     }
 
+    pub fn link(&self, to: &Path) -> Result<()> {
+        let appended = self.log().appended();
+        Blobs::linked(self.dir(), to, &appended)
+    }
+
+    fn linked(from: &Path, to: &Path, appended: &[PathBuf]) -> Result<()> {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let hidden = name.to_string_lossy().starts_with('.');
+            if hidden {
+                continue;
+            }
+            let path = entry.path();
+            let target = to.join(&name);
+            if entry.file_type()?.is_dir() {
+                Blobs::linked(&path, &target, appended)?;
+                continue;
+            }
+            match appended.contains(&path) {
+                true => fs::copy(&path, &target).map(drop)?,
+                false => fs::hard_link(&path, &target)?,
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "testkit"))]
     pub fn gate_copies(&self) -> CopyGate {
         let (reached, heard) = mpsc::sync_channel(1);

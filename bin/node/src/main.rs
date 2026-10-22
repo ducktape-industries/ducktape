@@ -116,6 +116,11 @@ enum Verb {
                  behind it, it state-syncs from its source first; past it, it is refused"
     )]
     Roll { height: u64 },
+    #[command(
+        subcommand,
+        about = "a throwaway fork of a stopped network's state, run alone with no consensus: it takes any signer's ops with no proof, and makes blocks on its parent's block time or by hand"
+    )]
+    Fork(ForkVerb),
     #[command(about = "print the node's height, tip, root, epoch and identity")]
     Status,
     #[command(
@@ -249,6 +254,32 @@ enum Verb {
         about = "run the work fleet assigns to the machines [machine] names, signed by machine.key"
     )]
     Machine(MachineVerb),
+}
+
+#[derive(Subcommand)]
+enum ForkVerb {
+    #[command(
+        about = "make this workspace a fork of the stopped workspace --from: its state and blobs under a network id of its own; then `ducktape run` drives it"
+    )]
+    New {
+        #[arg(long, help = "the stopped workspace the fork starts from")]
+        from: PathBuf,
+    },
+    #[command(
+        about = "on a fork, send a program an op as the signer key names, with no proof, and print what `op` prints; a validators vote is one of these per validator key"
+    )]
+    As {
+        #[arg(help = "the signer's public key, in hex")]
+        signer: String,
+        program: String,
+        op: String,
+        #[arg(long, conflicts_with = "land")]
+        preconfirm: bool,
+        #[arg(long)]
+        land: bool,
+    },
+    #[command(about = "on a fork, make blocks back to back until its tip reaches the height")]
+    Advance { height: u64 },
 }
 
 #[derive(Args)]
@@ -923,6 +954,22 @@ fn execute(cli: Cli) -> Result<(), String> {
                 Ok(())
             })
         }
+        Verb::Fork(ForkVerb::New { from }) => {
+            let log = workspace.settings().sentence()?.log;
+            let log = log.unwrap_or_else(|| noded::DEFAULT_LOG.to_string());
+            Runner::new(runtime_config(&workspace)).start(|context| async move {
+                Logs::install(&log)?;
+                let source = Workspace::at(from);
+                let forked = noded::fork(context, &source, &workspace).await.sentence()?;
+                println!(
+                    "forked {} at height {} as network {}; start it with `ducktape run`",
+                    source.dir().display(),
+                    forked.height,
+                    forked.network
+                );
+                Ok(())
+            })
+        }
         Verb::Wallet(verb) if !matches!(verb, WalletVerb::Consent { .. }) => {
             wallet(&workspace, verb)
         }
@@ -1120,6 +1167,45 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
             let answer =
                 json::ask(client, &key, &status, &program, request, layer(confirmed)).await?;
             json::print(&json::reply(&interface, &program, &answer)?);
+            Ok(())
+        }
+        Verb::Fork(ForkVerb::As {
+            signer,
+            program,
+            op,
+            preconfirm,
+            land,
+        }) => {
+            let interface = json::interface(workspace, client, &program).await?;
+            let payload = interface.encode_op(&json::parse(&op, "op")?).sentence()?;
+            let status = client.status().await.sentence()?;
+            let anchor = status.anchor();
+            let body = node::Body {
+                scheme: keyscheme::KeyScheme::Ed25519,
+                signer: hex::decode(&signer).sentence()?,
+                network: status.network.into_bytes(),
+                anchor,
+                salt: Some(salt()),
+                target: program.clone(),
+                payload: payload.clone(),
+                client: Some(CLIENT.to_owned()),
+            };
+            let sent = json::Sent {
+                interface: &interface,
+                program: &program,
+                payload: &payload,
+            };
+            let told = match (land, preconfirm) {
+                (true, _) => sent.land_played(client, &body).await?,
+                (false, true) => sent.play(client, &body, Preconfirm::On).await?,
+                (false, false) => sent.play(client, &body, Preconfirm::Off).await?,
+            };
+            json::print(&told);
+            Ok(())
+        }
+        Verb::Fork(ForkVerb::Advance { height }) => {
+            let reached = client.advance(height).await.sentence()?;
+            println!("{reached}");
             Ok(())
         }
         Verb::Mcp => {
@@ -1342,6 +1428,7 @@ async fn talk(workspace: &Workspace, client: &Client, verb: Verb) -> Result<(), 
         | Verb::RestoreArchives
         | Verb::Blob(BlobVerb::Unpack)
         | Verb::Roll { .. }
+        | Verb::Fork(ForkVerb::New { .. })
         | Verb::Wallet(_)
         | Verb::Machine(_) => unreachable!("handled before the client is built"),
     }

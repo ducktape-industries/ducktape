@@ -257,7 +257,23 @@ pub struct Sent<'a> {
 
 impl Sent<'_> {
     pub async fn land(&self, client: &Client, frame: &Frame) -> Result<Value, String> {
-        let (height, receipt) = match client.land(frame).await {
+        self.landed(frame, client.land(frame).await)
+    }
+
+    pub async fn land_played(&self, client: &Client, body: &node::Body) -> Result<Value, String> {
+        let frame = Frame {
+            body: body.clone(),
+            proof: Vec::new(),
+        };
+        self.landed(&frame, client.land_played(body).await)
+    }
+
+    fn landed(
+        &self,
+        frame: &Frame,
+        landed: noded::Result<(u64, Receipt)>,
+    ) -> Result<Value, String> {
+        let (height, receipt) = match landed {
             Ok(landed) => landed,
             Err(noded::Error::Unlanded) => {
                 return Err(format!(
@@ -277,7 +293,28 @@ impl Sent<'_> {
         frame: &Frame,
         preconfirm: Preconfirm,
     ) -> Result<Value, String> {
-        match client.submit(frame.encode(), preconfirm).await.sentence()? {
+        self.submitted(frame, client.submit(frame.encode(), preconfirm).await)
+    }
+
+    pub async fn play(
+        &self,
+        client: &Client,
+        body: &node::Body,
+        preconfirm: Preconfirm,
+    ) -> Result<Value, String> {
+        let frame = Frame {
+            body: body.clone(),
+            proof: Vec::new(),
+        };
+        self.submitted(&frame, client.play(body.clone(), preconfirm).await)
+    }
+
+    fn submitted(
+        &self,
+        frame: &Frame,
+        submitted: noded::Result<Submitted>,
+    ) -> Result<Value, String> {
+        match submitted.sentence()? {
             Submitted::Pooled => {
                 let id = hex::encode(frame.body.submission().id());
                 Ok(json!({ "pooled": id }))

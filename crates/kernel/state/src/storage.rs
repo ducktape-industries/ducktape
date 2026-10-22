@@ -162,6 +162,14 @@ impl Storage {
         Ok(self.db().flush()?)
     }
 
+    pub fn fork_to(&self, dest: &Path, name: &str) -> Result<()> {
+        let forked = self.db().fork(name)?;
+        let restored = fluent31::restore_to(&forked.path, dest, Some(name));
+        let deleted = self.db().delete_fork(name);
+        restored?;
+        Ok(deleted?)
+    }
+
     pub fn clear_pending(&self) -> Result<()> {
         let mut batch = WriteBatch::new();
         batch.delete(PENDING);
