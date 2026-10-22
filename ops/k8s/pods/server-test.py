@@ -3468,7 +3468,8 @@ class Shots(unittest.TestCase):
         self.assertEqual(self.signer.puts, [([b"abcd", b"ef", b"xy"], "chunk")])
         self.assertEqual(self.sent("files"), [self.written()])
         (posted,) = self.sent("chat")
-        self.assertIn("r1 ended: shot exit 0 (programs abc, slot quick) \u00b7 shots written: 2 files under /shared/jobs/J-1/shots at block 960".encode(), posted)
+        detail = "r1 ended: shot exit 0 (programs abc, slot quick) \u00b7 shots written: 2 files under /shared/jobs/J-1/shots at block 960"
+        self.assertIn(server.u8(server.STATUSES["passed"]) + server.borsh_text(detail), posted)
 
     def test_a_line_heard_again_writes_nothing_again(self):
         self.logged(SHOT + SHOT_END)
@@ -3502,13 +3503,14 @@ class Shots(unittest.TestCase):
         (posted,) = self.sent("chat")
         self.assertIn(b"shots not written: /w/runs/r1/shots.tar was not read from pod duckpond-41: No such file", posted)
 
-    def test_files_refusing_the_commit_is_final_and_the_end_says_its_reason(self):
+    def test_files_refusing_the_commit_is_final_and_the_end_fails_saying_its_reason(self):
         self.signer.submitted = [ran(POOLED + b"landed 960 rejected unauthorized: /shared/jobs is written by its write list only\n"), ran(POOLED + b"landed 961 applied 00ff\n")]
         self.logged(SHOT + SHOT_END)
         self.seen()
         self.assertEqual(self.sent("files"), [self.written()])
         (posted,) = self.sent("chat")
-        self.assertIn(b"shots not written: unauthorized: /shared/jobs is written by its write list only", posted)
+        detail = "r1 ended: shot exit 0 (programs abc, slot quick) \u00b7 shots not written: unauthorized: /shared/jobs is written by its write list only"
+        self.assertIn(server.u8(server.STATUSES["failed"]) + server.borsh_text(detail), posted)
 
     def test_a_commit_the_node_does_not_answer_is_made_again(self):
         self.signer.submitted = [ran(code=1, err="ducktape: the node failed (502): bad gateway"), ran(POOLED + b"landed 961 applied 00ff\n")]
@@ -3628,7 +3630,7 @@ class Posts(unittest.TestCase):
         self.assertEqual(self.notifier.each("desktop", None, [("j-1", text, None)], unvouched=True), 0)
         self.assertEqual(self.signer.submits, [])
 
-    def test_a_lines_status_is_its_runs_exit_and_a_lost_run_fails(self):
+    def test_a_lines_status_is_its_runs_exit_and_a_lost_run_or_unwritten_shots_fail(self):
         cases = {
             "20261019-1 ended: exit 0, GATES ok": "passed",
             "20261019-1 ended: exit 1, GATES FAIL: test": "failed",
@@ -3637,6 +3639,8 @@ class Posts(unittest.TestCase):
             "20261019-1 ended: sh exit 1 (core c293b001070e, slot 2)": "failed",
             "20261019-1 ended: shot exit 0 (programs 6064e86c9aa5, slot shot)": "passed",
             "20261019-1 ended: shot exit 1 (programs 6064e86c9aa5, slot shot)": "failed",
+            "20261019-1 ended: shot exit 0 (programs 6064e86c9aa5, slot shot) \u00b7 shots written: 2 files under /shared/j/shots at block 960": "passed",
+            "20261019-1 ended: shot exit 0 (programs 6064e86c9aa5, slot shot) \u00b7 shots not written: unauthorized: /shared/j is written by its write list only": "failed",
             "run 20261019-1 lost with pod duckpond-41: it ended before the run did": "failed",
             "relay this": "note",
         }

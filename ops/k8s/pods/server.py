@@ -557,6 +557,7 @@ STATUSES = {"note": 0, "running": 1, "passed": 2, "failed": 3}
 RUN_ENDED = re.compile(r"\bended: (?:sh |shot )?exit (\d+)")
 RUN_LOST = " lost with pod "
 RUN_NAMED = re.compile(rf"(?:run )?(\S+)(?: ended: |{RUN_LOST})")
+SHOTS_UNWRITTEN = "shots not written"
 
 
 def concerning(account):
@@ -580,7 +581,7 @@ def notice_message(channel, message_id, thread, said):
 def line_status(text):
     ended = RUN_ENDED.search(text)
     if ended is not None:
-        return "passed" if ended.group(1) == "0" else "failed"
+        return "passed" if ended.group(1) == "0" and f" \u00b7 {SHOTS_UNWRITTEN}: " not in text else "failed"
     return "failed" if RUN_LOST in text else "note"
 
 
@@ -3150,7 +3151,7 @@ class Notifier:
             outcome = self.filed_outcome(name, said)
         except Refused as refused:
             say("pods_unfiled", run=json.dumps(f"{name}:{said['run']}"), reason="refused", detail=json.dumps(refused.sentence))
-            outcome = f"shots not written: {refused.sentence}"
+            outcome = f"{SHOTS_UNWRITTEN}: {refused.sentence}"
         with self.lock:
             self.filed.setdefault(name, set()).add(key)
             self.shots.setdefault(name, {})[said["run"]] = outcome
@@ -3158,7 +3159,7 @@ class Notifier:
     def filed_outcome(self, name, said):
         if not self.signer.held():
             say("pods_unfiled", run=json.dumps(f"{name}:{said['run']}"), reason="no_key")
-            return "shots not written: no_key"
+            return f"{SHOTS_UNWRITTEN}: no_key"
         items = shot_files(self.fetched(name, said["tar"]), said["to"])
         pause = self.retry_pause
         attempts = 0
@@ -3209,7 +3210,7 @@ class Notifier:
             if outcome in ("unknown", "unlanded") or (outcome == "failed" and unanswered(sentence)):
                 raise Unanswered(sentence)
             say("pods_unfiled", run=json.dumps(f"{name}:{said['run']}"), reason=reason or outcome, detail=json.dumps(sentence))
-            return f"shots not written: {reason or outcome}: {sentence}"
+            return f"{SHOTS_UNWRITTEN}: {reason or outcome}: {sentence}"
 
     def filed_before(self, name, logged, passed):
         notified = 0

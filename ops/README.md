@@ -621,7 +621,8 @@ one up for another network.
   one commit with no call per file. It retries as a report does (a node
   that doesn't answer, a head files moved under it), and that run's end
   notice then ends with ` · shots written: <n> files under <folder> at block
-  <h>`, or ` · shots not written: <why>`. A line is written once per pod;
+  <h>`, or ` · shots not written: <why>`, and then the notice reads failed
+  whatever the run's exit. A line is written once per pod;
   before the service follows a log, the files lines ahead of the newest end
   notice chat holds count as written. It writes what `pods/NAME/file` would
   (any caller may ask that of any pod), so it gives no new power.
