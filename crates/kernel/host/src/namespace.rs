@@ -34,7 +34,7 @@ const LAYOUT_FROM: [(&[u8], Option<u64>); 2] =
 const READS_FROM: [(&[u8], Option<u64>); 2] =
     [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
 const MEASURED_DEPTH_FROM: [(&[u8], Option<u64>); 2] =
-    [(b"duckpond", Some(600000)), (b"sealpond", UNANNOUNCED)];
+    [(b"duckpond", Some(700000)), (b"sealpond", UNANNOUNCED)];
 const HEIGHT_BYTES: usize = size_of::<u64>();
 const ID_BYTES: usize = size_of::<SubmissionId>();
 
