@@ -36,7 +36,7 @@ fn member(context: &runtime::Context, seed: u64) -> (Arc<Halo>, Seat) {
     }]);
     let seat = Seat {
         key,
-        halo: format!("localhost:{}", halo.udp().unwrap().port()),
+        halo: Some(format!("localhost:{}", halo.udp().unwrap().port())),
         https: None,
         validator: true,
     };

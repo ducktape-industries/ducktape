@@ -975,7 +975,11 @@ async fn halo_seats<E: Context>(node: &Node<E>, network: &Network) -> Result<Vec
             "the validators program answered Members with another reply".into(),
         ));
     };
-    Ok(seats(&members, &validators))
+    let asked = abi::encode(&validators::Query::HaloCleared);
+    let cleared = node
+        .query(Layer::Confirmed, abi::Origin::System, &role, asked)
+        .await?;
+    Ok(seats(&members, &validators, &halo_cleared(cleared)?))
 }
 
 /// The lanes the halo role lists, at the confirmed tip.
@@ -1080,15 +1084,16 @@ async fn reseat_halo<E: Context>(daemon: &Daemon<E>, node: &Node<E>, height: u64
     daemon.reseating.pass(height).await;
 }
 
-pub fn seats(members: &[Member], validators: &[Vec<u8>]) -> Vec<Seat> {
+pub fn seats(members: &[Member], validators: &[Vec<u8>], cleared: &[Vec<u8>]) -> Vec<Seat> {
     members
         .iter()
         .filter_map(|member| {
             let key = PublicKey::decode(member.key.as_slice()).ok()?;
             let validator = validators.contains(&member.key);
+            let dialed_directly = !cleared.contains(&member.key);
             Some(Seat {
                 key,
-                halo: member.halo.clone(),
+                halo: dialed_directly.then(|| member.halo.clone()),
                 https: relay_address(member.address.as_deref()),
                 validator,
             })
@@ -1100,6 +1105,37 @@ fn relay_address(address: Option<&str>) -> Option<String> {
     let endpoint: Endpoint = address?.parse().ok()?;
     let web = matches!(endpoint.scheme, Scheme::Ws | Scheme::Wss);
     web.then(|| endpoint.to_string())
+}
+
+/// The members the validators program says have no direct halo address, from its answer to
+/// `HaloCleared`.
+pub fn halo_cleared(answer: std::result::Result<Vec<u8>, abi::Refusal>) -> Result<Vec<Vec<u8>>> {
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(refusal) => return halo_cleared_refused(refusal),
+    };
+    let validators::Reply::HaloCleared(cleared) = abi::decode(&answer).map_err(|refusal| {
+        Error::Corrupt(format!(
+            "the HaloCleared answer does not decode: {}",
+            refusal.sentence
+        ))
+    })?
+    else {
+        return Err(Error::Corrupt(
+            "the validators program answered HaloCleared with another reply".into(),
+        ));
+    };
+    Ok(cleared)
+}
+
+fn halo_cleared_refused(refusal: abi::Refusal) -> Result<Vec<Vec<u8>>> {
+    let valset_predates_the_query = refusal.reason == abi::reason::INVALID_INPUT;
+    match valset_predates_the_query {
+        true => Ok(Vec::new()),
+        false => Err(Error::Corrupt(format!(
+            "the validators program refused HaloCleared: {refusal}"
+        ))),
+    }
 }
 
 /// Every recorded epoch's validator keys: the sets the roster verifies
@@ -1960,9 +1996,48 @@ mod tests {
 
     use abi::Outcome;
 
+    use abi::role::validators::{self, Member};
+    use commonware_cryptography::Signer as _;
+    use commonware_cryptography::ed25519::PrivateKey;
+
     use super::{
-        Event, Phases, Slowest, listing, next, relay_address, rewrites, slow_of, slowest_of,
+        Event, Phases, Slowest, halo_cleared, listing, next, relay_address, rewrites, seats,
+        slow_of, slowest_of,
     };
+
+    #[test]
+    fn a_member_that_cleared_its_halo_address_is_seated_with_none() {
+        let member = |seed: u64| Member {
+            key: PrivateKey::from_seed(seed).public_key().as_ref().to_vec(),
+            address: None,
+            halo: format!("member-{seed}.example:9100"),
+        };
+        let members = [member(1), member(2)];
+        let cleared = [members[1].key.clone()];
+        let seated = seats(&members, &[], &cleared);
+        assert_eq!(seated[0].halo.as_deref(), Some("member-1.example:9100"));
+        assert_eq!(seated[1].halo, None);
+        assert!(
+            seats(&members, &[], &[])
+                .iter()
+                .all(|seat| seat.halo.is_some())
+        );
+    }
+
+    #[test]
+    fn a_validators_program_that_predates_halo_cleared_clears_no_one() {
+        let answered = abi::encode(&validators::Reply::HaloCleared(vec![vec![7]]));
+        assert_eq!(halo_cleared(Ok(answered)).unwrap(), vec![vec![7]]);
+        let undecoded = abi::Refusal::new(
+            abi::reason::INVALID_INPUT,
+            "valset: Query did not decode: Unexpected variant tag: 7",
+        );
+        assert_eq!(halo_cleared(Err(undecoded)).unwrap(), Vec::<Vec<u8>>::new());
+        let other = abi::Refusal::new(abi::reason::NOT_FOUND, "no such program");
+        assert!(halo_cleared(Err(other)).is_err());
+        let wrong = abi::encode(&validators::Reply::Members(Vec::new()));
+        assert!(halo_cleared(Ok(wrong)).is_err());
+    }
 
     #[test]
     fn a_member_is_relayed_through_its_address_only_when_that_is_a_websocket() {

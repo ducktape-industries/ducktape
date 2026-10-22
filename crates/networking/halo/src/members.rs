@@ -1,5 +1,5 @@
 //! The current member set halo admits and dials: each member's key, the halo address it
-//! registered on the chain, the HTTPS address it serves if any, and whether it votes.
+//! registered on the chain if it has one, the HTTPS address it serves if any, and whether it votes.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -9,7 +9,7 @@ use commonware_cryptography::ed25519::PublicKey;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seat {
     pub key: PublicKey,
-    pub halo: String,
+    pub halo: Option<String>,
     pub https: Option<String>,
     pub validator: bool,
 }
@@ -52,7 +52,7 @@ impl Members {
     }
 
     pub fn halo(&self, key: &PublicKey) -> Option<String> {
-        Some(self.read().get(key)?.halo.clone())
+        self.read().get(key)?.halo.clone()
     }
 
     pub fn https(&self, key: &PublicKey) -> Option<String> {
@@ -113,7 +113,7 @@ mod tests {
     fn seat(seed: u64, validator: bool) -> Seat {
         Seat {
             key: key(seed),
-            halo: format!("localhost:{seed}"),
+            halo: Some(format!("localhost:{seed}")),
             https: None,
             validator,
         }
@@ -128,7 +128,7 @@ mod tests {
         all.sort();
         assert_eq!(first, all);
         let moved = Seat {
-            halo: "elsewhere.example.org:9".into(),
+            halo: Some("elsewhere.example.org:9".into()),
             ..seat(1, true)
         };
         let mut changed = members.seat([seat(0, true), moved, seat(2, true), seat(3, false)]);
@@ -186,5 +186,18 @@ mod tests {
         assert_eq!(members.https_asked(&key(2)), expected);
         let unserved: Vec<String> = members.https_asked(&key(3));
         assert_eq!(unserved.len(), 3);
+    }
+
+    #[test]
+    fn a_member_seated_with_no_halo_address_is_admitted_and_names_none() {
+        let members = Members::default();
+        let unaddressed = Seat {
+            halo: None,
+            ..seat(1, true)
+        };
+        members.seat([seat(0, true), unaddressed]);
+        assert!(members.admits(&key(1)));
+        assert_eq!(members.halo(&key(1)), None);
+        assert_eq!(members.halo(&key(0)).as_deref(), Some("localhost:0"));
     }
 }

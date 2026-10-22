@@ -20,7 +20,7 @@ fn a_node_reaches_itself_at_the_halo_address_it_registered() {
         let at = format!("localhost:{}", halo.udp().unwrap().port());
         halo.seat([Seat {
             key,
-            halo: at.clone(),
+            halo: Some(at.clone()),
             https: None,
             validator: true,
         }]);

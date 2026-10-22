@@ -235,6 +235,44 @@ fn a_node_reports_whether_it_reaches_itself_at_its_registered_halo_address() {
 }
 
 #[test]
+fn a_node_that_clears_its_halo_address_dials_itself_no_more_and_says_so() {
+    apart!();
+    let root = tempfile::tempdir().unwrap();
+    let clearing = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&clearing], EPOCH_LENGTH);
+    clearing.init(&founding);
+    let live = vec![clearing.start()];
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let client = &live[0].client;
+        let at = clearing.halo_address();
+        let reached = noded::wire::HaloSelf::Reached { at: at.clone() };
+        assert_eq!(dialed_self(client).await, reached);
+        membership(client, &clearing.identity, Op::ClearHalo).await;
+        let mut blocks = client.changes(host::RECENT).await.unwrap();
+        loop {
+            let reach = client.halo_self().await.unwrap();
+            let dialing = matches!(reach, noded::wire::HaloSelf::Dialing { .. });
+            let moved = reach != reached && !dialing;
+            if moved {
+                assert_eq!(reach, noded::wire::HaloSelf::Unaddressed);
+                break;
+            }
+            blocks.next().await.unwrap().unwrap();
+        }
+        let lines = live[0].client.logs().await.unwrap();
+        let named = format!("at={at}");
+        let dials = lines
+            .iter()
+            .filter(|line| line.contains("halo_reached") || line.contains("halo_unreachable"))
+            .filter(|line| line.split_whitespace().any(|word| word == named))
+            .count();
+        assert_eq!(dials, 1, "{lines:?}");
+    });
+    shut_down(&runtime, &[&clearing], live);
+}
+
+#[test]
 fn a_put_through_a_member_no_one_can_dial_is_gathered_over_the_connections_it_dials_and_held() {
     apart!();
     let root = tempfile::tempdir().unwrap();

@@ -5,6 +5,7 @@
 pub const VALIDATORS: &[u8] = b"validators";
 pub const RESIDENTS: &[u8] = b"residents";
 pub const QUERIES: &[u8] = b"queries";
+pub const HALOLESS: &[u8] = b"haloless";
 
 #[cfg(target_arch = "wasm32")]
 mod program {
@@ -15,7 +16,7 @@ mod program {
     use abi::{Env, Origin, Refusal, reason};
     use program::{Execute, Program, Query, Reads};
 
-    use crate::{QUERIES, RESIDENTS, VALIDATORS};
+    use crate::{HALOLESS, QUERIES, RESIDENTS, VALIDATORS};
 
     struct Valset;
 
@@ -23,6 +24,7 @@ mod program {
         validators: Vec<Member>,
         residents: Vec<Member>,
         queries: QueryPolicy,
+        haloless: Vec<Vec<u8>>,
     }
 
     impl Roster {
@@ -35,6 +37,7 @@ mod program {
                 validators: list(VALIDATORS)?,
                 residents: list(RESIDENTS)?,
                 queries: policy(ctx)?,
+                haloless: haloless(ctx)?,
             })
         }
 
@@ -42,6 +45,7 @@ mod program {
             ctx.set(VALIDATORS, abi::encode(&self.validators));
             ctx.set(RESIDENTS, abi::encode(&self.residents));
             ctx.set(QUERIES, abi::encode(&self.queries));
+            ctx.set(HALOLESS, abi::encode(&self.haloless));
         }
 
         fn take(&mut self, key: &[u8]) -> Option<Member> {
@@ -53,6 +57,7 @@ mod program {
         }
 
         fn enroll(&mut self, key: Vec<u8>, address: Option<String>, halo: String) {
+            self.haloless.retain(|held| *held != key);
             match self.member(&key) {
                 Some(member) => {
                     member.address = address;
@@ -81,6 +86,7 @@ mod program {
                 }
                 Motion::Remove { key } => {
                     self.take(&key).ok_or_else(not_a_member)?;
+                    self.haloless.retain(|held| *held != key);
                 }
                 Motion::Role { role, op } => return Ok(Some(Forwarded { role, op })),
                 Motion::Queries { policy } => self.queries = policy,
@@ -92,6 +98,13 @@ mod program {
                 }
             }
             Ok(None)
+        }
+    }
+
+    fn haloless(ctx: &impl Reads) -> Result<Vec<Vec<u8>>, Refusal> {
+        match ctx.get(HALOLESS) {
+            Some(bytes) => abi::decode(&bytes),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -140,9 +153,18 @@ mod program {
                 Op::SetHalo { halo } => {
                     let member = roster.member(signer).ok_or_else(not_a_member)?;
                     member.halo = halo;
+                    roster.haloless.retain(|held| held != signer);
                 }
                 Op::Leave => {
                     roster.take(signer).ok_or_else(not_a_member)?;
+                    roster.haloless.retain(|held| held != signer);
+                }
+                Op::ClearHalo => {
+                    roster.member(signer).ok_or_else(not_a_member)?;
+                    let cleared = roster.haloless.contains(signer);
+                    if !cleared {
+                        roster.haloless.push(signer.clone());
+                    }
                 }
                 Op::Vote(motion) => {
                     if let Some(Forwarded { role, op }) = roster.enact(motion)? {
@@ -175,6 +197,7 @@ mod program {
                 ),
                 Ask::Members => Reply::Members([roster.validators, roster.residents].concat()),
                 Ask::QueryPolicy => Reply::QueryPolicy(roster.queries),
+                Ask::HaloCleared => Reply::HaloCleared(roster.haloless),
             };
             ctx.respond(abi::encode(&reply));
             Ok(())

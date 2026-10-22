@@ -367,6 +367,18 @@ pub async fn seating(client: &Client, key: &PrivateKey, status: &Status) -> Resu
             "the validators program answered Validators with another reply".into(),
         ));
     };
+    let cleared = client
+        .query(
+            Layer::Confirmed,
+            ask(&valset, abi::encode(&validators::Query::HaloCleared)),
+        )
+        .await;
+    let cleared = match cleared {
+        Ok(answer) => Ok(answer),
+        Err(Error::Refused(refusal)) => Err(refusal),
+        Err(error) => return Err(error),
+    };
+    let cleared = crate::run::halo_cleared(cleared)?;
     let halo = named(role::HALO)?;
     let lanes = client
         .query(
@@ -380,7 +392,7 @@ pub async fn seating(client: &Client, key: &PrivateKey, status: &Status) -> Resu
         ));
     };
     Ok(Seating {
-        seats: crate::run::seats(&members, &validators),
+        seats: crate::run::seats(&members, &validators, &cleared),
         lanes,
     })
 }

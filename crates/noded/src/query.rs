@@ -110,7 +110,9 @@ async fn query_policy<E: Context>(
         .map_err(unanswered)
         .and_then(|bytes| match abi::decode(&bytes)? {
             validators::Reply::QueryPolicy(policy) => Ok(policy),
-            validators::Reply::Validators(_) | validators::Reply::Members(_) => Err(Refusal::new(
+            validators::Reply::Validators(_)
+            | validators::Reply::Members(_)
+            | validators::Reply::HaloCleared(_) => Err(Refusal::new(
                 reason::INVALID_INPUT,
                 "the validators program answered QueryPolicy with another reply",
             )),

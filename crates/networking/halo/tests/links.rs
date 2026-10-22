@@ -52,7 +52,7 @@ fn node(context: &Context, seed: u64, egress: Option<u64>) -> Node {
     halo.plane().lanes(table());
     let seat = Seat {
         key: key.clone(),
-        halo: format!("localhost:{}", halo.udp().unwrap().port()),
+        halo: Some(format!("localhost:{}", halo.udp().unwrap().port())),
         https: None,
         validator: true,
     };
@@ -144,7 +144,7 @@ fn a_member_no_one_can_reach_takes_part_by_dialing_out() {
     runtime::Runner::default().start(|context| async move {
         let open = node(&context.child("open"), 1, None);
         let mut hidden = node(&context.child("hidden"), 2, None);
-        hidden.seat.halo = unheard();
+        hidden.seat.halo = Some(unheard());
         seat_all(&[&open, &hidden], &[]);
         serve_echo(&open);
         serve_echo(&hidden);
@@ -161,7 +161,7 @@ fn a_member_no_one_can_reach_is_reached_over_the_connections_it_dials_when_seate
         let first = node(&context.child("first"), 1, None);
         let second = node(&context.child("second"), 2, None);
         let mut hidden = node(&context.child("hidden"), 3, None);
-        hidden.seat.halo = unheard();
+        hidden.seat.halo = Some(unheard());
         seat_all(&[&first, &second, &hidden], &[]);
         serve_echo(&hidden);
         first.halo.linked(&hidden.key).await;

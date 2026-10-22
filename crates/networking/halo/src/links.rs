@@ -740,13 +740,15 @@ impl Links {
     ) -> Next {
         changed.borrow_and_update();
         let peer = self.peer(key);
-        let Some(halo) = self.members.halo(key) else {
+        let seated = self.members.admits(key);
+        if !seated {
             peer.unseat();
             for (_, carrying) in self.all() {
                 carrying.post(|outbox| outbox.forget(key));
             }
             return Next::Wait;
-        };
+        }
+        let halo = self.members.halo(key);
         if peer.direct() {
             *tries = 0;
             return Next::Wait;
@@ -774,12 +776,12 @@ impl Links {
                 *tries += 1;
                 let worth_a_line = *tries == 2 || tries.is_multiple_of(10);
                 if worth_a_line {
-                    tracing::debug!(target: "ducktape::halo", peer = %key, at = %halo, attempts = *tries, reason = "undialed", "halo did not reach a member directly; it dials again");
+                    tracing::debug!(target: "ducktape::halo", peer = %key, at = ?halo, attempts = *tries, reason = "undialed", "halo did not reach a member directly; it dials again");
                 }
                 Next::Again
             }
             Attempt::Refused => {
-                tracing::debug!(target: "ducktape::halo", peer = %key, at = %halo, reason = "refused", "halo's dials to a member were refused; it dials again when the member or its address moves");
+                tracing::debug!(target: "ducktape::halo", peer = %key, at = ?halo, reason = "refused", "halo's dials to a member were refused; it dials again when the member or its address moves");
                 Next::Wait
             }
         }

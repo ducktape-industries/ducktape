@@ -168,7 +168,7 @@ impl Node {
     fn seat(&self) -> Seat {
         Seat {
             key: self.key.clone(),
-            halo: format!("localhost:{}", self.halo.udp().unwrap().port()),
+            halo: Some(format!("localhost:{}", self.halo.udp().unwrap().port())),
             https: None,
             validator: true,
         }
@@ -1900,7 +1900,7 @@ fn a_member_that_cannot_be_reached_slows_no_other() {
         let hole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let dead = Seat {
             key: PrivateKey::from_seed(3).public_key(),
-            halo: format!("localhost:{}", hole.local_addr().unwrap().port()),
+            halo: Some(format!("localhost:{}", hole.local_addr().unwrap().port())),
             https: None,
             validator: true,
         };

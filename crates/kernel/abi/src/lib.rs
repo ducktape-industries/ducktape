@@ -710,6 +710,8 @@ pub mod role {
             Validators = 0,
             Members = 1,
             QueryPolicy = 6,
+            /// The keys of the members that have no direct halo address.
+            HaloCleared = 7,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -719,6 +721,7 @@ pub mod role {
             Validators(Vec<Vec<u8>>) = 0,
             Members(Vec<Member>) = 1,
             QueryPolicy(QueryPolicy) = 6,
+            HaloCleared(Vec<Vec<u8>>) = 7,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -744,6 +747,8 @@ pub mod role {
             SetHalo {
                 halo: String,
             },
+            /// The member has no direct halo address: members reach it relayed or punched through.
+            ClearHalo,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]

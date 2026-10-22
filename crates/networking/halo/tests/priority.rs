@@ -23,7 +23,7 @@ async fn fetch_beside_bulk(budget: u64, bulk: Class, bulk_bytes: u64, fetch: Cla
     let members = Arc::new(Members::default());
     members.seat([server.clone(), client.clone()].map(|key| Seat {
         key,
-        halo: "localhost:1".into(),
+        halo: Some("localhost:1".into()),
         https: None,
         validator: true,
     }));

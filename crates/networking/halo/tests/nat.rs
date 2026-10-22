@@ -1,6 +1,7 @@
 // Members behind simulated NATs: a box punches through to a node it first reaches over the node's
 // https, and the relay closes with the streams on it; two nodes and two boxes punch through, even
-// when the relay drops what it carried; behind a symmetric router the relayed link carries it all.
+// when the relay drops what it carried, and to a node seated with no halo address; behind a
+// symmetric router the relayed link carries it all.
 
 use std::collections::HashMap;
 use std::io;
@@ -168,10 +169,10 @@ fn member(
 }
 
 fn seat(members: &[&Member]) {
-    seat_with(members, |_| NOWHERE.into());
+    seat_with(members, |_| Some(NOWHERE.into()));
 }
 
-fn seat_with(members: &[&Member], halo: impl Fn(&Member) -> String) {
+fn seat_with(members: &[&Member], halo: impl Fn(&Member) -> Option<String>) {
     let seats: Vec<Seat> = members
         .iter()
         .map(|member| Seat {
@@ -383,8 +384,8 @@ fn two_boxes_meet_when_the_relay_that_carried_their_introductions_drops_them_and
         let node_at = node.at.to_string();
         seat_with(&[&node, &one, &two], |member| {
             match member.key == node.key {
-                true => node_at.clone(),
-                false => NOWHERE.into(),
+                true => Some(node_at.clone()),
+                false => Some(NOWHERE.into()),
             }
         });
         one.halo.direct(&node.key).await;
@@ -393,6 +394,29 @@ fn two_boxes_meet_when_the_relay_that_carried_their_introductions_drops_them_and
         two.halo.direct(&one.key).await;
         assert_eq!(pulled(&one, &two.key).await, PULLED);
         assert_eq!(one.halo.path(&two.key), Some(Path::Direct));
+    });
+}
+
+#[test]
+fn a_box_reaches_a_node_seated_with_no_halo_address_over_its_https_then_punches_through() {
+    runtime::Runner::default().start(|context| async move {
+        let web = Web::new();
+        let node = member(
+            &context.child("node"),
+            1,
+            Kind::Cone,
+            NODE,
+            Some("wss://node.test"),
+            &web,
+        );
+        let boxed = member(&context.child("box"), 2, Kind::Cone, BOX, None, &web);
+        seat_with(&[&node, &boxed], |_| None);
+        boxed.halo.direct(&node.key).await;
+        node.halo.direct(&boxed.key).await;
+        unrelayed(&boxed, &node.key).await;
+        assert_eq!(pulled(&boxed, &node.key).await, PULLED);
+        assert_eq!(pulled(&node, &boxed.key).await, PULLED);
+        assert_eq!(boxed.halo.path(&node.key), Some(Path::Direct));
     });
 }
 

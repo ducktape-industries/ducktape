@@ -12,7 +12,7 @@ fn members(keys: &[PublicKey]) -> Arc<Members> {
     let members = Arc::new(Members::default());
     members.seat(keys.iter().map(|key| Seat {
         key: key.clone(),
-        halo: "localhost:1".into(),
+        halo: Some("localhost:1".into()),
         https: None,
         validator: true,
     }));

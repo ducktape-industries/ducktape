@@ -25,7 +25,7 @@ fn pair() -> Pair {
     let members = Arc::new(Members::default());
     members.seat([server.clone(), client.clone()].map(|key| Seat {
         key,
-        halo: "localhost:1".into(),
+        halo: Some("localhost:1".into()),
         https: None,
         validator: true,
     }));

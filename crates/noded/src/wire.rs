@@ -314,9 +314,18 @@ pub struct PeerStatus {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum HaloSelf {
     Unregistered,
-    Dialing { at: String },
-    Reached { at: String },
-    Unreachable { at: String, reason: String },
+    Dialing {
+        at: String,
+    },
+    Reached {
+        at: String,
+    },
+    Unreachable {
+        at: String,
+        reason: String,
+    },
+    /// The node is seated with no direct halo address, so it dials none.
+    Unaddressed,
 }
 
 pub mod activity {
