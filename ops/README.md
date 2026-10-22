@@ -1165,7 +1165,12 @@ one up for another network.
 - `mac/mac.py` is the Mac's side, kept running by the LaunchAgent
   `mac/com.ducktape.mac.plist`. It needs Python 3.11 or later, Xcode with an
   iOS simulator runtime, XcodeGen, rustup's cargo first on `PATH` (so the
-  app's `rust-toolchain.toml` holds) and Rust's iOS targets. Its work
+  app's `rust-toolchain.toml` holds) and Rust's iOS targets. The app pins
+  its git dependencies by forge URL (`duck://duckpond-725bcad1/forge/<repo>`)
+  and git-remote-duck has no macOS build, so the plist's `GIT_CONFIG_*` env
+  rewrites those URLs to GitHub's mirrors (`url.<github>.insteadOf`), as
+  the app's GitHub workflows do: a Mac build fetches only commits
+  forge-mirror has pushed to GitHub (forge's `dev` and `main`). Its work
   directory (`MAC_HOME`) holds the relay's token (`token`), a bare
   repository per repo filled from the relay's bundles, one cargo target dir
   per repo, and each run's worktree, outputs and `state.json`.

@@ -24,6 +24,20 @@
     <string>@DEVICE@</string>
     <key>CARGO_HOME</key>
     <string>@HOME_DIR@/cargo</string>
+    <key>GIT_CONFIG_COUNT</key>
+    <string>3</string>
+    <key>GIT_CONFIG_KEY_0</key>
+    <string>url.https://github.com/ducktape-industries/ducktape.insteadOf</string>
+    <key>GIT_CONFIG_VALUE_0</key>
+    <string>duck://duckpond-725bcad1/forge/core</string>
+    <key>GIT_CONFIG_KEY_1</key>
+    <string>url.https://github.com/ducktape-industries/programs.insteadOf</string>
+    <key>GIT_CONFIG_VALUE_1</key>
+    <string>duck://duckpond-725bcad1/forge/programs</string>
+    <key>GIT_CONFIG_KEY_2</key>
+    <string>url.https://github.com/ducktape-industries/gpui-pre.insteadOf</string>
+    <key>GIT_CONFIG_VALUE_2</key>
+    <string>duck://duckpond-725bcad1/forge/gpui-pre</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
