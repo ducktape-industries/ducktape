@@ -1236,6 +1236,7 @@ mod tests {
         asked: Vec<(http::Method, String, Option<Value>)>,
         answers: VecDeque<Option<Reply>>,
         packs: Vec<(String, String)>,
+        stopper: Option<oneshot::Sender<Ending>>,
     }
 
     impl Fake {
@@ -1244,6 +1245,7 @@ mod tests {
                 asked: Vec::new(),
                 answers: answers.into(),
                 packs: Vec::new(),
+                stopper: None,
             }
         }
 
@@ -1266,7 +1268,12 @@ mod tests {
             self.asked.push((method, target, body));
             match self.answers.pop_front() {
                 Some(Some(reply)) => Ok(reply),
-                Some(None) => std::future::pending().await,
+                Some(None) => {
+                    if let Some(stopper) = self.stopper.take() {
+                        let _ = stopper.send(Ending::Stopped);
+                    }
+                    std::future::pending().await
+                }
                 None => Err("the fake holds no more answers".into()),
             }
         }
@@ -1312,19 +1319,41 @@ mod tests {
         json_reply(200, json!({ "deleted": "duckpond-41" }))
     }
 
-    async fn flowed(
+    struct Woken(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn driven<F: Future>(future: F) -> F::Output {
+        let woken = Arc::new(Woken(std::sync::atomic::AtomicBool::new(false)));
+        let waker = std::task::Waker::from(woken.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+            let woke = woken.0.swap(false, Ordering::SeqCst);
+            assert!(woke, "the flow waits on a call nothing will answer");
+        }
+    }
+
+    fn flowed(
         fake: &mut Fake,
         workload: &Workload,
         stop: oneshot::Receiver<Ending>,
     ) -> (Flowed, Vec<String>) {
         let mut pods = Vec::new();
         let mut started = |pod: &str| pods.push(pod.to_owned());
-        let flowed = flow(fake, workload, 32, stop, &mut started).await;
+        let flowed = driven(flow(fake, workload, 32, stop, &mut started));
         (flowed, pods)
     }
 
-    #[tokio::test]
-    async fn a_pod_is_made_waited_for_its_outputs_put_in_one_bundle_and_deleted() {
+    #[test]
+    fn a_pod_is_made_waited_for_its_outputs_put_in_one_bundle_and_deleted() {
         let manifest = json!({
             "files": [{ "name": "log", "size": 2, "pieces": ["/out/.fleet/pieces/0-0"] }],
             "packs": [],
@@ -1341,7 +1370,7 @@ mod tests {
             deleted(),
         ]);
         let (_stopper, stop) = oneshot::channel();
-        let (flowed, pods) = flowed(&mut fake, &workload(), stop).await;
+        let (flowed, pods) = flowed(&mut fake, &workload(), stop);
         assert_eq!(
             fake.routes(),
             [
@@ -1374,8 +1403,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_wait_cut_before_the_end_reads_the_pod_and_opens_another() {
+    #[test]
+    fn a_wait_cut_before_the_end_reads_the_pod_and_opens_another() {
         let running = json!({ "pod": view(Some(("running", Value::Null)), None) });
         let empty = json!({ "files": [], "packs": [], "refused": [] });
         let mut fake = Fake::answering(vec![
@@ -1392,7 +1421,7 @@ mod tests {
             deleted(),
         ]);
         let (_stopper, stop) = oneshot::channel();
-        let (flowed, _) = flowed(&mut fake, &workload(), stop).await;
+        let (flowed, _) = flowed(&mut fake, &workload(), stop);
         assert_eq!(
             fake.routes(),
             [
@@ -1410,12 +1439,12 @@ mod tests {
         assert_eq!(state, "failed");
     }
 
-    #[tokio::test]
-    async fn a_stopped_run_deletes_its_pod_and_gathers_nothing() {
+    #[test]
+    fn a_stopped_run_deletes_its_pod_and_gathers_nothing() {
         let mut fake = Fake::answering(vec![created(), None, deleted()]);
         let (stopper, stop) = oneshot::channel();
-        stopper.send(Ending::Stopped).unwrap();
-        let (flowed, _) = flowed(&mut fake, &workload(), stop).await;
+        fake.stopper = Some(stopper);
+        let (flowed, _) = flowed(&mut fake, &workload(), stop);
         assert_eq!(flowed, Flowed::Stopped(Ending::Stopped));
         assert_eq!(
             fake.routes(),
@@ -1427,15 +1456,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_pod_the_service_refuses_is_reported_in_its_words_and_nothing_follows() {
+    #[test]
+    fn a_pod_the_service_refuses_is_reported_in_its_words_and_nothing_follows() {
         let refused = json_reply(
             403,
             json!({ "error": "pods \"duckpond-41\" is forbidden: exceeded quota: hardcap" }),
         );
         let mut fake = Fake::answering(vec![refused]);
         let (_stopper, stop) = oneshot::channel();
-        let (flowed, pods) = flowed(&mut fake, &workload(), stop).await;
+        let (flowed, pods) = flowed(&mut fake, &workload(), stop);
         assert_eq!(
             flowed,
             Flowed::Unmade(
@@ -1447,8 +1476,8 @@ mod tests {
         assert!(pods.is_empty());
     }
 
-    #[tokio::test]
-    async fn a_forge_input_forge_lacks_is_filled_from_its_pack_in_a_second_pod_once() {
+    #[test]
+    fn a_forge_input_forge_lacks_is_filled_from_its_pack_in_a_second_pod_once() {
         let commit = "ab".repeat(20);
         let unfetched = json!({ "line": "pod duckpond-41 ended: fetching its inputs failed, exit code 1", "exit_code": null, "pod": view(None, Some(("terminated", json!(1)))) });
         let empty = json!({ "files": [], "packs": [], "refused": [] });
@@ -1463,7 +1492,7 @@ mod tests {
         ]);
         fake.packs.push(("core".into(), commit.clone()));
         let (_stopper, stop) = oneshot::channel();
-        let (flowed, pods) = flowed(&mut fake, &workload(), stop).await;
+        let (flowed, pods) = flowed(&mut fake, &workload(), stop);
         assert_eq!(pods.len(), 2);
         let again = fake.asked[3].2.clone().unwrap();
         assert_eq!(again["inputs"][0]["forge"]["commit"], "HEAD");
