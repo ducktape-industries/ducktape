@@ -358,6 +358,7 @@ spec:
             - {name: PODS_KEYS, value: /keys}
             - {name: PODS_RUNNERS, value: "desktop=/desktop zk-dev=/runners/zk-dev"}
             - {name: PODS_WARM_POD, value: /shared/tools/warm-pod}
+            - {name: PODS_LANE_FIRST_LIMIT, value: "40"}
           ports:
             - {name: http, containerPort: 8080}
           readinessProbe:

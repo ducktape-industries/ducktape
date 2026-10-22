@@ -4994,6 +4994,16 @@ class Builds(Streamed):
         self.assertEqual(execs[-1], ["exec", "JOB=forge:programs:5", "NOTIFY=forge:programs:5", "programs", COMMIT, "lane"])
         self.assertEqual(([request for program, request in self.signer.queries if program == "egress"], self.signer.senders), ([], []))
 
+    def test_a_lane_the_service_asks_for_states_the_operator_s_first_limit(self):
+        with unittest.mock.patch.object(server, "LANE_FIRST_LIMIT", "40"):
+            command = server.rerun_command({"repo": "programs", "n": 5, "commit": COMMIT})
+        self.assertEqual(command, ["sh", BUILD, "JOB=forge:programs:5", "NOTIFY=forge:programs:5", "FIRST_LIMIT=40", "programs", COMMIT, "lane"])
+
+    def test_a_lane_the_service_asks_for_with_no_first_limit_set_states_none(self):
+        with unittest.mock.patch.object(server, "LANE_FIRST_LIMIT", ""):
+            command = server.rerun_command({"repo": "programs", "n": 5, "commit": COMMIT})
+        self.assertEqual(command, self.rerun())
+
     def test_a_lane_the_service_asks_for_again_while_its_first_run_still_waits_gets_that_run(self):
         self.service.claim = server.Service.claim.__get__(self.service)
         self.service.launched[tuple(server.runner_words(self.rerun(), server.BUILDS))] = ("desktop", "r1")

@@ -282,6 +282,7 @@ RUNNER_NAME = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 AHEAD_PAUSED = re.compile(rb"ahead (heavy|lane|quick|light) paused")
 LANE_PAUSED = re.compile(r"(heavy|lane|quick:\S+) paused")
 BUILD_SH = "/var/tmp/warm/build.sh"
+LANE_FIRST_LIMIT = os.environ.get("PODS_LANE_FIRST_LIMIT", "")
 SETTING = re.compile(r"[A-Z_][A-Za-z0-9_]*=.*", re.S)
 UNPLAIN = frozenset("$`;|&<>()*?[~#\n")
 RUNNER_DOWN = 69
@@ -1983,7 +1984,8 @@ def rerun_key(repo, commit):
 
 def rerun_command(row):
     room = f"forge:{row['repo']}:{row['n']}"
-    return ["sh", BUILD_SH, f"JOB={room}", f"NOTIFY={room}", row["repo"], row["commit"], "lane"]
+    first_limit = [f"FIRST_LIMIT={LANE_FIRST_LIMIT}"] if LANE_FIRST_LIMIT else []
+    return ["sh", BUILD_SH, f"JOB={room}", f"NOTIFY={room}", *first_limit, row["repo"], row["commit"], "lane"]
 
 
 def wanted_at(line):

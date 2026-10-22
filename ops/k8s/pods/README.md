@@ -78,7 +78,7 @@ or through a member node's halo forward.
   `OfKey`), follows `ducktape changes forge-reach`, and reads `Wanted` page by page as it
   starts and on each block that changes a `w/` row. For each `build.sh#lane` row it first keeps
   `rerun-<sha256(repo, commit)>` in the ConfigMap `runs`, then calls build.sh
-  `JOB=forge:<repo>:<n> NOTIFY=forge:<repo>:<n> <repo> <commit> lane` as a `builds` call goes
+  `JOB=forge:<repo>:<n> NOTIFY=forge:<repo>:<n> [FIRST_LIMIT=<minutes>] <repo> <commit> lane` as a `builds` call goes
   (with no request behind it), and records the run, or why none started, under the key. A
   restart never starts a second lane for a Preview it kept, a key whose row is gone is dropped,
   and the lane's report reaches forge-reach as any lane's does.
@@ -138,6 +138,12 @@ or through a member node's halo forward.
   doesn't answer.
 - **Optional: the warm pod for `builds`.** `PODS_WARM_POD`, a files path whose one line names
   the warm pod `builds` falls back to. Unset, `builds` answers 503 when no runner is free.
+- **The lane's first bound.** `PODS_LANE_FIRST_LIMIT`, whole minutes, which each lane the service
+  starts states as `FIRST_LIMIT=`: build.sh bounds a run by twice the longest green run of its
+  kind on that machine, and a machine with none yet (a new warm pod) refuses a call that states
+  no bound. duckpond's is 40: twice the longest green lane measured, 1183 s of gates (programs,
+  desktop run 20261022-080840-1474062; the warm pod's longest was 1146 s). Unset, the service's
+  lanes state none.
 - **Optional: the build runners.** `PODS_RUNNERS`, `<name>=<keys path>` words in tie order
   (`desktop=/desktop` when unset), each keys path a mounted Secret (files `id_ed25519`,
   `id_ed25519.pub`, `known_hosts`, `user`, and `hosts` or `forward`, optionally `kinds`):
