@@ -149,6 +149,7 @@ class Kube:
         self.follows = []
         self.logs_of = {}
         self.kept = {}
+        self.processes = []
 
     def answer(self, verb, *answers):
         self.answers[verb] = list(answers)
@@ -182,6 +183,11 @@ class Kube:
 
     def keep(self, name, container, path, data):
         return self.ran("keep", name, container, path, data)
+
+    def exec_process(self, name, container, command):
+        process = ExecProcess(self.ran("exec", name, container, command), self.gate is not None)
+        self.processes.append(process)
+        return process
 
     def annotate(self, name, key, value):
         return self.ran("annotate", name, key, value)
@@ -248,6 +254,31 @@ class Log:
 
     def wait(self):
         return 0
+
+
+class ExecProcess:
+    def __init__(self, answer, held):
+        self.answer = answer
+        self.killed = False
+        self.returncode = None
+        self.ended = threading.Event()
+        if not held:
+            self.ended.set()
+
+    def communicate(self):
+        self.ended.wait()
+        if self.killed:
+            self.returncode = -9
+            return b"", b""
+        self.returncode = self.answer.code
+        return self.answer.out, self.answer.err.encode()
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.ended.set()
 
 
 class Watch:
@@ -594,6 +625,7 @@ class Wait(Streamed):
             kind, data = self.event(response)
             self.assertEqual(kind, "alive")
             if data not in ({}, *said[-1:]):
+                self.assertEqual(data, [first, second, unread][len(said)])
                 said.append(data)
         self.assertEqual(said, [first, second, unread])
         watch.send("MODIFIED", pod_json(state=ENDED, phase="Succeeded"))
@@ -617,6 +649,7 @@ class Wait(Streamed):
         watch.send("MODIFIED", pod_json(state=ENDED, phase="Succeeded"))
         kind, data = self.past_alive(response)
         self.assertEqual((kind, data["exit_code"]), ("ended", 0))
+        self.assertEqual([process.killed for process in self.kube.processes], [True], "the one read in flight ends with its wait")
 
     def test_a_deleted_pod_ends_the_wait_with_a_line_saying_so(self):
         self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running")))

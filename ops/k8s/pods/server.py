@@ -918,6 +918,10 @@ class Kube:
         argv = self.argv("get", "pods", "--selector", "=".join(MANAGED), "--watch", "--output-watch-events", "--output", "json")
         return popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    def exec_process(self, name, container, command):
+        argv = self.argv("exec", name, "--container", container, "--", *command)
+        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def watch_pod(self, name):
         argv = self.argv("get", "pod", name, "--watch", "--output-watch-events", "--output", "json")
         return popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2461,6 +2465,8 @@ class LogReads:
         self.lock = threading.Lock()
         self.latest = {}
         self.reading = False
+        self.process = None
+        self.stopped = False
         self.said()
 
     def said(self):
@@ -2472,9 +2478,24 @@ class LogReads:
         return latest
 
     def reread(self):
-        answer = self.read()
+        answer = self.read(self.held)
         with self.lock:
-            self.latest, self.reading = answer, False
+            self.latest, self.reading, self.process = answer, False, None
+
+    def held(self, process):
+        with self.lock:
+            self.process = process
+            stopped = self.stopped
+        if stopped:
+            process.kill()
+        return process
+
+    def stop(self):
+        with self.lock:
+            self.stopped = True
+            process = self.process
+        if process is not None and process.poll() is None:
+            process.kill()
 
 
 def relay(process, events):
@@ -4877,7 +4898,8 @@ class Service:
 
     def waited(self, name, pod, every, log):
         ended = ended_event(pod)
-        beat = Beat(every) if log is None else Beat(every, LogReads(lambda: self.log_said(name, log)).said)
+        reads = None if log is None else LogReads(lambda held: self.log_said(name, log, held))
+        beat = Beat(every) if reads is None else Beat(every, reads.said)
         process = None
         noted = False
         try:
@@ -4899,11 +4921,15 @@ class Service:
         finally:
             if process is not None:
                 process.kill()
+            if reads is not None:
+                reads.stop()
         yield sse("ended", ended)
 
-    def log_said(self, name, path):
+    def log_said(self, name, path, held):
         try:
-            ran = self.kube.exec(name, OUT, ["sh", "-c", LOG_READ, "sh", path])
+            process = held(self.kube.exec_process(name, OUT, ["sh", "-c", LOG_READ, "sh", path]))
+            out, err = process.communicate()
+            ran = Ran(process.returncode, out, err.decode(errors="replace").strip())
             stderr = reached(name, ran)
         except Refused as refused:
             return {"log": {"error": refused.sentence}}
