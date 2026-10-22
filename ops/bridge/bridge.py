@@ -27,10 +27,6 @@ def query(program, asked):
     return run("query", program, json.dumps(asked))
 
 
-def one(answer, *names):
-    return next(answer[name] for name in names if name in answer)
-
-
 def send(seq, op):
     done = subprocess.run(ducktape("op", "chat", op, "--land"), capture_output=True, text=True)
     if done.returncode == 0:
@@ -71,8 +67,8 @@ class Bridge:
 
     def hand(self, change):
         source = change["source"]
-        heard = source["program"] == "chat" and source["object"]["kind"] == "message" and change["kind"] in ("added", "Added")
-        message = one(query("chat", {"MessageById": {"message_id": source["object"]["id"]}}), "message", "Message") if heard else None
+        heard = source["program"] == "chat" and source["object"]["kind"] == "message" and change["kind"] == "added"
+        message = query("chat", {"message_by_id": {"message_id": source["object"]["id"]}})["message"] if heard else None
         if message and not message["deleted"]:
             told = json.dumps({"change": change, "message": message})
             done = subprocess.run(
@@ -87,7 +83,7 @@ class Bridge:
     def catch_up(self):
         page = {}
         while True:
-            answer = one(query("attribution", {"ChangesTo": {"recipient": self.account, "page": page}}), "changes", "Changes")
+            answer = query("attribution", {"changes_to": {"recipient": self.account, "page": page}})["changes"]
             for change in answer["items"]:
                 if change["seq"] > self.last:
                     self.hand(change)
@@ -99,7 +95,7 @@ class Bridge:
         for line in lines:
             seq = seq_of(line, self.account)
             if seq is not None and seq > self.last:
-                self.hand(one(query("attribution", {"Change": {"seq": seq}}), "change", "Change"))
+                self.hand(query("attribution", {"change": {"seq": seq}})["change"])
 
 
 def main():

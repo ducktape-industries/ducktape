@@ -38,23 +38,25 @@ if verb == "op":
         sys.exit(1)
     print(json.dumps({"landed": 9, "ok": True}))
     sys.exit(0)
-snake = fixture.get("snake", False)
-changes = {str(change["seq"]): {**change, **({"kind": change["kind"].lower()} if snake and "kind" in change else {})} for change in fixture["changes"]}
+changes = {str(change["seq"]): change for change in fixture["changes"]}
 
 
 def said(name, value):
-    print(json.dumps({name.lower() if snake else name: value}))
-if "ChangesTo" in asked:
-    after = asked["ChangesTo"]["page"].get("after")
+    print(json.dumps({name: value}))
+if "changes_to" in asked:
+    after = asked["changes_to"]["page"].get("after")
     pages = fixture["pages"]
     at = 0 if after is None else int(after) + 1
     items = [changes[str(seq)] for seq in pages[at]]
     following = str(at) if at + 1 < len(pages) else None
-    said("Changes", {"height": 9, "items": items, "next": following})
-elif "Change" in asked:
-    said("Change", changes.get(str(asked["Change"]["seq"])))
-elif "MessageById" in asked:
-    said("Message", fixture["messages"].get(asked["MessageById"]["message_id"]))
+    said("changes", {"height": 9, "items": items, "next": following})
+elif "change" in asked:
+    said("change", changes.get(str(asked["change"]["seq"])))
+elif "message_by_id" in asked:
+    said("message", fixture["messages"].get(asked["message_by_id"]["message_id"]))
+else:
+    sys.stderr.write(f"ducktape: there is no variant named {next(iter(asked))}\n")
+    sys.exit(1)
 '''
 
 
@@ -71,7 +73,7 @@ def line(account, seq, value=""):
     return f"12\t{key(account, seq)}\t{value}"
 
 
-def change(seq, message, kind="Added", recipient=ACCOUNT):
+def change(seq, message, kind="added", recipient=ACCOUNT):
     return {
         "seq": seq,
         "source": {"program": "chat", "object": {"kind": "message", "id": message}},
@@ -113,7 +115,7 @@ class Bridge(unittest.TestCase):
     def run_bridge(self, fixture, handler=None):
         with open(self.fixture, "w") as out:
             json.dump(fixture, out)
-        answer = '{"AddReaction": {"channel_id": "general", "seq": 4, "emoji": "👀"}}'
+        answer = '{"add_reaction": {"channel_id": "general", "seq": 4, "emoji": "👀"}}'
         told = f"cat >> \"$SEEN\"; echo >> \"$SEEN\"; echo \"pw=${{DUCKTAPE_PASSWORD:-}}\" >> \"$PASSWORDS\"; echo '{answer}'"
         env = dict(
             os.environ,
@@ -146,7 +148,7 @@ class Bridge(unittest.TestCase):
         return {
             "changes": [
                 change(1, "m1"),
-                change(2, "m1", kind="Withdrawn"),
+                change(2, "m1", kind="withdrawn"),
                 change(3, "m3", recipient=31),
                 change(5, "m5"),
                 change(6, "gone"),
@@ -169,15 +171,7 @@ class Bridge(unittest.TestCase):
         self.assertIn("closed attribution's changes", done.stderr)
         self.assertEqual(self.seen_texts(), ["first", "fifth"])
         self.assertEqual([row["program"] for row in self.posted()], ["chat", "chat"])
-        self.assertEqual(self.posted()[0]["op"]["AddReaction"]["emoji"], "👀")
-        self.assertEqual(read(self.state), "6")
-
-    def test_a_ducktape_that_answers_in_snake_case_is_read_the_same(self):
-        fixture = self.world()
-        fixture["snake"] = True
-        done = self.run_bridge(fixture)
-        self.assertIn("closed attribution's changes", done.stderr)
-        self.assertEqual(self.seen_texts(), ["first", "fifth"])
+        self.assertEqual(self.posted()[0]["op"]["add_reaction"]["emoji"], "👀")
         self.assertEqual(read(self.state), "6")
 
     def test_the_handler_never_sees_the_wallet_password_and_ducktape_does(self):

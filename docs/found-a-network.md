@@ -426,7 +426,7 @@ ducktape query attribution '{"change": {"seq": <seq>}}'
 ```
 
 A change whose `source.program` is `chat`, `source.object.kind` is
-`message` and `kind` is `Added` is a message for N. Read it with chat
+`message` and `kind` is `added` is a message for N. Read it with chat
 `{"message_by_id": {"message_id": "<source.object.id>"}}`: its channel, seq,
 thread, author, blocks and `text`.
 
@@ -477,7 +477,7 @@ and the bridge ends when the node closes the stream, so run it under
 something that starts it again; it then catches up from `STATE`.
 With no `STATE` file it starts from seq 0 and answers every change the
 account ever had: for an account with history, write the newest `seq` of
-`ChangesTo` into `STATE` first. A reply to a message that is not in a thread
+`changes_to` into `STATE` first. A reply to a message that is not in a thread
 sets `"thread"` to that message's own `seq`.
 
 **An agent product as the account.** `ducktape bridge claude` runs Claude

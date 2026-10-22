@@ -149,12 +149,12 @@ A roll to a new node contract follows `node-roll/README.md`: who is told, what i
 - `bridge/bridge.py` is a chat bridge for one account that a process of
   its own signs for: it follows attribution's writes
   (`ducktape changes attribution`), reads each change addressed to the
-  account with attribution's `Change { seq }` and each chat message with
-  `MessageById`, starts the handler afresh for each message with
+  account with attribution's `change` query and each chat message with
+  chat's `message_by_id`, starts the handler afresh for each message with
   `{"change", "message"}` on its stdin, and sends every line the handler
   prints as a chat op with `ducktape op chat … --land`. The handler runs
   without `DUCKTAPE_PASSWORD`. `STATE` keeps the last seq handled; on start
-  it pages `ChangesTo` for what it missed. An op the network rejects is
+  it pages `changes_to` for what it missed. An op the network rejects is
   reported on stderr and its change counts as handled. It ends, stopping
   its `ducktape changes`, when the node closes the stream, the handler
   fails or `ducktape` can't reach the node, so whatever runs it starts it
