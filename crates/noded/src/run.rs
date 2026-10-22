@@ -1534,7 +1534,15 @@ async fn closing<E: Context>(writing: Writing<E>, closer: Closer) {
     }
     drop(tracker);
     let closed = match unmarked {
-        Some(height) => Ok(height),
+        Some(height) => {
+            let storage = node.host().store().storage();
+            storage
+                .unmark()
+                .and_then(|()| storage.flush())
+                .map(|()| height)
+                .map_err(host::Error::from)
+                .map_err(Error::from)
+        }
         None => {
             let synced = node.close().await;
             synced
@@ -1636,6 +1644,7 @@ async fn holding<E: Context>(writing: &mut Writing<E>, block: &Block) -> Result<
             Raced::Held(held) => return Ok(held),
         };
         writing.node = joined.node;
+        writing.workspace.write_anchor(&joined.anchor)?;
         writing.unmarked = None;
         let tip = writing.node.tip()?;
         let head = match racing(writing, Box::pin(head_at(&source, tip))).await {
@@ -1713,7 +1722,6 @@ async fn readopted<E: Context>(
         reason = "blob_unheld",
         "the block reads a blob that no member gave and the source no longer serves; the node re-adopted the state at the source's head and goes on from there"
     );
-    writing.workspace.write_anchor(&anchor)?;
     retable_halo(&daemon, node, tip.height).await;
     let consenting = consensus.is_some();
     if consenting {

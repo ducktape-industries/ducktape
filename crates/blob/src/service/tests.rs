@@ -16,6 +16,8 @@ use super::{Config, Kept, Service, Source, Turn, answer, generation_path, seed};
 use crate::contract::LANE;
 use crate::{Blobs, frame, id_of};
 
+mod recovery;
+
 fn member(context: &runtime::Context, seed: u64) -> (Arc<Halo>, Seat) {
     let identity = PrivateKey::from_seed(seed);
     let key = identity.public_key();

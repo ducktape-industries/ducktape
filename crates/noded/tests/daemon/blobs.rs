@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod recovery;
+
 fn put_part(body: &[u8]) -> Step {
     Step::Op(HostOp::BlobPutAlone {
         hash: HashKind::Sha256,

@@ -758,16 +758,19 @@ impl Inner {
         }
         let me = self.halo.me();
         let sender = self.sender(id);
+        let mut missed = NO_MEMBER_GAVE_IT;
         for peer in self.halo.members().candidates(me, sender.as_ref()) {
             let pulled = self.pull(&peer, id, declared, class).await;
-            match pulled {
-                Ok(()) => return Ok(()),
-                Err(reason) => {
-                    tracing::debug!(target: "ducktape::blob", ?id, %peer, reason, "a member did not give a blob");
-                }
+            let Err(reason) = pulled else {
+                return Ok(());
+            };
+            tracing::debug!(target: "ducktape::blob", ?id, %peer, reason, "a member did not give a blob");
+            match reason {
+                "lacks" => {}
+                failed => missed = failed,
             }
         }
-        Err(NO_MEMBER_GAVE_IT)
+        Err(missed)
     }
 
     async fn fetch(
