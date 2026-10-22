@@ -452,9 +452,9 @@ def text(value):
     return relay.borsh_text(value)
 
 
-def check_row(check, runs_on=("mac",), steps=("make app",), state="queued"):
+def check_row(check, runs_on=("mac",), steps=("make app",), state="queued", env=(("MODE", "dist"),)):
     job = text("macos") + relay.borsh_vec([text(label) for label in runs_on]) + text("") + relay.borsh_vec([text(step) for step in steps])
-    job += relay.borsh_vec([text("MODE") + text("dist")]) + relay.borsh_vec([])
+    job += relay.borsh_vec([text(name) + text(value) for name, value in env]) + relay.borsh_vec([])
     row = relay.u64(check) + relay.u64(1) + text("app") + text(COMMIT) + text("release.toml") + relay.u32(1) + job
     row += relay.u8(relay.CHECK_STATES.index(state)) + b"\x00\x00" + relay.u64(1) + b"\x00\x00" + text("") + b"\x00"
     return row
@@ -549,6 +549,9 @@ class Checks(unittest.TestCase):
 
     def actions(self, tag):
         return [payload for program, payload in self.signer.submits if program == relay.ACTIONS and payload[0] == tag]
+
+    def reach(self):
+        return [payload for program, payload in self.signer.submits if program == relay.FORGE_REACH]
 
     def test_an_idle_mac_claims_the_oldest_check_it_covers_and_its_end_is_reported_with_its_outputs(self):
         self.signer.queue = [(5, {"runs_on": ("linux",)}), (3, {}), (4, {})]
@@ -666,6 +669,38 @@ class Checks(unittest.TestCase):
         self.assertEqual(self.actions(4), [errored, errored])
         self.assertEqual(self.service.runs["check-3"]["state"], "failed")
         self.assertEqual(self.event(answer)[1]["run"]["id"], "check-4")
+        connection.close()
+
+    def test_a_check_whose_job_names_a_reach_tells_forge_reach_before_actions_and_one_untold_waits(self):
+        self.signer.queue = [(3, {"env": (("FORGE_REACH", "phone/ios phone/Makefile"),)}), (4, {})]
+        connection, answer = self.work()
+        self.event(answer)
+        self.mac("PUT", "/v1/mac/runs/check-3/outputs/log", b"$ make -C phone ios-check\n")
+        self.signer.answers = [ran(b"preconfirmed applied 0a"), ran(code=1, err="the node was not reached")]
+        self.mac("POST", "/v1/mac/runs/check-3/state", {"state": "succeeded"})
+        log = f"/shared/actions/app/{COMMIT}/release/macos-1/log"
+        told = relay.reach_report("app", COMMIT, "release.toml#macos", "passed", log, ["phone/ios", "phone/Makefile"])
+        self.assertEqual(self.reach(), [told])
+        self.assertEqual(self.actions(4), [], "actions hears only once forge-reach has")
+        self.assertEqual(self.service.runs["check-3"]["state"], "writing")
+        self.service.pull()
+        self.assertEqual(self.reach(), [told, told], "telling forge-reach again replaces what it was told")
+        self.assertEqual(self.actions(4), [relay.actions_report(3, "passed", "every step passed", log)])
+        self.assertEqual(self.event(answer)[1]["run"]["id"], "check-4")
+        self.mac("POST", "/v1/mac/runs/check-4/state", {"state": "succeeded"})
+        self.assertEqual(len(self.reach()), 2, "a job that names no reach tells forge-reach nothing")
+        self.assertEqual(len(self.actions(4)), 2)
+        connection.close()
+
+    def test_a_report_forge_reach_refuses_is_said_in_the_checks_summary(self):
+        self.signer.queue = [(3, {"env": (("FORGE_REACH", "phone/ios"),)})]
+        connection, answer = self.work()
+        self.event(answer)
+        self.signer.answers = [ran(b"preconfirmed rejected invalid_input: a reached path holds an empty segment")]
+        self.mac("POST", "/v1/mac/runs/check-3/state", {"state": "failed", "reason": "step 1 (make -C phone ios-check) exited 2: Error 1", "exit": 2})
+        self.assertEqual(self.reach(), [relay.reach_report("app", COMMIT, "release.toml#macos", "failed", None, ["phone/ios"])])
+        said = "step 1 (make -C phone ios-check) exited 2: Error 1; forge-reach refused its report: invalid_input: a reached path holds an empty segment"
+        self.assertEqual(self.actions(4), [relay.actions_report(3, "failed", said, None)])
         connection.close()
 
     def test_the_follower_reads_actions_once_a_height_and_follows_again_after_its_pause(self):

@@ -1069,7 +1069,13 @@ one up for another network.
   `/shared/actions/<repo>/<commit>/<workflow>/<job>-<attempt>/log`, every
   other output is put as a blob of kind `output` in one bundle and recorded
   with actions `Outputs`, and the check is reported: passed, failed when a
-  step exited non-zero, errored otherwise. A check that ends elsewhere
+  step exited non-zero, errored otherwise. A job whose env names
+  `FORGE_REACH` (paths, space-separated) is reported to forge-reach first,
+  as `mac`'s `Report` in the context `<workflow file>#<job>` with that
+  reach and the log's files path as its url, so its status reads
+  `<mac's account>/<workflow file>#<job>`; a refusal is said in the check's
+  summary, and a report not sent holds the check as an unsent actions report
+  does (telling forge-reach again replaces it). A check that ends elsewhere
   (superseded) is forgotten on the Mac; deleting its run errs it. The Mac
   holds no key and the relay signs nothing but what `mac` already did, so
   any commit builds; signing is the separate signer's (J-074). The relay

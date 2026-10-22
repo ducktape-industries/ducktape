@@ -97,6 +97,8 @@ CHUNK_SIZE = 1 << 20
 KEEPALIVE = (10, 5, 3)
 HASHES = {"sha256": (0, 32), "sha1": (1, 20)}
 ACTIONS = "actions"
+FORGE_REACH = "forge-reach"
+REACH_STATES = ("pending", "passed", "failed", "errored")
 OUTPUT = "output"
 LOG = "log"
 FOLLOW_PAUSE = 5
@@ -238,6 +240,12 @@ def actions_needs(check):
 
 def actions_outputs_of(check):
     return u8(7) + u64(check)
+
+
+def reach_report(repo, commit, context, state, url, reach):
+    head = borsh_text(repo) + borsh_text(commit) + borsh_text(context)
+    paths = borsh_vec([borsh_text(path) for path in reach])
+    return u8(1) + head + u8(REACH_STATES.index(state)) + borsh_option(url, borsh_text) + paths + borsh_option(None, u64)
 
 
 def unframed(framed):
@@ -869,6 +877,7 @@ class Service:
                 "inputs": [input_name for input_name, _ in inputs],
                 "check": check["id"],
                 "job": {"steps": check["job"]["steps"], "env": check["job"]["env"]},
+                "context": f"{check['workflow']}#{check['job']['id']}",
             }
             if unstarted is not None:
                 record.update(state="writing", step="reporting the check", ending={"state": "failed", "reason": unstarted})
@@ -1280,6 +1289,16 @@ class Service:
             if outcome == "rejected":
                 notes.append(f"its outputs were not recorded: {reason}: {sentence}")
         state = {"succeeded": "passed", "failed": "failed" if final.get("exit") is not None else "errored"}.get(final["state"], "errored")
+        reach = ((final.get("job") or {}).get("env") or {}).get("FORGE_REACH", "").split()
+        context = final.get("context")
+        names_a_reach = bool(reach) and bool(context)
+        if names_a_reach:
+            told = self.signer.submit(FORGE_REACH, reach_report(final["repo"], final["commit"], context, state, log, reach))
+            outcome, reason, sentence = receipt(told)
+            if outcome == "failed":
+                return self.unsent(name, f"forge-reach was not told: {sentence}")
+            if outcome == "rejected":
+                notes.append(f"forge-reach refused its report: {reason}: {sentence}")
         summary = "; ".join(part for part in (final.get("reason") or "every step passed", *notes) if part)
         unreported = self.reported_now(final["check"], state, summary, log)
         if unreported is not None:
