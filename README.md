@@ -854,7 +854,7 @@ ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100  
 
 ## Run work for fleet
 
-fleet is the program that holds what someone asked to run, which machine
+fleet (`ducktape-industries/fleet`) is the program that holds what someone asked to run, which machine
 took each run and how it ended. A machine is an account with a key that runs
 that work: `ducktape machine init` mints `machine.key` in the workspace (mode
 0600) and prints its public half, and the account's owner makes the account

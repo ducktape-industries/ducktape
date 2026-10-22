@@ -25,7 +25,7 @@ or through a member node's halo forward.
   says sent the request (egress `Sender`, asked once per create), or a fleet call's asker. A
   body naming a `requester` is refused 400; a create egress could not be asked about is refused
   502 and makes nothing; a request egress names no account for makes it with no requester.
-- A call fleet relays for a machine (`ducktape-program` is `fleet`) names its run's asker in
+- A call fleet relays for a machine (`ducktape-program` is `ducktape-industries/fleet`) names its run's asker in
   `fleet-asker`, which fleet stamps on every call it relays. The service makes that account the
   requester of what the call makes, and refuses such a call with no account there. Such a call reaches only its own run's pod: a pod it makes carries its
   `fleet-run` and `fleet-attempt` as labels, and it may read, wait for, exec in, put the outputs

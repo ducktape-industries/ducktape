@@ -51,7 +51,7 @@ MANAGED = ("app.kubernetes.io/managed-by", "pods")
 DEFAULT_CONTAINER = "kubectl.kubernetes.io/default-container"
 ASKED = ("chain", "program", "request")
 REQUESTER = NOTE + "requester"
-FLEET_PROGRAM = "fleet"
+FLEET_PROGRAM = "ducktape-industries/fleet"
 FLEET_ASKER = "fleet-asker"
 ASKER = "asker"
 FLEET_RUN = "fleet-run"
@@ -1407,8 +1407,12 @@ def unrequested(body, what):
     return body
 
 
+def label_safe(value):
+    return value.replace("/", "-") if value is not None else None
+
+
 def labels_for(asked, requester):
-    labels = {NOTE + name: asked[name] for name in ASKED}
+    labels = {NOTE + name: label_safe(asked[name]) for name in ASKED}
     if ASKER in asked:
         labels[RUN_LABEL] = asked[FLEET_RUN]
         labels[ATTEMPT_LABEL] = asked[FLEET_ATTEMPT]

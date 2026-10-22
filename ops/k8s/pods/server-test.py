@@ -1084,7 +1084,7 @@ class Create(Served):
         self.assertEqual(notes["kubectl.kubernetes.io/default-container"], "run")
 
 
-FLEETED = {**ASKED, "ducktape-program": "fleet", "fleet-run": "7", "fleet-attempt": "1", "fleet-asker": "17", "fleet-machine": "31"}
+FLEETED = {**ASKED, "ducktape-program": "ducktape-industries/fleet", "fleet-run": "7", "fleet-attempt": "1", "fleet-asker": "17", "fleet-machine": "31"}
 
 
 class Fleeted(Served):
@@ -1094,7 +1094,7 @@ class Fleeted(Served):
         self.assertEqual(status, 201, answer)
         labels = self.created()["metadata"]["labels"]
         self.assertEqual(labels["ducktape.industries/requester"], "17")
-        self.assertEqual(labels["ducktape.industries/program"], "fleet")
+        self.assertEqual(labels["ducktape.industries/program"], "ducktape-industries-fleet")
         self.assertEqual((labels["ducktape.industries/fleet-run"], labels["ducktape.industries/fleet-attempt"]), ("7", "1"))
 
     def fleet_pod(self, run="7", attempt="1"):

@@ -25,7 +25,7 @@ use crate::{Sentence as _, json as said};
 use backend::{Forge, Workload};
 use decide::{Act, Ending, Held, Local};
 
-const FLEET: &str = "fleet";
+const FLEET: &str = "ducktape-industries/fleet";
 const FILES: &str = "files";
 const TARGET: &str = "ducktape::machine";
 
