@@ -61,6 +61,8 @@ NOTIFY_CHANNEL = NOTE + "notify-channel"
 NOTIFY_THREAD = NOTE + "notify-thread"
 NOTIFIED = NOTE + "notified"
 NOTIFIED_PENDING = NOTE + "notified-pending"
+DELETED = NOTE + "deleted-by-requester"
+UNMEASURED = "1970-01-01T00:00:00Z"
 UNSCHEDULABLE = "Unschedulable"
 REATTACH = "ducktape-reattach"
 REATTACH_BY = "request"
@@ -803,6 +805,9 @@ class Kube:
 
     def annotate(self, name, key, value):
         return self.call("annotate", "pod", name, f"{key}={value}", "--overwrite")
+
+    def unannotate(self, name, key):
+        return self.call("annotate", "pod", name, f"{key}-")
 
     def apply(self, objects, dry):
         listed = {"apiVersion": "v1", "kind": "List", "items": objects}
@@ -1877,7 +1882,47 @@ def view(pod):
     }
 
 
+def deleted_by_requester(pod):
+    meta = pod["metadata"]
+    uid, _, asked = ((meta.get("annotations") or {}).get(DELETED) or "").partition(" ")
+    deleting = "deletionTimestamp" in meta
+    marked_as_itself = uid != "" and uid == meta.get("uid")
+    asked_at = moment(asked)
+    finished = finished_at(pod)
+    both_known = asked_at is not None and finished is not None
+    ended_by_the_delete = both_known and finished >= asked_at
+    return deleting and marked_as_itself and ended_by_the_delete
+
+
+def stamped(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
+def finished_at(pod):
+    status = pod.get("status", {})
+    ran = state_of(status.get("containerStatuses", []), RUN)
+    fetched = state_of(status.get("initContainerStatuses", []), FETCH)
+    ended = [state for state in (ran, fetched) if state is not None and state["state"] == "terminated"]
+    return moment(ended[0]["finished"]) if ended else None
+
+
+def moment(stamp):
+    try:
+        return datetime.datetime.fromisoformat(stamp) if isinstance(stamp, str) else None
+    except ValueError:
+        return None
+
+
 def ended_line(pod):
+    line = exit_line(pod)
+    if line is None:
+        return None
+    if deleted_by_requester(pod):
+        return f"pod {pod['metadata']['name']} ended: deleted by its requester"
+    return line
+
+
+def exit_line(pod):
     name = pod["metadata"]["name"]
     status = pod.get("status", {})
     ran = state_of(status.get("containerStatuses", []), RUN)
@@ -2204,11 +2249,17 @@ def ended_said(pod):
     if line is None:
         return None
     name = pod["metadata"]["name"]
-    ran = state_of(pod.get("status", {}).get("containerStatuses", []), RUN)
-    passed = ran is not None and ran["state"] == "terminated" and ran["exit_code"] == 0
     detail = line.removeprefix(f"pod {name} ")
     requester = requester_of(pod["metadata"].get("labels") or {})
-    return {"group": name, "subject": f"pod {name}", "status": "passed" if passed else "failed", "detail": detail, "concerns": concerning(requester)}
+    return {"group": name, "subject": f"pod {name}", "status": ended_status(pod), "detail": detail, "concerns": concerning(requester)}
+
+
+def ended_status(pod):
+    if deleted_by_requester(pod):
+        return "note"
+    ran = state_of(pod.get("status", {}).get("containerStatuses", []), RUN)
+    passed = ran is not None and ran["state"] == "terminated" and ran["exit_code"] == 0
+    return "passed" if passed else "failed"
 
 
 def ended_event(pod):
@@ -2972,7 +3023,8 @@ def owning_pod(claim):
 
 def rootfs_read_at(entry):
     times = [(container.get("rootfs") or {}).get("time") for container in entry.get("containers") or []]
-    return min(times) if times and all(times) else None
+    measured = [read for read in times if read and read != UNMEASURED]
+    return min(times) if times and len(measured) == len(times) else None
 
 
 def claim_row(claim, phases):
@@ -4761,11 +4813,26 @@ class Service:
         if name in self.runners:
             raise Refused(403, f"pod {name} is a build runner, a machine and not a pod, so nothing deletes it")
         what = f"pod {name}"
-        uid = self.whose(asked, self.pod(name), what)
+        held = self.pod(name)
+        uid = self.whose(asked, held, what)
+        marked = self.marked(name, uid) if ended_line(held) is None else False
         answered = self.unmade(f"/api/v1/namespaces/{self.kube.namespace}/pods/{quote(name, safe='')}", "", {}, uid, what)
         if not 200 <= answered.status < 300:
+            if marked:
+                self.unmarked(name)
             raise api_refusal(answered, f"{what} was not deleted")
         return 200, {"deleted": name}
+
+    def marked(self, name, uid):
+        ran = self.kube.annotate(name, DELETED, f"{uid} {stamped(self.wall())}")
+        if ran.code != 0:
+            say("pods_unmarked", pod=name, reason="kubectl_failed", detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
+        return ran.code == 0
+
+    def unmarked(self, name):
+        ran = self.kube.unannotate(name, DELETED)
+        if ran.code != 0:
+            say("pods_mark_kept", pod=name, reason="kubectl_failed", detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
 
     def whose(self, asked, held, what):
         meta = mapping(mapping(held).get("metadata"))

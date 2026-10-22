@@ -542,7 +542,9 @@ one up for another network.
   walk fails, which a file removed during the walk makes it do, so a pod
   that keeps creating and removing files can read far below what it holds.
   `disk_read_at` is the oldest of its containers' `rootfs.time`, the moment
-  containerd last measured, and null when a container has none.
+  containerd last measured, and null when a container has none or has
+  `1970-01-01T00:00:00Z`, the zero time the kubelet sends for a container
+  containerd has never measured.
   `volume_disks` holds, once per node, the used and capacity bytes of the
   disk under the pods' inputs and `/out`. `claims` lists every claim with
   its requested bytes, and for one Kubernetes made for a pod's volume its
@@ -647,7 +649,18 @@ one up for another network.
   `pending, waiting to be placed: <the scheduler's message>` (id
   `pods-<pod>-pending`, marked said by the annotation
   `ducktape.industries/notified-pending`), so whoever waits on it sees why; the pod
-  keeps waiting for room. While its run container runs, each
+  keeps waiting for room. A pod its requester's `DELETE /v1/pods/NAME`
+  ended is posted status note, detail `ended: deleted by its requester`,
+  and a wait on it ends with that line: before it sends the delete of a
+  pod that hasn't ended, the service marks the pod with the annotation
+  `ducktape.industries/deleted-by-requester` holding its uid and the
+  time it asks (`<uid> <RFC 3339 UTC second>`), and takes the mark off
+  again when Kubernetes refuses the delete. A pod reads so only while
+  Kubernetes is deleting it, the mark holds its own uid, and its
+  container finished no earlier than the mark's time: a run that ended
+  on its own just before reads its exit, and the kubelet's own last
+  delete, which moves `deletionTimestamp`, changes nothing.
+  While its run container runs, each
   line it prints that reads `ducktape-notify <channel> <text>` is a notice
   for the requester in that channel too, with the pod as its subject and
   `<text>` as its detail, grouped by the run the text names (`<pod>:<run>`

@@ -49,7 +49,9 @@ or through a member node's halo forward.
   own account, which is that pod's requester. An object with no requester label (made before pods
   stamped one) is changed or deleted by no call: the operator removes it with kubectl. The service
   reads the object, then sends the delete held to the uid it read, so an object made again under
-  the same name in between is not deleted. A `/v1/k8s/` PUT or PATCH of an object that isn't there
+  the same name in between is not deleted. A `DELETE /v1/pods/NAME` of a pod that hasn't ended
+  first marks it `ducktape.industries/deleted-by-requester` with that uid and the time it asks, so its end notice says
+  it was deleted by its requester. A `/v1/k8s/` PUT or PATCH of an object that isn't there
   is refused 404, naming the POSTs that make one (a `/v1/k8s/` POST to its collection, or `POST
   /v1/manifests`), which stamp its requester. `POST /v1/manifests` keeps that rule for an object that is
   already there: it reads every object its manifests name in one `kubectl get`, and applies

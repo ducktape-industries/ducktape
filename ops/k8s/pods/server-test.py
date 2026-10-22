@@ -37,6 +37,11 @@ BASELINE = 'Error from server (Forbidden): error when creating "STDIN": pods "we
 SNAPSHOT = "sha256:" + "ab" * 32
 CHUNKS = ["sha256:" + "01" * 32, "sha256:" + "02" * 32, "sha256:" + "03" * 32]
 NOTIFY = {"ducktape.industries/notify-channel": "builds"}
+DELETED_MARK = "ducktape.industries/deleted-by-requester"
+SIGTERMED = {"terminated": {"exitCode": 143, "reason": "Error", "startedAt": "s", "finishedAt": "2026-10-22T09:30:31Z"}}
+FETCHED = {"terminated": {"exitCode": 0, "reason": "Completed", "startedAt": "s", "finishedAt": "2026-10-22T09:29:00Z"}}
+ASKED_AT = "2026-10-22T09:30:30Z"
+DELETE_MARKED = ("annotate", "duckpond-41", DELETED_MARK, "uid-duckpond-41 2026-10-22T15:00:00Z")
 ENDED = {"terminated": {"exitCode": 0, "reason": "Completed", "startedAt": "s", "finishedAt": "f"}}
 RUNNING = {"running": {"startedAt": "s"}}
 POSTED = bytes.fromhex(
@@ -180,6 +185,9 @@ class Kube:
 
     def annotate(self, name, key, value):
         return self.ran("annotate", name, key, value)
+
+    def unannotate(self, name, key):
+        return self.ran("unannotate", name, key)
 
     def apply(self, objects, dry):
         return self.ran("apply", objects, dry)
@@ -1251,7 +1259,7 @@ class Asked(Served):
         connection.close()
 
 
-class Read(Served):
+class Status(Served):
     def test_status_reports_each_container_the_inputs_and_who_asked(self):
         pod = pod_json(state=ENDED, phase="Succeeded", notes={**NOTIFY, "ducktape.industries/notify-thread": "5"})
         pod["spec"]["resources"] = {"limits": {"cpu": "1"}}
@@ -1297,17 +1305,57 @@ class Read(Served):
 
 
 class Delete(Served):
+    def setUp(self):
+        super().setUp()
+        self.service.wall = lambda: 1792681200.4
+
     def test_delete_removes_the_pod_without_waiting(self):
         self.kube.answer("get", ran(pod_json()))
         self.signer.sender = sent_by(17)
         self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-41"), (200, {"deleted": "duckpond-41"}))
-        self.assertEqual(self.kube.calls, [("get", "duckpond-41")])
+        self.assertEqual(self.kube.calls, [("get", "duckpond-41"), DELETE_MARKED])
         self.assertEqual([call[:2] for call in self.api.calls], [("DELETE", "/api/v1/namespaces/agents/pods/duckpond-41")])
 
     def test_deleting_a_missing_pod_is_not_found(self):
         self.kube.answer("get", ran(code=1, err=NOT_FOUND))
         self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-9")[0], 404)
         self.assertEqual(self.api.calls, [])
+
+    def test_a_requesters_delete_of_a_live_pod_marks_it_with_its_uid_before_the_delete(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running", requester="21")))
+        self.signer.sender = sent_by(21)
+        order = []
+        mark, call = self.kube.annotate, self.api.call
+        self.kube.annotate = lambda *args: (order.append("annotate"), mark(*args))[1]
+        self.api.call = lambda method, *rest: (order.append(method), call(method, *rest))[1]
+        self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-41"), (200, {"deleted": "duckpond-41"}))
+        self.assertEqual(order, ["annotate", "DELETE"])
+        self.assertEqual(self.kube.calls, [("get", "duckpond-41"), DELETE_MARKED])
+
+    def test_a_requesters_delete_of_a_pod_that_already_ended_leaves_it_unmarked(self):
+        for pod in (pod_json(state=ENDED, phase="Succeeded", requester="21"), pod_json(phase="Failed", reason="Evicted", requester="21")):
+            with self.subTest(phase=pod["status"]["phase"]):
+                self.kube.calls.clear()
+                self.kube.answer("get", ran(pod))
+                self.signer.sender = sent_by(21)
+                self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-41"), (200, {"deleted": "duckpond-41"}))
+                self.assertEqual(self.kube.verbs(), ["get"])
+
+    def test_a_delete_kubernetes_refuses_takes_its_mark_off_again(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running", requester="21")))
+        self.signer.sender = sent_by(21)
+        self.api.answers = [answered(500, {"kind": "Status", "message": "etcdserver: request timed out", "code": 500})]
+        self.refused("DELETE", "/v1/pods/duckpond-41", None, 500, ["pod duckpond-41 was not deleted", "request timed out"])
+        self.assertEqual(self.kube.calls[1:], [DELETE_MARKED, ("unannotate", "duckpond-41", DELETED_MARK)])
+
+    def test_a_mark_kubernetes_refuses_still_deletes_the_pod(self):
+        self.kube.answer("get", ran(pod_json(state=RUNNING, phase="Running", requester="21")))
+        self.kube.answer("annotate", ran(code=1, err=APISERVER))
+        self.signer.sender = sent_by(21)
+        with unittest.mock.patch.object(server, "say") as said:
+            self.assertEqual(self.call("DELETE", "/v1/pods/duckpond-41"), (200, {"deleted": "duckpond-41"}))
+        said.assert_any_call("pods_unmarked", pod="duckpond-41", reason="kubectl_failed", detail=json.dumps(APISERVER))
+        self.assertEqual([call[0] for call in self.api.calls], ["DELETE"])
 
 
 NOBODY = ran(server.u8(server.EGRESS_SENDER) + server.u8(0))
@@ -1321,7 +1369,7 @@ class Owned(Served):
         ((method, path, query, body, kind),) = self.api.calls
         self.assertEqual((method, path, query, kind), ("DELETE", "/api/v1/namespaces/agents/pods/duckpond-41", "", "application/json"))
         self.assertEqual(json.loads(body), {"preconditions": {"uid": "uid-duckpond-41"}})
-        self.assertEqual(self.kube.verbs(), ["get"])
+        self.assertEqual(self.kube.verbs(), ["get", "annotate"])
 
     def test_no_other_account_deletes_a_pod(self):
         self.kube.answer("get", ran(pod_json(requester="21")))
@@ -3271,6 +3319,34 @@ class Usage(Served):
         self.assertEqual(status, 200)
         self.assertEqual([(row["pod"], row["disk_bytes"], row["disk_read_at"]) for row in answer["pods"]], [("c", 8800000, "2026-10-21T16:58:00Z"), ("n", 4096, None)])
 
+    def test_a_disk_reading_containerd_never_took_reads_null(self):
+        never = pod_json(name="z", phase="Running", requester="15")
+        never["status"]["hostIP"] = "192.168.75.48"
+        half = pod_json(name="h", phase="Running", requester="15")
+        half["status"]["hostIP"] = "192.168.75.48"
+        self.kube.answer("list", ran({"items": [never, half]}))
+        self.kube.answer("claims", ran({"items": []}))
+        self.kube.answer("quotas", ran({"items": []}))
+        zero = "1970-01-01T00:00:00Z"
+        self.stats.summaries["192.168.75.48"] = {
+            "node": {"nodeName": "fabrics-1"},
+            "pods": [
+                {
+                    "podRef": {"name": "z", "namespace": "agents"},
+                    "ephemeral-storage": {"usedBytes": 0, "time": "2026-10-22T09:30:00Z"},
+                    "containers": [{"name": "run", "rootfs": {"time": zero, "usedBytes": 0}}, {"name": "out", "rootfs": {"time": zero, "usedBytes": 0}}],
+                },
+                {
+                    "podRef": {"name": "h", "namespace": "agents"},
+                    "ephemeral-storage": {"usedBytes": 4096, "time": "2026-10-22T09:30:00Z"},
+                    "containers": [{"name": "run", "rootfs": {"time": zero, "usedBytes": 0}}, {"name": "out", "rootfs": {"time": "2026-10-22T09:29:58Z", "usedBytes": 4096}}],
+                },
+            ],
+        }
+        status, answer = self.call("GET", "/v1/usage")
+        self.assertEqual(status, 200)
+        self.assertEqual([(row["pod"], row["disk_read_at"]) for row in answer["pods"]], [("z", None), ("h", None)])
+
     def test_quantities_read_every_suffix(self):
         self.assertEqual(server.quantity("250m"), 0.25)
         self.assertEqual(server.quantity("2Gi"), 2 * 2**30)
@@ -3663,6 +3739,50 @@ class Posts(unittest.TestCase):
         self.assertEqual(threaded[46:], POSTED[38:])
         failed = server.ended_said(pod_json(state=FAILED, phase="Failed", notes=NOTIFY))
         self.assertEqual(failed["status"], "failed")
+
+    def deleted(self, mark, deleting=True, **given):
+        pod = pod_json(**{"state": SIGTERMED, "phase": "Failed", "init": FETCHED, **given, "notes": {**NOTIFY, **({DELETED_MARK: f"{mark} {ASKED_AT}"} if mark else {})}})
+        if deleting:
+            pod["metadata"]["deletionTimestamp"] = "2026-10-22T09:31:00Z"
+            pod["metadata"]["deletionGracePeriodSeconds"] = 30
+        return pod
+
+    def test_a_pod_the_kubelet_deletes_again_once_its_containers_stopped_still_reads_deleted_by_its_requester(self):
+        pod = self.deleted("uid-duckpond-41")
+        pod["metadata"]["deletionTimestamp"] = "2026-10-22T09:30:32Z"
+        pod["metadata"]["deletionGracePeriodSeconds"] = 0
+        self.assertEqual(server.ended_said(pod)["status"], "note")
+        self.assertEqual(server.ended_event(pod)["line"], "pod duckpond-41 ended: deleted by its requester")
+
+    def test_a_run_that_ended_on_its_own_before_its_requesters_delete_still_reads_its_exit(self):
+        for code, reason, status in ((1, "Error", "failed"), (0, "Completed", "passed")):
+            with self.subTest(code=code):
+                pod = self.deleted("uid-duckpond-41", state={"terminated": {"exitCode": code, "reason": reason, "startedAt": "s", "finishedAt": "2026-10-22T09:30:29Z"}})
+                said = server.ended_said(pod)
+                self.assertEqual((said["status"], said["detail"]), (status, f"ended: exit code {code} ({reason})"))
+                self.assertEqual(server.ended_event(pod)["line"], f"pod duckpond-41 ended: exit code {code} ({reason})")
+        at_the_delete = self.deleted("uid-duckpond-41", state={"terminated": {**SIGTERMED["terminated"], "finishedAt": "2026-10-22T09:30:30Z"}})
+        self.assertEqual(server.ended_said(at_the_delete)["status"], "note")
+
+    def test_a_pod_its_requesters_delete_ended_is_noted_deleted_by_its_requester(self):
+        pod = self.deleted("uid-duckpond-41")
+        said = {"group": "duckpond-41", "subject": "pod duckpond-41", "status": "note", "detail": "ended: deleted by its requester", "concerns": [17]}
+        self.assertEqual(server.ended_said(pod), said)
+        self.assertEqual(server.ended_line(pod), "pod duckpond-41 ended: deleted by its requester")
+        fetching = self.deleted("uid-duckpond-41", state=None, init=SIGTERMED)
+        self.assertEqual(server.ended_line(fetching), "pod duckpond-41 ended: deleted by its requester")
+        self.assertIsNone(server.ended_line(self.deleted("uid-duckpond-41", state=RUNNING, phase="Running")))
+        self.notifier.seen(pod)
+        self.assertEqual(self.signer.submits, [("chat", server.notice_message("builds", "pods-duckpond-41-ended", None, said))])
+
+    def test_a_pod_no_delete_of_its_requesters_ended_still_reads_its_exit(self):
+        timeless = self.deleted(None)
+        timeless["metadata"]["annotations"][DELETED_MARK] = "uid-duckpond-41"
+        cases = {"another pod's mark": self.deleted("uid-an-older-pod"), "no mark": self.deleted(None), "a mark with no delete": self.deleted("uid-duckpond-41", deleting=False), "a mark with no ask time": timeless}
+        for case, pod in cases.items():
+            with self.subTest(case=case):
+                said = server.ended_said(pod)
+                self.assertEqual((said["status"], said["detail"]), ("failed", "ended: exit code 143 (Error)"))
 
     def test_a_post_without_a_requester_concerns_no_one(self):
         posted = server.notice_message("builds", "m", None, server.line_said("p", "ended", None))
