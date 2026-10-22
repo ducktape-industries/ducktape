@@ -25,7 +25,9 @@ use crate::{Context, Network};
 pub enum Error {
     #[error("epoch {epoch} names a validator key no validator scheme decodes")]
     Validators { epoch: u64 },
-    #[error("epoch {epoch} has no floor: neither an anchor block nor a finalization names the tip")]
+    #[error(
+        "epoch {epoch} has no floor: marshal holds no finalization at the tip and not the block the epoch opens on"
+    )]
     Floor { epoch: u64 },
     #[error("epoch {epoch} follows an epoch the roster never seated")]
     Previous { epoch: u64 },

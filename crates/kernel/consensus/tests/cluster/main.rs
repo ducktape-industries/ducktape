@@ -9,7 +9,9 @@ use abi::{
 };
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519};
 use commonware_p2p::simulated::{self, Link, Oracle};
-use commonware_runtime::{Quota, Runner as _, Spawner as _, Supervisor as _, deterministic};
+use commonware_runtime::{
+    Handle, Quota, Runner as _, Spawner as _, Supervisor as _, deterministic,
+};
 use commonware_utils::Acknowledgement as _;
 use commonware_utils::acknowledgement::Exact;
 use commonware_utils::vec::NonEmptyVec;
@@ -28,6 +30,7 @@ use node::{
 };
 
 mod epochs;
+mod restart;
 
 const NETWORK: &[u8] = b"cluster";
 const TIME: u64 = 0;
@@ -360,9 +363,9 @@ struct Stall {
 }
 
 impl Stall {
-    async fn hold(self) {
+    async fn hold(self) -> bool {
         let _ = self.holding.send(());
-        let _ = self.release.await;
+        self.release.await.is_ok()
     }
 }
 
@@ -380,6 +383,7 @@ struct Peer {
     roots: Roots,
     skewed: Skewed,
     carried: Carried,
+    pump: Handle<()>,
     _dir: tempfile::TempDir,
 }
 
@@ -468,7 +472,7 @@ impl Peer {
             .await
             .unwrap();
         assert_eq!(standing == Standing::Validator, roster.participates(0));
-        context.child("pump").spawn({
+        let pump = context.child("pump").spawn({
             let pump = Pump {
                 node: node.clone(),
                 pool: pool.clone(),
@@ -495,6 +499,7 @@ impl Peer {
             roots,
             skewed,
             carried,
+            pump,
             _dir: dir,
         }
     }
@@ -628,7 +633,12 @@ impl Pump {
                 .unwrap()
                 .take_if(|stall| stall.height == block.height);
             if let Some(stall) = stall {
-                stall.hold().await;
+                let released = stall.hold().await;
+                if !released {
+                    drop(node);
+                    membership.stop().await;
+                    return;
+                }
             }
             let sequenced = node.apply(&block).await.unwrap();
             let mut pool = self.pool.lock().await;

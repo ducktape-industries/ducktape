@@ -157,11 +157,21 @@ pub(crate) async fn floor(
     if let Some(certificate) = marshal.get_finalization(Height::new(tip.height)).await {
         return Some(Floor::Finalized(certificate));
     }
+    if let Some(floor) = anchored_in(anchor, epoch) {
+        return Some(floor);
+    }
+    let opened_on = marshal
+        .get_block(Height::new(network.anchor(epoch)))
+        .await?;
+    Some(Floor::Genesis(sha256::Digest(opened_on.tip().id)))
+}
+
+fn anchored_in(anchor: &Anchor, epoch: u64) -> Option<EngineFloor> {
     let Anchor::Finalized(certificate) = anchor else {
         return None;
     };
-    let anchor_names_the_tip = certificate.proposal.payload.0 == tip.id;
-    anchor_names_the_tip.then(|| Floor::Finalized(certificate.clone()))
+    let in_the_epoch = certificate.proposal.round.epoch().get() == epoch;
+    in_the_epoch.then(|| Floor::Finalized(certificate.clone()))
 }
 
 pub fn journals(partition: &str) -> String {
