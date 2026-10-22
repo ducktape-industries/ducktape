@@ -4229,6 +4229,8 @@ class Reruns(unittest.TestCase):
         self.signer = Forging({ASK_REQUIRED: LIVE_REQUIRED, ASK_FRONT: LIVE_QUEUE, ASK_PREVIEW: LIVE_PREVIEW, ASK_STATUSES: LIVE_STATUSES})
         self.launched = []
         self.answers = [ran(b"run desktop:r1\nread it with: build.sh status r1\n")]
+        self.calls = []
+        self.call_answer = ran(b"bumped\n")
         self.posts = []
         self.spawned = []
         self.pauses = []
@@ -4239,7 +4241,14 @@ class Reruns(unittest.TestCase):
         rerunner.reporter = 23
         rerunner.spawn = lambda target, *args: self.spawned.append((target, args))
         rerunner.pause = self.pauses.append
+        rerunner.called = self.call
         return rerunner
+
+    def call(self, command):
+        self.calls.append(command)
+        if isinstance(self.call_answer, server.Refused):
+            raise self.call_answer
+        return self.call_answer
 
     def launch(self, command):
         self.launched.append((command, dict(self.kube.kept)))
@@ -4283,6 +4292,49 @@ class Reruns(unittest.TestCase):
         self.assertEqual(self.launched, [(command, {key: self.record()})])
         self.assertEqual(self.kube.kept, {key: self.record(run="desktop:r1")})
         self.assertEqual((self.posts, self.spawned), ([], []))
+
+    def test_a_started_front_lane_is_bumped_to_the_front_of_its_machines_check_lane(self):
+        self.rerunner.settle("programs")
+        self.rerunner.settle("programs")
+        self.assertEqual(self.calls, [["sh", server.BUILD_SH, "bump", "desktop:r1"]])
+
+    def test_a_lane_that_did_not_start_is_not_bumped(self):
+        self.answers = [server.Refused(503, "no build runner is free")]
+        self.rerunner.settle("programs")
+        self.assertEqual(self.calls, [])
+
+    def test_a_refused_bump_leaves_the_lane_kept_and_running(self):
+        self.call_answer = server.Refused(502, "pod desktop was not reached")
+        self.rerunner.settle("programs")
+        self.assertEqual(self.kube.kept, {server.rerun_key("programs", LANE): self.record(run="desktop:r1")})
+        self.assertEqual((len(self.calls), self.spawned), (1, []))
+
+    def test_a_retried_lane_that_starts_is_bumped(self):
+        self.answers = [server.Refused(503, "no build runner is free"), ran(b"run desktop:r2\n")]
+        self.rerunner.settle("programs")
+        target, args = self.spawned[0]
+        target(*args)
+        self.assertEqual(self.calls, [["sh", server.BUILD_SH, "bump", "desktop:r2"]])
+
+    def test_a_kept_lane_whose_preview_left_the_front_is_stopped_and_one_that_never_started_is_not(self):
+        ran_key = server.rerun_key("programs", MOVED_PREVIEW)
+        never_key = server.rerun_key("programs", "8e" * 20)
+        app_key = server.rerun_key("app", "9e" * 20)
+        self.kube.kept = {
+            ran_key: json.dumps({"repo": "programs", "n": 559, "commit": MOVED_PREVIEW, "run": "duckpond-warm:r0"}),
+            never_key: json.dumps({"repo": "programs", "n": 577, "commit": "8e" * 20, "unstarted": "no build runner is free"}),
+            app_key: json.dumps({"repo": "app", "n": 3, "commit": "9e" * 20, "run": "desktop:r7"}),
+        }
+        self.rerunner.settle("programs")
+        self.assertEqual(self.calls, [["sh", server.BUILD_SH, "stop", "duckpond-warm:r0"], ["sh", server.BUILD_SH, "bump", "desktop:r1"]])
+        self.assertEqual(sorted(self.kube.kept), sorted([app_key, server.rerun_key("programs", LANE)]))
+
+    def test_a_refused_stop_still_drops_the_key(self):
+        key = server.rerun_key("programs", MOVED_PREVIEW)
+        self.kube.kept = {key: json.dumps({"repo": "programs", "n": 559, "commit": MOVED_PREVIEW, "run": "desktop:r0"})}
+        self.call_answer = server.Refused(502, "pod desktop was not reached")
+        self.rerunner.settle("programs")
+        self.assertNotIn(key, self.kube.kept)
 
     def test_a_front_no_lane_ever_reported_on_gets_its_lane(self):
         self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("56/review", "passed"))
@@ -4448,6 +4500,7 @@ class Reruns(unittest.TestCase):
 
         rerunner = server.Rerunner(self.signer, self.kube, self.launch, 1, self.post)
         rerunner.pause = pause
+        rerunner.called = self.call
         with self.assertRaises(Stop):
             rerunner.watch()
         settled = [required_repo(request) for request in self.asked() if request[:1] == b"\x14"]
@@ -5288,6 +5341,31 @@ class Builds(Streamed):
         execs = [words for words in self.gate.words() if words[0] == "exec"]
         self.assertEqual(execs[-1], ["exec", "JOB=forge:programs:5", "NOTIFY=forge:programs:5", "programs", COMMIT, "lane"])
         self.assertEqual(([request for program, request in self.signer.queries if program == "egress"], self.signer.senders), ([], []))
+
+    def test_the_service_bumps_a_lane_it_started_on_the_machine_that_runs_it(self):
+        self.service.rerunner.build("bump", "desktop:r1")
+        self.assertEqual([words for words in self.gate.words() if words[0] == "exec"][-1], ["exec", "bump", "r1"])
+
+    def test_the_service_stops_a_superseded_lane_where_build_sh_moved_it(self):
+        moved = ran(code=2, err="build.sh: run r0 (job forge:programs:5) was moved to run desktop:r9 on another machine: stop that one there")
+        self.gate.sequence["exec stop"] = [moved, ran(b"stopped r9 (job forge:programs:5)\n")]
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.rerunner.build("stop", "desktop:r0")
+        stops = [words for words in self.gate.words() if words[:2] == ["exec", "stop"]]
+        self.assertEqual(stops, [["exec", "stop", "r0"], ["exec", "stop", "r9"]])
+        self.assertNotIn("pods_rerun_unbuilt", [call.args[0] for call in said.call_args_list])
+
+    def test_stopping_a_lane_that_already_ended_is_done_and_says_nothing(self):
+        self.gate.sequence["exec stop"] = [ran(code=2, err="build.sh: run r0 (job forge:programs:5) has ended")]
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.rerunner.build("stop", "desktop:r0")
+        self.assertNotIn("pods_rerun_unbuilt", [call.args[0] for call in said.call_args_list])
+
+    def test_a_stop_build_sh_refuses_for_another_reason_says_so(self):
+        self.gate.sequence["exec stop"] = [ran(code=2, err="build.sh: no run r0 here")]
+        with unittest.mock.patch.object(server, "say") as said:
+            self.service.rerunner.build("stop", "desktop:r0")
+        said.assert_any_call("pods_rerun_unbuilt", verb="stop", run=json.dumps("desktop:r0"), detail=json.dumps("build.sh stop answered exit 2"))
 
     def test_a_lane_the_service_asks_for_states_the_operator_s_first_limit(self):
         with unittest.mock.patch.object(server, "LANE_FIRST_LIMIT", "40"):

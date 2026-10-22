@@ -611,7 +611,8 @@ one up for another network.
   required context passed (a front whose review is Pending waits for it), it
   keeps a `rerun-` key in the ConfigMap `runs`, then starts the lane as a
   `builds` call would, notifying the change's room `forge:<repo>:<n>`
-  (`pods_rerun run=`). A lane that doesn't start is posted in that room once
+  (`pods_rerun run=`), and bumps it to the front of its machine's check lane;
+  a run whose Preview is no longer the front is stopped. A lane that doesn't start is posted in that room once
   per reason (`pods_rerun_unstarted` with why) and asked again from one block
   time, doubling, while that Preview is still the front. Its report then
   lands as above and carries the Preview.

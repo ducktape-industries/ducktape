@@ -86,12 +86,16 @@ or through a member node's halo forward.
   required context Passed (a front whose review is Pending waits for it), it first keeps
   `rerun-<sha256(repo, commit)>` in the ConfigMap `runs`, then calls build.sh
   `JOB=forge:<repo>:<n> NOTIFY=forge:<repo>:<n> [FIRST_LIMIT=<minutes>] <repo> <commit> lane`
-  as a `builds` call goes (with no request behind it), and records the run under the key. A
+  as a `builds` call goes (with no request behind it), records the run under the key and bumps
+  it to the front of that machine's check lane (`build.sh bump <run>`), since it holds back every
+  change behind it. A
   lane that doesn't start is recorded with why, posted in the change's room once per distinct
   reason, and asked again after one block time, then two, four and so on, while that Preview is
   still its queue's front; it stops as soon as the front moves. A restart never starts a second
   lane for a Preview it kept (it takes up the retries of the ones that didn't start), a key whose
-  Preview is no longer its queue's front is dropped, and the lane's report reaches forge-reach
+  Preview is no longer its queue's front is dropped and its run stopped (`build.sh stop <run>`,
+  followed to wherever build.sh moved it; a run that already ended counts as stopped, and only a
+  stop refused for another reason logs `pods_rerun_unbuilt`), and the lane's report reaches forge-reach
   as any lane's does.
 
 ## What it needs

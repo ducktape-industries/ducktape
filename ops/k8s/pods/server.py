@@ -175,6 +175,7 @@ FILES_LINE = "ducktape-files "
 REPORT_STATES = {"passed": 1, "failed": 2}
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
 MOVED_ELSEWHERE = re.compile(r"moved to run (\S+?):(\S+) on another machine")
+RUN_HAS_ENDED = re.compile(r"\(job [^)\n]*\) has ended$", re.M)
 PACK = "pack"
 DROPPED = (
     "connection closed before message completed",
@@ -3576,6 +3577,7 @@ class Rerunner:
         self.signer = signer
         self.kube = kube
         self.launch = launch
+        self.called = launch
         self.retry_pause = retry_pause
         self.post = post
         self.reporter = None
@@ -3651,6 +3653,8 @@ class Rerunner:
                 return
             kept = self.kube.kept_load()
             gone = {key: None for key, value in kept.items() if key.startswith(RERUN) and key not in fronts and json.loads(value).get("repo") == repo}
+            for key in gone:
+                self.build("stop", json.loads(kept[key]).get("run"))
             if gone:
                 self.keep(gone)
             for key, front in fronts.items():
@@ -3675,7 +3679,26 @@ class Rerunner:
         run = started.group(1).decode(errors="replace")
         say("pods_rerun", repo=row["repo"], n=row["n"], commit=row["commit"], run=json.dumps(run))
         self.keep({key: json.dumps({**record, "run": run})})
+        self.build("bump", run)
         return True
+
+    def build(self, verb, run):
+        seen = set()
+        while run is not None and run not in seen:
+            seen.add(run)
+            try:
+                ran = self.called(["sh", BUILD_SH, verb, run])
+            except Refused as refused:
+                say("pods_rerun_unbuilt", verb=verb, run=json.dumps(run), detail=json.dumps(refused.sentence))
+                return
+            answered = ran.err + "\n" + ran.out.decode(errors="replace")
+            if ran.code == 0 or RUN_HAS_ENDED.search(answered):
+                return
+            moved = MOVED_ELSEWHERE.search(answered)
+            if moved is None:
+                say("pods_rerun_unbuilt", verb=verb, run=json.dumps(run), detail=json.dumps(f"build.sh {verb} answered exit {ran.code}"))
+                return
+            run = f"{moved.group(1)}:{moved.group(2)}"
 
     def unstarted(self, key, row, record, why):
         say("pods_rerun_unstarted", repo=row["repo"], n=row["n"], commit=row["commit"], detail=json.dumps(why))
