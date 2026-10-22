@@ -202,7 +202,7 @@ impl Blobs {
                 format!("another process holds the blob store at {}", dir.display()),
             ),
         })?;
-        let (mut log, copier) = Log::open(&dir.join(SEGMENTS), sizes.segment)?;
+        let (mut log, copier) = Log::open(&dir.join(SEGMENTS), sizes.segment, sizes.frame)?;
         for (id, kind, len) in frames::held(&dir.join(FRAMED))? {
             log.hold_framed(id, &kind, len);
         }
@@ -344,7 +344,7 @@ impl Blobs {
             let partial = self.framed_partial(id, framed, framed.len() as u64)?;
             return self.publish_framed(&mut self.log(), id, &partial);
         }
-        let record = segments::record(id, framed)?;
+        let record = segments::record(id, framed, self.shared.sizes.frame)?;
         self.log().log(&record)
     }
 
@@ -372,7 +372,7 @@ impl Blobs {
             let over = framed.len() as u64 > self.shared.sizes.segment;
             match over {
                 true => self.keep(id, &framed)?,
-                false => records.push(segments::record(id, &framed)?),
+                false => records.push(segments::record(id, &framed, self.shared.sizes.frame)?),
             }
         }
         let mut log = self.log();
@@ -598,7 +598,7 @@ impl Blobs {
             Err(error) => return Err(error.into()),
         };
         let framed = verified(&legacy.id, framed)?;
-        let record = segments::legacy_record(legacy.id, &framed)?;
+        let record = segments::legacy_record(legacy.id, &framed, self.shared.sizes.frame)?;
         Ok(Some(Moved::Logged(record)))
     }
 
@@ -738,11 +738,7 @@ impl Blobs {
     fn read_held(&self, id: &BlobId, hit: Hit, offset: u64, want: u64) -> Result<Option<Vec<u8>>> {
         match hit {
             Hit::Logged { file, logged, kind } => {
-                let framed = segments::framed(&file, id, &logged, &kind, false)?;
-                let (header, body) = parse(&framed)
-                    .ok_or_else(|| Error::Corrupt(*id, "the frame does not parse".into()))?;
-                let (start, end) = window(header.len, offset, want);
-                Ok(Some(body[start as usize..end as usize].to_vec()))
+                segments::range(&file, id, &logged, &kind, offset, want).map(Some)
             }
             Hit::Framed { .. } => frames::read(&self.framed_path(id), id, offset, want),
         }
@@ -832,7 +828,7 @@ impl Blobs {
                     self.publish_framed(&mut self.log(), *id, &partial)?;
                 }
                 false => {
-                    let record = segments::record(*id, &fs::read(from)?)?;
+                    let record = segments::record(*id, &fs::read(from)?, self.shared.sizes.frame)?;
                     self.log().log(&record)?;
                     self.sync()?;
                 }
@@ -1136,6 +1132,19 @@ fn not_kept(file: &fs::File, offset: u64, len: u64) -> std::io::Result<()> {
 fn not_kept(_: &fs::File, _: u64, _: u64) -> std::io::Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+thread_local! {
+    static INFLATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn inflated(bytes: usize) {
+    INFLATED.with(|inflated| inflated.set(inflated.get() + bytes as u64));
+}
+
+#[cfg(not(test))]
+fn inflated(_: usize) {}
 
 #[cfg(test)]
 mod tests {
@@ -2176,5 +2185,220 @@ mod tests {
         assert!(matches!(held.try_lock(), Err(fs::TryLockError::WouldBlock)));
         drop(second);
         held.try_lock().unwrap();
+    }
+
+    fn inflated_so_far() -> u64 {
+        INFLATED.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_range_of_a_segment_record_inflates_only_the_frames_it_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let body = noise(5 * FRAME_BYTES + 77, 6);
+        let head = header("part", body.len() as u64).len();
+        let mut stage = Stage::default();
+        let id = stage.put(HashKind::Sha256, "part", &body).unwrap();
+        blobs.promote(stage).unwrap();
+        assert!(
+            !blobs.framed_path(&id).is_file(),
+            "a blob under a segment is a segment record"
+        );
+        let frame = FRAME_BYTES as usize;
+        let ranges = [
+            (3 * frame + 5, 6, 1),
+            (2 * frame - head - 3, 6, 2),
+            (body.len() - 10, 100, 1),
+        ];
+        for (at, want, frames) in ranges {
+            let before = inflated_so_far();
+            let read = blobs.read(&id, at as u64, want as u64).unwrap().unwrap();
+            let spent = inflated_so_far() - before;
+            assert_eq!(read, body[at..(at + want).min(body.len())]);
+            assert!(
+                spent <= frames * FRAME_BYTES,
+                "a read of {want} bytes at {at} inflated {spent} bytes, past {frames} frames"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flipped_byte_in_one_frame_of_a_record_fails_only_the_ranges_that_cover_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let body = noise(3 * FRAME_BYTES, 8);
+        let before = every_file(dir.path());
+        let mut stage = Stage::default();
+        let id = stage.put(HashKind::Sha256, "part", &body).unwrap();
+        blobs.promote(stage).unwrap();
+        let (file, _, now) = grown(&before, &every_file(dir.path()));
+        flip(&file, now - 1);
+
+        assert_eq!(blobs.read(&id, 5, 100).unwrap().unwrap(), body[5..105]);
+        let end = body.len() as u64 - 100;
+        assert!(matches!(blobs.read(&id, end, 100), Err(Error::Corrupt(..))));
+        assert!(matches!(blobs.get(&id), Err(Error::Corrupt(..))));
+    }
+
+    const OLDER: &str = "fixtures/segment-whole-records";
+
+    fn older_bodies() -> [(&'static str, Vec<u8>); 2] {
+        let ramp: Vec<u8> = (0..3 * FRAME_BYTES + 5).map(|i| (i % 251) as u8).collect();
+        [("page", text(1)), ("part", ramp)]
+    }
+
+    fn older_ids() -> Vec<BlobId> {
+        older_bodies()
+            .iter()
+            .map(|(kind, body)| id_of(HashKind::Sha256, &frame(kind, body).unwrap()).unwrap())
+            .collect()
+    }
+
+    fn older_store() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let segments = dir.path().join(SEGMENTS);
+        fs::create_dir_all(&segments).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(OLDER);
+        fs::copy(&fixture, segments.join(format!("{:020}", 1))).unwrap();
+        dir
+    }
+
+    #[test]
+    fn records_older_builds_wrote_read_back_whole_and_by_range() {
+        let dir = older_store();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let bodies = older_bodies();
+        for ((kind, body), id) in bodies.iter().zip(older_ids()) {
+            let blob = blobs.get(&id).unwrap().unwrap();
+            assert_eq!((blob.kind.as_str(), &blob.body), (*kind, body));
+            let at = body.len() / 2;
+            assert_eq!(
+                blobs.read(&id, at as u64, 9).unwrap().unwrap(),
+                body[at..at + 9]
+            );
+        }
+    }
+
+    #[test]
+    fn a_tidy_rewrites_records_older_builds_wrote_so_a_range_inflates_one_frame() {
+        let dir = older_store();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let bodies = older_bodies();
+        let ids = older_ids();
+        let big = &bodies[1].1;
+        let at = 2 * FRAME_BYTES as usize + 7;
+        let range = |blobs: &Blobs| {
+            let before = inflated_so_far();
+            let read = blobs.read(&ids[1], at as u64, 6).unwrap().unwrap();
+            assert_eq!(read, big[at..at + 6]);
+            inflated_so_far() - before
+        };
+        let whole = framed_len("part", big.len() as u64);
+        assert_eq!(
+            range(&blobs),
+            whole,
+            "a record an older build wrote inflates whole until a tidy rewrites it"
+        );
+        blobs.tidy().unwrap();
+        let older = dir.path().join(SEGMENTS).join(format!("{:020}", 1));
+        assert!(
+            !older.exists(),
+            "a tidy rewrites every record of the older segment and retires it"
+        );
+        let reads = |blobs: &Blobs| {
+            for ((kind, body), id) in bodies.iter().zip(&ids) {
+                let blob = blobs.get(id).unwrap().unwrap();
+                assert_eq!((blob.kind.as_str(), &blob.body), (*kind, body));
+            }
+            let spent = range(blobs);
+            assert!(
+                spent <= FRAME_BYTES,
+                "a range of a rewritten record inflated {spent} bytes"
+            );
+        };
+        reads(&blobs);
+        drop(blobs);
+        reads(&Blobs::open(dir.path()).unwrap());
+    }
+
+    fn leb(bytes: &[u8]) -> Option<(u64, u64)> {
+        let mut value = 0u64;
+        for (index, byte) in bytes.iter().take(5).enumerate() {
+            value |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                return Some((value, index as u64 + 1));
+            }
+        }
+        None
+    }
+
+    fn counted(blobs: &Blobs, code: &BlobId, reads: &mut u64, offset: u64, len: u64) -> Vec<u8> {
+        *reads += 1;
+        blobs.read(code, offset, len).unwrap().unwrap()
+    }
+
+    fn source_of(blobs: &Blobs, code: &BlobId, reads: &mut u64) -> bool {
+        let name = b"ducktape.source";
+        if counted(blobs, code, reads, 0, 8) != b"\0asm\x01\0\0\0" {
+            return false;
+        }
+        let mut offset = 8u64;
+        loop {
+            let head = counted(blobs, code, reads, offset, 6);
+            let Some((&section, rest)) = head.split_first() else {
+                return false;
+            };
+            let Some((size, used)) = leb(rest) else {
+                return false;
+            };
+            let body = offset + 1 + used;
+            let end = body + size;
+            let custom = section == 0;
+            if custom {
+                let named = counted(blobs, code, reads, body, 5);
+                let Some((length, used)) = leb(&named) else {
+                    return false;
+                };
+                let at = body + used;
+                let sized = length == name.len() as u64;
+                let ours = sized && counted(blobs, code, reads, at, length) == name;
+                if ours {
+                    counted(blobs, code, reads, at + length, end - at - length);
+                    return true;
+                }
+            }
+            offset = end;
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_a_source_section_read_from_each_code() {
+        let Some(codes) = std::env::var_os("BLOB_BENCH_CODES") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let mut stage = Stage::default();
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(codes).unwrap() {
+            let framed = fs::read(entry.unwrap().path()).unwrap();
+            let (header, body) = parse(&framed).unwrap();
+            ids.push(stage.put(HashKind::Sha256, &header.kind, body).unwrap());
+        }
+        blobs.promote(stage).unwrap();
+        let mut reads = 0;
+        let mut found = 0;
+        let before = inflated_so_far();
+        let began = std::time::Instant::now();
+        for id in &ids {
+            found += u64::from(source_of(&blobs, id, &mut reads));
+        }
+        let took = began.elapsed();
+        println!(
+            "bench: {} codes, {found} sources, {reads} ranged reads, {} bytes inflated, {took:?}",
+            ids.len(),
+            inflated_so_far() - before
+        );
     }
 }

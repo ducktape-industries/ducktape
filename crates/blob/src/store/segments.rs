@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use abi::{BlobHeader, BlobId};
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use super::{Error, Result, framed_len, gone, not_kept, read_at, synced_dir, verified, write_at};
+use super::{
+    Error, Result, framed_len, gone, not_kept, read_at, synced_dir, verified, window, write_at,
+};
 use crate::parse;
 
 const APPLIED: [u8; 8] = *b"dtblobs1";
@@ -43,6 +45,39 @@ enum Head {
         origin_segment: u64,
         origin_at: u64,
     },
+    Framed {
+        id: BlobId,
+        kind: String,
+        len: u64,
+        encoded: u64,
+        crc: u32,
+        frame: u64,
+        frames: Vec<Frame>,
+    },
+    FramedCopy {
+        id: BlobId,
+        kind: String,
+        len: u64,
+        encoded: u64,
+        crc: u32,
+        frame: u64,
+        frames: Vec<Frame>,
+        origin_segment: u64,
+        origin_at: u64,
+    },
+}
+
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize)]
+struct Frame {
+    encoded: u64,
+    crc: u32,
+}
+
+struct Encoded {
+    frame: u64,
+    frames: Vec<Frame>,
+    body: Vec<u8>,
+    crc: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -66,38 +101,47 @@ pub(super) struct Record {
     head: u32,
     encoded: u64,
     crc: u32,
+    frame: u64,
     bytes: Vec<u8>,
 }
 
-pub(super) fn record(id: BlobId, framed: &[u8]) -> Result<Record> {
-    encoded(id, framed, None)
+pub(super) fn record(id: BlobId, framed: &[u8], frame: u64) -> Result<Record> {
+    encoded(id, framed, None, frame)
 }
 
-pub(super) fn legacy_record(id: BlobId, framed: &[u8]) -> Result<Record> {
-    encoded(id, framed, Some(LEGACY))
+pub(super) fn legacy_record(id: BlobId, framed: &[u8], frame: u64) -> Result<Record> {
+    encoded(id, framed, Some(LEGACY), frame)
 }
 
-fn encoded(id: BlobId, framed: &[u8], origin: Option<Origin>) -> Result<Record> {
+fn encoded(id: BlobId, framed: &[u8], origin: Option<Origin>, frame: u64) -> Result<Record> {
     let (header, _) =
         parse(framed).ok_or_else(|| Error::Corrupt(id, "the frame does not parse".into()))?;
-    let body = zstd::bulk::compress(framed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    let crc = crc32fast::hash(&body);
+    let Encoded {
+        frame,
+        frames,
+        body,
+        crc,
+    } = encode(framed, frame)?;
     let kind = header.kind.clone();
     let encoded = body.len() as u64;
     let head = match origin {
-        None => Head::Blob {
+        None => Head::Framed {
             id,
             kind,
             len: header.len,
             encoded,
             crc,
+            frame,
+            frames,
         },
-        Some(origin) => Head::Copy {
+        Some(origin) => Head::FramedCopy {
             id,
             kind,
             len: header.len,
             encoded,
             crc,
+            frame,
+            frames,
             origin_segment: origin.segment,
             origin_at: origin.at,
         },
@@ -110,8 +154,34 @@ fn encoded(id: BlobId, framed: &[u8], origin: Option<Origin>) -> Result<Record> 
         head: head.len() as u32,
         encoded,
         crc,
+        frame,
         bytes: laid(&head, &body),
     })
+}
+
+fn encode(framed: &[u8], frame: u64) -> Result<Encoded> {
+    let mut body = Vec::new();
+    let mut frames = Vec::new();
+    for piece in framed.chunks(frame as usize) {
+        let encoded = zstd::bulk::compress(piece, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+        frames.push(Frame {
+            encoded: encoded.len() as u64,
+            crc: crc32fast::hash(piece),
+        });
+        body.extend_from_slice(&encoded);
+    }
+    let crc = crc32fast::hash(&body);
+    Ok(Encoded {
+        frame,
+        frames,
+        body,
+        crc,
+    })
+}
+
+fn reframed(id: &BlobId, kind: &str, logged: &Logged, body: &[u8], frame: u64) -> Result<Encoded> {
+    let framed = verified(id, inflated_whole(id, kind, logged, body)?)?;
+    encode(&framed, frame)
 }
 
 fn laid(head: &[u8], body: &[u8]) -> Vec<u8> {
@@ -143,9 +213,122 @@ pub(super) fn framed(
             "its record's checksum disagrees with the bytes on disk".into(),
         ));
     }
-    let framed = zstd::bulk::decompress(&body, framed_len(kind, logged.len) as usize)
-        .map_err(|error| Error::Corrupt(*id, format!("its record does not decode: {error}")))?;
+    let framed = match logged.frame {
+        0 => inflated_whole(id, kind, logged, &body)?,
+        _ => inflated_frames(file, id, logged, kind, &body)?,
+    };
     verified(id, framed)
+}
+
+pub(super) fn range(
+    file: &fs::File,
+    id: &BlobId,
+    logged: &Logged,
+    kind: &str,
+    offset: u64,
+    want: u64,
+) -> Result<Vec<u8>> {
+    let whole = framed_len(kind, logged.len);
+    let head = whole - logged.len;
+    let (start, end) = window(logged.len, offset, want);
+    let (from, to) = (head + start, head + end);
+    let unframed = logged.frame == 0;
+    if unframed {
+        let framed = framed(file, id, logged, kind, false)?;
+        return Ok(framed[from as usize..to as usize].to_vec());
+    }
+    let frames = frames_of(file, id, logged, kind)?;
+    let mut bytes = Vec::with_capacity((to - from) as usize);
+    let mut at = logged.body();
+    for (n, frame) in frames.iter().enumerate() {
+        let lo = n as u64 * logged.frame;
+        let hi = (lo + logged.frame).min(whole);
+        let touched = lo < to && from < hi;
+        if touched {
+            let mut encoded = vec![0u8; frame.encoded as usize];
+            read_at(file, &mut encoded, at)?;
+            let decoded = inflated_frame(id, n, &encoded, hi - lo, frame.crc)?;
+            let (first, last) = (from.max(lo) - lo, to.min(hi) - lo);
+            bytes.extend_from_slice(&decoded[first as usize..last as usize]);
+        }
+        at += frame.encoded;
+    }
+    Ok(bytes)
+}
+
+fn inflated_whole(id: &BlobId, kind: &str, logged: &Logged, body: &[u8]) -> Result<Vec<u8>> {
+    let framed = zstd::bulk::decompress(body, framed_len(kind, logged.len) as usize)
+        .map_err(|error| Error::Corrupt(*id, format!("its record does not decode: {error}")))?;
+    super::inflated(framed.len());
+    Ok(framed)
+}
+
+fn inflated_frames(
+    file: &fs::File,
+    id: &BlobId,
+    logged: &Logged,
+    kind: &str,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let frames = frames_of(file, id, logged, kind)?;
+    let whole = framed_len(kind, logged.len);
+    let mut framed = Vec::with_capacity(whole as usize);
+    let mut at = 0usize;
+    for (n, frame) in frames.iter().enumerate() {
+        let lo = n as u64 * logged.frame;
+        let want = (whole - lo).min(logged.frame);
+        let encoded = &body[at..at + frame.encoded as usize];
+        framed.extend(inflated_frame(id, n, encoded, want, frame.crc)?);
+        at += frame.encoded as usize;
+    }
+    Ok(framed)
+}
+
+fn inflated_frame(id: &BlobId, n: usize, encoded: &[u8], want: u64, crc: u32) -> Result<Vec<u8>> {
+    let decoded = zstd::bulk::decompress(encoded, want as usize).map_err(|error| {
+        Error::Corrupt(
+            *id,
+            format!("frame {n} of its record does not decode: {error}"),
+        )
+    })?;
+    super::inflated(decoded.len());
+    let intact = decoded.len() as u64 == want && crc32fast::hash(&decoded) == crc;
+    if !intact {
+        return Err(Error::Corrupt(
+            *id,
+            format!("frame {n} of its record disagrees with its checksum"),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn frames_of(file: &fs::File, id: &BlobId, logged: &Logged, kind: &str) -> Result<Vec<Frame>> {
+    let corrupt = |why: &str| Error::Corrupt(*id, format!("its record's frame index {why}"));
+    let laid = 4 + logged.head as usize;
+    let mut bytes = vec![0u8; laid + 4];
+    read_at(file, &mut bytes, logged.at)?;
+    let crc = u32::from_le_bytes([
+        bytes[laid],
+        bytes[laid + 1],
+        bytes[laid + 2],
+        bytes[laid + 3],
+    ]);
+    let intact = crc32fast::hash(&bytes[..laid]) == crc;
+    if !intact {
+        return Err(corrupt("disagrees with its checksum"));
+    }
+    let frames = match borsh::from_slice::<Head>(&bytes[4..laid]) {
+        Ok(Head::Framed { frames, .. } | Head::FramedCopy { frames, .. }) => frames,
+        _ => return Err(corrupt("does not decode")),
+    };
+    let whole = framed_len(kind, logged.len);
+    let counted = frames.len() as u64 == whole.div_ceil(logged.frame);
+    let sized = frames.iter().map(|frame| frame.encoded).sum::<u64>() == logged.encoded;
+    let covers = counted && sized;
+    if !covers {
+        return Err(corrupt("does not cover the blob"));
+    }
+    Ok(frames)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +340,7 @@ pub(super) struct Logged {
     crc: u32,
     kind: u32,
     len: u64,
+    frame: u64,
     origin: Origin,
 }
 
@@ -223,6 +407,7 @@ struct Segment {
     dead: u64,
     records: u64,
     tombs: u64,
+    whole: u64,
     damaged: Option<u64>,
 }
 
@@ -236,6 +421,7 @@ impl Segment {
             dead: 0,
             records: 0,
             tombs: 0,
+            whole: 0,
             damaged: None,
         }
     }
@@ -276,12 +462,37 @@ impl Plan {
                 round.spoiled.push(logged);
                 continue;
             }
-            let head = borsh::to_vec(&Head::Copy {
+            let carried = match logged.frame {
+                0 => reframed(&id, &kind, &logged, &body, copier.frame),
+                _ => frames_of(&self.file, &id, &logged, &kind).map(|frames| Encoded {
+                    frame: logged.frame,
+                    frames,
+                    body,
+                    crc: logged.crc,
+                }),
+            };
+            let Encoded {
+                frame,
+                frames,
+                body,
+                crc,
+            } = match carried {
+                Ok(carried) => carried,
+                Err(Error::Corrupt(..) | Error::Collision(_)) => {
+                    round.spoiled.push(logged);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let encoded = body.len() as u64;
+            let head = borsh::to_vec(&Head::FramedCopy {
                 id,
                 kind,
                 len: logged.len,
-                encoded: logged.encoded,
-                crc: logged.crc,
+                encoded,
+                crc,
+                frame,
+                frames,
                 origin_segment: logged.origin.segment,
                 origin_at: logged.origin.at,
             })?;
@@ -290,6 +501,9 @@ impl Plan {
                 segment,
                 at,
                 head: head.len() as u32,
+                encoded,
+                crc,
+                frame,
                 ..logged
             };
             round.records.push((id, logged, copy));
@@ -320,6 +534,7 @@ impl Round {
             crc: record.crc,
             kind: 0,
             len: record.len,
+            frame: record.frame,
             origin: LEGACY,
         };
         self.moved.push((record.id, record.kind, logged, path));
@@ -330,6 +545,7 @@ impl Round {
 pub(super) struct Copier {
     dir: PathBuf,
     segment_bytes: u64,
+    frame: u64,
     next: Arc<AtomicU64>,
     active: Option<(u64, Arc<fs::File>, u64)>,
     touched: BTreeMap<u64, (Arc<fs::File>, u64)>,
@@ -443,7 +659,7 @@ struct Found {
 }
 
 impl Log {
-    pub(super) fn open(dir: &Path, segment_bytes: u64) -> Result<(Log, Copier)> {
+    pub(super) fn open(dir: &Path, segment_bytes: u64, frame: u64) -> Result<(Log, Copier)> {
         fs::create_dir_all(dir)?;
         let mut numbers = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -508,6 +724,7 @@ impl Log {
         let copier = Copier {
             dir: dir.to_path_buf(),
             segment_bytes,
+            frame,
             next: log.next.clone(),
             active,
             touched: BTreeMap::new(),
@@ -608,7 +825,7 @@ impl Log {
                     len,
                     encoded,
                     crc,
-                } => Some((id, kind, len, encoded, crc, here)),
+                } => Some((id, kind, len, encoded, crc, 0, here)),
                 Head::Copy {
                     id,
                     kind,
@@ -622,7 +839,33 @@ impl Log {
                         segment: origin_segment,
                         at: origin_at,
                     };
-                    Some((id, kind, len, encoded, crc, origin))
+                    Some((id, kind, len, encoded, crc, 0, origin))
+                }
+                Head::Framed {
+                    id,
+                    kind,
+                    len,
+                    encoded,
+                    crc,
+                    frame,
+                    ..
+                } => Some((id, kind, len, encoded, crc, frame, here)),
+                Head::FramedCopy {
+                    id,
+                    kind,
+                    len,
+                    encoded,
+                    crc,
+                    frame,
+                    origin_segment,
+                    origin_at,
+                    ..
+                } => {
+                    let origin = Origin {
+                        segment: origin_segment,
+                        at: origin_at,
+                    };
+                    Some((id, kind, len, encoded, crc, frame, origin))
                 }
                 Head::Tomb {
                     id,
@@ -639,7 +882,7 @@ impl Log {
                     None
                 }
             };
-            if let Some((id, kind, body, encoded, crc, origin)) = blob {
+            if let Some((id, kind, body, encoded, crc, frame, origin)) = blob {
                 let kind = self.kind(&kind);
                 let logged = Logged {
                     segment: n,
@@ -649,6 +892,7 @@ impl Log {
                     crc,
                     kind,
                     len: body,
+                    frame,
                     origin,
                 };
                 found.records.push((id, logged));
@@ -748,6 +992,7 @@ impl Log {
         let segment = self.segment_mut(logged.segment);
         segment.live += logged.size();
         segment.records += 1;
+        segment.whole += u64::from(logged.frame == 0);
         if let Some(Held::Logged(old)) = self.index.insert(id, Held::Logged(logged)) {
             self.dropped(&old);
             if old.origin == logged.origin {
@@ -761,6 +1006,7 @@ impl Log {
         segment.live = segment.live.saturating_sub(old.size());
         segment.dead += old.size();
         segment.records -= 1;
+        segment.whole -= u64::from(old.frame == 0);
     }
 
     fn kill(&mut self, id: &BlobId) {
@@ -875,6 +1121,7 @@ impl Log {
             crc: record.crc,
             kind,
             len: record.len,
+            frame: record.frame,
             origin: Origin { segment, at },
         };
         self.held(record.id, logged);
@@ -958,14 +1205,18 @@ impl Log {
     }
 
     pub(super) fn worn(&self) -> Vec<u64> {
-        self.segments
+        let mut worn: Vec<(bool, u64)> = self
+            .segments
             .iter()
-            .filter(|(_, segment)| {
+            .filter(|(_, segment)| segment.damaged.is_none())
+            .filter_map(|(n, segment)| {
                 let wasted = segment.dead > 0 && segment.dead >= segment.live;
-                wasted && segment.damaged.is_none()
+                let unframed = segment.whole > 0;
+                (wasted || unframed).then_some((!wasted, *n))
             })
-            .map(|(n, _)| *n)
-            .collect()
+            .collect();
+        worn.sort_unstable();
+        worn.into_iter().map(|(_, n)| n).collect()
     }
 
     pub(super) fn plan(&mut self, n: u64, budget: u64, whole: u64) -> Result<Plan> {
@@ -1180,7 +1431,10 @@ fn whole_at(bytes: &[u8]) -> Option<()> {
         return None;
     }
     let (encoded, crc) = match head {
-        Head::Blob { encoded, crc, .. } | Head::Copy { encoded, crc, .. } => (encoded, crc),
+        Head::Blob { encoded, crc, .. }
+        | Head::Copy { encoded, crc, .. }
+        | Head::Framed { encoded, crc, .. }
+        | Head::FramedCopy { encoded, crc, .. } => (encoded, crc),
         Head::Tomb { .. } => return Some(()),
     };
     let start = head_end + 4;
@@ -1224,7 +1478,10 @@ fn next(reader: &mut BufReader<&fs::File>, at: u64, len: u64, newest: bool) -> R
         return Ok(Scanned::Short);
     };
     let (encoded, body_crc) = match &head {
-        Head::Blob { encoded, crc, .. } | Head::Copy { encoded, crc, .. } => (*encoded, *crc),
+        Head::Blob { encoded, crc, .. }
+        | Head::Copy { encoded, crc, .. }
+        | Head::Framed { encoded, crc, .. }
+        | Head::FramedCopy { encoded, crc, .. } => (*encoded, *crc),
         Head::Tomb { .. } => (0, crc32fast::hash(&[])),
     };
     let body_fits = at + 8 + u64::from(head_len) + encoded <= len;
@@ -1260,7 +1517,10 @@ pub(super) fn heads(path: &Path) -> Vec<(u64, u64)> {
         let head_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
         let head: Head = borsh::from_slice(&bytes[at + 4..at + 4 + head_len]).unwrap();
         let encoded = match head {
-            Head::Blob { encoded, .. } | Head::Copy { encoded, .. } => encoded as usize,
+            Head::Blob { encoded, .. }
+            | Head::Copy { encoded, .. }
+            | Head::Framed { encoded, .. }
+            | Head::FramedCopy { encoded, .. } => encoded as usize,
             Head::Tomb { .. } => 0,
         };
         let size = 8 + head_len + encoded;

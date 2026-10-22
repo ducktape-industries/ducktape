@@ -163,6 +163,7 @@ impl Frames {
         let want = (self.framed_len() - start).min(self.index.frame);
         let decoded = zstd::bulk::decompress(&encoded, want as usize)
             .map_err(|error| Error::Corrupt(id, format!("frame {n} does not decode: {error}")))?;
+        super::inflated(decoded.len());
         let intact = decoded.len() as u64 == want && crc32fast::hash(&decoded) == frame.crc;
         if !intact {
             return Err(Error::Corrupt(
