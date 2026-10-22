@@ -375,13 +375,16 @@ async fn adopt<E: Context>(
         block_time_ms: status.block_time_ms,
     };
     let base = source.base().to_owned();
-    let joined = statesync::join(
+    let placing =
+        crate::snapshot::Placing::new(source.clone(), workspace.dir(), workspace.runtime_dir());
+    let joined = statesync::join_with(
         context.child("join"),
         &descriptor.network,
         workspace.dir(),
         descriptor.id(),
         Duration::from_millis(descriptor.block_time_ms),
         source,
+        placing,
     )
     .await?;
     workspace.write_source(&base)?;
@@ -1772,7 +1775,7 @@ async fn applied<E: Context>(
         Some(Anchor::Finalized(certificate)) => Some(certificate.clone()),
         Some(Anchor::Genesis(_)) | None => None,
     };
-    published(node, daemon, anchor);
+    published(node, daemon, anchor.clone());
     let closes = daemon.network.closes_an_epoch(block.height);
     let replayed = matches!(sequenced, Sequenced::Replayed);
     let opens_an_epoch = !replayed && closes;
@@ -1897,7 +1900,7 @@ async fn applied<E: Context>(
     phases.seating = lap.lap();
     let follows = !validators.contains(&daemon.identity);
     if follows {
-        snapshots.take(node, block.height);
+        snapshots.take(node, block.height, anchor);
         phases.snapshotting = lap.lap();
     }
     Ok(Flow::Writing)

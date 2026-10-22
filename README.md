@@ -279,7 +279,9 @@ clones every program's
 commitment files (every runtime partition under `state::partition_prefix`)
 into the snapshot's `runtime/` and
 writes its `manifest`, a borsh `statesync::Manifest`: the tip and each
-program's sync target, the root and op range its copy opens at. The snapshot
+program's sync target, the root and op range its copy opens at. Beside it,
+`anchor` holds the borsh `statesync::Anchor` that finalized that tip, captured
+by the writer. The snapshot
 appears whole by a rename, and the node serves it from then on; a thread of
 its own, off the block CPUs, removes each older one once no download reads it,
 and the one before that even while a download reads it, so a node holds at
@@ -292,8 +294,10 @@ clears `snapshots/` and makes none until it restarts; a snapshot that fails
 logs `snapshot_failed` and leaves the one before it.
 
 `POST /v1/snapshot` answers the newest snapshot in one stream. It takes a
-borsh `noded::wire::snapshot::Ask` and answers the manifest as a length-framed
-borsh `statesync::Manifest`, then each file under the snapshot's `runtime/` in
+borsh `noded::wire::snapshot::Ask` and answers its head as a length-framed
+borsh `statesync::Head` (the manifest's tip and targets, with the certificate
+that finalized the tip, kept beside the manifest), then each file under the
+snapshot's `runtime/` in
 the order of its path, as a length-framed `wire::snapshot::Part` (its path, its
 length and where its bytes start) followed by those bytes, then an empty
 frame. A download holds the snapshot it reads, so a newer one does not remove
@@ -303,10 +307,11 @@ and that snapshot goes, and a resume downloads the newest. An `Ask` whose
 the last file a cut download holds and that file's length is answered from
 there; one naming another height gets the newest snapshot whole.
 `Client::snapshot` writes a snapshot into a directory (its `manifest` and
-`runtime/`) and resumes from whatever that directory holds. Nothing fsyncs a
+`runtime/`), resumes from whatever that directory holds and answers the head. Nothing fsyncs a
 snapshot, so a node that restarts serves its newest one only if its manifest
-decodes and names that height (`snapshot_unserved` otherwise), and removes the
-rest. A node with no snapshot refuses `not_found`.
+decodes and names that height and its anchor decodes (`snapshot_unserved`
+otherwise), and removes the rest. A snapshot left by a build that wrote no
+anchor is not served. A node with no snapshot refuses `not_found`.
 
 ```sh
 make -C programs wasm-founding                      # a programs checkout; a hosted network's is at a forge dev commit
@@ -320,8 +325,21 @@ ducktape run --listen 127.0.0.1:9000 --http 127.0.0.1:8844 --halo 0.0.0.0:9100
 Any node joins through a running one. `join` signs an enrollment with the
 node's key and sends it to the program in the validators role. Once the
 epoch that seats the node begins, `join` adopts the network's state and
-fetches every program's code, and the node runs like a founder. While it
-syncs the state, `join` holds the head it read open (`POST /v1/sync/hold`):
+fetches every program's code, and the node runs like a founder. It asks its
+source for a snapshot first: it downloads it into `joining/` in its workspace
+(a cut download resumes), moves each program's commitment files into its
+runtime storage, opens each and compares the root and op range it opens at
+with the target the snapshot's head names. A commitment that opens anywhere
+else refuses the whole snapshot before anything is adopted (a copy short of
+its newest log section opens cleanly at an older root): the join logs
+`join_snapshot_refused`, removes what it moved and syncs the state by proof, as
+it does from a source that keeps no snapshot. A snapshot sits at an epoch's
+last block, and a node that joined from one follows the blocks after it.
+Either way a join trusts its source for the state: it checks that the tip's
+certificate verifies against the validators that state records and that the
+state's `$recent` names that tip. The join does not check the adopted state
+against the next epoch's `node::Settled` record, so a source that made up a
+whole state with the right tip and validators would pass. While it syncs the state by proof, `join` holds the head it read open (`POST /v1/sync/hold`):
 the node it joins through keeps serving that head, past its own prunes, until
 the hold closes: once the state is synced, or when the hold's connection drops (the
 joiner stops, or a proxy between them closes it), so a busy network cannot

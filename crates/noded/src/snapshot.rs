@@ -1,6 +1,6 @@
-// A follower whose filesystem reflinks keeps its newest whole snapshot and serves it: at each
-// epoch's last block, unless a later epoch's last block is already finalized, the writer clones every
-// commitment file beside a manifest; a thread removes older ones, a download holding the one before.
+// Epoch snapshots keep commitment files, a manifest and the tip's anchor.
+// The writer publishes each whole snapshot; a download holds it until the download ends or two newer
+// snapshots have replaced it.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -12,17 +12,20 @@ use std::thread::JoinHandle;
 
 use arc_swap::ArcSwapOption;
 use node::Node;
-use statesync::Manifest;
+use statesync::{Anchor, Head, Manifest};
 use tokio::sync::watch;
 
 use crate::Context;
 
+mod place;
 mod stream;
 
+pub(crate) use place::Placing;
 pub(crate) use stream::{fetched, resumed, served};
 
 pub(crate) const DIR: &str = "snapshots";
 pub(crate) const MANIFEST: &str = "manifest";
+pub(crate) const ANCHOR: &str = "anchor";
 pub(crate) const RUNTIME: &str = "runtime";
 
 pub(crate) enum Refused {
@@ -43,7 +46,7 @@ pub(crate) type Served = Arc<ArcSwapOption<Kept>>;
 pub(crate) struct Kept {
     height: u64,
     dir: PathBuf,
-    manifest: Manifest,
+    head: Head,
     released: mpsc::Sender<Removal>,
     cut: watch::Receiver<u64>,
 }
@@ -66,13 +69,19 @@ impl Kept {
                 format!("its manifest names height {}", manifest.tip.height),
             ));
         }
+        let anchor: Anchor = abi::decode(&std::fs::read(dir.join(ANCHOR))?)
+            .map_err(|refusal| io::Error::new(io::ErrorKind::InvalidData, refusal.sentence))?;
         removals
             .send(Removal::Kept(height))
             .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(Kept {
             height,
             dir,
-            manifest,
+            head: Head {
+                tip: manifest.tip,
+                anchor,
+                targets: manifest.targets,
+            },
             released: removals.clone(),
             cut: cut.subscribe(),
         })
@@ -204,20 +213,28 @@ impl Snapshots {
         }
     }
 
-    pub(crate) fn take<E: Context>(&mut self, node: &Node<E>, height: u64) {
+    pub(crate) fn take<E: Context>(&mut self, node: &Node<E>, height: u64, anchor: Option<Anchor>) {
         if !self.due(height) {
             return;
         }
+        let Some(anchor) = anchor else {
+            return failed(height, "the node holds no anchor for its tip");
+        };
         let manifest = match statesync::manifest(node) {
             Ok(manifest) => manifest,
             Err(refusal) => return failed(height, &refusal.sentence),
+        };
+        let head = Head {
+            tip: manifest.tip,
+            anchor,
+            targets: manifest.targets,
         };
         let store = node.host().store();
         let prefixes: Vec<String> = store
             .programs()
             .map(|program| state::partition_prefix(&state::commitment_name(store.name(), program)))
             .collect();
-        self.keep(height, &prefixes, &manifest);
+        self.keep(height, &prefixes, &head);
     }
 
     fn due(&self, height: u64) -> bool {
@@ -225,11 +242,11 @@ impl Snapshots {
         self.able && *self.finalized.borrow() < next
     }
 
-    pub(crate) fn keep(&mut self, height: u64, prefixes: &[String], manifest: &Manifest) {
+    pub(crate) fn keep(&mut self, height: u64, prefixes: &[String], head: &Head) {
         if !self.due(height) {
             return;
         }
-        match self.written(height, prefixes, manifest) {
+        match self.written(height, prefixes, head) {
             Ok(partitions) => self.published(height, partitions),
             Err(Refused::Unsupported(error)) => self.unsupported(&error),
             Err(Refused::Failed(error)) => failed(height, &error.to_string()),
@@ -260,12 +277,7 @@ impl Snapshots {
         );
     }
 
-    fn written(
-        &self,
-        height: u64,
-        prefixes: &[String],
-        manifest: &Manifest,
-    ) -> Result<usize, Refused> {
+    fn written(&self, height: u64, prefixes: &[String], head: &Head) -> Result<usize, Refused> {
         let name = height.to_string();
         let fresh = self.dir.join(format!(".{name}"));
         removed(&fresh)?;
@@ -288,7 +300,8 @@ impl Snapshots {
             )?;
             partitions += 1;
         }
-        std::fs::write(fresh.join(MANIFEST), abi::encode(manifest))?;
+        std::fs::write(fresh.join(MANIFEST), abi::encode(&head.manifest()))?;
+        std::fs::write(fresh.join(ANCHOR), abi::encode(&head.anchor))?;
         let whole = self.dir.join(&name);
         removed(&whole)?;
         std::fs::rename(&fresh, &whole)?;

@@ -249,7 +249,7 @@ fn join_held(seat: &Seat, source: Client, gate: Arc<Gate>) -> JoinHandle<()> {
     })
 }
 
-async fn agreed(clients: &[Client]) -> Vec<u64> {
+pub(crate) async fn agreed(clients: &[Client]) -> Vec<u64> {
     let mut ticks = clients[0].changes(host::RECENT).await.unwrap();
     let mut seen: Vec<BTreeMap<u64, abi::Root>> = clients.iter().map(|_| BTreeMap::new()).collect();
     loop {

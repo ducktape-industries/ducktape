@@ -1,6 +1,6 @@
-// A kept snapshot as one answer: its manifest, then each file under its runtime in path order as a
-// header and its bytes, then an empty frame. A download writes the same tree and resumes from the
-// last file it holds, at that file's length.
+// A kept snapshot as one answer: its head (its manifest with its tip's anchor), then each file under
+// its runtime in path order as a header and its bytes, then an empty frame. A download writes the
+// same tree and resumes from the last file it holds, at that file's length.
 
 use std::cmp::Ordering;
 use std::future::Future;
@@ -14,7 +14,7 @@ use bytes::{Bytes, BytesMut};
 use futures::future::ready;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
-use statesync::Manifest;
+use statesync::{Head, Manifest};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
@@ -35,7 +35,7 @@ pub(crate) fn served(
     kept: Arc<Kept>,
     ask: Ask,
 ) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
-    let head = Bytes::from(framed(&abi::encode(&kept.manifest)));
+    let head = Bytes::from(framed(&abi::encode(&kept.head)));
     let parts = futures::stream::once(sent(kept.clone(), ask)).flat_map(|listed| match listed {
         Ok(parts) => futures::stream::iter(parts).flat_map(part).left_stream(),
         Err(error) => futures::stream::once(ready(Err(error))).right_stream(),
@@ -242,12 +242,12 @@ fn written(into: &Path) -> io::Result<Option<Manifest>> {
 pub(crate) async fn fetched(
     answer: impl Stream<Item = Result<Bytes>>,
     into: &Path,
-) -> Result<Manifest> {
+) -> Result<Head> {
     let mut answer = std::pin::pin!(answer);
     let mut fetch = Fetch {
         into: into.to_owned(),
         held: BytesMut::new(),
-        manifest: None,
+        head: None,
         writing: None,
     };
     let fetched = fetch.read(&mut answer).await;
@@ -260,7 +260,7 @@ pub(crate) async fn fetched(
 struct Fetch {
     into: PathBuf,
     held: BytesMut,
-    manifest: Option<Manifest>,
+    head: Option<Head>,
     writing: Option<Writing>,
 }
 
@@ -273,10 +273,10 @@ impl Fetch {
     async fn read(
         &mut self,
         answer: &mut (impl Stream<Item = Result<Bytes>> + Unpin),
-    ) -> Result<Manifest> {
+    ) -> Result<Head> {
         loop {
-            if let Some(manifest) = self.taken().await? {
-                return Ok(manifest);
+            if let Some(head) = self.taken().await? {
+                return Ok(head);
             }
             match answer.next().await {
                 Some(Ok(bytes)) => self.held.extend_from_slice(&bytes),
@@ -286,7 +286,7 @@ impl Fetch {
         }
     }
 
-    async fn taken(&mut self) -> Result<Option<Manifest>> {
+    async fn taken(&mut self) -> Result<Option<Head>> {
         loop {
             if let Some(writing) = &mut self.writing {
                 if writing.left == 0 {
@@ -307,24 +307,26 @@ impl Fetch {
             let Some(frame) = frame(&mut self.held)? else {
                 return Ok(None);
             };
-            match self.manifest.is_some() {
-                false => self.manifest = Some(self.settled(&frame).await?),
-                true if frame.is_empty() => return Ok(self.manifest.take()),
+            match self.head.is_some() {
+                false => self.head = Some(self.settled(&frame).await?),
+                true if frame.is_empty() => return Ok(self.head.take()),
                 true => self.writing = Some(self.opened(&frame).await?),
             }
         }
     }
 
-    async fn settled(&self, frame: &[u8]) -> Result<Manifest> {
-        let manifest: Manifest = abi::decode(frame).map_err(Error::Decode)?;
+    async fn settled(&self, frame: &[u8]) -> Result<Head> {
+        let head: Head = abi::decode(frame).map_err(Error::Decode)?;
+        let manifest = head.manifest();
         let into = self.into.clone();
         let held = crate::offload(move || written(&into)).await??;
-        if held.as_ref() != Some(&manifest) {
+        let holds_another_snapshot = held.as_ref() != Some(&manifest);
+        if holds_another_snapshot {
             cleared(&self.into.join(RUNTIME)).await?;
             tokio::fs::create_dir_all(&self.into).await?;
-            tokio::fs::write(self.into.join(MANIFEST), frame).await?;
+            tokio::fs::write(self.into.join(MANIFEST), abi::encode(&manifest)).await?;
         }
-        Ok(manifest)
+        Ok(head)
     }
 
     async fn opened(&self, frame: &[u8]) -> Result<Writing> {

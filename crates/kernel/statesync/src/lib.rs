@@ -120,6 +120,31 @@ pub trait Install: Send {
     fn install(&mut self, id: BlobId, framed: Vec<u8>) -> impl Future<Output = Result<()>> + Send;
 }
 
+pub trait Place: Send {
+    type Error: Fault;
+
+    fn place(
+        &mut self,
+        name: &str,
+    ) -> impl Future<Output = std::result::Result<Option<Head>, Self::Error>> + Send;
+
+    fn discard(&mut self) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+}
+
+pub struct Unplaced;
+
+impl Place for Unplaced {
+    type Error = Infallible;
+
+    async fn place(&mut self, _: &str) -> std::result::Result<Option<Head>, Infallible> {
+        Ok(None)
+    }
+
+    async fn discard(&mut self) -> std::result::Result<(), Infallible> {
+        Ok(())
+    }
+}
+
 pub struct Joined<E: Context> {
     pub node: Node<E>,
     pub anchor: Anchor,
@@ -133,11 +158,24 @@ pub async fn join<E: Context, X: Exchange>(
     pause: Duration,
     exchange: X,
 ) -> Result<Joined<E>> {
+    join_with(context, name, dir, network, pause, exchange, Unplaced).await
+}
+
+pub async fn join_with<E: Context, X: Exchange, P: Place>(
+    context: E,
+    name: &str,
+    dir: &Path,
+    network: Vec<u8>,
+    pause: Duration,
+    exchange: X,
+    place: P,
+) -> Result<Joined<E>> {
     let asking = Asking {
         context: context.child("ask"),
         exchange,
         pause,
     };
+    let placed = placed(&context, name, &asking, place).await?;
     adopting(
         context,
         name,
@@ -146,6 +184,7 @@ pub async fn join<E: Context, X: Exchange>(
         network,
         &asking,
         None,
+        placed,
     )
     .await
 }
@@ -193,6 +232,7 @@ pub async fn readopt<E: Context, X: Exchange>(
         network,
         &asking,
         Some(past),
+        None,
     )
     .await
 }
@@ -213,6 +253,7 @@ impl Over<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn adopting<E: Context, X: Exchange>(
     mut context: E,
     name: &str,
@@ -221,11 +262,15 @@ async fn adopting<E: Context, X: Exchange>(
     network: Vec<u8>,
     asking: &Asking<E, X>,
     past: Option<u64>,
+    mut placed: Option<Placed<E>>,
 ) -> Result<Joined<E>> {
     let mut retargets: u64 = 0;
     let mut fetched = BTreeSet::new();
     loop {
-        let (head, commitments) = adopted_head(&context, name, asking, past).await?;
+        let (head, commitments) = match placed.take() {
+            Some(placed) => placed,
+            None => adopted_head(&context, name, asking, past).await?,
+        };
         let synced = Synced {
             height: head.tip.height,
             commitments,
@@ -297,6 +342,110 @@ pub async fn fill<E: Context, X: Exchange>(
         pause,
     };
     installed(&asking, missing, install).await
+}
+
+type Placed<E> = (Head, BTreeMap<ProgramId, Commitment<E>>);
+
+async fn placed<E: Context, X: Exchange, P: Place>(
+    context: &E,
+    name: &str,
+    asking: &Asking<E, X>,
+    mut place: P,
+) -> Result<Option<Placed<E>>> {
+    let mut attempts: u64 = 0;
+    let head = loop {
+        let error = match place.place(name).await {
+            Ok(Some(head)) => break head,
+            Ok(None) => return Ok(None),
+            Err(error) => error,
+        };
+        let Failure::Transient(reason) = error.failure() else {
+            let unplaced = Unmatched {
+                reason: "snapshot_unplaced",
+                sentence: error.to_string(),
+            };
+            return refused(&mut place, unplaced).await;
+        };
+        asking.waited(reason, &mut attempts).await;
+    };
+    let anchor_names_the_tip = head.anchor.names(head.tip);
+    if !anchor_names_the_tip {
+        let unanchored = Unmatched {
+            reason: "snapshot_unanchored",
+            sentence: format!(
+                "the snapshot's anchor does not name its tip at {}",
+                head.tip.height
+            ),
+        };
+        return refused(&mut place, unanchored).await;
+    }
+    let commitments = match opened(context, name, &head.targets).await {
+        Ok(commitments) => commitments,
+        Err(unmatched) => return refused(&mut place, unmatched).await,
+    };
+    tracing::info!(
+        target: "ducktape::sync",
+        event = "join_snapshot_opened",
+        height = head.tip.height,
+        programs = commitments.len(),
+        "every commitment of the source's snapshot opens at the target its head names; the join adopts them"
+    );
+    Ok(Some((head, commitments)))
+}
+
+struct Unmatched {
+    reason: &'static str,
+    sentence: String,
+}
+
+async fn refused<P: Place, T>(place: &mut P, unmatched: Unmatched) -> Result<Option<T>> {
+    tracing::warn!(
+        target: "ducktape::sync",
+        event = "join_snapshot_refused",
+        reason = unmatched.reason,
+        sentence = %unmatched.sentence,
+        "the join refuses its source's snapshot, removes what it placed and syncs the state by proof"
+    );
+    place
+        .discard()
+        .await
+        .map_err(|error| Error::Exchange(Box::new(error)))?;
+    Ok(None)
+}
+
+async fn opened<E: Context>(
+    context: &E,
+    name: &str,
+    targets: &BTreeMap<ProgramId, SyncTarget>,
+) -> std::result::Result<BTreeMap<ProgramId, Commitment<E>>, Unmatched> {
+    let mut commitments = BTreeMap::new();
+    for (program, target) in targets {
+        let unopened = |error: state::Error| Unmatched {
+            reason: "snapshot_unopened",
+            sentence: format!("{program}: {error}"),
+        };
+        let commitment = Commitment::open(
+            context
+                .child("snapshot")
+                .with_attribute("program", program.as_str()),
+            &commitment_name(name, program),
+            0,
+        )
+        .await
+        .map_err(unopened)?;
+        let opened_at = commitment.target().map_err(unopened)?;
+        let at_the_heads_target = opened_at.as_ref() == Some(target);
+        if !at_the_heads_target {
+            return Err(Unmatched {
+                reason: "snapshot_target",
+                sentence: format!(
+                    "{program} opens at {opened_at:?}, and the snapshot's head names {target:?}"
+                ),
+            });
+        }
+        commitments.insert(program.clone(), commitment);
+    }
+    Ok(commitments)
 }
 
 async fn adopted_head<E: Context, X: Exchange>(
@@ -640,6 +789,11 @@ impl<E: Context, X: Exchange> Asking<E, X> {
         let Failure::Transient(reason) = error.failure() else {
             return Err(Error::Exchange(Box::new(error)));
         };
+        self.waited(reason, attempts).await;
+        Ok(())
+    }
+
+    async fn waited(&self, reason: &'static str, attempts: &mut u64) {
         *attempts += 1;
         let worth_a_line = *attempts == 1 || attempts.is_multiple_of(ATTEMPTS_PER_LINE);
         if worth_a_line {
@@ -652,6 +806,5 @@ impl<E: Context, X: Exchange> Asking<E, X> {
             );
         }
         self.context.sleep(self.pause).await;
-        Ok(())
     }
 }

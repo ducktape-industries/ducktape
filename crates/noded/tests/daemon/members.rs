@@ -215,11 +215,99 @@ fn a_resident_snapshots_each_epoch_where_its_directory_clones_and_a_validator_ne
         height >= closing && (height + 1).is_multiple_of(EPOCH_LENGTH),
         "the download is at {height}, after {closing}"
     );
-    opens_at_its_targets(&into.join("runtime"), downloaded);
+    assert!(
+        downloaded.anchor.names(downloaded.tip),
+        "the download's anchor names its tip"
+    );
+    opens_at_its_targets(&into.join("runtime"), downloaded.manifest());
 }
 
 #[cfg(target_os = "linux")]
-async fn fetched_snapshot(client: &Client, into: &Path) -> statesync::Manifest {
+#[test]
+fn a_node_joining_through_a_resident_that_clones_adopts_its_snapshot_and_agrees_with_the_chain() {
+    apart!();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let mut resident = Seat::new(root.path(), "n1");
+    resident.address = None;
+    let mut joiner = Seat::new(root.path(), "n2");
+    joiner.address = None;
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    seat.init(&founding);
+    let cloning = clones(root.path());
+    let live = seat.start();
+    let client = live.client.clone();
+    let runtime = client_runtime();
+    resident.join(&client);
+    let follower = resident.start();
+    let served = runtime.block_on(async {
+        let joined = follower.client.status().await.unwrap().height;
+        reach(&follower.client, joined + EPOCH_LENGTH).await;
+        match cloning {
+            true => Some(fetched_snapshot(&follower.client, &root.path().join("served")).await),
+            false => None,
+        }
+    });
+    joiner.join(&follower.client);
+    let opened: Vec<String> = logs()
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("join_snapshot_opened"))
+        .collect();
+    assert!(
+        !joiner.workspace.dir().join("joining").exists(),
+        "the join left its download"
+    );
+    let anchor = joiner.workspace.anchor().unwrap();
+    let consensus::Anchor::Finalized(certificate) = &anchor else {
+        panic!("the join adopted a finalized tip")
+    };
+    let id = certificate.proposal.payload.0;
+    let started = joiner.start();
+    let adopted = runtime.block_on(async {
+        let ask = noded::wire::BlockAsk {
+            by: noded::wire::BlockRef::Id(id),
+            most: 0,
+        };
+        let adopted = client.block(ask).await.unwrap().unwrap().height;
+        crate::load::agreed(&[client.clone(), started.client.clone()]).await;
+        for (seat, node) in [(&seat, &live), (&resident, &follower), (&joiner, &started)] {
+            seat.admin(&node.client, Admin::Shutdown).await;
+        }
+        adopted
+    });
+    for node in [live, follower, started] {
+        node.thread.join().unwrap();
+    }
+    let Some(served) = served else {
+        println!(
+            "{} does not clone: the resident keeps no snapshot and the join synced by proof to {adopted}",
+            root.path().display()
+        );
+        assert!(opened.is_empty(), "{opened:?}");
+        return;
+    };
+    println!(
+        "{} clones: the join adopted the resident's snapshot at {adopted}",
+        root.path().display()
+    );
+    let opened_at_the_adopted_tip = format!(" height={adopted} ");
+    let [line] = opened.as_slice() else {
+        panic!("the join opened one snapshot: {opened:?}");
+    };
+    assert!(
+        line.contains(&opened_at_the_adopted_tip),
+        "{adopted}: {line}"
+    );
+    assert!(
+        adopted >= served.tip.height,
+        "the join adopted {adopted}, before the snapshot the resident served at {}",
+        served.tip.height
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn fetched_snapshot(client: &Client, into: &Path) -> statesync::Head {
     let mut blocks = client.changes(host::RECENT).await.unwrap();
     loop {
         match client.snapshot(into).await {

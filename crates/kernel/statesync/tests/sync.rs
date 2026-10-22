@@ -15,7 +15,7 @@ use commonware_consensus::simplex::types::{Finalization, Finalize, Proposal};
 use commonware_consensus::types::{Epoch, Round, View};
 use commonware_cryptography::{Digestible as _, Signer as _, ed25519, sha256};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Clock as _, Runner as _, Storage as _, Supervisor as _, deterministic};
 use commonware_utils::iter::NonEmpty;
 use consensus::{Certificate, validators_of};
 use fixture_probe::Step;
@@ -26,7 +26,8 @@ use host::{Founding, Genesis, Layer, Limits, Tip};
 use node::{Block, Frame, Node, Sequenced};
 use state::{Storage, Store};
 use statesync::{
-    Anchor, Anchors, Error, Exchange, Failure, Fault, Request, Response, anchored, join, serve,
+    Anchor, Anchors, Error, Exchange, Failure, Fault, Request, Response, anchored, join, join_with,
+    serve,
 };
 
 const NETWORK: &[u8] = b"sync";
@@ -2265,5 +2266,261 @@ fn a_release_that_lands_while_a_join_holds_its_head_leaves_the_join_on_that_head
         assert_eq!(unserved, vec![part(b"released")]);
         assert_eq!(filling.installed, vec![part(b"kept")]);
         assert!(!joined.node.host().blobs().has(&part(b"released")));
+    });
+}
+
+struct Snapshot {
+    context: Ctx,
+    name: &'static str,
+    head: statesync::Head,
+    discards: Arc<AtomicUsize>,
+}
+
+impl statesync::Place for Snapshot {
+    type Error = Infallible;
+
+    async fn place(&mut self, _: &str) -> Result<Option<statesync::Head>, Infallible> {
+        Ok(Some(self.head.clone()))
+    }
+
+    async fn discard(&mut self) -> Result<(), Infallible> {
+        self.discards.fetch_add(1, Ordering::SeqCst);
+        for program in self.head.targets.keys() {
+            let name = state::commitment_name(self.name, program);
+            let prefix = state::partition_prefix(&name);
+            for partition in PARTITIONS {
+                let partition = format!("{prefix}{partition}");
+                match self.context.remove(&partition, None).await {
+                    Ok(()) | Err(commonware_runtime::Error::PartitionMissing(_)) => {}
+                    Err(error) => panic!("{partition} is not removed: {error}"),
+                }
+            }
+            let context = self
+                .context
+                .child("discarded")
+                .with_attribute("program", program.as_str());
+            let emptied = state::Commitment::open(context, &name, 0).await.unwrap();
+            assert_eq!(emptied.height().await.unwrap(), None);
+            emptied.into_db().unwrap().destroy().await.unwrap();
+        }
+        Ok(())
+    }
+}
+
+const PARTITIONS: [&str; 8] = [
+    "merkle-journal",
+    "merkle-journal-blobs",
+    "merkle-journal-metadata",
+    "merkle-meta",
+    "log_data",
+    "log_offsets",
+    "log_offsets-blobs",
+    "log_offsets-metadata",
+];
+
+async fn snapshot_of(
+    context: &Ctx,
+    network: &Network,
+    name: &'static str,
+    short: Option<&str>,
+) -> Snapshot {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let statesync::Joined { node, anchor, .. } = join(
+        context.child("snapshot"),
+        name,
+        elsewhere.path(),
+        NETWORK.to_vec(),
+        PAUSE,
+        network.exchange(),
+    )
+    .await
+    .unwrap();
+    let manifest = statesync::manifest(&node).unwrap();
+    drop(node);
+    if let Some(program) = short {
+        let prefix = state::partition_prefix(&state::commitment_name(name, program));
+        let log = format!("{prefix}log_data");
+        let mut sections = context.scan(&log).await.unwrap();
+        sections.sort();
+        assert!(
+            sections.len() > 1,
+            "{program}'s log holds {} sections",
+            sections.len()
+        );
+        let newest = sections.pop().unwrap();
+        context.remove(&log, Some(newest.as_slice())).await.unwrap();
+    }
+    Snapshot {
+        context: context.child("discards"),
+        name,
+        head: statesync::Head {
+            tip: manifest.tip,
+            anchor,
+            targets: manifest.targets,
+        },
+        discards: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+#[test]
+fn a_join_adopts_a_snapshot_that_opens_at_its_head_with_no_proof_and_applies_the_blocks_after_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        network
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
+            .await;
+        let snapshot = snapshot_of(&context, &network, "joiner", None).await;
+        let placed = snapshot.head.tip;
+        let tip = network
+            .advance(vec![frame(&key(11), vec![set(b"b", b"2")])])
+            .await;
+        assert!(tip.height > placed.height);
+
+        let proofs = Arc::new(AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let mut joined = join_with(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            network.counting(&proofs, usize::MAX),
+            snapshot,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            proofs.load(Ordering::SeqCst),
+            0,
+            "the join asked for probe's proofs"
+        );
+        assert_eq!(joined.node.tip().unwrap(), placed);
+
+        caught_up(&mut joined.node, &network.source).await;
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+        let read = joined
+            .node
+            .view(Layer::Confirmed)
+            .get("probe", b"b")
+            .unwrap();
+        assert_eq!(read, Some(b"2".to_vec()));
+    });
+}
+
+#[test]
+fn a_join_refuses_a_snapshot_short_of_its_newest_log_section_and_syncs_the_state_by_proof() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let section = state::Tuning::default().items_per_section.get() as usize;
+        let frames = (0..2 * section / 64)
+            .map(|n| {
+                let steps = (0..64)
+                    .map(|i| set(format!("{n}-{i}").as_bytes(), b"1"))
+                    .collect();
+                frame(&key(11), steps)
+            })
+            .collect();
+        let tip = network.advance(frames).await;
+        let snapshot = snapshot_of(&context, &network, "joiner", Some("probe")).await;
+        let named = snapshot.head.targets["probe"].clone();
+        let short = state::Commitment::open(
+            context.child("short"),
+            &state::commitment_name("joiner", "probe"),
+            0,
+        )
+        .await
+        .map(|commitment| commitment.target().unwrap());
+        let opens_at_the_heads_target = matches!(&short, Ok(Some(target)) if *target == named);
+        assert!(
+            !opens_at_the_heads_target,
+            "the short copy opens at the snapshot's target"
+        );
+        let discards = snapshot.discards.clone();
+
+        let proofs = Arc::new(AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join_with(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            network.counting(&proofs, usize::MAX),
+            snapshot,
+        )
+        .await
+        .unwrap();
+        assert_eq!(discards.load(Ordering::SeqCst), 1);
+        assert!(
+            proofs.load(Ordering::SeqCst) > 0,
+            "the join synced probe by proof"
+        );
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+    });
+}
+
+#[test]
+fn a_join_refuses_a_snapshot_whose_copy_opens_cleanly_at_an_older_root_than_its_head_names() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        network
+            .advance(vec![frame(&key(11), vec![set(b"a", b"1")])])
+            .await;
+        let mut snapshot = snapshot_of(&context, &network, "joiner", None).await;
+        let copied = snapshot.head.targets["probe"].clone();
+        let tip = network
+            .advance(vec![frame(&key(11), vec![set(b"a", b"2")])])
+            .await;
+        let Ok(Response::Head(later)) = network.exchange().exchange(Request::Head).await else {
+            panic!("the source answers its head");
+        };
+        assert_eq!(later.tip, tip);
+        let named = later.targets["probe"].clone();
+        assert_ne!(copied, named, "probe's root moved with the later block");
+        snapshot.head = later;
+        let opened = state::Commitment::open(
+            context.child("older"),
+            &state::commitment_name("joiner", "probe"),
+            0,
+        )
+        .await
+        .expect("the copy opens cleanly")
+        .target()
+        .unwrap();
+        assert_eq!(
+            opened,
+            Some(copied),
+            "the copy opens at the root it was copied at"
+        );
+        let discards = snapshot.discards.clone();
+
+        let proofs = Arc::new(AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join_with(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            network.counting(&proofs, usize::MAX),
+            snapshot,
+        )
+        .await
+        .unwrap();
+        assert_eq!(discards.load(Ordering::SeqCst), 1);
+        assert!(
+            proofs.load(Ordering::SeqCst) > 0,
+            "the join synced probe by proof"
+        );
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+        let read = joined
+            .node
+            .view(Layer::Confirmed)
+            .get("probe", b"a")
+            .unwrap();
+        assert_eq!(read, Some(b"2".to_vec()));
     });
 }

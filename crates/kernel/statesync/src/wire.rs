@@ -44,6 +44,15 @@ pub struct Manifest {
     pub targets: BTreeMap<ProgramId, SyncTarget>,
 }
 
+impl Head {
+    pub fn manifest(&self) -> Manifest {
+        Manifest {
+            tip: self.tip,
+            targets: self.targets.clone(),
+        }
+    }
+}
+
 impl BorshSerialize for Head {
     fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         write_tip(&self.tip, writer)?;

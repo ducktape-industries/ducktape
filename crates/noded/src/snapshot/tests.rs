@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,11 +11,12 @@ use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use futures::{Stream, StreamExt as _};
 use host::Tip;
 use state::{Commitment, Storage, Store, Writes, commitment_name};
-use statesync::Manifest;
+use statesync::{Anchor, Head, Manifest};
 
+use super::place::{discarded, moved};
 use super::{
-    DIR, Kept, MANIFEST, RUNTIME, Reflink, Refused, Removals, Snapshots, fetched, resumed, served,
-    swept,
+    ANCHOR, DIR, Kept, MANIFEST, RUNTIME, Reflink, Refused, Removals, Snapshots, fetched, resumed,
+    served, swept,
 };
 use crate::wire::snapshot::{Ask, Part, Resume};
 
@@ -129,7 +130,12 @@ fn a_snapshot_opens_at_the_targets_its_manifest_names_and_only_the_newest_is_kep
                 let closes = height % 8 == 7;
                 if closes {
                     let manifest = manifest_of(&store, height);
-                    snapshots.keep(height, &prefixes(), &manifest);
+                    let head = Head {
+                        tip: manifest.tip,
+                        anchor: anchor(),
+                        targets: manifest.targets.clone(),
+                    };
+                    snapshots.keep(height, &prefixes(), &head);
                     kept.push(manifest);
                 }
             }
@@ -205,12 +211,12 @@ fn a_follower_replaying_finalized_epochs_clones_nothing_until_it_reaches_the_new
     let boundaries = (1..=8).map(|epoch| epoch * EPOCH - 1);
     let mut cloned = Vec::new();
     for boundary in boundaries {
-        kept.keep(boundary, &prefixes(), &empty_manifest(boundary));
+        kept.keep(boundary, &prefixes(), &empty_head(boundary));
         cloned.push(CLONED.load(Ordering::SeqCst));
     }
     assert_eq!(cloned, [0, 0, 0, 0, 0, 0, 0, 1]);
     finalized.send_replace(9 * EPOCH);
-    kept.keep(9 * EPOCH - 1, &prefixes(), &empty_manifest(9 * EPOCH - 1));
+    kept.keep(9 * EPOCH - 1, &prefixes(), &empty_head(9 * EPOCH - 1));
     assert_eq!(CLONED.load(Ordering::SeqCst), 2);
     drop(kept);
     assert_eq!(listed(&snapshots_dir), [(9 * EPOCH - 1).to_string()]);
@@ -237,6 +243,18 @@ fn empty_manifest(height: u64) -> Manifest {
     }
 }
 
+fn anchor() -> Anchor {
+    Anchor::Genesis(node::Block::genesis(b"snapshot", 0))
+}
+
+fn empty_head(height: u64) -> Head {
+    Head {
+        tip: empty_manifest(height).tip,
+        anchor: anchor(),
+        targets: BTreeMap::new(),
+    }
+}
+
 static UNSUPPORTED: AtomicUsize = AtomicUsize::new(0);
 
 fn unsupported(_: &File, _: &File) -> Result<(), Refused> {
@@ -257,8 +275,8 @@ fn a_node_whose_filesystem_does_not_reflink_keeps_no_snapshot_and_asks_once() {
     partition_with_a_file(&runtime);
     let snapshots_dir = temp.path().join(DIR);
     let mut kept = snapshots(&snapshots_dir, &runtime, unsupported);
-    kept.keep(7, &prefixes(), &empty_manifest(7));
-    kept.keep(15, &prefixes(), &empty_manifest(15));
+    kept.keep(7, &prefixes(), &empty_head(7));
+    kept.keep(15, &prefixes(), &empty_head(15));
     assert!(kept.removals.served().load_full().is_none());
     drop(kept);
     assert_eq!(UNSUPPORTED.load(Ordering::SeqCst), 1);
@@ -271,8 +289,8 @@ fn a_snapshot_that_fails_leaves_the_one_before_it_whole() {
     let runtime = temp.path().join("runtime");
     partition_with_a_file(&runtime);
     let snapshots_dir = temp.path().join(DIR);
-    snapshots(&snapshots_dir, &runtime, copied).keep(7, &prefixes(), &empty_manifest(7));
-    snapshots(&snapshots_dir, &runtime, failing).keep(15, &prefixes(), &empty_manifest(15));
+    snapshots(&snapshots_dir, &runtime, copied).keep(7, &prefixes(), &empty_head(7));
+    snapshots(&snapshots_dir, &runtime, failing).keep(15, &prefixes(), &empty_head(15));
     let before = snapshots_dir.join("7");
     let written: Manifest = abi::decode(&std::fs::read(before.join(MANIFEST)).unwrap()).unwrap();
     assert_eq!(written, empty_manifest(7));
@@ -304,6 +322,7 @@ fn written_snapshot(dir: &Path, height: u64) {
         abi::encode(&empty_manifest(height)),
     )
     .unwrap();
+    std::fs::write(snapshot.join(ANCHOR), abi::encode(&anchor())).unwrap();
 }
 
 fn files() -> BTreeMap<String, Vec<u8>> {
@@ -372,12 +391,15 @@ async fn a_download_cut_at_any_byte_resumes_to_the_snapshot_byte_for_byte() {
         let resume = resumed(&into).await.unwrap();
         let rest = answered(kept.clone(), Ask { resume }).await;
         assert!(rest.len() <= whole.len(), "a resume at {cut} asks for more");
-        let manifest = fetched(pieces(&rest, rest.len()), &into).await.unwrap();
+        let manifest = fetched(pieces(&rest, rest.len()), &into)
+            .await
+            .unwrap()
+            .manifest();
         assert_eq!(manifest, empty_manifest(7), "cut at {cut}");
         assert_eq!(tree(&into.join(RUNTIME)), files(), "cut at {cut}");
     }
     let into = temp.path().join("whole");
-    let manifest = fetched(pieces(&whole, 3), &into).await.unwrap();
+    let manifest = fetched(pieces(&whole, 3), &into).await.unwrap().manifest();
     assert_eq!(manifest, empty_manifest(7));
     assert_eq!(tree(&into.join(RUNTIME)), files());
     let written: Manifest = abi::decode(&std::fs::read(into.join(MANIFEST)).unwrap()).unwrap();
@@ -411,7 +433,7 @@ async fn a_download_that_holds_every_file_is_sent_no_byte_of_them_again() {
         from: len,
     };
     let only_the_ends = [
-        framed(&abi::encode(&empty_manifest(7))),
+        framed(&abi::encode(&empty_head(7))),
         framed(&abi::encode(&header)),
         vec![0; 4],
     ]
@@ -430,7 +452,7 @@ async fn a_snapshot_a_download_reads_stays_until_its_answer_ends_and_goes_then()
     let kept = snapshots.removals.served().load_full().unwrap();
     let mut answer = Box::pin(served(kept, Ask::default()));
     let head = answer.next().await.unwrap().unwrap();
-    snapshots.keep(15, &prefixes(), &empty_manifest(15));
+    snapshots.keep(15, &prefixes(), &empty_head(15));
     snapshots.removals.settled();
     assert_eq!(listed(&snapshots_dir), ["15", "7"]);
     let serving = snapshots.removals.served().load_full().unwrap();
@@ -439,7 +461,7 @@ async fn a_snapshot_a_download_reads_stays_until_its_answer_ends_and_goes_then()
     let into = temp.path().join("into");
     let read = futures::stream::once(async { Ok(head) })
         .chain(answer.map(|piece| piece.map_err(crate::Error::from)));
-    let manifest = fetched(read, &into).await.unwrap();
+    let manifest = fetched(read, &into).await.unwrap().manifest();
     assert_eq!(manifest, empty_manifest(7));
     assert_eq!(tree(&into.join(RUNTIME)), files());
     snapshots.removals.settled();
@@ -459,12 +481,15 @@ async fn a_download_resumed_after_a_newer_snapshot_took_over_holds_the_newer_one
     let into = temp.path().join("into");
     let short = fetched(pieces(&whole[..whole.len() / 2], 7), &into).await;
     assert!(short.is_err());
-    snapshots.keep(15, &prefixes(), &empty_manifest(15));
+    snapshots.keep(15, &prefixes(), &empty_head(15));
     let resume = resumed(&into).await.unwrap();
     assert_eq!(resume.as_ref().map(|resume| resume.height), Some(7));
     let newer = snapshots.removals.served().load_full().unwrap();
     let rest = answered(newer, Ask { resume }).await;
-    let manifest = fetched(pieces(&rest, rest.len()), &into).await.unwrap();
+    let manifest = fetched(pieces(&rest, rest.len()), &into)
+        .await
+        .unwrap()
+        .manifest();
     assert_eq!(manifest, empty_manifest(15));
     let held = BTreeMap::from([(format!("{}/0000", partition()), b"ops".to_vec())]);
     assert_eq!(tree(&into.join(RUNTIME)), held);
@@ -497,14 +522,14 @@ async fn a_stalled_download_is_cut_once_two_newer_snapshots_land_and_its_snapsho
         read[2].len(),
         2 * unit + 1
     );
-    snapshots.keep(15, &prefixes(), &empty_manifest(15));
+    snapshots.keep(15, &prefixes(), &empty_head(15));
     snapshots.removals.settled();
     assert_eq!(
         listed(&snapshots_dir),
         ["15", "7"],
         "the one before the newest stays"
     );
-    snapshots.keep(23, &prefixes(), &empty_manifest(23));
+    snapshots.keep(23, &prefixes(), &empty_head(23));
     snapshots.removals.settled();
     assert_eq!(
         listed(&snapshots_dir),
@@ -534,7 +559,10 @@ async fn a_stalled_download_is_cut_once_two_newer_snapshots_land_and_its_snapsho
     );
     let newest = snapshots.removals.served().load_full().unwrap();
     let whole = answered(newest, Ask { resume }).await;
-    let manifest = fetched(pieces(&whole, whole.len()), &into).await.unwrap();
+    let manifest = fetched(pieces(&whole, whole.len()), &into)
+        .await
+        .unwrap()
+        .manifest();
     assert_eq!(manifest, empty_manifest(23));
 }
 
@@ -548,7 +576,7 @@ async fn a_download_refuses_a_header_longer_than_a_node_message_before_buffering
         matches!(refused, Err(crate::Error::Decode(_))),
         "{refused:?}"
     );
-    let header = [framed(&abi::encode(&empty_manifest(7))), past.to_vec()].concat();
+    let header = [framed(&abi::encode(&empty_head(7))), past.to_vec()].concat();
     let refused = fetched(pieces(&header, header.len()), &into).await;
     assert!(
         matches!(refused, Err(crate::Error::Decode(_))),
@@ -566,7 +594,7 @@ async fn a_download_refuses_a_file_named_outside_its_directory() {
             from: 0,
         };
         let answer = [
-            framed(&abi::encode(&empty_manifest(7))),
+            framed(&abi::encode(&empty_head(7))),
             framed(&abi::encode(&header)),
             b"x".to_vec(),
             vec![0; 4],
@@ -601,6 +629,54 @@ fn a_restarted_node_serves_its_newest_snapshot_whose_manifest_reads_as_its_own_a
     let removals = Removals::start(dir.clone()).unwrap();
     let kept = removals.served().load_full().unwrap();
     assert_eq!(kept.height, 9);
-    assert_eq!(kept.manifest, empty_manifest(9));
+    assert_eq!(kept.head.manifest(), empty_manifest(9));
     assert_eq!(listed(&dir), ["9"]);
+}
+
+fn file_at(path: PathBuf, bytes: &[u8]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn a_placed_snapshot_replaces_the_commitments_it_names_in_the_runtime_and_a_discard_removes_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("joining");
+    let runtime = temp.path().join("runtime");
+    let prefixes = prefixes();
+    let downloaded = staging.join(RUNTIME);
+    file_at(
+        downloaded.join(format!("{}log", prefixes[0])).join("0000"),
+        b"the snapshot's",
+    );
+    file_at(downloaded.join("unnamed-log").join("0000"), b"no program's");
+    file_at(staging.join(MANIFEST), b"manifest");
+    file_at(
+        runtime.join(format!("{}log", prefixes[0])).join("0001"),
+        b"an earlier join's",
+    );
+    file_at(
+        runtime
+            .join(format!("{}merkle-meta", prefixes[1]))
+            .join("0"),
+        b"an earlier join's",
+    );
+    file_at(runtime.join("elsewhere").join("0"), b"the node's");
+
+    moved(&staging, &runtime, &prefixes).unwrap();
+    assert!(!staging.exists(), "the download stays after its move");
+    let placed = BTreeMap::from([
+        (
+            format!("{}log/0000", prefixes[0]),
+            b"the snapshot's".to_vec(),
+        ),
+        ("elsewhere/0".to_owned(), b"the node's".to_vec()),
+    ]);
+    assert_eq!(tree(&runtime), placed);
+
+    file_at(staging.join(MANIFEST), b"a later download");
+    discarded(&staging, &runtime, &prefixes).unwrap();
+    assert!(!staging.exists(), "the download stays after a discard");
+    let left = BTreeMap::from([("elsewhere/0".to_owned(), b"the node's".to_vec())]);
+    assert_eq!(tree(&runtime), left);
 }

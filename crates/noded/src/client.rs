@@ -253,7 +253,7 @@ impl Client {
         self.post(route::ACTIVITY, query).await
     }
 
-    pub async fn snapshot(&self, into: &std::path::Path) -> Result<statesync::Manifest> {
+    pub async fn snapshot(&self, into: &std::path::Path) -> Result<statesync::Head> {
         let resume = crate::snapshot::resumed(into).await?;
         let ask = crate::wire::snapshot::Ask { resume };
         let response = self
