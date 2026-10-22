@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs, logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends or a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane run again on each Preview forge-reach asks the service's account for again, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, and `server.py fetch` is each pod's input fetcher.
 import base64
 import binascii
@@ -158,6 +158,13 @@ CHUNK = "chunk"
 CHUNK_SIZE = 1 << 20
 EGRESS = "egress"
 FORGE_REACH = "forge-reach"
+IDENTITY = "identity"
+USER_KEY = "ducktape-user-key-v1:"
+USER_KEY_LEN = 16 + 12 + 24 + 32 + 32 + 16
+PUBKEY_AT = 16 + 12 + 24
+LANE_CONTEXT = "build.sh#lane"
+RERUN = "rerun-"
+WANTED_KEYS = b"w/".hex()
 REPORT_LINE = "ducktape-report "
 FILES_LINE = "ducktape-files "
 REPORT_STATES = {"passed": 1, "failed": 2}
@@ -827,6 +834,12 @@ class Signer:
 
     def query(self, program, request):
         return run([*self.ducktape, "query", program, "--raw"], stdin=request, env=self.env())
+
+    def key(self):
+        return public_key((self.keys / "key").read_text())
+
+    def follow(self, program):
+        return subprocess.Popen([*self.ducktape, "changes", program], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env())
 
 
 def plain_words(script):
@@ -1887,6 +1900,62 @@ def reports_of(reply):
             reader.bytes()
         found.append((context, url))
     return found, reader.bytes() if reader.u8() == 1 else None
+
+
+def public_key(line):
+    text = line.strip()
+    body = text.removeprefix(USER_KEY)
+    try:
+        blob = base64.b64decode(body + "=" * (-len(body) % 4), altchars=b"-_", validate=True) if text.startswith(USER_KEY) else b""
+    except (binascii.Error, ValueError):
+        blob = b""
+    if len(blob) != USER_KEY_LEN:
+        raise Refused(500, f"the service's key is not a {USER_KEY} key")
+    return blob[PUBKEY_AT : PUBKEY_AT + 32]
+
+
+def identity_of_key(key):
+    return u8(0) + borsh_bytes(key)
+
+
+def account_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != 0:
+        raise Refused(502, "identity answered OfKey with something else")
+    return reader.u64() if reader.u8() == 1 else None
+
+
+def reach_wanted(reporter, after):
+    return u8(2) + u64(reporter) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+
+
+def wanted_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != 2:
+        raise Refused(502, "forge-reach answered Wanted with something else")
+    reader.u64()
+    rows = []
+    for _ in range(int.from_bytes(reader.take(4), "little")):
+        repo = reader.bytes().decode(errors="replace")
+        n = reader.u64()
+        commit = reader.bytes().decode(errors="replace")
+        context = reader.bytes().decode(errors="replace")
+        rows.append({"repo": repo, "n": n, "commit": commit, "context": context})
+    return rows, reader.bytes() if reader.u8() == 1 else None
+
+
+def rerun_key(repo, commit):
+    return RERUN + hashlib.sha256(f"{repo}\n{commit}".encode()).hexdigest()
+
+
+def rerun_command(row):
+    room = f"forge:{row['repo']}:{row['n']}"
+    return ["sh", BUILD_SH, f"JOB={room}", f"NOTIFY={room}", row["repo"], row["commit"], "lane"]
+
+
+def wanted_at(line):
+    words = line.decode(errors="replace").rstrip("\r\n").split("\t")
+    return words[0] if len(words) == 3 and words[1].startswith(WANTED_KEYS) else None
 
 
 def run_lines(stream):
@@ -3169,6 +3238,8 @@ class Notifier:
                 return
             with self.lock:
                 for key, value in kept.items():
+                    if key.startswith(RERUN):
+                        continue
                     record = json.loads(value)
                     if "why" in record:
                         self.pending[key] = record
@@ -3257,6 +3328,118 @@ class Notifier:
             time.sleep(WATCH_PAUSE)
 
 
+class Rerunner:
+    def __init__(self, signer, kube, launch, retry_pause):
+        self.signer = signer
+        self.kube = kube
+        self.launch = launch
+        self.retry_pause = retry_pause
+        self.reporter = None
+        self.pause = time.sleep
+
+    def asked(self, program, request):
+        ran = self.signer.query(program, request)
+        why = failed(ran)
+        if why is None:
+            return ran.out
+        if unanswered(why):
+            raise Unanswered(why)
+        raise Refused(502, f"{program} was not asked: {why}")
+
+    def identify(self):
+        key = self.signer.key()
+        pause = self.retry_pause
+        attempts = 0
+        while True:
+            try:
+                return account_of(self.asked(IDENTITY, identity_of_key(key)))
+            except Unanswered as why:
+                attempts += 1
+                if attempts & (attempts - 1) == 0:
+                    say("pods_retried", attempts=attempts, reason="node_unanswered", detail=json.dumps(str(why)))
+                self.pause(pause)
+                pause *= 2
+
+    def wanted(self):
+        rows, after = [], None
+        while True:
+            found, after = wanted_of(self.asked(FORGE_REACH, reach_wanted(self.reporter, after)))
+            rows += found
+            if after is None:
+                return rows
+
+    def keep(self, changes):
+        ran = self.kube.kept_change(changes)
+        if ran.code != 0:
+            say("pods_unkept", reason="kubectl_failed", keys=len(changes), detail=json.dumps(ran.err or f"kubectl exited {ran.code}"))
+        return ran.code == 0
+
+    def settle(self):
+        rows = {rerun_key(row["repo"], row["commit"]): row for row in self.wanted() if row["context"] == LANE_CONTEXT and FULL_COMMIT.fullmatch(row["commit"])}
+        kept = self.kube.kept_load()
+        gone = {key: None for key in kept if key.startswith(RERUN) and key not in rows}
+        if gone:
+            self.keep(gone)
+        for key, row in rows.items():
+            if key not in kept:
+                self.rerun(key, row)
+
+    def rerun(self, key, row):
+        record = {"repo": row["repo"], "n": row["n"], "commit": row["commit"]}
+        if not self.keep({key: json.dumps(record)}):
+            return
+        try:
+            ran = self.launch(rerun_command(row))
+        except Refused as refused:
+            say("pods_rerun_unstarted", repo=row["repo"], n=row["n"], commit=row["commit"], detail=json.dumps(refused.sentence))
+            self.keep({key: json.dumps({**record, "unstarted": refused.sentence})})
+            return
+        started = STARTED.search(ran.out)
+        if started is None:
+            why = f"build.sh answered exit {ran.code} with no run"
+            say("pods_rerun_unstarted", repo=row["repo"], n=row["n"], commit=row["commit"], detail=json.dumps(why))
+            self.keep({key: json.dumps({**record, "unstarted": why})})
+            return
+        run = started.group(1).decode(errors="replace")
+        say("pods_rerun", repo=row["repo"], n=row["n"], commit=row["commit"], run=json.dumps(run))
+        self.keep({key: json.dumps({**record, "run": run})})
+
+    def settled(self):
+        try:
+            self.settle()
+        except Exception as error:
+            say("pods_rerun_unsettled", detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+
+    def watch(self):
+        try:
+            self.reporter = self.identify()
+        except (OSError, Refused) as error:
+            say("pods_rerun_unkeyed", detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+            return
+        if self.reporter is None:
+            say("pods_rerun_unkeyed", detail=json.dumps("identity names no account for the service's key"))
+            return
+        say("pods_rerunning", reporter=self.reporter)
+        pause = self.retry_pause
+        while True:
+            process = self.signer.follow(FORGE_REACH)
+            self.settled()
+            heard, at = False, None
+            with process.stdout:
+                for line in process.stdout:
+                    heard = True
+                    height = wanted_at(line)
+                    if height is not None and height != at:
+                        at = height
+                        self.settled()
+            say("pods_rerun_unfollowed", code=process.wait(), heard=heard)
+            if heard:
+                pause = self.retry_pause
+            self.pause(pause)
+            if not heard:
+                pause *= 2
+
+
 def json_stream(stream):
     decoder = json.JSONDecoder()
     buffer = ""
@@ -3299,6 +3482,7 @@ class Service:
         self.swept = threading.Event()
         self.rerouting = threading.Lock()
         self.launched = {}
+        self.rerunner = Rerunner(signer, kube, lambda command: self.routed(None, command, None), self.retry_pause)
 
     def machines(self):
         return ", ".join(f"pod {name}" for name in self.runners)
@@ -3314,6 +3498,8 @@ class Service:
             raise Refused(503, f"this service holds no key to {doing} with")
 
     def waiting(self, asked):
+        if asked is None:
+            return True
         request = int(asked["request"])
         reply = self.signer.query(EGRESS, egress_request(request))
         why = failed(reply)
@@ -3975,7 +4161,7 @@ class Service:
         machine, run = place
         with self.lock:
             self.launched[key] = place
-        say("pods_run_claimed", run=json.dumps(f"{machine}:{run}"), request=asked["request"])
+        say("pods_run_claimed", run=json.dumps(f"{machine}:{run}"), **({"request": asked["request"]} if asked else {}))
         note = f"the same call started run {machine}:{run} for an earlier request, and {why}, so this call gets that run rather than a second one"
         if "WAIT=1" in settings:
             try:
@@ -4946,6 +5132,8 @@ def main():
     service = Service(kube, signer, fetching, Stats(), Api(), runners, os.environ.get("PODS_WARM_POD"))
     threading.Thread(target=service.notifier.watch, daemon=True).start()
     threading.Thread(target=service.sweeper, daemon=True).start()
+    if signer.held():
+        threading.Thread(target=service.rerunner.watch, daemon=True).start()
     for runner in runners:
         if runner.held():
             service.follow(runner.name)

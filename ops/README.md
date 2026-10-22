@@ -588,6 +588,14 @@ one up for another network.
   machine's own files, so the check trusts anyone who can run commands on the
   build machines: it guards against mistakes, not against a forged run
   directory.
+- A lane forge-reach asks the service's account for again (forge-reach
+  `Wanted`: a Preview whose passed lane went Pending only because its target
+  moved, with every other required context passed) runs by itself, once per
+  Preview: the service follows forge-reach's changes, keeps a `rerun-` key in
+  the ConfigMap `runs` before it starts each one, and starts it as a `builds`
+  call would, notifying the change's room `forge:<repo>:<n>`
+  (`pods_rerun run=`, or `pods_rerun_unstarted` with why). Its report then
+  lands as above and carries the Preview.
 - Each line a followed pod (or a build runner) prints that reads
   `ducktape-files <run> <tar> <folder>` (build.sh's `shot` run with `TO`)
   names a tar the run made on that machine: the service reads it in one

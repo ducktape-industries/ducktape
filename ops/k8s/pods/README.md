@@ -55,6 +55,16 @@ or through a member node's halo forward.
 - A build.sh call sent to a pod by name (the warm pod, not `builds` or a build runner) goes with
   `PINNED=1` added to its settings, unless it names that itself. build.sh's `movable` then keeps
   the run, so `builds`' reroute never moves it to another machine.
+- A lane that forge-reach asks the service's own account for again (`Wanted { reporter }`: a
+  Preview whose passed lane went Pending only because the target branch moved) runs once per
+  Preview, by itself. With a key, a thread finds the account the key acts as (identity
+  `OfKey`), follows `ducktape changes forge-reach`, and reads `Wanted` page by page as it
+  starts and on each block that changes a `w/` row. For each `build.sh#lane` row it first keeps
+  `rerun-<sha256(repo, commit)>` in the ConfigMap `runs`, then calls build.sh
+  `JOB=forge:<repo>:<n> NOTIFY=forge:<repo>:<n> <repo> <commit> lane` as a `builds` call goes
+  (with no request behind it), and records the run, or why none started, under the key. A
+  restart never starts a second lane for a Preview it kept, a key whose row is gone is dropped,
+  and the lane's report reaches forge-reach as any lane's does.
 
 ## What it needs
 

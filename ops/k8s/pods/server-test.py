@@ -3734,6 +3734,148 @@ class KeptRuns(unittest.TestCase):
         ])
 
 
+WANTED = "5e" * 20
+LANE_ROOM = "forge:programs:5"
+
+
+def wanted_reply(rows, after=None):
+    items = [server.borsh_text(repo) + server.u64(n) + server.borsh_text(commit) + server.borsh_text(context) for repo, n, commit, context in rows]
+    return server.u8(2) + server.u64(1) + server.borsh_vec(items) + server.borsh_option(after, server.borsh_bytes)
+
+
+class Wanting:
+    def __init__(self, pages, account=23):
+        self.pages = pages
+        self.account = account
+        self.queries = []
+        self.follows = []
+        self.streams = []
+
+    def key(self):
+        return b"k" * 32
+
+    def query(self, program, request):
+        self.queries.append((program, request))
+        if program == "identity":
+            return ran(server.u8(0) + server.borsh_option(self.account, server.u64))
+        return ran(self.pages[request])
+
+    def follow(self, program):
+        self.follows.append(program)
+        return Log(self.streams.pop(0))
+
+
+class Reruns(unittest.TestCase):
+    def setUp(self):
+        self.kube = Kube()
+        lane = ("programs", 5, WANTED, "build.sh#lane")
+        review = ("programs", 6, "6e" * 20, "review")
+        self.signer = Wanting({server.reach_wanted(23, None): wanted_reply([lane, review])})
+        self.launched = []
+        self.answer = ran(b"run desktop:r1\nread it with: build.sh status r1\n")
+        self.rerunner = self.fresh()
+
+    def fresh(self):
+        rerunner = server.Rerunner(self.signer, self.kube, self.launch, 1)
+        rerunner.reporter = 23
+        return rerunner
+
+    def launch(self, command):
+        self.launched.append((command, dict(self.kube.kept)))
+        if isinstance(self.answer, server.Refused):
+            raise self.answer
+        return self.answer
+
+    def record(self, **more):
+        return json.dumps({"repo": "programs", "n": 5, "commit": WANTED, **more})
+
+    def test_a_wanted_lane_is_kept_first_then_run_once_through_builds_in_its_change_room(self):
+        self.rerunner.settle()
+        self.rerunner.settle()
+        key = server.rerun_key("programs", WANTED)
+        command = ["sh", server.BUILD_SH, f"JOB={LANE_ROOM}", f"NOTIFY={LANE_ROOM}", "programs", WANTED, "lane"]
+        self.assertEqual(self.launched, [(command, {key: self.record()})])
+        self.assertEqual(self.kube.kept, {key: self.record(run="desktop:r1")})
+
+    def test_a_restarted_service_starts_no_second_lane_for_a_preview_it_kept(self):
+        self.kube.kept[server.rerun_key("programs", WANTED)] = self.record()
+        self.fresh().settle()
+        self.assertEqual(self.launched, [])
+
+    def test_a_preview_no_longer_wanted_drops_its_key_and_leaves_the_runs_it_does_not_own(self):
+        self.signer.pages = {server.reach_wanted(23, None): wanted_reply([])}
+        other = server.kept_key("duckpond-41", "r1")
+        self.kube.kept = {server.rerun_key("programs", WANTED): self.record(run="desktop:r1"), other: "{}"}
+        self.rerunner.settle()
+        self.assertEqual((self.kube.kept, self.launched), ({other: "{}"}, []))
+
+    def test_wanted_is_read_page_by_page(self):
+        later = "7e" * 20
+        self.signer.pages = {
+            server.reach_wanted(23, None): wanted_reply([("programs", 5, WANTED, "build.sh#lane")], after=b"c"),
+            server.reach_wanted(23, b"c"): wanted_reply([("app", 7, later, "build.sh#lane")]),
+        }
+        self.rerunner.settle()
+        self.assertEqual([command[4:6] for command, _ in self.launched], [["programs", WANTED], ["app", later]])
+        self.assertEqual(self.signer.queries, [("forge-reach", server.reach_wanted(23, None)), ("forge-reach", server.reach_wanted(23, b"c"))])
+
+    def test_a_key_the_configmap_would_not_take_starts_no_lane(self):
+        self.kube.kept_change = lambda data: ran(code=1, err="Error from server (Forbidden): configmaps is forbidden")
+        self.rerunner.settle()
+        self.assertEqual(self.launched, [])
+
+    def test_a_refused_lane_is_kept_with_its_reason_and_not_asked_again_for_that_preview(self):
+        self.answer = server.Refused(503, "no build runner is free")
+        self.rerunner.settle()
+        self.rerunner.settle()
+        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(self.kube.kept, {server.rerun_key("programs", WANTED): self.record(unstarted="no build runner is free")})
+
+    def test_a_lane_build_sh_did_not_start_is_kept_with_its_exit(self):
+        self.answer = ran(code=2, err="build.sh: usage")
+        self.rerunner.settle()
+        self.assertEqual(self.kube.kept, {server.rerun_key("programs", WANTED): self.record(unstarted="build.sh answered exit 2 with no run")})
+
+    def test_it_follows_forge_reach_and_reads_wanted_once_per_block_that_changes_a_wanted_row(self):
+        rows = b"w/".hex()
+        lines = [f"10\t{b'r/x'.hex()}\t00\n", f"11\t{rows}aa\t01\n", f"11\t{rows}bb\t-\n", f"12\t{rows}cc\t01\n"]
+        self.signer.streams = ["".join(lines).encode()]
+
+        class Stop(BaseException):
+            pass
+
+        def stop(pause):
+            raise Stop()
+
+        rerunner = server.Rerunner(self.signer, self.kube, self.launch, 1)
+        rerunner.pause = stop
+        with self.assertRaises(Stop):
+            rerunner.watch()
+        wanted = ("forge-reach", server.reach_wanted(23, None))
+        self.assertEqual(self.signer.queries, [("identity", server.identity_of_key(b"k" * 32)), wanted, wanted, wanted])
+        self.assertEqual((self.signer.follows, len(self.launched)), (["forge-reach"], 1))
+
+    def test_a_key_no_account_acts_as_follows_nothing(self):
+        self.signer.account = None
+        server.Rerunner(self.signer, self.kube, self.launch, 1).watch()
+        self.assertEqual((self.signer.follows, self.launched), ([], []))
+
+    def test_the_service_key_line_names_its_public_key(self):
+        body = bytes(range(16 + 12 + 24)) + b"P" * 32 + bytes(48)
+        line = server.USER_KEY + server.base64.urlsafe_b64encode(body).decode().rstrip("=") + "\n"
+        self.assertEqual(server.public_key(line), b"P" * 32)
+        with self.assertRaises(server.Refused):
+            server.public_key("ducktape-user-key-v1:AAAA\n")
+
+    def test_the_runs_the_notifier_resumes_leave_the_rerun_keys_alone(self):
+        key = server.rerun_key("programs", WANTED)
+        self.kube.kept[key] = self.record(run="desktop:r1")
+        self.kube.answer("list", ran({"items": []}))
+        notifier = server.Notifier(self.kube, Signer(), 1)
+        notifier.resume()
+        self.assertEqual((notifier.open, notifier.pending, self.kube.kept), ({}, {}, {key: self.record(run="desktop:r1")}))
+
+
 class Encodings(unittest.TestCase):
     def test_blob_ids_encode_their_hash_kind_then_digest(self):
         self.assertEqual(server.blob_id("sha256:" + "ab" * 32), b"\x00" + b"\xab" * 32)
@@ -4519,6 +4661,26 @@ class Builds(Streamed):
         self.assertEqual(self.service.recalled(["JOB=j-1", "programs", "dev", "gates"], None), "desktop:r1")
         self.assertEqual(self.gate.words()[-1], ["exec", "JOB=j-1", "AGAIN=1", "programs", "dev", "gates"])
         self.assertEqual(self.warm_execs(), [])
+
+    def rerun(self):
+        room = "forge:programs:5"
+        return ["sh", BUILD, f"JOB={room}", f"NOTIFY={room}", "programs", COMMIT, "lane"]
+
+    def test_a_lane_the_service_asks_for_itself_goes_through_builds_with_no_request_behind_it(self):
+        answer = self.service.routed(None, self.rerun(), None)
+        self.assertEqual(answer.out.splitlines()[0], b"run desktop:r1")
+        execs = [words for words in self.gate.words() if words[0] == "exec"]
+        self.assertEqual(execs[-1], ["exec", "JOB=forge:programs:5", "NOTIFY=forge:programs:5", "programs", COMMIT, "lane"])
+        self.assertEqual(([request for program, request in self.signer.queries if program == "egress"], self.signer.senders), ([], []))
+
+    def test_a_lane_the_service_asks_for_again_while_its_first_run_still_waits_gets_that_run(self):
+        self.service.claim = server.Service.claim.__get__(self.service)
+        self.service.launched[tuple(server.runner_words(self.rerun(), server.BUILDS))] = ("desktop", "r1")
+        self.gate.answers["exec claim"] = ran(b"same r1\n")
+        answer = self.service.routed(None, self.rerun(), None)
+        self.assertEqual(answer.out.splitlines()[0], b"run desktop:r1")
+        execs = [words for words in self.gate.words() if words[0] == "exec"]
+        self.assertEqual(execs, [["exec", "claim", "r1", "JOB=forge:programs:5", "NOTIFY=forge:programs:5", "programs", COMMIT, "lane"]])
 
     def test_a_free_desktop_takes_the_run_and_the_answer_names_it(self):
         status, answer = self.built("JOB=j-1", "programs", "dev", "gates")
