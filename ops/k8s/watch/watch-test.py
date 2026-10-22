@@ -1040,6 +1040,19 @@ class ChangelogPosts(unittest.TestCase):
         self.assertEqual(cli.ops[0]["post"]["text"].splitlines()[1:-1], ["• The cut that is a merge."])
         self.assertEqual(cli.ops[1]["post"]["text"].splitlines()[4], f"• Changes: {oid(2)[:8]}")
 
+    def test_the_same_commit_published_again_under_a_higher_sequence_is_no_move_and_is_read_once_a_day(self):
+        seeded = {**NIGHTLY_CHANNEL, "since": oid(4), "since_sequence": 300}
+        http = FakeHttp({NIGHTLY_JSON: manifest(400, oid(4))})
+        cli = FakeCli(forge={"refs/heads/dev": DEV})
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as temp:
+            watcher = changelog_watch(pathlib.Path(temp) / "state.json", http, cli, clock, seeded)
+            for _ in range(3):
+                watcher.tick()
+                clock.now += watch.SAMPLE_S
+        self.assertEqual((cli.ops, cli.logs, http.asked.count(NIGHTLY_JSON)), ([], [], 1))
+        self.assertEqual((watcher.state["changelog"]["nightly"], watcher.state["changelog_unread"]), ({"sequence": 400, "commit": oid(4), "read": "1970-01-01"}, []))
+
     def test_a_day_whose_changes_all_say_none_posts_nothing_and_moves_on(self):
         seeded = {**NIGHTLY_CHANNEL, "since": oid(3), "since_sequence": 300}
         http = FakeHttp({NIGHTLY_JSON: manifest(400, oid(4))})

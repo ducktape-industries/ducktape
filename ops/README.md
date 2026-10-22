@@ -868,7 +868,9 @@ one up for another network.
     `release.yml` and the forge release workflows both publish, and
     TestFlight by its newest `refs/tags/testflight-<build>`, read from
     GitHub's git `info/refs` (not the API, so not its limit). When a
-    channel has moved past the commit its last entry named, one forge
+    channel has moved past the commit its last entry named (a higher
+    sequence naming the same commit, a nightly with nothing new, only
+    moves the sequence it holds), one forge
     `Log` from the channel's branch, less that commit, gives the commits
     in between, and watch walks their first-parent chain from the
     published commit, leaving out merges that carry no `Release note:`

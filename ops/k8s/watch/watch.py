@@ -558,7 +558,8 @@ def digest(changelog, channel, published, commits, since):
 
 def channel_read(http, cli, repo, channel, held):
     published = published_by(http, channel)
-    moved = held is None or published.sequence > held["sequence"]
+    same = held is not None and held["commit"].startswith(published.commit)
+    moved = held is None or (published.sequence > held["sequence"] and not same)
     since = None if held is None else held["commit"]
     return published, commits_to(cli, repo, channel.branch, published.commit, since) if moved else []
 
