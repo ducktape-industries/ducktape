@@ -162,8 +162,15 @@ or through a member node's halo forward.
   Cloudflare tunnel refuses a request body over 100 MB. Agent pods are handed `NODE_URL`
   (`PODS_NODE`), since namespace `agents`' policy `isolated` lets them reach only addresses
   outside the private ranges.
+- **Runner-only placement.** With `PODS_WARM_POD` unset, `builds` gives each eligible runner
+  its next turn in configuration order, skipping unreachable runners and full slots. Capacity
+  comes from `build.sh ahead` and the runner's ping (`busy`, `heavy_runs`), not predicted finish
+  times. When every reachable runner is full, the next runner holds the queued call. This path
+  does not move a new call to another clone just because that clone already holds its commit.
+  `reroute` reads queues on every runner and moves queued calls in batches to runners with
+  shorter waits; it needs no warm pod. Runs already started and pinned runs stay where they are.
 - **Optional: the warm pod for `builds`.** `PODS_WARM_POD`, a files path whose one line names
-  the warm pod `builds` falls back to. Unset, `builds` answers 503 when no runner is free.
+  the warm pod `builds` falls back to. Unset, `builds` uses runner-only placement.
 - **The lane's first bound.** `PODS_LANE_FIRST_LIMIT`, whole minutes, which each lane the service
   starts states as `FIRST_LIMIT=`: build.sh bounds a run by twice the longest green run of its
   kind on that machine, and a machine with none yet (a new warm pod) refuses a call that states

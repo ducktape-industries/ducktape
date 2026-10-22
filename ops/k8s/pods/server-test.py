@@ -6185,7 +6185,7 @@ class Builds(Streamed):
         self.gate.answers["ahead"] = ran(code=2, err="build.sh: a repo is a forge repository name, not Bad")
         with unittest.mock.patch.object(server, "say") as said:
             self.assertEqual(self.built("programs", "dev", "gates")[1]["stdout"].splitlines()[0], "run desktop:r1")
-        said.assert_any_call("pods_routed", to="desktop", reason="warm_unasked", detail=unittest.mock.ANY)
+        said.assert_any_call("pods_routed", to="desktop", reason="runner_unasked", runner="desktop", detail=unittest.mock.ANY)
 
     def test_an_empty_warm_pod_file_sends_a_run_the_desktop_judges_busy_to_the_desktop(self):
         self.signer.head = ran(files_answer(b""))
@@ -6219,7 +6219,7 @@ class Builds(Streamed):
     def test_with_no_warm_pod_named_a_desktop_that_is_down_answers_503(self):
         self.service.warm_pod = None
         self.gate.answers["ping"] = ran(code=69, err="gate: runner_down")
-        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "programs", "dev", "gates"]}, 503, ["PODS_WARM_POD"])
+        self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "programs", "dev", "gates"]}, 503, ["runner_down"])
 
     def test_it_is_no_pod_to_read(self):
         self.refused("GET", "/v1/pods/builds", None, 400, ["routes build.sh"])
@@ -6227,6 +6227,79 @@ class Builds(Streamed):
 
 MEMBER = "ad8cb74e" + "0" * 56
 ZK_KINDS = "gates lint check lane lane-test test quick wasm shot sh\n"
+
+
+class RoundRobin(unittest.TestCase):
+    class Machine:
+        def __init__(self, name, busy=()):
+            self.name, self.busy, self.calls = name, list(busy), []
+
+        def takes(self, words):
+            return True
+
+        def state(self):
+            return {**UP, 'runner': self.name, 'busy': self.busy, 'heavy_runs': 1}
+
+        def ran(self, command, alive=None):
+            words = command[2:]
+            self.calls.append(words)
+            match words[0]:
+                case 'ahead':
+                    return ran(b'ahead heavy 0\n')
+                case 'lanes':
+                    return ran(b'heavy 3\n' if self.busy else b'heavy 0\n')
+                case 'movable':
+                    packed = base64.b64encode(b'programs\0dev\0gates\0').decode()
+                    return ran(f'move queued heavy 3 {packed}\n'.encode() if self.busy else b'')
+                case 'take':
+                    return ran(b'run copied\n')
+                case 'moved':
+                    return ran(f'queued: moved to run {words[2]}\n'.encode())
+                case _:
+                    raise AssertionError(words)
+
+    def machines(self, full=False):
+        busy = [HEAVY] if full else []
+        first, second = self.Machine('lat-a', busy), self.Machine('lat-b')
+        service = server.Service(Kube(), Signer(), FETCHING, Stats(), Api(), [first, second])
+        return service, first, second
+
+    def test_each_runner_gets_its_turn_without_a_warm_pod(self):
+        service, first, second = self.machines()
+        chosen = [service.pick(ASKED_BY, ['programs', 'dev', 'gates'], None)[0] for _ in range(4)]
+        self.assertEqual(chosen, [first.name, second.name, first.name, second.name])
+
+    def test_a_full_runner_is_skipped_for_the_other_runner(self):
+        service, first, second = self.machines(full=True)
+        self.assertEqual(service.pick(ASKED_BY, ['programs', 'dev', 'gates'], None)[0], second.name)
+
+    def test_a_runner_only_call_does_not_move_to_a_clone_that_holds_the_commit(self):
+        service, first, second = self.machines()
+        service.claim = lambda *args: None
+        service.still_open = lambda *args: True
+        service.reroute_after = lambda *args: None
+        service.launched_on = lambda *args: ran(b'run picked\n')
+        def holding(*args):
+            raise AssertionError('runner-only routing must not ask another clone to take the call')
+        service.holding = holding
+        command = ['sh', BUILD, 'programs', 'a' * 40, 'gates']
+        one = service.routed(ASKED_BY, command, None)
+        two = service.routed(ASKED_BY, command, None)
+        self.assertEqual((one.out, two.out), (b'run lat-a:picked\n', b'run lat-b:picked\n'))
+
+    def test_when_every_runner_is_full_the_next_runner_holds_the_queue(self):
+        service, first, second = self.machines(full=True)
+        second.busy = [HEAVY]
+        one = service.pick(ASKED_BY, ['programs', 'dev', 'gates'], None)
+        two = service.pick(ASKED_BY, ['programs', 'dev', 'gates'], None)
+        self.assertEqual((one, two), ((first.name, False), (second.name, False)))
+
+    def test_reroute_moves_a_queued_run_between_runners_without_a_warm_pod(self):
+        service, first, second = self.machines(full=True)
+        said = service.rerouted(ASKED_BY, None)
+        self.assertIn('queued: moved to run lat-b:copied', said)
+        self.assertTrue(any(words[0] == 'take' for words in second.calls))
+        self.assertIn(['moved', 'queued', 'lat-b:copied'], first.calls)
 
 
 class Runners(Streamed):

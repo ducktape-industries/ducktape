@@ -276,8 +276,14 @@ one up for another network.
   runs (a `sh -c` script on any other pod, say) goes as it came, so a pod's
   own output can name any account in a notify-for line, as a chat mention can
   name anyone.
-- The reserved pod `builds` routes a build.sh call to the machine where it
-  ends first. It asks each runner that takes the call's kind, in
+- When `PODS_WARM_POD` is unset, `builds` rotates through the configured
+  runners in order instead of comparing finish times or clone contents.
+  It skips unreachable runners and full slots, using `build.sh ahead` and
+  the ping's `busy` and `heavy_runs` capacity. If all reachable runners are
+  full, the next runner holds the queued call. `reroute` reads every runner's
+  queued calls and moves batches to shorter queues without a warm pod.
+- With `PODS_WARM_POD` configured, the reserved pod `builds` routes a build.sh
+  call to the machine where it ends first. It asks each runner that takes the call's kind, in
   `PODS_RUNNERS`' order: one whose `ping` says it is up, whose `busy` reads
   (a list of `build.sh busy` lines, `busy_exit` 0) with no quiet run or
   stray lock holder among them (a line naming no weight build.sh prints,

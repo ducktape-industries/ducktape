@@ -4005,6 +4005,8 @@ class Service:
         self.background = Background()
         self.swept = threading.Event()
         self.rerouting = threading.Lock()
+        self.picking = threading.Lock()
+        self.next_runner = 0
         self.launched = {}
         self.rerunner = Rerunner(signer, kube, lambda command: self.routed(None, command, None), self.retry_pause, self.tell_room)
         self.notifier.spawn = self.background.start
@@ -4275,7 +4277,49 @@ class Service:
             raise Refused(502, f"{self.warm_pod} names no warm pod")
         return name
 
+    def pick_runner(self, asked, words, alive):
+        with self.picking:
+            names = list(self.runners)
+            if not names:
+                raise Refused(503, "this service names no build runner")
+            order = names[self.next_runner:] + names[:self.next_runner]
+            waiting, passed = [], []
+            for name in order:
+                runner = self.runners[name]
+                if not runner.takes(words):
+                    continue
+                try:
+                    state = runner.state()
+                    free, why = runner_free(name, state)
+                except Refused as refusal:
+                    passed.append(("runner_unready", name, refusal.sentence))
+                    continue
+                if not free:
+                    passed.append(("runner_busy", name, why))
+                    continue
+                ahead, why = self.ahead(asked, name, words, alive)
+                waiting.append(name)
+                if ahead is None:
+                    passed.append(("runner_unasked", name, why))
+                    continue
+                heavy = sum(1 for line in state["busy"] if (line.split()[2:3] or [""])[0] == "heavy")
+                cap = state.get("heavy_runs")
+                heavy_full = ahead[0] == "heavy" and type(cap) is int and heavy >= cap
+                full = ahead[1] != 0 or heavy_full
+                if full:
+                    passed.append(("runner_full", name, "its build slots are full"))
+                    continue
+                self.next_runner = (names.index(name) + 1) % len(names)
+                return self.went(name, name, passed), True
+            if waiting:
+                name = waiting[0]
+                self.next_runner = (names.index(name) + 1) % len(names)
+                return self.went(name, name, passed), False
+            raise Refused(503, "; ".join(sentence for _, _, sentence in passed) or "no build runner takes this call")
+
     def pick(self, asked, words, alive):
+        if not self.warm_pod:
+            return self.pick_runner(asked, words, alive)
         passed, readable, kept = [], [], []
         for name, runner in self.runners.items():
             if not runner.takes(words):
@@ -4346,7 +4390,55 @@ class Service:
         if self.background.start(run) is None:
             self.rerouting.release()
 
+    def rerouted_runners(self, asked, alive):
+        waits, queued, said = {}, {}, []
+        for name, runner in self.runners.items():
+            try:
+                lanes = runner.ran(["sh", BUILD_SH, "lanes"], alive)
+                movable = runner.ran(["sh", BUILD_SH, "movable"], alive)
+            except Refused as refusal:
+                said.append(f"keep pod {name}: {refusal.sentence}")
+                continue
+            if lanes.code != 0 or movable.code != 0:
+                said.append(f"keep pod {name}: lanes/movable answered exit {lanes.code}/{movable.code}")
+                continue
+            waits[name], queued[name] = {}, []
+            for line in lanes.out.decode(errors="replace").splitlines():
+                found, paused = LANE_WAIT.fullmatch(line), LANE_PAUSED.fullmatch(line)
+                if found:
+                    waits[name][found.group(1)] = int(found.group(2))
+                elif paused:
+                    waits[name][paused.group(1)] = None
+            for line in movable.out.decode(errors="replace").splitlines():
+                found = MOVABLE_RUN.fullmatch(line)
+                if found:
+                    queued[name].append((found.group(2), int(found.group(3)), found.group(1), found.group(4)))
+                elif line.startswith("keep "):
+                    said.append(f"{name}: {line}")
+        for source, candidates in queued.items():
+            chosen, moved_ahead = {}, {}
+            for lane, ahead, run, words in sorted(candidates):
+                there = ahead - moved_ahead.get(lane, 0)
+                taking = [(lanes.get(lane, 0), name) for name, lanes in waits.items() if name != source and lanes.get(lane, 0) is not None and self.runners[name].takes(unpacked(words))]
+                if not taking:
+                    said.append(f"keep {source}:{run}: no other runner takes its {lane} lane")
+                    continue
+                here, name = min(taking, key=lambda pair: pair[0])
+                if here >= there:
+                    said.append(f"keep {source}:{run}: {lane} waits for {here} on pod {name} and {there} here")
+                    continue
+                chosen.setdefault(name, []).append((run, words))
+                waits[name][lane] = here + 1
+                moved_ahead[lane] = moved_ahead.get(lane, 0) + 1
+            for name, runs in chosen.items():
+                said += self.carried(asked, source, name, runs, alive)
+        moved = sum(1 for line in said if ": moved to run " in line)
+        say("pods_rerouted", moved=moved, kept=len(said) - moved)
+        return "\n".join(said) + "\n" if said else "nothing queued on the build runners to move\n"
+
     def rerouted(self, asked, alive):
+        if not self.warm_pod:
+            return self.rerouted_runners(asked, alive)
         warm = self.warm()
         listed = self.executed(asked, warm, None, ["sh", BUILD_SH, "movable"], alive=alive)
         if listed.code != 0:
@@ -4434,7 +4526,7 @@ class Service:
 
     def warm_moved(self, asked, warm, pairs, alive):
         try:
-            ran = self.executed(asked, warm, None, ["sh", BUILD_SH, "moved", *itertools.chain.from_iterable(pairs.items())], alive=alive)
+            ran = self.asked_on(asked, warm, ["moved", *itertools.chain.from_iterable(pairs.items())], alive)
         except Refused as refused:
             return {}, refused.sentence
         lines = (line.split(": ", 1) for line in ran.out.decode(errors="replace").splitlines() if ": " in line)
@@ -4547,7 +4639,7 @@ class Service:
             return claimed
         machine, idle = self.pick(asked, words, alive)
         named = named_commit(called)
-        if named is not None:
+        if named is not None and self.warm_pod:
             held = self.holding(asked, machine, *named, words, alive)
             idle = idle and held == machine
             machine = held
