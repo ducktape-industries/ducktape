@@ -157,15 +157,16 @@ or through a member node's halo forward.
   endpoint's kind), and sends
   Kubernetes its own reading of each in Kubernetes' canonical form, so Kubernetes never parses an
   agent's text. Each group-version's schema is kept by the hash the index names.
-- **Its node's status.** It reads the network's block time from `NODE_URL`'s `/v1/status` as
+- **Its node's status.** It reads the network's block time from `PODS_NODE`'s `/v1/status` as
   it starts, and every retry pause starts there; it stops, saying why, when that node
   doesn't answer.
 - **Its node inside the cluster.** The service sends its own calls (`PODS_DUCKTAPE`: blob
   puts, files commits, chat posts, follows) to the Service `node-http` in namespace
   `duckpond`, `http://node-http.duckpond.svc:8844`, never through the public host, whose
-  Cloudflare tunnel refuses a request body over 100 MB. Agent pods are handed `NODE_URL`
-  (`PODS_NODE`), since namespace `agents`' policy `isolated` lets them reach only addresses
-  outside the private ranges.
+  Cloudflare tunnel refuses a request body over 100 MB. Agent pods' input fetches read the
+  same node (`PODS_NODE`): namespace `agents`' policy `isolated` lets them reach only
+  addresses outside the private ranges, and its policy `to-duckpond-node` adds TCP 8844 on
+  duckpond's node pods.
 - **Runner-only placement.** With `PODS_WARM_POD` unset, `builds` gives each eligible runner
   its next turn in configuration order, skipping unreachable runners and full slots. Capacity
   comes from `build.sh ahead` and the runner's ping (`busy`, `heavy_runs`), not predicted finish
@@ -193,10 +194,10 @@ or through a member node's halo forward.
 ## Stand one up for another network
 
 1. Build and apply: `ops/k8s/pods/deploy NODE_URL FORGE DUCKTAPE_COMMIT`, where `NODE_URL`
-   is a node the pods' inputs are read from and `FORGE` is `duck://<chain id>/forge`.
+   is a node `deploy` reads the network's block time from and `FORGE` is `duck://<chain id>/forge`.
    It builds the image, pushes it to the cluster node's registry and applies
-   `pods.yaml`, with `hardcap` computed from the live cluster. The NetworkPolicy
-   `node-only`, `PODS_DUCKTAPE`'s node, the Service's fixed `clusterIP` and the deploy's `DEPLOY_NODE` and
+   `pods.yaml`, with `hardcap` computed from the live cluster. The NetworkPolicies
+   `node-only` and `to-duckpond-node`, `PODS_DUCKTAPE`'s and `PODS_NODE`'s node, the Service's fixed `clusterIP` and the deploy's `DEPLOY_NODE` and
    `DEPLOY_CONTEXT` assume fabrics-1 and duckpond's node. Change those to match the new
    network's node and cluster.
 2. Give it an account: create a key and an account for it on the network (`ducktape wallet

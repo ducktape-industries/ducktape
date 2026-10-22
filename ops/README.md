@@ -173,9 +173,9 @@ one up for another network.
   git-remote-duck, pushes it to the cluster node's registry, and applies
   `k8s/pods/pods.yaml`: the service `pods` in namespace `pods` at
   `http://10.43.80.80:8080`, and namespace `agents`, where it runs what agents
-  ask for; a pod's inputs come from the node at `NODE_URL` and its forge
-  `FORGE` (`duck://NETWORK/forge`), while the service's own calls go to the node inside the
-  cluster at `http://node-http.duckpond.svc:8844`. A network reaches it as the egress service `pods`
+  ask for; a pod's inputs come from its forge `FORGE` (`duck://NETWORK/forge`) on the
+  node inside the cluster at `http://node-http.duckpond.svc:8844`, where the service's own
+  calls go too, and `NODE_URL` is the node `deploy` reads the block time from. A network reaches it as the egress service `pods`
   (`[services.pods] base = "http://10.43.80.80:8080"` in the node's
   `egress.toml`); a NetworkPolicy admits only the duckpond node pod, so the
   `ducktape-chain`, `ducktape-program` and `ducktape-request` headers it reads

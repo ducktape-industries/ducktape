@@ -6979,11 +6979,36 @@ class Manifest(unittest.TestCase):
         text = (HERE / "pods.yaml").read_text()
         return dict(re.findall(r'- \{name: (PODS_\w+), value: "?([^"}]*)"?\}', text))
 
+    def documents(self, name):
+        text = (HERE / "pods.yaml").read_text()
+        return [document for document in text.split("\n---\n") if f"\n  name: {name}\n" in document]
+
     def test_its_own_calls_reach_the_node_inside_the_cluster(self):
         self.assertEqual(self.env()["PODS_DUCKTAPE"], "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844")
 
-    def test_agent_pods_are_handed_the_public_node(self):
-        self.assertEqual(self.env()["PODS_NODE"], "@NODE_URL@")
+    def test_agent_pods_are_handed_the_node_inside_the_cluster(self):
+        self.assertEqual(self.env()["PODS_NODE"], "http://node-http.duckpond.svc:8844")
+
+    def test_agent_pods_may_open_only_the_node_port_inside_the_cluster(self):
+        policy = "\n".join([
+            "apiVersion: networking.k8s.io/v1",
+            "kind: NetworkPolicy",
+            "metadata:",
+            "  name: to-duckpond-node",
+            "  namespace: agents",
+            "spec:",
+            "  podSelector: {}",
+            "  policyTypes: [Egress]",
+            "  egress:",
+            "    - to:",
+            "        - namespaceSelector:",
+            "            matchLabels: {kubernetes.io/metadata.name: duckpond}",
+            "          podSelector:",
+            "            matchLabels: {app: node}",
+            "      ports:",
+            "        - {protocol: TCP, port: 8844}",
+        ])
+        self.assertEqual(self.documents("to-duckpond-node"), [policy])
 
 
 class Lifecycle(unittest.TestCase):

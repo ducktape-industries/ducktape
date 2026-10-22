@@ -1,5 +1,5 @@
 # The pods service and the agents namespace it manages: priority, RBAC, the admission policies on the operator's quota hardcap and on every pod, hardcap itself and the LimitRange defaults, isolation, its Deployment and its fixed-address Service.
-# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @NODE_URL@, @FORGE@, @AGENTS_CPU@, @AGENTS_MEMORY@, @PRESTOP@ and @GRACE@; the key it signs with is the Secret `blob-key`, and the desktop runner's ssh key the Secret `desktop-runner`.
+# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @FORGE@, @AGENTS_CPU@, @AGENTS_MEMORY@, @PRESTOP@ and @GRACE@; the key it signs with is the Secret `blob-key`, and the desktop runner's ssh key the Secret `desktop-runner`.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -327,6 +327,23 @@ spec:
             cidr: 0.0.0.0/0
             except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: to-duckpond-node
+  namespace: agents
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: duckpond}
+          podSelector:
+            matchLabels: {app: node}
+      ports:
+        - {protocol: TCP, port: 8844}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -352,7 +369,7 @@ spec:
           env:
             - {name: PODS_OUT_IMAGE, value: "@IMAGE@"}
             - {name: PODS_NAMESPACE, value: agents}
-            - {name: PODS_NODE, value: "@NODE_URL@"}
+            - {name: PODS_NODE, value: "http://node-http.duckpond.svc:8844"}
             - {name: PODS_FORGE, value: "@FORGE@"}
             - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844"}
             - {name: PODS_KEYS, value: /keys}

@@ -55,7 +55,7 @@ spec:
           image: "@IMAGE@"
           env:
             - name: FORGE_MIRROR_NODE
-              value: https://duckpond.ducktape.industries
+              value: http://node-http.duckpond.svc:8844
             - name: FORGE_MIRROR_CHAIN
               value: duckpond-725bcad1
             - name: FORGE_MIRROR_CLOCK
