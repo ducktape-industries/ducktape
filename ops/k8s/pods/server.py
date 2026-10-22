@@ -173,7 +173,7 @@ PUBKEY_AT = 16 + 12 + 24
 LANE_CONTEXT = "build.sh#lane"
 RERUN = "rerun-"
 FORGE_PROGRAM = "forge"
-FRONT_KEYS = tuple(table.hex() for table in (b"e/", b"s/", b"m/", b"q/"))
+FRONT_KEYS = tuple(table.hex() for table in (b"e/", b"s/", b"m/", b"q/", b"y/", b"z/"))
 CHECK_STATES = ("pending", "passed", "failed", "errored")
 REPORT_LINE = "ducktape-report "
 FILES_LINE = "ducktape-files "
@@ -2163,6 +2163,10 @@ def forge_required(repo, after):
     return u8(20) + borsh_text(repo) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
 
 
+def forge_train(repo, branch):
+    return u8(28) + borsh_text(repo) + borsh_bytes(branch)
+
+
 def forge_queue_front(repo, branch):
     return u8(21) + borsh_text(repo) + borsh_bytes(branch) + borsh_option(None, borsh_bytes) + borsh_option(1, u64)
 
@@ -2232,6 +2236,20 @@ def required_of(reply):
         contexts = [text_at(reader) for _ in range(page_count(reader))]
         branches.append({"branch": branch, "reporter": reporter, "contexts": contexts})
     return branches, page_next(reader)
+
+
+def train_of(reply):
+    reader = forge_answer(reply, 25, "Train", False)
+    train = None
+    if reader.u8() == 1:
+        length = reader.u64()
+        train = {"length": length, "tip": [text_at(reader) for _ in range(page_count(reader))]}
+    members = []
+    if reader.u8() == 1:
+        members = [{"n": reader.u64(), "merge": text_at(reader)} for _ in range(page_count(reader))]
+        reader.u8()
+        reader.u64()
+    return train, members
 
 
 def queue_front_of(reply):
@@ -3800,10 +3818,17 @@ class Rerunner:
         return ran.code == 0
 
     def front(self, repo, required, lane):
-        n = queue_front_of(self.asked(FORGE_PROGRAM, forge_queue_front(repo, required["branch"])))
-        if n is None:
-            return None
-        merge = preview_of(self.asked(FORGE_PROGRAM, forge_preview(repo, n)))
+        train, members = train_of(self.asked(FORGE_PROGRAM, forge_train(repo, required["branch"])))
+        lanes_tip = train is not None and lane in train["tip"]
+        if lanes_tip:
+            if not members:
+                return None
+            n, merge = members[-1]["n"], members[-1]["merge"]
+        else:
+            n = queue_front_of(self.asked(FORGE_PROGRAM, forge_queue_front(repo, required["branch"])))
+            if n is None:
+                return None
+            merge = preview_of(self.asked(FORGE_PROGRAM, forge_preview(repo, n)))
         if merge is None or not FULL_COMMIT.fullmatch(merge):
             return None
         statuses = self.pages(lambda after: forge_statuses(repo, merge, after), statuses_of)
@@ -3880,7 +3905,7 @@ class Rerunner:
         say("pods_rerun_unstarted", repo=row["repo"], n=row["n"], commit=row["commit"], detail=json.dumps(why))
         self.keep({key: json.dumps({**record, "unstarted": why})})
         told = hashlib.sha256(f"{row['repo']}\n{row['commit']}\n{why}".encode()).hexdigest()
-        detail = f"the lane on Preview {row['commit']} did not start: {why}. The pods service asks again from one block, doubling, while that Preview is its queue's front."
+        detail = f"the lane on Preview {row['commit']} did not start: {why}. The pods service asks again from one block, doubling, while that Preview is its queue's lane target."
         said = {"group": f"lane {row['commit']}", "subject": f"the lane of {row['repo']} #{row['n']}", "status": "failed", "detail": detail, "concerns": []}
         self.post(f"forge:{row['repo']}:{row['n']}", f"pods-rerun-{told}", said)
         self.retry_later(row["repo"], key)

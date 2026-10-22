@@ -4422,7 +4422,7 @@ class Forging:
 class Reruns(unittest.TestCase):
     def setUp(self):
         self.kube = Kube()
-        self.signer = Forging({ASK_REQUIRED: LIVE_REQUIRED, ASK_FRONT: LIVE_QUEUE, ASK_PREVIEW: LIVE_PREVIEW, ASK_STATUSES: LIVE_STATUSES})
+        self.signer = Forging({ASK_REQUIRED: LIVE_REQUIRED, ASK_TRAIN: server.u8(25) + server.u64(1) + b"\x00\x00", ASK_FRONT: LIVE_QUEUE, ASK_PREVIEW: LIVE_PREVIEW, ASK_STATUSES: LIVE_STATUSES})
         self.launched = []
         self.answers = [ran(b"run desktop:r1\nread it with: build.sh status r1\n")]
         self.calls = []
@@ -4540,7 +4540,7 @@ class Reruns(unittest.TestCase):
     def test_only_the_queues_front_is_read_and_laned(self):
         self.signer.answers[ASK_FRONT] = queue_reply(561, 577)
         self.rerunner.settle("programs")
-        self.assertEqual(self.asked(), [ASK_REQUIRED, ASK_FRONT, ASK_PREVIEW, ASK_STATUSES])
+        self.assertEqual(self.asked(), [ASK_REQUIRED, ASK_TRAIN, ASK_FRONT, ASK_PREVIEW, ASK_STATUSES])
         self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
 
     def test_a_front_whose_review_is_pending_waits_for_it_then_gets_its_lane(self):
@@ -4588,7 +4588,7 @@ class Reruns(unittest.TestCase):
         self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("56/review", "passed"), after=b"d")
         self.signer.answers[more_statuses] = statuses_reply(check_status("23/build.sh#lane", "passed"))
         self.rerunner.settle("programs")
-        self.assertEqual(self.asked(), [ASK_REQUIRED, more_required, ASK_FRONT, ASK_PREVIEW, ASK_STATUSES, more_statuses])
+        self.assertEqual(self.asked(), [ASK_REQUIRED, more_required, ASK_TRAIN, ASK_FRONT, ASK_PREVIEW, ASK_STATUSES, more_statuses])
         self.assertEqual(self.launched, [])
 
     def test_a_restarted_service_starts_no_second_lane_for_a_front_it_kept(self):
@@ -4616,7 +4616,7 @@ class Reruns(unittest.TestCase):
         self.rerunner.settle("programs")
         self.assertEqual(len(self.launched), 1)
         self.assertEqual(self.kube.kept, {server.rerun_key("programs", LANE): self.record(unstarted="no build runner is free")})
-        self.assertEqual([(channel, detail) for channel, _, detail in self.posts], [(LANE_ROOM, f"the lane on Preview {LANE} did not start: no build runner is free. The pods service asks again from one block, doubling, while that Preview is its queue's front.")])
+        self.assertEqual([(channel, detail) for channel, _, detail in self.posts], [(LANE_ROOM, f"the lane on Preview {LANE} did not start: no build runner is free. The pods service asks again from one block, doubling, while that Preview is its queue's lane target.")])
         self.assertEqual([(target, args) for target, args in self.spawned], [(self.rerunner.retry, ("programs", server.rerun_key("programs", LANE)))])
 
     def test_a_lane_build_sh_did_not_start_is_kept_with_its_exit(self):
@@ -4733,6 +4733,92 @@ class Reruns(unittest.TestCase):
         notifier = server.Notifier(self.kube, Signer(), 1)
         notifier.resume()
         self.assertEqual((notifier.open, notifier.pending, self.kube.kept), ({}, {}, {key: self.record(run="desktop:r1")}))
+
+TRAIN_REPLY_TAG = 25
+ASK_TRAIN = server.u8(28) + server.borsh_text("programs") + server.borsh_bytes(DEV)
+
+
+def train_reply(members=(), tip=("23/build.sh#lane",), formed=True, alone=False):
+    train = server.u64(4) + server.borsh_vec([server.borsh_text(context) for context in tip])
+    row = server.borsh_vec([server.u64(n) + server.borsh_text(commit) for n, commit in members]) + server.u8(int(alone)) + server.u64(2)
+    return server.u8(TRAIN_REPLY_TAG) + server.u64(3) + server.borsh_option(train, bytes) + server.borsh_option(row if formed else None, bytes)
+
+
+class Trains(unittest.TestCase):
+    fresh = Reruns.fresh
+    call = Reruns.call
+    launch = Reruns.launch
+    post = Reruns.post
+    asked = Reruns.asked
+
+    def setUp(self):
+        Reruns.setUp(self)
+        self.signer.answers[ASK_TRAIN] = train_reply([(561, LANE), (577, MOVED_PREVIEW)])
+        self.signer.answers[server.forge_statuses("programs", MOVED_PREVIEW, None)] = LIVE_STATUSES
+
+    def test_one_tip_lane_is_started_and_kept_across_settles_and_restart(self):
+        self.rerunner.settle("programs")
+        self.rerunner.settle("programs")
+        self.fresh().settle("programs")
+        command = ["sh", server.BUILD_SH, "JOB=forge:programs:577", "NOTIFY=forge:programs:577", "programs", MOVED_PREVIEW, "lane"]
+        self.assertEqual([command for command, _ in self.launched], [command])
+        self.assertNotIn(ASK_FRONT, self.asked())
+        self.assertNotIn(ASK_PREVIEW, self.asked())
+        self.assertNotIn(ASK_STATUSES, self.asked())
+
+    def test_no_formed_members_means_no_lane_and_no_queue_fallback(self):
+        for formed in (False, True):
+            self.signer.answers[ASK_TRAIN] = train_reply(formed=formed)
+            self.rerunner.settle("programs")
+        self.assertEqual(self.launched, [])
+        self.assertNotIn(ASK_FRONT, self.asked())
+
+    def test_a_red_train_stops_its_tip_and_lanes_the_front_alone(self):
+        self.rerunner.settle("programs")
+        self.signer.answers[ASK_TRAIN] = train_reply([(561, LANE)], alone=True)
+        self.rerunner.settle("programs")
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", MOVED_PREVIEW], ["programs", LANE]])
+        self.assertIn(["sh", server.BUILD_SH, "stop", "desktop:r1"], self.calls)
+        self.assertEqual(list(self.kube.kept), [server.rerun_key("programs", LANE)])
+
+    def test_an_unstarted_tip_is_not_retried_after_the_tip_moves(self):
+        self.answers = [server.Refused(503, "no build runner is free"), ran(b"run desktop:r2\n")]
+        self.rerunner.settle("programs")
+        self.signer.answers[ASK_TRAIN] = train_reply([(561, LANE)], alone=True)
+        target, args = self.spawned[0]
+        target(*args)
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", MOVED_PREVIEW]])
+        self.assertEqual(self.rerunner.retrying, set())
+
+    def test_a_lane_not_named_as_a_tip_context_keeps_the_queue_front_path(self):
+        self.signer.answers[ASK_TRAIN] = train_reply([(561, LANE), (577, MOVED_PREVIEW)], tip=("56/review",))
+        self.rerunner.settle("programs")
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
+
+    def test_a_tip_with_a_result_or_pending_review_starts_nothing(self):
+        ask = server.forge_statuses("programs", MOVED_PREVIEW, None)
+        for lane, review in (("passed", "passed"), ("failed", "passed"), ("errored", "passed"), ("pending", "pending")):
+            self.signer.answers[ask] = statuses_reply(check_status("23/build.sh#lane", lane), check_status("56/review", review))
+            self.rerunner.settle("programs")
+        self.assertEqual(self.launched, [])
+
+    def test_train_configuration_and_formation_writes_trigger_settle(self):
+        for table in (b"y/", b"z/"):
+            with self.subTest(table=table):
+                self.assertEqual(server.front_touched(f"42\t{forge_key(table, 'programs')}\t01\n".encode()), ("42", "programs"))
+
+
+class TrainWire(unittest.TestCase):
+    def test_train_query_and_reply_match_forges_contract(self):
+        self.assertEqual(server.forge_train("programs", DEV), ASK_TRAIN)
+        train, members = server.train_of(train_reply([(561, LANE), (577, MOVED_PREVIEW)]))
+        self.assertEqual(train, {"length": 4, "tip": ["23/build.sh#lane"]})
+        self.assertEqual(members, [{"n": 561, "merge": LANE}, {"n": 577, "merge": MOVED_PREVIEW}])
+        self.assertEqual(server.train_of(server.u8(TRAIN_REPLY_TAG) + server.u64(1) + b"\x00\x00"), (None, []))
+        self.assertEqual(server.train_of(train_reply(formed=False))[1], [])
+        with self.assertRaises(server.Refused):
+            server.train_of(LIVE_REQUIRED)
+
 
 class Encodings(unittest.TestCase):
     def test_blob_ids_encode_their_hash_kind_then_digest(self):
