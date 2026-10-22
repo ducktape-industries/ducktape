@@ -154,6 +154,12 @@ or through a member node's halo forward.
 - **Its node's status.** It reads the network's block time from `NODE_URL`'s `/v1/status` as
   it starts, and every retry pause starts there; it stops, saying why, when that node
   doesn't answer.
+- **Its node inside the cluster.** The service sends its own calls (`PODS_DUCKTAPE`: blob
+  puts, files commits, chat posts, follows) to the Service `node-http` in namespace
+  `duckpond`, `http://node-http.duckpond.svc:8844`, never through the public host, whose
+  Cloudflare tunnel refuses a request body over 100 MB. Agent pods are handed `NODE_URL`
+  (`PODS_NODE`), since namespace `agents`' policy `isolated` lets them reach only addresses
+  outside the private ranges.
 - **Optional: the warm pod for `builds`.** `PODS_WARM_POD`, a files path whose one line names
   the warm pod `builds` falls back to. Unset, `builds` answers 503 when no runner is free.
 - **The lane's first bound.** `PODS_LANE_FIRST_LIMIT`, whole minutes, which each lane the service
@@ -177,7 +183,7 @@ or through a member node's halo forward.
    is a node the pods' inputs are read from and `FORGE` is `duck://<chain id>/forge`.
    It builds the image, pushes it to the cluster node's registry and applies
    `pods.yaml`, with `hardcap` computed from the live cluster. The NetworkPolicy
-   `node-only`, the Service's fixed `clusterIP` and the deploy's `DEPLOY_NODE` and
+   `node-only`, `PODS_DUCKTAPE`'s node, the Service's fixed `clusterIP` and the deploy's `DEPLOY_NODE` and
    `DEPLOY_CONTEXT` assume fabrics-1 and duckpond's node. Change those to match the new
    network's node and cluster.
 2. Give it an account: create a key and an account for it on the network (`ducktape wallet

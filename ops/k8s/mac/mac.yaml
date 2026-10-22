@@ -61,7 +61,7 @@ spec:
         - name: mac
           image: "@IMAGE@"
           env:
-            - {name: MAC_DUCKTAPE, value: "ducktape --workspace /home/mac --node @NODE_URL@"}
+            - {name: MAC_DUCKTAPE, value: "ducktape --workspace /home/mac --node http://node-http.duckpond.svc:8844"}
             - {name: MAC_NODE, value: "@NODE_URL@"}
             - {name: MAC_FORGE, value: "@FORGE@"}
             - {name: MAC_KEYS, value: /keys}

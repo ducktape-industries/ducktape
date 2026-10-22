@@ -6782,5 +6782,17 @@ class Hardcap(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout, done.stderr), (1, "", said))
 
 
+class Manifest(unittest.TestCase):
+    def env(self):
+        text = (HERE / "pods.yaml").read_text()
+        return dict(re.findall(r'- \{name: (PODS_\w+), value: "?([^"}]*)"?\}', text))
+
+    def test_its_own_calls_reach_the_node_inside_the_cluster(self):
+        self.assertEqual(self.env()["PODS_DUCKTAPE"], "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844")
+
+    def test_agent_pods_are_handed_the_public_node(self):
+        self.assertEqual(self.env()["PODS_NODE"], "@NODE_URL@")
+
+
 if __name__ == "__main__":
     unittest.main()

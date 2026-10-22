@@ -6,6 +6,7 @@ import struct
 import subprocess
 import json
 import pathlib
+import re
 import tempfile
 import threading
 import unittest
@@ -718,6 +719,14 @@ class Checks(unittest.TestCase):
             self.service.followed()
         self.assertEqual((len(pulls), paused), (2, [relay.FOLLOW_PAUSE]))
         self.assertFalse(self.service.following)
+
+
+class Manifest(unittest.TestCase):
+    def test_its_own_calls_reach_the_node_inside_the_cluster(self):
+        text = (HERE / "mac.yaml").read_text()
+        env = dict(re.findall(r'- \{name: (MAC_\w+), value: "?([^"}]*)"?\}', text))
+        self.assertEqual(env["MAC_DUCKTAPE"], "ducktape --workspace /home/mac --node http://node-http.duckpond.svc:8844")
+
 
 if __name__ == "__main__":
     unittest.main()

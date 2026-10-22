@@ -354,7 +354,7 @@ spec:
             - {name: PODS_NAMESPACE, value: agents}
             - {name: PODS_NODE, value: "@NODE_URL@"}
             - {name: PODS_FORGE, value: "@FORGE@"}
-            - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node @NODE_URL@"}
+            - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844"}
             - {name: PODS_KEYS, value: /keys}
             - {name: PODS_RUNNERS, value: "desktop=/desktop zk-dev=/runners/zk-dev"}
             - {name: PODS_WARM_POD, value: /shared/tools/warm-pod}

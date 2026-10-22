@@ -174,7 +174,8 @@ one up for another network.
   `k8s/pods/pods.yaml`: the service `pods` in namespace `pods` at
   `http://10.43.80.80:8080`, and namespace `agents`, where it runs what agents
   ask for; a pod's inputs come from the node at `NODE_URL` and its forge
-  `FORGE` (`duck://NETWORK/forge`). A network reaches it as the egress service `pods`
+  `FORGE` (`duck://NETWORK/forge`), while the service's own calls go to the node inside the
+  cluster at `http://node-http.duckpond.svc:8844`. A network reaches it as the egress service `pods`
   (`[services.pods] base = "http://10.43.80.80:8080"` in the node's
   `egress.toml`); a NetworkPolicy admits only the duckpond node pod, so the
   `ducktape-chain`, `ducktape-program` and `ducktape-request` headers it reads
@@ -1195,7 +1196,8 @@ one up for another network.
 - `k8s/mac/deploy NODE_URL FORGE COMMIT` builds `k8s/mac/Containerfile`
   around the ducktape CLI built from `git archive COMMIT` and
   git-remote-duck, pushes it to the cluster node's registry, and applies
-  `k8s/mac/mac.yaml`.
+  `k8s/mac/mac.yaml`. The relay's own calls (`MAC_DUCKTAPE`) go to the node inside the
+  cluster at `http://node-http.duckpond.svc:8844`, as the pods service's do.
 - `mac/mac.py` is the Mac's side, kept running by the LaunchAgent
   `mac/com.ducktape.mac.plist`. It needs Python 3.11 or later, Xcode with an
   iOS simulator runtime, XcodeGen, rustup's cargo first on `PATH` (so the
