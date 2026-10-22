@@ -164,8 +164,12 @@ pub(crate) async fn floor(
     anchor_names_the_tip.then(|| Floor::Finalized(certificate.clone()))
 }
 
+pub fn journals(partition: &str) -> String {
+    format!("{partition}-simplex-")
+}
+
 pub(crate) fn journal(partition: &str, epoch: u64) -> String {
-    format!("{partition}-simplex-{epoch}")
+    format!("{}{epoch}", journals(partition))
 }
 
 pub(crate) async fn sweep<E: Storage>(context: &E, partition: &str, from: u64, epoch: u64) -> u64 {

@@ -19,7 +19,7 @@ pub use archives::{Archives, ArchivesError};
 pub use cadence::{Cadence, CadenceError, Timeouts};
 pub use chain::{App, Chain, unapplied};
 pub use commonware_consensus::marshal::ancestry::Ancestry;
-pub use engine::proposer;
+pub use engine::{journals, proposer};
 pub use gap::CopyError;
 pub use lanes::{EngineChannels, EngineMux, MarshalLanes, channel};
 pub use marshal::{Certificate, Marshal, MarshalError, MarshalMailbox, Transport};

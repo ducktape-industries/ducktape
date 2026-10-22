@@ -62,7 +62,9 @@ pub async fn roll<E: Context>(context: E, workspace: &Workspace, height: u64) ->
         Ordering::Greater => Err(Error::Unrolled(format!(
             "this workspace's tip {tip} is past the roll height {height}: a binary before \
              contract {NODE_CONTRACT} applied blocks after the roll, so its state is not the \
-             network's; move the workspace aside and `ducktape join` again"
+             network's; move every file but identity.key and runtime/{network}-simplex-* aside, \
+             then `ducktape join` again",
+            network = descriptor.network
         ))),
         Ordering::Less => synced(context, workspace, &descriptor, height, tip).await,
     }

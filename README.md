@@ -1013,8 +1013,10 @@ A contract bump that changes how blocks decode rolls as a stop at one announced
 height R: with the node stopped, `ducktape roll R` stamps a workspace whose tip
 is R; one behind R state-syncs from its `source` to a head at or past R, served
 by a node on the new contract (the state from before goes to `pre-roll-<tip>/`
-in the workspace), then stamps from the head after it; one past R is refused, and
-joins again. So a binary never applies a block another contract produced.
+in the workspace, all but the vote journals `runtime/<network>-simplex-*`, which
+stay, so a validator replays its own votes), then stamps from the head after it;
+one past R is refused, and joins again, set aside by the same rule. So a binary
+never applies a block another contract produced.
 
 A fork is a throwaway copy of a stopped network's state that runs alone. With
 the parent's node stopped, `ducktape --workspace <new> fork new --from

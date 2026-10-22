@@ -165,15 +165,34 @@ impl Workspace {
     }
 
     pub(crate) fn set_aside(&self, name: &str) -> Result<PathBuf> {
+        let journals = consensus::journals(&self.descriptor()?.network);
         let aside = self.dir.join(name);
         std::fs::create_dir(&aside)?;
-        for applied in APPLIED {
+        for applied in APPLIED.into_iter().filter(|applied| *applied != RUNTIME) {
             let path = self.dir.join(applied);
             if path.exists() {
                 std::fs::rename(path, aside.join(applied))?;
             }
         }
+        self.runtime_aside(&aside.join(RUNTIME), &journals)?;
         Ok(aside)
+    }
+
+    fn runtime_aside(&self, to: &Path, journals: &str) -> Result<()> {
+        let listed = match std::fs::read_dir(self.runtime_dir()) {
+            Ok(listed) => listed,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        std::fs::create_dir(to)?;
+        for entry in listed {
+            let entry = entry?;
+            let journal = entry.file_name().to_string_lossy().starts_with(journals);
+            if !journal {
+                std::fs::rename(entry.path(), to.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn http(&self) -> Result<SocketAddr> {
@@ -476,7 +495,7 @@ mod tests {
     use commonware_cryptography::Signer as _;
     use commonware_runtime::Runner as _;
 
-    use super::{Founding, Workspace, halo_address};
+    use super::{Descriptor, Founding, Workspace, halo_address};
     use crate::Error;
 
     fn genesis_of(text: &str) -> host::Genesis {
@@ -601,5 +620,47 @@ mod tests {
             let refused = workspace.machine_key_or_create(&mut context);
             assert!(matches!(refused, Err(Error::MachineIsIdentity)));
         });
+    }
+
+    #[test]
+    fn setting_a_workspace_aside_leaves_its_vote_journals_in_its_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::at(dir.path());
+        workspace
+            .write_descriptor(&Descriptor {
+                network: "n".into(),
+                time: 0,
+                block_time_ms: 1000,
+            })
+            .unwrap();
+        let journals = ["n-simplex-6", "n-simplex-7"];
+        let others = ["n-blocks-z", "commitment-harness-log", "m-simplex-7"];
+        for partition in journals.into_iter().chain(others) {
+            let at = workspace.runtime_dir().join(partition);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("0000"), partition).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let aside = workspace.set_aside("pre-roll-9").unwrap();
+        for journal in journals {
+            let kept = workspace.runtime_dir().join(journal).join("0000");
+            assert_eq!(
+                std::fs::read(&kept).ok(),
+                Some(journal.as_bytes().to_vec()),
+                "{journal}"
+            );
+            assert!(!aside.join("runtime").join(journal).exists(), "{journal}");
+        }
+        for other in others {
+            let moved = aside.join("runtime").join(other).join("0000");
+            assert_eq!(
+                std::fs::read(&moved).ok(),
+                Some(other.as_bytes().to_vec()),
+                "{other}"
+            );
+            assert!(!workspace.runtime_dir().join(other).exists(), "{other}");
+        }
+        assert!(aside.join("state").exists());
+        assert!(!dir.path().join("state").exists());
     }
 }
