@@ -858,7 +858,9 @@ fleet is the program that holds what someone asked to run, which machine
 took each run and how it ended. A machine is an account with a key that runs
 that work: `ducktape machine init` mints `machine.key` in the workspace (mode
 0600) and prints its public half, and the account's owner makes the account
-with identity's `CreateAgent` and adds that key with `AddKey`. A
+with identity's `CreateAgent`. `ducktape machine consent --account <n>` then
+prints machine.key's consent to joining account `n`, as the JSON identity's
+`AddKey` takes for its `consent`, and the owner sends that `AddKey`. A
 `machine.key` that is the workspace's `identity.key` is refused.
 
 `ducktape machine run` runs the machines `[machine]` names (`node.toml`, or
@@ -1008,6 +1010,7 @@ ducktape blob get sha256:…              # a blob's framed bytes
 ducktape blob put code.wasm --kind program --wait  # put a bundle, print its ids, wait until it is held
 ducktape blob unpack                    # with the node stopped, every blob back as one file, for an older build
 ducktape machine init                   # mint machine.key and print its public key
+ducktape machine consent --account 64   # machine.key's consent to joining account 64, as AddKey's JSON
 ducktape machine run                    # run the work fleet assigns to the machines [machine] names
 ```
 

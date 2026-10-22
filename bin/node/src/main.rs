@@ -700,6 +700,21 @@ enum MachineVerb {
         )]
         child: bool,
     },
+    #[command(
+        about = "sign with machine.key its consent to joining the machine's account, and print it as \
+                 the JSON identity's add_key op takes as its consent"
+    )]
+    Consent {
+        #[arg(long, help = "the machine's account, which machine.key joins")]
+        account: u64,
+        #[arg(
+            long,
+            help = "the network it is for; refused unless the node runs it [default: the node's]"
+        )]
+        network: Option<String>,
+        #[arg(long, help = EXPIRES)]
+        expires: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -922,6 +937,14 @@ fn execute(cli: Cli) -> Result<(), String> {
         Verb::Machine(MachineVerb::Run { config, child }) => {
             let client = client(&workspace, cli.node)?;
             machine::run(&workspace, client, config, child)
+        }
+        Verb::Machine(MachineVerb::Consent {
+            account,
+            network,
+            expires,
+        }) => {
+            let client = client(&workspace, cli.node)?;
+            machine::consent(&workspace, client, account, network, expires)
         }
         #[cfg(unix)]
         Verb::Bridge(BridgeVerb::Relay { socket, place }) => {

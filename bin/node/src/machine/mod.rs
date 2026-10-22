@@ -37,6 +37,26 @@ pub fn init(workspace: &Workspace) -> Result<(), String> {
     Ok(())
 }
 
+pub fn consent(
+    workspace: &Workspace,
+    client: Client,
+    account: u64,
+    network: Option<String>,
+    expires: Option<u64>,
+) -> Result<(), String> {
+    let key = workspace.machine_key().sentence()?;
+    let asked = said::Consenting {
+        account,
+        key: None,
+        scheme: abi::Scheme::Ed25519,
+        network,
+        expires,
+    };
+    let consent = crate::client_runtime()?.block_on(said::consent(&client, &key, asked))?;
+    said::print(&consent);
+    Ok(())
+}
+
 pub fn run(
     workspace: &Workspace,
     client: Client,
@@ -990,6 +1010,23 @@ mod tests {
             panic!("not a machine run");
         };
         assert_eq!((config, child), (Some("m.toml".into()), true));
+    }
+
+    #[test]
+    fn a_machine_consent_names_its_account_and_never_expires_unless_told() {
+        let args = ["ducktape", "machine", "consent", "--account", "64"];
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Verb::Machine(MachineVerb::Consent {
+            account,
+            network,
+            expires,
+        }) = parsed.verb
+        else {
+            panic!("not a machine consent");
+        };
+        assert_eq!((account, network, expires), (64, None, None));
+        let unnamed = Cli::try_parse_from(["ducktape", "machine", "consent"]);
+        assert!(unnamed.is_err(), "a consent names the account it joins");
     }
 
     #[test]
