@@ -69,8 +69,8 @@ fixture_scheduler init: spent 20172 crossings [] verdict Ok(Ok(()))
 fixture_scheduler execute: spent 21206 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
 fixture_scheduler query: spent 21208 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
 fixture_valset init: spent 21242 crossings [] verdict Ok(Err(Refusal { reason: "protocol", sentence: "Unexpected length of input" }))
-fixture_valset execute: spent 25203 crossings [14777, 16539, 18297] verdict Ok(Err(Refusal { reason: "not_found", sentence: "the fixture valset holds no query policy" }))
-fixture_valset query: spent 25198 crossings [14772, 16534, 18292] verdict Ok(Err(Refusal { reason: "not_found", sentence: "the fixture valset holds no query policy" }))
+fixture_valset execute: spent 25208 crossings [14788, 16550, 18308] verdict Ok(Err(Refusal { reason: "not_found", sentence: "the fixture valset holds no query policy" }))
+fixture_valset query: spent 25192 crossings [14772, 16534, 18292] verdict Ok(Err(Refusal { reason: "not_found", sentence: "the fixture valset holds no query policy" }))
 proposal mvp: loads
 proposal mutable-global: loads
 proposal sign-extension: loads
