@@ -1,4 +1,5 @@
 """Exercise the pods service over real HTTP against a recording kubectl, ducktape and kubelet, and its input fetcher against a recording runner; run by `make test`."""
+import ast
 import base64
 import contextlib
 import datetime
@@ -7374,7 +7375,7 @@ BUILD_POD_IMAGE = "localhost:5000/toolchain@sha256:00"
 BUILT = "a" * 40
 
 
-class Builds(Served):
+class BuildPods(Served):
     def setUp(self):
         self.builds = Kube()
         self.builds.namespace = "builds"
@@ -7562,6 +7563,13 @@ class Unbuilt(Served):
         self.assertIsNone(server.building_of({}, ["kubectl"]))
         building = server.building_of({"PODS_BUILD_IMAGE": "localhost:5000/toolchain:x", "PODS_BUILD_CPU": "7000m", "PODS_BUILD_MEMORY": "28Gi"}, ["kubectl"])
         self.assertEqual((building.kube.namespace, building.kube.kept_name, building.cpu, building.memory), ("builds", "build-runs", "7", "28Gi"))
+
+
+class Suite(unittest.TestCase):
+    def test_no_two_classes_share_a_name(self):
+        tree = ast.parse((HERE / "server-test.py").read_text())
+        names = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
+        self.assertEqual(sorted({name for name in names if names.count(name) > 1}), [], "a later class of the same name hides the earlier one's tests")
 
 
 if __name__ == "__main__":
