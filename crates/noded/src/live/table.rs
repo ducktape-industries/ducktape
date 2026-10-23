@@ -125,6 +125,7 @@ pub(super) enum Event {
         reply: oneshot::Sender<Option<GoingAway>>,
     },
     Moved(Dirty),
+    Readopted,
     Due {
         reply: oneshot::Sender<Dirty>,
     },
@@ -263,6 +264,7 @@ impl<E: crate::Context> Table<E> {
             Event::GoAway { in_ms } => self.go_away(in_ms),
             Event::GoingAway { reply } => self.going_away(reply),
             Event::Moved(dirty) => self.moved(dirty),
+            Event::Readopted => self.readopted(),
             Event::Due { reply } => self.due(reply),
             Event::RequestsIn { program, reply } => self.requests_in(program, reply),
             Event::WaitingIn { program, reply } => self.waiting_in(program, reply),
@@ -382,6 +384,14 @@ impl<E: crate::Context> Table<E> {
         if grew {
             self.rechecks.notify_one();
         }
+    }
+
+    fn readopted(&mut self) {
+        let programs = self.state.requested_programs();
+        self.moved(Dirty {
+            programs,
+            identity: true,
+        });
     }
 
     fn due(&mut self, reply: oneshot::Sender<Dirty>) {

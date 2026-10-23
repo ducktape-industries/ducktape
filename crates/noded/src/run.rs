@@ -1773,8 +1773,7 @@ async fn readopted<E: Context>(
     }
     published(node, &daemon, Some(anchor.clone()));
     daemon.tips.send_replace(tip.height);
-    let programs: Vec<abi::ProgramId> = node.host().store().programs().cloned().collect();
-    daemon.readopted(programs, head).await;
+    daemon.readopted(head).await;
     let blobs_role = node.host().role(role::BLOBS)?;
     let bundles: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> = node
         .view(Layer::Confirmed)

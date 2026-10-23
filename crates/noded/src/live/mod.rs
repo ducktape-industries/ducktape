@@ -232,13 +232,10 @@ impl<E: crate::Context> Relay<E> {
         }
     }
 
-    pub fn readopted(&self, programs: Vec<ProgramId>) {
+    pub fn readopted(&self) {
         self.grants.identity_moved();
         self.grants.moved();
-        self.send(Event::Moved(Dirty {
-            programs: programs.into_iter().collect(),
-            identity: true,
-        }));
+        self.send(Event::Readopted);
     }
 
     /// The grant read for one request, with the generation it was read at, so a block that

@@ -29,6 +29,8 @@ use tokio_tungstenite::tungstenite::Message;
 use super::grants::{Answered, Chain};
 use super::{Config, GOAWAY_MS, Network, Relay, ws_upgrade};
 
+mod recovery;
+
 type Context = runtime::Context;
 
 const NETWORK: &str = "live-test";
@@ -42,6 +44,7 @@ type Row = (String, String, Option<Account>);
 struct Ledger {
     accounts: Mutex<HashMap<Vec<u8>, Account>>,
     grants: Mutex<HashMap<Row, Grant>>,
+    grant_reads: Mutex<Vec<Row>>,
     parked: Mutex<Option<Parked>>,
     parked_account: Mutex<Option<Parked>>,
 }
@@ -130,6 +133,10 @@ impl Chain for Ledger {
     }
 
     fn grant(&self, program: &str, room: &str, account: Account) -> Answered<'_, Option<Grant>> {
+        self.grant_reads
+            .lock()
+            .unwrap()
+            .push((program.to_owned(), room.to_owned(), Some(account)));
         let grants = self.grants.lock().unwrap();
         let own = grants.get(&(program.to_owned(), room.to_owned(), Some(account)));
         let grant = own

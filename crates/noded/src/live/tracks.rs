@@ -3,7 +3,7 @@
 //! under one lock and returns what to send; the sessions' outlets carry it.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use live_wire::{
     Welcome, well_named,
 };
 
+use abi::ProgramId;
 use abi::live::{Grant, pattern_covers};
 
 use super::grants::{Act, watch_patterns};
@@ -2137,6 +2138,25 @@ impl State {
             objects: vec![payload],
             complete: true,
         });
+    }
+
+    pub fn requested_programs(&self) -> BTreeSet<ProgramId> {
+        let mut programs = BTreeSet::new();
+        for session in self.sessions.values() {
+            let namespaces = session
+                .published
+                .values()
+                .chain(session.subscribed.values())
+                .map(|track| track.namespace.as_str())
+                .chain(session.watching.values().map(String::as_str))
+                .chain(session.waiting.values().map(Ask::namespace));
+            for namespace in namespaces {
+                if let Some(place) = super::grants::place(namespace) {
+                    programs.insert(place.program.to_owned());
+                }
+            }
+        }
+        programs
     }
 
     /// Every request that lives in `program`'s rooms, as the thing it holds, in the order a

@@ -338,8 +338,8 @@ impl<E: Context> Daemon<E> {
         self.changes.hang_up().await;
     }
 
-    pub(crate) async fn readopted(&self, programs: Vec<ProgramId>, head: Option<wire::Head>) {
-        self.live.readopted(programs);
+    pub(crate) async fn readopted(&self, head: Option<wire::Head>) {
+        self.live.readopted();
         self.changes.cut(head).await;
     }
 
