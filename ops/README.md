@@ -959,7 +959,8 @@ one up for another network.
   merge into its `main` (protected, so only merges move it) is the
   decision. `k8s/reconcile/reconcile.py` is reconcile, a daemon off the
   chain that applies it. Its duties are `egress/fabrics-1.toml`, the
-  node's own `egress.toml`, and `pods.toml`, the pods service's image.
+  node's own `egress.toml`, and `pods.toml`, the pods service's image and
+  settings.
 - On duckpond a new egress service goes into `infra` first, as a change to
   `egress/fabrics-1.toml`, and reconcile applies it once it merges. Nobody
   edits the node's `/data/egress.toml` or runs `ducktape egress reload` by
@@ -1000,13 +1001,20 @@ one up for another network.
   `report_unposted`, and a tick that cannot read forge, the node or
   Kubernetes logs `unread`, each at its first attempt and every tenth; a
   good read logs `read` once.
-- `pods.toml` holds one line, `image = "localhost:5000/pods:<tag>@sha256:<digest>"`,
-  a digest already pushed (`k8s/pods/deploy` builds and pushes it). An open
-  change to it gets status `reconcile/pods`: refused when the image is not
+- `pods.toml` holds `image = "localhost:5000/pods:<tag>@sha256:<digest>"`,
+  a digest already pushed (`k8s/pods/deploy` builds and pushes it), and an
+  optional `[env]` table of the `pods` container's settings, each
+  `NAME = "string"` (`PODS_BUILD_IMAGE`, `PODS_LANE_FIRST_LIMIT`, ...).
+  `PODS_OUT_IMAGE` is not one of them: reconcile sets it to the image. A
+  setting reconcile patches only the entries `[env]` names, merged by name,
+  so a name taken out of `[env]` keeps its live value, and a name the live
+  container sets from `valueFrom` is refused. An open
+  change to it gets status `reconcile/pods`: refused when the file is not
   that shape, when infra's egress file serves no `pods` (the proof below
   could not run), or when a server-side dry-run patch changes more than the
-  `pods` container's image and its `PODS_OUT_IMAGE`. A new `main` that
-  changes the image is patched once (strategic merge, with the
+  `pods` container's image, its `PODS_OUT_IMAGE` and the `[env]` entries
+  (paths name env entries by name). A new `main` that
+  changes the image or a setting is patched once (strategic merge, with the
   Deployment's `resourceVersion`); reconcile then follows the rollout on
   the Deployment's watch stream. It is proven when the rollout completes,
   the node's dry `egress set` says `pods` answered from the node, and the
@@ -1014,7 +1022,9 @@ one up for another network.
   also concerns `RECONCILE_PROBER` (17), who runs the functional probe (exec, a
   tmpfs scratch, a notify post) with the pod tools, since nothing off the
   chain reaches the pods service. A failed proof, or a rollout past
-  `progressDeadlineSeconds`, patches back the image it replaced. A digest
+  `progressDeadlineSeconds`, patches back the image it replaced and each
+  `[env]` entry's value read live before the roll (deleting one that was
+  not set). A digest
   the registry lacks fails to pull while the old pod serves, so it costs
   that deadline and rolls back by itself. A tick waits on the rollout, so
   egress waits behind a roll. The proof's dry `egress set` is refused while

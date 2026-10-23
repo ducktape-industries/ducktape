@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# reconcile: applies what forge repo `infra` holds on `main` to fabrics-1, one duty at a time: the node's egress services (`egress/<node>.toml`) and the pods service's image (`pods.toml`).
+# reconcile: applies what forge repo `infra` holds on `main` to fabrics-1, one duty at a time: the node's egress services (`egress/<node>.toml`) and the pods service's image and settings (`pods.toml`).
 # Each open change into `main` gets a dry-run verdict per duty as a commit status and a review comment; each new `main` is applied once, proven, and rolled back when its proof fails. reconcile-test.py tests it against a fake node and a fake Kubernetes.
 import http.client
 import json
@@ -33,6 +33,7 @@ PODS_DEPLOYMENT = "pods"
 PODS_CONTAINER = "pods"
 PODS_OUT = "PODS_OUT_IMAGE"
 PODS_IMAGE = re.compile(r"localhost:5000/pods:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 DEPLOYMENTS = f"/apis/apps/v1/namespaces/{PODS_NAMESPACE}/deployments"
 MANAGER = "reconcile"
 SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
@@ -330,6 +331,17 @@ def out_image(template):
     return values[0] if values else None
 
 
+def env_of(template, names):
+    container = container_of(template) or {}
+    held = {entry["name"]: entry for entry in container.get("env", [])}
+    return {name: held[name].get("value") if name in held else None for name in names}
+
+
+def with_env(image, env):
+    shown = [f"{name}={value}" if value is not None else f"{name} unset" for name, value in env.items()]
+    return " with ".join([image, ", ".join(shown)]) if shown else image
+
+
 def rollout_of(deployment):
     spec = deployment["spec"]
     status = deployment.get("status", {})
@@ -347,10 +359,12 @@ def rollout_of(deployment):
     return Rollout(image, complete, exceeded, spec["progressDeadlineSeconds"], deployment["metadata"]["resourceVersion"])
 
 
-def pods_patch(image, out, resource_version):
+def pods_patch(image, out, env, resource_version):
     container = {"name": PODS_CONTAINER, "image": image}
-    if out is not None:
-        container["env"] = [{"name": PODS_OUT, "value": out}]
+    entries = [] if out is None else [{"name": PODS_OUT, "value": out}]
+    entries += [{"name": name, "$patch": "delete"} if value is None else {"name": name, "value": value} for name, value in env.items()]
+    if entries:
+        container["env"] = entries
     return {"metadata": {"resourceVersion": resource_version}, "spec": {"template": {"spec": {"containers": [container]}}}}
 
 
@@ -363,21 +377,27 @@ def differences(before, after, path=""):
     return [] if before == after else [path]
 
 
+def keyed(spec):
+    template = spec.get("template", {})
+    pod = template.get("spec", {})
+    containers = [{**held, "env": {entry["name"]: entry for entry in held.get("env", [])}} for held in pod.get("containers", [])]
+    return {**spec, "template": {**template, "spec": {**pod, "containers": containers}}}
+
+
 def compared(held):
     meta = held["metadata"]
-    return {"spec": held["spec"], "labels": meta.get("labels", {}), "annotations": meta.get("annotations", {})}
+    return {"spec": keyed(held["spec"]), "labels": meta.get("labels", {}), "annotations": meta.get("annotations", {})}
 
 
 def changed_paths(live, dry):
     return differences(compared(live), compared(dry))
 
 
-def pods_paths(deployment):
+def pods_paths(deployment, names):
     containers = deployment["spec"]["template"]["spec"]["containers"]
     at = [held["name"] for held in containers].index(PODS_CONTAINER)
-    names = [held["name"] for held in containers[at].get("env", [])]
     base = f"spec.template.spec.containers.{at}"
-    return {f"{base}.image", *([f"{base}.env.{names.index(PODS_OUT)}.value"] if PODS_OUT in names else [])}
+    return {f"{base}.image", f"{base}.env.{PODS_OUT}.value", *[f"{base}.env.{name}{tail}" for name in names for tail in ("", ".value")]}
 
 
 def digest_of(image):
@@ -392,6 +412,17 @@ class PodsPlan:
     out: str | None = None
     changed: tuple = ()
     body: dict | None = None
+    env: dict | None = None
+    live_env: dict | None = None
+
+
+def pods_moves(found):
+    moves = [] if found.live == found.image else [f"{found.live} to {found.image}"]
+    for name, value in (found.env or {}).items():
+        before = found.live_env[name]
+        if before != value:
+            moves.append(f"{name} from {'unset' if before is None else before} to {value}")
+    return "; ".join(moves)
 
 
 def pods_declared(text):
@@ -401,12 +432,18 @@ def pods_declared(text):
         document = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         return None, f"the file does not parse: {error}"
-    if sorted(document) != ["image"] or not isinstance(document["image"], str):
-        return None, "the file does not parse: pods.toml holds one string, image"
+    env = document.get("env", {})
+    if "image" not in document or set(document) - {"image", "env"} or not isinstance(document["image"], str) or not isinstance(env, dict):
+        return None, "the file does not parse: pods.toml holds one string, image, and an optional [env] table"
     image = document["image"]
     if not PODS_IMAGE.fullmatch(image):
         return None, f"the image {image} is not localhost:5000/pods:<tag>@sha256:<digest>, a digest already pushed"
-    return image, None
+    unread = sorted(name for name, value in env.items() if not ENV_NAME.fullmatch(name) or not isinstance(value, str))
+    if unread:
+        return None, f"the [env] entries {unread} are not NAME = \"string\", an environment variable of the pods container"
+    if PODS_OUT in env:
+        return None, f"[env] sets {PODS_OUT}, which reconcile sets to the image"
+    return (image, env), None
 
 
 def serves_pods(egress_text):
@@ -420,26 +457,31 @@ def serves_pods(egress_text):
 
 
 def pods_plan(text, egress_text, kube):
-    image, problem = pods_declared(text)
+    declared, problem = pods_declared(text)
     if problem is not None:
         return PodsPlan((problem,))
+    image, env = declared
     if not serves_pods(egress_text):
         return PodsPlan(("infra's egress file serves no pods service, so the roll's proof that the node reaches pods cannot run",))
     try:
         deployment = kube.deployment()
         template = deployment["spec"]["template"]
-        live = container_image(template)
-        if live is None:
+        container = container_of(template)
+        if container is None:
             return PodsPlan((f"deployment {PODS_NAMESPACE}/{PODS_DEPLOYMENT} has no container {PODS_CONTAINER}",))
-        body = pods_patch(image, image, deployment["metadata"]["resourceVersion"])
+        live = container["image"]
+        sourced = sorted(entry["name"] for entry in container.get("env", []) if entry["name"] in env and "valueFrom" in entry)
+        if sourced:
+            return PodsPlan((f"[env] names {sourced}, which the live pods container sets from valueFrom",))
+        body = pods_patch(image, image, env, deployment["metadata"]["resourceVersion"])
         dry = kube.patch(body, dry_run=True)
     except KubeRefused as refused:
         return PodsPlan((f"Kubernetes refuses the dry run: {refused}",))
     changed = changed_paths(deployment, dry)
-    stray = [path for path in changed if path not in pods_paths(deployment)]
+    stray = [path for path in changed if path not in pods_paths(deployment, env)]
     if stray:
-        return PodsPlan((f"the server-side dry run changes {stray}, beyond the pods container's image and {PODS_OUT}",))
-    return PodsPlan((), image, live, out_image(template), tuple(changed), body)
+        return PodsPlan((f"the server-side dry run changes {stray}, beyond the pods container's image, {PODS_OUT} and the [env] entries",))
+    return PodsPlan((), image, live, out_image(template), tuple(changed), body, env, env_of(template, env))
 
 
 def pods_verdict_body(found):
@@ -450,7 +492,7 @@ def pods_verdict_body(found):
     return "\n".join(
         [
             "reconcile/pods: PASS (server-side dry run, nothing applied)",
-            f"rolls {found.live} to {found.image}; the dry run changes {', '.join(found.changed)}",
+            f"rolls {pods_moves(found)}; the dry run changes {', '.join(found.changed)}",
         ]
     )
 
@@ -597,8 +639,8 @@ class Reconcile:
             pods["applied"] = {"commit": tip, "image": found.image}
             return say("pods_unchanged", commit=tip, image=found.image)
         if self.mode == "report":
-            return self.report(f"pods-would-roll-{short}", [f"infra main {short}: would roll the pods service from {found.live} to {found.image}. Report mode, so it is unchanged."])
-        pods["rolling"] = {"commit": tip, "image": found.image, "before": found.live, "before_out": found.out, "problems": None}
+            return self.report(f"pods-would-roll-{short}", [f"infra main {short}: would roll the pods service: {pods_moves(found)}. Report mode, so it is unchanged."])
+        pods["rolling"] = {"commit": tip, "image": found.image, "before": found.live, "before_out": found.out, "env": found.env, "before_env": found.live_env, "problems": None}
         self.store.save(self.state)
         try:
             self.kube.patch(found.body, dry_run=False)
@@ -655,7 +697,7 @@ class Reconcile:
         self.state["pods"]["applied"] = {"commit": rolling["commit"], "image": rolling["image"]}
         lines = [
             f"infra main {short}: the pods service runs {rolling['image']}, proven: the rollout completed, the node reaches pods, and the running pod's imageID is {digest_of(rolling['image'])}.",
-            f"Run the functional probe now (one exec, a tmpfs scratch input, one notify post). If it fails, roll back by hand to {rolling['before']}.",
+            f"Run the functional probe now (one exec, a tmpfs scratch input, one notify post). If it fails, roll back by hand to {with_env(rolling['before'], rolling.get('before_env') or {})}.",
         ]
         self.report(f"pods-proven-{short}", lines, mention=self.prober)
 
@@ -681,15 +723,19 @@ class Reconcile:
     def roll_back_pods(self, rolling):
         short = rolling["commit"][:12]
         problems = rolling["problems"]
+        before_env = rolling.get("before_env") or {}
+        before = with_env(rolling["before"], before_env)
+        rolled = with_env(rolling["image"], rolling.get("env") or {})
         try:
             deployment = self.kube.deployment()
-            if container_image(deployment["spec"]["template"]) != rolling["before"]:
-                self.kube.patch(pods_patch(rolling["before"], rolling["before_out"], deployment["metadata"]["resourceVersion"]), dry_run=False)
+            template = deployment["spec"]["template"]
+            if container_image(template) != rolling["before"] or env_of(template, before_env) != before_env:
+                self.kube.patch(pods_patch(rolling["before"], rolling["before_out"], before_env, deployment["metadata"]["resourceVersion"]), dry_run=False)
         except KubeRefused as refused:
             self.state["pods"]["rolling"] = None
-            return self.report(f"pods-stuck-{short}", [f"infra main {short}: rolled the pods service to {rolling['image']}, its proof failed, and the rollback to {rolling['before']} was refused: {refused}", *problems])
+            return self.report(f"pods-stuck-{short}", [f"infra main {short}: rolled the pods service to {rolled}, its proof failed, and the rollback to {before} was refused: {refused}", *problems])
         self.state["pods"]["rolling"] = None
-        self.report(f"pods-rolled-back-{short}", [f"infra main {short}: rolled the pods service to {rolling['image']}, its proof failed, so it runs {rolling['before']} again. Revert {short} in infra.", *problems])
+        self.report(f"pods-rolled-back-{short}", [f"infra main {short}: rolled the pods service to {rolled}, its proof failed, so it runs {before} again. Revert {short} in infra.", *problems])
 
     def follow_main(self):
         tip = self.forge.tip()

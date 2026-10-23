@@ -31,8 +31,13 @@ def image(letter):
 POD_A, POD_B, POD_C = image("a"), image("b"), image("c")
 
 
-def pods_toml(declared):
-    return f'image = "{declared}"\n'
+def pods_toml(declared, env=None):
+    lines = [f'image = "{declared}"', *(["[env]", *[f'{name} = "{value}"' for name, value in env.items()]] if env else [])]
+    return "\n".join(lines) + "\n"
+
+
+def env_entries(kube):
+    return {held["name"]: held.get("value") for held in kube.live["spec"]["template"]["spec"]["containers"][0]["env"]}
 
 
 def services(text):
@@ -87,6 +92,7 @@ class FakeKube:
         self.watched = []
         self.refuse = None
         self.stray = False
+        self.stray_env = False
         self.version = 1000
 
     def deployment(self):
@@ -102,11 +108,17 @@ class FakeKube:
         container = held["spec"]["template"]["spec"]["containers"][0]
         container["image"] = asked["image"]
         for env in asked.get("env", []):
-            for have in container["env"]:
-                if have["name"] == env["name"]:
-                    have["value"] = env["value"]
+            have = [entry for entry in container["env"] if entry["name"] == env["name"]]
+            if env.get("$patch") == "delete":
+                container["env"] = [entry for entry in container["env"] if entry["name"] != env["name"]]
+            elif have:
+                have[0]["value"] = env["value"]
+            else:
+                container["env"].append({"name": env["name"], "value": env["value"]})
         if self.stray:
             held["spec"]["replicas"] = 2
+        if self.stray_env:
+            container["env"].append({"name": "STRAY", "value": "1"})
         if dry_run:
             self.dry_runs += 1
             return held
@@ -329,7 +341,7 @@ class RealKube(unittest.TestCase):
     def test_a_dry_run_patch_is_a_strategic_merge_patch_with_its_field_manager_and_bearer_token(self):
         kube, asked, temp = self.kube(json.dumps(deployment_of(POD_B)).encode())
         with temp:
-            held = kube.patch(rc.pods_patch(POD_B, POD_B, "100"), dry_run=True)
+            held = kube.patch(rc.pods_patch(POD_B, POD_B, {}, "100"), dry_run=True)
             self.assertEqual(rc.container_image(held["spec"]["template"]), POD_B)
             request = asked[0]
             self.assertEqual(request.get_method(), "PATCH")
@@ -722,8 +734,54 @@ class PodsChanges(unittest.TestCase):
             n, head, passed, body = forge.verdicts[0]
             self.assertTrue(passed)
             self.assertIn(f"rolls {POD_A} to {POD_B}", body)
-            self.assertIn("spec.template.spec.containers.0.env.0.value, spec.template.spec.containers.0.image", body)
+            self.assertIn("spec.template.spec.containers.0.env.PODS_OUT_IMAGE.value, spec.template.spec.containers.0.image", body)
             self.assertEqual(kube.patches, [])
+
+    def test_an_env_table_passes_on_a_dry_run_that_changes_only_its_entries_and_adds_a_new_one(self):
+        node, cli, forge, kube, reconcile, temp = world(pods_text=pods_toml(POD_A))
+        with temp:
+            self.change(forge, 6, pods_toml(POD_A, {"PODS_NAMESPACE": "builds", "PODS_LANE_FIRST_LIMIT": "60"}))
+            reconcile.tick()
+            n, head, passed, body = forge.verdicts[0]
+            self.assertTrue(passed, body)
+            self.assertIn("rolls PODS_NAMESPACE from agents to builds; PODS_LANE_FIRST_LIMIT from unset to 60;", body)
+            self.assertIn("spec.template.spec.containers.0.env.PODS_LANE_FIRST_LIMIT, spec.template.spec.containers.0.env.PODS_NAMESPACE.value", body)
+            self.assertNotIn(POD_A, body.split("rolls ", 1)[1])
+            self.assertEqual(kube.patches, [])
+
+    def test_an_env_table_that_is_not_names_to_strings_fails_without_asking_kubernetes(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            kube.refuse = "Kubernetes must not be asked"
+            self.change(forge, 7, pods_toml(POD_B) + 'env = "x"\n')
+            self.change(forge, 8, pods_toml(POD_B) + "[env]\nPODS_LANE_FIRST_LIMIT = 60\n")
+            self.change(forge, 9, pods_toml(POD_B) + '[env]\n"A-B" = "x"\n')
+            self.change(forge, 10, pods_toml(POD_B, {"PODS_OUT_IMAGE": POD_C}))
+            reconcile.tick()
+            bodies = [body for _, _, passed, body in forge.verdicts if not passed]
+            self.assertEqual(len(bodies), 4)
+            self.assertIn("an optional [env] table", bodies[0])
+            self.assertIn("['PODS_LANE_FIRST_LIMIT'] are not NAME", bodies[1])
+            self.assertIn("['A-B'] are not NAME", bodies[2])
+            self.assertIn("[env] sets PODS_OUT_IMAGE", bodies[3])
+
+    def test_an_env_entry_the_live_container_sets_from_value_from_fails(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            kube.live["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "PODS_KEY", "valueFrom": {"secretKeyRef": {"name": "k", "key": "k"}}})
+            self.change(forge, 11, pods_toml(POD_A, {"PODS_KEY": "x"}))
+            reconcile.tick()
+            self.assertFalse(forge.verdicts[0][2])
+            self.assertIn("['PODS_KEY'], which the live pods container sets from valueFrom", forge.verdicts[0][3])
+
+    def test_a_dry_run_that_changes_an_env_entry_not_declared_fails(self):
+        node, cli, forge, kube, reconcile, temp = world()
+        with temp:
+            kube.stray_env = True
+            self.change(forge, 12, pods_toml(POD_A, {"PODS_LANE_FIRST_LIMIT": "60"}))
+            reconcile.tick()
+            self.assertFalse(forge.verdicts[0][2])
+            self.assertIn("spec.template.spec.containers.0.env.STRAY", forge.verdicts[0][3])
 
     def test_an_image_that_is_not_a_pushed_digest_fails_without_asking_kubernetes(self):
         node, cli, forge, kube, reconcile, temp = world()
@@ -877,7 +935,46 @@ class PodsRoll(unittest.TestCase):
             reconcile.tick()
             self.assertEqual(kube.patches, [])
             self.assertGreater(kube.dry_runs, 0)
-            self.assertIn(f"would roll the pods service from {POD_A} to {POD_B}", cli.posts[0])
+            self.assertIn(f"would roll the pods service: {POD_A} to {POD_B}.", cli.posts[0])
+
+    def env_rolled(self):
+        node, cli, forge, kube, reconcile, temp = world(pods_text=pods_toml(POD_A))
+        reconcile.tick()
+        forge.merge("e" * 40, {PATH: LIVE, PODS: pods_toml(POD_A, {"PODS_NAMESPACE": "builds", "PODS_LANE_FIRST_LIMIT": "60"})})
+        reconcile.tick()
+        return node, cli, forge, kube, reconcile, temp
+
+    def test_an_env_change_on_main_patches_its_entries_and_is_proven(self):
+        node, cli, forge, kube, reconcile, temp = self.env_rolled()
+        with temp:
+            self.assertEqual(kube.patches, [POD_A])
+            self.assertEqual(env_entries(kube), {"PODS_OUT_IMAGE": POD_A, "PODS_NAMESPACE": "builds", "PODS_LANE_FIRST_LIMIT": "60"})
+            kube.streams = [[kube.progress()]]
+            reconcile.tick()
+            self.assertIsNone(reconcile.state["pods"]["rolling"])
+            self.assertIn(f"roll back by hand to {POD_A} with PODS_NAMESPACE=agents, PODS_LANE_FIRST_LIMIT unset", cli.posts[0])
+            reconcile.tick()
+            self.assertEqual(kube.patches, [POD_A])
+
+    def test_a_failed_env_roll_puts_back_the_values_it_read_and_removes_the_entry_it_added(self):
+        node, cli, forge, kube, reconcile, temp = self.env_rolled()
+        with temp:
+            kube.streams = [[kube.progress(counts=(2, 1, 0), exceeded=True)]]
+            reconcile.tick()
+            self.assertEqual(kube.patches, [POD_A, POD_A])
+            self.assertEqual(env_entries(kube), {"PODS_OUT_IMAGE": POD_A, "PODS_NAMESPACE": "agents"})
+            self.assertIn(f"so it runs {POD_A} with PODS_NAMESPACE=agents, PODS_LANE_FIRST_LIMIT unset again", cli.posts[0])
+            self.assertIsNone(reconcile.state["pods"]["rolling"])
+
+    def test_a_rolling_state_saved_before_env_existed_still_rolls_back_the_image(self):
+        node, cli, forge, kube, reconcile, temp = self.rolled()
+        with temp:
+            for key in ("env", "before_env"):
+                reconcile.state["pods"]["rolling"].pop(key)
+            kube.streams = [[kube.progress(counts=(2, 1, 0), exceeded=True)]]
+            reconcile.tick()
+            self.assertEqual(kube.patches, [POD_B, POD_A])
+            self.assertIn(f"runs {POD_A} again. Revert", cli.posts[0])
 
 
 if __name__ == "__main__":
