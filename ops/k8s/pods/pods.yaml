@@ -583,7 +583,7 @@ spec:
             - {name: PODS_FORGE, value: "@FORGE@"}
             - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844"}
             - {name: PODS_KEYS, value: /keys}
-            - {name: PODS_RUNNERS, value: "lat-4=/runners/lat-4 lat-7=/runners/lat-7 lat-2=/runners/lat-2 lat-5=/runners/lat-5 desktop=/desktop zk-dev=/runners/zk-dev"}
+            - {name: PODS_RUNNERS, value: "lat-7=/runners/lat-7 lat-5=/runners/lat-5 desktop=/desktop zk-dev=/runners/zk-dev"}
             - {name: PODS_WARM_POD, value: ""}
             - {name: PODS_LANE_FIRST_LIMIT, value: "40"}
             - {name: PODS_BUILD_IMAGE, value: "localhost:5000/toolchain:70b103bd4da8@sha256:a71046e612592a00cc3034d9727fcbb9173c1729ea07f5b696c885694d2a84d0"}
@@ -602,9 +602,7 @@ spec:
             - {name: keys, mountPath: /keys, readOnly: true}
             - {name: desktop, mountPath: /desktop, readOnly: true}
             - {name: runner-zk-dev, mountPath: /runners/zk-dev, readOnly: true}
-            - {name: runner-lat-2, mountPath: /runners/lat-2, readOnly: true}
             - {name: runner-lat-5, mountPath: /runners/lat-5, readOnly: true}
-            - {name: runner-lat-4, mountPath: /runners/lat-4, readOnly: true}
             - {name: runner-lat-7, mountPath: /runners/lat-7, readOnly: true}
           securityContext:
             allowPrivilegeEscalation: false
@@ -626,19 +624,9 @@ spec:
             secretName: runner-zk-dev
             optional: true
             defaultMode: 0440
-        - name: runner-lat-2
-          secret:
-            secretName: runner-lat-2
-            optional: true
-            defaultMode: 0440
         - name: runner-lat-5
           secret:
             secretName: runner-lat-5
-            optional: true
-            defaultMode: 0440
-        - name: runner-lat-4
-          secret:
-            secretName: runner-lat-4
             optional: true
             defaultMode: 0440
         - name: runner-lat-7
