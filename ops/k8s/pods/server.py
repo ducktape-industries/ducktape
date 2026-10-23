@@ -151,7 +151,7 @@ READ = {"path": str, "offset": int, "length": int, "container": str}
 REPORT = {"report": str, "push": dict}
 APPLY = {"manifests": list}
 DELETE = {"kind": str, "name": str}
-LOGS = {"tail", "since", "container"}
+LOGS = {"tail", "bytes", "whole", "since", "container"}
 WAIT = {"every", "log"}
 LOG_READ = 'wc -c < "$1" && tail -c 2048 "$1" | tail -n 1'
 ALIASES = {
@@ -2850,16 +2850,31 @@ def report_answer(report, push):
 def log_options(query):
     unknown = sorted(set(query) - LOGS)
     if unknown:
-        raise Refused(400, f"logs take no {', '.join(unknown)}; they take tail, since and container")
+        raise Refused(400, f"logs take no {', '.join(unknown)}; they take tail, bytes, whole, since and container")
+    bounds = {"tail", "bytes", "whole"} & set(query)
+    if not bounds:
+        raise Refused(400, "logs answer a slice: name tail (lines), bytes (the last ones), or whole=1 for all of it")
+    if "whole" in bounds and (len(bounds) > 1 or query["whole"][-1] != "1"):
+        raise Refused(400, "whole is whole=1, named without tail or bytes")
+    for name in ("tail", "bytes", "since"):
+        if name in query and not (query[name][-1].isascii() and query[name][-1].isdigit()):
+            raise Refused(400, f"{name} is a whole number")
     options = ["--container", query["container"][-1]] if "container" in query else []
     for name, flag, unit in (("tail", "--tail", ""), ("since", "--since", "s")):
-        if name not in query:
-            continue
-        value = query[name][-1]
-        if not value.isdigit():
-            raise Refused(400, f"{name} is a whole number")
-        options.append(f"{flag}={value}{unit}")
+        if name in query:
+            options.append(f"{flag}={query[name][-1]}{unit}")
     return options
+
+
+def log_shown(out, query):
+    shown = b"\n".join(line.rstrip(b"\r").rsplit(b"\r", 1)[-1] for line in out.split(b"\n"))
+    limit = int(query["bytes"][-1]) if "bytes" in query else len(shown)
+    if len(shown) <= limit:
+        return shown
+    cut = shown[len(shown) - limit:]
+    if shown[len(shown) - limit - 1] != ord("\n") and b"\n" in cut[:-1]:
+        cut = cut[cut[:-1].index(b"\n") + 1:]
+    return cut.lstrip(bytes(range(0x80, 0xC0)))
 
 
 def put_answer(text, count):
@@ -4473,7 +4488,7 @@ class Service:
         ran = self.built().kube.logs(name, log_options(query))
         if ran.code != 0:
             raise kube_refusal(ran, f"build {name}'s logs were not read")
-        return 200, ran.out
+        return 200, log_shown(ran.out, query)
 
     def build_delete(self, asked, name):
         building = self.built()
@@ -5091,11 +5106,11 @@ class Service:
 
     def logs(self, name, query):
         if name in self.runners:
-            return 200, self.runners[name].logs(log_options(query))
+            return 200, log_shown(self.runners[name].logs(log_options(query)), query)
         ran = self.kube.logs(name, log_options(query))
         if ran.code != 0:
             raise kube_refusal(ran, f"pod {name}'s logs were not read")
-        return 200, ran.out
+        return 200, log_shown(ran.out, query)
 
     def wait(self, name, query, headers):
         every = wait_every(query, headers)

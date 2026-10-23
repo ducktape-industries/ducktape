@@ -2,7 +2,9 @@
 
 `server.py` is the pods service: a network's agents use it to run work on a Kubernetes
 cluster through the network's egress. It makes pods with fetched inputs and execs into
-them, either whole or streamed. It also serves logs and a wait that streams until a pod
+them, either whole or streamed. It also serves logs, as the slice the caller names
+(`tail` lines, the last `bytes` from a line's start, or `whole=1`; each line as a terminal
+shows it, after its last carriage return), and a wait that streams until a pod
 ends, applies and deletes manifests, passes Kubernetes API calls through inside one
 namespace, puts a pod's outputs as blobs or files, reads a file out of a pod, packs a pod's commit for a forge push and reads forge's report of it,
 posts when work ends, and reports usage. The build runners `PODS_RUNNERS` names (`desktop`
@@ -70,7 +72,7 @@ or through a member node's halo forward.
   `gates` (full, check or light), or the command. A gates build keeps cargo's registry and git in
   the node's `/srv/build-jobs/cargo`. A command build mounts nothing of the node: its mirror and
   cargo live in its own `/work`. It ends within `limit` minutes, 1 to 40 (40
-  when unnamed, the gates' own bound from J-493, as `activeDeadlineSeconds`). `GET /v1/builds/NAME/logs` reads its log, `DELETE
+  when unnamed, the gates' own bound from J-493, as `activeDeadlineSeconds`). `GET /v1/builds/NAME/logs` reads its log as a pod's logs read, `DELETE
   /v1/builds/NAME` deletes it for its requester alone, and `notify` posts its end as a pod's.
   An `env` naming a setting the pod makes itself is refused 400.
 - A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and

@@ -1327,15 +1327,33 @@ class Status(Served):
         self.assertEqual([pod["name"] for pod in answer["pods"]], ["duckpond-41", "web-7c9"])
         self.assertIsNone(answer["pods"][1]["requester"])
 
-    def test_logs_come_whole_unless_the_caller_asks_for_a_tail_a_window_or_a_container(self):
+    def test_logs_answer_the_slice_the_caller_names(self):
         self.kube.answer("logs", ran(b"compiling\n"))
-        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs"), (200, b"compiling\n"))
-        self.call("GET", "/v1/pods/duckpond-41/logs?tail=20&since=60&container=fetch")
+        self.refused("GET", "/v1/pods/duckpond-41/logs", None, 400, ["tail", "bytes", "whole=1"])
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?whole=1"), (200, b"compiling\n"))
+        self.assertEqual(self.kube.calls[-1], ("logs", "duckpond-41", []))
+        self.call("GET", "/v1/pods/duckpond-41/logs?tail=20&since=60&container=fetch&bytes=9")
         self.assertEqual(self.kube.calls[-1], ("logs", "duckpond-41", ["--container", "fetch", "--tail=20", "--since=60s"]))
+
+    def test_a_log_line_is_what_a_terminal_shows_and_bytes_keep_whole_lines_from_the_end(self):
+        self.kube.answer("logs", ran(b"Receiving 10%\rReceiving 90%\rReceiving 100%, done.\r\nGATES ok\ncrlf\r\n"))
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?tail=5"), (200, b"Receiving 100%, done.\nGATES ok\ncrlf\n"))
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?bytes=14"), (200, b"GATES ok\ncrlf\n"))
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?bytes=12"), (200, b"crlf\n"))
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?bytes=0"), (200, b""))
+        self.kube.answer("logs", ran("été".encode()))
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?bytes=4"), (200, "té".encode()))
+        self.kube.answer("logs", ran("été\n".encode()))
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?bytes=4"), (200, "té\n".encode()))
+        self.kube.answer("logs", ran(b"ok\n" + b"x" * 5000 + b"\n"))
+        self.assertEqual(self.call("GET", "/v1/pods/duckpond-41/logs?bytes=4096"), (200, b"x" * 4095 + b"\n"))
 
     def test_logs_refuse_an_option_they_do_not_take(self):
         self.refused("GET", "/v1/pods/duckpond-41/logs?follow=1", None, 400, ["no follow"])
         self.refused("GET", "/v1/pods/duckpond-41/logs?tail=-1", None, 400, ["whole number"])
+        self.refused("GET", "/v1/pods/duckpond-41/logs?bytes=%D9%A3", None, 400, ["whole number"])
+        self.refused("GET", "/v1/pods/duckpond-41/logs?whole=1&tail=5", None, 400, ["whole=1"])
+        self.refused("GET", "/v1/pods/duckpond-41/logs?whole=yes", None, 400, ["whole=1"])
 
 
 class Delete(Served):
@@ -7538,7 +7556,7 @@ class BuildPods(Served):
         self.builds.answer("logs", ran(b"GATES ok\n"))
         status, answer = self.call("GET", "/v1/builds/duckpond-41")
         self.assertEqual((status, answer["build"]["phase"]), (200, "Succeeded"))
-        status, logs = self.call("GET", "/v1/builds/duckpond-41/logs")
+        status, logs = self.call("GET", "/v1/builds/duckpond-41/logs?whole=1")
         self.assertEqual((status, logs), (200, b"GATES ok\n"))
         self.assertEqual(self.builds.verbs(), ["get", "logs"])
         self.assertNotIn("get", self.kube.verbs())

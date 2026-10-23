@@ -527,7 +527,7 @@ one up for another network.
   long as the pod lives: the request that made the pod was answered when the
   pod was created, so no request bounds it, and deleting the pod ends it. An
   HTTP answer, or any other failure, ends the fetch at once. Each try again
-  is a line in the fetch container's log (`pods/NAME/logs?container=fetch`)
+  is a line in the fetch container's log (`pods/NAME/logs?container=fetch&tail=N`)
   with the failure in the fetcher's words, and the pod stays in its init
   phase meanwhile.
 - A pod the service makes shares one process namespace among its
