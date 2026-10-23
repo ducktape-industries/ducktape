@@ -42,21 +42,14 @@ fn offer(seat: &Seat, address: SocketAddr, signer: &ed25519::PrivateKey) {
     std::fs::write(seat.workspace.dir().join("forward.toml"), text).unwrap();
 }
 
-async fn anchor_both_hold(first: &Client, second: &Client) -> Tip {
-    let first = first.status().await.unwrap().anchor();
-    let second = second.status().await.unwrap().anchor();
-    std::cmp::min_by_key(first, second, |anchor| anchor.height)
-}
-
 async fn call(
     client: &Client,
-    serving: &Client,
     key: &ed25519::PrivateKey,
     member: &[u8],
     service: &str,
     said: &[u8],
 ) -> noded::Result<Vec<u8>> {
-    let anchor = anchor_both_hold(client, serving).await;
+    let anchor = client.status().await.unwrap().anchor();
     let frame = Frame::sign_forward(key, NETWORK.as_bytes(), anchor, service, member.to_vec());
     let mut heard = Vec::new();
     client.forward(&frame, said, &mut heard).await?;
@@ -89,7 +82,7 @@ fn a_listed_signer_reaches_a_members_forwarded_service_through_any_node_and_no_r
         offer(&serving, echo.address, &caller);
         let through = &live[0].client;
         let at = serving.key();
-        let unopened = call(through, &live[1].client, &caller, &at, "echo", b"hi").await;
+        let unopened = call(through, &caller, &at, "echo", b"hi").await;
         assert_eq!(refusal_reason(unopened), reason::UNSUPPORTED);
 
         let open = halo::Op::Open {
@@ -105,22 +98,14 @@ fn a_listed_signer_reaches_a_members_forwarded_service_through_any_node_and_no_r
             reach(&node.client, height).await;
         }
 
-        let unlisted = call(through, &live[1].client, &stranger, &at, "echo", b"hi").await;
+        let unlisted = call(through, &stranger, &at, "echo", b"hi").await;
         assert_eq!(refusal_reason(unlisted), reason::NOT_FOUND);
-        let unoffered = call(through, &live[1].client, &caller, &at, "nothing", b"hi").await;
+        let unoffered = call(through, &caller, &at, "nothing", b"hi").await;
         assert_eq!(refusal_reason(unoffered), reason::NOT_FOUND);
         let nobody = stranger.public_key();
-        let unmembered = call(
-            through,
-            &live[1].client,
-            &caller,
-            nobody.as_ref(),
-            "echo",
-            b"hi",
-        )
-        .await;
+        let unmembered = call(through, &caller, nobody.as_ref(), "echo", b"hi").await;
         assert_eq!(refusal_reason(unmembered), reason::NOT_FOUND);
-        let anchor = anchor_both_hold(through, &live[1].client).await;
+        let anchor = through.status().await.unwrap().anchor();
         let asked = Frame::sign_query(&caller, NETWORK.as_bytes(), anchor, "echo", at.clone());
         let mut heard = Vec::new();
         let misnamed = through.forward(&asked, &b"hi"[..], &mut heard).await;
@@ -128,20 +113,11 @@ fn a_listed_signer_reaches_a_members_forwarded_service_through_any_node_and_no_r
         assert_eq!(refusal_reason(misnamed), reason::INVALID_INPUT);
         assert_eq!(echo.accepted.load(Ordering::SeqCst), 0);
 
-        let relayed = call(through, &live[1].client, &caller, &at, "echo", b"hello")
+        let relayed = call(through, &caller, &at, "echo", b"hello").await.unwrap();
+        assert_eq!(relayed, b"echo:hello");
+        let local = call(&live[1].client, &caller, &at, "echo", b"here")
             .await
             .unwrap();
-        assert_eq!(relayed, b"echo:hello");
-        let local = call(
-            &live[1].client,
-            &live[1].client,
-            &caller,
-            &at,
-            "echo",
-            b"here",
-        )
-        .await
-        .unwrap();
         assert_eq!(local, b"echo:here");
         assert_eq!(echo.accepted.load(Ordering::SeqCst), 2);
     });
@@ -323,7 +299,7 @@ fn a_node_names_a_block_in_its_status_only_once_it_serves_the_lane_and_seats_of_
         for node in &live {
             reach(&node.client, height).await;
         }
-        let unlisted = call(through, &live[1].client, &stranger, &at, "echo", b"hi").await;
+        let unlisted = call(through, &stranger, &at, "echo", b"hi").await;
         assert_eq!(refusal_reason(unlisted), reason::NOT_FOUND);
         assert_eq!(echo.accepted.load(Ordering::SeqCst), 0);
     });

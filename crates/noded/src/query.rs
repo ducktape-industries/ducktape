@@ -1,12 +1,18 @@
-// What /v1/query answers: a signed ask verified under the query namespace and fresh at its anchor,
-// or an unsigned one while the validators role's QueryPolicy is Open, run as the empty key.
+// Signed and unsigned queries, checked against the newest applied anchor before selecting a read layer.
 
 use abi::role::validators::{self, QueryPolicy};
 use abi::{Origin, ProgramId, Refusal, reason, role};
-use host::{Layer, Source};
+use host::{Layer, Source, Submission};
+use tokio::sync::watch;
 
-use crate::Context;
+use crate::view::{Current, Reading};
 use crate::wire::{Ask, Query};
+use crate::{Context, offload};
+
+enum VerifiedAsk {
+    Signed(Submission),
+    Unsigned { target: ProgramId, payload: Vec<u8> },
+}
 
 struct Asking {
     origin: Origin,
@@ -15,16 +21,57 @@ struct Asking {
 }
 
 pub(crate) async fn answer<E: Context>(
+    current: &Current<E>,
+    tips: watch::Receiver<u64>,
+    finalized: &watch::Receiver<u64>,
+    query: Query,
+    network: Vec<u8>,
+    now: impl FnOnce() -> u64 + Send,
+) -> crate::Result<Result<(ProgramId, host::Queried), Refusal>> {
+    let layer = query.layer;
+    let asking = match query.ask {
+        Ask::Signed(frame) => {
+            let submission = match offload(move || node::verify_query(&frame, &network)).await? {
+                Ok(submission) => submission,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+            VerifiedAsk::Signed(submission)
+        }
+        Ask::Unsigned { target, payload } => VerifiedAsk::Unsigned { target, payload },
+    };
+    let newest = match &asking {
+        VerifiedAsk::Signed(submission) => {
+            current
+                .for_anchor(tips, finalized, submission.anchor.height)
+                .await?
+        }
+        VerifiedAsk::Unsigned { .. } => current.view()?,
+    };
+    let reading = match layer {
+        Layer::Confirmed => Reading::Confirmed(newest.clone()),
+        Layer::Preconfirmed => current.reading(layer)?,
+    };
+    let time = now();
+    offload(move || {
+        let source = reading.source();
+        let anchors = newest.source();
+        tokio::runtime::Handle::current().block_on(asked(&source, &anchors, layer, asking, time))
+    })
+    .await?
+    .map_err(crate::Error::from)
+}
+
+async fn asked<E: Context>(
     source: &Source<'_, E>,
     newest: &Source<'_, E>,
-    query: Query,
-    network: &[u8],
+    layer: Layer,
+    ask: VerifiedAsk,
     time: u64,
 ) -> host::Result<Result<(ProgramId, host::Queried), Refusal>> {
-    let asking = match query.ask {
-        Ask::Signed(frame) => signed_query(newest, &frame, network)?,
-        Ask::Unsigned { target, payload } => {
-            unsigned_query(source, query.layer, time, target, payload).await?
+    let asking = match ask {
+        VerifiedAsk::Signed(submission) => signed_query(newest, submission)?,
+        VerifiedAsk::Unsigned { target, payload } => {
+            unsigned_query(source, layer, time, target, payload).await?
         }
     };
     match asking {
@@ -34,7 +81,7 @@ pub(crate) async fn answer<E: Context>(
             payload,
         }) => {
             let queried = source
-                .queried(query.layer, time, origin, &target, payload)
+                .queried(layer, time, origin, &target, payload)
                 .await?;
             Ok(Ok((target, queried)))
         }
@@ -44,13 +91,8 @@ pub(crate) async fn answer<E: Context>(
 
 fn signed_query<E: Context>(
     source: &Source<'_, E>,
-    frame: &[u8],
-    network: &[u8],
+    submission: Submission,
 ) -> host::Result<Result<Asking, Refusal>> {
-    let submission = match node::verify_query(frame, network) {
-        Ok(submission) => submission,
-        Err(refusal) => return Ok(Err(refusal)),
-    };
     if let Err(refusal) = source.fresh(&submission)? {
         return Ok(Err(refusal));
     }
@@ -120,32 +162,4 @@ async fn query_policy<E: Context>(
 }
 
 #[cfg(test)]
-mod tests {
-    use abi::role::validators;
-    use host::Layer;
-    use node::Frame;
-
-    use super::answer;
-    use crate::view::tests::{NETWORK, TIME, founded};
-    use crate::wire::{Ask, Query};
-
-    #[test]
-    fn a_query_anchored_at_the_newest_tip_is_answered_over_a_layer_a_block_behind() {
-        founded(|founded| async move {
-            let asked = abi::encode(&validators::Query::QueryPolicy);
-            let anchor = founded.next.tip();
-            let frame = Frame::sign_query(&founded.key, NETWORK, anchor, "valset", asked);
-            let query = Query {
-                layer: Layer::Preconfirmed,
-                ask: Ask::Signed(frame.encode()),
-            };
-            let behind = founded.first.source();
-            let newest = founded.next.source();
-            match answer(&behind, &newest, query, NETWORK, TIME).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(refusal)) => panic!("refused: {}: {}", refusal.reason, refusal.sentence),
-                Err(error) => panic!("the query failed: {error}"),
-            }
-        });
-    }
-}
+mod tests;

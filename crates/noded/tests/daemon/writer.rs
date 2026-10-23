@@ -286,3 +286,112 @@ async fn metric(client: &Client, name: &str) -> u64 {
         .unwrap();
     line.rsplit(' ').next().unwrap().parse().unwrap()
 }
+
+#[test]
+fn signed_queries_and_submits_wait_for_a_finalized_anchor_without_holding_the_pool_or_reading_the_old_view()
+ {
+    apart!();
+    let root = tempfile::tempdir().unwrap();
+    let first = Seat::new(root.path(), "n0");
+    let second = Seat::new(root.path(), "n1");
+    let founding = founding(root.path(), &[&first, &second], EPOCH_LENGTH);
+    first.init(&founding);
+    second.init(&founding);
+    let source = first.start();
+    let (behind, daemon) =
+        second.start_handing(LoadConfig::default(), |running| running.daemon.clone());
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let mut reseating = daemon.reseating.arm();
+        let publishing = reseating.recv().await.unwrap();
+        drop(reseating);
+        reach(&source.client, publishing.height).await;
+        let block = source
+            .client
+            .block(BlockAsk {
+                by: BlockRef::Height(publishing.height),
+                most: 0,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let anchor = Tip {
+            height: block.height,
+            id: block.id,
+        };
+        daemon
+            .finalized_blocks()
+            .wait_for(|height| *height >= anchor.height)
+            .await
+            .unwrap();
+        assert!(behind.client.status().await.unwrap().height < anchor.height);
+        let key = ed25519::PrivateKey::from_seed(31);
+        let query = Frame::sign_query(
+            &key,
+            NETWORK.as_bytes(),
+            anchor,
+            "probe",
+            abi::encode(&vec![Step::Env]),
+        );
+        let submit = Frame::sign(
+            &key,
+            NETWORK.as_bytes(),
+            anchor,
+            None,
+            "probe",
+            abi::encode(&vec![set(b"after-anchor", b"yes")]),
+        );
+        let mut checking = daemon.checking_anchors().arm();
+        let mut querying = Box::pin(behind.client.query(Layer::Confirmed, query.encode()));
+        let mut submitting = Box::pin(behind.client.submit(submit.encode(), Preconfirm::On));
+        let waiting_query_or_submit = ::tokio::select! {
+            waiting = checking.recv() => waiting.unwrap(),
+            early = &mut querying => panic!("the query judged an unapplied anchor: {early:?}"),
+            early = &mut submitting => panic!("the submit judged an unapplied anchor: {early:?}"),
+        };
+        let waiting_submit_or_query = ::tokio::select! {
+            waiting = checking.recv() => waiting.unwrap(),
+            early = &mut querying => panic!("the query judged an unapplied anchor: {early:?}"),
+            early = &mut submitting => panic!("the submit judged an unapplied anchor: {early:?}"),
+        };
+        assert_eq!(waiting_query_or_submit.height, anchor.height);
+        assert_eq!(waiting_submit_or_query.height, anchor.height);
+        drop(checking);
+        let held_anchor = behind.client.status().await.unwrap().anchor();
+        let beside = Frame::sign(
+            &key,
+            NETWORK.as_bytes(),
+            held_anchor,
+            None,
+            "probe",
+            abi::encode(&vec![set(b"beside-anchor", b"yes")]),
+        );
+        let beside = preconfirmed(&behind.client, beside.encode()).await;
+        assert!(
+            matches!(beside.outcome, Outcome::Applied { .. }),
+            "{beside:?}"
+        );
+        waiting_query_or_submit.release();
+        waiting_submit_or_query.release();
+        publishing.release();
+        let (queried, submitted) = futures::join!(querying, submitting);
+        let replies: Vec<Reply> = abi::decode(&queried.unwrap()).unwrap();
+        let [Reply::Env(env)] = replies.as_slice() else {
+            panic!("the query answers its environment: {replies:?}");
+        };
+        assert!(env.height >= anchor.height);
+        assert_eq!(
+            env.origin,
+            abi::Origin::External(key.public_key().as_ref().to_vec())
+        );
+        let Submitted::Preconfirmed(receipt) = submitted.unwrap() else {
+            panic!("the submit answers its prediction after the anchor is applied");
+        };
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+    });
+    drop(daemon);
+    shut_down(&runtime, &[&first, &second], vec![source, behind]);
+}

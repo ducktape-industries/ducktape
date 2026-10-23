@@ -133,6 +133,8 @@ impl<E: Context> Reading<E> {
 pub(crate) struct Current<E: Context> {
     pub(crate) views: ArcSwapOption<View<E>>,
     pub(crate) speculative: ArcSwapOption<Speculative<E>>,
+    #[cfg(feature = "testkit")]
+    pub(crate) checking_anchors: crate::testkit::Gate,
 }
 
 impl<E: Context> Current<E> {
@@ -140,6 +142,8 @@ impl<E: Context> Current<E> {
         Current {
             views: ArcSwapOption::empty(),
             speculative: ArcSwapOption::empty(),
+            #[cfg(feature = "testkit")]
+            checking_anchors: Default::default(),
         }
     }
 
@@ -158,9 +162,42 @@ impl<E: Context> Current<E> {
         }
     }
 
+    pub(crate) async fn for_anchor(
+        &self,
+        mut tips: watch::Receiver<u64>,
+        finalized: &watch::Receiver<u64>,
+        anchored: u64,
+    ) -> Result<Arc<View<E>>> {
+        loop {
+            tips.borrow_and_update();
+            let view = self.view()?;
+            let applied = view.tip().height >= anchored;
+            let unfinalized = anchored > *finalized.borrow();
+            let judged = applied || unfinalized;
+            if judged {
+                return Ok(view);
+            }
+            drop(view);
+            #[cfg(feature = "testkit")]
+            self.checking_anchors.pass(anchored).await;
+            tips.changed().await.map_err(|_| crate::Error::Stopped)?;
+        }
+    }
+
     pub(crate) fn withdraw(&self) {
         self.views.store(None);
         self.speculative.store(None);
+    }
+}
+
+#[cfg(feature = "testkit")]
+impl<E: Context> crate::Daemon<E> {
+    pub fn checking_anchors(&self) -> &crate::testkit::Gate {
+        &self.current.checking_anchors
+    }
+
+    pub fn finalized_blocks(&self) -> watch::Receiver<u64> {
+        self.finalized.clone()
     }
 }
 

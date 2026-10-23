@@ -496,25 +496,9 @@ async fn query<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Vec<u8>> {
         Ok(query) => query,
         Err(refusal) => return Reply::Refused(refusal),
     };
-    let reading = match ctx.reading(query.layer) {
-        Ok(reading) => reading,
-        Err(error) => return failed(error),
-    };
-    let network = ctx.network_id();
-    let time = ctx.now();
-    let newest = ctx.view().clone();
-    let asked = offload(move || {
-        let source = reading.source();
-        let anchors = newest.source();
-        tokio::runtime::Handle::current().block_on(crate::query::answer(
-            &source, &anchors, query, &network, time,
-        ))
-    })
-    .await;
-    match asked {
-        Ok(Ok(Ok((program, queried)))) => counted(&ctx, program, queried),
-        Ok(Ok(Err(refusal))) => Reply::Refused(refusal),
-        Ok(Err(error)) => failed(error),
+    match ctx.query(query).await {
+        Ok(Ok((program, queried))) => counted(&ctx, program, queried),
+        Ok(Err(refusal)) => Reply::Refused(refusal),
         Err(error) => failed(error),
     }
 }

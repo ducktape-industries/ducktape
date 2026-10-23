@@ -93,14 +93,38 @@ impl<E: Context> Ctx<E> {
         frame: Vec<u8>,
         preconfirm: Preconfirm,
     ) -> Result<std::result::Result<Taken, Refusal>> {
-        let taken = self
-            .daemon
-            .submit(frame.clone(), Source::Client, preconfirm)
-            .await;
+        let checked = match self.daemon.admit(frame.clone()).await? {
+            Ok(checked) => checked,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        self.daemon
+            .current
+            .for_anchor(
+                self.tips(),
+                &self.daemon.finalized,
+                checked.submission().anchor.height,
+            )
+            .await?;
+        let taken = self.daemon.take(checked, Source::Client, preconfirm).await;
         if let Ok(Ok(Taken::New(_))) = &taken {
             self.daemon.relay.send([frame.as_slice()]);
         }
         taken
+    }
+
+    pub(crate) async fn query(
+        &self,
+        query: crate::wire::Query,
+    ) -> Result<std::result::Result<(ProgramId, host::Queried), Refusal>> {
+        crate::query::answer(
+            &self.daemon.current,
+            self.tips(),
+            &self.daemon.finalized,
+            query,
+            self.network_id(),
+            || self.now(),
+        )
+        .await
     }
 
     pub(crate) async fn play(

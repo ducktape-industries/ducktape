@@ -172,24 +172,15 @@ async fn verified<E: Context>(
 
 async fn fresh<E: Context>(
     current: &Current<E>,
-    mut tips: watch::Receiver<u64>,
+    tips: watch::Receiver<u64>,
     finalized: &watch::Receiver<u64>,
     submission: &Submission,
 ) -> std::result::Result<(), Refusal> {
-    loop {
-        tips.borrow_and_update();
-        let view = current.view().map_err(unchecked)?;
-        let anchored = submission.anchor.height;
-        let applied = view.tip().height >= anchored;
-        let unfinalized = anchored > *finalized.borrow();
-        let judged = applied || unfinalized;
-        if judged {
-            return view.source().fresh(submission).map_err(unchecked)?;
-        }
-        if tips.changed().await.is_err() {
-            return Err(unchecked(crate::Error::Stopped));
-        }
-    }
+    let view = current
+        .for_anchor(tips, finalized, submission.anchor.height)
+        .await
+        .map_err(unchecked)?;
+    view.source().fresh(submission).map_err(unchecked)?
 }
 
 fn unchecked(error: impl std::fmt::Display) -> Refusal {
