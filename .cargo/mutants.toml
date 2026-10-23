@@ -1,0 +1,4 @@
+exclude_re = [
+    "<impl core::fmt::Debug for Root>::fmt",
+    "<impl core::fmt::Debug for BlobId>::fmt",
+]

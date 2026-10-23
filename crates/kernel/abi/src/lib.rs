@@ -2262,6 +2262,37 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_id_digest_is_the_hash_it_was_made_from() {
+        let sha1 = [7u8; 20];
+        let sha256 = [9u8; 32];
+        assert_eq!(BlobId::Sha1(sha1).digest(), &sha1[..]);
+        assert_eq!(BlobId::Sha256(sha256).digest(), &sha256[..]);
+    }
+
+    #[test]
+    fn hex_writes_two_lowercase_digits_per_byte() {
+        assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");
+    }
+
+    #[test]
+    fn roles_iterate_every_role_with_its_program() {
+        let roles: Roles = [("access", "ownership"), ("egress", "egress")]
+            .into_iter()
+            .collect();
+        let ownership = "ownership".to_owned();
+        let egress = "egress".to_owned();
+        assert_eq!(
+            roles.iter().collect::<Vec<_>>(),
+            vec![("access", &ownership), ("egress", &egress)]
+        );
+    }
+
+    #[test]
+    fn a_refusal_displays_as_its_reason_then_its_sentence() {
+        assert_eq!(Refusal::new("a", "b").to_string(), "a: b");
+    }
+
+    #[test]
     fn the_programs_role_keeps_at_on_tag_zero_and_asks_hooks_on_tag_five() {
         use role::programs::{Query, Reply};
         let at = Query::At(7);
