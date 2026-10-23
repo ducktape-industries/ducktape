@@ -156,9 +156,9 @@ spec:
             - name: WATCH_CHANGELOG
               value: >-
                 {"channel": "release", "repo": "app", "channels": [
-                {"check": "nightly", "label": "Desktop nightly", "tags": "#app", "emoji": "🌙", "branch": "dev", "manifest": "https://dl.ducktape.industries/app/nightly.json", "since": "1708042bce09e9cf10f80c6271ea9df96ed48687", "since_sequence": 1792644023},
-                {"check": "stable", "label": "Desktop stable", "tags": "#app", "emoji": "🦆", "branch": "main", "manifest": "https://dl.ducktape.industries/app/stable.json", "since": "3d412ddac342889633b57525557f769be7cf02c8", "since_sequence": 1792648780},
-                {"check": "testflight", "label": "TestFlight", "tags": "#mobile", "emoji": "📱", "branch": "dev", "refs": "https://github.com/ducktape-industries/app.git", "prefix": "testflight-", "since": "21d5fa9e2d12422151c43ea6a858fc7c2b767d38", "since_sequence": 1792645567}]}
+                {"check": "nightly", "label": "Desktop nightly", "tags": "#app", "emoji": "🌙", "branch": "dev", "manifest": "https://dl.ducktape.industries/app/nightly.json", "since": "8ee76ca2f7cbe369a11d6b1639e1b2b71b96a3aa", "since_sequence": 1792648502},
+                {"check": "stable", "label": "Desktop stable", "tags": "#app", "emoji": "🦆", "branch": "main", "manifest": "https://dl.ducktape.industries/app/stable.json", "since": "88b3210455149e8dcafe6dca64c626ab147acacb", "since_sequence": 1792650405},
+                {"check": "testflight", "label": "TestFlight", "tags": "#mobile", "emoji": "📱", "branch": "dev", "refs": "https://github.com/ducktape-industries/app.git", "prefix": "testflight-", "since": "1e4dfff64016783bed3d602747a559933a2826dd", "since_sequence": 1792648428}]}
             - {name: WATCH_STATE, value: /state}
             - {name: WATCH_KEYS, value: /keys}
             - {name: WATCH_WORKSPACE, value: /tmp/ducktape}
