@@ -61,6 +61,18 @@ or through a member node's halo forward.
   and with it the right to delete it. A `/v1/k8s/` DELETE of a collection deletes only the caller's
   own: its `labelSelector` gains `ducktape.industries/requester=<caller>`. A `/v1/k8s/` POST
   stamps the sender as requester too, as `/v1/pods` and `/v1/manifests` do.
+- `POST /v1/builds` makes one build from `{repo, commit, base, gates | command, env, notify,
+  limit}`: a bare pod in namespace `builds` named `<chain>-<request>` as any pod is, so its name,
+  the run's id, is in the create's answer, and a lost answer is read again by that name
+  (`GET /v1/builds/NAME`). Its init container `fetch` mirrors `repo` and tools `main` into its
+  node's `/srv/build-jobs/repos` under a lock; then `run`, which mounts that mirror read-only,
+  checks `commit` out with `origin/<base>` beside it and runs tools' `gates.sh` with `GATES` set to
+  `gates` (full, check or light), or the command. A gates build keeps cargo's registry and git in
+  the node's `/srv/build-jobs/cargo`. A command build mounts nothing of the node: its mirror and
+  cargo live in its own `/work`. It ends within `limit` minutes, 1 to 40 (40
+  when unnamed, the gates' own bound from J-493, as `activeDeadlineSeconds`). `GET /v1/builds/NAME/logs` reads its log, `DELETE
+  /v1/builds/NAME` deletes it for its requester alone, and `notify` posts its end as a pod's.
+  An `env` naming a setting the pod makes itself is refused 400.
 - A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and
   never ends (`ducktape-run done <run>`) is posted `run <run> lost with pod <pod>: <why>` in
   its channel, once, when the pod ends, when it is deleted, or when the service finds it gone
@@ -173,6 +185,17 @@ or through a member node's halo forward.
   same node (`PODS_NODE`): namespace `agents`' policy `isolated` lets them reach only
   addresses outside the private ranges, and its policy `to-duckpond-node` adds TCP 8844 on
   duckpond's node pods.
+- **Optional: build pods.** `PODS_BUILD_IMAGE` (a `localhost:5000/toolchain` image),
+  `PODS_BUILD_CPU` and `PODS_BUILD_MEMORY` (each build pod's fixed request, and its memory
+  limit; duckpond's 7 and 28Gi fit four to a lat VM's 32 cpu and 121.8Gi allocatable), and
+  `PODS_BUILD_NAMESPACE` (`builds` when unset). Unset, `/v1/builds` answers 503. The operator's
+  Role `pods-builds` there lets the service create, read, watch, patch and delete pods and read their
+  logs; the policy `builds-pods` holds every pod there to what the service writes (uid 10001,
+  non-root, no privilege or added capability, `hostUsers: false`, hostPath only
+  `/srv/build-jobs/cargo` and `/srv/build-jobs/repos`, the toolchain image, class `builds`,
+  `builds.ducktape/pods=true` and the `ducktape.industries/builds` toleration). A node carries
+  `builds.ducktape/pods=true` only once its SSH runner is out, so the two never share a VM. Build
+  notices keep their open runs in the ConfigMap `build-runs`.
 - **Runner-only placement.** With `PODS_WARM_POD` unset, `builds` gives each eligible runner
   its next turn in configuration order, skipping unreachable runners and full slots. Capacity
   comes from `build.sh ahead` and the runner's ping (`busy`, `heavy_runs`), not predicted finish

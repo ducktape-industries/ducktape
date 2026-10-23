@@ -490,13 +490,13 @@ class Api:
 
 
 class Served(unittest.TestCase):
-    def serve(self, signer=None, runners=None):
+    def serve(self, signer=None, runners=None, building=None):
         self.kube = Kube()
         self.kube.answer("cluster_kinds", ran(KINDS))
         self.signer = signer or Signer()
         self.stats = Stats()
         self.api = Api()
-        service = self.service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api, runners)
+        service = self.service = server.Service(self.kube, self.signer, FETCHING, self.stats, self.api, runners, building=building)
         self.paused = []
         service.pause = self.paused.append
         quiet = type("Quiet", (server.handler(service),), {"log_message": lambda *_: None})
@@ -7012,6 +7012,14 @@ class Manifest(unittest.TestCase):
         ])
         self.assertEqual(self.documents("to-duckpond-node"), [policy])
 
+    def test_build_pods_fit_four_to_a_lat_node(self):
+        env = self.env()
+        self.assertTrue(env["PODS_BUILD_IMAGE"].startswith("localhost:5000/toolchain"))
+        self.assertEqual((env["PODS_BUILD_CPU"], env["PODS_BUILD_MEMORY"]), ("7", "28Gi"))
+
+    def test_the_service_keeps_build_runs_apart_from_agents_runs(self):
+        self.assertIn("resourceNames: [runs, build-runs]", (HERE / "pods.yaml").read_text())
+
 
 class Lifecycle(unittest.TestCase):
     node = Stopped.node
@@ -7309,6 +7317,200 @@ else:
                 process.kill()
                 process.wait()
                 unblock(place)
+
+
+BUILD_POD_IMAGE = "localhost:5000/toolchain@sha256:00"
+BUILT = "a" * 40
+
+
+class Builds(Served):
+    def setUp(self):
+        self.builds = Kube()
+        self.builds.namespace = "builds"
+        self.serve(building=server.Building(self.builds, BUILD_POD_IMAGE, "7", "28Gi"))
+        self.signer.sender = sent_by(17)
+
+    def built(self):
+        return [call[1] for call in self.builds.calls if call[0] == "create"][0]
+
+    def asked(self, **fields):
+        return {"repo": "programs", "commit": BUILT, "base": "dev", **fields}
+
+    def test_a_build_is_one_pod_named_by_its_request_and_answered_at_create(self):
+        self.builds.answer("create", ran(pod_json()))
+        status, answer = self.call("POST", "/v1/builds", self.asked(gates="check", notify={"channel": "j-532"}))
+        self.assertEqual(status, 201, answer)
+        self.assertEqual(answer["build"]["name"], "duckpond-41")
+        pod = self.built()
+        self.assertEqual((pod["kind"], pod["metadata"]["name"], pod["metadata"]["namespace"]), ("Pod", "duckpond-41", "builds"))
+        self.assertEqual(pod["metadata"]["labels"]["ducktape.industries/requester"], "17")
+        self.assertEqual(pod["metadata"]["labels"]["ducktape.industries/request"], "41")
+        self.assertEqual(pod["metadata"]["labels"]["app.kubernetes.io/managed-by"], "pods")
+        self.assertEqual(pod["metadata"]["annotations"]["ducktape.industries/notify-channel"], "j-532")
+        self.assertNotIn("create", self.kube.verbs())
+
+    def test_a_build_pod_holds_the_lat_contract(self):
+        self.call("POST", "/v1/builds", self.asked(gates="check"))
+        body = self.built()["spec"]
+        self.assertEqual(body["restartPolicy"], "Never")
+        self.assertEqual(body["activeDeadlineSeconds"], 2400)
+        self.assertIs(body["hostUsers"], False)
+        self.assertIs(body["automountServiceAccountToken"], False)
+        self.assertIs(body["enableServiceLinks"], False)
+        self.assertEqual(body["priorityClassName"], "builds")
+        self.assertEqual(body["nodeSelector"], {"builds.ducktape/pods": "true"})
+        self.assertEqual(body["tolerations"], [{"key": "ducktape.industries/builds", "operator": "Equal", "value": "latitude", "effect": "NoSchedule"}])
+        self.assertEqual(body["securityContext"], {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "seccompProfile": {"type": "RuntimeDefault"}})
+        for hostless in ("hostNetwork", "hostPID", "hostIPC", "serviceAccountName"):
+            self.assertNotIn(hostless, body)
+        (fetch,) = body["initContainers"]
+        (run,) = body["containers"]
+        for container in (fetch, run):
+            self.assertEqual(container["image"], BUILD_POD_IMAGE)
+            self.assertEqual(container["securityContext"], {"privileged": False, "allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}})
+            self.assertEqual(container["resources"], {"requests": {"cpu": "7", "memory": "28Gi"}, "limits": {"memory": "28Gi"}})
+        self.assertEqual(fetch["command"], ["sh", "-euc", server.BUILD_FETCH, "fetch", "programs", BUILT, "dev", "tools", "main"])
+        self.assertEqual(fetch["volumeMounts"], [{"name": "repos", "mountPath": "/cache/repos"}, {"name": "work", "mountPath": "/work"}])
+        fetched = {item["name"]: item.get("value", item.get("valueFrom")) for item in fetch["env"]}
+        self.assertEqual(fetched["MIRRORS"], "/cache/repos")
+        self.assertEqual(set(fetched), {"NODE", "HOME", "MIRRORS", "FORGE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"})
+        self.assertEqual(fetched["GIT_CONFIG_VALUE_0"], FETCHING.node)
+        self.assertEqual(
+            body["volumes"],
+            [
+                {"name": "cargo", "hostPath": {"path": "/srv/build-jobs/cargo", "type": "Directory"}},
+                {"name": "repos", "hostPath": {"path": "/srv/build-jobs/repos", "type": "Directory"}},
+                {"name": "work", "emptyDir": {}},
+            ],
+        )
+        self.assertEqual(run["volumeMounts"], [{"name": "cargo", "mountPath": "/cache/cargo"}, {"name": "repos", "mountPath": "/cache/repos", "readOnly": True}, {"name": "work", "mountPath": "/work"}])
+        env = {item["name"]: item.get("value", item.get("valueFrom")) for item in run["env"]}
+        self.assertEqual(
+            env,
+            {
+                "NODE": {"fieldRef": {"fieldPath": "spec.nodeName"}},
+                "GATES": "check",
+                "HOME": "/work",
+                "MIRRORS": "/cache/repos",
+                "CARGO_HOME": "/cache/cargo",
+                "CARGO_TARGET_DIR": "/work/target",
+                "FORGE": FETCHING.forge,
+                "GATES_OUT": "/work/out",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "duck.duckpond.node",
+                "GIT_CONFIG_VALUE_0": FETCHING.node,
+            },
+        )
+        self.assertEqual(run["command"], ["sh", "-euc", server.BUILD_ENTRY, "build", "programs", BUILT, "dev", "tools", "main"])
+
+    def test_a_build_pod_passes_every_builds_pods_rule(self):
+        for asked in (self.asked(gates="full"), self.asked(command=["make"])):
+            self.builds.calls.clear()
+            self.call("POST", "/v1/builds", asked)
+            pod = self.built()
+            body = pod["spec"]
+            containers = body["containers"] + body["initContainers"]
+            context = body["securityContext"]
+            contexts = [container["securityContext"] for container in containers]
+            exact = ({"path": "/srv/build-jobs/cargo", "type": "Directory"}, {"path": "/srv/build-jobs/repos", "type": "Directory"})
+            rules = {
+                "run-as-uid-10001": (context["runAsUser"], context["runAsGroup"]) == (10001, 10001) and all("runAsUser" not in held for held in contexts),
+                "run-as-non-root": context["runAsNonRoot"] is True,
+                "no-privilege-escalation": all(held["allowPrivilegeEscalation"] is False for held in contexts),
+                "drop-all-capabilities": all(held["capabilities"]["drop"] == ["ALL"] for held in contexts),
+                "no-added-capabilities": all("add" not in held["capabilities"] for held in contexts),
+                "not-privileged": all(held["privileged"] is False for held in contexts),
+                "host-users-false": body["hostUsers"] is False,
+                "seccomp-runtime-default": context["seccompProfile"] == {"type": "RuntimeDefault"},
+                "no-host-namespaces": not any(body.get(name) for name in ("hostNetwork", "hostPID", "hostIPC")),
+                "volume-types": all(set(volume) - {"name"} in ({"hostPath"}, {"emptyDir"}) for volume in body["volumes"]),
+                "host-paths-exact": all(volume["hostPath"] in exact for volume in body["volumes"] if "hostPath" in volume),
+                "no-host-ports": all("ports" not in container for container in containers),
+                "proc-mount-default": all("procMount" not in held for held in contexts),
+                "no-sysctls": "sysctls" not in context,
+                "apparmor-runtime-default": all("appArmorProfile" not in held for held in [context, *contexts]) and not any(key.startswith("container.apparmor") for key in pod["metadata"]["annotations"]),
+                "no-selinux-options": all("seLinuxOptions" not in held for held in [context, *contexts]),
+                "image-toolchain": all(container["image"].startswith(("localhost:5000/toolchain:", "localhost:5000/toolchain@")) for container in containers),
+                "priority-class-builds": body["priorityClassName"] == "builds",
+                "node-selector-pods": body["nodeSelector"] == {"builds.ducktape/pods": "true"},
+                "toleration-builds-taint": {"key": "ducktape.industries/builds", "operator": "Equal", "value": "latitude", "effect": "NoSchedule"} in body["tolerations"],
+                "no-service-account-token": body["automountServiceAccountToken"] is False and not any("projected" in volume for volume in body["volumes"]),
+            }
+            self.assertEqual(len(rules), 21)
+            self.assertEqual([rule for rule, held in rules.items() if not held], [], asked)
+
+    def test_a_command_build_runs_its_words_and_no_gates(self):
+        self.call("POST", "/v1/builds", self.asked(command=["cargo", "test", "-p", "blob"], env={"KEEP_GOING": "1"}, limit=25))
+        pod = self.built()
+        (run,) = pod["spec"]["containers"]
+        self.assertEqual(run["command"][3:], ["build", "programs", BUILT, "dev", "tools", "main", "cargo", "test", "-p", "blob"])
+        names = [item["name"] for item in run["env"]]
+        self.assertNotIn("GATES", names)
+        self.assertEqual(names[1], "KEEP_GOING")
+        self.assertIn({"name": "CARGO_HOME", "value": "/work/cargo"}, run["env"])
+        self.assertIn({"name": "MIRRORS", "value": "/work/mirrors"}, run["env"])
+        self.assertEqual(pod["spec"]["volumes"], [{"name": "work", "emptyDir": {}}])
+        self.assertFalse([volume for volume in pod["spec"]["volumes"] if "hostPath" in volume])
+        (fetch,) = pod["spec"]["initContainers"]
+        for container in (fetch, run):
+            self.assertEqual(container["volumeMounts"], [{"name": "work", "mountPath": "/work"}])
+        self.assertEqual(pod["spec"]["activeDeadlineSeconds"], 1500)
+
+    def test_a_build_made_already_answers_the_one_there(self):
+        self.builds.answer("create", ran(code=1, err='Error from server (AlreadyExists): pods "duckpond-41" already exists'))
+        self.builds.answer("get", ran(pod_json(phase="Running")))
+        status, answer = self.call("POST", "/v1/builds", self.asked(gates="light"))
+        self.assertEqual(status, 200, answer)
+        self.assertEqual((answer["build"]["name"], answer["build"]["phase"]), ("duckpond-41", "Running"))
+
+    def test_a_build_names_its_tree_and_one_way_to_run_it(self):
+        for body, words in (
+            (self.asked(), ["exactly one"]),
+            (self.asked(gates="check", command=["make"]), ["exactly one"]),
+            (self.asked(gates="fast"), ["full, check, light"]),
+            (self.asked(repo="../x", gates="check"), ["repo"]),
+            (self.asked(commit="abc", gates="check"), ["commit"]),
+            (self.asked(base="-x", gates="check"), ["base"]),
+            ({"repo": "programs", "commit": BUILT, "gates": "check"}, ["base"]),
+            (self.asked(gates="check", env={"CARGO_HOME": "/x", "HOME": "/y"}), ["CARGO_HOME, HOME"]),
+            (self.asked(gates="check", limit=0), ["limit"]),
+            (self.asked(gates="check", limit=41), ["from 1 to 40"]),
+            (self.asked(gates="check", image="ubuntu"), ["no field image"]),
+            (self.asked(gates="check", requester=9), ["requester"]),
+        ):
+            self.refused("POST", "/v1/builds", body, 400, words)
+        self.assertNotIn("create", self.builds.verbs())
+
+    def test_a_build_is_read_from_its_own_namespace(self):
+        self.builds.answer("get", ran(pod_json(phase="Succeeded")))
+        self.builds.answer("logs", ran(b"GATES ok\n"))
+        status, answer = self.call("GET", "/v1/builds/duckpond-41")
+        self.assertEqual((status, answer["build"]["phase"]), (200, "Succeeded"))
+        status, logs = self.call("GET", "/v1/builds/duckpond-41/logs")
+        self.assertEqual((status, logs), (200, b"GATES ok\n"))
+        self.assertEqual(self.builds.verbs(), ["get", "logs"])
+        self.assertNotIn("get", self.kube.verbs())
+
+    def test_only_its_requester_deletes_a_build(self):
+        self.builds.answer("get", ran(pod_json(requester="99")))
+        self.refused("DELETE", "/v1/builds/duckpond-41", None, 403, ["99"])
+        self.assertEqual(self.api.calls, [])
+
+    def test_the_routes_are_counted_by_shape(self):
+        self.assertEqual([server.route_of(path) for path in ("/v1/builds", "/v1/builds/x", "/v1/builds/x/logs")], ["builds", "builds/NAME", "builds/NAME/logs"])
+
+
+class Unbuilt(Served):
+    def test_a_service_with_no_build_image_makes_no_builds(self):
+        self.refused("POST", "/v1/builds", {"repo": "programs", "commit": BUILT, "base": "dev", "gates": "check"}, 503, ["PODS_BUILD_IMAGE"])
+
+    def test_a_build_setting_names_what_is_unset(self):
+        with self.assertRaises(server.Refused) as caught:
+            server.building_of({"PODS_BUILD_IMAGE": "localhost:5000/toolchain:x", "PODS_BUILD_CPU": "7"}, ["kubectl"])
+        self.assertIn("PODS_BUILD_MEMORY", caught.exception.sentence)
+        self.assertIsNone(server.building_of({}, ["kubectl"]))
+        building = server.building_of({"PODS_BUILD_IMAGE": "localhost:5000/toolchain:x", "PODS_BUILD_CPU": "7000m", "PODS_BUILD_MEMORY": "28Gi"}, ["kubectl"])
+        self.assertEqual((building.kube.namespace, building.kube.kept_name, building.cpu, building.memory), ("builds", "build-runs", "7", "28Gi"))
 
 
 if __name__ == "__main__":

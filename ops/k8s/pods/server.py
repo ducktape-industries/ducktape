@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs (output past the bytes an exec names as inline kept in the pod and answered by path), logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends, when the scheduler first can't place a notified pod, or when a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane started by itself on each merge queue front's Preview that waits on the service's account, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
+# The pods service: agents' computing on the cluster through a network's egress, in one namespace: pods run with fetched inputs (tried again while the pod lives when a fetch loses its connection), exec answered whole or streamed while it runs (output past the bytes an exec names as inline kept in the pod and answered by path), logs, a wait that streams until a pod ends, manifests applied and deleted, Kubernetes API calls passed through inside the namespace, outputs put as blobs or files, a pod's commit packed for a forge push, chat notices to the requester when work ends, when the scheduler first can't place a notified pod, or when a notified pod prints a `ducktape-notify` line, forge-reach reports of each `ducktape-report` line a lane prints (whether each landed said in that run's end notice), the shots each `ducktape-files` line names written into files in one commit (said there too), a lane started by itself on each merge queue front's Preview that waits on the service's account, build pods (one bare pod a build, gates.sh or a command, on a node whose runner is out, with that node's caches) in their own namespace, and usage; the build runners PODS_RUNNERS names (`desktop` unless it names others) are machines reserved as pods of their names, reached by ssh through their `gate` command, straight or through a member node's halo forward.
 # ops/k8s/pods/pods.yaml runs it on fabrics-1, server-test.py tests it, `server.py fetch` is each pod's input fetcher, and `server.py hardcap` prints the agents quota k8s/pods/deploy applies, refusing one below what agents' pods already hold.
 import base64
 import binascii
@@ -76,6 +76,51 @@ U64_MAX = (1 << 64) - 1
 EGRESS_SENDER = 7
 RUN_LINE = "ducktape-run "
 KEPT = ("pods", "runs")
+BUILD_KEPT = ("pods", "build-runs")
+BUILD_NAMESPACE = "builds"
+BUILD = {"repo": str, "commit": str, "base": str, "gates": str, "command": list, "env": dict, "notify": dict, "limit": int}
+BUILD_MODES = ("full", "check", "light")
+BUILD_UID = 10001
+BUILD_PRIORITY = "builds"
+BUILD_NODES = ("builds.ducktape/pods", "true")
+BUILD_TAINT = ("ducktape.industries/builds", "latitude")
+BUILD_CARGO = ("cargo", "/srv/build-jobs/cargo", "/cache/cargo")
+BUILD_REPOS = ("repos", "/srv/build-jobs/repos", "/cache/repos")
+BUILD_LIMIT_MINUTES = 40
+BUILD_WORK = "/work"
+BUILD_TOOLS = ("tools", "main")
+BUILD_SET = ("NODE", "HOME", "MIRRORS", "CARGO_HOME", "CARGO_TARGET_DIR", "FORGE", "GATES", "GATES_OUT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+COMMIT_ID = re.compile(r"[0-9a-f]{40}")
+BUILD_FETCH = """repo=$1 commit=$2 base=$3 tools=$4 tools_branch=$5
+echo "build $HOSTNAME on $NODE: $repo $commit, fetching from $(date -u +%FT%T.%NZ)"
+mkdir -p "$MIRRORS"
+mirror() {
+  (
+    flock 9
+    [ -d "$MIRRORS/$1.git" ] || git init -q --bare "$MIRRORS/$1.git"
+    git -C "$MIRRORS/$1.git" config gc.auto 0
+    git -C "$MIRRORS/$1.git" fetch -q "$FORGE/$1" "+refs/heads/$2:refs/heads/$2"
+    [ -z "$3" ] || git -C "$MIRRORS/$1.git" cat-file -e "$3^{commit}" 2> /dev/null || git -C "$MIRRORS/$1.git" fetch -q "$FORGE/$1" "$3"
+  ) 9> "$MIRRORS/$1.lock"
+}
+mirror "$tools" "$tools_branch" ""
+mirror "$repo" "$base" "$commit"
+"""
+BUILD_ENTRY = """repo=$1 commit=$2 base=$3 tools=$4 tools_branch=$5
+shift 5
+echo "build $HOSTNAME: cloning from $(date -u +%FT%T.%NZ)"
+mkdir -p /work/src /work/out
+git clone -q --shared --branch "$tools_branch" "$MIRRORS/$tools.git" /work/tools
+git clone -q --shared --no-checkout --branch "$base" "$MIRRORS/$repo.git" "/work/src/$repo"
+git -C "/work/src/$repo" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$base"
+git -C "/work/src/$repo" checkout -q --detach "$commit"
+echo "build $HOSTNAME: running from $(date -u +%FT%T.%NZ)"
+cd "/work/src/$repo"
+[ "$#" -eq 0 ] || exec "$@"
+exec sh /work/tools/gates.sh "/work/src/$repo"
+"""
 SPEC = {
     "image": str,
     "command": list,
@@ -1537,6 +1582,26 @@ class Fetching:
     block_ms: int
 
 
+@dataclass
+class Building:
+    kube: object
+    image: str
+    cpu: str
+    memory: str
+
+
+def building_of(environ, kubectl):
+    image = environ.get("PODS_BUILD_IMAGE", "")
+    if not image:
+        return None
+    amounts = {name: environ.get(name, "") for name in ("PODS_BUILD_CPU", "PODS_BUILD_MEMORY")}
+    unset = [name for name, value in amounts.items() if not value]
+    if unset:
+        raise Refused(400, f"{', '.join(unset)} must be set beside PODS_BUILD_IMAGE: each build pod's fixed request")
+    kube = Kube(kubectl, environ.get("PODS_BUILD_NAMESPACE", BUILD_NAMESPACE), kept=BUILD_KEPT)
+    return Building(kube, image, *(canonical_quantity(value, name) for name, value in amounts.items()))
+
+
 def resources_of(given):
     checked(given, RESOURCES, "resources")
     amounts = {group: checked(given[group], AMOUNTS, f"resources' {group}") for group in RESOURCES if group in given}
@@ -1639,6 +1704,100 @@ def fetch_container(inputs, fetching):
         "volumeMounts": [{"name": f"in-{index}", "mountPath": f"{IN_ROOT}/{index}"} for index, given in enumerate(inputs) if SCRATCH not in given],
         "terminationMessagePolicy": "FallbackToLogsOnError",
         "securityContext": confined(),
+    }
+
+
+def matched(pattern, value, what):
+    if not pattern.fullmatch(value):
+        raise Refused(400, f"{what} {value!r} does not match {pattern.pattern}")
+    return value
+
+
+def build_pod(asked, requester, body, building, fetching):
+    checked(body, BUILD, "a build")
+    named(body, ["repo", "commit", "base"], "a build")
+    repo = matched(REPO_NAME, body["repo"], "a build's repo")
+    commit = matched(COMMIT_ID, body["commit"], "a build's commit")
+    base = matched(BRANCH_NAME, body["base"], "a build's base")
+    runs = [field for field in ("gates", "command") if field in body]
+    if len(runs) != 1:
+        raise Refused(400, f"a build runs gates ({', '.join(BUILD_MODES)}) or a command, exactly one of them")
+    settings = {}
+    command = []
+    if runs == ["gates"]:
+        if body["gates"] not in BUILD_MODES:
+            raise Refused(400, f"a build's gates is one of {', '.join(BUILD_MODES)}, not {body['gates']!r}")
+        settings["GATES"] = body["gates"]
+    else:
+        command = strings(body["command"], "a build's command")
+    env = body.get("env", {})
+    if not all(isinstance(value, str) for value in env.values()):
+        raise Refused(400, "a build's env maps names to strings")
+    held = sorted(set(env) & set(BUILD_SET))
+    if held:
+        raise Refused(400, f"a build's env sets {', '.join(held)}, which the build pod sets itself")
+    limit = body.get("limit", BUILD_LIMIT_MINUTES)
+    if not 1 <= limit <= BUILD_LIMIT_MINUTES:
+        raise Refused(400, f"a build's limit is whole minutes from 1 to {BUILD_LIMIT_MINUTES}, the gates' own bound")
+    gated = "gates" in body
+    chain = urlsplit(fetching.forge).netloc
+    reach = {
+        "HOME": BUILD_WORK,
+        "MIRRORS": BUILD_REPOS[2] if gated else f"{BUILD_WORK}/mirrors",
+        "FORGE": fetching.forge,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"duck.{chain}.node",
+        "GIT_CONFIG_VALUE_0": fetching.node,
+    }
+    settings.update(reach)
+    settings.update({"CARGO_HOME": BUILD_CARGO[2] if gated else f"{BUILD_WORK}/cargo", "CARGO_TARGET_DIR": f"{BUILD_WORK}/target", "GATES_OUT": f"{BUILD_WORK}/out"})
+    node = {"name": "NODE", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}
+    words = [repo, commit, base, *BUILD_TOOLS]
+    requested = {"requests": {"cpu": building.cpu, "memory": building.memory}, "limits": {"memory": building.memory}}
+    unprivileged = {"privileged": False, "allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
+    work = {"name": "work", "mountPath": BUILD_WORK}
+    fetch_container = {
+        "name": FETCH,
+        "image": building.image,
+        "command": ["sh", "-euc", BUILD_FETCH, "fetch", *words],
+        "env": [node] + [{"name": name, "value": value} for name, value in reach.items()],
+        "resources": requested,
+        "securityContext": unprivileged,
+        "volumeMounts": ([{"name": BUILD_REPOS[0], "mountPath": BUILD_REPOS[2]}] if gated else []) + [work],
+    }
+    caches = [BUILD_CARGO, BUILD_REPOS] if gated else []
+    run_container = {
+        "name": RUN,
+        "image": building.image,
+        "command": ["sh", "-euc", BUILD_ENTRY, "build", *words, *command],
+        "env": [node] + [{"name": name, "value": value} for name, value in {**env, **settings}.items()],
+        "resources": requested,
+        "securityContext": unprivileged,
+        "volumeMounts": [{"name": name, "mountPath": mounted, **({} if name == BUILD_CARGO[0] else {"readOnly": True})} for name, _, mounted in caches] + [work],
+    }
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": f"{asked['chain']}-{asked['request']}",
+            "namespace": building.kube.namespace,
+            "labels": {**dict([MANAGED]), **labels_for(asked, requester)},
+            "annotations": {DEFAULT_CONTAINER: RUN, **notify_notes(body)},
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "activeDeadlineSeconds": limit * 60,
+            "automountServiceAccountToken": False,
+            "enableServiceLinks": False,
+            "hostUsers": False,
+            "priorityClassName": BUILD_PRIORITY,
+            "nodeSelector": dict([BUILD_NODES]),
+            "tolerations": [{"key": BUILD_TAINT[0], "operator": "Equal", "value": BUILD_TAINT[1], "effect": "NoSchedule"}],
+            "securityContext": {"runAsNonRoot": True, "runAsUser": BUILD_UID, "runAsGroup": BUILD_UID, "seccompProfile": {"type": "RuntimeDefault"}},
+            "initContainers": [fetch_container],
+            "containers": [run_container],
+            "volumes": [{"name": name, "hostPath": {"path": path, "type": "Directory"}} for name, path, _ in caches] + [{"name": "work", "emptyDir": {}}],
+        },
     }
 
 
@@ -4012,8 +4171,9 @@ def json_stream(stream):
 
 
 class Service:
-    def __init__(self, kube, signer, fetching, stats, api, runners=None, warm_pod=None):
+    def __init__(self, kube, signer, fetching, stats, api, runners=None, warm_pod=None, building=None):
         self.kube = kube
+        self.building = building
         self.warm_pod = warm_pod
         self.uncalled = 0
         self.runners = {runner.name: runner for runner in (runners if runners is not None else [Runner(DESKTOP, Path(DESKTOP_KEYS), signer=signer)])}
@@ -4046,6 +4206,10 @@ class Service:
         self.rerunner = Rerunner(signer, kube, lambda command: self.routed(None, command, None), self.retry_pause, self.tell_room)
         self.notifier.spawn = self.background.start
         self.notifier.pause = self.background.pause
+        self.build_notifier = Notifier(building.kube, signer, self.retry_pause) if building else None
+        if self.build_notifier:
+            self.build_notifier.spawn = self.background.start
+            self.build_notifier.pause = self.background.pause
         self.rerunner.spawn = self.background.start
         self.rerunner.pause = self.background.pause
 
@@ -4282,6 +4446,43 @@ class Service:
         if not repeated:
             raise refusal
         return 200, warned({"pod": view(self.pod(pod["metadata"]["name"]))}, spec)
+
+    def built(self):
+        if self.building is None:
+            raise Refused(503, "this service makes no builds: PODS_BUILD_IMAGE is unset")
+        return self.building
+
+    def build(self, asked, body):
+        building = self.built()
+        pod = build_pod(asked, self.requester(asked), unrequested(body, "a build"), building, self.fetching)
+        ran = building.kube.create(pod)
+        if ran.code == 0:
+            return 201, {"build": view(json.loads(ran.out))}
+        refusal = kube_refusal(ran, "the build was not created")
+        if refusal.status != 409 or "AlreadyExists" not in ran.err:
+            raise refusal
+        return 200, {"build": view(self.build_read(pod["metadata"]["name"]))}
+
+    def build_read(self, name):
+        ran = self.built().kube.get(name)
+        if ran.code != 0:
+            raise kube_refusal(ran, f"build {name} was not read")
+        return json.loads(ran.out)
+
+    def build_logs(self, name, query):
+        ran = self.built().kube.logs(name, log_options(query))
+        if ran.code != 0:
+            raise kube_refusal(ran, f"build {name}'s logs were not read")
+        return 200, ran.out
+
+    def build_delete(self, asked, name):
+        building = self.built()
+        what = f"build {name}"
+        uid = self.whose(asked, self.build_read(name), what)
+        answered = self.unmade(f"/api/v1/namespaces/{building.kube.namespace}/pods/{quote(name, safe='')}", "", {}, uid, what)
+        if not 200 <= answered.status < 300:
+            raise api_refusal(answered, f"{what} was not deleted")
+        return 200, {"deleted": name}
 
     def list(self):
         return 200, {"pods": [view(pod) for pod in self.items(self.kube.list(), "the pods were not listed")]}
@@ -5557,6 +5758,14 @@ class Service:
                 return self.push(name, asked, parsed(body))
             case ("DELETE", "pods", name):
                 return self.delete(asked, name)
+            case ("POST", "builds"):
+                return self.build(asked, parsed(body))
+            case ("GET", "builds", name):
+                return 200, {"build": view(self.build_read(name))}
+            case ("GET", "builds", name, "logs"):
+                return self.build_logs(name, query)
+            case ("DELETE", "builds", name):
+                return self.build_delete(asked, name)
             case ("POST", "manifests"):
                 return self.apply(asked, body)
             case ("DELETE", "manifests"):
@@ -5586,6 +5795,12 @@ def route_of(target):
             return "pods/NAME"
         case ["v1", "pods", _, action] if action in POD_ROUTES:
             return f"pods/NAME/{action}"
+        case ["v1", "builds"]:
+            return "builds"
+        case ["v1", "builds", _]:
+            return "builds/NAME"
+        case ["v1", "builds", _, "logs"]:
+            return "builds/NAME/logs"
         case ["v1", "manifests", _]:
             return "manifests/KIND"
         case ["v1", "manifests", _, _]:
@@ -6017,8 +6232,14 @@ def main():
         runners = runners_of(os.environ.get("PODS_RUNNERS", f"{DESKTOP}={DESKTOP_KEYS}"), signer)
     except ValueError as error:
         sys.exit(str(error))
-    service = Service(kube, signer, fetching, Stats(), Api(), runners, os.environ.get("PODS_WARM_POD"))
+    try:
+        building = building_of(os.environ, kube.kubectl)
+    except Refused as refusal:
+        sys.exit(refusal.sentence)
+    service = Service(kube, signer, fetching, Stats(), Api(), runners, os.environ.get("PODS_WARM_POD"), building)
     service.background.start(service.notifier.watch)
+    if service.build_notifier:
+        service.background.start(service.build_notifier.watch)
     service.background.start(service.sweeper)
     if signer.held():
         service.background.start(service.rerunner.watch)
