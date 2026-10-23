@@ -3746,6 +3746,98 @@ class Shots(unittest.TestCase):
         self.assertEqual(self.sent("files"), [self.written(), self.written(moved)])
 
 
+class ArchiveRetention(unittest.TestCase):
+    fetched = Shots.fetched
+    sent = Shots.sent
+
+    def setUp(self):
+        Shots.setUp(self)
+        self.folder = "/shared/runs/programs/20261023-120000-run"
+        self.parent = "/shared/runs/programs"
+        self.said = {"run": "r1", "tar": "/w/runs/r1/shots.tar", "to": self.folder, "prune_before": "20261009"}
+        self.pages = []
+        self.listed = []
+        self.exists = True
+        original = self.signer.query
+        def query(program, request):
+            if program == "files" and request[:1] == server.u8(3):
+                self.listed.append(request)
+                entry = server.u8(1) + self.entry(self.parent, 1) if self.exists else server.u8(0)
+                return ran(server.u8(3) + server.u8(1) + server.blob_id(SNAPSHOT) + entry)
+            if program == "files" and request[:1] == server.u8(4):
+                self.listed.append(request)
+                return self.pages.pop(0)
+            return original(program, request)
+        self.signer.query = query
+
+    def entry(self, path, kind, meta=()):
+        node = {
+            0: server.u8(0) + server.blob_id(SNAPSHOT) + server.u64(2) + server.u8(0),
+            1: server.u8(1) + server.blob_id(SNAPSHOT) + server.u64(1),
+            2: server.u8(2) + server.borsh_text("target"),
+        }[kind]
+        return server.borsh_text(path) + node + server.borsh_vec([server.borsh_text(k) + server.borsh_text(v) for k, v in meta])
+
+    def page(self, entries, after=None):
+        return ran(server.u8(4) + server.u8(1) + server.blob_id(SNAPSHOT) + server.u64(950) + server.borsh_vec(entries) + server.borsh_option(after, server.borsh_bytes))
+
+    def test_the_optional_cutoff_is_a_calendar_date_not_part_of_the_destination(self):
+        line = f"ducktape-files r1 /w/runs/r1/shots.tar {self.folder} prune-before 20261009\n"
+        self.assertEqual(list(server.files_lines([line.encode()])), [self.said])
+        plain = dict(self.said)
+        del plain["prune_before"]
+        self.assertEqual(list(server.files_lines([line.split(" prune-before")[0].encode()])), [plain])
+        for suffix in ("20260230", "20260001", "00001009", "2026109", "tomorrow", "20261009 extra", ""):
+            invalid = f"ducktape-files r1 /w/runs/r1/shots.tar {self.folder} prune-before {suffix}\n"
+            self.assertEqual(list(server.files_lines([invalid.encode()])), [], suffix)
+        self.assertEqual(list(server.files_lines([f"ducktape-files r1 /w/runs/r1/shots.tar {self.folder} prune-before".encode()])), [])
+
+    def test_old_sibling_directories_across_pages_are_removed_in_the_write_commit(self):
+        old = self.parent + "/20261008-old"
+        older = self.parent + "/20260901-older"
+        self.pages = [
+            self.page([self.entry(old, 1, [("label", "old")]), self.entry(self.parent + "/20261008-file", 0)], b"next"),
+            self.page([self.entry(older, 1), self.entry(self.parent + "/20261008-link", 2), self.entry(self.parent + "/20261009-equal", 1), self.entry(self.folder, 1), self.entry(self.parent + "/20261022-new", 1), self.entry(self.parent + "/notes", 1), self.entry(self.parent + "/20260230-invalid", 1)]),
+        ]
+        self.notifier.file("duckpond-41", self.said)
+        items = [(self.folder + "/a.png", 6, CHUNKS[:2]), (self.folder + "/phone/b.png", 2, CHUNKS[2:])]
+        expected = server.files_commit_many(SNAPSHOT, f"pods: duckpond-41 run r1 wrote {self.folder}", items, [old, older])
+        self.assertEqual(self.sent("files"), [expected])
+        self.assertEqual(self.listed, [server.files_stat(self.parent, SNAPSHOT), server.files_list(self.parent, SNAPSHOT, None), server.files_list(self.parent, SNAPSHOT, b"next")])
+        self.assertIn(self.folder, self.notifier.told("duckpond-41", "r1 ended: exit 1"))
+
+    def test_the_destination_is_kept_even_when_its_date_is_old(self):
+        self.said["prune_before"] = "20261101"
+        self.pages = [self.page([self.entry(self.folder, 1)])]
+        self.notifier.file("duckpond-41", self.said)
+        items = [(self.folder + "/a.png", 6, CHUNKS[:2]), (self.folder + "/phone/b.png", 2, CHUNKS[2:])]
+        self.assertEqual(self.sent("files"), [server.files_commit_many(SNAPSHOT, f"pods: duckpond-41 run r1 wrote {self.folder}", items)])
+
+    def test_a_first_archive_has_no_siblings(self):
+        self.exists = False
+        self.notifier.file("duckpond-41", self.said)
+        self.assertEqual(len(self.sent("files")), 1)
+        self.assertEqual(self.listed, [server.files_stat(self.parent, SNAPSHOT)])
+
+    def test_a_stale_commit_reads_the_new_siblings_before_committing_again(self):
+        old = self.parent + "/20261008-old"
+        moved = "sha256:" + "cd" * 32
+        self.signer.head = [ran(server.u8(0) + server.u8(1) + server.blob_id(SNAPSHOT)), ran(server.u8(0) + server.u8(1) + server.blob_id(moved))]
+        self.signer.submitted = [ran(POOLED + b"landed 960 rejected stale: the head moved\n"), ran(POOLED + b"landed 961 applied 00ff\n")]
+        self.pages = [self.page([self.entry(old, 1)]), self.page([])]
+        self.notifier.file("duckpond-41", self.said)
+        first, second = self.sent("files")
+        self.assertTrue(first.endswith(server.u8(2) + server.borsh_text(old)))
+        self.assertNotIn(old.encode(), second)
+        self.assertEqual(self.listed[-2:], [server.files_stat(self.parent, moved), server.files_list(self.parent, moved, None)])
+
+    def test_a_listing_failure_writes_nothing(self):
+        self.pages = [ran(code=1, err="query refused: invalid cursor")]
+        self.notifier.file("duckpond-41", self.said)
+        self.assertEqual(self.sent("files"), [])
+        self.assertIn("siblings were not read", self.notifier.told("duckpond-41", "r1 ended: exit 1"))
+
+
 class Posts(unittest.TestCase):
     def setUp(self):
         self.kube = Kube()

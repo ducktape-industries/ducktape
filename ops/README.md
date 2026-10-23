@@ -644,7 +644,13 @@ one up for another network.
   under `<folder>` (each at its path in the tar; a path that leaves the
   folder refuses the whole tar) in one files commit as its own account
   (message `pods: <pod> run <run> wrote <folder>`), so a shot round lands in
-  one commit with no call per file. It retries as a report does (a node
+  one commit with no call per file. An optional `prune-before <YYYYMMDD>`
+  suffix asks the same commit to remove sibling directories whose names
+  start with a valid calendar date earlier than that cutoff. The destination
+  itself, files, symlinks and non-date names stay. The service reads every
+  page of siblings at the commit's base snapshot; a stale commit reads them
+  again at the new base. An invalid cutoff makes no files line.
+  It retries as a report does (a node
   that doesn't answer, a head files moved under it), and that run's end
   notice then ends with ` · shots written: <n> files under <folder> at block
   <h>`, or ` · shots not written: <why>`, and then the notice reads failed

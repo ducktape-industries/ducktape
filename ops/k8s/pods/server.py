@@ -842,6 +842,59 @@ def head_of(reply):
     return reader.blob() if reader.u8() == 1 else None
 
 
+def files_stat(path, snapshot):
+    return u8(3) + borsh_text(path) + borsh_option(snapshot, blob_id)
+
+
+def files_list(path, snapshot, after):
+    page = borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+    return u8(4) + borsh_text(path) + borsh_option(snapshot, blob_id) + page
+
+
+def files_entry(reader):
+    path, kind = reader.bytes().decode(), reader.u8()
+    if kind == 0:
+        reader.blob()
+        reader.u64()
+        reader.u8()
+    elif kind == 1:
+        reader.blob()
+        reader.u64()
+    elif kind == 2:
+        reader.bytes()
+    else:
+        raise Refused(502, f"files answered an entry with node kind {kind}")
+    for _ in range(int.from_bytes(reader.take(4), "little")):
+        reader.bytes()
+        reader.bytes()
+    return path, kind
+
+
+def directory_exists(reply):
+    reader = Reader(reply)
+    if reader.u8() != 3:
+        raise Refused(502, "files answered a stat with something else")
+    if reader.u8() == 1:
+        reader.blob()
+    if reader.u8() == 0:
+        return False
+    _, kind = files_entry(reader)
+    if kind != 1:
+        raise Refused(502, "the archive's parent is not a directory")
+    return True
+
+
+def files_entries(reply):
+    reader = Reader(reply)
+    if reader.u8() != 4:
+        raise Refused(502, "files answered a listing with something else")
+    if reader.u8() == 1:
+        reader.blob()
+    reader.u64()
+    entries = [files_entry(reader) for _ in range(int.from_bytes(reader.take(4), "little"))]
+    return entries, reader.bytes() if reader.u8() == 1 else None
+
+
 def files_read(path, snapshot, offset, length):
     return u8(5) + borsh_text(path) + borsh_option(snapshot, blob_id) + u64(offset) + u64(length)
 
@@ -868,8 +921,9 @@ def files_put(path, size, chunks):
     return u8(0) + borsh_text(path) + u8(0) + (0).to_bytes(4, "little") + content
 
 
-def files_commit_many(base, message, items):
-    return u8(1) + borsh_option(base, blob_id) + borsh_text(message) + borsh_vec([files_put(*item) for item in items])
+def files_commit_many(base, message, items, removed=()):
+    changes = [files_put(*item) for item in items] + [u8(2) + borsh_text(path) for path in removed]
+    return u8(1) + borsh_option(base, blob_id) + borsh_text(message) + borsh_vec(changes)
 
 
 def egress_request(request):
@@ -2262,14 +2316,38 @@ def report_lines(name, stream):
         yield {"repo": repo, "commit": commit, "context": context, "state": state, "run": run, "url": f"{name}:{run}", "reach": reach or [""]}
 
 
+def archive_date(word):
+    if re.fullmatch(r"[0-9]{8}", word) is None:
+        return False
+    try:
+        datetime.date(int(word[:4]), int(word[4:6]), int(word[6:8]))
+    except ValueError:
+        return False
+    return True
+
+
 def files_lines(stream):
     for raw in stream:
         line = raw.decode(errors="replace").rstrip("\r\n")
         if not line.startswith(FILES_LINE):
             continue
         words = line[len(FILES_LINE):].split(" ", 2)
-        if len(words) == 3 and words[0] and words[1].startswith("/") and words[2].startswith("/"):
-            yield {"run": words[0], "tar": words[1], "to": words[2]}
+        if len(words) != 3:
+            continue
+        run, tar, to = words
+        cutoff = None
+        if " prune-before" in to:
+            to, separator, cutoff = to.rpartition(" prune-before ")
+            valid_cutoff = separator and archive_date(cutoff)
+            if not valid_cutoff:
+                continue
+        valid_paths = run and tar.startswith("/") and to.startswith("/")
+        if not valid_paths:
+            continue
+        said = {"run": run, "tar": tar, "to": to}
+        if cutoff is not None:
+            said["prune_before"] = cutoff
+        yield said
 
 
 def shot_files(data, to):
@@ -3632,6 +3710,34 @@ class Notifier:
                 self.pause(pause)
                 pause *= 2
 
+    def archive_query(self, query):
+        answer = self.signer.query(FILES_PROGRAM, query)
+        why = failed(answer)
+        if why is not None and unanswered(why):
+            raise Unanswered(why)
+        if why is not None:
+            raise Refused(502, f"the archive's siblings were not read: {why}")
+        return answer.out
+
+    def archives_before(self, said, base):
+        cutoff = said.get("prune_before")
+        if cutoff is None or base is None:
+            return []
+        destination = str(PurePosixPath(said["to"]))
+        parent = str(PurePosixPath(destination).parent)
+        if not directory_exists(self.archive_query(files_stat(parent, base))):
+            return []
+        after, removed = None, []
+        while True:
+            entries, after = files_entries(self.archive_query(files_list(parent, base, after)))
+            for path, kind in entries:
+                date = PurePosixPath(path).name[:8]
+                is_old_sibling = kind == 1 and path != destination and archive_date(date) and date < cutoff
+                if is_old_sibling:
+                    removed.append(path)
+            if after is None:
+                return removed
+
     def file_once(self, name, said, items):
         pieces = [(path, data, [data[start : start + CHUNK_SIZE] for start in range(0, len(data), CHUNK_SIZE)]) for path, data in items]
         ids = []
@@ -3660,7 +3766,9 @@ class Notifier:
                 raise Unanswered(why)
             if why is not None:
                 raise Refused(502, f"files' head was not read: {why}")
-            outcome, reason, sentence, height = receipt(self.signer.submit(FILES_PROGRAM, files_commit_many(head_of(head.out), message, listed)))
+            base = head_of(head.out)
+            removed = self.archives_before(said, base)
+            outcome, reason, sentence, height = receipt(self.signer.submit(FILES_PROGRAM, files_commit_many(base, message, listed, removed)))
             if outcome == "applied":
                 say("pods_filed", run=json.dumps(f"{name}:{said['run']}"), files=len(listed), height=height)
                 return f"shots written: {len(listed)} files under {said['to']} at block {height}"
