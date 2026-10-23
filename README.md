@@ -451,6 +451,16 @@ failure; one event or an end larger than a block carries ends the stream `Cut`
 (`event_too_large`, `end_too_large`) and the node drops the rest. On a network that binds no egress
 role the node does none of this.
 
+Both a node and a box log `egress_called` at debug under `ducktape::egress`
+when a call ends. Its `call_ms` measures local time from scheduling the call
+through reading its answer, and `first_ms` is the time to its first complete
+stream event (`None` for a whole answer or a stream with no complete event).
+`served_by` is `node` or `box`. These times include local scheduling and body
+preparation, not the time to elect the serving key or commit the answer. Turn
+on the plane with `ducktape log-filter 'info,ducktape::egress=debug'` before
+measuring on a node; for a box, set `log = 'info,ducktape::egress=debug'` in
+its `node.toml` before starting it. An aborted call has no ending event.
+
 A key with no node of its own, a box, serves egress the same way over halo's
 lane `ducktape/egress`, which the validators' vote opens. It needs no valset
 row: halo takes any key's connection, and egress lets the keys a registered

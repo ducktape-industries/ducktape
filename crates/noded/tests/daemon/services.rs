@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod call_times;
+
 const PONG: &str = "pong";
 
 async fn upstream() -> SocketAddr {

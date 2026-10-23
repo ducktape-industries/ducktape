@@ -340,12 +340,15 @@ impl<E: Context> Window for Worker<E> {
             id = row.id,
             service = row.request.service(),
         );
+        let started = std::time::Instant::now();
         self.daemon
             .context
             .child("egress_call")
             .spawn(move |_| async move {
                 let id = row.id;
+                let mut first_ms = None;
                 let event = |data: Vec<u8>| {
+                    first_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
                     let _ = answers.unbounded_send((id, Called::Event(data)));
                 };
                 let called = match body(&daemon, row.request.parts()).await {
@@ -384,6 +387,9 @@ impl<E: Context> Window for Worker<E> {
                     event = "egress_called",
                     id,
                     ending = called.ending(),
+                    call_ms = started.elapsed().as_millis() as u64,
+                    ?first_ms,
+                    served_by = "node",
                 );
                 let _ = answers.unbounded_send((id, called));
             })

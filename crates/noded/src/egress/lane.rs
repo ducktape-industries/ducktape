@@ -758,9 +758,12 @@ impl<W: AsyncWrite + Unpin + Send> Window for Remote<'_, W> {
         let serving = self.serving.clone();
         let answers = self.answers.clone();
         let network = self.network.to_owned();
+        let started = std::time::Instant::now();
         let call = tokio::spawn(async move {
             let id = row.id;
+            let mut first_ms = None;
             let event = |data: Vec<u8>| {
+                first_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
                 let _ = answers.unbounded_send((id, Called::Event(data)));
             };
             let called = match body {
@@ -790,6 +793,15 @@ impl<W: AsyncWrite + Unpin + Send> Window for Remote<'_, W> {
                     "the relay node sent no body for this request".into(),
                 )),
             };
+            tracing::debug!(
+                target: TARGET,
+                event = "egress_called",
+                id,
+                ending = called.ending(),
+                call_ms = started.elapsed().as_millis() as u64,
+                ?first_ms,
+                served_by = "box",
+            );
             let _ = answers.unbounded_send((id, called));
         });
         call.abort_handle()
