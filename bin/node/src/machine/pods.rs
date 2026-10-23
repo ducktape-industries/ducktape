@@ -20,6 +20,7 @@ const PART: &str = "part";
 const CHUNK: &str = "chunk";
 const OUT: &str = "out";
 const KEEP: &str = "/out/.fleet";
+const SCRATCH: &str = "/tmp/fleet";
 const FILLS: &str = "/fleet/fills";
 const ENDED: &str = "ended";
 const FETCH: &str = "fetch";
@@ -31,10 +32,10 @@ import shutil
 import subprocess
 import sys
 
-size, keep = int(sys.argv[1]), sys.argv[2]
+size, keep, scratch = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 out = os.path.dirname(keep)
-cut = os.path.join(keep, "pieces")
-packed = os.path.join(keep, "packs")
+cut = os.path.join(scratch, "pieces")
+packed = os.path.join(scratch, "packs")
 for made in (cut, packed):
     shutil.rmtree(made, ignore_errors=True)
     os.makedirs(made)
@@ -559,7 +560,7 @@ pub fn pieces_of(manifest: &Value) -> Vec<String> {
 
 async fn gathered<R: Relay>(relay: &mut R, pod: &str) -> Result<Gathered, String> {
     let exec = json!({
-        "command": ["python3", "-c", GATHER, out::CHUNK_SIZE.to_string(), KEEP],
+        "command": ["python3", "-c", GATHER, out::CHUNK_SIZE.to_string(), KEEP, SCRATCH],
         "container": OUT,
     });
     let target = format!("/v1/pods/{pod}/exec");
@@ -1042,6 +1043,44 @@ mod tests {
         let command = script.find("exec \"$@\"");
         assert!(index < checkout && checkout < command, "{script}");
         assert!(index.is_some(), "{script}");
+    }
+
+    #[test]
+    fn the_outputs_are_cut_into_a_folder_of_the_gatherers_own_and_none_under_the_runs() {
+        let run = tempfile::tempdir().unwrap();
+        let out = run.path().join("out");
+        let keep = out.join(".fleet");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(keep.join("log"), b"ran\n").unwrap();
+        std::fs::write(out.join("hello.txt"), b"hello\n").unwrap();
+        let own = tempfile::tempdir().unwrap();
+        let scratch = own.path().join("fleet");
+        let ran = std::process::Command::new("python3")
+            .args(["-c", GATHER, "4"])
+            .arg(&keep)
+            .arg(&scratch)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let manifest: Value = serde_json::from_slice(&ran.stdout).unwrap();
+        let paths = pieces_of(&manifest);
+        assert_eq!(paths.len(), 3, "{manifest}");
+        for path in &paths {
+            assert!(path.starts_with(scratch.to_str().unwrap()), "{path}");
+        }
+        let left: Vec<_> = std::fs::read_dir(&keep)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left,
+            ["log"],
+            "the run's own folder holds only what the run wrote"
+        );
     }
 
     #[test]
