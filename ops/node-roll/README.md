@@ -12,7 +12,7 @@ The app people run never speaks a different contract from the node, in either di
 - Check that the app people have installed already shows "this node speaks contract X; update this app" (app #144 and later). A roll never ships that screen.
 - Stage every client's contract N+1 build and say where each one is. Staged means proven, not only built: each build has run once against an N+1 node (a local network, or a rehearsal on a copy) before R. On 10-21 chief-relay's first contract-10 image crash-looped, because it signed queries as writes. The clients, each with its owner after the colon, who acks R and swaps it at R (on 10-21 pushd sat on contract 9 for 2h40m because nobody owned its swap):
   - the node: the operator (22); every resident: its own operator (each runs `ducktape roll R` at R);
-  - pods, the mac runner, forge-mirror, chief-relay, pi-chief: the operator (22);
+  - pods, the mac runner, forge-mirror, chief-relay: the operator (22);
   - pushd: eddy-zk-1 (39);
   - the reconcile, watch and warm pod images: the operator (22);
   - the build machines' shared `/out` binaries, the warm pod's and the desktop build runner's out image (the warm pod's pause check reads `/out/ducktape` and fails closed): tech (21);
@@ -29,7 +29,6 @@ The app people run never speaks a different contract from the node, in either di
 
 ## 2. At R: one sitting, no gaps
 
-- pi-chief is scaled to 0 before the node stops at R, and comes back only as its proven N+1 image after "node proven". Its old record treats N+1 as unproven, but it never sets the node back across a contract: it records the contract each image ran, and a stall in the next epoch is refused as `contract_differs` rather than sending the node back to the N image, which refuses state stamped with the new contract.
 - Before the node stops, the operator checks that no app release run is past its `contract` job and short of its last release step: forge's release-stable and release-nightly (short of `mirror`), and GitHub's release.yml (short of `publish`) and testflight.yml (short of `upload`). The gate below runs just before those steps, and nothing after it checks again; GitHub's two wait in the `release` environment, so that wait can straddle R.
 - The node stops at R and rolls. Residents run `ducktape roll R` with it.
 - The operator posts "node proven" from node-only checks (apply_slow, state root, history, egress, decodes) before rolling any image. PAUSED and the agents' after-roll steps wait on that word, and the image rolls come after it.

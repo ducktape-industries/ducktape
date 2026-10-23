@@ -93,7 +93,6 @@ test:
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/pods/server-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/bridge/bridge-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/forge-mirror/mirror-test.py && \
-	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/pi-chief/pi-chief-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/watch/watch-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/registry-gc/gc-test.py && \
 	  PYTHONDONTWRITEBYTECODE=1 python3 ops/k8s/reconcile/reconcile-test.py && \
