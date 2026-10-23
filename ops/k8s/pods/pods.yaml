@@ -583,7 +583,7 @@ spec:
             - {name: PODS_FORGE, value: "@FORGE@"}
             - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844"}
             - {name: PODS_KEYS, value: /keys}
-            - {name: PODS_RUNNERS, value: "lat-7=/runners/lat-7 lat-5=/runners/lat-5 desktop=/desktop zk-dev=/runners/zk-dev"}
+            - {name: PODS_RUNNERS, value: "lat-7=/runners/lat-7 lat-5=/runners/lat-5 lat-1=/runners/lat-1 lat-4=/runners/lat-4 lat-8=/runners/lat-8 desktop=/desktop zk-dev=/runners/zk-dev"}
             - {name: PODS_WARM_POD, value: ""}
             - {name: PODS_LANE_FIRST_LIMIT, value: "60"}
             - {name: PODS_BUILD_IMAGE, value: "localhost:5000/toolchain:436bbb1f713d@sha256:6ae72f0c210a163e5c3fbd52abd55b7638674805f2dd5796adf923b601c5beb7"}
@@ -604,6 +604,9 @@ spec:
             - {name: runner-zk-dev, mountPath: /runners/zk-dev, readOnly: true}
             - {name: runner-lat-5, mountPath: /runners/lat-5, readOnly: true}
             - {name: runner-lat-7, mountPath: /runners/lat-7, readOnly: true}
+            - {name: runner-lat-1, mountPath: /runners/lat-1, readOnly: true}
+            - {name: runner-lat-4, mountPath: /runners/lat-4, readOnly: true}
+            - {name: runner-lat-8, mountPath: /runners/lat-8, readOnly: true}
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
@@ -632,6 +635,21 @@ spec:
         - name: runner-lat-7
           secret:
             secretName: runner-lat-7
+            optional: true
+            defaultMode: 0440
+        - name: runner-lat-1
+          secret:
+            secretName: runner-lat-1
+            optional: true
+            defaultMode: 0440
+        - name: runner-lat-4
+          secret:
+            secretName: runner-lat-4
+            optional: true
+            defaultMode: 0440
+        - name: runner-lat-8
+          secret:
+            secretName: runner-lat-8
             optional: true
             defaultMode: 0440
 ---

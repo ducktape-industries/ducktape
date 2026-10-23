@@ -204,6 +204,12 @@ or through a member node's halo forward.
   public addresses; `to-duckpond-node` adds TCP 8844 on duckpond's node pods. A node carries
   `builds.ducktape/pods=true` only once its SSH runner is out, so the two never share a VM. Build
   notices keep their open runs in the ConfigMap `build-runs`.
+- **duckpond's Latitude split.** Five of the eight Latitude build VMs are SSH runners: `lat-1`,
+  `lat-4`, `lat-5`, `lat-7` and `lat-8`, each named in `PODS_RUNNERS`. The other three, `lat-2`,
+  `lat-3` and `lat-6`, carry `builds.ducktape/pods=true`, so every pod placed by that label, build
+  pods included, runs there. Reviewer 56 reads both sides' CPU in Bottlenecks. When the three build
+  VMs' 3-row mean goes above 60%, or the runners' mean stays below 25% for an hour, one VM changes
+  sides (chief 17's rule).
 - **Runner-only placement.** With `PODS_WARM_POD` unset or empty, `builds` gives each eligible runner
   its next turn in configuration order, skipping unreachable runners and full slots. Capacity
   comes from `build.sh ahead` and the runner's ping (`busy`, `heavy_runs`), not predicted finish
