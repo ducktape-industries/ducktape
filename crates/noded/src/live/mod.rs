@@ -113,6 +113,8 @@ pub struct Relay<E: crate::Context> {
     me: PublicKey,
     plane: lane::Plane,
     table: mpsc::UnboundedSender<Event>,
+    #[cfg(test)]
+    unlink_gate: std::sync::Mutex<Option<tests::UnlinkGate>>,
     _tasks: JoinSet<()>,
 }
 
@@ -163,6 +165,8 @@ impl<E: crate::Context> Relay<E> {
                 me,
                 plane,
                 table,
+                #[cfg(test)]
+                unlink_gate: Default::default(),
                 _tasks: tasks,
             }
         });
@@ -825,6 +829,34 @@ async fn rechecking<E: crate::Context>(relay: Weak<Relay<E>>, rechecks: Arc<Noti
                     relay.send(Event::CloseSession {
                         id,
                         reason: "no_account",
+                    });
+                }
+            }
+        }
+        let moved = dirty.identity || !dirty.programs.is_empty();
+        if moved {
+            let Ok(strangers) = relay.asking(|reply| Event::Strangers { reply }).await else {
+                return;
+            };
+            for (peer, tracks) in strangers {
+                let account = relay.grants.account(peer.as_ref()).await;
+                let mut disowned = Vec::new();
+                for (track, by) in tracks {
+                    let owned = account == Some(by);
+                    let granted = relay
+                        .decided(by, &track.namespace)
+                        .await
+                        .grant
+                        .is_some_and(|grant| grant.publishes(&track.name, by));
+                    let kept = owned && granted;
+                    if !kept {
+                        disowned.push(track);
+                    }
+                }
+                if !disowned.is_empty() {
+                    relay.send(Event::Disowned {
+                        from: peer,
+                        tracks: disowned,
                     });
                 }
             }

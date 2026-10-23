@@ -143,3 +143,12 @@ fn serve_is_sent_by_a_member_while_the_chain_records_other_services() {
     let drifted = desk.read(reading(&[], &[], true));
     assert_eq!(drifted, [Step::Send(Purpose::Serve)]);
 }
+
+#[test]
+fn serve_of_registered_services_alone_is_sent_without_membership() {
+    let mut registered = Desk::new(vec!["echo".into()]);
+    let unsettled = registered.read(reading(&[], &[], false));
+    assert_eq!(unsettled, [Step::Send(Purpose::Serve)]);
+    let mut own = Desk::new(vec!["echo".into(), "relay".into()]);
+    assert!(own.read(reading(&[], &[], false)).is_empty());
+}

@@ -1,6 +1,6 @@
-//! halo: the network between members, off consensus. It carries lanes of streams and
-//! datagrams between current members over QUIC, at a priority class capped by who asks and by
-//! the lane. Which lanes exist, and each one's wire id and cap, is the halo role's table.
+//! halo: the network between members, off consensus. It carries lanes over QUIC to and from any
+//! key that links, a lane capped `Critical` from seated members alone, dialing only seated members,
+//! at a class capped by who asks and by the lane. The halo role's table names lanes, ids and caps.
 
 pub mod class;
 mod control;
@@ -103,6 +103,10 @@ impl Halo {
 
     pub async fn direct(&self, member: &PublicKey) {
         self.links.direct(member).await;
+    }
+
+    pub async fn unlinked(&self, key: &PublicKey) {
+        self.links.unlinked(key).await;
     }
 
     pub fn path(&self, member: &PublicKey) -> Option<Path> {

@@ -17,7 +17,7 @@ enum Registered {
 
 fn registered(halo: &halo::Halo) -> Registered {
     let members = halo.members();
-    let seated = members.admits(halo.me());
+    let seated = members.seated(halo.me());
     if !seated {
         return Registered::Unseated;
     }

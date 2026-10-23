@@ -338,14 +338,16 @@ fn boxed(
     client: &Client,
     echo: SocketAddr,
     unreached: ::tokio::sync::watch::Sender<usize>,
+    relay: &Seat,
 ) -> Boxed {
     let boxed = Workspace::at(root.join("box"));
     let udp = UdpSocket::bind((outbound_ip(), 0)).unwrap();
-    let registered = udp.local_addr().unwrap().to_string();
-    runner(&boxed.runtime_dir())
-        .start(|context| noded::enroll(context, &boxed, client.clone(), registered, None))
-        .unwrap();
-    let key = boxed.identity().unwrap().public_key().as_ref().to_vec();
+    let identity = runner(&boxed.runtime_dir()).start({
+        let boxed = boxed.clone();
+        |mut context| async move { boxed.identity_or_create(&mut context).unwrap() }
+    });
+    let key = identity.public_key().as_ref().to_vec();
+    let (relay_key, relay_halo) = (relay.key(), relay.halo_address());
     let services = format!("[services.echo]\nbase = \"http://{echo}\"\n");
     std::fs::write(boxed.dir().join("egress.toml"), services).unwrap();
     let (die, dying) = oneshot::channel::<()>();
@@ -355,7 +357,8 @@ fn boxed(
         let _alive = alive;
         let counted = tracing_subscriber::registry().with(Unreached(unreached));
         runner(&boxed.runtime_dir()).start(|context| async move {
-            let serving = noded::serve_box(&context, boxed, &client, udp).with_subscriber(counted);
+            let serving = noded::serve_box(&context, boxed, &client, udp, &relay_key, relay_halo)
+                .with_subscriber(counted);
             ::tokio::select! {
                 served = serving => panic!("the box stopped serving: {served:?}"),
                 _ = dying => {}
@@ -391,12 +394,21 @@ fn a_box_with_no_node_serves_egress_through_a_relay_and_its_stream_ends_unserved
         die,
         mut gone,
         thread,
-    } = boxed(root.path(), &client, echo, unreached);
+    } = boxed(root.path(), &client, echo, unreached, &seats[0]);
 
     let id = runtime.block_on(racing(&mut gone, async {
         let mut changes = client.changes("egress").await.unwrap();
         recorded(&client, &mut changes, &key, &["echo"]).await;
         pinged(&client, &mut changes, "echo").await;
+        let status = client.status().await.unwrap();
+        let seating = noded::seating(&client, &seats[0].identity, &status)
+            .await
+            .unwrap();
+        let rowless = seating
+            .seats
+            .iter()
+            .all(|seat| seat.key.as_ref() != key.as_slice());
+        assert!(rowless, "the box serves with no valset row");
 
         let streamed = egress::Op::Request {
             request: egress::Request::Http {
@@ -468,7 +480,7 @@ fn a_box_whose_lane_is_unlisted_reads_again_only_when_halo_changes_and_serves_on
         die,
         mut gone,
         thread,
-    } = boxed(root.path(), &client, echo, unreached);
+    } = boxed(root.path(), &client, echo, unreached, &seats[0]);
     runtime.block_on(racing(&mut gone, async {
         let first = *counted.wait_for(|count| *count > 0).await.unwrap();
         let from = client.status().await.unwrap().height;
@@ -510,7 +522,7 @@ fn a_box_sends_an_answer_larger_than_a_block_carries_as_a_failure() {
         die,
         mut gone,
         thread,
-    } = boxed(root.path(), &client, echo, unreached);
+    } = boxed(root.path(), &client, echo, unreached, &seats[0]);
     runtime.block_on(racing(&mut gone, async {
         let mut changes = client.changes("egress").await.unwrap();
         recorded(&client, &mut changes, &key, &["echo"]).await;
@@ -571,7 +583,7 @@ fn a_box_answers_a_request_whose_body_no_member_holds_failed_and_serves_the_rest
         die,
         mut gone,
         thread,
-    } = boxed(root.path(), &client, echo, unreached);
+    } = boxed(root.path(), &client, echo, unreached, &seats[0]);
     runtime.block_on(racing(&mut gone, async {
         let mut changes = client.changes("egress").await.unwrap();
         recorded(&client, &mut changes, &key, &["echo"]).await;
@@ -619,4 +631,45 @@ fn a_box_answers_a_request_whose_body_no_member_holds_failed_and_serves_the_rest
     }));
     thread.join().unwrap();
     shut_down(&runtime, &seats.iter().collect::<Vec<_>>(), live);
+}
+
+#[test]
+fn a_box_started_before_its_node_serves_once_the_node_answers_and_again_after_it_restarts() {
+    apart!();
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding(root.path(), &[&seat], EPOCH_LENGTH);
+    std::fs::write(
+        root.path().join("halo.params"),
+        abi::encode(&box_lanes(true)),
+    )
+    .unwrap();
+    seat.init(&founding);
+    let runtime = client_runtime();
+    let (echo, _chunks) = runtime.block_on(lane_upstream());
+    let client = Client::new(format!("http://{}", seat.http));
+    let (unreached, _) = ::tokio::sync::watch::channel(0);
+    let Boxed {
+        key,
+        die,
+        mut gone,
+        thread,
+    } = boxed(root.path(), &client, echo, unreached, &seat);
+    let live = seat.start();
+    runtime.block_on(racing(&mut gone, async {
+        let mut changes = client.changes("egress").await.unwrap();
+        recorded(&client, &mut changes, &key, &["echo"]).await;
+        pinged(&client, &mut changes, "echo").await;
+        seat.admin(&client, Admin::Shutdown).await;
+    }));
+    live.thread.join().unwrap();
+    *seat.held.lock().unwrap() = Some(rebound(&seat));
+    let restarted = seat.start();
+    runtime.block_on(racing(&mut gone, async {
+        let mut changes = client.changes("egress").await.unwrap();
+        pinged(&client, &mut changes, "echo").await;
+        die.send(()).unwrap();
+    }));
+    thread.join().unwrap();
+    shut_down(&runtime, &[&seat], vec![restarted]);
 }

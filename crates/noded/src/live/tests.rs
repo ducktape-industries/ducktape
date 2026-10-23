@@ -18,9 +18,9 @@ use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _, tokio as ru
 use futures::{SinkExt as _, StreamExt as _};
 use halo::{Class, Halo, Lane, Seat};
 use live_wire::{
-    ALPN, Account, Challenge, Code, Control, DatagramHeader, End, Ending, GroupHeader, Hello, LANE,
-    MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Scheme, Start, Track, WS_MESSAGE, Welcome,
-    WsFrame, proof_preimage,
+    ALPN, Account, Challenge, Code, Control, DatagramHeader, End, Ending, Forward, GroupHeader,
+    Hello, LANE, LaneMeta, MAX_STREAM_OBJECT, Mode, NAMESPACE, Proof, ROUTE, Scheme, Start, Track,
+    WS_MESSAGE, Welcome, WsFrame, proof_preimage,
 };
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{oneshot, watch};
@@ -51,6 +51,21 @@ struct Ledger {
 struct Parked {
     read: oneshot::Sender<()>,
     answer: oneshot::Receiver<()>,
+}
+
+pub(super) struct UnlinkGate {
+    ready: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+    sent: oneshot::Sender<()>,
+}
+
+impl UnlinkGate {
+    pub(super) async fn send<E: crate::Context>(self, relay: &Relay<E>, from: PublicKey) {
+        self.ready.send(()).unwrap();
+        self.resume.await.unwrap();
+        relay.send(super::table::Event::PeerGone { from });
+        self.sent.send(()).unwrap();
+    }
 }
 
 impl Ledger {
@@ -2175,5 +2190,345 @@ fn a_group_whose_first_object_comes_after_a_newer_groups_still_reaches_the_subsc
         );
         newer.finish().unwrap();
         assert!(read_end(&mut stream).await);
+    });
+}
+
+// ---- a key that is no member, over the live lane ----
+
+fn stranger(context: &Context, seed: u64, to: &Node) -> Arc<Halo> {
+    let config = halo::Config {
+        egress_bytes_per_sec: Some(1 << 30),
+        udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into(),
+        reach: halo::Https::shared(),
+        queues: halo::Queues::default(),
+    };
+    let halo = Arc::new(
+        Halo::start(
+            &context.child("stranger"),
+            PrivateKey::from_seed(seed),
+            config,
+        )
+        .unwrap(),
+    );
+    halo.plane().lanes(vec![Lane {
+        name: LANE.into(),
+        id: 1,
+        cap: Class::Client,
+        enabled: true,
+        pinned: false,
+        since: 0,
+    }]);
+    halo.seat([to.seat()]);
+    halo
+}
+
+async fn announced(control: &mut halo::Paced<halo::Carried>, track: Track, by: Account) {
+    let forward = Forward::Announce {
+        track,
+        by,
+        mode: Mode::Stream,
+        priority: 128,
+        up: true,
+    };
+    super::session::framed(control, &abi::encode(&forward))
+        .await
+        .unwrap();
+}
+
+fn heard(track: Track, by: Account, up: bool) -> Control {
+    Control::Announce {
+        request: 1,
+        track,
+        by,
+        mode: Mode::Stream,
+        up,
+    }
+}
+
+#[test]
+fn a_key_that_is_no_member_announces_under_its_own_account_alone_and_keeps_it_across_a_reseat() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let alice = seated(&ledger, 11, 42);
+        let bob = seated(&ledger, 12, 43);
+        let carol = seated(&ledger, 13, 44);
+        ledger.holds(&PrivateKey::from_seed(1), 42);
+        ledger.holds(&PrivateKey::from_seed(5), 50);
+        ledger.grant("room", None, Grant::all());
+        ledger.grant("elsewhere", None, Grant::all());
+        let first = node(context.child("first"), 1, ledger.clone());
+        let second = node(context.child("second"), 2, ledger);
+        first.halo.seat([first.seat()]);
+        second.halo.seat([second.seat()]);
+        let (mut carol, _) = Client::open(&second, &carol).await;
+        carol.watch(1, namespace("elsewhere")).await;
+        let (mut alice, _) = Client::open(&first, &alice).await;
+        alice
+            .publish(1, track("elsewhere", "alice"), Mode::Stream)
+            .await;
+        let (mut bob, _) = Client::open(&first, &bob).await;
+        bob.watch(1, namespace("room")).await;
+
+        let stranger = stranger(&context, 5, &first);
+        let lane = stranger.plane().streams(LANE, 1).unwrap();
+        let mut control = lane
+            .open(&first.key, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await
+            .unwrap();
+        announced(&mut control, track("room", "theirs"), 42).await;
+        announced(&mut control, track("room", "own"), 50).await;
+        assert_eq!(
+            bob.recv().await,
+            heard(track("room", "own"), 50, true),
+            "the announce under another account was dropped and its own taken"
+        );
+
+        first.halo.seat([first.seat(), second.seat()]);
+        assert_eq!(
+            carol.recv().await,
+            heard(track("elsewhere", "alice"), 42, true),
+            "the first node reconciled the reseat and resynced the second"
+        );
+        announced(&mut control, track("room", "later"), 50).await;
+        assert_eq!(
+            bob.recv().await,
+            heard(track("room", "later"), 50, true),
+            "the reseat kept the linked stranger's track"
+        );
+        first.shutdown.send_replace(true);
+        second.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn a_key_that_is_no_member_loses_its_tracks_when_it_leaves_its_account_and_when_its_link_ends() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let bob = seated(&ledger, 12, 43);
+        let key = PrivateKey::from_seed(5);
+        ledger.holds(&key, 50);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context.child("node"), 1, ledger.clone());
+        node.halo.seat([node.seat()]);
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        bob.watch(1, namespace("room")).await;
+
+        let stranger = stranger(&context, 5, &node);
+        let lane = stranger.plane().streams(LANE, 1).unwrap();
+        let mut control = lane
+            .open(&node.key, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await
+            .unwrap();
+        announced(&mut control, track("room", "first"), 50).await;
+        assert_eq!(bob.recv().await, heard(track("room", "first"), 50, true));
+
+        ledger.unseat(&key);
+        node.relay.invalidate(&wrote_identity());
+        assert_eq!(
+            bob.recv().await,
+            heard(track("room", "first"), 50, false),
+            "the track ended when its key left the account"
+        );
+        announced(&mut control, track("room", "unowned"), 50).await;
+        ledger.holds(&key, 51);
+        node.relay.invalidate(&wrote_identity());
+        announced(&mut control, track("room", "again"), 51).await;
+        assert_eq!(
+            bob.recv().await,
+            heard(track("room", "again"), 51, true),
+            "the announce made while the key held no account was dropped"
+        );
+
+        drop(control);
+        drop(lane);
+        drop(stranger);
+        assert_eq!(
+            bob.recv().await,
+            heard(track("room", "again"), 51, false),
+            "its track ended with its last link"
+        );
+        node.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn a_key_that_is_no_member_announces_only_what_its_room_lets_it_publish_and_loses_it_when_that_moves()
+ {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let bob = seated(&ledger, 12, 43);
+        ledger.holds(&PrivateKey::from_seed(5), 50);
+        let echo = |publish: Vec<String>| Grant {
+            publish,
+            subscribe: vec!["*".into()],
+        };
+        ledger.grant("echo", None, echo(vec!["echo/{account}".into()]));
+        let node = node(context.child("node"), 1, ledger.clone());
+        node.halo.seat([node.seat()]);
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        bob.watch(1, namespace("echo")).await;
+
+        let stranger = stranger(&context, 5, &node);
+        let lane = stranger.plane().streams(LANE, 1).unwrap();
+        let mut control = lane
+            .open(&node.key, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await
+            .unwrap();
+        announced(&mut control, track("echo", "echo/42"), 50).await;
+        announced(&mut control, track("echo", "echo/50"), 50).await;
+        assert_eq!(
+            bob.recv().await,
+            heard(track("echo", "echo/50"), 50, true),
+            "the name its room does not let it publish was dropped"
+        );
+        ledger.grant("echo", None, echo(Vec::new()));
+        node.relay
+            .invalidate(&wrote(PROGRAM, abi::live::key("echo", None)));
+        assert_eq!(
+            bob.recv().await,
+            heard(track("echo", "echo/50"), 50, false),
+            "the track ended when its room stopped letting it publish"
+        );
+        node.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn an_announce_whose_grant_was_revoked_while_it_was_read_is_checked_again() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let bob = seated(&ledger, 12, 43);
+        ledger.holds(&PrivateKey::from_seed(5), 50);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context.child("node"), 1, ledger.clone());
+        node.halo.seat([node.seat()]);
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        bob.watch(1, namespace("room")).await;
+
+        let stranger = stranger(&context, 5, &node);
+        let lane = stranger.plane().streams(LANE, 1).unwrap();
+        let mut control = lane
+            .open(&node.key, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await
+            .unwrap();
+        let (was_read, answers) = ledger.park();
+        announced(&mut control, track("room", "revoked"), 50).await;
+        was_read.await.unwrap();
+        ledger.grant(
+            "room",
+            Some(50),
+            Grant {
+                publish: Vec::new(),
+                subscribe: vec!["*".into()],
+            },
+        );
+        node.relay.grants.moved();
+        answers.send(()).unwrap();
+        assert_eq!(bob.recv().await, heard(track("room", "revoked"), 50, true));
+        assert_eq!(bob.recv().await, heard(track("room", "revoked"), 50, false));
+        node.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn an_announce_whose_key_left_its_account_while_it_was_read_is_checked_again() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let bob = seated(&ledger, 12, 43);
+        let key = PrivateKey::from_seed(5);
+        ledger.holds(&key, 50);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context.child("node"), 1, ledger.clone());
+        node.halo.seat([node.seat()]);
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        bob.watch(1, namespace("room")).await;
+
+        let stranger = stranger(&context, 5, &node);
+        let lane = stranger.plane().streams(LANE, 1).unwrap();
+        let mut control = lane
+            .open(&node.key, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await
+            .unwrap();
+        let (was_read, answers) = ledger.park_account();
+        announced(&mut control, track("room", "moved"), 50).await;
+        was_read.await.unwrap();
+        ledger.unseat(&key);
+        node.relay.grants.identity_moved();
+        answers.send(()).unwrap();
+        assert_eq!(bob.recv().await, heard(track("room", "moved"), 50, true));
+        assert_eq!(
+            bob.recv().await,
+            heard(track("room", "moved"), 50, false),
+            "the announce read across the move was checked again and ended"
+        );
+        node.shutdown.send_replace(true);
+    });
+}
+
+#[test]
+fn a_key_that_is_no_member_gets_no_writer_and_keeps_its_tracks_past_a_peer_gone_while_linked() {
+    runtime::Runner::default().start(|context| async move {
+        let ledger = Arc::new(Ledger::default());
+        let bob = seated(&ledger, 12, 43);
+        let key = PrivateKey::from_seed(5);
+        ledger.holds(&key, 50);
+        ledger.grant("room", None, Grant::all());
+        let node = node(context.child("node"), 1, ledger.clone());
+        node.halo.seat([node.seat()]);
+        let (mut bob, _) = Client::open(&node, &bob).await;
+        bob.watch(1, namespace("room")).await;
+
+        let stranger = stranger(&context, 5, &node);
+        let lane = stranger.plane().streams(LANE, 1).unwrap();
+        let mut control = lane
+            .open(&node.key, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await
+            .unwrap();
+        announced(&mut control, track("room", "first"), 50).await;
+        assert_eq!(bob.recv().await, heard(track("room", "first"), 50, true));
+        let (reply, writers) = oneshot::channel();
+        node.relay.send(super::table::Event::Writers { reply });
+        let writers = writers.await.unwrap();
+        assert!(
+            !writers.contains(&key.public_key()),
+            "no writer is opened to a key that is no member"
+        );
+        let (ready, was_unlinked) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        let (sent, was_sent) = oneshot::channel();
+        *node.relay.unlink_gate.lock().unwrap() = Some(UnlinkGate {
+            ready,
+            resume: resumed,
+            sent,
+        });
+        drop(control);
+        drop(lane);
+        drop(stranger);
+        was_unlinked.await.unwrap();
+
+        let relinked = self::stranger(&context.child("relinked"), 5, &node);
+        let lane = relinked.plane().streams(LANE, 1).unwrap();
+        let mut control = lane
+            .open(&node.key, Class::Client, &abi::encode(&LaneMeta::Control))
+            .await
+            .unwrap();
+        announced(&mut control, track("room", "second"), 50).await;
+        assert_eq!(bob.recv().await, heard(track("room", "second"), 50, true));
+        resume.send(()).unwrap();
+        was_sent.await.unwrap();
+        let (reply, writers) = oneshot::channel();
+        node.relay.send(super::table::Event::Writers { reply });
+        assert!(!writers.await.unwrap().contains(&key.public_key()));
+        announced(&mut control, track("room", "third"), 50).await;
+        assert_eq!(bob.recv().await, heard(track("room", "third"), 50, true));
+
+        drop(control);
+        drop(lane);
+        drop(relinked);
+        let ended = [bob.recv().await, bob.recv().await, bob.recv().await];
+        assert!(ended.contains(&heard(track("room", "first"), 50, false)));
+        assert!(ended.contains(&heard(track("room", "second"), 50, false)));
+        assert!(ended.contains(&heard(track("room", "third"), 50, false)));
+        node.shutdown.send_replace(true);
     });
 }

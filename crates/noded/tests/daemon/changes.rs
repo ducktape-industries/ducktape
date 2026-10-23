@@ -2,18 +2,6 @@
 
 use super::*;
 
-/// The sockets a seat first served on, bound again, so a restart is where its peers dial it.
-fn rebound(seat: &Seat) -> Listeners {
-    let tcp = |address: SocketAddr| TcpListener::bind(address).unwrap();
-    Listeners {
-        p2p: tcp(seat.p2p),
-        http: tcp(seat.http),
-        tls: Some(tcp(seat.tls)),
-        halo: UdpSocket::bind(seat.halo).unwrap(),
-        live: Some(UdpSocket::bind((outbound_ip(), 0)).unwrap()),
-    }
-}
-
 #[test]
 fn a_changes_subscriber_that_closes_is_answered() {
     apart!();

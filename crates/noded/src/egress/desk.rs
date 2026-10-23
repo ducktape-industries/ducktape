@@ -3,7 +3,7 @@
 //! Pure decisions; `mod.rs` performs them.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use abi::role::egress::{Answer, Event, Op, RequestRow, StreamEnd};
+use abi::role::egress::{Answer, Event, Op, RESERVED, RequestRow, StreamEnd};
 use abi::{Refusal, reason};
 
 pub struct Reading {
@@ -327,7 +327,12 @@ impl Desk {
             steps.extend(flights.map(Step::Send));
         }
         let settled = reading.serving == self.wanted;
-        match (settled, reading.member, &self.serve) {
+        let registered_only = self
+            .wanted
+            .iter()
+            .all(|service| !RESERVED.contains(&service.as_str()));
+        let admitted = reading.member || registered_only;
+        match (settled, admitted, &self.serve) {
             (true, _, _) => self.serve = Sending::Unsigned,
             (false, true, Sending::Unsigned | Sending::Pending(_)) => {
                 steps.push(Step::Send(Purpose::Serve));

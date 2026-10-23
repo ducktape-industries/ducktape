@@ -8,7 +8,7 @@ use abi::live::Grant;
 use bytes::Bytes;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_runtime::telemetry::metrics::Counter;
-use live_wire::{Account, Alias, DatagramHeader, Forward, GroupHeader, RequestId};
+use live_wire::{Account, Alias, DatagramHeader, Forward, GroupHeader, RequestId, Track};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::lane::Lanes;
@@ -30,6 +30,7 @@ impl Dirty {
 pub(super) type Requests = Vec<(SessionId, RequestId, Held, Account)>;
 pub(super) type Waiting = Vec<(SessionId, RequestId, Ask, Account)>;
 pub(super) type Sessions = Vec<(SessionId, Vec<u8>, Account)>;
+pub(super) type Strangers = Vec<(PublicKey, Vec<(Track, Account)>)>;
 
 pub(super) enum Event {
     Welcome {
@@ -150,6 +151,20 @@ pub(super) enum Event {
         peer: PublicKey,
         reply: oneshot::Sender<Vec<Forward>>,
     },
+    PeerGone {
+        from: PublicKey,
+    },
+    Strangers {
+        reply: oneshot::Sender<Strangers>,
+    },
+    Disowned {
+        from: PublicKey,
+        tracks: Vec<Track>,
+    },
+    #[cfg(test)]
+    Writers {
+        reply: oneshot::Sender<Vec<PublicKey>>,
+    },
     #[cfg(test)]
     Inspect(Box<dyn FnOnce(&State) + Send>),
 }
@@ -248,6 +263,11 @@ impl<E: crate::Context> Table<E> {
             Event::PeerFresh { from } => self.peer_fresh(from),
             Event::Heard { from, forward } => self.heard(from, forward),
             Event::Resync { peer, reply } => self.resync(peer, reply),
+            Event::PeerGone { from } => self.peer_gone(from),
+            Event::Strangers { reply } => self.strangers(reply),
+            Event::Disowned { from, tracks } => self.disowned(from, tracks),
+            #[cfg(test)]
+            Event::Writers { reply } => self.writers(reply),
             #[cfg(test)]
             Event::Inspect(look) => self.inspect(look),
         }
@@ -398,13 +418,17 @@ impl<E: crate::Context> Table<E> {
             self.step(|state| state.peers_gone(|_| false));
             return;
         };
-        self.step(|state| state.peers_gone(|peer| seated.contains(peer)));
+        let halo = self.lanes.halo();
+        self.step(|state| {
+            state.peers_gone(|peer| seated.contains(peer) || halo.path(peer).is_some())
+        });
         for member in seated {
             self.lanes.resync(member);
         }
     }
 
     fn peer_fresh(&mut self, from: PublicKey) {
+        self.lanes.watch_unlinked(from.clone());
         self.step(|state| state.peer_fresh(from));
     }
 
@@ -441,6 +465,34 @@ impl<E: crate::Context> Table<E> {
 
     fn resync(&mut self, peer: PublicKey, reply: oneshot::Sender<Vec<Forward>>) {
         let _ = reply.send(self.state.resync(&peer));
+    }
+
+    fn peer_gone(&mut self, from: PublicKey) {
+        self.lanes.unwatched(&from);
+        let halo = self.lanes.halo();
+        let stays = halo.members().seated(&from) || halo.path(&from).is_some();
+        if stays {
+            self.lanes.watch_unlinked(from);
+            return;
+        }
+        self.step(|state| state.peers_gone(|peer| *peer != from));
+    }
+
+    fn strangers(&mut self, reply: oneshot::Sender<Strangers>) {
+        let halo = self.lanes.halo();
+        let strangers = self
+            .state
+            .remote_published(|peer| !halo.members().seated(peer));
+        let _ = reply.send(strangers);
+    }
+
+    fn disowned(&mut self, from: PublicKey, tracks: Vec<Track>) {
+        self.step(|state| state.remote_disowned(&from, &tracks));
+    }
+
+    #[cfg(test)]
+    fn writers(&mut self, reply: oneshot::Sender<Vec<PublicKey>>) {
+        let _ = reply.send(self.lanes.writers());
     }
 
     #[cfg(test)]

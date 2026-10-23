@@ -133,6 +133,18 @@ fn listeners() -> Listeners {
     }
 }
 
+/// The sockets a seat first served on, bound again, so a restart is where its peers dial it.
+fn rebound(seat: &Seat) -> Listeners {
+    let tcp = |address: SocketAddr| TcpListener::bind(address).unwrap();
+    Listeners {
+        p2p: tcp(seat.p2p),
+        http: tcp(seat.http),
+        tls: Some(tcp(seat.tls)),
+        halo: UdpSocket::bind(seat.halo).unwrap(),
+        live: Some(UdpSocket::bind((outbound_ip(), 0)).unwrap()),
+    }
+}
+
 /// A p2p address no node answers at: the listener holding it never accepts.
 fn unheard() -> (TcpListener, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

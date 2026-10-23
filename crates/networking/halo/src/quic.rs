@@ -1,6 +1,6 @@
 //! halo over QUIC. Each node presents a self-signed certificate made from its ed25519 node
-//! key, and both ends admit the other only if that key is a current member; the dialer also
-//! requires the key it meant to reach.
+//! key. A server takes any key's certificate; a dialer takes only the seated key it meant to
+//! reach.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -119,14 +119,13 @@ impl Admit {
                 "the certificate holds no node key".into(),
             ));
         };
-        let meant = self
-            .expected
-            .as_ref()
-            .is_none_or(|expected| *expected == key);
-        let member = self.members.admits(&key);
-        if !(meant && member) {
+        let Some(expected) = &self.expected else {
+            return Ok(());
+        };
+        let reached = *expected == key && self.members.seated(&key);
+        if !reached {
             return Err(rustls::Error::General(
-                "the node key is not a member".into(),
+                "the node key is not the seated member dialed".into(),
             ));
         }
         Ok(())

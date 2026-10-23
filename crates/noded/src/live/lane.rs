@@ -4,7 +4,7 @@
 //! track would. One writer task per peer owns the one control stream to it, so a member that
 //! cannot be reached slows no one else; a group is a stream of its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
@@ -12,8 +12,8 @@ use commonware_cryptography::ed25519::PublicKey;
 use commonware_runtime::telemetry::metrics::Counter;
 use halo::{Carried, Class, Halo, Inbound, Links, Paced};
 use live_wire::{
-    Alias, CONTROL_BYTES, DatagramHeader, Forward, GROUP_COMPLETE, GroupHeader, LANE, LaneMeta,
-    MAX_STREAM_OBJECT,
+    Account, Alias, CONTROL_BYTES, DatagramHeader, Forward, GROUP_COMPLETE, GroupHeader, LANE,
+    LaneMeta, MAX_STREAM_OBJECT,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
@@ -152,6 +152,8 @@ pub struct Lanes<E: crate::Context> {
     /// is on (it ends when the peer's queue next takes an item beyond the reset's own resync),
     /// for the log's pace.
     resets: HashMap<PublicKey, u32>,
+    unlinking: HashSet<PublicKey>,
+    waiters: JoinSet<()>,
 }
 
 impl<E: crate::Context> Lanes<E> {
@@ -174,6 +176,8 @@ impl<E: crate::Context> Lanes<E> {
             config,
             peers: HashMap::new(),
             resets: HashMap::new(),
+            unlinking: HashSet::new(),
+            waiters: JoinSet::new(),
         }
     }
 
@@ -188,6 +192,10 @@ impl<E: crate::Context> Lanes<E> {
         // A lane that is not served has no peers to carry anything to; its group fan-out would
         // otherwise spawn writers that only fail to open.
         if !self.streams.served() {
+            return;
+        }
+        let seated = self.halo.members().seated(&to);
+        if !seated {
             return;
         }
         match item {
@@ -278,6 +286,45 @@ impl<E: crate::Context> Lanes<E> {
 
     pub fn resync(&mut self, member: PublicKey) {
         self.queue(member, Queued::Resync);
+    }
+
+    pub fn halo(&self) -> Arc<Halo> {
+        self.halo.clone()
+    }
+
+    pub fn watch_unlinked(&mut self, peer: PublicKey) {
+        if self.halo.members().seated(&peer) {
+            return;
+        }
+        let fresh = self.unlinking.insert(peer.clone());
+        if !fresh {
+            return;
+        }
+        while self.waiters.try_join_next().is_some() {}
+        let (halo, relay) = (self.halo.clone(), self.relay.clone());
+        self.waiters.spawn(async move {
+            halo.unlinked(&peer).await;
+            if let Some(relay) = relay.upgrade() {
+                #[cfg(test)]
+                {
+                    let gate = relay.unlink_gate.lock().unwrap().take();
+                    if let Some(gate) = gate {
+                        gate.send(&relay, peer).await;
+                        return;
+                    }
+                }
+                relay.send(Event::PeerGone { from: peer });
+            }
+        });
+    }
+
+    pub fn unwatched(&mut self, peer: &PublicKey) {
+        self.unlinking.remove(peer);
+    }
+
+    #[cfg(test)]
+    pub fn writers(&self) -> Vec<PublicKey> {
+        self.peers.keys().cloned().collect()
     }
 
     fn queue(&mut self, to: PublicKey, queued: Queued) {
@@ -517,7 +564,7 @@ impl<E: crate::Context> PeerLink<E> {
                 // Unreachable names a member halo has no connection to, or a key that is no
                 // member: only the member is waited for, so a stale item for an unseated peer
                 // does not wake on a link that resolves at once.
-                let member = self.halo.members().admits(&self.to);
+                let member = self.halo.members().seated(&self.to);
                 self.link = match (&error, member) {
                     (halo::Error::Unreachable(_), true) => Link::Unlinked,
                     (halo::Error::Unreachable(_), false)
@@ -648,22 +695,65 @@ async fn read_forward(stream: &mut Stream) -> Option<Forward> {
 async fn control_reading<E: crate::Context>(relay: Weak<Relay<E>>, inbound: Inbound<Carried>) {
     let from = inbound.from;
     let mut stream = inbound.stream;
-    // A control stream newly opened to us: the peer is new, or restarted and forgot us. Open our
-    // own stream back and resync, and hold what it told us before as provisional until this
-    // stream's own resync repeats it.
     let Some(strong) = relay.upgrade() else {
         return;
     };
     strong.send(Event::PeerFresh { from: from.clone() });
+    let halo = strong.halo.clone();
     drop(strong);
+    let mut owner: Option<(u64, Option<Account>)> = None;
     while let Some(forward) = read_forward(&mut stream).await {
         let Some(relay) = relay.upgrade() else {
             return;
         };
+        let claimed = match &forward {
+            Forward::Announce {
+                by,
+                track,
+                up: true,
+                ..
+            } => Some((*by, track.clone())),
+            Forward::Announce { up: false, .. }
+            | Forward::Subscribe { .. }
+            | Forward::Unsubscribe { .. }
+            | Forward::Forwarded { .. }
+            | Forward::Ended { .. }
+            | Forward::Refused { .. }
+            | Forward::Count { .. }
+            | Forward::Resynced => None,
+        };
+        let unseated = !halo.members().seated(&from);
+        let mut read = None;
+        if let Some((by, track)) = claimed.filter(|_| unseated) {
+            let generation = relay.grants.identity_generation();
+            let fresh = owner.is_some_and(|(at, _)| at == generation);
+            if !fresh {
+                owner = Some((generation, relay.grants.account(from.as_ref()).await));
+            }
+            let owns = owner.is_some_and(|(_, account)| account == Some(by));
+            if !owns {
+                tracing::debug!(target: "ducktape::live", %from, by, reason = "not_its_account", "the live lane dropped an announce a key that is no member made under another account");
+                continue;
+            }
+            let decided = relay.decided(by, &track.namespace).await;
+            let granted = decided
+                .grant
+                .as_ref()
+                .is_some_and(|grant| grant.publishes(&track.name, by));
+            if !granted {
+                tracing::debug!(target: "ducktape::live", %from, by, reason = "not_granted", "the live lane dropped an announce of a track its room does not let a key that is no member publish");
+                continue;
+            }
+            read = Some((generation, decided));
+        }
         relay.send(Event::Heard {
             from: from.clone(),
             forward,
         });
+        if let Some((generation, decided)) = read {
+            relay.settled(decided);
+            relay.settled_identity(generation);
+        }
     }
 }
 

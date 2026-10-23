@@ -1,4 +1,4 @@
-//! The current member set halo admits and dials: each member's key, the halo address it
+//! The current member set halo seats and dials: each member's key, the halo address it
 //! registered on the chain if it has one, the HTTPS address it serves if any, and whether it votes.
 
 use std::collections::HashMap;
@@ -43,7 +43,7 @@ impl Members {
         self.seats.read().expect("the seats lock is never poisoned")
     }
 
-    pub fn admits(&self, key: &PublicKey) -> bool {
+    pub fn seated(&self, key: &PublicKey) -> bool {
         self.read().contains_key(key)
     }
 
@@ -196,7 +196,7 @@ mod tests {
             ..seat(1, true)
         };
         members.seat([seat(0, true), unaddressed]);
-        assert!(members.admits(&key(1)));
+        assert!(members.seated(&key(1)));
         assert_eq!(members.halo(&key(1)), None);
         assert_eq!(members.halo(&key(0)).as_deref(), Some("localhost:0"));
     }

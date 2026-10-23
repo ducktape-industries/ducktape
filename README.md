@@ -451,11 +451,18 @@ failure; one event or an end larger than a block carries ends the stream `Cut`
 (`event_too_large`, `end_too_large`) and the node drops the rest. On a network that binds no egress
 role the node does none of this.
 
-A member key with no node of its own serves egress the same way over halo's
-lane `ducktape/egress`, which the validators' vote opens. The box enrolls with
-`ducktape enroll`, then runs `ducktape egress serve --halo <bind>`: it reads
-the members and halo's lane table from a node over HTTP (`--node`), seats the
-validators and opens the lane to one of them. That node, its relay, sends it
+A key with no node of its own, a box, serves egress the same way over halo's
+lane `ducktape/egress`, which the validators' vote opens. It needs no valset
+row: halo takes any key's connection, and egress lets the keys a registered
+service's owner `Assign`s serve it, so nothing about where the box runs goes
+on chain. A box that is no member sends `Serve` only when every service it
+offers is a registered one (none of `http`, `relay`, `crosspond`). It runs
+`ducktape egress serve --halo <bind> --relay-key <hex> --relay-halo
+<host:port>`, naming the validator behind `--node` by its node key and its
+registered halo address, both public in valset. It seats and dials that
+validator at start, then reads the members and halo's lane table from
+`--node` over HTTP, seats the validators and opens the lane to one of them.
+That node, its relay, sends it
 after each block the tip, the requests egress assigned to the box's key with
 their bodies, and the box's service row. The box decides and calls as a node
 does, from its own `egress.toml`, signs each frame with its own key at the
@@ -476,8 +483,18 @@ runtime, beside the block threads. While the box's lane table does not list
 the lane enabled (before the vote opens it, or after a vote pauses or closes
 it), the box waits for the next change to the halo program and reads again.
 With no validator reachable it waits until one links; after a round in which
-every relay it reached dropped it, it waits for the next block; when it
-reaches every one and none serves the lane, it stops with an error.
+every relay it reached dropped it, it waits for the next block. When a read
+of its node fails (status, seating, the halo program's changes or the next
+block), or it reaches every validator and none serves the lane, the round
+ends and the box tries again a block time later, for as long as it runs,
+logging `egress_node_lost` at the first failure and at each power of two
+after. Before its first status read answers it knows no block time, so it
+tries again each time its halo link to `--relay-key` changes: while halo
+stays linked and the node's HTTP keeps failing, it waits for the next link
+change. It stops only when its identity, its `egress.toml` or the halo socket
+fails at start. A service's owner takes a box down with egress
+`Assign { service, nodes: [] }`, which stops electing its key, then
+`remove_key` if the key was ever added to an account.
 
 ```toml
 # $DUCKTAPE_HOME/egress.toml: read when the node starts and on `ducktape egress reload`;
@@ -534,7 +551,7 @@ at each block while an answer still lands before the request's expiry. A
 relaying node drops a record once every linked network holds a header of its
 epoch or later; a node with no `[crosspond.*]` entry keeps only its newest
 close and opening. A node does not serve `crosspond` through
-`ducktape egress serve`: that server has no node of its own to prove from.
+`ducktape egress serve`: a box has no node of its own to prove from.
 
 `/v1/crosspond/acks` takes a borsh `AcksAsk { from, seqs, held }` and answers
 a borsh `Acked { epoch, header, acks }`: the crosspond program's settled row
@@ -743,6 +760,24 @@ not route a host back to its own public address fails that dial while members
 still reach the node directly. `GET /v1/halo/self` answers `Unregistered`,
 `Dialing { at }`, `Reached { at }` or `Unreachable { at, reason }`.
 
+A node takes a halo connection from any key whose certificate holds a
+well-formed node key, the way its `/v1` surface takes any client: the key may
+open streams and send datagrams on the lanes the node serves capped below
+`Critical`, at no higher a class than that cap. A lane capped `Critical`
+(`ducktape/blobs`, what validators fetch the blocks they execute over) takes
+seated members alone; a joiner syncs by proof, not over it. Its authority comes
+from what it signs, never from the link. The node dials, opens streams to,
+sends datagrams to, relays to and introduces seated members alone. It ignores
+the addresses an unseated key tells it, tells its own reached address only to
+seated members, and forgets an unseated key once its last connection ends. On
+the live lane an unseated key's announce is taken only for the account the
+identity role names for that key, and only for a track name the room's grant
+lets that account publish; each block that writes identity or a grant checks
+its tracks again and ends those it no longer owns, and they end with its last
+connection. No node opens a stream to an unseated key, so its tracks are heard
+of but not fetched over halo, and it is pushed none: apps reach live over
+`/v1`.
+
 A member whose `address` is `ws://` or `wss://` also carries halo on its
 `--http` socket: a member that does not reach it over UDP opens a WebSocket
 at `/v1/halo` there and runs the same QUIC inside it, with the same node-key
@@ -755,16 +790,16 @@ forward. The direct link is preferred, and the relayed one closes once it is
 up. Behind a router that maps each remote apart (symmetric or carrier-grade
 NAT) the punch fails and halo stays on the relayed link. Two members with no
 `ws://` or `wss://` address learn where the other is reached from a member
-both are linked to. A member tells its address only to members it admitted.
+both are linked to. A member tells its address only to seated members.
 The `/v1/seen` answer is not authenticated: someone on the path can rewrite
 it, and the member then tells a wrong address. That costs reachability, not
 data. Its members' direct dials miss and it stays on the relayed link, while
-node keys still decide who is admitted.
+node keys still decide whom a dial reaches.
 `--halo-egress` caps the bytes per second a node sends over halo;
 without it the node sends as fast as the path allows.
-`--halo-inbound-streams` is how many streams members open to the node wait
+`--halo-inbound-streams` is how many streams linked keys open to the node wait
 for it to take them; past it the node takes no more until one is taken.
-`--halo-datagrams` is how many datagrams from members wait for the node to
+`--halo-datagrams` is how many datagrams from linked keys wait for the node to
 read them; past it a datagram is dropped.
 
 Three more `run` flags set how much blob work a node takes on at once.

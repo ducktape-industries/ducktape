@@ -383,6 +383,7 @@ impl Links {
                 tokio::spawn(keeping(Arc::downgrade(self), key, peer.changed.subscribe()));
             }
             peer.changed.send_replace(());
+            peer.posted.send_replace(());
         }
         if moved {
             self.relearn.notify_one();
@@ -410,12 +411,24 @@ impl Links {
         }
     }
 
+    pub async fn unlinked(&self, key: &PublicKey) {
+        let Some(peer) = self.known(key) else {
+            return;
+        };
+        let mut changed = peer.changed.subscribe();
+        while peer.live().is_some() {
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub fn path(&self, key: &PublicKey) -> Option<Path> {
-        self.peer(key).path()
+        self.known(key)?.path()
     }
 
     pub fn paths(&self, key: &PublicKey) -> Vec<Path> {
-        self.peer(key).paths()
+        self.known(key).map(|peer| peer.paths()).unwrap_or_default()
     }
 
     pub fn link_changes(&self, key: &PublicKey) -> watch::Receiver<()> {
@@ -456,6 +469,14 @@ impl Links {
             .entry(key.clone())
             .or_default()
             .clone()
+    }
+
+    fn known(&self, key: &PublicKey) -> Option<Arc<Peer>> {
+        self.peers
+            .lock()
+            .expect("the peers lock is never poisoned")
+            .get(key)
+            .cloned()
     }
 
     fn all(&self) -> Vec<(PublicKey, Arc<Peer>)> {
@@ -598,6 +619,10 @@ impl Links {
     }
 
     fn introduce(&self, key: &PublicKey, peer: &Peer) {
+        let seated = self.members.seated(key);
+        if !seated {
+            return;
+        }
         let unlinked = peer.live().is_none() && self.members.https(key).is_none();
         let mine = self.mine.borrow().clone();
         if !unlinked || mine.is_empty() {
@@ -605,7 +630,9 @@ impl Links {
         }
         let introduction = (mine, true);
         for (carrier, carrying) in self.all() {
-            if carrier == *key || carrying.live().is_none() {
+            let unfit =
+                carrier == *key || carrying.live().is_none() || !self.members.seated(&carrier);
+            if unfit {
                 continue;
             }
             let held = carrying
@@ -627,13 +654,17 @@ impl Links {
     fn heard(&self, from: &PublicKey, said: Said) {
         match said {
             Said::Mine { addrs } => {
-                self.peer(from).told(control::read_addrs(&addrs));
+                let seated = self.members.seated(from);
+                if seated {
+                    self.peer(from).told(control::read_addrs(&addrs));
+                }
             }
             Said::Introduce { to, addrs, reply } => {
                 let Ok(to) = PublicKey::decode(to.as_slice()) else {
                     return;
                 };
-                if to != self.me && self.members.admits(&to) {
+                let seated = to != self.me && self.members.seated(from) && self.members.seated(&to);
+                if seated {
                     self.peer(&to).post(|outbox| {
                         outbox
                             .introduced
@@ -649,7 +680,8 @@ impl Links {
                 let Ok(who) = PublicKey::decode(who.as_slice()) else {
                     return;
                 };
-                let known = who != self.me && self.members.admits(&who);
+                let known =
+                    who != self.me && self.members.seated(from) && self.members.seated(&who);
                 if !known {
                     return;
                 }
@@ -710,7 +742,12 @@ impl Links {
             path,
             _endpoint: endpoint,
         };
-        self.peer(key).adopt(link);
+        self.peers
+            .lock()
+            .expect("the peers lock is never poisoned")
+            .entry(key.clone())
+            .or_default()
+            .adopt(link);
         tokio::spawn(carried(
             Arc::downgrade(self),
             key.clone(),
@@ -724,8 +761,22 @@ impl Links {
         self.stir();
     }
 
+    fn release(&self, key: &PublicKey, connection: Option<&quinn::Connection>) {
+        let mut peers = self.peers.lock().expect("the peers lock is never poisoned");
+        let Some(peer) = peers.get(key) else {
+            return;
+        };
+        if let Some(connection) = connection {
+            peer.forget(connection);
+        }
+        let gone = !self.members.seated(key) && peer.live().is_none();
+        if gone {
+            peers.remove(key);
+        }
+    }
+
     fn lost(&self, key: &PublicKey, connection: &quinn::Connection) {
-        self.peer(key).forget(connection);
+        self.release(key, Some(connection));
         let any = self.all().iter().any(|(_, peer)| peer.live().is_some());
         if !any {
             self.relearn.notify_one();
@@ -739,13 +790,16 @@ impl Links {
         changed: &mut watch::Receiver<()>,
     ) -> Next {
         changed.borrow_and_update();
-        let peer = self.peer(key);
-        let seated = self.members.admits(key);
+        let Some(peer) = self.known(key) else {
+            return Next::Wait;
+        };
+        let seated = self.members.seated(key);
         if !seated {
             peer.unseat();
             for (_, carrying) in self.all() {
                 carrying.post(|outbox| outbox.forget(key));
             }
+            self.release(key, None);
             return Next::Wait;
         }
         let halo = self.members.halo(key);
@@ -912,12 +966,19 @@ async fn hearing(links: Weak<Links>, from: PublicKey, mut recv: quinn::RecvStrea
     }
 }
 
+fn tells_mine(seated: bool, current: &[SocketAddr], said: &[SocketAddr]) -> bool {
+    seated && !current.is_empty() && current != said
+}
+
 async fn telling(links: Weak<Links>, key: PublicKey, connection: quinn::Connection) {
     let Some(strong) = links.upgrade() else {
         return;
     };
     let mut mine = strong.mine.subscribe();
-    let peer = strong.peer(&key);
+    let Some(peer) = strong.known(&key) else {
+        return;
+    };
+    let members = strong.members.clone();
     drop(strong);
     let mut posted = peer.posted.subscribe();
     let Ok(mut send) = connection.open_uni().await else {
@@ -930,7 +991,8 @@ async fn telling(links: Weak<Links>, key: PublicKey, connection: quinn::Connecti
     let mut said: Vec<Said> = Vec::new();
     loop {
         let current = mine.borrow_and_update().clone();
-        if !current.is_empty() && current != said_mine {
+        let tells = tells_mine(members.seated(&key), &current, &said_mine);
+        if tells {
             let said = Said::Mine {
                 addrs: control::written(&current),
             };
@@ -996,8 +1058,128 @@ impl Transport for Arc<Links> {
 #[cfg(test)]
 mod tests {
     use commonware_cryptography::Signer as _;
+    use commonware_runtime::{Runner as _, Supervisor as _, tokio as runtime};
 
     use super::*;
+    use crate::members::Seat;
+
+    fn seat(key: PublicKey, port: u16) -> Seat {
+        Seat {
+            key,
+            halo: Some(format!("localhost:{port}")),
+            https: None,
+            validator: true,
+        }
+    }
+
+    fn started(context: &runtime::Context, seed: u64, seats: Vec<Seat>) -> Arc<Links> {
+        let members = Arc::new(Members::default());
+        members.seat(seats);
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        Links::start(
+            context,
+            PrivateKey::from_seed(seed),
+            members,
+            udp.into(),
+            Queues::default(),
+            crate::reach::Https::shared(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_word_from_or_about_a_key_that_is_not_seated_moves_nothing() {
+        runtime::Runner::default().start(|context| async move {
+            let me = PrivateKey::from_seed(1).public_key();
+            let member = PrivateKey::from_seed(2).public_key();
+            let stranger = PrivateKey::from_seed(3).public_key();
+            let links = started(&context, 1, vec![seat(me, 1), seat(member.clone(), 1)]);
+            let at: Vec<SocketAddr> = vec!["203.0.113.7:9100".parse().unwrap()];
+            let addrs = control::written(&at);
+            links.heard(
+                &stranger,
+                Said::Mine {
+                    addrs: addrs.clone(),
+                },
+            );
+            links.heard(
+                &stranger,
+                Said::Introduce {
+                    to: member.as_ref().to_vec(),
+                    addrs: addrs.clone(),
+                    reply: true,
+                },
+            );
+            links.heard(
+                &stranger,
+                Said::Introduced {
+                    from: member.as_ref().to_vec(),
+                    addrs: addrs.clone(),
+                    reply: true,
+                },
+            );
+            links.heard(
+                &member,
+                Said::Introduce {
+                    to: stranger.as_ref().to_vec(),
+                    addrs: addrs.clone(),
+                    reply: true,
+                },
+            );
+            links.heard(
+                &member,
+                Said::Introduced {
+                    from: stranger.as_ref().to_vec(),
+                    addrs,
+                    reply: true,
+                },
+            );
+            let peers = links.peers.lock().unwrap();
+            assert!(
+                !peers.contains_key(&stranger),
+                "nothing is held for a key that is not seated"
+            );
+            let moved = peers
+                .get(&member)
+                .is_some_and(|peer| !peer.told.borrow().is_empty() || !peer.said().is_empty());
+            assert!(!moved, "a stranger's word moved nothing of a member's");
+        });
+    }
+
+    #[test]
+    fn a_stranger_carries_no_introduction_and_is_forgotten_once_its_last_link_ends() {
+        runtime::Runner::default().start(|context| async move {
+            let me = PrivateKey::from_seed(1).public_key();
+            let member = PrivateKey::from_seed(2).public_key();
+            let stranger_key = PrivateKey::from_seed(3).public_key();
+            let node = started(
+                &context.child("node"),
+                1,
+                vec![seat(me.clone(), 1), seat(member.clone(), 1)],
+            );
+            let port = node.udp().unwrap().port();
+            let stranger = started(&context.child("stranger"), 3, vec![seat(me.clone(), port)]);
+            let stream = stranger.connect(&me).await.unwrap();
+            node.linked(&stranger_key).await;
+            node.mine
+                .send_replace(vec!["203.0.113.7:9100".parse().unwrap()]);
+            node.introduce(&member, &node.peer(&member));
+            let peer = node.known(&stranger_key).unwrap();
+            let mut changed = peer.changed.subscribe();
+            assert!(
+                peer.said().is_empty(),
+                "no introduction rides a stranger's link"
+            );
+            drop(stream);
+            drop(stranger);
+            node.unlinked(&stranger_key).await;
+            while node.known(&stranger_key).is_some() {
+                changed.changed().await.unwrap();
+            }
+            let kept = node.peers.lock().unwrap().contains_key(&stranger_key);
+            assert!(!kept, "the stranger is forgotten with its last link");
+        });
+    }
 
     #[test]
     fn of_two_connections_between_a_pair_both_ends_prefer_the_one_the_lower_key_dialed() {
@@ -1030,5 +1212,73 @@ mod tests {
         assert!(peer.told(first));
         assert!(peer.told(second.clone()));
         assert_eq!(*peer.told.borrow(), second);
+    }
+
+    #[test]
+    fn a_node_tells_its_reached_address_to_seated_members_alone() {
+        let at: Vec<SocketAddr> = vec!["203.0.113.7:9100".parse().unwrap()];
+        assert!(tells_mine(true, &at, &[]));
+        assert!(!tells_mine(false, &at, &[]), "a stranger is told nothing");
+        assert!(!tells_mine(true, &at, &at), "an address is told once");
+        assert!(!tells_mine(true, &[], &[]), "no address, nothing told");
+    }
+
+    #[test]
+    fn a_key_that_is_not_seated_is_introduced_to_no_one() {
+        runtime::Runner::default().start(|context| async move {
+            let me = PrivateKey::from_seed(1).public_key();
+            let member = PrivateKey::from_seed(2).public_key();
+            let stranger = PrivateKey::from_seed(3).public_key();
+            let far = PrivateKey::from_seed(4).public_key();
+            let node = started(
+                &context.child("node"),
+                1,
+                vec![
+                    seat(me.clone(), 1),
+                    seat(member.clone(), 1),
+                    seat(far.clone(), 1),
+                ],
+            );
+            let port = node.udp().unwrap().port();
+            let linking = started(
+                &context.child("member"),
+                2,
+                vec![seat(me.clone(), port), seat(member.clone(), 1)],
+            );
+            let _stream = linking.connect(&me).await.unwrap();
+            node.linked(&member).await;
+            node.mine
+                .send_replace(vec!["203.0.113.7:9100".parse().unwrap()]);
+            node.introduce(&stranger, &node.peer(&stranger));
+            assert!(
+                node.peer(&member).said().is_empty(),
+                "no member is asked to introduce a key that is not seated"
+            );
+            node.introduce(&far, &node.peer(&far));
+            assert!(
+                !node.peer(&member).said().is_empty(),
+                "a seated member unlinked is introduced over the same carrier"
+            );
+        });
+    }
+
+    #[test]
+    fn a_member_unseated_with_nothing_linked_is_forgotten() {
+        runtime::Runner::default().start(|context| async move {
+            let me = PrivateKey::from_seed(1).public_key();
+            let member = PrivateKey::from_seed(2).public_key();
+            let node = started(
+                &context,
+                1,
+                vec![seat(me.clone(), 1), seat(member.clone(), 1)],
+            );
+            let peer = node.peer(&member);
+            node.members.seat([seat(me, 1)]);
+            let mut changed = peer.changed.subscribe();
+            let mut tries = 0;
+            node.keep(&member, &mut tries, &mut changed).await;
+            let kept = node.peers.lock().unwrap().contains_key(&member);
+            assert!(!kept, "the unseated member is forgotten");
+        });
     }
 }

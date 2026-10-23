@@ -85,8 +85,8 @@ enum Verb {
         invite: Option<String>,
     },
     #[command(
-        about = "enroll this workspace's key as a resident member that runs no node, such as a \
-                 box serving egress over halo with `egress serve`; nothing is synced"
+        about = "enroll this workspace's key as a resident member that runs no node; nothing is \
+                 synced"
     )]
     Enroll {
         source: String,
@@ -610,17 +610,28 @@ enum EgressVerb {
         node_key: bool,
     },
     #[command(
-        about = "serve what this workspace's egress.toml names with its member key and no node: \
+        about = "serve what this workspace's egress.toml names with its key, no node and no valset row: \
                  hear assigned requests from the validators' nodes over the ducktape/egress halo \
                  lane and answer through them; --node names the node whose HTTP gives the \
-                 members and the lane table"
+                 members and the lane table, and --relay-key and --relay-halo the validator it \
+                 links first"
     )]
     Serve {
         #[arg(
             long,
-            help = "the local UDP address halo binds; enroll registers the host:port that reaches it"
+            help = "the local UDP address halo binds; the box only dials out from it"
         )]
         halo: std::net::SocketAddr,
+        #[arg(
+            long,
+            help = "the node key, in hex, of the validator --node names, as the validators program lists it: the box seats and dials it at start"
+        )]
+        relay_key: String,
+        #[arg(
+            long,
+            help = "that validator's registered halo address, host:port, as the validators program lists it"
+        )]
+        relay_halo: String,
     },
 }
 
@@ -857,14 +868,19 @@ fn execute(cli: Cli) -> Result<(), String> {
                     .sentence()
             })
         }
-        Verb::Egress(EgressVerb::Serve { halo }) => {
+        Verb::Egress(EgressVerb::Serve {
+            halo,
+            relay_key,
+            relay_halo,
+        }) => {
+            let relay_key = hex::decode(relay_key).sentence()?;
             let client = client(&workspace, cli.node)?;
             let udp = std::net::UdpSocket::bind(halo).sentence()?;
             let log = workspace.settings().sentence()?.log;
             let log = log.unwrap_or_else(|| noded::DEFAULT_LOG.to_string());
             Runner::new(runtime_config(&workspace)).start(|context| async move {
                 Logs::install(&log)?;
-                noded::serve_box(&context, workspace, &client, udp)
+                noded::serve_box(&context, workspace, &client, udp, &relay_key, relay_halo)
                     .await
                     .sentence()
             })

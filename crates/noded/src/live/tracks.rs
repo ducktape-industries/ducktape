@@ -884,6 +884,39 @@ impl State {
         effects
     }
 
+    pub fn remote_published(
+        &self,
+        unseated: impl Fn(&PublicKey) -> bool,
+    ) -> Vec<(PublicKey, Vec<(Track, Account)>)> {
+        let mut published: HashMap<PublicKey, Vec<(Track, Account)>> = HashMap::new();
+        for (track, held) in &self.tracks {
+            let Origin::Remote(peer) = &held.origin else {
+                continue;
+            };
+            if unseated(peer) {
+                published
+                    .entry(peer.clone())
+                    .or_default()
+                    .push((track.clone(), held.by));
+            }
+        }
+        published.into_iter().collect()
+    }
+
+    pub fn remote_disowned(&mut self, peer: &PublicKey, tracks: &[Track]) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for track in tracks {
+            let theirs = self
+                .tracks
+                .get(track)
+                .is_some_and(|held| held.origin == Origin::Remote(peer.clone()));
+            if theirs {
+                self.end_track(track, End::PublisherGone, &mut effects);
+            }
+        }
+        effects
+    }
+
     /// The alias a node forwards a track to us under is the one we asked with, which is our
     /// own alias of the track: data from `peer` naming `alias` is that track's if we hold it
     /// as `peer`'s.

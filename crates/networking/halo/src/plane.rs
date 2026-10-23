@@ -1,10 +1,6 @@
-//! halo's lanes over one medium. A handler binds a lane by name; the lane table the halo role
-//! holds gives each served name its wire id and class cap. A stream opens with a hello naming
-//! its lane's id, its class and a short meta; the accepting side admits only current members on
-//! lanes it serves, caps the class by who asked and by the lane, and paces its writes. Datagrams
-//! carry their lane's id in the first byte and wait in a short queue per sender that drops the
-//! oldest. A table change reaches the next open and the next arrival; a stream already open
-//! keeps its class and runs on.
+//! halo's lanes over one medium: a stream opens with a hello naming its lane, class and meta,
+//! and a datagram carries its lane's id first. Any linked key uses a lane capped below `Critical`;
+//! a lane capped `Critical`, and every open and send from this node, is for seated members alone.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,11 +221,6 @@ async fn accepting<T: Transport>(shared: Arc<Shared<T>>) {
 }
 
 async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stream: T::Stream) {
-    let admitted = shared.members.admits(&from);
-    if !admitted {
-        tracing::debug!(target: "ducktape::halo", %from, reason = "not_a_member", "halo dropped a stream from a key that is not a member");
-        return;
-    }
     let Ok(hello) = read_hello(&mut stream).await else {
         tracing::debug!(target: "ducktape::halo", %from, reason = "no_hello", "halo dropped a stream that named no lane");
         return;
@@ -238,6 +229,11 @@ async fn arrived<T: Transport>(shared: Arc<Shared<T>>, from: PublicKey, mut stre
         tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane, reason = "no_lane", "halo dropped a stream for a lane it does not serve");
         return;
     };
+    let open = lane.cap != Class::Critical || shared.members.seated(&from);
+    if !open {
+        tracing::debug!(target: "ducktape::halo", %from, lane = hello.lane, reason = "critical_unseated", "halo dropped a stream from a key that is not seated on a lane capped critical");
+        return;
+    }
     let backlog = shared
         .streams
         .lock()
@@ -310,7 +306,7 @@ impl<T: Transport> Streams<T> {
         let Some(lane) = self.shared.named(&self.name) else {
             return Err(Error::NoLane(self.name.clone()));
         };
-        let member = self.shared.members.admits(to);
+        let member = self.shared.members.seated(to);
         if !member {
             return Err(Error::Unreachable(to.clone()));
         }
@@ -347,13 +343,13 @@ async fn demuxing<T: Transport>(shared: Arc<Shared<T>>) {
         let Some((&id, payload)) = frame.split_first() else {
             continue;
         };
-        let admitted = shared.members.admits(&from);
-        if !admitted {
-            continue;
-        }
         let Some(lane) = shared.numbered(id) else {
             continue;
         };
+        let open = lane.cap != Class::Critical || shared.members.seated(&from);
+        if !open {
+            continue;
+        }
         let queues = shared
             .datagrams
             .lock()
@@ -378,7 +374,7 @@ impl<T: Transport> Datagrams<T> {
         let Some(lane) = self.shared.named(&self.name) else {
             return Err(Error::NoLane(self.name.clone()));
         };
-        let member = self.shared.members.admits(to);
+        let member = self.shared.members.seated(to);
         if !member {
             return Err(Error::Unreachable(to.clone()));
         }

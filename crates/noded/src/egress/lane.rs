@@ -1,15 +1,17 @@
-//! The `ducktape/egress` lane: a member key with no node of its own serves egress through relay
+//! The `ducktape/egress` lane: a key with no node of its own serves egress through relay
 //! nodes. The relay streams it the tip, its assigned requests and their bodies, and pools the
 //! frames it signs; `serve_box` is the far end, run by `ducktape egress serve`.
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use abi::role::egress::{Answer, CROSSPOND, Op, RequestRow};
 use abi::role::{self, validators};
 use abi::{BlobId, NetworkId, ProgramId, Refusal};
 use borsh::{BorshDeserialize, BorshSerialize};
+use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt as _, StreamExt as _};
@@ -408,7 +410,11 @@ pub async fn serve_box<E: commonware_runtime::Metrics>(
     workspace: Workspace,
     client: &Client,
     udp: std::net::UdpSocket,
+    relay_key: &[u8],
+    relay_halo: String,
 ) -> Result<()> {
+    let relay = PublicKey::decode(relay_key)
+        .map_err(|error| Error::Address(format!("--relay-key: {error}")))?;
     let key = workspace.identity()?;
     let config = halo::Config {
         egress_bytes_per_sec: None,
@@ -421,89 +427,138 @@ pub async fn serve_box<E: commonware_runtime::Metrics>(
     let station = Station::open(workspace)?;
     let streams = halo.plane().streams(LANE, 0)?;
     let mut server = Server::new(key, station);
+    let mut linked = halo.link_changes(&relay);
+    halo.seat([Seat {
+        key: relay,
+        halo: Some(relay_halo),
+        https: None,
+        validator: true,
+    }]);
+    let mut block_time = None;
     let mut lost: u64 = 0;
+    let mut attempts: u64 = 0;
     loop {
-        let status = client.status().await?;
-        let listing = status
-            .roles
-            .bound(role::HALO)
-            .cloned()
-            .map_err(Error::Refused)?;
-        let mut relisted = client.changes(&listing).await?;
-        let seating = seating(client, &server.key, &status).await?;
-        let relays: Vec<PublicKey> = seating
-            .seats
-            .iter()
-            .filter(|seat| seat.validator)
-            .map(|seat| seat.key.clone())
-            .collect();
-        halo.seat(seating.seats);
-        halo.plane().lanes(seating.lanes);
-        let order: Vec<PublicKey> = halo
-            .members()
-            .candidates(halo.me(), None)
-            .into_iter()
-            .filter(|key| relays.contains(key))
-            .collect();
-        let mut served = false;
-        let mut unlisted = false;
-        let mut unreached = Vec::new();
-        for relay in order {
-            let stream = match streams.open(&relay, Class::Member, &[]).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    unlisted = matches!(error, halo::Error::NoLane(_));
-                    let reason = if unlisted { "no_lane" } else { "unreachable" };
-                    tracing::debug!(
-                        target: TARGET,
-                        event = "egress_relay_unreached",
-                        %relay,
-                        %error,
-                        reason,
-                        "the box could not open the egress lane to a relay node"
-                    );
-                    if unlisted {
-                        break;
-                    }
-                    unreached.push(relay);
-                    continue;
-                }
-            };
-            let heard = server.session(stream).await;
-            lost = if server.took { 1 } else { lost + 1 };
-            if lost.is_power_of_two() {
-                tracing::info!(
-                    target: TARGET,
-                    event = "egress_relay_lost",
-                    %relay,
-                    heard,
-                    attempts = lost,
-                    "the box lost its relay node; it tries the next"
-                );
+        let round = serve_round(
+            &halo,
+            &streams,
+            &mut server,
+            client,
+            &mut block_time,
+            &mut lost,
+        )
+        .await;
+        let Err(error) = round else {
+            attempts = 0;
+            continue;
+        };
+        attempts += 1;
+        if attempts.is_power_of_two() {
+            tracing::info!(
+                target: TARGET,
+                event = "egress_node_lost",
+                %error,
+                attempts,
+                "the box could not read its node or reach a relay; it tries again"
+            );
+        }
+        match block_time {
+            Some(block_time) => tokio::time::sleep(block_time).await,
+            None => {
+                let _ = linked.changed().await;
             }
-            served |= heard;
         }
-        if unlisted {
-            let _ = relisted.next().await;
-            continue;
-        }
-        drop(relisted);
-        if !served && unreached.is_empty() {
-            return Err(Error::Unrelayed);
-        }
-        let unlinked: Vec<&PublicKey> = unreached
-            .iter()
-            .filter(|relay| halo.linked(relay).now_or_never().is_none())
-            .collect();
-        if served || unlinked.is_empty() {
-            next_block(client).await?;
-            continue;
-        }
-        let linked = unlinked
-            .into_iter()
-            .map(|relay| Box::pin(halo.linked(relay)));
-        futures::future::select_all(linked).await;
     }
+}
+
+async fn serve_round(
+    halo: &Halo,
+    streams: &halo::Streams<Arc<halo::Links>>,
+    server: &mut Server,
+    client: &Client,
+    block_time: &mut Option<Duration>,
+    lost: &mut u64,
+) -> Result<()> {
+    let status = client.status().await?;
+    *block_time = Some(Duration::from_millis(status.block_time_ms));
+    let listing = status
+        .roles
+        .bound(role::HALO)
+        .cloned()
+        .map_err(Error::Refused)?;
+    let mut relisted = client.changes(&listing).await?;
+    let seating = seating(client, &server.key, &status).await?;
+    let relays: Vec<PublicKey> = seating
+        .seats
+        .iter()
+        .filter(|seat| seat.validator)
+        .map(|seat| seat.key.clone())
+        .collect();
+    halo.seat(seating.seats);
+    halo.plane().lanes(seating.lanes);
+    let order: Vec<PublicKey> = halo
+        .members()
+        .candidates(halo.me(), None)
+        .into_iter()
+        .filter(|key| relays.contains(key))
+        .collect();
+    let mut served = false;
+    let mut unlisted = false;
+    let mut unreached = Vec::new();
+    for relay in order {
+        let stream = match streams.open(&relay, Class::Member, &[]).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                unlisted = matches!(error, halo::Error::NoLane(_));
+                let reason = if unlisted { "no_lane" } else { "unreachable" };
+                tracing::debug!(
+                    target: TARGET,
+                    event = "egress_relay_unreached",
+                    %relay,
+                    %error,
+                    reason,
+                    "the box could not open the egress lane to a relay node"
+                );
+                if unlisted {
+                    break;
+                }
+                unreached.push(relay);
+                continue;
+            }
+        };
+        let heard = server.session(stream).await;
+        *lost = if server.took { 1 } else { *lost + 1 };
+        if lost.is_power_of_two() {
+            tracing::info!(
+                target: TARGET,
+                event = "egress_relay_lost",
+                %relay,
+                heard,
+                attempts = *lost,
+                "the box lost its relay node; it tries the next"
+            );
+        }
+        served |= heard;
+    }
+    if unlisted {
+        let _ = relisted.next().await;
+        return Ok(());
+    }
+    drop(relisted);
+    if !served && unreached.is_empty() {
+        return Err(Error::Unrelayed);
+    }
+    let unlinked: Vec<&PublicKey> = unreached
+        .iter()
+        .filter(|relay| halo.linked(relay).now_or_never().is_none())
+        .collect();
+    if served || unlinked.is_empty() {
+        return next_block(client).await;
+    }
+    let linked = unlinked
+        .into_iter()
+        .map(|relay| Box::pin(halo.linked(relay)));
+    futures::future::select_all(linked).await;
+    Ok(())
 }
 
 struct Server {
