@@ -3625,6 +3625,22 @@ class Reports(unittest.TestCase):
             record = f"job j-1\nrun r1: programs {GATED}, slot lane, lane\n{lead} build.sh#lane passed, reach: crates/a\nGATES ok\n"
             self.assertTrue(server.lane_record_holds(said, record), lead)
 
+    def test_a_lane_stopped_past_its_bound_is_reported_errored_on_the_whole_tree(self):
+        self.kube.logs_of["duckpond-41"] = f"ducktape-report programs {GATED} build.sh#lane errored r1\n".encode()
+        self.runs[("duckpond-41", "r1")] = f"job j-1\nrun r1: programs {GATED}, slot lane, lane\nreport sent: build.sh#lane errored, reach: the whole tree\nFAIL: past its LIMIT of 40 min; it was at: gate test\n"
+        for _ in range(2):
+            self.notifier.seen(pod_json(state=RUNNING, phase="Running", notes=NOTIFY))
+        self.assertEqual(self.signer.submits, [self.report("duckpond-41:r1", state="errored", reach=("",))])
+        said = next(server.report_lines("duckpond-41", [f"ducktape-report programs {GATED} build.sh#lane errored r1\n".encode()]))
+        whole = b"\x01" + text("programs") + text(GATED) + text("build.sh#lane") + b"\x03" + b"\x01" + text("duckpond-41:r1") + (1).to_bytes(4, "little") + text("") + b"\x00"
+        self.assertEqual(server.reach_report(said), whole)
+
+    def test_an_errored_line_whose_lane_ended_on_its_gates_is_never_reported(self):
+        said = next(server.report_lines("duckpond-41", [f"ducktape-report programs {GATED} build.sh#lane errored r1\n".encode()]))
+        self.assertFalse(server.lane_record_holds(said, lane_run("r1", state="errored", reach="the whole tree")))
+        stopped = f"job j-1\nrun r1: programs {GATED}, slot lane, lane\nreport sent: build.sh#lane errored, reach: the whole tree\nstopped by build.sh stop\n"
+        self.assertFalse(server.lane_record_holds(said, stopped))
+
 
 
 def shots_tar(files):
@@ -4521,9 +4537,17 @@ class Forging:
         self.queries = []
         self.follows = []
         self.streams = []
+        self.submits = []
+        self.refusals = []
 
     def key(self):
         return b"k" * 32
+
+    def submit(self, program, payload):
+        self.submits.append((program, payload))
+        if self.refusals:
+            return self.refusals.pop(0)
+        return ran(POOLED + b"landed 960 applied 00ff\n")
 
     def query(self, program, request):
         self.queries.append((program, request))
@@ -4852,6 +4876,103 @@ class Reruns(unittest.TestCase):
         notifier = server.Notifier(self.kube, Signer(), 1)
         notifier.resume()
         self.assertEqual((notifier.open, notifier.pending, self.kube.kept), ({}, {}, {key: self.record(run="desktop:r1")}))
+
+    def kept_lane(self, record):
+        key = server.rerun_key("programs", LANE)
+        self.kube.kept[key] = record
+        return key
+
+    def end(self, url):
+        self.rerunner.ended(url)
+        self.run_spawned()
+
+    def move(self, old, new):
+        self.rerunner.moved(old, new)
+        self.run_spawned()
+
+    def run_spawned(self):
+        while self.spawned:
+            target, args = self.spawned.pop(0)
+            target(*args)
+
+    def test_the_end_of_a_run_no_lane_names_reads_the_kept_runs_once_and_starts_nothing(self):
+        self.kept_lane(self.record(run="desktop:r1"))
+        self.rerunner.ended("lat-5:r8")
+        self.kube.kept.clear()
+        self.rerunner.ended("lat-5:r9")
+        self.rerunner.ended("desktop:r1")
+        self.assertEqual(self.spawned, [(self.rerunner.missed_run, ("desktop:r1",))])
+
+    def test_a_front_lane_that_ends_with_no_report_is_laned_once_more(self):
+        key = self.kept_lane(self.record(run="desktop:r1"))
+        self.answers = [ran(b"run lat-5:r2\n")]
+        self.end("desktop:r1")
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
+        self.assertEqual(self.kube.kept, {key: self.record(missed=["desktop:r1"], run="lat-5:r2")})
+        self.assertEqual(self.signer.submits, [])
+
+    def test_a_second_front_lane_that_ends_with_no_report_reports_errored_naming_both_runs(self):
+        key = self.kept_lane(self.record(missed=["desktop:r1"], run="lat-5:r2"))
+        self.end("lat-5:r2")
+        said = {"repo": "programs", "commit": LANE, "context": "build.sh#lane", "state": "errored", "url": "desktop:r1 lat-5:r2", "reach": [""]}
+        self.assertEqual(self.signer.submits, [("forge-reach", server.reach_report(said))])
+        self.assertEqual(self.launched, [])
+        self.assertEqual(self.kube.kept, {key: self.record(missed=["desktop:r1", "lat-5:r2"], run="lat-5:r2", errored=True)})
+
+    def test_an_errored_report_that_did_not_land_is_filed_again_when_the_front_settles(self):
+        key = self.kept_lane(self.record(missed=["desktop:r1"], run="lat-5:r2"))
+        self.signer.refusals = [ran(code=1, err="ducktape: forge-reach refused it: no such report")]
+        self.end("lat-5:r2")
+        self.assertEqual(self.kube.kept, {key: self.record(missed=["desktop:r1", "lat-5:r2"], run="lat-5:r2", erroring="desktop:r1 lat-5:r2")})
+        self.end("lat-5:r2")
+        self.assertEqual(len(self.signer.submits), 1)
+        self.rerunner.settle("programs")
+        self.run_spawned()
+        said = {"repo": "programs", "commit": LANE, "context": "build.sh#lane", "state": "errored", "url": "desktop:r1 lat-5:r2", "reach": [""]}
+        self.assertEqual(self.signer.submits, [("forge-reach", server.reach_report(said))] * 2)
+        self.assertEqual(self.kube.kept, {key: self.record(missed=["desktop:r1", "lat-5:r2"], run="lat-5:r2", errored=True)})
+        self.assertEqual(self.launched, [])
+
+    def test_a_front_lane_that_ends_after_its_report_counts_no_miss(self):
+        key = self.kept_lane(self.record(run="desktop:r1"))
+        for state in ("passed", "failed", "errored"):
+            self.signer.answers[ASK_STATUSES] = statuses_reply(check_status("23/build.sh#lane", state), check_status("56/review", "passed"))
+            self.end("desktop:r1")
+        self.assertEqual((self.launched, self.signer.submits), ([], []))
+        self.assertEqual(self.kube.kept, {key: self.record(run="desktop:r1")})
+
+    def test_the_end_of_a_run_no_record_names_or_of_an_errored_lane_does_nothing(self):
+        record = self.record(missed=["desktop:r1", "lat-5:r2"], run="lat-5:r2", errored=True)
+        key = self.kept_lane(record)
+        self.end("desktop:r1")
+        self.end("lat-5:r2")
+        self.assertEqual((self.launched, self.signer.submits), ([], []))
+        self.assertEqual(self.kube.kept, {key: record})
+
+    def test_a_lane_called_again_elsewhere_is_followed_under_its_new_run(self):
+        key = self.kept_lane(self.record(run="desktop:r1"))
+        self.answers = [ran(b"run lat-7:r3\n")]
+        self.move("desktop:r1", "lat-5:r2")
+        self.end("desktop:r1")
+        self.assertEqual(self.launched, [])
+        self.end("lat-5:r2")
+        self.assertEqual([lane_of(command) for command, _ in self.launched], [["programs", LANE]])
+        self.assertEqual(self.kube.kept, {key: self.record(missed=["lat-5:r2"], run="lat-7:r3")})
+
+    def test_the_notifier_tells_each_run_it_reads_ended_lost_or_called_again(self):
+        notifier = server.Notifier(self.kube, Signer(), 1)
+        told = []
+        notifier.ended = lambda url: told.append(("ended", url))
+        notifier.moved = lambda old, new: told.append(("moved", old, new))
+        text = "r1 ended: exit 0, GATES ok"
+        notifier.posted = {"desktop": {server.line_id("desktop", "j-1", text)}}
+        notifier.each("desktop", None, [("j-1", text, None)])
+        notifier.open = {"lat-5": {"r2": {"pod": "lat-5", "run": "r2", "channel": "j-1", "call": "", "requester": 17}}}
+        notifier.lose("lat-5", "it was gone")
+        argv = server.base64.b64encode(chr(0).join(["sh", server.BUILD_SH, "programs", LANE, "lane"]).encode()).decode()
+        notifier.pending = {"pending-r3": {"pod": "lat-7", "run": "r3", "channel": "j-1", "call": "", "requester": 17, "argv": argv, "why": "it was gone"}}
+        notifier.call_pending(lambda words: "desktop:r4")
+        self.assertEqual(told, [("ended", "desktop:r1"), ("ended", "lat-5:r2"), ("moved", "lat-7:r3", "desktop:r4")])
 
 TRAIN_REPLY_TAG = 25
 ASK_TRAIN = server.u8(28) + server.borsh_text("programs") + server.borsh_bytes(DEV)

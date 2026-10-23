@@ -592,14 +592,16 @@ one up for another network.
   processes are OOM-killed. A reply with nothing to warn of has no
   `warnings` field.
 - Each line a followed pod (or a build runner) prints that reads
-  `ducktape-report <repo> <commit> <context> passed|failed <run> [<path>...]`
-  (build.sh's lane: its verdict, and the paths it read) is a forge-reach
+  `ducktape-report <repo> <commit> <context> passed|failed|errored <run> [<path>...]`
+  (build.sh's lane: its verdict, and the paths it read; errored when it was
+  stopped past its time bound, with no verdict) is a forge-reach
   `Report` the service sends as its own account: url `<pod>:<run>`, reach the
   paths (none is `""`, the whole tree), no change. It is sent only when the
   line came from a build machine (a build runner, or the pod
   `PODS_WARM_POD` names) and that machine's `build.sh status <run>` records a
   lane run of that repo and commit (`run <run>: <repo> <commit>, slot …,
-  lane`) that ended with the line's verdict (`GATES ok`, or `GATES FAIL:`) and
+  lane`) that ended with the line's verdict (`GATES ok`, or `GATES FAIL:`; for
+  errored, a stop past its bound: `FAIL: past …`) and
   recorded the line's reach (`report sent: build.sh#lane <state>, reach:
   <path>...` or `reach: the whole tree`; a build.sh from before it said
   `report sent:` says `report:`); otherwise `pods_unreported reason=unrecorded`,
@@ -636,7 +638,17 @@ one up for another network.
   a run whose Preview is no longer the front is stopped. A lane that doesn't start is posted in that room once
   per reason (`pods_rerun_unstarted` with why) and asked again from one block
   time, doubling, while that Preview is still the front. Its report then
-  lands as above and carries the Preview.
+  lands as above and carries the Preview. The run's own end is what the
+  service watches, never a clock: when that run ends (its end notice comes
+  after any report it printed) or is lost with its pod, and the Preview is
+  still the front with its lane Pending, the lane is started once more
+  (`pods_rerun_missed`); a run called again elsewhere is followed under its
+  new id. A second such end reports `build.sh#lane errored` on the Preview,
+  naming both runs (`pods_rerun_errored`), so the queue takes the front out;
+  until that report lands the record says `erroring`, and each settle of
+  the repository files it again.
+  A lane stopped at its time bound reports errored itself and is not started
+  again.
 - Each line a followed pod (or a build runner) prints that reads
   `ducktape-files <run> <tar> <folder>` (build.sh's `shot` run with `TO`)
   names a tar the run made on that machine: the service reads it in one

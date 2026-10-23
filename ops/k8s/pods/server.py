@@ -246,7 +246,7 @@ FRONT_KEYS = tuple(table.hex() for table in (b"e/", b"s/", b"m/", b"q/", b"y/", 
 CHECK_STATES = ("pending", "passed", "failed", "errored")
 REPORT_LINE = "ducktape-report "
 FILES_LINE = "ducktape-files "
-REPORT_STATES = {"passed": 1, "failed": 2}
+REPORT_STATES = {"passed": 1, "failed": 2, "errored": 3}
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
 MOVED_ELSEWHERE = re.compile(r"moved to run (\S+?):(\S+) on another machine")
 RUN_HAS_ENDED = re.compile(r"\(job [^)\n]*\) has ended$", re.M)
@@ -752,6 +752,7 @@ STATUSES = {"note": 0, "running": 1, "passed": 2, "failed": 3}
 RUN_ENDED = re.compile(r"\bended: (?:sh |shot )?exit (\d+)")
 RUN_LOST = " lost with pod "
 RUN_NAMED = re.compile(rf"(?:run )?(\S+)(?: ended: |{RUN_LOST})")
+RUN_ENDS = re.compile(r"(?:run )?(\S+) ended: ")
 SHOTS_UNWRITTEN = "shots not written"
 
 
@@ -2471,6 +2472,8 @@ def lane_record_holds(said, record):
     lane = any(line.startswith(named) and line.endswith(", lane") for line in lines)
     if said["state"] == "passed":
         ended = "GATES ok" in lines
+    elif said["state"] == "errored":
+        ended = any(line.startswith("FAIL: past ") for line in lines)
     else:
         ended = any(line.startswith("GATES FAIL:") for line in lines)
     reach = " ".join(path for path in said["reach"] if path) or "the whole tree"
@@ -3623,6 +3626,8 @@ class Notifier:
         self.resumed = False
         self.recall = None
         self.pending = {}
+        self.ended = None
+        self.moved = None
         self.keeping = threading.Lock()
         self.lock = threading.Lock()
         self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
@@ -3947,6 +3952,9 @@ class Notifier:
         concerned = requester if concerned is None else concerned
         held = 0
         for channel, text, caller in said:
+            ends = RUN_ENDS.match(text)
+            if ends is not None:
+                self.tell(self.ended, f"{name}:{ends.group(1)}")
             message_id = line_id(name, channel, text)
             with self.lock:
                 if message_id in self.posted.get(name, ()):
@@ -3957,6 +3965,10 @@ class Notifier:
                 with self.lock:
                     self.posted.setdefault(name, set()).add(message_id)
         return held
+
+    def tell(self, hook, *args):
+        if hook is not None:
+            hook(*args)
 
     def follow(self, name, requester):
         try:
@@ -4042,6 +4054,7 @@ class Notifier:
             text = f"run {run}{RUN_LOST}{name}: {why}, so nothing of it runs now{again}"
             said = line_said(name, text, kept["requester"])
             self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], lost_id(name, kept["channel"], run), said)
+            self.tell(self.ended, f"{name}:{run}")
         with self.keeping:
             self.keep({kept_key(name, run): None for run in runs})
 
@@ -4066,6 +4079,7 @@ class Notifier:
                 self.keep({pending_key(name, run): json.dumps({**kept, "why": why})})
             text = f"run {run} waits to be called again: pod {name} went before it ended ({why}), and no build machine took it ({reason or 'none takes it'}); the next builds call calls it again"
         else:
+            self.tell(self.moved, f"{name}:{run}", new)
             text = f"run {run} is now run {new}: pod {name} went before it ended ({why}), so the pods service called it again once: wait on that one"
         self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], lost_id(name, kept["channel"], run), line_said(name, text, kept["requester"]))
         return True
@@ -4087,6 +4101,7 @@ class Notifier:
                 continue
             with self.keeping:
                 self.keep({key: None})
+            self.tell(self.moved, f"{kept['pod']}:{kept['run']}", new)
             text = f"run {kept['run']} is now run {new}: pod {kept['pod']} went before it ended ({kept['why']}), so the pods service called it again once: wait on that one"
             self.post({NOTIFY_CHANNEL: kept["channel"]}, kept["requester"], recalled_id(kept["pod"], kept["channel"], kept["run"]), line_said(kept["pod"], text, kept["requester"]))
 
@@ -4210,6 +4225,9 @@ class Rerunner:
         self.reporter = None
         self.lock = threading.RLock()
         self.retrying = set()
+        self.known = threading.Lock()
+        self.runs = None
+        self.filing = set()
         self.spawn = lambda target, *args: threading.Thread(target=target, args=args, daemon=True).start()
         self.pause = time.sleep
 
@@ -4298,9 +4316,13 @@ class Rerunner:
                     self.rerun(key, front)
                 elif "unstarted" in json.loads(kept[key]):
                     self.retry_later(repo, key)
+                elif "erroring" in json.loads(kept[key]):
+                    self.spawn(self.file_errored, key)
 
-    def rerun(self, key, row):
+    def rerun(self, key, row, missed=()):
         record = {"repo": row["repo"], "n": row["n"], "commit": row["commit"]}
+        if missed:
+            record["missed"] = list(missed)
         if not self.keep({key: json.dumps(record)}):
             return False
         try:
@@ -4313,8 +4335,102 @@ class Rerunner:
         run = started.group(1).decode(errors="replace")
         say("pods_rerun", repo=row["repo"], n=row["n"], commit=row["commit"], run=json.dumps(run))
         self.keep({key: json.dumps({**record, "run": run})})
+        self.laning(run)
         self.build("bump", run)
         return True
+
+    def ended(self, url):
+        if self.laned(url):
+            self.spawn(self.missed_run, url)
+
+    def moved(self, old, new):
+        if self.laned(old):
+            self.laning(new)
+            self.spawn(self.move, old, new)
+
+    def laned(self, url):
+        with self.known:
+            if self.runs is None:
+                try:
+                    self.runs = {json.loads(value).get("run") for key, value in self.kube.kept_load().items() if key.startswith(RERUN)}
+                except Refused as refused:
+                    say("pods_rerun_unsettled", run=json.dumps(url), detail=json.dumps(refused.sentence))
+                    return False
+            return url in self.runs
+
+    def laning(self, run):
+        with self.known:
+            if self.runs is not None:
+                self.runs.add(run)
+
+    def missed_run(self, url):
+        try:
+            with self.lock:
+                due = [key for key, record in self.naming(url) if self.missed(key, record, url)]
+            for key in due:
+                self.file_errored(key)
+        except Exception as error:
+            say("pods_rerun_unsettled", run=json.dumps(url), detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+
+    def move(self, old, new):
+        with self.lock:
+            changes = {key: json.dumps({**record, "run": new}) for key, record in self.naming(old)}
+            if changes:
+                self.keep(changes)
+
+    def naming(self, url):
+        records = {key: json.loads(value) for key, value in self.kube.kept_load().items() if key.startswith(RERUN)}
+        return [(key, record) for key, record in records.items() if record.get("run") == url]
+
+    def missed(self, key, record, url):
+        if record.get("errored") or "erroring" in record:
+            return False
+        _, fronts = self.fronts(record["repo"])
+        front = fronts.get(key)
+        if front is None or not front["wanted"]:
+            return False
+        missed = [*record.get("missed", ()), url]
+        say("pods_rerun_missed", repo=record["repo"], n=record["n"], commit=record["commit"], runs=json.dumps(" ".join(missed)))
+        if len(missed) == 1:
+            self.rerun(key, front, missed)
+            return False
+        return self.keep({key: json.dumps({**record, "missed": missed, "erroring": " ".join(missed)})})
+
+    def file_errored(self, key):
+        with self.lock:
+            if key in self.filing:
+                return
+            self.filing.add(key)
+        try:
+            with self.lock:
+                value = self.kube.kept_load().get(key)
+            record = None if value is None else json.loads(value)
+            if record is None or "erroring" not in record:
+                return
+            if self.errored(record, record["erroring"]):
+                with self.lock:
+                    self.keep({key: json.dumps({**{name: kept for name, kept in record.items() if name != "erroring"}, "errored": True})})
+        finally:
+            with self.lock:
+                self.filing.discard(key)
+
+    def errored(self, record, runs):
+        said = {"repo": record["repo"], "commit": record["commit"], "context": LANE_CONTEXT, "state": "errored", "url": runs, "reach": [""]}
+        pause = self.retry_pause
+        attempts = 0
+        while True:
+            outcome, reason, sentence, _ = receipt(self.signer.submit(FORGE_REACH, reach_report(said)))
+            if outcome in ("applied", "rejected"):
+                say("pods_rerun_errored", repo=record["repo"], n=record["n"], commit=record["commit"], runs=json.dumps(runs), outcome=outcome, detail=json.dumps(sentence))
+                return True
+            if outcome == "failed" and not unanswered(sentence):
+                say("pods_rerun_unreported", repo=record["repo"], n=record["n"], commit=record["commit"], runs=json.dumps(runs), detail=json.dumps(sentence))
+                return False
+            attempts += 1
+            if attempts & (attempts - 1) == 0:
+                say("pods_retried", attempts=attempts, reason="node_unanswered", run=json.dumps(runs), detail=json.dumps(sentence))
+            self.pause(pause)
+            pause *= 2
 
     def build(self, verb, run):
         seen = set()
@@ -4361,7 +4477,7 @@ class Rerunner:
                     record = self.kube.kept_load().get(key)
                     if front is None or not front["wanted"] or record is None or "unstarted" not in json.loads(record):
                         return
-                    if self.rerun(key, front):
+                    if self.rerun(key, front, json.loads(record).get("missed", ())):
                         return
         except Exception as error:
             say("pods_rerun_unsettled", repo=repo, detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
@@ -4674,6 +4790,10 @@ class Service:
             self.build_notifier.pause = self.background.pause
         self.rerunner.spawn = self.background.start
         self.rerunner.pause = self.background.pause
+        for notifier in (self.notifier, self.build_notifier):
+            if notifier is not None:
+                notifier.ended = self.rerunner.ended
+                notifier.moved = self.rerunner.moved
 
     def stop_background(self):
         self.background.stopping.set()
