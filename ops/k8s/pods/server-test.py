@@ -7464,7 +7464,7 @@ class BuildPods(Served):
             containers = body["containers"] + body["initContainers"]
             context = body["securityContext"]
             contexts = [container["securityContext"] for container in containers]
-            exact = ({"path": "/srv/build-jobs/cargo", "type": "Directory"}, {"path": "/srv/build-jobs/repos", "type": "Directory"})
+            exact = ({"path": "/srv/build-jobs/cargo", "type": "Directory"}, {"path": "/srv/build-jobs/repos", "type": "Directory"}, {"path": "/srv/build-jobs/sccache", "type": "Directory"})
             rules = {
                 "run-as-uid-10001": (context["runAsUser"], context["runAsGroup"]) == (10001, 10001) and all("runAsUser" not in held for held in contexts),
                 "run-as-non-root": context["runAsNonRoot"] is True,

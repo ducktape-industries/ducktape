@@ -320,8 +320,8 @@ spec:
       message: 'builds-pods no-host-namespaces: a pod in namespace builds uses no hostNetwork, hostPID or hostIPC'
     - expression: variables.volumes.all(v, has(v.hostPath) || has(v.emptyDir))
       message: 'builds-pods volume-types: every volume of a pod in namespace builds is hostPath or emptyDir'
-    - expression: variables.volumes.all(v, !has(v.hostPath) || (v.hostPath.path in ['/srv/build-jobs/cargo', '/srv/build-jobs/repos'] && v.hostPath.?type.orValue('') == 'Directory'))
-      message: 'builds-pods host-paths-exact: a hostPath volume in namespace builds is exactly /srv/build-jobs/cargo or /srv/build-jobs/repos, with type Directory'
+    - expression: variables.volumes.all(v, !has(v.hostPath) || (v.hostPath.path in ['/srv/build-jobs/cargo', '/srv/build-jobs/repos', '/srv/build-jobs/sccache'] && v.hostPath.?type.orValue('') == 'Directory'))
+      message: 'builds-pods host-paths-exact: a hostPath volume in namespace builds is exactly /srv/build-jobs/cargo, /srv/build-jobs/repos or /srv/build-jobs/sccache, with type Directory'
     - expression: variables.containers.all(c, c.?ports.orValue([]).all(p, p.?hostPort.orValue(0) == 0))
       message: 'builds-pods no-host-ports: no container port in namespace builds sets hostPort'
     - expression: variables.containers.all(c, c.?securityContext.?procMount.orValue('Default') == 'Default')
