@@ -393,7 +393,8 @@ class Background:
         with self.lock:
             if self.stopping.is_set():
                 return None
-            thread = threading.Thread(target=self.work, args=(target, args), daemon=True)
+            subject = f"({args[0]})" if args and isinstance(args[0], str) else ""
+            thread = threading.Thread(target=self.work, args=(target, args), name=f"{target.__qualname__}{subject}", daemon=True)
             self.threads.add(thread)
             thread.start()
             return thread
@@ -434,10 +435,21 @@ class Background:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+        frames = sys._current_frames()
+        for thread in threads:
+            frame = frames.get(thread.ident)
+            stack = []
+            while frame is not None:
+                stack.append(f"{Path(frame.f_code.co_filename).name}:{frame.f_lineno}:{frame.f_code.co_name}")
+                frame = frame.f_back
+            say("pods_background_waiting", worker=json.dumps(thread.name), ident=thread.ident, stack=json.dumps(stack))
+        del frames
         for process in processes:
+            say("pods_background_process_waiting", pid=process.pid)
             process.wait()
         for thread in threads:
             thread.join()
+            say("pods_background_joined", worker=json.dumps(thread.name), ident=thread.ident)
 
 
 def popen(argv, **options):
@@ -450,9 +462,6 @@ def popen(argv, **options):
 def run(argv, stdin=None, env=None):
     with popen(argv, stdin=subprocess.PIPE if stdin is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as process:
         out, err = process.communicate(stdin)
-        background = getattr(BACKGROUND, "owner", None)
-        if background is not None:
-            background.check()
         return Ran(process.returncode, out, err.decode(errors="replace").strip())
 
 
@@ -1143,8 +1152,9 @@ def runners_of(text, signer):
 
 
 def gate_run(argv, env=None):
-    done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, env=env)
-    return Ran(done.returncode, done.stdout, done.stderr.decode(errors="replace").strip())
+    with popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as process:
+        out, err = process.communicate()
+        return Ran(process.returncode, out, err.decode(errors="replace").strip())
 
 
 def gate_spawn(argv, env=None):
@@ -3262,7 +3272,7 @@ class Notifier:
         outcome, reason, sentence, _ = receipt(self.signer.submit(CHAT, payload))
         posted = outcome == "applied" or (outcome == "rejected" and reason == "already_exists")
         if posted:
-            say("pods_posted", message=message_id)
+            say("pods_posted", message=message_id, outcome=outcome, reason=reason)
             return True
         if outcome in ("unknown", "unlanded") or (outcome == "failed" and unanswered(sentence)):
             raise Unanswered(sentence)
@@ -4906,6 +4916,7 @@ class Service:
         reached = False
         pause = self.retry_pause
         while True:
+            self.background.check()
             asked = self.clock()
             if not reached:
                 since, reached = self.runner_began(name, since, begun, wall)

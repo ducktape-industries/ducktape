@@ -4097,7 +4097,9 @@ class Posts(unittest.TestCase):
         self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
         self.assertEqual(self.kube.verbs(), ["logs"])
         self.signer.submitted = ran(POOLED + b"landed 960 rejected already_exists: message pods-duckpond-41-ended exists\n")
-        self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        with unittest.mock.patch.object(server, "say") as said:
+            self.notifier.seen(pod_json(state=ENDED, phase="Succeeded", notes=NOTIFY))
+        said.assert_any_call("pods_posted", message="pods-duckpond-41-ended", outcome="rejected", reason="already_exists")
         self.assertEqual(self.kube.verbs(), ["logs", "logs", "annotate"])
 
     def test_a_post_no_block_carried_is_made_again_until_one_does(self):
@@ -7055,6 +7057,139 @@ else:
                         os.kill(child, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def test_sigterm_stops_a_reroute_reading_a_runner_while_an_exec_drains(self):
+        with tempfile.TemporaryDirectory() as temp:
+            place = pathlib.Path(temp)
+            keys = place / "keys"
+            keys.mkdir()
+            for name, text in {"id_ed25519": "private", "known_hosts": "lat-1 ssh-ed25519 AAAA", "hosts": "lat-1\n", "user": "tech\n"}.items():
+                (keys / name).write_text(text)
+            entered, stopped = place / "entered", place / "stopped"
+            os.mkfifo(entered)
+            reading = "import os, pathlib, signal, sys\nif pathlib.Path(sys.argv[2]).exists():\n    sys.exit(0)\npathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\nsignal.pause()\n"
+            runner = server.Runner("lat-1", keys)
+            runner.argv = lambda host, words, alive: [sys.executable, "-c", reading, str(entered), str(stopped)]
+            service = server.Service(Kube(), Signer(), FETCHING, Stats(), Api(), [runner])
+            started = threading.Event()
+            release = threading.Event()
+
+            def execute(*args, **kwargs):
+                started.set()
+                release.wait()
+                return ran(b"finished")
+
+            service.executed = execute
+            execution = service.execution({"chain": "duckpond", "program": "harness", "request": "485269"}, "duckpond-41", None, ["make"])
+            started.wait()
+            workers = []
+            start = service.background.start
+
+            def starting(target, *args):
+                thread = start(target, *args)
+                workers.append(thread)
+                return thread
+
+            service.background.start = starting
+            service.reroute_after({"chain": "duckpond", "program": "harness", "request": "485539"})
+            read = int(entered.read_text())
+            join = workers[0].join
+            events = []
+
+            def joining(*args, **kwargs):
+                try:
+                    with self.assertRaises(ProcessLookupError, msg="shutdown joined the reroute while its runner read was still running"):
+                        os.kill(read, 0)
+                finally:
+                    stopped.touch()
+                    try:
+                        os.kill(read, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    join(*args, **kwargs)
+
+            try:
+                with unittest.mock.patch.object(workers[0], "join", side_effect=joining), unittest.mock.patch.object(server, "say", side_effect=lambda event, **fields: events.append(event)):
+                    service.background.stopping.set()
+                    service.stop_background()
+                self.assertFalse(workers[0].is_alive())
+                self.assertNotIn("pods_rerouted", events, "the reroute read its next runner after shutdown")
+                self.assertNotIn("pods_reroute_failed", events)
+                self.assertEqual(service.draining_execs(), [{"pod": "duckpond-41", "chain": "duckpond", "program": "harness", "request": "485269"}])
+            finally:
+                stopped.touch()
+                release.set()
+                try:
+                    os.kill(read, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            service.drain_execs()
+            self.assertEqual(execution.get().out, b"finished")
+
+    def test_runner_follow_does_not_reopen_after_shutdown_wakes_its_rest(self):
+        service = server.Service(Kube(), Signer(), FETCHING, Stats(), Api(), [])
+        service.runners = {"runner": object()}
+        service.wanted = {"runner": threading.Event()}
+        resting = threading.Event()
+        attempts = []
+
+        class Reopened(BaseException):
+            pass
+
+        def tail(since):
+            attempts.append(since)
+            if len(attempts) > 1:
+                raise Reopened()
+            raise server.Refused(503, "unreachable")
+
+        def rest(name, pause):
+            resting.set()
+            service.wanted[name].wait()
+
+        def follow():
+            try:
+                service.followed("runner", 0, 0)
+            except Reopened:
+                pass
+
+        service.runners["runner"] = type("Runner", (), {"tail": staticmethod(tail)})()
+        service.runner_began = lambda *args: (0, True)
+        service.caught_up = lambda *args: None
+        service.rest = rest
+        thread = service.background.start(follow)
+        resting.wait()
+        service.stop_background()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(attempts), 1, "shutdown woke the reader only for it to reopen the runner")
+
+    def test_background_shutdown_names_the_worker_and_its_wait_stack(self):
+        background = server.Background()
+        entered = threading.Event()
+        release = threading.Event()
+        events = []
+
+        def waiting():
+            entered.set()
+            release.wait()
+
+        def said(event, **fields):
+            events.append((event, fields))
+            if event == "pods_background_waiting":
+                release.set()
+
+        thread = background.start(waiting)
+        entered.wait()
+        try:
+            with unittest.mock.patch.object(server, "say", side_effect=said):
+                background.stop()
+        finally:
+            release.set()
+            thread.join()
+        self.assertEqual([event for event, fields in events], ["pods_background_waiting", "pods_background_joined"])
+        waiting_fields = events[0][1]
+        self.assertEqual(json.loads(waiting_fields["worker"]), waiting.__qualname__)
+        self.assertEqual(waiting_fields["ident"], thread.ident)
+        self.assertTrue(any(":waiting" in frame for frame in json.loads(waiting_fields["stack"])))
 
     def test_background_stop_wakes_a_retry_and_refuses_new_workers(self):
         background = server.Background()

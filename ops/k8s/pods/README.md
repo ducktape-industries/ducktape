@@ -113,7 +113,13 @@ or through a member node's halo forward.
   connections and reattachable waits, cancels and joins its background workers, and answers each
   whole call and exec stream still open before it exits. An exec whose caller disconnected is
   also drained. Shutdown logs how many whole calls and which pods' execs are still open, then
-  says when background work has stopped and when the drain has finished. `terminationGracePeriodSeconds` is the preStop plus
+  logs every background worker it is waiting on (worker name, thread identity and stack
+  locations), each subprocess it reaps, and each joined worker before saying that background
+  work has stopped and the drain has finished. Runner reads and live follows both belong to
+  their background worker and are cancelled together; foreground execs remain separate.
+  `pods_posted` carries the submit receipt's outcome and reason, distinguishing an applied
+  submission from an `already_exists` refusal without claiming a second message was created.
+  `terminationGracePeriodSeconds` is the preStop plus
   egress's wait for a whole answer (`DEFAULT_WAIT`, 64 blocks, times the network's block time,
   which `deploy` reads from `NODE_URL`'s `/v1/status`), since egress gives up on a whole answer
   then anyway. A stream has no such bound (egress's wait runs from its last event); Kubernetes
