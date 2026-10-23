@@ -585,8 +585,8 @@ spec:
             - {name: PODS_KEYS, value: /keys}
             - {name: PODS_RUNNERS, value: "lat-7=/runners/lat-7 lat-5=/runners/lat-5 desktop=/desktop zk-dev=/runners/zk-dev"}
             - {name: PODS_WARM_POD, value: ""}
-            - {name: PODS_LANE_FIRST_LIMIT, value: "40"}
-            - {name: PODS_BUILD_IMAGE, value: "localhost:5000/toolchain:70b103bd4da8@sha256:a71046e612592a00cc3034d9727fcbb9173c1729ea07f5b696c885694d2a84d0"}
+            - {name: PODS_LANE_FIRST_LIMIT, value: "60"}
+            - {name: PODS_BUILD_IMAGE, value: "localhost:5000/toolchain:436bbb1f713d@sha256:6ae72f0c210a163e5c3fbd52abd55b7638674805f2dd5796adf923b601c5beb7"}
             - {name: PODS_BUILD_CPU, value: "7"}
             - {name: PODS_BUILD_MEMORY, value: "28Gi"}
           resources:

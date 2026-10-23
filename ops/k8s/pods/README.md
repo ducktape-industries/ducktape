@@ -217,9 +217,10 @@ or through a member node's halo forward.
 - **The lane's first bound.** `PODS_LANE_FIRST_LIMIT`, whole minutes, which each lane the service
   starts states as `FIRST_LIMIT=`: build.sh bounds a run by twice the longest green run of its
   kind on that machine, and a machine with none yet (a new warm pod) refuses a call that states
-  no bound. duckpond's is 40: twice the longest green lane measured, 1183 s of gates (programs,
-  desktop run 20261022-080840-1474062; the warm pod's longest was 1146 s). Unset, the service's
-  lanes state none.
+  no bound. duckpond's is 60. The longest green lane measured ran 1183 s of gates (programs,
+  desktop run 20261022-080840-1474062; the warm pod's longest was 1146 s), and a lane on a merge
+  train's tip that runs out of its bound sends the whole train back. Unset, the service's lanes
+  state none.
 - **Optional: the build runners.** `PODS_RUNNERS`, `<name>=<keys path>` words in tie order
   (`desktop=/desktop` when unset), each keys path a mounted Secret (files `id_ed25519`,
   `id_ed25519.pub`, `known_hosts`, `user`, and `hosts` or `forward`, optionally `kinds`):
