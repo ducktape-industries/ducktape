@@ -1306,6 +1306,11 @@ cargo test -p host -p node -p consensus -p statesync -p noded   # the kernel and
 make test                                                       # everything the repo verifies locally
 ```
 
+The check lane reads `.forge/workflows/gates.toml` and runs unit and integration
+tests for the crates the change reaches, selected from Cargo's workspace metadata.
+The host's depth test runs the full nesting cap on Tokio's fallback stack in debug
+and on half of that stack in release.
+
 [`AGENTS.md`](AGENTS.md) holds the rules that bind changes to this tree.
 
 ## Documentation

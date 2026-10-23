@@ -1,0 +1,12 @@
+name = "gates"
+
+[on]
+trigger = false
+
+[[jobs]]
+id = "gates"
+runs-on = ["pods"]
+steps = ["sh /var/tmp/tools/gates.sh /work/core"]
+
+[jobs.env]
+LANE_TESTS = "--tests"

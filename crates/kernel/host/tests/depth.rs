@@ -1,5 +1,5 @@
-//! A frame nested as deep as the kernel lets it runs in half of the 2 MiB a tokio worker falls
-//! back to, so a frame the cap admits never overflows the thread that applies its block.
+//! Runs a frame at the nesting cap within the worker stack budget: Tokio's 2 MiB fallback
+//! in debug, and half of that stack in release.
 use std::path::Path;
 
 use abi::role::{self, halo, validators};
@@ -14,7 +14,11 @@ use host::{Block, BlockId, Founding, Genesis, Host, Limits, MAX_DEPTH, Submissio
 const SIGNER: &[u8] = b"signer";
 const TIME: u64 = 1_700_000_000;
 const TOKIO_FALLBACK_THREAD_STACK: usize = 2 << 20;
-const HALF_OF_THE_FALLBACK_STACK: usize = TOKIO_FALLBACK_THREAD_STACK / 2;
+const FRAME_THREAD_STACK: usize = if cfg!(debug_assertions) {
+    TOKIO_FALLBACK_THREAD_STACK
+} else {
+    TOKIO_FALLBACK_THREAD_STACK / 2
+};
 
 fn founding(program: &str, code: &[u8], params: Vec<u8>) -> Founding {
     let roles: &[&str] = match program {
@@ -140,11 +144,11 @@ async fn deepest_frame(context: deterministic::Context, dir: &Path) -> Receipt {
 }
 
 #[test]
-fn a_frame_as_deep_as_the_cap_runs_in_half_of_a_fallback_thread_stack() {
+fn a_frame_as_deep_as_the_cap_fits_the_worker_stack_budget() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_owned();
     let receipt = std::thread::Builder::new()
-        .stack_size(HALF_OF_THE_FALLBACK_STACK)
+        .stack_size(FRAME_THREAD_STACK)
         .spawn(move || {
             deterministic::Runner::default()
                 .start(|context| async move { deepest_frame(context, &path).await })

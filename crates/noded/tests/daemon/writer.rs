@@ -3,6 +3,66 @@
 use super::*;
 
 #[test]
+fn the_consensus_writer_applies_a_frame_at_the_full_nesting_cap() {
+    apart!();
+    fn replying_chain(depth: u32) -> fixture_relay::Script {
+        use fixture_relay::Script;
+        if depth == 0 {
+            return Script::Note(b"end".to_vec());
+        }
+        let target = match depth % 2 {
+            0 => "ping",
+            _ => "pong",
+        };
+        Script::Send(vec![abi::Message {
+            target: target.into(),
+            payload: abi::encode(&replying_chain(depth - 1)),
+            reply: true,
+            acting: None,
+        }])
+    }
+    fn applied_depth(receipt: &abi::Receipt) -> u32 {
+        assert!(
+            matches!(receipt.outcome, Outcome::Applied { .. }),
+            "{receipt:?}"
+        );
+        receipt
+            .nested
+            .iter()
+            .map(|nested| 1 + applied_depth(nested))
+            .max()
+            .unwrap_or(0)
+    }
+    let root = tempfile::tempdir().unwrap();
+    let seat = Seat::new(root.path(), "n0");
+    let founding = founding_with(
+        root.path(),
+        &[&seat],
+        EPOCH_LENGTH,
+        MEMBER_CAP,
+        &[("pong", RELAY)],
+    );
+    seat.init(&founding);
+    let live = seat.start();
+    let runtime = client_runtime();
+    runtime.block_on(async {
+        let client = &live.client;
+        let putter = ed25519::PrivateKey::from_seed(PUTTER_SEED);
+        let given = signed(
+            client,
+            &putter,
+            "ping",
+            abi::encode(&replying_chain(host::MAX_DEPTH)),
+        )
+        .await;
+        let (height, receipt) = client.land(&Frame::decode(&given).unwrap()).await.unwrap();
+        assert!(height > 0);
+        assert_eq!(applied_depth(&receipt), host::MAX_DEPTH);
+    });
+    shut_down(&runtime, &[&seat], vec![live]);
+}
+
+#[test]
 fn a_node_answers_reads_from_its_last_applied_block_while_its_writer_is_held() {
     apart!();
     let root = tempfile::tempdir().unwrap();
