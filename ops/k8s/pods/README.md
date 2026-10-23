@@ -234,12 +234,11 @@ or through a member node's halo forward.
   taint. A VM that also runs an SSH runner caps the runner at 64G and reserves 66Gi for the
   system in its kubelet (the 2Gi OS reserve plus that cap), so build pods never overcommit it. Build
   notices keep their open runs in the ConfigMap `build-runs`.
-- **duckpond's Latitude split.** Five of the eight Latitude build VMs are SSH runners: `lat-1`,
-  `lat-4`, `lat-5`, `lat-7` and `lat-8`, each named in `PODS_RUNNERS`. The other three, `lat-2`,
-  `lat-3` and `lat-6`, carry `builds.ducktape/pods=true`, so every pod placed by that label, build
-  pods included, runs there. Reviewer 56 reads both sides' CPU in Bottlenecks. When the three build
-  VMs' 3-row mean goes above 60%, or the runners' mean stays below 25% for an hour, one VM changes
-  sides (chief 17's rule).
+- **duckpond's Latitude VMs.** All eight are labelled `builds.ducktape/pods=true` and tainted
+  `ducktape.industries/builds=latitude:NoSchedule`, so every pod placed by that label, build and
+  fill pods included, may run on any of them. Five also run an SSH runner: `lat-1`, `lat-4`,
+  `lat-5`, `lat-7` and `lat-8`, each named in `PODS_RUNNERS`. Those runner VMs reserve 66Gi in
+  their kubelet for the runner and the system, as above.
 - **Runner-only placement.** With `PODS_WARM_POD` unset or empty, `builds` gives each eligible runner
   its next turn in configuration order, skipping unreachable runners and full slots. Capacity
   comes from `build.sh ahead` and the runner's ping (`busy`, `heavy_runs`), not predicted finish
@@ -253,10 +252,9 @@ or through a member node's halo forward.
 - **The lane's first bound.** `PODS_LANE_FIRST_LIMIT`, whole minutes, which each lane the service
   starts states as `FIRST_LIMIT=`: build.sh bounds a run by twice the longest green run of its
   kind on that machine, and a machine with none yet (a new warm pod) refuses a call that states
-  no bound. duckpond's is 60. The longest green lane measured ran 1183 s of gates (programs,
-  desktop run 20261022-080840-1474062; the warm pod's longest was 1146 s), and a lane on a merge
-  train's tip that runs out of its bound sends the whole train back. Unset, the service's lanes
-  state none.
+  no bound. duckpond's is 90, about 1.3 times the slowest repo's measured green lane: core's
+  ran 69.6 minutes (reviewer 56's measure, chief j-532:242). A lane on a merge train's tip that
+  runs out of its bound sends the whole train back. Unset, the service's lanes state none.
 - **Optional: the build runners.** `PODS_RUNNERS`, `<name>=<keys path>` words in tie order
   (`desktop=/desktop` when unset), each keys path a mounted Secret (files `id_ed25519`,
   `id_ed25519.pub`, `known_hosts`, `user`, and `hosts` or `forward`, optionally `kinds`):
