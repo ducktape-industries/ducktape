@@ -8,6 +8,7 @@ use std::io::{self, BufReader, Read, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use abi::{BlobHeader, BlobId};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -661,6 +662,7 @@ pub(super) struct Log {
     copying: Option<u64>,
     dirty: BTreeSet<u64>,
     made: bool,
+    rolling: Duration,
 }
 
 enum Scanned {
@@ -703,6 +705,7 @@ impl Log {
             copying: None,
             dirty: BTreeSet::new(),
             made: false,
+            rolling: Duration::ZERO,
         };
         let mut streams = Vec::new();
         for n in numbers {
@@ -1104,7 +1107,9 @@ impl Log {
         let over = len + bytes.len() as u64 > self.segment_bytes;
         let rolls = over && !empty;
         if rolls {
+            let began = Instant::now();
             self.roll()?;
+            self.rolling += began.elapsed();
         }
         let active = self.active;
         let segment = self.segment_mut(active);
@@ -1113,6 +1118,10 @@ impl Log {
         segment.len += bytes.len() as u64;
         self.dirty.insert(active);
         Ok((active, at))
+    }
+
+    pub(super) fn rolled(&mut self) -> Duration {
+        std::mem::take(&mut self.rolling)
     }
 
     pub(super) fn holds(&self, id: &BlobId) -> bool {

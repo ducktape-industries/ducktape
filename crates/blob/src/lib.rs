@@ -16,8 +16,8 @@ use sha2::Digest as _;
 pub use store::CopyGate;
 #[cfg(feature = "store")]
 pub use store::{
-    Blobs, Error, FRAME_BYTES, Layered, Reader, Result, SEGMENT_BYTES, Stage, Tidied, Tidier,
-    Unpacked, file_entry, names, size_of, window,
+    Blobs, Error, FRAME_BYTES, Layered, Promoted, Reader, Result, SEGMENT_BYTES, Stage, Tidied,
+    Tidier, Unpacked, file_entry, names, size_of, window,
 };
 
 pub fn is_kind(kind: &str) -> bool {

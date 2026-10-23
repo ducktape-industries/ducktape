@@ -250,6 +250,7 @@ pub(crate) mod tests {
         pub(crate) next: Arc<View<runtime::Context>>,
         pub(crate) mempool: Mempool<runtime::Context>,
         pub(crate) key: ed25519::PrivateKey,
+        pub(crate) spent: host::Spent,
     }
 
     fn founding(program: &str, code: &[u8], params: Vec<u8>, roles: &[&str]) -> Founding {
@@ -331,12 +332,14 @@ pub(crate) mod tests {
             let mut mempool = mempool.unwrap();
             let block = mempool.build(origin.tip(), std::iter::empty(), TIME + BLOCK_TIME_MS);
             node.apply(&block).await.unwrap();
+            let spent = node.host().spent().clone();
             let next = Arc::new(View::of(&node, &facts, None).unwrap());
             test(Founded {
                 first,
                 next,
                 mempool,
                 key,
+                spent,
             })
             .await;
         });

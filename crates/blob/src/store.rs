@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(test, feature = "testkit"))]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 
 use abi::{Blob, BlobHeader, BlobId, HashKind, Refusal, reason};
 
@@ -45,6 +46,17 @@ const PARTIAL: &str = ".partial";
 const HEADER_BYTES: u64 = 4 << 10;
 
 static OPEN: Mutex<BTreeMap<PathBuf, Weak<Shared>>> = Mutex::new(BTreeMap::new());
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Promoted {
+    pub looking: Duration,
+    pub encoding: Duration,
+    pub large: Duration,
+    pub writing: Duration,
+    pub rolling: Duration,
+    pub waiting: Duration,
+    pub syncing: Duration,
+}
 
 #[derive(Clone, Default)]
 pub struct Stage {
@@ -102,6 +114,8 @@ struct Shared {
     held: fs::File,
     #[cfg(any(test, feature = "testkit"))]
     gate: Mutex<Option<Armed>>,
+    #[cfg(test)]
+    asking: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 #[cfg(any(test, feature = "testkit"))]
@@ -216,6 +230,8 @@ impl Blobs {
             held,
             #[cfg(any(test, feature = "testkit"))]
             gate: Mutex::default(),
+            #[cfg(test)]
+            asking: Mutex::default(),
         });
         open.retain(|_, weak| weak.strong_count() > 0);
         open.insert(dir, Arc::downgrade(&shared));
@@ -227,6 +243,25 @@ impl Blobs {
             .log
             .lock()
             .expect("the blob log is never poisoned")
+    }
+
+    fn locked(&self, waiting: &mut Duration) -> MutexGuard<'_, Log> {
+        let asked = Instant::now();
+        #[cfg(test)]
+        {
+            let asking = self
+                .shared
+                .asking
+                .lock()
+                .expect("the lock probe is never poisoned")
+                .take();
+            if let Some(asking) = asking {
+                let _ = asking.send(());
+            }
+        }
+        let log = self.log();
+        *waiting += asked.elapsed();
+        log
     }
 
     fn dir(&self) -> &Path {
@@ -311,14 +346,22 @@ impl Blobs {
     }
 
     fn found(&self, id: &BlobId) -> Option<Found> {
-        let hit = self.log().hit(id);
+        self.found_locking(id, || self.log())
+    }
+
+    fn found_locking<'a>(
+        &'a self,
+        id: &BlobId,
+        mut lock: impl FnMut() -> MutexGuard<'a, Log>,
+    ) -> Option<Found> {
+        let hit = lock().hit(id);
         if let Some(hit) = hit {
             return Some(Found::Held(hit));
         }
         if self.legacy(id).is_file() {
             return Some(Found::Legacy);
         }
-        let hit = self.log().hit(id);
+        let hit = lock().hit(id);
         hit.map(Found::Held)
     }
 
@@ -363,24 +406,56 @@ impl Blobs {
         gone(fs::remove_file(legacy))
     }
 
-    pub fn promote(&self, stage: Stage) -> Result<()> {
+    pub fn promote(&self, stage: Stage) -> Result<Promoted> {
+        let mut promoted = Promoted::default();
         let mut records = Vec::new();
         for (id, framed) in stage.framed {
-            if self.has(&id) {
+            let waited_before = promoted.waiting;
+            let looked = Instant::now();
+            let held = self
+                .found_locking(&id, || self.locked(&mut promoted.waiting))
+                .is_some();
+            let waited = promoted.waiting - waited_before;
+            promoted.looking += looked.elapsed().saturating_sub(waited);
+            if held {
                 continue;
             }
             let over = framed.len() as u64 > self.shared.sizes.segment;
             match over {
-                true => self.keep(id, &framed)?,
-                false => records.push(segments::record(id, &framed, self.shared.sizes.frame)?),
+                true => self.promote_large(id, &framed, &mut promoted)?,
+                false => {
+                    let began = Instant::now();
+                    records.push(segments::record(id, &framed, self.shared.sizes.frame)?);
+                    promoted.encoding += began.elapsed();
+                }
             }
         }
-        let mut log = self.log();
+        let mut log = self.locked(&mut promoted.waiting);
+        log.rolled();
+        let began = Instant::now();
         for record in &records {
             log.log(record)?;
         }
+        let rolled = log.rolled();
         drop(log);
-        self.sync()
+        promoted.writing += began.elapsed().saturating_sub(rolled);
+        promoted.rolling += rolled;
+        let dirty = self.locked(&mut promoted.waiting).dirty();
+        let began = Instant::now();
+        self.flush_dirty(dirty)?;
+        promoted.syncing += began.elapsed();
+        Ok(promoted)
+    }
+
+    fn promote_large(&self, id: BlobId, framed: &[u8], promoted: &mut Promoted) -> Result<()> {
+        let began = Instant::now();
+        let partial = self.framed_partial(id, framed, framed.len() as u64)?;
+        promoted.large += began.elapsed();
+        let mut log = self.locked(&mut promoted.waiting);
+        let began = Instant::now();
+        self.publish_framed(&mut log, id, &partial)?;
+        promoted.syncing += began.elapsed();
+        Ok(())
     }
 
     pub fn tidy(&self) -> Result<Tidied> {
@@ -501,7 +576,11 @@ impl Blobs {
     }
 
     fn sync(&self) -> Result<()> {
-        let (files, made) = self.log().dirty();
+        let dirty = self.log().dirty();
+        self.flush_dirty(dirty)
+    }
+
+    fn flush_dirty(&self, (files, made): (Vec<Arc<fs::File>>, bool)) -> Result<()> {
         for file in &files {
             file.sync_data()?;
         }
@@ -1501,6 +1580,68 @@ mod tests {
         segment: 4096,
         frame: 512,
     };
+
+    #[test]
+    fn a_promote_names_a_large_blob_apart_from_records_and_a_held_blob_costs_only_its_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        let mut stage = Stage::default();
+        stage
+            .put(HashKind::Sha256, "part", &noise(3 * 4096, 1))
+            .unwrap();
+        let large = blobs.promote(stage).unwrap();
+        assert!(!large.large.is_zero(), "{large:?}");
+        assert_eq!(large.encoding, Duration::ZERO, "{large:?}");
+        let mut stage = Stage::default();
+        stage.put(HashKind::Sha256, "part", &noise(300, 2)).unwrap();
+        let small = blobs.promote(stage.clone()).unwrap();
+        assert!(!small.encoding.is_zero(), "{small:?}");
+        assert_eq!(small.large, Duration::ZERO, "{small:?}");
+        let again = blobs.promote(stage).unwrap();
+        assert_eq!(
+            (again.large, again.encoding),
+            (Duration::ZERO, Duration::ZERO),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn a_promote_whose_records_cross_a_segment_charges_the_roll_apart_from_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        let mut stage = Stage::default();
+        stage.put(HashKind::Sha256, "part", &noise(300, 4)).unwrap();
+        let fits = blobs.promote(stage).unwrap();
+        assert_eq!(fits.rolling, Duration::ZERO, "{fits:?}");
+        let mut stage = Stage::default();
+        for i in 0..20 {
+            stage
+                .put(HashKind::Sha256, "part", &noise(300, 10 + i))
+                .unwrap();
+        }
+        let crossing = blobs.promote(stage).unwrap();
+        assert!(!crossing.rolling.is_zero(), "{crossing:?}");
+    }
+
+    #[test]
+    fn a_promote_charges_the_blob_log_lock_another_thread_holds_to_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::sized(dir.path(), SMALL).unwrap();
+        let (asking, asked) = mpsc::sync_channel(1);
+        *blobs.shared.asking.lock().unwrap() = Some(asking);
+        let mut stage = Stage::default();
+        stage.put(HashKind::Sha256, "part", &noise(300, 3)).unwrap();
+        let log = blobs.log();
+        let (promoted, held) = std::thread::scope(|scope| {
+            let promoting = scope.spawn(|| blobs.promote(stage).unwrap());
+            asked.recv().unwrap();
+            let held_from = Instant::now();
+            let held = held_from.elapsed();
+            drop(log);
+            (promoting.join().unwrap(), held)
+        });
+        assert!(promoted.waiting >= held, "{promoted:?} held {held:?}");
+    }
 
     fn segment_bytes(dir: &Path) -> u64 {
         every_file(&dir.join(SEGMENTS)).values().sum()

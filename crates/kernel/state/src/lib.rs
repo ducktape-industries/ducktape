@@ -5,6 +5,7 @@ mod storage;
 mod view;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::{Duration, Instant};
 
 use abi::{ProgramId, Root};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -12,8 +13,8 @@ use commonware_runtime::{Clock, Spawner};
 use commonware_storage::Context;
 
 pub use commitment::{
-    Commitment, Db, Family, Op, OpProof, Reader, Serving, SyncTarget, Tuning, codec_config, digest,
-    holds, partition_prefix,
+    Commitment, Db, Family, Op, OpProof, Reader, Serving, Steps, SyncTarget, Tuning, codec_config,
+    digest, holds, partition_prefix,
 };
 pub use overlay::{Checkpoint, Overlay, Slot};
 pub use receiving::Receiving;
@@ -424,7 +425,7 @@ where
         self.storage.flush()
     }
 
-    pub async fn commit(&mut self, height: u64, writes: Writes) -> Result<()> {
+    pub async fn commit(&mut self, height: u64, writes: Writes) -> Result<Wrote> {
         let unknown = writes
             .programs
             .keys()
@@ -434,17 +435,40 @@ where
                 "a write reached the unknown program {program}"
             )));
         }
+        let keys = writes.programs.values().map(BTreeMap::len).sum();
+        let began = Instant::now();
         self.storage.commit(height, &writes)?;
+        let stored = Instant::now();
         let applies = self
             .commitments
             .iter_mut()
             .filter_map(|(program, commitment)| {
                 let keys = writes.programs.get(program)?;
-                Some(commitment.apply(height, keys))
+                Some(async move {
+                    let steps = commitment.apply(height, keys).await?;
+                    Ok::<_, Error>((program, steps))
+                })
             });
-        futures::future::try_join_all(applies).await?;
-        Ok(())
+        let applied = futures::future::try_join_all(applies).await?;
+        let slowest = applied
+            .into_iter()
+            .max_by_key(|(_, steps)| steps.total())
+            .map(|(program, steps)| (program.clone(), steps));
+        Ok(Wrote {
+            storing: stored.duration_since(began),
+            commitments: stored.elapsed(),
+            keys,
+            slowest,
+        })
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Wrote {
+    pub storing: Duration,
+    pub commitments: Duration,
+    pub keys: usize,
+    pub slowest: Option<(ProgramId, Steps)>,
 }
 
 async fn open_commitment<E>(

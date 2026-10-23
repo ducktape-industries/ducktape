@@ -1295,6 +1295,7 @@ struct Phases {
     applying: Duration,
     executing: Duration,
     committing: Duration,
+    commit: host::Committing,
     publishing: Duration,
     recording: Duration,
     proposing: Duration,
@@ -1315,10 +1316,30 @@ impl Phases {
             .saturating_sub(self.executing)
             .saturating_sub(self.committing)
     }
+
+    fn took(&mut self, spent: &host::Spent, receipts: &[abi::Receipt], carried: &[node::Carried]) {
+        self.executing = spent.executing;
+        self.committing = spent.committing;
+        self.commit = spent.commit.clone();
+        self.slowest = slowest_of(spent.slowest, receipts, carried);
+    }
 }
 
 fn ms(spent: Duration) -> u64 {
     spent.as_millis() as u64
+}
+
+fn commit_parts(commit: &host::Committing) -> String {
+    let mut parts: Vec<String> = commit
+        .parts()
+        .map(|part| format!("{}_ms={}", part.step, ms(part.spent)))
+        .collect();
+    parts.push(format!("commitments_ms={}", ms(commit.wrote.commitments)));
+    parts.push(format!("keys={}", commit.wrote.keys));
+    if let Some((program, _)) = &commit.wrote.slowest {
+        parts.push(format!("commitment={program}"));
+    }
+    parts.join(" ")
 }
 
 fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
@@ -1326,6 +1347,7 @@ fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
     if !phases.slow(block_time_ms) {
         return;
     }
+    let step = phases.commit.slowest();
     tracing::warn!(
         target: "ducktape::node",
         event = "apply_slow",
@@ -1338,6 +1360,10 @@ fn reported(phases: &Phases, tally: &Tally, height: u64, block_time_ms: u64) {
         commands_ms = ms(tally.commanding),
         executing_ms = ms(phases.executing),
         committing_ms = ms(phases.committing),
+        commit_step = step.map(|part| part.step),
+        commit_program = step.and_then(|part| part.program),
+        commit_step_ms = step.map(|part| ms(part.spent)),
+        commit_parts = %commit_parts(&phases.commit),
         verifying_ms = ms(phases.verifying()),
         publishing_ms = ms(phases.publishing),
         recording_ms = ms(phases.recording),
@@ -1374,6 +1400,14 @@ fn slow_of(
             position: slowest.position,
             tx: slowest.tx.clone(),
         });
+    let commit_step = phases
+        .commit
+        .slowest()
+        .map(|part| crate::health::CommitStep {
+            step: part.step.to_owned(),
+            program: part.program.map(str::to_owned),
+            ms: ms(part.spent),
+        });
     Some(crate::health::Slow {
         height,
         total_ms: ms(phases.total),
@@ -1391,6 +1425,7 @@ fn slow_of(
         seating_ms: ms(phases.seating),
         snapshot_ms: ms(phases.snapshotting),
         slowest,
+        commit_step,
     })
 }
 
@@ -1894,10 +1929,7 @@ async fn applied<E: Context>(
         } => {
             let ran = crate::blocks::ran(block, &carried)?;
             let receipts = std::mem::take(&mut applied.submissions);
-            let spent = node.host().spent();
-            phases.executing = spent.executing;
-            phases.committing = spent.committing;
-            phases.slowest = slowest_of(spent.slowest, &receipts, &carried);
+            phases.took(node.host().spent(), &receipts, &carried);
             let records = std::mem::take(&mut applied.records);
             let refused = crate::activity::refused(&records, &receipts);
             let recorded = daemon
@@ -2061,8 +2093,8 @@ mod tests {
     use commonware_cryptography::ed25519::PrivateKey;
 
     use super::{
-        Event, Phases, Slowest, halo_cleared, listing, next, relay_address, rewrites, seats,
-        slow_of, slowest_of,
+        Event, Phases, Slowest, commit_parts, halo_cleared, listing, ms, next, relay_address,
+        rewrites, seats, slow_of, slowest_of,
     };
 
     #[test]
@@ -2183,6 +2215,83 @@ mod tests {
             slow_of(&half_a_millisecond_past, 7, 1000, 0, Duration::ZERO),
             None
         );
+    }
+
+    #[test]
+    fn a_slow_commit_names_its_slowest_part_and_logs_every_part() {
+        let commit = host::Committing {
+            preparing: Duration::from_millis(2),
+            promoted: host::Promoted {
+                syncing: Duration::from_millis(40),
+                ..host::Promoted::default()
+            },
+            wrote: host::Wrote {
+                storing: Duration::from_millis(5),
+                commitments: Duration::from_millis(900),
+                keys: 12,
+                slowest: Some((
+                    "chat".into(),
+                    host::Steps {
+                        pruning: Duration::from_millis(880),
+                        ..host::Steps::default()
+                    },
+                )),
+            },
+            closing: Duration::from_millis(1),
+        };
+        let phases = Phases {
+            total: Duration::from_millis(1100),
+            committing: Duration::from_millis(950),
+            commit,
+            ..Phases::default()
+        };
+        let kept = slow_of(&phases, 9, 1000, 0, Duration::ZERO).unwrap();
+        assert_eq!(
+            kept.commit_step,
+            Some(crate::health::CommitStep {
+                step: "commitment_prune".into(),
+                program: Some("chat".into()),
+                ms: 880,
+            })
+        );
+        assert_eq!(
+            commit_parts(&phases.commit),
+            "prepare_ms=2 blob_lookup_ms=0 blob_encode_ms=0 blob_large_ms=0 blob_write_ms=0 \
+             blob_roll_ms=0 blob_wait_ms=0 blob_sync_ms=40 store_write_ms=5 close_ms=1 commitment_merkleize_ms=0 commitment_apply_ms=0 commitment_commit_ms=0 \
+             commitment_prune_ms=880 commitment_reader_ms=0 commitments_ms=900 keys=12 commitment=chat"
+        );
+        let replayed = Phases {
+            total: Duration::from_millis(1100),
+            ..Phases::default()
+        };
+        let kept = slow_of(&replayed, 9, 1000, 0, Duration::ZERO).unwrap();
+        assert_eq!(kept.commit_step, None);
+    }
+
+    #[test]
+    fn a_slow_block_names_the_slowest_part_of_the_commit_a_real_block_spent() {
+        crate::view::tests::founded(|founded| async move {
+            let commit = &founded.spent.commit;
+            assert!(commit.wrote.keys > 0, "{commit:?}");
+            assert!(!commit.wrote.storing.is_zero(), "{commit:?}");
+            let mut phases = Phases {
+                total: Duration::from_millis(1100),
+                ..Phases::default()
+            };
+            phases.took(&founded.spent, &[], &[]);
+            let step = commit.slowest().unwrap();
+            let kept = slow_of(&phases, 1, 1000, 0, Duration::ZERO).unwrap();
+            assert_eq!(
+                kept.commit_step,
+                Some(crate::health::CommitStep {
+                    step: step.step.to_owned(),
+                    program: step.program.map(str::to_owned),
+                    ms: ms(step.spent),
+                })
+            );
+            let keys = format!("keys={}", commit.wrote.keys);
+            assert!(commit_parts(&phases.commit).contains(&keys), "{phases:?}");
+        });
     }
 
     #[test]

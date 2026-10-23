@@ -184,7 +184,7 @@ fn crash_inside_a_prune(seed: u64) {
                 reference = unpruned(reference, height).await;
                 settle(&mut live, height);
                 match applied {
-                    Ok(()) => assert!(start(&store) >= before),
+                    Ok(_) => assert!(start(&store) >= before),
                     Err(error) => {
                         torn = Some((height, error));
                         break;

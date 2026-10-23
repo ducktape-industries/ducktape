@@ -27,6 +27,13 @@ pub(crate) struct Slowest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CommitStep {
+    pub(crate) step: String,
+    pub(crate) program: Option<String>,
+    pub(crate) ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Slow {
     pub(crate) height: u64,
     pub(crate) total_ms: u64,
@@ -44,6 +51,7 @@ pub(crate) struct Slow {
     pub(crate) seating_ms: u64,
     pub(crate) snapshot_ms: u64,
     pub(crate) slowest: Option<Slowest>,
+    pub(crate) commit_step: Option<CommitStep>,
 }
 
 pub(crate) struct Slowed {
@@ -317,6 +325,7 @@ mod tests {
                 position: 0,
                 tx: String::new(),
             }),
+            commit_step: None,
         }
     }
 

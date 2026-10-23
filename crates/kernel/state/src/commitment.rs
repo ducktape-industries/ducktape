@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use abi::{Entry, Root};
 use commonware_codec::{Decode as _, Encode as _, RangeCfg};
@@ -233,6 +234,31 @@ pub fn config<E: Context>(context: &E, name: &str, live_keys: usize) -> Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Steps {
+    pub merkleizing: Duration,
+    pub applying: Duration,
+    pub committing: Duration,
+    pub pruning: Duration,
+    pub serving: Duration,
+}
+
+impl Steps {
+    pub fn named(&self) -> [(&'static str, Duration); 5] {
+        [
+            ("commitment_merkleize", self.merkleizing),
+            ("commitment_apply", self.applying),
+            ("commitment_commit", self.committing),
+            ("commitment_prune", self.pruning),
+            ("commitment_reader", self.serving),
+        ]
+    }
+
+    pub fn total(&self) -> Duration {
+        self.named().into_iter().map(|(_, spent)| spent).sum()
+    }
+}
+
 /// A program's authenticated state: a qmdb in the runtime's storage, named
 /// for its store and program. A sync cut short leaves a log that starts past
 /// 0 with no merkle over it. The next sync of the same chain resumes it, one
@@ -377,7 +403,8 @@ where
         self.serving.clone()
     }
 
-    pub async fn apply(&mut self, height: u64, writes: &BTreeMap<Vec<u8>, Slot>) -> Result<()> {
+    pub async fn apply(&mut self, height: u64, writes: &BTreeMap<Vec<u8>, Slot>) -> Result<Steps> {
+        let began = Instant::now();
         let db = self
             .db
             .take()
@@ -399,13 +426,23 @@ where
                 return Err(error.into());
             }
         };
+        let merkleized = Instant::now();
         let (db, _) = db.apply_batch(batch).await?;
+        let applied = Instant::now();
         let db = db.commit().await?;
+        let committed = Instant::now();
         let db = self.pruned(db).await?;
+        let pruned = Instant::now();
         let (db, serving) = served(db).await?;
         self.serving = serving;
         self.db = Some(db);
-        Ok(())
+        Ok(Steps {
+            merkleizing: merkleized.duration_since(began),
+            applying: applied.duration_since(merkleized),
+            committing: committed.duration_since(applied),
+            pruning: pruned.duration_since(committed),
+            serving: pruned.elapsed(),
+        })
     }
 
     pub async fn sync(&mut self) -> Result<()> {

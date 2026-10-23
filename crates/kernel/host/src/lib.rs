@@ -11,7 +11,7 @@ mod unit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use abi::Roles;
 use abi::{
@@ -36,6 +36,7 @@ use crate::parking::{Run, Segment, Start, Status};
 use crate::reads::Recorder;
 use crate::unit::{Emitted, Frame, Loaded, World, refusal_of};
 
+pub use blob::Promoted;
 pub use namespace::{
     BLOBS, INDEXED_AT, NETWORK, PARKED, PROGRAMS, RECENT, RESERVED, SPENT, epoch_validators,
 };
@@ -43,7 +44,7 @@ pub use parking::PAGE_FUEL;
 pub use reads::{ReadSet, Written};
 pub use runtime::{Limits, OUT_OF_FUEL};
 pub use snapshot::{Queried, Snapshot, Source};
-pub use state::LOCAL;
+pub use state::{LOCAL, Steps, Wrote};
 pub use unit::Places;
 
 pub const STATE_DIR: &str = "state";
@@ -190,11 +191,63 @@ pub struct Applied {
     pub places: Arc<Places>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Spent {
     pub executing: Duration,
     pub committing: Duration,
+    pub commit: Committing,
     pub slowest: Option<Slowest>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Committing {
+    pub preparing: Duration,
+    pub promoted: Promoted,
+    pub wrote: Wrote,
+    pub closing: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part<'a> {
+    pub step: &'static str,
+    pub program: Option<&'a str>,
+    pub spent: Duration,
+}
+
+impl Committing {
+    pub fn parts(&self) -> impl Iterator<Item = Part<'_>> {
+        let whole = [
+            ("prepare", self.preparing),
+            ("blob_lookup", self.promoted.looking),
+            ("blob_encode", self.promoted.encoding),
+            ("blob_large", self.promoted.large),
+            ("blob_write", self.promoted.writing),
+            ("blob_roll", self.promoted.rolling),
+            ("blob_wait", self.promoted.waiting),
+            ("blob_sync", self.promoted.syncing),
+            ("store_write", self.wrote.storing),
+            ("close", self.closing),
+        ]
+        .map(|(step, spent)| Part {
+            step,
+            program: None,
+            spent,
+        });
+        let commitment = self.wrote.slowest.iter().flat_map(|(program, steps)| {
+            steps.named().map(move |(step, spent)| Part {
+                step,
+                program: Some(program.as_str()),
+                spent,
+            })
+        });
+        whole.into_iter().chain(commitment)
+    }
+
+    pub fn slowest(&self) -> Option<Part<'_>> {
+        self.parts()
+            .filter(|part| !part.spent.is_zero())
+            .max_by_key(|part| part.spent)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,7 +588,7 @@ where
         }
         host.record_epoch(0, 0, genesis.time, &mut overlay, &stage)
             .await?;
-        let applied = host
+        let (applied, _) = host
             .commit(
                 Tip {
                     height: 0,
@@ -764,8 +817,8 @@ where
         }
     }
 
-    pub fn spent(&self) -> Spent {
-        self.spent
+    pub fn spent(&self) -> &Spent {
+        &self.spent
     }
 
     pub fn meter_queries(&mut self, fuel: Option<u64>) {
@@ -1090,9 +1143,14 @@ where
             )
             .await;
         let committed = self.store.clock().current();
+        let (applied, commit) = match applied {
+            Ok((applied, commit)) => (Ok(applied), commit),
+            Err(error) => (Err(error), Committing::default()),
+        };
         self.spent = Spent {
             executing: executed.duration_since(started).unwrap_or_default(),
             committing: committed.duration_since(executed).unwrap_or_default(),
+            commit,
             slowest,
         };
         let applied = applied?;
@@ -2466,7 +2524,8 @@ where
         admissions: Vec<Receipt>,
         submissions: Vec<Receipt>,
         records: Vec<hook::Record>,
-    ) -> Result<Applied> {
+    ) -> Result<(Applied, Committing)> {
+        let began = Instant::now();
         overlay.set(RECENT, namespace::height(tip.height), abi::encode(&tip.id));
         if tip.height >= self.layout_from {
             let row: Vec<u8> = overlay
@@ -2488,12 +2547,14 @@ where
         unit::discard_unrostered(self.store.storage(), &overlay, &mut stage)?;
         let mut writes = overlay.into_writes();
         let local = std::mem::take(&mut writes.local);
-        self.blobs.promote(stage)?;
         let committed = Writes {
             programs: writes.programs.clone(),
             local,
         };
-        self.store.commit(tip.height, committed).await?;
+        let prepared = Instant::now();
+        let promoted = self.blobs.promote(stage)?;
+        let wrote = self.store.commit(tip.height, committed).await?;
+        let stored = Instant::now();
         self.roles = roles_of(&self.store.view(Vec::new()))?;
         // a commitment outlives neither its program's drop nor an undone
         // admission: the root is over the programs a reopened node opens
@@ -2507,7 +2568,7 @@ where
         for program in stale {
             self.store.remove_program(&program).await?;
         }
-        Ok(Applied {
+        let applied = Applied {
             height: tip.height,
             admissions,
             submissions,
@@ -2515,7 +2576,14 @@ where
             writes,
             root: self.root()?,
             places: Arc::new(self.loaded.places().clone()),
-        })
+        };
+        let commit = Committing {
+            preparing: prepared.duration_since(began),
+            promoted,
+            wrote,
+            closing: stored.elapsed(),
+        };
+        Ok((applied, commit))
     }
 
     pub async fn drop_unnamed(&self, ids: &BTreeSet<BlobId>, time: u64) -> Result<()> {

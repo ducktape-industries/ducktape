@@ -116,7 +116,7 @@ fn crash_mid_commit(seed: u64) -> bool {
             let mut height = BLOCKS;
             let error = loop {
                 match store.commit(height, block(height)).await {
-                    Ok(()) => height += 1,
+                    Ok(_) => height += 1,
                     Err(error) => break error,
                 }
             };
