@@ -57,19 +57,36 @@ def pieces(path):
             names.append(name)
 
 
+def gather(name, path):
+    try:
+        held["files"].append({"name": name, **pieces(path)})
+    except OSError as error:
+        held["refused"].append(f"{name}: not read: {error.strerror}")
+
+
+def unlisted(error):
+    held["refused"].append(f"out/{os.path.relpath(error.filename, out)}: not read: {error.strerror}")
+
+
 log = os.path.join(keep, "log")
 if os.path.isfile(log):
-    held["files"].append({"name": "log", **pieces(log)})
-for at, dirs, files in os.walk(out):
+    gather("log", log)
+for at, dirs, files in os.walk(out, onerror=unlisted):
     dirs[:] = sorted(name for name in dirs if os.path.join(at, name) != keep and not os.path.islink(os.path.join(at, name)))
     for name in sorted(files):
         path = os.path.join(at, name)
         if os.path.isfile(path) and not os.path.islink(path):
-            held["files"].append({"name": "out/" + os.path.relpath(path, out), **pieces(path)})
+            gather("out/" + os.path.relpath(path, out), path)
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 commits = os.path.join(out, "commits")
-lines = open(commits).read().splitlines() if os.path.isfile(commits) else []
+try:
+    lines = open(commits).read().splitlines() if os.path.isfile(commits) else []
+except OSError as error:
+    lines = []
+    unread = f"out/commits: not read: {error.strerror}"
+    if unread not in held["refused"]:
+        held["refused"].append(unread)
 for line in lines:
     if not line.strip():
         continue
@@ -1080,6 +1097,65 @@ mod tests {
             left,
             ["log"],
             "the run's own folder holds only what the run wrote"
+        );
+    }
+
+    #[test]
+    fn an_output_the_gatherer_cannot_read_is_refused_and_the_rest_is_gathered() {
+        let run = tempfile::tempdir().unwrap();
+        let out = run.path().join("out");
+        let keep = out.join(".fleet");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(out.join("private")).unwrap();
+        std::fs::write(keep.join("log"), b"ran\n").unwrap();
+        std::fs::write(out.join("hello.txt"), b"hello\n").unwrap();
+        std::fs::write(out.join("secret"), b"0600\n").unwrap();
+        std::fs::write(
+            out.join("commits"),
+            b"core 0000000000000000000000000000000000000000 /work\n",
+        )
+        .unwrap();
+        std::fs::write(out.join("private").join("inside"), b"0700\n").unwrap();
+        let own = tempfile::tempdir().unwrap();
+        let scratch = own.path().join("fleet");
+        let denied = format!(
+            "import builtins, os, sys\nopened, scanned = builtins.open, os.scandir\n\
+             def refuse(path):\n    raise PermissionError(13, 'Permission denied', path)\n\
+             builtins.open = lambda path, *a, **k: refuse(path) if str(path).endswith(('/secret', '/commits')) else opened(path, *a, **k)\n\
+             os.scandir = lambda path='.': refuse(path) if str(path).endswith('/private') else scanned(path)\n\
+             exec({GATHER:?})\n"
+        );
+        let ran = std::process::Command::new("python3")
+            .args(["-c", &denied, "64"])
+            .arg(&keep)
+            .arg(&scratch)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let manifest: Value = serde_json::from_slice(&ran.stdout).unwrap();
+        let names: Vec<&str> = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|file| file["name"].as_str())
+            .collect();
+        assert_eq!(names, ["log", "out/hello.txt"], "{manifest}");
+        let refused = manifest["refused"].to_string();
+        assert!(
+            refused.contains("out/secret: not read: Permission denied"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("out/private: not read: Permission denied"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("out/commits: not read: Permission denied"),
+            "{refused}"
         );
     }
 
