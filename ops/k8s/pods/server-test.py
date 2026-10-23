@@ -7654,12 +7654,11 @@ class BuildPods(Served):
         self.assertNotIn("GATES", names)
         self.assertEqual(names[1], "KEEP_GOING")
         self.assertIn({"name": "CARGO_HOME", "value": "/work/cargo"}, run["env"])
-        self.assertIn({"name": "MIRRORS", "value": "/work/mirrors"}, run["env"])
-        self.assertEqual(pod["spec"]["volumes"], [{"name": "work", "emptyDir": {}}])
-        self.assertFalse([volume for volume in pod["spec"]["volumes"] if "hostPath" in volume])
+        self.assertIn({"name": "MIRRORS", "value": "/cache/repos"}, run["env"])
+        self.assertEqual(pod["spec"]["volumes"], [{"name": "repos", "hostPath": {"path": "/srv/build-jobs/repos", "type": "Directory"}}, {"name": "work", "emptyDir": {}}])
         (fetch,) = pod["spec"]["initContainers"]
-        for container in (fetch, run):
-            self.assertEqual(container["volumeMounts"], [{"name": "work", "mountPath": "/work"}])
+        self.assertEqual(fetch["volumeMounts"], [{"name": "repos", "mountPath": "/cache/repos"}, {"name": "work", "mountPath": "/work"}])
+        self.assertEqual(run["volumeMounts"], [{"name": "repos", "mountPath": "/cache/repos", "readOnly": True}, {"name": "work", "mountPath": "/work"}])
         self.assertEqual(pod["spec"]["activeDeadlineSeconds"], 1500)
 
     def test_a_build_made_already_answers_the_one_there(self):

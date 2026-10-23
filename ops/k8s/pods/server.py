@@ -1823,7 +1823,7 @@ def build_pod(asked, requester, body, building, fetching):
     chain = urlsplit(fetching.forge).netloc
     reach = {
         "HOME": BUILD_WORK,
-        "MIRRORS": BUILD_REPOS[2] if gated else f"{BUILD_WORK}/mirrors",
+        "MIRRORS": BUILD_REPOS[2],
         "FORGE": fetching.forge,
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": f"duck.{chain}.node",
@@ -1845,9 +1845,9 @@ def build_pod(asked, requester, body, building, fetching):
         "env": [node] + [{"name": name, "value": value} for name, value in reach.items()],
         "resources": requested,
         "securityContext": unprivileged,
-        "volumeMounts": ([{"name": BUILD_REPOS[0], "mountPath": BUILD_REPOS[2]}] if gated else []) + [work],
+        "volumeMounts": [{"name": BUILD_REPOS[0], "mountPath": BUILD_REPOS[2]}, work],
     }
-    caches = [BUILD_CARGO, BUILD_REPOS, BUILD_SCCACHE] if gated else []
+    caches = [BUILD_CARGO, BUILD_REPOS, BUILD_SCCACHE] if gated else [BUILD_REPOS]
     run_container = {
         "name": RUN,
         "image": building.image,

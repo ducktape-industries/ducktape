@@ -74,8 +74,8 @@ or through a member node's halo forward.
   first `/srv/build-jobs/sccache/<n>` no other build holds. It holds `<n>.lock` with `flock` for its
   whole run, since sccache's local cache takes one server at a time; the kernel frees the lock when
   the pod ends, so the next build takes that dir again. Its log ends with `sccache --show-stats`,
-  after the gates' own last line. A command build mounts nothing of the node: its mirror and
-  cargo live in its own `/work`. It ends within `limit` minutes, 1 to 40 (40
+  after the gates' own last line. A command build shares that mirror alone and keeps its
+  cargo in its own `/work`. It ends within `limit` minutes, 1 to 40 (40
   when unnamed, the gates' own bound from J-493, as `activeDeadlineSeconds`). `GET /v1/builds/NAME/logs` reads its log as a pod's logs read, `DELETE
   /v1/builds/NAME` deletes it for its requester alone, and `notify` posts its end as a pod's.
   An `env` naming a setting the pod makes itself is refused 400.
