@@ -1,6 +1,6 @@
 //! `ducktape machine`: the machines `[machine]` names, talking to fleet in JSON through its own
 //! schema. Each says it is ready, claims what fleet assigns it, runs it on its backend in a task of
-//! its own, beats while it holds a run, and reports each end once the run's outputs are in files.
+//! its own, beats with its host's load, and reports each end once the run's outputs are in files.
 mod backend;
 mod decide;
 mod out;
@@ -385,6 +385,7 @@ struct Serving {
     machines: Vec<MachineEntry>,
     local: BTreeMap<u64, Running>,
     beats: BTreeMap<String, u64>,
+    host: Option<decide::Cpu>,
     failures: BTreeMap<&'static str, u64>,
     done: mpsc::UnboundedSender<Done>,
     tasks: JoinSet<()>,
@@ -398,6 +399,11 @@ async fn serve(
     settings: MachineSettings,
 ) -> Result<(), String> {
     let fleet_schema = said::interface(workspace, &client, FLEET).await?;
+    let probe = decide::beat("", Some(&decide::Load::default()));
+    let host = match fleet_schema.encode_op(&probe) {
+        Ok(_) => host_sample().ok().map(|(cpu, _)| cpu),
+        Err(_) => None,
+    };
     let files_schema = said::interface(workspace, &client, FILES).await?;
     let status = client.status().await.sentence()?;
     let chain = format!("{}-{}", status.network, hex::encode(&status.genesis[..4]));
@@ -439,6 +445,7 @@ async fn serve(
         machines: settings.machines,
         local: BTreeMap::new(),
         beats: BTreeMap::new(),
+        host,
         failures: BTreeMap::new(),
         done,
         tasks: JoinSet::new(),
@@ -570,27 +577,56 @@ impl Serving {
             .ok_or("the node closed its block stream")?
             .sentence()?
             .height;
-        let names: Vec<String> = self
+        let due: Vec<MachineEntry> = self
             .machines
             .iter()
-            .map(|machine| machine.name.clone())
+            .filter(|machine| {
+                let last = self.beats.get(&machine.name).copied().unwrap_or(0);
+                decide::beat_due(height, last)
+            })
+            .cloned()
             .collect();
-        for name in names {
-            let holding = self.local.values().any(|run| run.machine == name);
-            let last = self.beats.get(&name).copied().unwrap_or(0);
-            if !decide::beat_due(height, last, holding) {
-                continue;
-            }
-            let beat = json!({ "beat": { "name": name } });
+        if due.is_empty() {
+            return Ok(Flow::Serving);
+        }
+        let load = self.load();
+        for machine in due {
+            let reads_its_host = reads_host(machine.backend);
+            let carried = load.as_ref().filter(|_| reads_its_host);
+            let beat = decide::beat(&machine.name, carried);
             match self.shared.talk.fleet(beat, Landing::Pool).await {
                 Ok(_) => {
                     self.failures.remove("beat_unsent");
-                    self.beats.insert(name, height);
+                    self.beats.insert(machine.name, height);
                 }
                 Err(error) => self.failed("beat_unsent", 0, &error),
             }
         }
         Ok(Flow::Serving)
+    }
+
+    fn load(&mut self) -> Option<decide::Load> {
+        let before = self.host?;
+        let (now, memory) = match host_sample() {
+            Ok(sample) => sample,
+            Err(error) => {
+                self.failed("host_unread", 0, &error);
+                return None;
+            }
+        };
+        self.failures.remove("host_unread");
+        self.host = Some(now);
+        let started = self.local.values().filter(|run| run.kill.is_some()).count();
+        let unstarted = self
+            .local
+            .values()
+            .filter(|run| run.kill.is_none() && run.stopper.is_some())
+            .count();
+        let workloads = decide::Workloads {
+            running: u64::try_from(started).unwrap_or(u64::MAX),
+            waiting: u64::try_from(unstarted).unwrap_or(u64::MAX),
+        };
+        Some(decide::load(before, now, memory, workloads))
     }
 
     async fn reconcile(&mut self) {
@@ -804,6 +840,22 @@ impl Serving {
             self.local.remove(&run);
         }
     }
+}
+
+fn reads_host(backend: Backend) -> bool {
+    match backend {
+        Backend::Shell | Backend::Podman => true,
+        Backend::Pods => false,
+    }
+}
+
+fn host_sample() -> Result<(decide::Cpu, decide::Memory), String> {
+    let stat = std::fs::read_to_string("/proc/stat").map_err(|error| error.to_string())?;
+    let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|error| error.to_string())?;
+    let cpu = decide::cpu_of(&stat).ok_or("/proc/stat has no cpu line")?;
+    let memory =
+        decide::memory_of(&meminfo).ok_or("/proc/meminfo has no MemTotal or MemAvailable")?;
+    Ok((cpu, memory))
 }
 
 fn serves(machine: &MachineEntry, manager: u64) -> Value {

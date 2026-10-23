@@ -1,10 +1,11 @@
 //! What a machine does about the runs fleet says it holds, decided apart from doing it: claim and
 //! start an assigned run, stop one being stopped, report one it lost track of, drop one fleet no
-//! longer gives it; when it beats; and how a run's end reads as fleet's state.
+//! longer gives it; when it beats and the load of its host a beat carries; and how a run's end
+//! reads as fleet's state.
 use std::collections::BTreeMap;
 
 use abi::role::egress::DEFAULT_WAIT;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Seen {
@@ -124,9 +125,123 @@ fn act(held: &Held, mine: Option<Ending>) -> Option<Act> {
     }
 }
 
-pub fn beat_due(height: u64, last: u64, holding: bool) -> bool {
-    let due = height.saturating_sub(last) >= DEFAULT_WAIT / 2;
-    holding && due
+pub fn beat_due(height: u64, last: u64) -> bool {
+    height.saturating_sub(last) >= DEFAULT_WAIT / 2
+}
+
+const MILLI_PER_CORE: u64 = 1000;
+const BYTES_PER_KIB: u64 = 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cpu {
+    pub busy: u64,
+    pub total: u64,
+    pub cores: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    pub used: u64,
+    pub total: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Workloads {
+    pub running: u64,
+    pub waiting: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Load {
+    pub cpu_used_milli: u64,
+    pub cpu_milli: u64,
+    pub memory_used: u64,
+    pub memory: u64,
+    pub running: u64,
+    pub waiting: u64,
+}
+
+pub fn cpu_of(stat: &str) -> Option<Cpu> {
+    let mut lines = stat.lines();
+    let ticks: Vec<u64> = lines
+        .next()?
+        .strip_prefix("cpu ")?
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [user, nice, system, idle, iowait, irq, softirq, steal, ..] = ticks[..] else {
+        return None;
+    };
+    let total = user + nice + system + idle + iowait + irq + softirq + steal;
+    let cores = lines.filter(|line| names_a_core(line)).count();
+    Some(Cpu {
+        busy: total - idle - iowait,
+        total,
+        cores: u64::try_from(cores).ok()?,
+    })
+}
+
+fn names_a_core(line: &str) -> bool {
+    line.strip_prefix("cpu")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|first| first.is_ascii_digit())
+}
+
+pub fn memory_of(meminfo: &str) -> Option<Memory> {
+    let total = kibibytes(meminfo, "MemTotal:")?;
+    let available = kibibytes(meminfo, "MemAvailable:")?;
+    Some(Memory {
+        used: total
+            .saturating_sub(available)
+            .saturating_mul(BYTES_PER_KIB),
+        total: total.saturating_mul(BYTES_PER_KIB),
+    })
+}
+
+fn kibibytes(meminfo: &str, field: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix(field))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+pub fn load(before: Cpu, now: Cpu, memory: Memory, workloads: Workloads) -> Load {
+    let cpu_milli = now.cores.saturating_mul(MILLI_PER_CORE);
+    let busy = u128::from(now.busy.saturating_sub(before.busy));
+    let total = u128::from(now.total.saturating_sub(before.total));
+    let cpu_used_milli = match total {
+        0 => 0,
+        total => u64::try_from(busy * u128::from(cpu_milli) / total).unwrap_or(cpu_milli),
+    };
+    Load {
+        cpu_used_milli,
+        cpu_milli,
+        memory_used: memory.used,
+        memory: memory.total,
+        running: workloads.running,
+        waiting: workloads.waiting,
+    }
+}
+
+pub fn beat(name: &str, load: Option<&Load>) -> Value {
+    let Some(load) = load else {
+        return json!({ "beat": { "name": name } });
+    };
+    json!({ "beat_load": {
+        "name": name,
+        "load": {
+            "cpu_used_milli": load.cpu_used_milli,
+            "cpu_milli": load.cpu_milli,
+            "memory_used": load.memory_used,
+            "memory": load.memory,
+            "running": load.running,
+            "waiting": load.waiting,
+        },
+    }})
 }
 
 pub fn state_of(end: &End, ending: Ending) -> (&'static str, String) {
@@ -226,11 +341,71 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_beats_every_half_wait_while_it_holds_a_run_and_never_when_idle() {
+    fn a_machine_beats_every_half_wait_whether_or_not_it_holds_a_run() {
         let half = DEFAULT_WAIT / 2;
-        assert!(!beat_due(10 + half - 1, 10, true));
-        assert!(beat_due(10 + half, 10, true));
-        assert!(!beat_due(10 + half, 10, false));
+        assert!(!beat_due(10 + half - 1, 10));
+        assert!(beat_due(10 + half, 10));
+        assert!(beat_due(half, 0));
+    }
+
+    #[test]
+    fn a_hosts_proc_reads_as_its_load_between_two_samples() {
+        let first = "cpu  100 0 50 800 50 10 20 30 0 0\ncpu0 50 0 25 400 25 0 0 0 0 0\ncpu1 50 0 25 400 25 0 0 0 0 0\nintr 1\n";
+        let before = cpu_of(first).unwrap();
+        let counted = Cpu {
+            busy: 210,
+            total: 1060,
+            cores: 2,
+        };
+        assert_eq!(before, counted);
+        let second = "cpu  400 0 150 1300 150 60 70 80 0 0\ncpu0 1 1 1 1\ncpu1 1 1 1 1\n";
+        let now = cpu_of(second).unwrap();
+        let meminfo = "MemTotal:       4000 kB\nMemFree:         100 kB\nMemAvailable:   1000 kB\n";
+        let memory = memory_of(meminfo).unwrap();
+        let read = Memory {
+            used: 3_072_000,
+            total: 4_096_000,
+        };
+        assert_eq!(memory, read);
+        let workloads = Workloads {
+            running: 2,
+            waiting: 1,
+        };
+        let reading = Load {
+            cpu_used_milli: 956,
+            cpu_milli: 2000,
+            memory_used: 3_072_000,
+            memory: 4_096_000,
+            running: 2,
+            waiting: 1,
+        };
+        assert_eq!(load(before, now, memory, workloads), reading);
+        assert_eq!(load(now, now, memory, workloads).cpu_used_milli, 0);
+        assert!(cpu_of("intr 1\n").is_none());
+        assert!(cpu_of("cpu  1 2 3\n").is_none());
+        assert!(memory_of("MemTotal: 4000 kB\n").is_none());
+    }
+
+    #[test]
+    fn a_beat_carries_a_load_only_where_one_was_read() {
+        assert_eq!(beat("m", None), json!({ "beat": { "name": "m" } }));
+        let reading = Load {
+            cpu_used_milli: 1,
+            cpu_milli: 2,
+            memory_used: 3,
+            memory: 4,
+            running: 5,
+            waiting: 6,
+        };
+        let carried = json!({ "beat_load": { "name": "m", "load": {
+            "cpu_used_milli": 1,
+            "cpu_milli": 2,
+            "memory_used": 3,
+            "memory": 4,
+            "running": 5,
+            "waiting": 6,
+        }}});
+        assert_eq!(beat("m", Some(&reading)), carried);
     }
 
     #[test]
