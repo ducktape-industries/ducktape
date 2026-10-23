@@ -221,28 +221,29 @@ async fn a_box_whose_egress_links_a_network_neither_offers_crosspond_nor_relays_
 }
 
 #[tokio::test]
-async fn a_box_streams_each_event_once_the_frame_before_it_is_pooled_and_then_ends_the_stream() {
+async fn a_box_streams_each_event_once_the_frame_before_it_is_carried_and_then_ends_the_stream() {
     let (base, chunks, _) = service().await;
     let (_dir, mut server) = server(&base);
     let (mut relay, stream) = Relay::new();
-    let deliver = Delivery::Events { deliver: vec![4] };
-    let streamed = row(1, Method::Get, "/stream", deliver);
     let relaying = async move {
-        relay.hello().await;
-        relay.body(1, "").await;
-        relay.reading(5, vec![streamed]).await;
-        send(&chunks, "data: 1\n\n");
-        assert_eq!(
-            relay.op(Verdict::Pending).await.1,
-            events(1, 0, "data: 1\n")
-        );
+        streaming(&mut relay, &chunks).await;
         send(&chunks, "data: 2");
         send(&chunks, "\n\n");
+        relay.reading(6, vec![streamed(1)]).await;
+        assert_eq!(
+            relay.op(Verdict::Carried).await.1,
+            events(1, 0, "data: 1\n")
+        );
         assert_eq!(
             relay.op(Verdict::Pending).await.1,
             events(1, 1, "data: 2\n")
         );
         drop(chunks);
+        relay.reading(7, vec![streamed(1)]).await;
+        assert_eq!(
+            relay.op(Verdict::Carried).await.1,
+            events(1, 1, "data: 2\n")
+        );
         let (_, end) = relay.op(Verdict::Pending).await;
         let Op::EndStream {
             id: 1,

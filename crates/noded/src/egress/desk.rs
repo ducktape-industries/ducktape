@@ -1,6 +1,6 @@
-//! The egress worker's decisions after each block and each thing a call reports: which requests to
-//! call or give up, and which answers, events and `Serve` frames to send: a request's next frame as soon as the
-//! one before is in the pool, carrying every event read since. Pure; `mod.rs` performs them.
+//! The egress worker's decisions after each block and each thing a call reports.
+//! Each request batches its queued events after its previous frame is carried.
+//! Pure decisions; `mod.rs` performs them.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use abi::role::egress::{Answer, Event, Op, RequestRow, StreamEnd};
@@ -161,11 +161,8 @@ impl Outbox {
     }
 
     fn launch(&mut self) -> Option<u64> {
-        let unpooled = self
-            .flights
-            .values()
-            .any(|flight| flight.sending == Sending::Unsigned);
-        if unpooled {
+        let awaiting_block = !self.flights.is_empty();
+        if awaiting_block {
             return None;
         }
         let first = self.waiting.pop_front()?;
@@ -266,7 +263,7 @@ impl Outbox {
         match sent {
             Sent::Pending(frame) => {
                 *sending = Sending::Pending(frame);
-                self.launch()
+                None
             }
             Sent::Stale => {
                 *sending = Sending::Unsigned;

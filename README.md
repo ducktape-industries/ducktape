@@ -441,15 +441,12 @@ egress program which open requests the chain elected it for. It calls each new
 one and signs the answer with its own key. It also sends `Serve` while the chain's
 record of the services it serves differs from its `egress.toml`. It submits each
 of these frames again every block until a block carries it, and signs one again
-at once when its anchor grows old. A stream's frames go out as its events
-arrive: the node sends the next frame as soon as the one before is in its pool,
-without waiting for a block to carry it, and that frame carries every event
-read since, or the end. Several frames of one stream may wait for blocks at
-once. The node's own blocks carry its pool in the order it took them, but the
-relay to the validators may drop a frame and offer it again blocks later, so on
-a network of several validators frames may land out of order; egress puts the
-events back in order. Events together larger than a block carries go out in
-halves, in order. An answer larger than a block carries goes out as a
+at once when its anchor grows old. A stream's first frame goes out when its
+first event arrives. Its next frame waits until a block carries the previous
+frame, then carries every event read since, or the end. Pool acceptance alone
+does not release the next batch. Other requests and `Serve` frames proceed
+independently. Events together larger than a block carries go out in halves,
+in order, each half waiting until the previous frame is carried. An answer larger than a block carries goes out as a
 failure; one event or an end larger than a block carries ends the stream `Cut`
 (`event_too_large`, `end_too_large`) and the node drops the rest. On a network that binds no egress
 role the node does none of this.

@@ -297,7 +297,12 @@ async fn a_stream_the_service_marked_reattachable_is_asked_again_and_its_events_
     assert_eq!(desk.launch(), [Step::Send(flight(5, 0))]);
     let all = [(0, "data: 1\n"), (1, "data: 2\n"), (2, "data: 3\n")];
     assert_eq!(desk.op(&flight(5, 0)), Some(events_op(5, &all)));
-    let next = desk.sent(&flight(5, 0), Sent::Pending(b"frame 0".to_vec()));
+    assert_eq!(
+        desk.sent(&flight(5, 0), Sent::Pending(b"frame 0".to_vec())),
+        None
+    );
+    assert!(desk.launch().is_empty());
+    let next = desk.sent(&flight(5, 0), Sent::Carried);
     assert_eq!(next, Some(Step::Send(flight(5, 1))));
     let Some(Op::EndStream { events, end, .. }) = desk.op(&flight(5, 1)) else {
         panic!("no end after the events: {ended:?}");
@@ -365,13 +370,12 @@ fn whole(called: Called) -> Response {
 }
 
 #[tokio::test]
-async fn a_stream_sends_each_event_as_it_arrives_while_earlier_frames_wait_for_a_block() {
+async fn a_stream_batches_events_until_the_previous_frame_is_carried() {
     let (base, chunks) = service().await;
     let row = get_row(1, &base, "/stream", events());
     let mut desk = served();
     assert_eq!(desk.read(assigned(&row)), [Step::Call(row.clone())]);
     let mut calls = call(&row);
-
     send(&chunks, "event: delta\ndata: 1\n\n");
     let first = calls.next().await.unwrap();
     assert_eq!(first, Called::Event(b"event: delta\ndata: 1\n".to_vec()));
@@ -385,26 +389,14 @@ async fn a_stream_sends_each_event_as_it_arrives_while_earlier_frames_wait_for_a
         desk.sent(&flight(1, 0), Sent::Pending(b"frame 0".to_vec())),
         None
     );
-
     send(&chunks, "data: 2");
     send(&chunks, "\n\n");
-    let second = calls.next().await.unwrap();
-    desk.called(1, second);
-    assert_eq!(desk.launch(), [Step::Send(flight(1, 1))]);
-    assert_eq!(desk.op(&flight(1, 1)), Some(event(1, 1, "data: 2\n")));
-    assert_eq!(
-        desk.sent(&flight(1, 1), Sent::Pending(b"frame 1".to_vec())),
-        None
-    );
-    let both = [Step::Send(flight(1, 0)), Step::Send(flight(1, 1))];
-    assert_eq!(desk.read(assigned(&row)), both);
+    desk.called(1, calls.next().await.unwrap());
+    send(&chunks, "data: 3\n\n");
+    desk.called(1, calls.next().await.unwrap());
+    assert!(desk.launch().is_empty());
+    assert_eq!(desk.read(assigned(&row)), [Step::Send(flight(1, 0))]);
     assert_eq!(desk.frame(&flight(1, 0)), Some(&b"frame 0"[..]));
-    assert_eq!(desk.sent(&flight(1, 0), Sent::Carried), None);
-    assert_eq!(
-        desk.sent(&flight(1, 1), Sent::Pending(b"frame 1".to_vec())),
-        None
-    );
-
     drop(chunks);
     let end = calls.next().await.unwrap();
     let Called::End(StreamEnd::Complete { status, headers }) = &end else {
@@ -421,17 +413,36 @@ async fn a_stream_sends_each_event_as_it_arrives_while_earlier_frames_wait_for_a
         headers: headers.clone(),
     };
     desk.called(1, end);
-    assert_eq!(desk.launch(), [Step::Send(flight(1, 2))]);
-    let closing = Op::EndStream {
-        id: 1,
-        events: 2,
-        end: complete,
-    };
-    assert_eq!(desk.op(&flight(1, 2)), Some(closing));
-    desk.sent(&flight(1, 2), Sent::Pending(b"frame 2".to_vec()));
-    let last = [Step::Send(flight(1, 1)), Step::Send(flight(1, 2))];
-    assert_eq!(desk.read(assigned(&row)), last);
-    assert_eq!(desk.sent(&flight(1, 1), Sent::Carried), None);
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(1, 0), Sent::Carried),
+        Some(Step::Send(flight(1, 1)))
+    );
+    assert_eq!(
+        desk.op(&flight(1, 1)),
+        Some(events_op(1, &[(1, "data: 2\n"), (2, "data: 3\n")]))
+    );
+    assert_eq!(
+        desk.sent(&flight(1, 1), Sent::Pending(b"frame 1".to_vec())),
+        None
+    );
+    assert_eq!(desk.read(assigned(&row)), [Step::Send(flight(1, 1))]);
+    assert_eq!(
+        desk.sent(&flight(1, 1), Sent::Carried),
+        Some(Step::Send(flight(1, 2)))
+    );
+    assert_eq!(
+        desk.op(&flight(1, 2)),
+        Some(Op::EndStream {
+            id: 1,
+            events: 3,
+            end: complete
+        })
+    );
+    assert_eq!(
+        desk.sent(&flight(1, 2), Sent::Pending(b"frame 2".to_vec())),
+        None
+    );
     assert_eq!(desk.sent(&flight(1, 2), Sent::Carried), None);
     assert!(desk.read(assigned(&row)).is_empty());
     assert_eq!(calls.next().await, None);
@@ -462,6 +473,11 @@ async fn a_stream_the_service_cuts_ends_cut_after_the_events_already_read() {
     assert_eq!(desk.op(&flight(2, 0)), Some(event(2, 0, "data: only\n")));
     assert_eq!(
         desk.sent(&flight(2, 0), Sent::Pending(b"frame 0".to_vec())),
+        None
+    );
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(2, 0), Sent::Carried),
         Some(Step::Send(flight(2, 1)))
     );
     let closing = Op::EndStream {
@@ -512,6 +528,11 @@ fn an_event_too_large_for_a_block_cuts_the_stream_and_later_events_are_dropped()
     assert_eq!(desk.op(&flight(5, 0)), Some(event(5, 0, "data: 0\n")));
     assert_eq!(
         desk.sent(&flight(5, 0), Sent::Pending(b"frame 0".to_vec())),
+        None
+    );
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(5, 0), Sent::Carried),
         Some(Step::Send(flight(5, 1)))
     );
     assert_eq!(
@@ -544,6 +565,81 @@ fn an_event_too_large_for_a_block_cuts_the_stream_and_later_events_are_dropped()
 }
 
 #[test]
+fn the_1494_event_workload_coalesces_on_carried_blocks() {
+    let mut desk = served();
+    desk.read(reading(&[10], &["relay"], true));
+    let total = 1494_u64;
+    let mut pending = Vec::new();
+    let mut submitted = Vec::new();
+    for seq in 0..total {
+        desk.called(10, Called::Event(seq.to_le_bytes().to_vec()));
+        for step in desk.launch() {
+            let Step::Send(purpose) = step else {
+                panic!("not a frame: {step:?}");
+            };
+            submitted.push(desk.op(&purpose).unwrap());
+            assert_eq!(desk.sent(&purpose, Sent::Pending(vec![1])), None);
+            pending.push(purpose);
+        }
+    }
+    let complete = StreamEnd::Complete {
+        status: 200,
+        headers: Vec::new(),
+    };
+    desk.called(10, Called::End(complete.clone()));
+    for step in desk.launch() {
+        let Step::Send(purpose) = step else {
+            panic!("not a frame: {step:?}");
+        };
+        submitted.push(desk.op(&purpose).unwrap());
+        assert_eq!(desk.sent(&purpose, Sent::Pending(vec![1])), None);
+        pending.push(purpose);
+    }
+    let mut frames_per_block = Vec::new();
+    while !pending.is_empty() {
+        frames_per_block.push(pending.len());
+        let mut next = Vec::new();
+        for purpose in pending {
+            if let Some(Step::Send(purpose)) = desk.sent(&purpose, Sent::Carried) {
+                submitted.push(desk.op(&purpose).unwrap());
+                assert_eq!(desk.sent(&purpose, Sent::Pending(vec![1])), None);
+                next.push(purpose);
+            }
+        }
+        pending = next;
+    }
+    let events: Vec<_> = submitted
+        .iter()
+        .filter_map(|op| match op {
+            Op::Events(events) => Some(events.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(events.len() as u64, total);
+    for (seq, event) in events.into_iter().enumerate() {
+        assert_eq!(event.id, 10);
+        assert_eq!(event.seq, seq as u64);
+        assert!(event.data == (seq as u64).to_le_bytes());
+    }
+    assert_eq!(
+        submitted.last(),
+        Some(&Op::EndStream {
+            id: 10,
+            events: total,
+            end: complete,
+        })
+    );
+    eprintln!(
+        "workload events={total} frames={} frames_per_block={frames_per_block:?}",
+        submitted.len()
+    );
+    assert_eq!(frames_per_block, [1, 1, 1]);
+    assert!(desk.launch().is_empty());
+    assert!(desk.read(reading(&[10], &["relay"], true)).is_empty());
+}
+
+#[test]
 fn every_event_read_while_the_worker_is_busy_goes_out_together_in_one_frame() {
     let mut desk = served();
     desk.read(reading(&[6], &["relay"], true));
@@ -560,10 +656,19 @@ fn every_event_read_while_the_worker_is_busy_goes_out_together_in_one_frame() {
         headers: Vec::new(),
     };
     desk.called(6, Called::End(complete.clone()));
-    assert_eq!(desk.launch(), [Step::Send(flight(6, 1))]);
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(6, 0), Sent::Carried),
+        Some(Step::Send(flight(6, 1)))
+    );
     assert_eq!(desk.op(&flight(6, 1)), Some(event(6, 3, "data: 3\n")));
     assert_eq!(
         desk.sent(&flight(6, 1), Sent::Pending(b"frame 1".to_vec())),
+        None
+    );
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(6, 1), Sent::Carried),
         Some(Step::Send(flight(6, 2)))
     );
     let closing = Op::EndStream {
@@ -572,7 +677,7 @@ fn every_event_read_while_the_worker_is_busy_goes_out_together_in_one_frame() {
         end: complete,
     };
     assert_eq!(desk.op(&flight(6, 2)), Some(closing));
-    assert_eq!(desk.frame(&flight(6, 0)), Some(&b"frame 0"[..]));
+    assert_eq!(desk.frame(&flight(6, 0)), None);
 }
 
 #[test]
@@ -591,6 +696,17 @@ fn a_frame_not_yet_in_the_pool_holds_the_events_read_after_it() {
     );
     assert_eq!(
         desk.sent(&flight(9, 0), Sent::Pending(b"frame 0".to_vec())),
+        None
+    );
+    assert_eq!(desk.sent(&flight(9, 0), Sent::Untaken), None);
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.read(reading(&[9], &["relay"], true)),
+        [Step::Send(flight(9, 0))]
+    );
+    assert_eq!(desk.frame(&flight(9, 0)), Some(&b"frame 0"[..]));
+    assert_eq!(
+        desk.sent(&flight(9, 0), Sent::Carried),
         Some(Step::Send(flight(9, 1)))
     );
     let after = events_op(9, &[(1, "data: 1\n"), (2, "data: 2\n")]);
@@ -605,15 +721,24 @@ fn a_stale_frame_is_signed_again_at_once_with_its_own_events() {
     desk.launch();
     desk.sent(&flight(7, 0), Sent::Pending(b"frame 0".to_vec()));
     desk.called(7, Called::Event(b"data: 1\n".to_vec()));
-    assert_eq!(desk.launch(), [Step::Send(flight(7, 1))]);
-    desk.sent(&flight(7, 1), Sent::Pending(b"frame 1".to_vec()));
+    assert!(desk.launch().is_empty());
     assert_eq!(
         desk.sent(&flight(7, 0), Sent::Stale),
         Some(Step::Send(flight(7, 0)))
     );
     assert_eq!(desk.frame(&flight(7, 0)), None);
     assert_eq!(desk.op(&flight(7, 0)), Some(event(7, 0, "data: 0\n")));
-    assert_eq!(desk.frame(&flight(7, 1)), Some(&b"frame 1"[..]));
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(7, 0), Sent::Pending(b"resigned".to_vec())),
+        None
+    );
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(7, 0), Sent::Carried),
+        Some(Step::Send(flight(7, 1)))
+    );
+    assert_eq!(desk.op(&flight(7, 1)), Some(event(7, 1, "data: 1\n")));
 }
 
 #[test]
@@ -626,7 +751,11 @@ fn events_too_large_for_one_block_together_go_out_in_halves_in_order() {
     for n in 1..=4 {
         desk.called(8, Called::Event(format!("data: {n}\n").into_bytes()));
     }
-    assert_eq!(desk.launch(), [Step::Send(flight(8, 1))]);
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(8, 0), Sent::Carried),
+        Some(Step::Send(flight(8, 1)))
+    );
     let capacity = || Sent::Refused(Refusal::new(reason::CAPACITY, "too large"));
     assert_eq!(
         desk.sent(&flight(8, 1), capacity()),
@@ -636,8 +765,43 @@ fn events_too_large_for_one_block_together_go_out_in_halves_in_order() {
     assert_eq!(desk.op(&flight(8, 1)), Some(front));
     assert_eq!(
         desk.sent(&flight(8, 1), Sent::Pending(b"frame 1".to_vec())),
+        None
+    );
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(8, 1), Sent::Carried),
         Some(Step::Send(flight(8, 2)))
     );
     let back = events_op(8, &[(3, "data: 3\n"), (4, "data: 4\n")]);
     assert_eq!(desk.op(&flight(8, 2)), Some(back));
+    assert_eq!(desk.sent(&flight(8, 2), Sent::Carried), None);
+    assert!(desk.launch().is_empty());
+}
+
+#[test]
+fn a_pending_stream_does_not_hold_other_requests_or_serve_frames() {
+    let mut desk = served();
+    desk.read(reading(&[11, 12], &["relay"], true));
+    desk.called(11, Called::Event(b"first".to_vec()));
+    assert_eq!(desk.launch(), [Step::Send(flight(11, 0))]);
+    desk.sent(&flight(11, 0), Sent::Pending(vec![1]));
+    desk.called(11, Called::Event(b"waiting".to_vec()));
+    desk.called(12, Called::Event(b"independent".to_vec()));
+    desk.want(vec!["other".into()]);
+    assert_eq!(
+        desk.read(reading(&[11, 12], &["relay"], true)),
+        [Step::Send(flight(11, 0)), Step::Send(Purpose::Serve)]
+    );
+    assert_eq!(desk.launch(), [Step::Send(flight(12, 0))]);
+    assert_eq!(desk.op(&flight(12, 0)), Some(event(12, 0, "independent")));
+    assert_eq!(desk.sent(&flight(12, 0), Sent::Pending(vec![2])), None);
+    assert_eq!(desk.sent(&Purpose::Serve, Sent::Pending(vec![3])), None);
+    assert_eq!(desk.sent(&flight(12, 0), Sent::Carried), None);
+    assert_eq!(desk.sent(&Purpose::Serve, Sent::Carried), None);
+    assert!(desk.launch().is_empty());
+    assert_eq!(
+        desk.sent(&flight(11, 0), Sent::Carried),
+        Some(Step::Send(flight(11, 1)))
+    );
+    assert_eq!(desk.op(&flight(11, 1)), Some(event(11, 1, "waiting")));
 }
