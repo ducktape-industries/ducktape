@@ -12,7 +12,8 @@ channel = "ci"
 [[jobs]]
 id = "cross-pin"
 runs-on = ["pods"]
-cpu = "16"
+cpu = "8"
+memory = "5Gi"
 scratch = ["/var/tmp/target"]
 image = "localhost:5000/toolchain:b240e4516c93@sha256:d80bfd948f37f381542c720e3f67a39c06606e88aec9f66f88aefb295468136b"
 steps = [
