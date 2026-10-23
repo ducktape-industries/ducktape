@@ -86,10 +86,11 @@ BUILD_NODES = ("builds.ducktape/pods", "true")
 BUILD_TAINT = ("ducktape.industries/builds", "latitude")
 BUILD_CARGO = ("cargo", "/srv/build-jobs/cargo", "/cache/cargo")
 BUILD_REPOS = ("repos", "/srv/build-jobs/repos", "/cache/repos")
+BUILD_SCCACHE = ("sccache", "/srv/build-jobs/sccache", "/cache/sccache")
 BUILD_LIMIT_MINUTES = 40
 BUILD_WORK = "/work"
 BUILD_TOOLS = ("tools", "main")
-BUILD_SET = ("NODE", "HOME", "MIRRORS", "CARGO_HOME", "CARGO_TARGET_DIR", "FORGE", "GATES", "GATES_OUT", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+BUILD_SET = ("NODE", "HOME", "MIRRORS", "CARGO_HOME", "CARGO_TARGET_DIR", "FORGE", "GATES", "GATES_OUT", "SCCACHE_DIRS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
 REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 COMMIT_ID = re.compile(r"[0-9a-f]{40}")
@@ -108,6 +109,10 @@ mirror() {
 mirror "$tools" "$tools_branch" ""
 mirror "$repo" "$base" "$commit"
 """
+BUILD_CACHE_SLOT = """slot=0
+until { exec 7> "$SCCACHE_DIRS/$slot.lock"; flock -n 7; }; do slot=$((slot + 1)); done
+export SCCACHE_DIR="$SCCACHE_DIRS/$slot" RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0
+"""
 BUILD_ENTRY = """repo=$1 commit=$2 base=$3 tools=$4 tools_branch=$5
 shift 5
 echo "build $HOSTNAME: cloning from $(date -u +%FT%T.%NZ)"
@@ -119,7 +124,15 @@ git -C "/work/src/$repo" checkout -q --detach "$commit"
 echo "build $HOSTNAME: running from $(date -u +%FT%T.%NZ)"
 cd "/work/src/$repo"
 [ "$#" -eq 0 ] || exec "$@"
-exec sh /work/tools/gates.sh "/work/src/$repo"
+if ! command -v sccache > /dev/null; then
+  echo "build $HOSTNAME: the image holds no sccache, so it builds without it"
+  exec sh /work/tools/gates.sh "/work/src/$repo"
+fi
+""" + BUILD_CACHE_SLOT + """echo "build $HOSTNAME: sccache in $SCCACHE_DIR"
+code=0
+sh /work/tools/gates.sh "/work/src/$repo" || code=$?
+sccache --show-stats || true
+exit "$code"
 """
 SPEC = {
     "image": str,
@@ -1751,6 +1764,8 @@ def build_pod(asked, requester, body, building, fetching):
     }
     settings.update(reach)
     settings.update({"CARGO_HOME": BUILD_CARGO[2] if gated else f"{BUILD_WORK}/cargo", "CARGO_TARGET_DIR": f"{BUILD_WORK}/target", "GATES_OUT": f"{BUILD_WORK}/out"})
+    if gated:
+        settings["SCCACHE_DIRS"] = BUILD_SCCACHE[2]
     node = {"name": "NODE", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}
     words = [repo, commit, base, *BUILD_TOOLS]
     requested = {"requests": {"cpu": building.cpu, "memory": building.memory}, "limits": {"memory": building.memory}}
@@ -1765,7 +1780,7 @@ def build_pod(asked, requester, body, building, fetching):
         "securityContext": unprivileged,
         "volumeMounts": ([{"name": BUILD_REPOS[0], "mountPath": BUILD_REPOS[2]}] if gated else []) + [work],
     }
-    caches = [BUILD_CARGO, BUILD_REPOS] if gated else []
+    caches = [BUILD_CARGO, BUILD_REPOS, BUILD_SCCACHE] if gated else []
     run_container = {
         "name": RUN,
         "image": building.image,
@@ -1773,7 +1788,7 @@ def build_pod(asked, requester, body, building, fetching):
         "env": [node] + [{"name": name, "value": value} for name, value in {**env, **settings}.items()],
         "resources": requested,
         "securityContext": unprivileged,
-        "volumeMounts": [{"name": name, "mountPath": mounted, **({} if name == BUILD_CARGO[0] else {"readOnly": True})} for name, _, mounted in caches] + [work],
+        "volumeMounts": [{"name": name, "mountPath": mounted, **({"readOnly": True} if name == BUILD_REPOS[0] else {})} for name, _, mounted in caches] + [work],
     }
     return {
         "apiVersion": "v1",

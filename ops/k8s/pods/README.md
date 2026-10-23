@@ -70,7 +70,11 @@ or through a member node's halo forward.
   node's `/srv/build-jobs/repos` under a lock; then `run`, which mounts that mirror read-only,
   checks `commit` out with `origin/<base>` beside it and runs tools' `gates.sh` with `GATES` set to
   `gates` (full, check or light), or the command. A gates build keeps cargo's registry and git in
-  the node's `/srv/build-jobs/cargo`. A command build mounts nothing of the node: its mirror and
+  the node's `/srv/build-jobs/cargo`, and compiles through the toolchain image's sccache into the
+  first `/srv/build-jobs/sccache/<n>` no other build holds. It holds `<n>.lock` with `flock` for its
+  whole run, since sccache's local cache takes one server at a time; the kernel frees the lock when
+  the pod ends, so the next build takes that dir again. Its log ends with `sccache --show-stats`,
+  after the gates' own last line. A command build mounts nothing of the node: its mirror and
   cargo live in its own `/work`. It ends within `limit` minutes, 1 to 40 (40
   when unnamed, the gates' own bound from J-493, as `activeDeadlineSeconds`). `GET /v1/builds/NAME/logs` reads its log as a pod's logs read, `DELETE
   /v1/builds/NAME` deletes it for its requester alone, and `notify` posts its end as a pod's.
@@ -194,7 +198,7 @@ or through a member node's halo forward.
   writes namespace `builds`: its Role `pods-builds` lets the service create, read, watch, patch and delete pods and read their
   logs; the policy `builds-pods` holds every pod there to what the service writes (uid 10001,
   non-root, no privilege or added capability, `hostUsers: false`, hostPath only
-  `/srv/build-jobs/cargo` and `/srv/build-jobs/repos`, the toolchain image, class `builds`,
+  `/srv/build-jobs/cargo`, `/srv/build-jobs/repos` and `/srv/build-jobs/sccache`, the toolchain image, class `builds`,
   `builds.ducktape/pods=true` and the `ducktape.industries/builds` toleration). Its policy
   `isolated` admits no traffic in and lets its pods out only to their own namespace, DNS and
   public addresses; `to-duckpond-node` adds TCP 8844 on duckpond's node pods. A node carries

@@ -1,4 +1,4 @@
-# The agents' build image: Rust 1.96.1 with wasm32, binaryen 132, wasm-tools, cargo-deny, git-remote-duck for duckpond's forge, zstd (CLI and python binding), gdb and elfutils (eu-stack) for stack dumps, Xvfb, xdotool, ImageMagick and x11-utils for a live app on a virtual display, shellcheck (tools' make check), cargo-mutants, the native packages ducktape, programs and the app build with, and the CEF the app's web build links (CEF_PATH) with the libraries it loads.
+# The agents' build image: Rust 1.96.1 with wasm32, binaryen 132, wasm-tools, cargo-deny, git-remote-duck for duckpond's forge, zstd (CLI and python binding), gdb and elfutils (eu-stack) for stack dumps, Xvfb, xdotool, ImageMagick and x11-utils for a live app on a virtual display, shellcheck (tools' make check), cargo-mutants, sccache (the build pods' compile cache), the native packages ducktape, programs and the app build with, and the CEF the app's web build links (CEF_PATH) with the libraries it loads.
 # Built by ops/k8s/toolchain/deploy from a staged context holding git-remote-duck, and pushed to the cluster node's registry; an agent names it as a pod's image.
 FROM docker.io/library/debian:trixie-slim
 ARG RUSTUP_VERSION=1.29.1
@@ -60,6 +60,15 @@ RUN curl -fsSL -o /tmp/cargo-mutants.tar.gz \
     && install -m 0755 /tmp/cargo-mutants /usr/local/bin/cargo-mutants \
     && cargo mutants --version \
     && rm /tmp/cargo-mutants.tar.gz /tmp/cargo-mutants
+ARG SCCACHE_VERSION=v0.10.0
+ARG SCCACHE_SHA256=1fbb35e135660d04a2d5e42b59c7874d39b3deb17de56330b25b713ec59f849b
+RUN curl -fsSL -o /tmp/sccache.tar.gz \
+      "https://github.com/mozilla/sccache/releases/download/$SCCACHE_VERSION/sccache-$SCCACHE_VERSION-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "$SCCACHE_SHA256  /tmp/sccache.tar.gz" | sha256sum --check \
+    && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+    && install -m 0755 "/tmp/sccache-$SCCACHE_VERSION-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache \
+    && sccache --version \
+    && rm -rf /tmp/sccache.tar.gz "/tmp/sccache-$SCCACHE_VERSION-x86_64-unknown-linux-musl"
 COPY git-remote-duck /usr/local/bin/git-remote-duck
 RUN git config --system duck.duckpond-725bcad1.node https://duckpond.ducktape.industries
 ENV DUCKTAPE_DEVICE_KEY_STORE=file

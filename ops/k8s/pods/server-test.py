@@ -7450,10 +7450,11 @@ class BuildPods(Served):
             [
                 {"name": "cargo", "hostPath": {"path": "/srv/build-jobs/cargo", "type": "Directory"}},
                 {"name": "repos", "hostPath": {"path": "/srv/build-jobs/repos", "type": "Directory"}},
+                {"name": "sccache", "hostPath": {"path": "/srv/build-jobs/sccache", "type": "Directory"}},
                 {"name": "work", "emptyDir": {}},
             ],
         )
-        self.assertEqual(run["volumeMounts"], [{"name": "cargo", "mountPath": "/cache/cargo"}, {"name": "repos", "mountPath": "/cache/repos", "readOnly": True}, {"name": "work", "mountPath": "/work"}])
+        self.assertEqual(run["volumeMounts"], [{"name": "cargo", "mountPath": "/cache/cargo"}, {"name": "repos", "mountPath": "/cache/repos", "readOnly": True}, {"name": "sccache", "mountPath": "/cache/sccache"}, {"name": "work", "mountPath": "/work"}])
         env = {item["name"]: item.get("value", item.get("valueFrom")) for item in run["env"]}
         self.assertEqual(
             env,
@@ -7466,12 +7467,26 @@ class BuildPods(Served):
                 "CARGO_TARGET_DIR": "/work/target",
                 "FORGE": FETCHING.forge,
                 "GATES_OUT": "/work/out",
+                "SCCACHE_DIRS": "/cache/sccache",
                 "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "duck.duckpond.node",
                 "GIT_CONFIG_VALUE_0": FETCHING.node,
             },
         )
         self.assertEqual(run["command"], ["sh", "-euc", server.BUILD_ENTRY, "build", "programs", BUILT, "dev", "tools", "main"])
+
+    def test_a_gates_build_takes_the_first_sccache_dir_no_build_holds_and_a_killed_ones_again(self):
+        with tempfile.TemporaryDirectory() as dirs:
+            env = {**os.environ, "SCCACHE_DIRS": dirs}
+            shown = server.BUILD_CACHE_SLOT + 'echo "$SCCACHE_DIR $RUSTC_WRAPPER $CARGO_INCREMENTAL"\n'
+            with subprocess.Popen(["sh", "-euc", shown + "read held\n"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as holder:
+                self.assertEqual(holder.stdout.readline(), f"{dirs}/0 sccache 0\n")
+                beside = subprocess.run(["sh", "-euc", shown], env=env, capture_output=True, text=True, check=True)
+                self.assertEqual(beside.stdout, f"{dirs}/1 sccache 0\n")
+                holder.kill()
+            again = subprocess.run(["sh", "-euc", shown], env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(again.stdout, f"{dirs}/0 sccache 0\n")
+            self.assertEqual(sorted(os.listdir(dirs)), ["0.lock", "1.lock"])
 
     def test_a_build_pod_passes_every_builds_pods_rule(self):
         for asked in (self.asked(gates="full"), self.asked(command=["make"])):
