@@ -65,7 +65,7 @@ or through a member node's halo forward.
   stamps the sender as requester too, as `/v1/pods` and `/v1/manifests` do.
 - `POST /v1/builds` makes one build from `{repo, commit, base, gates | command, env, notify,
   limit}`: a bare pod in namespace `builds` named `<chain>-<request>` as any pod is, so its name,
-  the run's id, is in the create's answer, and a lost answer is read again by that name
+  the run's id, is in the create's answer (`{build: {name, phase}}`), and a lost answer is read again by that name
   (`GET /v1/builds/NAME`). Its init container `fetch` mirrors `repo` and tools `main` into its
   node's `/srv/build-jobs/repos` under a lock; then `run`, which mounts that mirror read-only,
   checks `commit` out with `origin/<base>` beside it and runs tools' `gates.sh` with `GATES` set to
@@ -79,6 +79,25 @@ or through a member node's halo forward.
   when unnamed, the gates' own bound from J-493, as `activeDeadlineSeconds`). `GET /v1/builds/NAME/logs` reads its log as a pod's logs read, `DELETE
   /v1/builds/NAME` deletes it for its requester alone, and `notify` posts its end as a pod's.
   An `env` naming a setting the pod makes itself is refused 400.
+- With `PODS_FILL` set, the service keeps a fixed number of cargo-mutants shards of each named
+  repo's `dev` head in flight on the build nodes (J-554). A fill pod is a plain build pod: class
+  `builds`, no node of its own, no preemption, so Kubernetes places fill pods, builds and gates
+  alike in the order they arrive (orthory, chief j-554:239). Each is a command build of tools'
+  `fill.sh` with `SHARD=k/N` and `FILL_JOBS`. The service tops up as it starts and whenever a
+  build pod ends or is deleted, to each repo's count less its fill pods in flight, taking the
+  lowest shard of the head with neither a result nor a pod. When a fill pod ends, the service commits its log
+  from fill.sh's header line on to `/shared/fill/<repo>/<height>-<commit>/<k>-of-<N>.txt`,
+  where height is the block it first read that head at, and deletes the pod; the files tree is
+  the state, so a restart loses nothing. cargo-mutants exits 2 when it finds survivors: the
+  header line says so, and the shard is done, as with 0 (all caught) and 3 (some timed out).
+  Any other exit tested no mutant (4: the unmutated tree's tests failed), so it is lost, as is
+  a pod that ended before fill.sh printed (out of memory, past its deadline, evicted): it writes
+  fill.sh's result or how it ended to `<k>-of-<N>.lost-<n>` instead, and
+  its shard runs once again, as a lost run is called again once; after a second loss it is not
+  run again. A deleted pod writes nothing, so its shard runs again. The service finishes the
+  newest head before it takes `dev`'s tip again, so every shard of a head runs (chief j-554:98).
+  Once every shard of a head is done or lost twice, it writes the head's `summary.txt` (shards
+  done, and which were lost twice) and keeps only the newest 3 heads of that repo.
 - A run a notified pod arms (`ducktape-run armed <channel> <run> <words>` in its log) and
   never ends (`ducktape-run done <run>`) is posted `run <run> lost with pod <pod>: <why>` in
   its channel, once, when the pod ends, when it is deleted, or when the service finds it gone
@@ -193,16 +212,27 @@ or through a member node's halo forward.
   duckpond's node pods.
 - **Optional: build pods.** `PODS_BUILD_IMAGE` (a `localhost:5000/toolchain` image),
   `PODS_BUILD_CPU` and `PODS_BUILD_MEMORY` (each build pod's fixed request, and its memory
-  limit; duckpond's 7 and 28Gi fit four to a lat VM's 32 cpu and 121.8Gi allocatable), and
-  `PODS_BUILD_NAMESPACE` (`builds` when unset). Unset, `/v1/builds` answers 503. `pods.yaml`
+  limit; duckpond's 7 and 28Gi fit four to a build-only lat VM's 32 cpu and 121.8Gi
+  allocatable, and two to a runner VM's 57.79Gi), and
+  `PODS_BUILD_NAMESPACE` (`builds` when unset). Unset, `/v1/builds` answers 503.
+  `PODS_FILL` (`repo:pods:jobs` triples: how many fill pods of that repo are in flight, and
+  cargo-mutants' `-j` in each) turns the fill on. duckpond's `core:13:4,programs:6:2` is the 19
+  places of a 7 cpu / 28Gi pod (chief j-554:267, from 22's read at j-554:264): 3 on each of the
+  3 build-only VMs, whose four leave one for builds and gates, plus 2 on each of the 5 runner
+  VMs (floor(57.79Gi / 28Gi)). It splits about 2:1 between core and programs, and the jobs keep
+  each shard under the 28Gi limit, from the shards' measured memory peaks. Once the SSH runners
+  retire, it becomes 8 × 3 (chief j-554:256). `PODS_FILL_SHARDS` (64 when
+  unset) is how many shards a head is cut into. `pods.yaml`
   writes namespace `builds`: its Role `pods-builds` lets the service create, read, watch, patch and delete pods and read their
   logs; the policy `builds-pods` holds every pod there to what the service writes (uid 10001,
   non-root, no privilege or added capability, `hostUsers: false`, hostPath only
   `/srv/build-jobs/cargo`, `/srv/build-jobs/repos` and `/srv/build-jobs/sccache`, the toolchain image, class `builds`,
   `builds.ducktape/pods=true` and the `ducktape.industries/builds` toleration). Its policy
   `isolated` admits no traffic in and lets its pods out only to their own namespace, DNS and
-  public addresses; `to-duckpond-node` adds TCP 8844 on duckpond's node pods. A node carries
-  `builds.ducktape/pods=true` only once its SSH runner is out, so the two never share a VM. Build
+  public addresses; `to-duckpond-node` adds TCP 8844 on duckpond's node pods. All 8 lat VMs
+  carry `builds.ducktape/pods=true` and the `ducktape.industries/builds=latitude:NoSchedule`
+  taint. A VM that also runs an SSH runner caps the runner at 64G and reserves 66Gi for the
+  system in its kubelet (the 2Gi OS reserve plus that cap), so build pods never overcommit it. Build
   notices keep their open runs in the ConfigMap `build-runs`.
 - **duckpond's Latitude split.** Five of the eight Latitude build VMs are SSH runners: `lat-1`,
   `lat-4`, `lat-5`, `lat-7` and `lat-8`, each named in `PODS_RUNNERS`. The other three, `lat-2`,

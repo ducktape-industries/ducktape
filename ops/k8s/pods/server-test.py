@@ -174,6 +174,12 @@ class Kube:
     def list(self):
         return self.ran("list")
 
+    def labelled(self, selector):
+        return self.ran("labelled", selector)
+
+    def delete(self, name):
+        return self.ran("delete", name)
+
     def logs(self, name, options):
         return self.ran("logs", name, options)
 
@@ -7532,7 +7538,7 @@ class BuildPods(Served):
         self.builds.answer("create", ran(pod_json()))
         status, answer = self.call("POST", "/v1/builds", self.asked(gates="check", notify={"channel": "j-532"}))
         self.assertEqual(status, 201, answer)
-        self.assertEqual(answer["build"]["name"], "duckpond-41")
+        self.assertEqual(answer["build"], {"name": "duckpond-41", "phase": "Pending"})
         pod = self.built()
         self.assertEqual((pod["kind"], pod["metadata"]["name"], pod["metadata"]["namespace"]), ("Pod", "duckpond-41", "builds"))
         self.assertEqual(pod["metadata"]["labels"]["ducktape.industries/requester"], "17")
@@ -7822,6 +7828,190 @@ class ClaimOwners(Served):
         status, answer = self.call("GET", "/v1/usage")
         self.assertEqual(status, 200, answer)
         self.assertEqual([(row["claim"], row["pod"], row["phase"]) for row in answer["claims"]], [("claim-0", "runner", "Running"), ("claim-1", None, None), ("claim-2", None, None)])
+
+
+FILL_COMMIT = "c" * 40
+FILL_AT = "900-" + FILL_COMMIT
+
+
+def ref_names_reply(height, refs):
+    items = b"".join(server.borsh_text(name) + server.borsh_text(target) for name, target in refs)
+    return server.u8(14) + server.u64(height) + server.u64(height) + len(refs).to_bytes(4, "little") + items + server.u8(0)
+
+
+def listing_reply(names):
+    entries = b"".join(server.borsh_text(f"/shared/fill/core/{name}") + server.u8(1) + server.u8(0) + bytes(32) + server.u64(0) + (0).to_bytes(4, "little") for name in names)
+    return server.u8(4) + server.u8(0) + server.u64(900) + len(names).to_bytes(4, "little") + entries + server.u8(0)
+
+
+def fill_pod_json(shard, phase="Running", state=None, reason=None):
+    pod = pod_json(name=f"fill-core-{shard}", state=state, phase=phase, reason=reason, requester=None)
+    pod["metadata"]["labels"].update({"ducktape.industries/fill-repo": "core", "ducktape.industries/fill-head": FILL_AT, "ducktape.industries/fill-shard": f"{shard}-of-64"})
+    pod["spec"]["nodeSelector"] = {"builds.ducktape/pods": "true"}
+    return pod
+
+
+def finished(code):
+    return {"terminated": {"exitCode": code, "reason": "Completed" if code == 0 else "Error"}}
+
+
+class FillSigner(Signer):
+    def __init__(self):
+        super().__init__()
+        self.answers = {}
+        self.put_ran = ran(b"sha256:" + b"ab" * 32 + b"\nbundle 7 put at block 900\nbundle 7 held since block 901\n")
+
+    def query(self, program, request):
+        if (program, request) == ("files", server.files_head()):
+            return self.head
+        self.queries.append((program, request))
+        answer = self.answers.get((program, request), ran(code=1, err="not_found: no directory"))
+        if isinstance(answer, list):
+            return answer.pop(0) if len(answer) > 1 else answer[0]
+        return answer
+
+
+class FillSource(unittest.TestCase):
+    def setUp(self):
+        self.builds = Kube()
+        self.builds.namespace = "builds"
+        self.signer = FillSigner()
+        fetching = server.Fetching(image="pods", node="https://node.example", forge="https://node.example/forge", block_ms=1000)
+        self.filler = server.Filler(server.Building(self.builds, BUILD_POD_IMAGE, "7", "28Gi"), self.signer, fetching, {"core": (3, 4)}, 64, 0)
+        self.filler.pause = lambda seconds: None
+        self.builds.answer("labelled", ran({"items": []}))
+        refs = [("refs/heads/dev", FILL_COMMIT), ("refs/heads/dev-old", "d" * 40)]
+        self.signer.answers[("forge", server.forge_ref_names("core", "refs/heads/dev", None))] = ran(ref_names_reply(950, refs))
+
+    def listing(self, path, *listings):
+        self.signer.answers[("files", server.files_list(path, None, None))] = [ran(listing_reply(names)) for names in listings]
+
+    def created(self):
+        return [call[1] for call in self.builds.calls if call[0] == "create"]
+
+    def shards(self):
+        return [pod["metadata"]["labels"]["ducktape.industries/fill-shard"] for pod in self.created()]
+
+    def test_a_top_up_starts_the_lowest_free_shards_up_to_its_repos_count_in_flight(self):
+        self.builds.answer("labelled", ran({"items": [fill_pod_json(0), fill_pod_json(2, phase="Succeeded", state=finished(0))]}))
+        self.listing("/shared/fill/core", [FILL_AT])
+        self.listing(f"/shared/fill/core/{FILL_AT}", ["1-of-64.txt", "3-of-16.txt"])
+        self.filler.top_up()
+        self.assertEqual(self.shards(), ["3-of-64", "4-of-64"])
+        pod = self.created()[0]
+        self.assertEqual(pod["metadata"]["name"], "fill-core-cccccccccccc-3")
+        self.assertEqual(pod["metadata"]["labels"]["ducktape.industries/fill-head"], FILL_AT)
+        self.assertNotIn("ducktape.industries/requester", pod["metadata"]["labels"])
+        self.assertEqual(pod["spec"]["priorityClassName"], "builds")
+        self.assertEqual(pod["spec"]["nodeSelector"], {"builds.ducktape/pods": "true"})
+        (run,) = pod["spec"]["containers"]
+        self.assertEqual(run["command"][-2:], ["sh", "/work/tools/fill.sh"])
+        self.assertIn({"name": "SHARD", "value": "3/64"}, run["env"])
+        self.assertIn({"name": "FILL_JOBS", "value": "4"}, run["env"])
+        self.assertEqual(run["resources"], {"requests": {"cpu": "7", "memory": "28Gi"}, "limits": {"memory": "28Gi"}})
+
+    def test_a_new_dev_head_starts_at_shard_zero_under_the_block_it_was_read_at(self):
+        self.filler.top_up()
+        self.assertEqual(self.shards(), ["0-of-64", "1-of-64", "2-of-64"])
+        self.assertEqual({pod["metadata"]["labels"]["ducktape.industries/fill-head"] for pod in self.created()}, {f"950-{FILL_COMMIT}"})
+
+    def test_an_unsettled_head_is_finished_before_dev_moves_on(self):
+        self.signer.answers[("forge", server.forge_ref_names("core", "refs/heads/dev", None))] = ran(ref_names_reply(990, [("refs/heads/dev", "d" * 40)]))
+        self.listing("/shared/fill/core", [FILL_AT])
+        self.listing(f"/shared/fill/core/{FILL_AT}", [f"{shard}-of-64.txt" for shard in range(10)])
+        self.filler.top_up()
+        self.assertEqual(self.shards(), ["10-of-64", "11-of-64", "12-of-64"])
+        self.assertEqual({pod["metadata"]["labels"]["ducktape.industries/fill-head"] for pod in self.created()}, {FILL_AT})
+
+    def test_each_repo_counts_only_its_own_fill_pods_in_flight(self):
+        programs = {"metadata": {"labels": {"ducktape.industries/fill-repo": "programs"}}}
+        live = [fill_pod_json(0), fill_pod_json(1)] + [programs] * 8
+        self.assertEqual(server.fill_free({"core": (16, 4), "programs": (8, 2)}, live), {"core": 14, "programs": 0})
+        self.assertEqual(server.fill_free({"core": (1, 4)}, live), {"core": 0})
+
+    def test_with_its_count_in_flight_a_top_up_reads_neither_forge_nor_files(self):
+        self.builds.answer("labelled", ran({"items": [fill_pod_json(shard) for shard in range(3)]}))
+        self.filler.top_up()
+        self.assertEqual((self.created(), self.signer.queries), ([], []))
+
+    def test_an_ended_shard_is_written_from_its_header_line_on_then_deleted(self):
+        block = "fill shard 3/64 jobs 4 exit 2 memory.peak 1\n9 mutants tested: 1 missed, 8 caught\nMISSED src/a.rs:1:1: replace f with g\n"
+        self.builds.answer("logs", ran(("build fill-core-3: running from now\n" + block).encode()))
+        ended = fill_pod_json(3, phase="Failed", state=finished(2))
+        self.filler.event({"type": "MODIFIED", "object": ended})
+        self.filler.event({"type": "MODIFIED", "object": ended})
+        self.assertEqual(self.signer.puts, [([block.encode()], "chunk")])
+        ((program, payload),) = self.signer.submits
+        self.assertEqual(program, "files")
+        self.assertIn(server.borsh_text(f"/shared/fill/core/{FILL_AT}/3-of-64.txt"), payload)
+        self.assertIn(("delete", "fill-core-3"), self.builds.calls)
+
+    def test_a_shard_cut_before_its_result_is_lost_once_and_runs_again(self):
+        others = [f"{shard}-of-64.txt" for shard in range(64) if shard != 5]
+        self.listing("/shared/fill/core", [FILL_AT])
+        self.listing(f"/shared/fill/core/{FILL_AT}", others, others + ["5-of-64.lost-1"])
+        self.builds.answer("logs", ran(b"build fill-core-5: running from now\n"))
+        self.filler.event({"type": "MODIFIED", "object": fill_pod_json(5, phase="Failed", reason="DeadlineExceeded")})
+        self.assertEqual(self.signer.puts, [([b"pod fill-core-5 ended: DeadlineExceeded before fill.sh printed its result\n"], "chunk")])
+        ((_, payload),) = self.signer.submits
+        self.assertIn(server.borsh_text(f"/shared/fill/core/{FILL_AT}/5-of-64.lost-1"), payload)
+        self.assertNotIn(b"5-of-64.txt", payload)
+        self.assertIn(("delete", "fill-core-5"), self.builds.calls)
+        self.assertEqual(self.shards(), ["5-of-64"])
+
+    def test_a_shard_whose_unmutated_tests_failed_is_lost_not_done(self):
+        block = "fill shard 29/64 jobs 2 exit 4 memory.peak 1\n"
+        self.builds.answer("logs", ran(block.encode()))
+        self.filler.event({"type": "MODIFIED", "object": fill_pod_json(29, phase="Failed", state=finished(4))})
+        self.assertEqual(self.signer.puts, [([block.encode()], "chunk")])
+        ((_, payload),) = self.signer.submits
+        self.assertIn(server.borsh_text(f"/shared/fill/core/{FILL_AT}/29-of-64.lost-1"), payload)
+        self.assertEqual([server.fill_exit(f"fill shard 1/64 jobs 2 exit {code} memory.peak 1".encode()) in server.FILL_FINISHED for code in (0, 2, 3, 4, 70)], [True, True, True, False, False])
+
+    def test_a_shard_lost_twice_is_not_run_again_and_its_head_settles(self):
+        heads = [f"{height}-{digit * 40}" for height, digit in ((100, "a"), (200, "b"), (300, "d"))] + [FILL_AT]
+        others = [f"{shard}-of-64.txt" for shard in range(64) if shard != 5]
+        self.listing("/shared/fill/core", heads)
+        self.listing(f"/shared/fill/core/{FILL_AT}", others + ["5-of-64.lost-1"], others + ["5-of-64.lost-1", "5-of-64.lost-2"])
+        self.builds.answer("logs", ran(b""))
+        self.filler.event({"type": "MODIFIED", "object": fill_pod_json(5, phase="Failed", state={"terminated": {"exitCode": 137, "reason": "OOMKilled"}})})
+        written, _, pruned = [payload for _, payload in self.signer.submits]
+        self.assertIn(server.borsh_text(f"/shared/fill/core/{FILL_AT}/5-of-64.lost-2"), written)
+        self.assertEqual(self.signer.puts[1], ([f"core {FILL_AT}: 63 of 64 shards done, 1 lost twice: 5\n".encode()], "chunk"))
+        self.assertEqual(pruned[-len(server.files_remove(f"/shared/fill/core/{heads[0]}")) :], server.files_remove(f"/shared/fill/core/{heads[0]}"))
+        self.assertEqual(self.created(), [])
+
+    def test_a_deleted_shard_writes_nothing_and_tops_up(self):
+        preempted = fill_pod_json(4, phase="Failed", state=finished(137))
+        preempted["metadata"]["deletionTimestamp"] = "2026-10-23T05:00:00Z"
+        self.filler.event({"type": "MODIFIED", "object": preempted})
+        self.filler.event({"type": "DELETED", "object": preempted})
+        self.assertEqual(self.signer.puts, [])
+        self.assertNotIn("delete", self.builds.verbs())
+        self.assertEqual(self.builds.verbs().count("labelled"), 2)
+
+    def test_a_head_whose_shards_are_all_written_keeps_only_the_newest_three_heads(self):
+        heads = [f"{height}-{digit * 40}" for height, digit in ((100, "a"), (200, "b"), (300, "d"), (400, "e"))] + [FILL_AT]
+        self.listing("/shared/fill/core", heads)
+        self.listing(f"/shared/fill/core/{FILL_AT}", [f"{shard}-of-64.txt" for shard in range(64)] + ["63-of-64.lost-1"])
+        self.builds.answer("logs", ran(b"fill shard 63/64 jobs 4 exit 0 memory.peak 1\n"))
+        self.filler.event({"type": "MODIFIED", "object": fill_pod_json(63, phase="Succeeded", state=finished(0))})
+        written, summary, pruned = [payload for _, payload in self.signer.submits]
+        self.assertIn(server.borsh_text(f"/shared/fill/core/{FILL_AT}/63-of-64.txt"), written)
+        self.assertIn(server.borsh_text(f"/shared/fill/core/{FILL_AT}/summary.txt"), summary)
+        self.assertEqual(self.signer.puts[1], ([f"core {FILL_AT}: 64 of 64 shards done, 0 lost twice\n".encode()], "chunk"))
+        for old in heads[:2]:
+            self.assertIn(server.files_remove(f"/shared/fill/core/{old}"), pruned)
+        for kept in heads[2:]:
+            self.assertNotIn(server.borsh_text(f"/shared/fill/core/{kept}"), pruned)
+
+    def test_fill_is_off_unless_named_and_reads_repo_pods_jobs_triples(self):
+        self.assertIsNone(server.fill_of({}))
+        self.assertEqual(server.fill_of({"PODS_FILL": "core:16:4,programs:8:2"}), ({"core": (16, 4), "programs": (8, 2)}, 64))
+        self.assertEqual(server.fill_of({"PODS_FILL": "core:3:4", "PODS_FILL_SHARDS": "16"}), ({"core": (3, 4)}, 16))
+        for given in ({"PODS_FILL": "core"}, {"PODS_FILL": "core:4"}, {"PODS_FILL": "core:0:4"}, {"PODS_FILL": "core:4:0"}, {"PODS_FILL": "core:1:1:1"}, {"PODS_FILL": "/etc:1:1"}, {"PODS_FILL": "core:4:4", "PODS_FILL_SHARDS": "0"}):
+            with self.assertRaises(server.Refused):
+                server.fill_of(given)
 
 
 if __name__ == "__main__":

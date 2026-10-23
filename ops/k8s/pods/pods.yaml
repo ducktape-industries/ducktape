@@ -589,6 +589,7 @@ spec:
             - {name: PODS_BUILD_IMAGE, value: "localhost:5000/toolchain:436bbb1f713d@sha256:6ae72f0c210a163e5c3fbd52abd55b7638674805f2dd5796adf923b601c5beb7"}
             - {name: PODS_BUILD_CPU, value: "7"}
             - {name: PODS_BUILD_MEMORY, value: "28Gi"}
+            - {name: PODS_FILL, value: "core:13:4,programs:6:2"}
           resources:
             requests: {cpu: 653m}
           ports:

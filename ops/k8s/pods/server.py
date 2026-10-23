@@ -91,6 +91,17 @@ BUILD_LIMIT_MINUTES = 40
 BUILD_WORK = "/work"
 BUILD_TOOLS = ("tools", "main")
 BUILD_SET = ("NODE", "HOME", "MIRRORS", "CARGO_HOME", "CARGO_TARGET_DIR", "FORGE", "GATES", "GATES_OUT", "SCCACHE_DIRS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+FILL_REPO = NOTE + "fill-repo"
+FILL_HEAD = NOTE + "fill-head"
+FILL_SHARD = NOTE + "fill-shard"
+FILL_ROOT = "/shared/fill"
+FILL_BASE = "dev"
+FILL_KEPT = 3
+FILL_SHARDS = 64
+FILL_RUNS = 2
+FILL_FINISHED = (0, 2, 3)
+FILL_SCRIPT = f"{BUILD_WORK}/tools/fill.sh"
+FILL_HEADER = "fill shard "
 REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 COMMIT_ID = re.compile(r"[0-9a-f]{40}")
@@ -922,8 +933,16 @@ def files_put(path, size, chunks):
 
 
 def files_commit_many(base, message, items, removed=()):
-    changes = [files_put(*item) for item in items] + [u8(2) + borsh_text(path) for path in removed]
+    return files_changes(base, message, [files_put(*item) for item in items] + [files_remove(path) for path in removed])
+
+
+def files_changes(base, message, changes):
     return u8(1) + borsh_option(base, blob_id) + borsh_text(message) + borsh_vec(changes)
+
+
+def files_remove(path):
+    return u8(2) + borsh_text(path)
+
 
 
 def egress_request(request):
@@ -993,6 +1012,12 @@ class Kube:
 
     def list(self):
         return self.call("get", "pods", "--output", "json")
+
+    def labelled(self, selector):
+        return self.call("get", "pods", "--selector", selector, "--output", "json")
+
+    def delete(self, name):
+        return self.call("delete", "pod", name, "--wait=false")
 
     def logs(self, name, options):
         return self.call("logs", name, *options)
@@ -1883,6 +1908,76 @@ def build_pod(asked, requester, body, building, fetching):
     }
 
 
+def fill_label(shard, shards):
+    return f"{shard}-of-{shards}"
+
+
+def fill_done(names, shards):
+    return {int(name.split("-", 1)[0]) for name in names if re.fullmatch(rf"\d+-of-{shards}\.txt", name)}
+
+
+def fill_exit(result):
+    header = re.match(rb"fill shard \S+ jobs \S+ exit (\d+)", result)
+    return int(header.group(1)) if header else None
+
+
+def fill_lost(names, label):
+    return sum(1 for name in names if re.fullmatch(rf"{re.escape(label)}\.lost-\d+", name))
+
+
+def fill_spent(names, shards):
+    return {shard for shard in range(shards) if fill_lost(names, fill_label(shard, shards)) >= FILL_RUNS}
+
+
+def fill_settled(names, shards):
+    return len(fill_done(names, shards) | fill_spent(names, shards)) == shards
+
+
+def fill_height(name):
+    dated = re.fullmatch(r"(\d+)-[0-9a-f]{40,64}", name)
+    return int(dated.group(1)) if dated else None
+
+
+def fill_live(pod):
+    return exit_line(pod) is None and "deletionTimestamp" not in pod["metadata"]
+
+
+def fill_free(repos, live):
+    held = [(pod["metadata"].get("labels") or {}).get(FILL_REPO) for pod in live]
+    return {repo: max(0, pods - held.count(repo)) for repo, (pods, _) in repos.items()}
+
+
+def fill_result(log):
+    lines = log.splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines) if line.startswith(FILL_HEADER)]
+    return "".join(lines[starts[-1] :]).encode()[:CHUNK_SIZE] if starts else None
+
+
+def fill_pod(building, fetching, repo, jobs, head, shard, shards):
+    commit = head.split("-", 1)[1]
+    asked = {"chain": "fill", "program": "pods", "request": f"{repo}-{commit[:12]}-{shard}"}
+    body = {"repo": repo, "commit": commit, "base": FILL_BASE, "command": ["sh", FILL_SCRIPT], "env": {"SHARD": f"{shard}/{shards}", "FILL_JOBS": str(jobs)}}
+    pod = build_pod(asked, None, body, building, fetching)
+    pod["metadata"]["labels"].update({FILL_REPO: repo, FILL_HEAD: head, FILL_SHARD: fill_label(shard, shards)})
+    return pod
+
+
+def fill_of(environ):
+    given = environ.get("PODS_FILL", "")
+    if not given:
+        return None
+    repos = {}
+    for entry in given.split(","):
+        parts = entry.strip().split(":")
+        if len(parts) != 3 or not REPO_NAME.fullmatch(parts[0]) or not all(part.isdigit() and int(part) >= 1 for part in parts[1:]):
+            raise Refused(400, f"PODS_FILL lists repo:pods:jobs triples, such as core:16:4,programs:8:2, not {entry!r}")
+        repos[parts[0]] = (int(parts[1]), int(parts[2]))
+    shards = environ.get("PODS_FILL_SHARDS", str(FILL_SHARDS))
+    if not shards.isdigit() or int(shards) < 1:
+        raise Refused(400, f"PODS_FILL_SHARDS is how many shards a head is cut into, a whole number from 1, not {shards!r}")
+    return repos, int(shards)
+
+
 def refused_kind(kind):
     base = kind.lower().split(".")[0]
     return ALIASES.get(base, base)
@@ -2222,6 +2317,10 @@ def view(pod):
     }
 
 
+def build_answer(pod):
+    return {"name": pod["metadata"]["name"], "phase": (pod.get("status") or {}).get("phase")}
+
+
 def deleted_by_requester(pod):
     meta = pod["metadata"]
     uid, _, asked = ((meta.get("annotations") or {}).get(DELETED) or "").partition(" ")
@@ -2454,6 +2553,10 @@ def forge_statuses(repo, commit, after):
     return u8(19) + borsh_text(repo) + borsh_text(commit) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
 
 
+def forge_ref_names(repo, prefix, after):
+    return u8(16) + borsh_text(repo) + borsh_text(prefix) + borsh_option(after, borsh_bytes) + borsh_option(None, u64)
+
+
 def forge_answer(reply, tag, query, paged):
     reader = Reader(reply)
     if reader.u8() != tag:
@@ -2556,6 +2659,16 @@ def statuses_of(reply):
         reader.u64()
         found.append({"reporter": reporter, "context": context, "state": CHECK_STATES[state]})
     return found, page_next(reader)
+
+
+def ref_names_of(reply):
+    reader = Reader(reply)
+    if reader.u8() != 14:
+        raise Refused(502, "forge answered RefNames with something else")
+    height = reader.u64()
+    reader.u64()
+    refs = [(text_at(reader), text_at(reader)) for _ in range(page_count(reader))]
+    return height, refs, page_next(reader)
 
 
 def repo_of_key(word):
@@ -4321,6 +4434,204 @@ def json_stream(stream):
             buffer = buffer[end:]
 
 
+class Filler:
+    def __init__(self, building, signer, fetching, repos, shards, retry_pause):
+        self.building = building
+        self.kube = building.kube
+        self.signer = signer
+        self.fetching = fetching
+        self.repos = repos
+        self.shards = shards
+        self.retry_pause = retry_pause
+        self.ended = set()
+        self.pause = time.sleep
+
+    def asked(self, program, request):
+        ran = self.signer.query(program, request)
+        why = failed(ran)
+        if why is not None:
+            raise Refused(502, f"{program} was not asked: {why}")
+        return ran.out
+
+    def listed(self, path):
+        names, after = [], None
+        while True:
+            ran = self.signer.query(FILES_PROGRAM, files_list(path, None, after))
+            why = failed(ran)
+            if why is not None and "not_found" in why:
+                return names
+            if why is not None:
+                raise Refused(502, f"{path} was not listed: {why}")
+            entries, after = files_entries(ran.out)
+            names += [PurePosixPath(path).name for path, _ in entries]
+            if after is None:
+                return names
+
+    def head(self, repo):
+        branch, after = f"refs/heads/{FILL_BASE}", None
+        while True:
+            height, refs, after = ref_names_of(self.asked(FORGE_PROGRAM, forge_ref_names(repo, branch, after)))
+            for name, target in refs:
+                if name == branch:
+                    return height, target
+            if after is None:
+                raise Refused(502, f"forge names no {branch} in {repo}")
+
+    def pods(self):
+        ran = self.kube.labelled(FILL_REPO)
+        if ran.code != 0:
+            raise kube_refusal(ran, "the fill pods were not listed")
+        return json.loads(ran.out).get("items") or []
+
+    def wanted(self, pods, free):
+        labels = [pod["metadata"].get("labels") or {} for pod in pods]
+        queues = []
+        for repo in self.repos:
+            if not free[repo]:
+                continue
+            head, names = self.current(repo, labels)
+            done = fill_done(names, self.shards) | fill_spent(names, self.shards)
+            taken = {held.get(FILL_SHARD) for held in labels if held.get(FILL_REPO) == repo and held.get(FILL_HEAD) == head}
+            queues.append([(repo, head, shard) for shard in range(self.shards) if shard not in done and fill_label(shard, self.shards) not in taken][: free[repo]])
+        return [item for turn in itertools.zip_longest(*queues) for item in turn if item is not None]
+
+    def current(self, repo, labels):
+        running = {held.get(FILL_HEAD) for held in labels if held.get(FILL_REPO) == repo}
+        dated = [name for name in set(self.listed(f"{FILL_ROOT}/{repo}")) | running if fill_height(name or "") is not None]
+        if dated:
+            newest = max(dated, key=fill_height)
+            names = self.listed(f"{FILL_ROOT}/{repo}/{newest}")
+            if not fill_settled(names, self.shards):
+                return newest, names
+        height, commit = self.head(repo)
+        head = next((name for name in dated if name.endswith(f"-{commit}")), f"{height}-{commit}")
+        return head, self.listed(f"{FILL_ROOT}/{repo}/{head}")
+
+    def top_up(self):
+        pods = self.pods()
+        free = fill_free(self.repos, [pod for pod in pods if fill_live(pod)])
+        if not any(free.values()):
+            return
+        for repo, head, shard in self.wanted(pods, free):
+            pod = fill_pod(self.building, self.fetching, repo, self.repos[repo][1], head, shard, self.shards)
+            name = pod["metadata"]["name"]
+            ran = self.kube.create(pod)
+            if ran.code == 0:
+                say("pods_fill_started", pod=name, repo=repo, head=head, shard=fill_label(shard, self.shards))
+            elif "AlreadyExists" not in ran.err:
+                raise kube_refusal(ran, f"fill pod {name} was not created")
+
+    def harvest(self, pod):
+        meta = pod["metadata"]
+        name, labels = meta["name"], meta.get("labels") or {}
+        repo, head, shard = (labels.get(key) or "" for key in (FILL_REPO, FILL_HEAD, FILL_SHARD))
+        if not REPO_NAME.fullmatch(repo) or fill_height(head) is None or not re.fullmatch(r"\d+-of-\d+", shard):
+            say("pods_fill_unread", pod=name)
+            return
+        ran = self.kube.logs(name, ["--container", RUN])
+        result = fill_result(ran.out.decode(errors="replace") if ran.code == 0 else "")
+        folder = f"{FILL_ROOT}/{repo}/{head}"
+        path = f"{folder}/{shard}.txt"
+        if result is None or fill_exit(result) not in FILL_FINISHED:
+            ended = exit_line(pod) or f"pod {name} ended"
+            lost = fill_lost(self.listed(folder), shard) + 1
+            say("pods_fill_lost", pod=name, attempt=lost, detail=json.dumps(ended))
+            told = f"{ended} before fill.sh printed its result\n".encode() if result is None else result
+            path, result = f"{folder}/{shard}.lost-{lost}", told
+        if not self.write(path, result, f"pods: fill {repo} {head} shard {shard}"):
+            return
+        deleted = self.kube.delete(name)
+        if deleted.code != 0:
+            say("pods_fill_undeleted", pod=name, detail=json.dumps(deleted.err))
+        names = self.listed(folder)
+        if fill_settled(names, self.shards):
+            self.settle(repo, head, names)
+
+    def settle(self, repo, head, names):
+        done, spent = fill_done(names, self.shards), sorted(fill_spent(names, self.shards))
+        lost = f": {' '.join(map(str, spent))}" if spent else ""
+        line = f"{repo} {head}: {len(done)} of {self.shards} shards done, {len(spent)} lost twice{lost}\n"
+        say("pods_fill_settled", repo=repo, head=head, done=len(done), lost=len(spent))
+        self.write(f"{FILL_ROOT}/{repo}/{head}/summary.txt", line.encode(), f"pods: fill {repo} {head} settled")
+        self.prune(repo)
+
+    def prune(self, repo):
+        dated = sorted((name for name in self.listed(f"{FILL_ROOT}/{repo}") if fill_height(name) is not None), key=fill_height, reverse=True)
+        old = dated[FILL_KEPT:]
+        if old:
+            self.commit([files_remove(f"{FILL_ROOT}/{repo}/{name}") for name in old], f"pods: fill keeps {repo}'s newest {FILL_KEPT} heads")
+
+    def write(self, path, data, message):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "result"
+            file.write_bytes(data)
+            put = self.signer.put([file], CHUNK)
+        why = failed(put)
+        if why is not None:
+            say("pods_fill_unwritten", path=path, detail=json.dumps(why))
+            return False
+        return self.commit([files_put(path, len(data), put_answer(put.out.decode(), 1)["blobs"])], message)
+
+    def commit(self, changes, message):
+        pause = self.retry_pause
+        while True:
+            head = self.signer.query(FILES_PROGRAM, files_head())
+            why = failed(head)
+            if why is None:
+                outcome, reason, sentence, _ = receipt(self.signer.submit(FILES_PROGRAM, files_changes(head_of(head.out), message, changes)))
+                if outcome == "applied":
+                    return True
+                why = f"{reason or outcome}: {sentence}"
+                again = moved_under(outcome, reason, sentence) or outcome in ("unknown", "unlanded") or (outcome == "failed" and unanswered(sentence))
+            else:
+                again = unanswered(why)
+            if not again:
+                say("pods_fill_unwritten", detail=json.dumps(why))
+                return False
+            say("pods_retried", reason="fill_unwritten", detail=json.dumps(why))
+            self.pause(pause)
+            pause *= 2
+
+    def safely(self, step, *args):
+        try:
+            step(*args)
+        except (Refused, Unanswered, OSError, ValueError, KeyError) as error:
+            say("pods_fill_skipped", step=step.__name__, detail=json.dumps(error.sentence if isinstance(error, Refused) else repr(error)))
+
+    def event(self, event):
+        kind = event.get("type")
+        pod = event.get("object") or {}
+        meta = pod.get("metadata") or {}
+        name = meta.get("name")
+        if kind == "DELETED":
+            self.ended.discard(name)
+            self.safely(self.top_up)
+            return
+        if kind not in ("ADDED", "MODIFIED") or name in self.ended or exit_line(pod) is None:
+            return
+        self.ended.add(name)
+        if FILL_REPO in (meta.get("labels") or {}) and "deletionTimestamp" not in meta:
+            self.safely(self.harvest, pod)
+        self.safely(self.top_up)
+
+    def watch(self):
+        failures = 0
+        while True:
+            self.safely(self.top_up)
+            process = self.kube.watch()
+            for event in json_stream(process.stdout):
+                self.event(event)
+            code = process.wait()
+            if code == 0:
+                failures = 0
+                continue
+            failures += 1
+            if failures & (failures - 1) == 0:
+                detail = process.stderr.read().decode(errors="replace").strip()
+                say("pods_fill_unwatched", attempts=failures, detail=json.dumps(detail))
+            self.pause(WATCH_PAUSE)
+
+
 class Service:
     def __init__(self, kube, signer, fetching, stats, api, runners=None, warm_pod=None, building=None):
         self.kube = kube
@@ -4608,11 +4919,11 @@ class Service:
         pod = build_pod(asked, self.requester(asked), unrequested(body, "a build"), building, self.fetching)
         ran = building.kube.create(pod)
         if ran.code == 0:
-            return 201, {"build": view(json.loads(ran.out))}
+            return 201, {"build": build_answer(json.loads(ran.out))}
         refusal = kube_refusal(ran, "the build was not created")
         if refusal.status != 409 or "AlreadyExists" not in ran.err:
             raise refusal
-        return 200, {"build": view(self.build_read(pod["metadata"]["name"]))}
+        return 200, {"build": build_answer(self.build_read(pod["metadata"]["name"]))}
 
     def build_read(self, name):
         ran = self.built().kube.get(name)
@@ -6390,10 +6701,18 @@ def main():
         building = building_of(os.environ, kube.kubectl)
     except Refused as refusal:
         sys.exit(refusal.sentence)
+    try:
+        filling = fill_of(os.environ)
+    except Refused as refusal:
+        sys.exit(refusal.sentence)
     service = Service(kube, signer, fetching, Stats(), Api(), runners, os.environ.get("PODS_WARM_POD"), building)
     service.background.start(service.notifier.watch)
     if service.build_notifier:
         service.background.start(service.build_notifier.watch)
+    if building and filling and signer.held():
+        filler = Filler(building, signer, fetching, *filling, service.retry_pause)
+        filler.pause = service.background.pause
+        service.background.start(filler.watch)
     service.background.start(service.sweeper)
     if signer.held():
         service.background.start(service.rerunner.watch)
