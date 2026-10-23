@@ -126,6 +126,17 @@ impl<E: Context> Holds<E> {
         }
     }
 
+    pub fn serving(&self, hold: u64, program: &str) -> Option<Arc<Serving<E>>> {
+        self.held
+            .load()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|pinned| pinned.number == hold)?
+            .programs()
+            .get(program)
+            .cloned()
+    }
+
     pub fn release(&self, hold: u64, program: &str) {
         let pinned = self
             .held

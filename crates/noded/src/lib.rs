@@ -31,6 +31,7 @@ mod run;
 mod server;
 mod snapshot;
 mod standing;
+pub mod state_lane;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 mod transport;

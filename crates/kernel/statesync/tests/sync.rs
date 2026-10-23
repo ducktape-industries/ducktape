@@ -1,3 +1,6 @@
+#[path = "sync/bulk.rs"]
+mod bulk;
+
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::Path;

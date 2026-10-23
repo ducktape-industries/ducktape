@@ -21,7 +21,7 @@ pub use error::{EngineError, Error, ServeError};
 
 mod gaps;
 pub(crate) mod journal;
-pub(crate) use journal::Journal;
+pub use journal::Journal;
 
 mod metrics;
 pub use metrics::Metrics;

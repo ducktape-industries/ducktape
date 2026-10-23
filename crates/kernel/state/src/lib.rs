@@ -1,5 +1,6 @@
 mod commitment;
 mod overlay;
+mod receiving;
 mod storage;
 mod view;
 
@@ -15,6 +16,7 @@ pub use commitment::{
     holds, partition_prefix,
 };
 pub use overlay::{Checkpoint, Overlay, Slot};
+pub use receiving::Receiving;
 pub use storage::{RESERVED_PREFIX, Reads, Storage, reserved, valid_program_id};
 pub use view::View;
 
@@ -36,6 +38,17 @@ pub enum Error {
     },
     #[error("state is corrupt: {0}")]
     Corrupt(String),
+    #[error("sync operations at {from}, count {count}, are outside {start}..{end}")]
+    SyncRange {
+        from: u64,
+        count: u64,
+        start: u64,
+        end: u64,
+    },
+    #[error("sync stopped at {received}, before its target {end}")]
+    IncompleteSync { received: u64, end: u64 },
+    #[error("sync root {actual:?} differs from target {expected:?}")]
+    RootMismatch { expected: Root, actual: Root },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -57,6 +57,41 @@ impl<E: Context> Serving<E> {
         *self.reader.size()
     }
 
+    pub async fn pinned(&self) -> Result<Vec<Digest>> {
+        let Some(target) = &self.target else {
+            return Ok(Vec::new());
+        };
+        self.reader
+            .pinned_nodes_at(target.range.start())
+            .await
+            .map_err(qmdb::Error::<Family>::from)
+            .map_err(Error::from)
+    }
+
+    pub async fn ops(&self, from: u64, max: NonZeroU64) -> Result<Vec<Op>> {
+        let (start, end) = self
+            .target
+            .as_ref()
+            .map(|target| (*target.range.start(), *target.range.end()))
+            .unwrap_or((0, 0));
+        let outside = from < start || from > end;
+        if outside {
+            return Err(Error::SyncRange {
+                from,
+                count: max.get(),
+                start,
+                end,
+            });
+        }
+        let until = from.saturating_add(max.get()).min(end);
+        let positions: Vec<_> = (from..until).collect();
+        self.reader
+            .read_many(&positions)
+            .await
+            .map_err(qmdb::Error::<Family>::from)
+            .map_err(Error::from)
+    }
+
     pub async fn op_proof(&self, size: u64, key: &[u8], value: &[u8]) -> Result<Option<OpProof>> {
         let bounds = self.reader.bounds();
         let held = bounds.start < size && size <= bounds.end;
@@ -294,6 +329,23 @@ where
         })
     }
 
+    pub async fn receive(
+        context: E,
+        name: &str,
+        target: SyncTarget,
+    ) -> Result<crate::Receiving<E>> {
+        crate::Receiving::open(context, name, target).await
+    }
+
+    pub(crate) async fn received(name: String, db: Db<E>) -> Result<Self> {
+        let (db, serving) = served(db).await?;
+        Ok(Self {
+            name,
+            db: Some(db),
+            serving,
+        })
+    }
+
     pub fn db(&self) -> Result<&Db<E>> {
         self.db
             .as_ref()
@@ -425,13 +477,20 @@ where
     ) -> Result<(BTreeMap<Vec<u8>, Slot>, HashSet<Digest>)> {
         let db = self.db()?;
         let bounds = db.bounds();
-        let page = Tuning::default().sync_apply_batch;
+        let page = Tuning::default().sync_apply_batch.get();
         let mut names: HashMap<Digest, Vec<u8>> = HashMap::new();
         let mut unnamed = HashSet::new();
         let mut keys = BTreeMap::new();
         let mut at = from;
         while at < bounds.end {
-            let (_, ops) = db.proof(at, page).await?;
+            let end = at.checked_add(page).unwrap_or(bounds.end).min(bounds.end);
+            let positions: Vec<_> = (*at..*end).collect();
+            let ops = self
+                .serving
+                .reader
+                .read_many(&positions)
+                .await
+                .map_err(qmdb::Error::<Family>::from)?;
             if ops.is_empty() {
                 return Err(Error::Corrupt(format!(
                     "the op log of {} is empty at {at} inside its bounds",

@@ -1,3 +1,5 @@
+mod bulk;
+pub mod lane;
 mod remote;
 mod serve;
 mod wire;
@@ -16,6 +18,7 @@ use futures::{Stream, StreamExt as _};
 use node::{Digest, Node, Synced};
 use state::{Adoption, Commitment, SyncFailure, SyncTarget, commitment_name};
 
+pub use bulk::{Bulk, HeldClosing, bulk_join, bulk_readopt};
 pub use consensus::Anchor;
 pub use consensus::Context;
 pub use remote::Remote;
@@ -45,6 +48,15 @@ pub enum Error {
     Codec(#[from] commonware_codec::Error),
     #[error("the peer's head names a tip its anchor and state do not")]
     Head,
+    #[error(
+        "epoch {epoch} does not verify against the trusted validators; needs a newer checkpoint"
+    )]
+    Untrusted { epoch: u64 },
+    #[error("the adopted root {actual:?} differs from the finalized root {expected:?}")]
+    Root {
+        expected: abi::Root,
+        actual: abi::Root,
+    },
     #[error("the adopted state belongs to another network")]
     Network,
     #[error(
