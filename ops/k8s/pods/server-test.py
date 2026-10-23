@@ -6613,11 +6613,11 @@ class Runners(Streamed):
 
     def test_a_kind_zk_dev_does_not_take_never_goes_there(self):
         self.aheads(b"ahead heavy 2 500\n", b"ahead heavy 0 1\n", b"ahead heavy 5 900\n")
-        for request, words in enumerate((("programs", "dev", "pack", "chat"), ("programs", "dev", "sh", "make x"), ("apply", "--no-gate", "programs", "dev", "/home/x/e.sh")), start=60):
+        for request, words in enumerate((("programs", "dev", "pack", "chat"), ("LOCAL=1", "programs", "dev", "sh", "make x"), ("apply", "--no-gate", "programs", "dev", "/home/x/e.sh")), start=60):
             self.kube.answer("exec", ran(b"ahead heavy 5 900\n"), ran(b"run w1\n"))
             self.assertEqual(self.built(*words, request=request)[1]["stdout"].splitlines()[0], "run desktop:r1", words)
         self.assertEqual(self.on("zk-dev"), [])
-        self.assertEqual(self.built("MOVABLE=1", "programs", "dev", "sh", "make check", request=70)[1]["stdout"].splitlines()[0], "run zk-dev:z1")
+        self.assertEqual(self.built("programs", "dev", "sh", "make check", request=70)[1]["stdout"].splitlines()[0], "run zk-dev:z1")
 
     def test_a_kind_named_straight_at_zk_dev_is_refused_naming_its_kinds(self):
         self.refused("POST", "/v1/pods/zk-dev/exec", {"command": ["sh", BUILD, "programs", "dev", "pack", "chat"]}, 400, ["pod zk-dev takes only the run kinds its kinds file lists", "not build.sh pack"])
@@ -6771,8 +6771,9 @@ class RunnerList(unittest.TestCase):
                 ("programs", "dev", "pack"): False,
                 ("programs", "dev", "schema-diff", "chat"): False,
                 ("apply", "programs", "dev", "/x.sh"): False,
-                ("programs", "dev", "sh", "make"): False,
-                ("MOVABLE=1", "programs", "dev", "sh", "make"): True,
+                ("programs", "dev", "sh", "make"): True,
+                ("LOCAL=1", "programs", "dev", "sh", "make"): False,
+                ("JOB=j-1", "LOCAL=1", "programs", "dev", "sh", "make"): False,
                 ("status", "z1"): True,
                 ("busy",): True,
                 ("ahead", "programs", "dev", "pack"): True,

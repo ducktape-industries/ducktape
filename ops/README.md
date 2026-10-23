@@ -217,7 +217,7 @@ one up for another network.
   key under the runner's name; while the service holds no key the runner
   answers 503. The runner's key may only run that machine's `gate` command.
   A runner whose keys hold a `kinds` file takes only the run kinds it lists
-  (build.sh's third word, or `apply`; an `sh` only with `MOVABLE=1`):
+  (build.sh's third word, or `apply`; an `sh` unless it says `LOCAL=1`):
   `builds` never sends it another kind, and one named straight at it is
   refused with 400, while calls that start no run (`status`, `busy`, `ahead`,
   …) go as ever. `pods/<runner>` answers
@@ -331,7 +331,7 @@ one up for another network.
   kind and say that lane's wait (`<lane> paused` says none), whose wait is
   least, ties to the runner named first: the warm pod's `build.sh
   movable` (the queued runs another machine may take, in lane order: the
-  read-only verbs, and an `sh` or `shot` whose call set `MOVABLE=1`), each
+  read-only verbs, and every `sh` or `shot` but one called `LOCAL=1`), each
   runner's `build.sh lanes` (a runner that can't answer is passed over), one
   `build.sh take` on each runner of every run it moves there (after
   following that runner's log when a moved run names NOTIFY, so its end

@@ -344,7 +344,7 @@ RUNNER_FILES = ("id_ed25519", "known_hosts", "user")
 HOSTS_FILE = "hosts"
 FORWARD_FILE = "forward"
 KINDS_FILE = "kinds"
-MOVABLE_WORD = "MOVABLE=1"
+LOCAL_WORD = "LOCAL=1"
 UNSTARTING = frozenset({"ahead", "lanes", "movable", "take", "moved", "yield"})
 RUNNER_NAME = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 AHEAD_PAUSED = re.compile(rb"ahead (heavy|lane|quick|light) paused")
@@ -1313,8 +1313,8 @@ class Runner:
         listed = self.keys / KINDS_FILE
         if kind is None or not listed.is_file():
             return True
-        movable = MOVABLE_WORD in itertools.takewhile(SETTING.fullmatch, words)
-        return kind in listed.read_text().split() and (kind != "sh" or movable)
+        stays_local = LOCAL_WORD in itertools.takewhile(SETTING.fullmatch, words)
+        return kind in listed.read_text().split() and (kind != "sh" or not stays_local)
 
     def hosts(self):
         if self.forwarded():
@@ -1384,7 +1384,7 @@ class Runner:
                 words = runner_words(command, self.name)
                 if not self.takes(words):
                     listed = " ".join((self.keys / KINDS_FILE).read_text().split())
-                    raise Refused(400, f"pod {self.name} takes only the run kinds its kinds file lists ({listed}; an sh only with {MOVABLE_WORD}), not build.sh {run_kind(words)}")
+                    raise Refused(400, f"pod {self.name} takes only the run kinds its kinds file lists ({listed}; an sh unless it says {LOCAL_WORD}), not build.sh {run_kind(words)}")
                 return self.call(["exec", *words], alive, again=False)
 
     def state(self):
