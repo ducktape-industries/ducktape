@@ -887,7 +887,7 @@ one up for another network.
     or answers 500 or more;
   - the Kubernetes API's `/readyz` and, while it is ready, the `Available`
     condition of Deployments `duckpond/node`, `duckpond/ccs`,
-    `duckpond/tunnel`, `pods/pods` and `pi-chief/pi-chief` (not the
+    `duckpond/tunnel` and `pods/pods` (not the
     registry: a registry that fails shows as a roll that cannot pull);
   - while the API is ready, the warm pod `/shared/tools/warm-pod` names:
     files' `Stat` gives the file's size and snapshot, `Read` reads that
@@ -983,7 +983,7 @@ one up for another network.
   `k8s/watch/Containerfile` with the CLI from `git archive
   DUCKTAPE_COMMIT`, pushes it to the cluster node's registry and applies
   `k8s/watch/watch.yaml`: namespace `watch`, service account `watch`, a
-  Role in `duckpond`, `pods` and `pi-chief` that may get only
+  Role in `duckpond` and `pods` that may get only
   those Deployments, one in `agents` that may get pods, the claim, a
   policy closing every inbound port, and Deployment `watch`. Each DIR is an empty directory made beforehand on
   that filesystem. ccs's NetworkPolicy `duckpond/ccs-node-only` admits only

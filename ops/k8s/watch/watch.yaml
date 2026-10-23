@@ -34,17 +34,6 @@ rules:
     verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: watch
-  namespace: pi-chief
-rules:
-  - apiGroups: [apps]
-    resources: [deployments]
-    resourceNames: [pi-chief]
-    verbs: [get]
----
-apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: watch
@@ -57,14 +46,6 @@ kind: RoleBinding
 metadata:
   name: watch
   namespace: pods
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: watch}
-subjects: [{kind: ServiceAccount, name: watch, namespace: watch}]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: watch
-  namespace: pi-chief
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: watch}
 subjects: [{kind: ServiceAccount, name: watch, namespace: watch}]
 ---
@@ -140,7 +121,7 @@ spec:
             - {name: WATCH_CCS, value: "@CCS@"}
             - {name: WATCH_CHANNEL, value: alerts}
             - {name: WATCH_PAGER, value: "@PAGER@"}
-            - {name: WATCH_DEPLOYMENTS, value: duckpond/node duckpond/ccs duckpond/tunnel pods/pods pi-chief/pi-chief}
+            - {name: WATCH_DEPLOYMENTS, value: duckpond/node duckpond/ccs duckpond/tunnel pods/pods}
             - {name: WATCH_WARM_POD_FILE, value: /shared/tools/warm-pod}
             - {name: WATCH_WARM_POD_NAMESPACE, value: agents}
             - name: WATCH_DISKS
