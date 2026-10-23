@@ -222,10 +222,15 @@ one up for another network.
   refused with 400, while calls that start no run (`status`, `busy`, `ahead`,
   …) go as ever. `pods/<runner>` answers
   the runner's `ping` as a pod that runs (503 while it is down or
-  unreachable); `pods/<runner>/exec` runs only `build.sh`: the command
-  `["sh", "/var/tmp/warm/build.sh", ...]`, or a script of plain words that
-  calls it (KEY=VALUE words first, no expansion, operator or comment outside
-  quotes), and refuses anything else with 400. An exec is sent to the next
+  unreachable); `pods/<runner>/exec` (and `builds`) runs only `build.sh`: the command
+  `["sh", "/var/tmp/warm/build.sh", ...]`, or the same with a bare `build.sh`
+  or `/var/tmp/warm/build.sh` for the first two words, a leading `env` or
+  KEY=VALUE words before it, or a script of those plain words (no expansion,
+  operator or comment outside quotes). Each reads as the one form, and the
+  service sends it on as `sh /var/tmp/warm/build.sh <words>`. A pod named by
+  its own name gets only the first form read as build.sh; any other command
+  there, its own `build.sh` included, runs as it came. Anything else is
+  refused with 400, naming a whole call to copy. An exec is sent to the next
   host only when ssh never connected; a session that broke once it ran
   answers 502 and is not run again, while reads try the next host. `blob` and `file` read through
   `gate get` (paths under `/out/` and `/var/tmp/warm/`), `push` through

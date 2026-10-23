@@ -5247,6 +5247,13 @@ class DesktopRunner(Streamed):
         execs = [words for words in self.gate.words() if words[0] == "exec"]
         self.assertEqual(execs, [["exec", "programs", "dev", "gates"]])
 
+    def test_a_pod_by_name_runs_its_own_build_sh_as_it_came(self):
+        own = (["sh", "build.sh", "x"], ["build.sh", "x"], ["env", "K=V", "build.sh", "x"], ["K=V", "build.sh", "x"], [BUILD, "x"])
+        for request, command in enumerate(own, start=90):
+            self.call("POST", "/v1/pods/duckpond-41/exec", {"command": command}, headers=asked(request))
+        pods = [call[3] for call in self.kube.calls if call[0] == "exec"]
+        self.assertEqual(pods, list(own))
+
     def test_a_build_call_egress_names_no_sender_for_goes_as_it_came_and_says_so_once(self):
         self.signer.sender = ran(code=1, err="egress: no such query")
         self.gate.answers["exec"] = ran(b"run r1\n")
@@ -5474,6 +5481,28 @@ class DesktopRunner(Streamed):
         script = "JOB=j-1 LIGHT=1 sh /var/tmp/warm/build.sh programs dev sh 'cargo test; echo $X # light'"
         self.call("POST", "/v1/pods/desktop/exec", {"command": ["sh", "-c", script]})
         self.assertEqual(self.gate.words(), [["exec", "JOB=j-1", "LIGHT=1", "programs", "dev", "sh", "cargo test; echo $X # light"]])
+
+    def test_the_obvious_build_sh_forms_read_as_its_words(self):
+        for request, command in enumerate((
+            ["build.sh", "JOB=j-1", "programs", "dev", "gates"],
+            [BUILD, "JOB=j-1", "programs", "dev", "gates"],
+            ["sh", "build.sh", "JOB=j-1", "programs", "dev", "gates"],
+            ["env", "JOB=j-1", "sh", BUILD, "programs", "dev", "gates"],
+            ["env", "JOB=j-1", "build.sh", "programs", "dev", "gates"],
+            ["JOB=j-1", "build.sh", "programs", "dev", "gates"],
+            ["sh", "-c", "env JOB=j-1 build.sh programs dev gates"],
+        ), start=70):
+            self.gate.calls.clear()
+            self.call("POST", "/v1/pods/desktop/exec", {"command": command}, headers=asked(request))
+            self.assertEqual(self.gate.words(), [["exec", "JOB=j-1", "programs", "dev", "gates"]], command)
+
+    def test_a_refused_command_names_a_call_to_copy(self):
+        self.refused("POST", "/v1/pods/desktop/exec", {"command": ["make"]}, 400, ['as in ["sh", "/var/tmp/warm/build.sh", "JOB=j-1", "NOTIFY=j-1", "programs", "dev", "lint"]', "Not make"])
+        for request, command in enumerate((["env", "-i", "build.sh", "busy"], ["sh", "-c", "sh -x build.sh busy"], ["bash", BUILD, "busy"], ["sh", "-c", "env", "build.sh"]), start=80):
+            status, answer = self.call("POST", "/v1/pods/desktop/exec", {"command": command}, headers=asked(request))
+            self.assertEqual(status, 400, (command, answer))
+            self.assertIn("runs build.sh alone", answer["error"])
+        self.assertEqual(self.gate.calls, [])
 
     def test_any_other_command_is_refused_before_ssh(self):
         for command in (
@@ -5949,7 +5978,7 @@ class Builds(Streamed):
         self.refused("POST", "/v1/pods/builds/exec", {"command": ["sh", BUILD, "status", "r1"]}, 503, ["the warm pod could not be asked: this service names no warm pod (PODS_WARM_POD)", "pod desktop has no run r1"])
 
     def test_a_run_named_without_its_machine_or_a_machine_wide_call_is_refused(self):
-        refusals = ((["sh", BUILD, "status"], "names its run"), (["sh", BUILD, "busy"], "acts on one machine"), (["sh", BUILD, "disk-targets", "programs"], "acts on one machine"), (["make"], "pod builds runs build.sh alone"))
+        refusals = ((["sh", BUILD, "status"], "names its run"), (["sh", BUILD, "busy"], "acts on one machine"), (["build.sh", "busy"], "acts on one machine"), (["env", "JOB=j-1", "build.sh", "busy"], "acts on one machine"), (["sh", BUILD, "disk-targets", "programs"], "acts on one machine"), (["make"], "pod builds runs build.sh alone"))
         for request, (command, words) in enumerate(refusals, start=50):
             status, answer = self.call("POST", "/v1/pods/builds/exec", {"command": command}, headers=asked(request))
             self.assertEqual(status, 400, answer)

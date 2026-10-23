@@ -1067,27 +1067,40 @@ def plain_words(script):
         return None
 
 
+def build_words(command, scripted=True):
+    words = plain_words(command[2]) if scripted and len(command) == 3 and command[:2] == ["sh", "-c"] else command
+    if words is None:
+        return None
+    if not scripted:
+        settings = list(itertools.takewhile(SETTING.fullmatch, words))
+        called = words[len(settings) :]
+        return settings + called[2:] if called[:2] == ["sh", BUILD_SH] else None
+    if words[:1] == ["env"]:
+        words = words[1:]
+    settings = list(itertools.takewhile(SETTING.fullmatch, words))
+    called = words[len(settings) :]
+    if called[:1] == ["sh"]:
+        called = called[1:]
+    if not called or called[0] not in (BUILD_SH, "build.sh"):
+        return None
+    return settings + called[1:]
+
+
 def runner_words(command, name):
-    words = plain_words(command[2]) if len(command) == 3 and command[:2] == ["sh", "-c"] else command
-    settings = list(itertools.takewhile(SETTING.fullmatch, words or []))
-    called = (words or [])[len(settings) :]
-    if called[:2] != ["sh", BUILD_SH]:
+    words = build_words(command)
+    if words is None:
         raise Refused(
             400,
-            f'pod {name} runs build.sh alone: the command ["sh", "{BUILD_SH}", ...], or a script of plain words that calls it (KEY=VALUE words first; no expansion, operator or comment outside quotes), not {shlex.join(command)}',
+            f'pod {name} runs build.sh alone, as in ["sh", "{BUILD_SH}", "JOB=j-1", "NOTIFY=j-1", "programs", "dev", "lint"]. A bare build.sh, a leading env or KEY=VALUE words, and a script of those plain words (no expansion, operator or comment outside quotes) read the same. Not {shlex.join(command)}',
         )
-    return settings + called[2:]
+    return words
 
 
 def build_settings(command, scripted):
-    words = command
-    if scripted and len(command) == 3 and command[:2] == ["sh", "-c"]:
-        words = plain_words(command[2]) or []
-    before = list(itertools.takewhile(SETTING.fullmatch, words))
-    called = words[len(before) :]
-    if called[:2] != ["sh", BUILD_SH]:
+    words = build_words(command, scripted)
+    if words is None:
         return None
-    return before + list(itertools.takewhile(SETTING.fullmatch, called[2:]))
+    return list(itertools.takewhile(SETTING.fullmatch, words))
 
 
 def with_setting(command, word):
@@ -5179,9 +5192,12 @@ class Service:
         self.notifier.caught_up(name, logged.splitlines(keepends=True))
 
     def called(self, asked, name, command):
-        settings = build_settings(command, name in self.runners or name == BUILDS)
+        scripted = name in self.runners or name == BUILDS
+        settings = build_settings(command, scripted)
         if settings is None:
             return command
+        if scripted:
+            command = ["sh", BUILD_SH, *build_words(command, scripted)]
         if any(word.startswith(CALLER_WORD) for word in settings):
             raise Refused(400, f"pods names a build.sh call's caller itself, as the account egress says sent its request: leave {CALLER_WORD}<n> out of the call")
         a_pod_by_name = name not in self.runners and name != BUILDS
