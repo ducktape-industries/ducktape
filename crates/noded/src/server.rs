@@ -620,70 +620,121 @@ fn pieces<E: Context>(
     futures::stream::once(async move { vec![Ok(count)] }).chain(reads)
 }
 
-type Encoder = zstd::stream::raw::Encoder<'static>;
+struct Compressor {
+    encoder: zstd::stream::raw::Encoder<'static>,
+    room: Vec<u8>,
+}
 
 async fn blobs_zstd<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Response {
     let ids: Vec<BlobId> = match abi::decode(&body) {
         Ok(ids) => ids,
         Err(refusal) => return Reply::<()>::Refused(refusal).into_response(),
     };
-    let encoder = match Encoder::new(zstd::DEFAULT_COMPRESSION_LEVEL) {
-        Ok(encoder) => encoder,
+    let compressor = match Compressor::new() {
+        Ok(compressor) => compressor,
         Err(error) => return failed::<()>(error).into_response(),
     };
-    let mut pieces = pieces(ctx, ids).boxed();
-    let first = pieces.next().await;
-    let answer = futures::stream::unfold(Some((pieces, encoder, first)), |state| async move {
-        let (mut pieces, encoder, held) = state?;
-        let Some(piece) = held else {
-            let last = settled(offload(move || finished(encoder)).await);
-            return Some((last.map(Bytes::from), None));
-        };
-        let plain = match piece.into_iter().collect::<crate::Result<Vec<Bytes>>>() {
-            Ok(plain) => plain,
-            Err(error) => return Some((Err(error), None)),
-        };
-        let (done, next) =
-            futures::join!(offload(move || compressed(encoder, &plain)), pieces.next());
-        match settled(done) {
-            Ok((encoder, out)) => Some((Ok(Bytes::from(out)), Some((pieces, encoder, next)))),
-            Err(error) => Some((Err(error), None)),
-        }
-    });
+    let answer = compressed(pieces(ctx, ids), compressor);
     (StatusCode::OK, Body::from_stream(answer)).into_response()
+}
+
+fn compressed(
+    pieces: impl futures::Stream<Item = Vec<crate::Result<Bytes>>> + Send + 'static,
+    compressor: Compressor,
+) -> impl futures::Stream<Item = crate::Result<Bytes>> + Send + 'static {
+    let mut batches = compression_batches(pieces).boxed();
+    futures::stream::once(async move {
+        let first = batches.next().await;
+        futures::stream::unfold(Some((batches, compressor, first)), |state| async move {
+            let (mut batches, compressor, held) = state?;
+            let Some(batch) = held else {
+                let last = settled(offload(move || compressor.finish()).await);
+                return Some((last.map(Bytes::from), None));
+            };
+            let plain = match batch {
+                Ok(plain) => plain,
+                Err(error) => return Some((Err(error), None)),
+            };
+            let (done, next) =
+                futures::join!(offload(move || compressor.compress(&plain)), batches.next(),);
+            match settled(done) {
+                Ok((compressor, out)) => {
+                    Some((Ok(Bytes::from(out)), Some((batches, compressor, next))))
+                }
+                Err(error) => Some((Err(error), None)),
+            }
+        })
+    })
+    .flatten()
+}
+
+fn compression_batches(
+    pieces: impl futures::Stream<Item = Vec<crate::Result<Bytes>>> + Send + 'static,
+) -> impl futures::Stream<Item = crate::Result<Vec<Bytes>>> + Send + 'static {
+    let input_size = zstd::zstd_safe::CCtx::in_size();
+    futures::stream::unfold(Some(pieces.boxed()), move |state| async move {
+        let mut pieces = state?;
+        let mut plain = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(piece) = pieces.next().await {
+            for part in piece {
+                let part = match part {
+                    Ok(part) => part,
+                    Err(error) => return Some((Err(error), None)),
+                };
+                bytes = bytes.saturating_add(part.len());
+                plain.push(part);
+            }
+            let ready = bytes >= input_size;
+            if ready {
+                return Some((Ok(plain), Some(pieces)));
+            }
+        }
+        if plain.is_empty() {
+            return None;
+        }
+        Some((Ok(plain), None))
+    })
 }
 
 fn settled<T>(done: crate::Result<std::io::Result<T>>) -> crate::Result<T> {
     Ok(done??)
 }
 
-fn compressed(mut encoder: Encoder, plain: &[Bytes]) -> std::io::Result<(Encoder, Vec<u8>)> {
-    use zstd::stream::raw::{InBuffer, Operation, OutBuffer};
-    let mut out = Vec::new();
-    let mut room = vec![0; zstd::zstd_safe::CCtx::out_size()];
-    for part in plain {
-        let mut input = InBuffer::around(part);
-        while input.pos() < part.len() {
-            let mut output = OutBuffer::around(&mut room[..]);
-            encoder.run(&mut input, &mut output)?;
-            let wrote = output.pos();
-            out.extend_from_slice(&room[..wrote]);
-        }
+impl Compressor {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            encoder: zstd::stream::raw::Encoder::new(zstd::DEFAULT_COMPRESSION_LEVEL)?,
+            room: vec![0; zstd::zstd_safe::CCtx::out_size()],
+        })
     }
-    Ok((encoder, out))
-}
 
-fn finished(mut encoder: Encoder) -> std::io::Result<Vec<u8>> {
-    use zstd::stream::raw::{Operation, OutBuffer};
-    let mut out = Vec::new();
-    loop {
-        let mut room = vec![0; zstd::zstd_safe::CCtx::out_size()];
-        let mut output = OutBuffer::around(&mut room[..]);
-        let left = encoder.finish(&mut output, true)?;
-        let wrote = output.pos();
-        out.extend_from_slice(&room[..wrote]);
-        if left == 0 {
-            return Ok(out);
+    fn compress(mut self, plain: &[Bytes]) -> std::io::Result<(Self, Vec<u8>)> {
+        use zstd::stream::raw::{InBuffer, Operation, OutBuffer};
+        let mut out = Vec::new();
+        for part in plain {
+            let mut input = InBuffer::around(part);
+            while input.pos() < part.len() {
+                let mut output = OutBuffer::around(&mut self.room[..]);
+                self.encoder.run(&mut input, &mut output)?;
+                let wrote = output.pos();
+                out.extend_from_slice(&self.room[..wrote]);
+            }
+        }
+        Ok((self, out))
+    }
+
+    fn finish(mut self) -> std::io::Result<Vec<u8>> {
+        use zstd::stream::raw::{Operation, OutBuffer};
+        let mut out = Vec::new();
+        loop {
+            let mut output = OutBuffer::around(&mut self.room[..]);
+            let left = self.encoder.finish(&mut output, true)?;
+            let wrote = output.pos();
+            out.extend_from_slice(&self.room[..wrote]);
+            if left == 0 {
+                return Ok(out);
+            }
         }
     }
 }
@@ -1385,6 +1436,8 @@ fn seen_from(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
 
 #[cfg(test)]
 mod tests {
+    mod zstd_batches;
+
     use std::collections::BTreeMap;
 
     use axum::body::Body;
