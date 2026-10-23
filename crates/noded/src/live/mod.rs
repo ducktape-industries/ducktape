@@ -113,8 +113,6 @@ pub struct Relay<E: crate::Context> {
     me: PublicKey,
     plane: lane::Plane,
     table: mpsc::UnboundedSender<Event>,
-    #[cfg(test)]
-    unlink_gate: std::sync::Mutex<Option<tests::UnlinkGate>>,
     _tasks: JoinSet<()>,
 }
 
@@ -165,8 +163,6 @@ impl<E: crate::Context> Relay<E> {
                 me,
                 plane,
                 table,
-                #[cfg(test)]
-                unlink_gate: Default::default(),
                 _tasks: tasks,
             }
         });

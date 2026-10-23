@@ -305,15 +305,17 @@ impl<E: crate::Context> Lanes<E> {
         self.waiters.spawn(async move {
             halo.unlinked(&peer).await;
             if let Some(relay) = relay.upgrade() {
-                #[cfg(test)]
-                {
-                    let gate = relay.unlink_gate.lock().unwrap().take();
-                    if let Some(gate) = gate {
-                        gate.send(&relay, peer).await;
-                        return;
-                    }
-                }
                 relay.send(Event::PeerGone { from: peer });
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub fn park_unlinked(&mut self, gate: super::tests::UnlinkGate, peer: PublicKey) {
+        let relay = self.relay.clone();
+        self.waiters.spawn(async move {
+            if let Some(relay) = relay.upgrade() {
+                gate.send(&relay, peer).await;
             }
         });
     }

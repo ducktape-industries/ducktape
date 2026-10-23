@@ -2496,10 +2496,12 @@ fn a_key_that_is_no_member_gets_no_writer_and_keeps_its_tracks_past_a_peer_gone_
         let (ready, was_unlinked) = oneshot::channel();
         let (resume, resumed) = oneshot::channel();
         let (sent, was_sent) = oneshot::channel();
-        *node.relay.unlink_gate.lock().unwrap() = Some(UnlinkGate {
-            ready,
-            resume: resumed,
-            sent,
+        node.relay.send(super::table::Event::GateUnlink {
+            gate: UnlinkGate {
+                ready,
+                resume: resumed,
+                sent,
+            },
         });
         drop(control);
         drop(lane);

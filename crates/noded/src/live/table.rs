@@ -166,6 +166,10 @@ pub(super) enum Event {
         reply: oneshot::Sender<Vec<PublicKey>>,
     },
     #[cfg(test)]
+    GateUnlink {
+        gate: super::tests::UnlinkGate,
+    },
+    #[cfg(test)]
     Inspect(Box<dyn FnOnce(&State) + Send>),
 }
 
@@ -175,6 +179,8 @@ pub(super) struct Table<E: crate::Context> {
     dirty: Dirty,
     rechecks: Arc<Notify>,
     dropped: Counter,
+    #[cfg(test)]
+    unlink_gate: Option<super::tests::UnlinkGate>,
 }
 
 impl<E: crate::Context> Table<E> {
@@ -185,6 +191,8 @@ impl<E: crate::Context> Table<E> {
             dirty: Dirty::default(),
             rechecks,
             dropped,
+            #[cfg(test)]
+            unlink_gate: None,
         }
     }
 
@@ -268,6 +276,8 @@ impl<E: crate::Context> Table<E> {
             Event::Disowned { from, tracks } => self.disowned(from, tracks),
             #[cfg(test)]
             Event::Writers { reply } => self.writers(reply),
+            #[cfg(test)]
+            Event::GateUnlink { gate } => self.gate_unlink(gate),
             #[cfg(test)]
             Event::Inspect(look) => self.inspect(look),
         }
@@ -468,6 +478,13 @@ impl<E: crate::Context> Table<E> {
     }
 
     fn peer_gone(&mut self, from: PublicKey) {
+        #[cfg(test)]
+        {
+            if let Some(gate) = self.unlink_gate.take() {
+                self.lanes.park_unlinked(gate, from);
+                return;
+            }
+        }
         self.lanes.unwatched(&from);
         let halo = self.lanes.halo();
         let stays = halo.members().seated(&from) || halo.path(&from).is_some();
@@ -493,6 +510,11 @@ impl<E: crate::Context> Table<E> {
     #[cfg(test)]
     fn writers(&mut self, reply: oneshot::Sender<Vec<PublicKey>>) {
         let _ = reply.send(self.lanes.writers());
+    }
+
+    #[cfg(test)]
+    fn gate_unlink(&mut self, gate: super::tests::UnlinkGate) {
+        self.unlink_gate = Some(gate);
     }
 
     #[cfg(test)]
