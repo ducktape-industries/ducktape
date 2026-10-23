@@ -7572,5 +7572,103 @@ class Suite(unittest.TestCase):
         self.assertEqual(sorted({name for name in names if names.count(name) > 1}), [], "a later class of the same name hides the earlier one's tests")
 
 
+class StampEdges(Holder):
+    def test_lookalike_domains_remain_callers_labels_and_annotations(self):
+        key = "ducktape.industries.example/requester"
+        manifest = deployment()
+        manifest["metadata"].update({"labels": {key: "mine"}, "annotations": {key: "mine"}})
+        self.kube.answer("apply", ran({"kind": "List", "items": []}))
+        status, answer = self.call("POST", "/v1/manifests", {"manifests": [manifest]})
+        self.assertEqual(status, 200, answer)
+        applies = [call for call in self.kube.calls if call[0] == "apply"]
+        for _, objects, _ in applies:
+            self.assertEqual(objects[0]["metadata"]["labels"][key], "mine")
+            self.assertEqual(objects[0]["metadata"]["annotations"][key], "mine")
+
+    def test_an_empty_service_stamp_is_still_refused_before_apply(self):
+        for field in ("labels", "annotations"):
+            with self.subTest(field=field):
+                manifest = deployment()
+                manifest["metadata"][field] = {NOTED: ""}
+                status, answer = self.call("POST", "/v1/manifests", {"manifests": [manifest]})
+                self.assertEqual(status, 403, answer)
+        self.assertNotIn("apply", self.kube.verbs())
+        self.assertNotIn("trial", self.kube.verbs())
+        self.assertEqual(self.api.calls, [])
+
+    def test_each_stateful_claim_template_keeps_its_own_stamps(self):
+        name = "io.k8s.api.apps.v1.StatefulSet"
+        path = "/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}"
+        spec = {"type": "object", "properties": {
+            "template": ref(CORE + "PodTemplateSpec"),
+            "volumeClaimTemplates": {"type": "array", "items": ref(CORE + "PersistentVolumeClaim")},
+        }}
+        document = {
+            "components": {"schemas": {
+                **CORE_V1["components"]["schemas"],
+                **APPS_V1["components"]["schemas"],
+                name: kind_of("apps", "v1", "StatefulSet", spec=spec),
+            }},
+            "paths": {**APPS_V1["paths"], path: operations(name, "patch")},
+        }
+        self.api.published["apis/apps/v1"] = ("stateful", document)
+        current = held_deployment({})
+        current["kind"] = "StatefulSet"
+        claims = [
+            {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": name, "labels": dict(STAMPED)}, "spec": {"resources": {"requests": {"storage": "1Gi"}}}}
+            for name in ("data", "cache")
+        ]
+        current["spec"]["volumeClaimTemplates"] = claims
+        changed = json.loads(json.dumps(current))
+        changed["spec"]["volumeClaimTemplates"][0]["metadata"]["labels"].update(MOVED)
+        self.api.answers = [answered(200, current), answered(200, changed), answered(200, changed)]
+        status, answer = self.call("PATCH", "/v1/k8s/apis/apps/v1/namespaces/agents/statefulsets/web", b'{"spec": {}}', headers=MERGE)
+        self.assertEqual(status, 403, answer)
+        self.assertEqual([(call[0], call[2]) for call in self.api.calls], [("GET", ""), ("PATCH", "dryRun=All")])
+
+
+class SenderReplies(Served):
+    def test_each_create_asks_egress_about_that_requests_exact_number(self):
+        self.signer.sender = sent_by(21)
+        self.kube.answer("create", ran(pod_json()))
+        self.kube.answer("apply", ran({"kind": "List", "items": []}))
+        cases = (("/v1/pods", {"image": "t"}, 201, 41), ("/v1/manifests", {"manifests": [deployment()]}, 200, 42))
+        for path, body, expected, request in cases:
+            status, answer = self.call("POST", path, body, headers=asked(request))
+            self.assertEqual(status, expected, answer)
+        self.assertEqual(self.signer.senders, [bytes([server.EGRESS_SENDER]) + request.to_bytes(8, "little") for *_, request in cases])
+
+    def test_a_sender_answer_of_another_variant_makes_nothing(self):
+        self.signer.sender = ran(bytes([3, 1]) + (21).to_bytes(8, "little"))
+        for path, body in (("/v1/pods", {"image": "t"}), ("/v1/manifests", {"manifests": [deployment()]})):
+            with self.subTest(path=path):
+                status, answer = self.call("POST", path, body)
+                self.assertEqual(status, 502, answer)
+        self.assertNotIn("create", self.kube.verbs())
+        self.assertNotIn("apply", self.kube.verbs())
+        self.assertNotIn("trial", self.kube.verbs())
+
+
+class ClaimOwners(Served):
+    def test_a_claims_pod_is_its_pod_controller_not_another_owner_reference(self):
+        runner = pod_json(name="runner", phase="Running")
+        observer = pod_json(name="observer", phase="Succeeded")
+        references = (
+            [{"apiVersion": "v1", "kind": "Pod", "name": "observer", "controller": False}, {"apiVersion": "v1", "kind": "Pod", "name": "runner", "controller": True}],
+            [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "runner", "controller": True}],
+            [{"apiVersion": "v1", "kind": "Pod", "name": "observer"}],
+        )
+        claims = [
+            {"metadata": {"name": f"claim-{index}", "ownerReferences": owners}, "spec": {"resources": {"requests": {"storage": "1Gi"}}}}
+            for index, owners in enumerate(references)
+        ]
+        self.kube.answer("list", ran({"items": [runner, observer]}))
+        self.kube.answer("claims", ran({"items": claims}))
+        self.kube.answer("quotas", ran({"items": []}))
+        status, answer = self.call("GET", "/v1/usage")
+        self.assertEqual(status, 200, answer)
+        self.assertEqual([(row["claim"], row["pod"], row["phase"]) for row in answer["claims"]], [("claim-0", "runner", "Running"), ("claim-1", None, None), ("claim-2", None, None)])
+
+
 if __name__ == "__main__":
     unittest.main()
