@@ -940,7 +940,8 @@ one up for another network.
     or a merge of dev that holds its own note) brings only the cut's own
     note, while dev's changes stay in the nightly's entries. Each one's
     `Release note:` line (its title when it has
-    none; `none` leaves it out) goes into one entry in chat channel
+    none; `none` leaves it out), less any `(J-…)` job mark, goes into
+    one entry in chat channel
     `release`, with the commits and change numbers in its thread, posted
     once the entry is in a block. A day whose changes all say `none`
     posts nothing. A row's `since` and `since_sequence` name where a fresh

@@ -963,6 +963,11 @@ class Notes(unittest.TestCase):
             (None, "app: the first commit"),
         ])
 
+    def test_a_job_mark_in_a_note_or_a_title_is_left_out_and_other_parentheses_stay(self):
+        self.assertEqual(watch.note_of(squash("shell: each window on its own network (J-145 2c-2)", 217)), ("217", "shell: each window on its own network"))
+        self.assertEqual(watch.note_of(squash("a11y: ids", 192, "Release note: Every node carries its own id (J-254), a view's under view/<program>/")), ("192", "Every node carries its own id, a view's under view/<program>/"))
+        self.assertEqual(watch.note_of(squash("host: a zip read in place (see J-1)", 210)), ("210", "host: a zip read in place (see J-1)"))
+
     def test_a_manifest_names_its_sequence_version_time_and_commit_prefix(self):
         http = FakeHttp({NIGHTLY_JSON: manifest(1792644023, "1708042bce09e9cf10f80c6271ea9df96ed48687")})
         self.assertEqual(watch.manifest_published(http, NIGHTLY_JSON), watch.Published(1792644023, "1708042", "0.1.0+1708042", "2026-10-22T05:02:38Z"))

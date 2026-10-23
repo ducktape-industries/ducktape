@@ -4,6 +4,7 @@
 # ops/k8s/watch/watch.yaml runs it on fabrics-1, watch-test.py tests it, and `watch.py once` prints one sample.
 import json
 import os
+import re
 import shlex
 import ssl
 import subprocess
@@ -33,6 +34,7 @@ WARM_POD_RUN = "run"
 GITHUB = "https://api.github.com"
 DECIDED = ("success", "failure")
 NOTE = "Release note:"
+JOB_MARK = re.compile(r"\s*\([Jj]-\d+[^()]*\)")
 UPLOAD_PACK = "/info/refs?service=git-upload-pack"
 
 
@@ -531,6 +533,7 @@ def note_of(message):
     subject, *body = message.splitlines() or [""]
     title, number = change_of(subject)
     said = next((line[len(NOTE) :].strip() for line in body if line.startswith(NOTE)), "") or title
+    said = JOB_MARK.sub("", said).strip()
     return number, None if said.rstrip(".").lower() == "none" else said
 
 
