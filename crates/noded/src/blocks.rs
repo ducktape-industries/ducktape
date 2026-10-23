@@ -14,7 +14,10 @@ use host::{ANCHOR_WINDOW, Submission, SubmissionId};
 use node::{Block, Carried, Frame, Node};
 
 use crate::history::Row;
-use crate::wire::{BlockAsk, BlockRef, Blocks, Finalized, Located, Page, Tx, TxAsk, TxRef};
+use crate::wire::{
+    BlockAsk, BlockRef, Blocks, Facts, FactsAsk, FactsPage, Finalized, Located, MOST_LISTED, Page,
+    Tx, TxAsk, TxPage, TxPlace, TxRange, TxRef, TxSummary,
+};
 use crate::{Context, Daemon, Error, Result};
 
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -93,11 +96,7 @@ impl<E: Context> Daemon<E> {
             });
         };
         let listed_from = Some(lowest);
-        let top = match page.before {
-            None => Some(newest),
-            Some(before) => before.checked_sub(1).map(|top| top.min(newest)),
-        };
-        let Some(top) = top.filter(|top| *top >= lowest) else {
+        let Some(top) = listed_top(lowest, newest, page.before) else {
             return Ok(Page {
                 blocks: Vec::new(),
                 listed_from,
@@ -114,6 +113,51 @@ impl<E: Context> Daemon<E> {
             blocks,
             listed_from,
         })
+    }
+
+    pub async fn block_facts(&self, ask: FactsAsk) -> Result<FactsPage> {
+        let Some((lowest, newest)) = self.history.span() else {
+            return Ok(FactsPage {
+                blocks: Vec::new(),
+                listed_from: None,
+            });
+        };
+        let listed_from = Some(lowest);
+        let Some(top) = listed_top(lowest, newest, ask.before) else {
+            return Ok(FactsPage {
+                blocks: Vec::new(),
+                listed_from,
+            });
+        };
+        let mut blocks = Vec::new();
+        for height in (lowest..=top).rev().take(listed_limit(ask.limit)) {
+            let Some(kept) = self.summary(height).await? else {
+                break;
+            };
+            blocks.push(facts_of(&kept.block));
+        }
+        Ok(FactsPage {
+            blocks,
+            listed_from,
+        })
+    }
+
+    pub async fn txs(&self, range: TxRange) -> Result<TxPage> {
+        let Some((lowest, newest)) = self.history.span() else {
+            return Ok(TxPage {
+                txs: Vec::new(),
+                next: None,
+            });
+        };
+        let mut ranged = Ranged::new(&range, lowest, newest);
+        while let Some(height) = ranged.wants() {
+            let Some(kept) = self.summary(height).await? else {
+                ranged.gone();
+                break;
+            };
+            ranged.take(&kept.block);
+        }
+        Ok(ranged.page())
     }
 
     pub async fn block(&self, ask: BlockAsk) -> Result<Option<Finalized>> {
@@ -287,6 +331,143 @@ impl<E: Context> Daemon<E> {
         self.record(node, block, id, ran, None, finalization)
             .await?;
         Ok(())
+    }
+}
+
+fn listed_top(lowest: u64, newest: u64, before: Option<u64>) -> Option<u64> {
+    let top = match before {
+        None => Some(newest),
+        Some(before) => before.checked_sub(1).map(|top| top.min(newest)),
+    };
+    top.filter(|top| *top >= lowest)
+}
+
+fn facts_of(block: &Finalized) -> Facts {
+    Facts {
+        height: block.height,
+        id: block.id,
+        parent: block.parent,
+        time: block.time,
+        epoch: block.epoch,
+        proposer: block.proposer.clone(),
+        txs: block.txs.len() as u32,
+    }
+}
+
+fn summary_of(block: &Finalized, position: u32, tx: &Tx) -> TxSummary {
+    let applied = tx
+        .receipt
+        .as_ref()
+        .map(|receipt| matches!(receipt.outcome, abi::Outcome::Applied { .. }));
+    TxSummary {
+        height: block.height,
+        position,
+        time: block.time,
+        hash: tx.hash,
+        signer: tx.signer.clone(),
+        anchor: tx.anchor,
+        target: tx.target.clone(),
+        size: tx.size,
+        applied,
+    }
+}
+
+fn listed_limit(limit: u32) -> usize {
+    limit.min(MOST_LISTED) as usize
+}
+
+fn below(place: TxPlace, newest: u64) -> Option<(u64, Option<u32>)> {
+    let past_the_tip = place.height > newest;
+    if past_the_tip {
+        return Some((newest, None));
+    }
+    let before_the_block = place.position == 0;
+    if before_the_block {
+        return place.height.checked_sub(1).map(|height| (height, None));
+    }
+    Some((place.height, Some(place.position)))
+}
+
+struct Ranged<'a> {
+    target: Option<&'a str>,
+    oldest: u64,
+    newest: u64,
+    limit: usize,
+    read: usize,
+    txs: Vec<TxSummary>,
+    next: Option<TxPlace>,
+}
+
+impl<'a> Ranged<'a> {
+    fn new(range: &'a TxRange, lowest: u64, newest: u64) -> Ranged<'a> {
+        let past_the_tip = TxPlace {
+            height: newest.saturating_add(1),
+            position: 0,
+        };
+        Ranged {
+            target: range.target.as_deref(),
+            oldest: range.oldest.max(lowest),
+            newest,
+            limit: listed_limit(range.limit),
+            read: 0,
+            txs: Vec::new(),
+            next: Some(range.before.unwrap_or(past_the_tip)),
+        }
+    }
+
+    fn at(&self) -> Option<(u64, Option<u32>)> {
+        let next = self.next?;
+        below(next, self.newest).filter(|(height, _)| *height >= self.oldest)
+    }
+
+    fn wants(&self) -> Option<u64> {
+        let rows_taken = self.txs.len() >= self.limit;
+        let blocks_read = self.read >= self.limit;
+        let page_spent = rows_taken || blocks_read;
+        if page_spent {
+            return None;
+        }
+        self.at().map(|(height, _)| height)
+    }
+
+    fn take(&mut self, block: &Finalized) {
+        self.read += 1;
+        let Some((_, end)) = self.at() else {
+            return;
+        };
+        let end = end.map_or(block.txs.len(), |end| block.txs.len().min(end as usize));
+        let target = self.target;
+        for position in (0..end).rev() {
+            let rows_taken = self.txs.len() >= self.limit;
+            if rows_taken {
+                self.next = Some(TxPlace {
+                    height: block.height,
+                    position: position as u32 + 1,
+                });
+                return;
+            }
+            let tx = &block.txs[position];
+            let sent_to_target = target.is_none_or(|target| tx.target == target);
+            if sent_to_target {
+                self.txs.push(summary_of(block, position as u32, tx));
+            }
+        }
+        self.next = Some(TxPlace {
+            height: block.height,
+            position: 0,
+        });
+    }
+
+    fn gone(&mut self) {
+        self.next = None;
+    }
+
+    fn page(self) -> TxPage {
+        let next = self.at().and(self.next);
+        TxPage {
+            txs: self.txs,
+            next,
+        }
     }
 }
 

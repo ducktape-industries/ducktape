@@ -329,6 +329,129 @@ fn a_validator_serves_its_network_over_http() {
             genesis[0].id,
             node::Block::genesis(NETWORK.as_bytes(), TIME).digest().0
         );
+        let facts = client
+            .block_facts(FactsAsk {
+                before: Some(block.height + 1),
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        let listed = client
+            .blocks(page(Some(block.height + 1), 2, 0))
+            .await
+            .unwrap();
+        assert_eq!(facts.listed_from, listed.listed_from);
+        let counted: Vec<(u64, [u8; 32], [u8; 32], u32)> = listed
+            .blocks
+            .iter()
+            .map(|listed| {
+                (
+                    listed.height,
+                    listed.id,
+                    listed.parent,
+                    listed.txs.len() as u32,
+                )
+            })
+            .collect();
+        let faced: Vec<(u64, [u8; 32], [u8; 32], u32)> = facts
+            .blocks
+            .iter()
+            .map(|facts| (facts.height, facts.id, facts.parent, facts.txs))
+            .collect();
+        assert_eq!(faced, counted, "facts count what the whole block carries");
+        let summed = client
+            .txs(TxRange {
+                before: Some(TxPlace {
+                    height: block.height + 1,
+                    position: 0,
+                }),
+                oldest: block.height,
+                target: None,
+                limit: u32::MAX,
+            })
+            .await
+            .unwrap();
+        assert_eq!(summed.next, None, "the range ends at its oldest block");
+        let newest_first: Vec<_> = block.txs.iter().enumerate().rev().collect();
+        assert_eq!(summed.txs.len(), newest_first.len());
+        for (summary, (position, tx)) in summed.txs.iter().zip(newest_first) {
+            let applied = tx
+                .receipt
+                .as_ref()
+                .map(|receipt| matches!(receipt.outcome, Outcome::Applied { .. }));
+            assert_eq!(
+                (
+                    summary.height,
+                    summary.position,
+                    summary.time,
+                    summary.hash,
+                    &summary.signer,
+                    summary.anchor,
+                    &summary.target,
+                    summary.size,
+                    summary.applied,
+                ),
+                (
+                    block.height,
+                    position as u32,
+                    block.time,
+                    tx.hash,
+                    &tx.signer,
+                    tx.anchor,
+                    &tx.target,
+                    tx.size,
+                    applied,
+                )
+            );
+        }
+        let refused_rows = client
+            .txs(TxRange {
+                before: Some(TxPlace {
+                    height: rejected_at.height + 1,
+                    position: 0,
+                }),
+                oldest: rejected_at.height,
+                target: Some(rejected_at.tx.target.clone()),
+                limit: u32::MAX,
+            })
+            .await
+            .unwrap();
+        let refused_row = refused_rows
+            .txs
+            .iter()
+            .find(|row| row.position == rejected_at.position)
+            .expect("the rejected frame is listed");
+        assert_eq!(refused_row.applied, Some(false));
+        let unsent = client
+            .txs(TxRange {
+                before: Some(TxPlace {
+                    height: block.height + 1,
+                    position: 0,
+                }),
+                oldest: 0,
+                target: Some("nothing sent here".into()),
+                limit: u32::MAX,
+            })
+            .await
+            .unwrap();
+        assert!(unsent.txs.is_empty());
+        let newest_row = client
+            .txs(TxRange {
+                before: None,
+                oldest: 0,
+                target: None,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert!(
+            newest_row.txs.len() <= 1,
+            "a one-row ask answers one row at most"
+        );
+        assert!(
+            newest_row.next.is_some(),
+            "a chain longer than one block reads on"
+        );
 
         let read = abi::encode(&vec![Step::Op(HostOp::Get(b"a".to_vec()))]);
         let query = query_frame(&client, &alice, "probe", read.clone()).await;

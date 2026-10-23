@@ -26,8 +26,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::changes::{self, Fanout, Published, Subscription};
 use crate::ctx::{Ctx, EgressSigner};
 use crate::wire::{
-    AcksAsk, Admin, BlockAsk, Blocks, EgressPlan, EgressSet, Finalized, Get, Located, Network,
-    Page, Play, Query, Range, Submit, Submitted, TxAsk, route,
+    AcksAsk, Admin, BlockAsk, Blocks, EgressPlan, EgressSet, FactsAsk, FactsPage, Finalized, Get,
+    Located, Network, Page, Play, Query, Range, Submit, Submitted, TxAsk, TxPage, TxRange, route,
 };
 use crate::{Context, Daemon, cores, offload};
 
@@ -196,6 +196,8 @@ fn router<E: Context>(daemon: Arc<Daemon<E>>) -> Router {
         .route(route::BLOCK, post(block::<E>))
         .route(route::CROSSPOND_ACKS, post(crosspond_acks::<E>))
         .route(route::TX, post(tx::<E>))
+        .route(route::BLOCK_FACTS, post(block_facts::<E>))
+        .route(route::TXS, post(txs::<E>))
         .route(route::ACTIVITY, post(activity::<E>))
         .route(route::LOGS, get(logs::<E>))
         .route(route::HEALTH, get(health::<E>))
@@ -994,6 +996,28 @@ async fn block<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<Option<Fina
     };
     match ctx.block(ask).await {
         Ok(block) => Reply::Answered(block),
+        Err(error) => failed(error),
+    }
+}
+
+async fn block_facts<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<FactsPage> {
+    let ask: FactsAsk = match abi::decode(&body) {
+        Ok(ask) => ask,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match ctx.block_facts(ask).await {
+        Ok(page) => Reply::Answered(page),
+        Err(error) => failed(error),
+    }
+}
+
+async fn txs<E: Context>(ctx: Ctx<E>, Whole(body): Whole) -> Reply<TxPage> {
+    let range: TxRange = match abi::decode(&body) {
+        Ok(range) => range,
+        Err(refusal) => return Reply::Refused(refusal),
+    };
+    match ctx.txs(range).await {
+        Ok(page) => Reply::Answered(page),
         Err(error) => failed(error),
     }
 }

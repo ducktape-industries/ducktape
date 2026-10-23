@@ -8,6 +8,7 @@ pub const NODE_CONTRACT: u32 = 10;
 pub const ADMIN: &str = "$admin";
 pub const EGRESS: &str = "$egress";
 pub const HOLD_HEADER: &str = "ducktape-hold";
+pub const MOST_LISTED: u32 = crate::history::WINDOW as u32 + 1;
 
 pub mod route {
     pub const STATUS: &str = "/v1/status";
@@ -32,6 +33,8 @@ pub mod route {
     pub const BLOCKS: &str = "/v1/blocks";
     pub const BLOCK: &str = "/v1/block";
     pub const TX: &str = "/v1/tx";
+    pub const BLOCK_FACTS: &str = "/v1/blocks/facts";
+    pub const TXS: &str = "/v1/txs";
     pub const ACTIVITY: &str = "/v1/activity";
     pub const LOGS: &str = "/v1/logs";
     pub const HEALTH: &str = "/v1/health";
@@ -285,6 +288,69 @@ pub struct Located {
     pub position: u32,
     pub time: u64,
     pub tx: Tx,
+}
+
+/// A page of block facts, newest first, below `before` when it is given.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct FactsAsk {
+    pub before: Option<u64>,
+    pub limit: u32,
+}
+
+/// One finalized block without its transactions: `txs` counts them.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Facts {
+    pub height: u64,
+    pub id: [u8; 32],
+    pub parent: [u8; 32],
+    pub time: u64,
+    pub epoch: u64,
+    pub proposer: Option<Vec<u8>>,
+    pub txs: u32,
+}
+
+/// The facts a `FactsAsk` reaches, and the lowest height this node lists.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct FactsPage {
+    pub blocks: Vec<Facts>,
+    pub listed_from: Option<u64>,
+}
+
+/// A transaction's place on the chain: its block's height and its position in that block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct TxPlace {
+    pub height: u64,
+    pub position: u32,
+}
+
+/// The transactions older than `before` down to block `oldest`, newest first, sent to `target` when it is given.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct TxRange {
+    pub before: Option<TxPlace>,
+    pub oldest: u64,
+    pub target: Option<String>,
+    pub limit: u32,
+}
+
+/// A transaction as a list shows it: no payload, and of its receipt only whether it applied.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct TxSummary {
+    pub height: u64,
+    pub position: u32,
+    pub time: u64,
+    pub hash: [u8; 32],
+    pub signer: Vec<u8>,
+    pub anchor: Tip,
+    pub target: String,
+    pub size: u32,
+    pub applied: Option<bool>,
+}
+
+/// The rows a `TxRange` page answers, and the `before` that reads on while the range holds more.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct TxPage {
+    pub txs: Vec<TxSummary>,
+    pub next: Option<TxPlace>,
 }
 
 /// Every member of the current epoch as this node sees it (`/v1/network`).

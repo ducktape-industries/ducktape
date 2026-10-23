@@ -43,8 +43,8 @@ use host::{Layer, Submission, Tip};
 use node::{Frame, Preconfirm};
 
 use noded::wire::{
-    Admin, BlockAsk, BlockRef, Blocks, Change, EgressPlan, EgressSet, Head, Reached, Submitted,
-    TxAsk, TxRef,
+    Admin, BlockAsk, BlockRef, Blocks, Change, EgressPlan, EgressSet, FactsAsk, Head, Reached,
+    Submitted, TxAsk, TxPlace, TxRange, TxRef,
 };
 
 use noded::{

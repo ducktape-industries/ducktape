@@ -14,8 +14,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::wire::{
-    AcksAsk, Ask, BlockAsk, BlockRef, Blocks, Change, Finalized, Forwarded, Get, HaloSelf, Head,
-    Located, Network, Page, Play, Query, Range, Status, Submit, Submitted, TxAsk, activity, route,
+    AcksAsk, Ask, BlockAsk, BlockRef, Blocks, Change, FactsAsk, FactsPage, Finalized, Forwarded,
+    Get, HaloSelf, Head, Located, Network, Page, Play, Query, Range, Status, Submit, Submitted,
+    TxAsk, TxPage, TxRange, activity, route,
 };
 use crate::{Error, Result};
 
@@ -247,6 +248,14 @@ impl Client {
 
     pub async fn tx(&self, ask: TxAsk) -> Result<Option<Located>> {
         self.post(route::TX, &ask).await
+    }
+
+    pub async fn block_facts(&self, ask: FactsAsk) -> Result<FactsPage> {
+        self.post(route::BLOCK_FACTS, &ask).await
+    }
+
+    pub async fn txs(&self, range: TxRange) -> Result<TxPage> {
+        self.post(route::TXS, &range).await
     }
 
     pub async fn activity(&self, query: &activity::Query) -> Result<activity::Reply> {

@@ -1243,12 +1243,27 @@ is not a read, so a query whose answer moves only with time is not run again.
 Pings and the epoch cut are as on `/v1/changes`, and a frame that is not a
 `Watch` ends the socket.
 
+`POST /v1/blocks/facts` takes a borsh `noded::wire::FactsAsk` (`before`,
+`limit`) and answers a `FactsPage`: each block's facts, newest first, with the
+count of its transactions in place of them, and `listed_from` as `/v1/blocks`
+has it. `POST /v1/txs` takes a `TxRange`: the transactions older than the place
+`before` names (a block's height and a position in it; none reads from the
+newest block) down to block `oldest`, newest first, only those sent to `target`
+when it is given. Its `TxPage` answers them as `TxSummary` rows: where each
+sits, its signer, anchor, target and size, and whether it applied where the
+node kept its receipt, never its payload, events or nested receipts. A page
+holds at most `limit` rows and reads at most `limit` blocks, and `next` is the
+`before` that reads on, none once the range is read. Both routes answer at most
+`noded::wire::MOST_LISTED` (1025, the blocks the history keeps) whatever
+`limit` asks. A list reads its rows through these two, and `/v1/tx` opens one
+transaction whole.
+
 A node keeps the block history of its tip and the 1024 blocks below it (each
 block's summary, where each transaction first landed and the payload of each
 transaction a block ran) in a store of its own under `history/` in the
 workspace: keeping a block lets go of the one 1025 below it, so `/v1/blocks`
-lists from the window's bottom (`listed_from`) and `/v1/block` and `/v1/tx`
-answer not found below it. The same store keeps crosspond's epoch-close and
+and `/v1/blocks/facts` list from the window's bottom (`listed_from`), `/v1/txs`
+reads nothing below it, and `/v1/block` and `/v1/tx` answer not found below it. The same store keeps crosspond's epoch-close and
 epoch-opening records, which the window does not drop: the block writer deletes
 the ones a node with no linked network no longer needs, and the crosspond relay
 deletes the ones no linked network needs. The block read routes read it from

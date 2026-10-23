@@ -15,7 +15,10 @@ use node::{Preconfirm, Source, Taken};
 use crate::changes::Subscription;
 use crate::crosspond::{Asked, Unbuilt};
 use crate::view::{Reading, View};
-use crate::wire::{AcksAsk, BlockAsk, Blocks, Finalized, Located, Network, Page, TxAsk, activity};
+use crate::wire::{
+    AcksAsk, BlockAsk, Blocks, FactsAsk, FactsPage, Finalized, Located, Network, Page, TxAsk,
+    TxPage, TxRange, activity,
+};
 use crate::{Context, Daemon, Error, Result};
 
 pub(crate) struct Ctx<E: Context> {
@@ -134,6 +137,14 @@ impl<E: Context> Ctx<E> {
 
     pub(crate) async fn block(&self, ask: BlockAsk) -> Result<Option<Finalized>> {
         self.daemon.block(ask).await
+    }
+
+    pub(crate) async fn block_facts(&self, ask: FactsAsk) -> Result<FactsPage> {
+        self.daemon.block_facts(ask).await
+    }
+
+    pub(crate) async fn txs(&self, range: TxRange) -> Result<TxPage> {
+        self.daemon.txs(range).await
     }
 
     pub(crate) async fn crosspond_acks(
