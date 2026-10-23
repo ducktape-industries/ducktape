@@ -1307,7 +1307,7 @@ struct Phases {
 
 impl Phases {
     fn slow(&self, block_time_ms: u64) -> bool {
-        self.total > Duration::from_millis(block_time_ms)
+        ms(self.total) > block_time_ms
     }
 
     fn verifying(&self) -> Duration {
@@ -2168,6 +2168,21 @@ mod tests {
             ..Phases::default()
         };
         assert_eq!(replayed.verifying(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_block_under_a_millisecond_past_its_time_is_not_slow_since_its_report_says_it_took_the_block_time()
+     {
+        let half_a_millisecond_past = Phases {
+            total: Duration::from_micros(1_000_500),
+            ..Phases::default()
+        };
+        assert_eq!(super::ms(half_a_millisecond_past.total), 1000);
+        assert!(!half_a_millisecond_past.slow(1000));
+        assert_eq!(
+            slow_of(&half_a_millisecond_past, 7, 1000, 0, Duration::ZERO),
+            None
+        );
     }
 
     #[test]
