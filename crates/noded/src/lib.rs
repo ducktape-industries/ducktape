@@ -320,7 +320,8 @@ impl<E: Context> Daemon<E> {
 
     pub async fn sync(&self, request: statesync::Request) -> Result<statesync::Response> {
         let view = self.view()?;
-        let served = statesync::serve(view.sync(), &self.holds, request).await;
+        let bounds = statesync::AnswerBounds::default();
+        let served = statesync::serve(view.sync(), &self.holds, request, bounds).await;
         Ok(statesync::anchored(served, &**view.sync()).await)
     }
 

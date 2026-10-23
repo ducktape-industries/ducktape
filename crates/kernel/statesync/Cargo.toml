@@ -11,6 +11,7 @@ commonware-codec = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-parallel = { workspace = true }
+commonware-runtime = { workspace = true }
 commonware-storage = { workspace = true }
 consensus = { workspace = true }
 futures = { workspace = true }
@@ -22,7 +23,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 blob = { workspace = true }
-commonware-runtime = { workspace = true }
 commonware-utils = { workspace = true }
 fixture-programs = { path = "../fixtures/programs" }
 fixture-probe = { path = "../fixtures/probe" }

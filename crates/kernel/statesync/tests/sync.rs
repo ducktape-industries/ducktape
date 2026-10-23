@@ -12,6 +12,7 @@ use abi::{
     BlobId, HostOp, role,
     role::{halo, validators},
 };
+use commonware_codec::{Decode as _, Encode as _, EncodeSize as _};
 use commonware_consensus::marshal::Start;
 use commonware_consensus::simplex::scheme::ed25519::Scheme;
 use commonware_consensus::simplex::types::{Finalization, Finalize, Proposal};
@@ -224,6 +225,7 @@ struct Source {
     certificates: Mutex<BTreeMap<u64, Certificate>>,
     blocks: Mutex<Vec<Block>>,
     holds: statesync::Holds<Ctx>,
+    answers: statesync::AnswerBounds,
 }
 
 impl Anchors for Source {
@@ -251,7 +253,7 @@ impl Exchange for Loopback {
         let node = self.0.node.lock().await;
         let published = statesync::Published::of(&node, None).unwrap();
         drop(node);
-        let served = serve(&published, &self.0.holds, request).await;
+        let served = serve(&published, &self.0.holds, request, self.0.answers).await;
         let response = anchored(served, &*self.0).await;
         Ok(abi::decode(&abi::encode(&response)).unwrap())
     }
@@ -465,6 +467,14 @@ async fn found(context: &Ctx) -> Network {
 
 /// Founds the network as the source's store `name`.
 async fn found_as(context: &Ctx, name: &'static str) -> Network {
+    found_answering_as(context, name, statesync::AnswerBounds::default()).await
+}
+
+async fn found_answering_as(
+    context: &Ctx,
+    name: &'static str,
+    answers: statesync::AnswerBounds,
+) -> Network {
     let keys: Vec<_> = (1..=3).map(key).collect();
     let members: Vec<_> = keys.iter().map(member).collect();
     let dir = tempfile::tempdir().unwrap();
@@ -486,6 +496,7 @@ async fn found_as(context: &Ctx, name: &'static str) -> Network {
             certificates: Mutex::new(BTreeMap::new()),
             blocks: Mutex::new(Vec::new()),
             holds: statesync::Holds::default(),
+            answers,
         }),
         _dir: dir,
     }
@@ -2525,5 +2536,111 @@ fn a_join_refuses_a_snapshot_whose_copy_opens_cleanly_at_an_older_root_than_its_
             .get("probe", b"a")
             .unwrap();
         assert_eq!(read, Some(b"2".to_vec()));
+    });
+}
+
+async fn answered(network: &Network, answers: statesync::AnswerBounds) -> (Vec<state::Op>, u64) {
+    let node = network.source.node.lock().await;
+    let published = statesync::Published::of(&node, None).unwrap();
+    drop(node);
+    let target = published.serving("probe").unwrap().target.clone().unwrap();
+    let max_ops = state::Tuning::default().sync_fetch_batch;
+    let start = target.range.start();
+    let size = target.range.end();
+    let wanted = max_ops.get().min(*size - *start);
+    let request = statesync::SyncRequest::Operations {
+        size,
+        start,
+        max_ops,
+    };
+    let request = Request::Sync {
+        program: "probe".to_string(),
+        request: request.encode().to_vec(),
+    };
+    let served = serve(&published, &network.source.holds, request, answers).await;
+    let statesync::Served::Answered(Response::Sync(bytes)) = served else {
+        panic!("a sync of probe is answered");
+    };
+    let config = (max_ops.get() as usize, state::codec_config());
+    let response = statesync::SyncResponse::decode_cfg(bytes.as_slice(), &config).unwrap();
+    let statesync::SyncResponse::Operations { operations, .. } = response else {
+        panic!("a request for operations is answered with operations");
+    };
+    (operations, wanted)
+}
+
+fn bounded_steps() -> Vec<Step> {
+    (0..8)
+        .map(|i| set(format!("bounded-{i}").as_bytes(), b"1"))
+        .collect()
+}
+
+#[test]
+fn a_sync_answer_ends_with_the_operation_that_reaches_its_byte_bound_or_at_its_time_bound_and_holds_one_at_least()
+ {
+    deterministic::Runner::default().start(|context| async move {
+        let mut network = found(&context).await;
+        let alice = key(11);
+        network.advance(vec![frame(&alice, bounded_steps())]).await;
+
+        let (whole, wanted) = answered(&network, statesync::AnswerBounds::default()).await;
+        assert!(wanted > 1, "probe has {wanted} operations to sync");
+        assert_eq!(whole.len() as u64, wanted);
+
+        let one = whole[0].encode_size();
+        let one_operation = statesync::AnswerBounds {
+            bytes: one,
+            ..Default::default()
+        };
+        assert_eq!(answered(&network, one_operation).await.0, whole[..1]);
+        let crossed_by_the_second = statesync::AnswerBounds {
+            bytes: one + 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            answered(&network, crossed_by_the_second).await.0,
+            whole[..2]
+        );
+        let no_bytes = statesync::AnswerBounds {
+            bytes: 0,
+            ..Default::default()
+        };
+        assert_eq!(answered(&network, no_bytes).await.0, whole[..1]);
+        let no_time = statesync::AnswerBounds {
+            time: Duration::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(answered(&network, no_time).await.0, whole[..1]);
+    });
+}
+
+#[test]
+fn a_join_from_a_source_answering_one_operation_at_a_time_asks_again_from_where_each_ended_and_adopts_its_state()
+ {
+    deterministic::Runner::default().start(|context| async move {
+        let one_at_a_time = statesync::AnswerBounds {
+            bytes: 0,
+            ..Default::default()
+        };
+        let mut network = found_answering_as(&context, "source", one_at_a_time).await;
+        let alice = key(11);
+        let tip = network.advance(vec![frame(&alice, bounded_steps())]).await;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            context.child("joiner"),
+            "joiner",
+            dir.path(),
+            NETWORK.to_vec(),
+            PAUSE,
+            network.counting(&asked, usize::MAX),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.node.tip().unwrap(), tip);
+        assert_eq!(joined.node.host().root().unwrap(), network.root().await);
+        let (_, wanted) = answered(&network, statesync::AnswerBounds::default()).await;
+        let asked = asked.load(Ordering::SeqCst) as u64;
+        assert_eq!(asked, wanted, "probe is asked once for each operation");
     });
 }

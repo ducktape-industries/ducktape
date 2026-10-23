@@ -1010,6 +1010,19 @@ where
         Ok((proof, ops))
     }
 
+    pub async fn historical_range_proof(
+        &self,
+        historical_leaves: Location<F>,
+        range: Range<Location<F>>,
+        inactive_peaks: usize,
+    ) -> Result<Proof<F, H::Digest>, Error<F>> {
+        let proof = self
+            .merkle
+            .historical_range_proof(&self.hasher, historical_leaves, range, inactive_peaks)
+            .await?;
+        Ok(proof)
+    }
+
     pub async fn pinned_nodes_at(&self, loc: Location<F>) -> Result<Vec<H::Digest>, Error<F>> {
         self.merkle.pinned_nodes_at(loc).await.map_err(Into::into)
     }

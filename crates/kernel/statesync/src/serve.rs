@@ -1,21 +1,25 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use abi::{ProgramId, Refusal, reason};
 use arc_swap::ArcSwap;
-use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_codec::{DecodeExt as _, Encode as _, EncodeSize as _};
 use commonware_consensus::types::Height;
+use commonware_runtime::ReadOptions;
 use commonware_storage::journal::contiguous::Contiguous as _;
-use commonware_storage::qmdb::sync::Source as _;
+use commonware_storage::merkle;
+use commonware_storage::qmdb::{self, sync::Source as _};
 use consensus::MarshalMailbox;
+use futures::StreamExt as _;
 use host::Tip;
 use node::Node;
 use state::Serving;
 
 use crate::Anchor;
 use crate::wire::{Head, Manifest, Request, Response};
-use crate::{Context, SyncRequest, SyncTarget};
+use crate::{Context, SyncRequest, SyncResponse, SyncTarget};
 
 pub trait Anchors: Send + Sync {
     fn anchor(&self, tip: Tip) -> impl Future<Output = Option<Anchor>> + Send;
@@ -188,6 +192,22 @@ impl<E: Context> Drop for Hold<E> {
     }
 }
 
+/// What one sync answer reads at most: operations up to `bytes`, for up to `time`.
+#[derive(Clone, Copy, Debug)]
+pub struct AnswerBounds {
+    pub bytes: usize,
+    pub time: Duration,
+}
+
+impl Default for AnswerBounds {
+    fn default() -> AnswerBounds {
+        AnswerBounds {
+            bytes: abi::BLOCK_BYTES,
+            time: Duration::from_secs(10),
+        }
+    }
+}
+
 pub enum Served {
     Answered(Response),
     Unanchored {
@@ -200,11 +220,12 @@ pub async fn serve<E: Context>(
     published: &Published<E>,
     holds: &Holds<E>,
     request: Request,
+    bounds: AnswerBounds,
 ) -> Served {
     match request {
         Request::Head => head(published),
         Request::Sync { program, request } => {
-            Served::Answered(sync(published, holds, &program, &request).await)
+            Served::Answered(sync(published, holds, &program, &request, bounds).await)
         }
         Request::Release { hold, program } => {
             holds.release(hold, &program);
@@ -277,6 +298,7 @@ async fn sync<E: Context>(
     holds: &Holds<E>,
     program: &str,
     request: &[u8],
+    bounds: AnswerBounds,
 ) -> Response {
     let Some(newest) = published.programs.get(program) else {
         return refused(
@@ -308,10 +330,72 @@ async fn sync<E: Context>(
             "this node pruned the operations the request starts at; read the head again",
         );
     };
-    match serving.reader.serve(request).await {
-        Ok((response, _)) => Response::Sync(response.encode().to_vec()),
+    match answer(&serving, request, bounds).await {
+        Ok(response) => Response::Sync(response.encode().to_vec()),
         Err(error) => refused(reason::INVALID_INPUT, error),
     }
+}
+
+async fn answer<E: Context>(
+    serving: &Serving<E>,
+    request: SyncRequest,
+    bounds: AnswerBounds,
+) -> Result<SyncResponse, qmdb::Error<state::Family>> {
+    let SyncRequest::Operations {
+        size,
+        start,
+        max_ops,
+    } = request
+    else {
+        let (response, _) = serving.reader.serve(request).await?;
+        return Ok(response);
+    };
+    let past_the_log = size > serving.reader.size();
+    if past_the_log {
+        return Err(merkle::Error::RangeOutOfBounds(size).into());
+    }
+    let past_the_size = start >= size;
+    if past_the_size {
+        return Err(merkle::Error::RangeOutOfBounds(start).into());
+    }
+    let inactive_peaks = qmdb::inactive_peaks_at(&serving.reader, size).await?;
+    let wanted = max_ops.get().min(*size - *start);
+    let operations = read_within(&serving.reader, *start, wanted, bounds).await?;
+    let end = start.saturating_add(operations.len() as u64);
+    let proof = serving
+        .reader
+        .historical_range_proof(size, start..end, inactive_peaks)
+        .await?;
+    Ok(SyncResponse::Operations { proof, operations })
+}
+
+async fn read_within<E: Context>(
+    reader: &state::Reader<E>,
+    start: u64,
+    wanted: u64,
+    bounds: AnswerBounds,
+) -> Result<Vec<state::Op>, qmdb::Error<state::Family>> {
+    let begun = Instant::now();
+    let replay_buffer = state::Tuning::default().replay_buffer;
+    let replayed = reader
+        .replay(start, replay_buffer, ReadOptions::default())
+        .await?;
+    let mut replayed = std::pin::pin!(replayed);
+    let mut operations = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(read) = replayed.next().await {
+        let (_, operation) = read?;
+        bytes = bytes.saturating_add(operation.encode_size());
+        operations.push(operation);
+        let holds_all_wanted = operations.len() as u64 == wanted;
+        let fills_the_bytes = bytes >= bounds.bytes;
+        let out_of_time = begun.elapsed() >= bounds.time;
+        let answered = holds_all_wanted || fills_the_bytes || out_of_time;
+        if answered {
+            break;
+        }
+    }
+    Ok(operations)
 }
 
 fn refused(reason: &str, sentence: impl ToString) -> Response {

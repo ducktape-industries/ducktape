@@ -166,7 +166,7 @@ where
 }
 
 /// Compute the inactive peak count for a historical operation count.
-pub(crate) async fn inactive_peaks_at<F, R>(
+pub async fn inactive_peaks_at<F, R>(
     reader: &R,
     op_count: Location<F>,
 ) -> Result<usize, Error<F>>

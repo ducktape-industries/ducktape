@@ -22,7 +22,9 @@ pub use bulk::{Bulk, HeldClosing, bulk_join, bulk_readopt};
 pub use consensus::Anchor;
 pub use consensus::Context;
 pub use remote::Remote;
-pub use serve::{Anchors, Hold, Holds, Published, Served, anchored, held, manifest, serve};
+pub use serve::{
+    Anchors, AnswerBounds, Hold, Holds, Published, Served, anchored, held, manifest, serve,
+};
 pub use wire::{Head, Manifest, Request, Response};
 
 pub type SyncRequest = sync::Request<state::Family>;
