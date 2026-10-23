@@ -723,14 +723,14 @@ impl Compressor {
     }
 }
 
-enum Read {
+pub(crate) enum Read {
     Framed(Vec<u8>),
     Unnamed,
     Fetching,
 }
 
 impl Read {
-    fn framed(self) -> Option<Vec<u8>> {
+    pub(crate) fn framed(self) -> Option<Vec<u8>> {
         match self {
             Read::Framed(framed) => Some(framed),
             Read::Unnamed | Read::Fetching => None,
@@ -738,7 +738,7 @@ impl Read {
     }
 }
 
-async fn served<E: Context>(ctx: &Ctx<E>, id: BlobId) -> crate::Result<Read> {
+pub(crate) async fn served<E: Context>(ctx: &Ctx<E>, id: BlobId) -> crate::Result<Read> {
     let view = ctx.view().clone();
     let now = ctx.now();
     let readable = offload(move || {

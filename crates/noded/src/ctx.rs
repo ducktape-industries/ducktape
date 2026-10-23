@@ -56,15 +56,19 @@ impl<E: Context> FromRequestParts<Arc<Daemon<E>>> for Ctx<E> {
         _: &mut Parts,
         daemon: &Arc<Daemon<E>>,
     ) -> std::result::Result<Self, Stopped> {
-        let view = daemon.view().map_err(Stopped)?;
+        Ctx::of(daemon).map_err(Stopped)
+    }
+}
+
+impl<E: Context> Ctx<E> {
+    pub(crate) fn of(daemon: &Arc<Daemon<E>>) -> Result<Ctx<E>> {
+        let view = daemon.view()?;
         Ok(Ctx {
             view,
             daemon: daemon.clone(),
         })
     }
-}
 
-impl<E: Context> Ctx<E> {
     pub(crate) fn view(&self) -> &Arc<View<E>> {
         &self.view
     }

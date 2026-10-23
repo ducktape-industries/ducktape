@@ -65,6 +65,8 @@ pub struct LoadSettings {
     pub egress_lane_backlog: Option<NonZeroUsize>,
     #[serde(default, deserialize_with = "held_permits")]
     pub forward_lane_backlog: Option<NonZeroUsize>,
+    #[serde(default, deserialize_with = "held_permits")]
+    pub state_lane_backlog: Option<NonZeroUsize>,
     pub query_fuel: Option<NonZeroU64>,
 }
 
@@ -263,6 +265,7 @@ impl LoadSettings {
             live_linger_ms: self.live_linger_ms.or(under.live_linger_ms),
             egress_lane_backlog: self.egress_lane_backlog.or(under.egress_lane_backlog),
             forward_lane_backlog: self.forward_lane_backlog.or(under.forward_lane_backlog),
+            state_lane_backlog: self.state_lane_backlog.or(under.state_lane_backlog),
             query_fuel: self.query_fuel.or(under.query_fuel),
         }
     }
@@ -305,6 +308,9 @@ impl LoadSettings {
             forward_lane_backlog: self
                 .forward_lane_backlog
                 .unwrap_or(default.forward_lane_backlog),
+            state_lane_backlog: self
+                .state_lane_backlog
+                .unwrap_or(default.state_lane_backlog),
             rpc_cpus: None,
             rpc_blocking_threads: None,
             query_fuel: self.query_fuel,

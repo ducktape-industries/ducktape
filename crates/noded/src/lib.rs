@@ -209,6 +209,7 @@ pub struct Daemon<E: Context> {
     votes: Votes,
     halo_self: watch::Sender<wire::HaloSelf>,
     forward: forward::Forwarding,
+    state_lane: state_lane::Lane<E>,
     solo: Option<fork::Solo>,
     #[cfg(feature = "testkit")]
     pub retabling: testkit::Gate,

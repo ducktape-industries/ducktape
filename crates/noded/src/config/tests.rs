@@ -50,6 +50,7 @@ const EVERY_KEY: &str = "listen = \"127.0.0.1:9000\"\n\
                          live_linger_ms = 700\n\
                          egress_lane_backlog = 2\n\
                          forward_lane_backlog = 3\n\
+                         state_lane_backlog = 6\n\
                          query_fuel = 5000000\n\
                          [consensus]\n\
                          leader_timeout_ms = 4000\n\
@@ -81,6 +82,7 @@ fn every_key() -> Settings {
             live_linger_ms: NonZeroU64::new(700),
             egress_lane_backlog: Some(count(2)),
             forward_lane_backlog: Some(count(3)),
+            state_lane_backlog: Some(count(6)),
             query_fuel: NonZeroU64::new(5_000_000),
         },
         consensus: ConsensusSettings {
@@ -135,6 +137,7 @@ fn a_count_the_file_names_must_be_nonzero_and_fit_a_tokio_semaphore() {
         "blob_backlog",
         "egress_lane_backlog",
         "forward_lane_backlog",
+        "state_lane_backlog",
     ] {
         assert!(
             Settings::parse(&format!("[load]\n{key} = 0\n")).is_err(),
@@ -198,6 +201,7 @@ fn file_only_settings_reach_the_config() {
             live_linger: Duration::from_millis(700),
             egress_lane_backlog: count(2),
             forward_lane_backlog: count(3),
+            state_lane_backlog: count(6),
             rpc_cpus: None,
             rpc_blocking_threads: None,
             query_fuel: NonZeroU64::new(5_000_000),

@@ -1,17 +1,29 @@
-//! Raw state streams over the node's QUIC plane and their framed replies.
+//! Raw state streams over the node's QUIC plane: the joining end, and the serving end that answers
+//! from the newest epoch close this node holds.
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use abi::{BlobId, ProgramId, Refusal, reason};
 use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::Encode as _;
 use commonware_cryptography::ed25519::PublicKey;
+use consensus::Certificate;
 use futures::{Stream, StreamExt as _};
-use halo::{Class, Halo, Links, Streams, Transport};
+use halo::{Class, Halo, Inbound, Links, Streams, Transport};
+use node::Block;
 use statesync::lane::{Ask, Closing, Piece};
-use statesync::{Bulk, Exchange, Failure, Fault, HeldClosing, Request, Response};
+use statesync::{
+    Bulk, Exchange, Failure, Fault, HeldClosing, Hold, Holds, Published, Request, Response,
+};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::sync::watch;
+
+use crate::Daemon;
+use crate::ctx::Ctx;
+
+const TARGET: &str = "ducktape::sync";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -21,10 +33,18 @@ pub enum Error {
     Halo(#[from] halo::Error),
     #[error(transparent)]
     State(#[from] state::Error),
+    #[error(transparent)]
+    Node(Box<crate::Error>),
     #[error("state stream refused: {}: {}", .0.reason, .0.sentence)]
     Refused(Refusal),
     #[error("state stream encoding: {0}")]
     Encoding(#[source] io::Error),
+}
+
+impl From<crate::Error> for Error {
+    fn from(error: crate::Error) -> Error {
+        Error::Node(Box::new(error))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -41,10 +61,19 @@ impl Fault for Error {
             | Self::Halo(halo::Error::NoDatagrams(_))
             | Self::Halo(halo::Error::Oversized(_))
             | Self::State(_)
-            | Self::Refused(_)
+            | Self::Node(_)
             | Self::Encoding(_) => Failure::Definite,
+            Self::Refused(refusal) => refused(refusal),
         }
     }
+}
+
+fn refused(refusal: &Refusal) -> Failure {
+    let served_later = refusal.reason == reason::NOT_YET;
+    if served_later {
+        return Failure::Transient("state_not_served_yet");
+    }
+    Failure::Definite
 }
 
 #[derive(Clone)]
@@ -157,6 +186,207 @@ impl Exchange for Source {
     }
 }
 
+/// The node's end of `ducktape/state`: the streams it accepts and the newest close it serves.
+pub(crate) struct Lane<E: crate::Context> {
+    streams: Arc<Streams<Arc<Links>>>,
+    ready: watch::Sender<Option<Arc<Ready<E>>>>,
+}
+
+/// An epoch close a joiner can adopt: the state published at the closing block, and the block
+/// that opens the next epoch with its finalization.
+pub(crate) struct Ready<E: crate::Context> {
+    published: Arc<Published<E>>,
+    opening: Block,
+    certificate: Certificate,
+}
+
+impl<E: crate::Context> Lane<E> {
+    pub(crate) fn bind(
+        halo: &Halo,
+        backlog: NonZeroUsize,
+    ) -> std::result::Result<Lane<E>, halo::Taken> {
+        let streams = halo.plane().streams(statesync::lane::LANE, backlog.get())?;
+        Ok(Lane {
+            streams: Arc::new(streams),
+            ready: watch::Sender::new(None),
+        })
+    }
+
+    pub(crate) fn opened(
+        &self,
+        published: Arc<Published<E>>,
+        opening: Block,
+        certificate: Certificate,
+    ) {
+        let ready = Ready {
+            published,
+            opening,
+            certificate,
+        };
+        self.ready.send_replace(Some(Arc::new(ready)));
+    }
+
+    fn unserved(&self, past: Option<u64>) -> Option<Refusal> {
+        let asks_any = past.is_none();
+        let serves_none = self.ready.borrow().is_none();
+        let refused = asks_any && serves_none;
+        refused.then(|| {
+            Refusal::new(
+                reason::NOT_YET,
+                "this node serves no epoch close yet: it serves one once it applies a close and the block after it",
+            )
+        })
+    }
+
+    async fn newer(&self, past: Option<u64>) -> Option<Arc<Ready<E>>> {
+        let mut readies = self.ready.subscribe();
+        let above = |ready: &Option<Arc<Ready<E>>>| {
+            ready
+                .as_ref()
+                .is_some_and(|ready| past.is_none_or(|past| ready.published.tip().height > past))
+        };
+        let held = readies.wait_for(above).await.ok()?;
+        let ready = Option::clone(&held);
+        drop(held);
+        ready
+    }
+}
+
+pub(crate) fn spawn<E: crate::Context>(daemon: Arc<Daemon<E>>, rpc: tokio::runtime::Handle) {
+    let asks = rpc.clone();
+    rpc.spawn(async move {
+        while let Some(inbound) = daemon.state_lane.streams.accept().await {
+            asks.spawn(served(daemon.clone(), inbound));
+        }
+    });
+}
+
+async fn served<E: crate::Context, S>(daemon: Arc<Daemon<E>>, inbound: Inbound<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let peer = inbound.from;
+    let ask = borsh::from_slice::<Ask>(&inbound.meta);
+    let mut stream = inbound.stream;
+    let answered = match ask {
+        Ok(Ask::Head { past }) => head(&daemon, past, &mut stream).await,
+        Ok(Ask::Ops {
+            hold,
+            program,
+            from,
+        }) => ops(&daemon, hold, &program, from, &mut stream).await,
+        Ok(Ask::Blobs) => blobs(&daemon, &mut stream).await,
+        Err(error) => unasked(error, &mut stream).await,
+    };
+    if let Err(error) = answered {
+        tracing::debug!(target: TARGET, event = "state_stream_cut", %peer, %error, reason = "stream_unanswered", "a state stream ended before its answer did");
+    }
+}
+
+async fn head<E: crate::Context, S: AsyncRead + AsyncWrite + Unpin>(
+    daemon: &Daemon<E>,
+    past: Option<u64>,
+    stream: &mut S,
+) -> Result<()> {
+    let held = held_close(&daemon.state_lane, &daemon.holds, past, &mut *stream).await?;
+    let Some(hold) = held else {
+        return Ok(());
+    };
+    let mut byte = [0];
+    let _ = stream.read(&mut byte).await;
+    drop(hold);
+    daemon.holds_ended.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn held_close<E: crate::Context, S: AsyncWrite + Unpin>(
+    lane: &Lane<E>,
+    holds: &Holds<E>,
+    past: Option<u64>,
+    stream: &mut S,
+) -> Result<Option<Hold<E>>> {
+    if let Some(none) = lane.unserved(past) {
+        write::<_, Closing>(stream, &Err(none)).await?;
+        return Ok(None);
+    }
+    let Some(ready) = lane.newer(past).await else {
+        return Ok(None);
+    };
+    let (served, hold) = statesync::held(ready.published.clone(), holds);
+    let answer = statesync::anchored(served, &*ready.published).await;
+    let (closing, hold) = match closed(answer, hold, &ready) {
+        Ok(closed) => closed,
+        Err(refusal) => {
+            write::<_, Closing>(stream, &Err(refusal)).await?;
+            return Ok(None);
+        }
+    };
+    write(stream, &Ok(closing)).await?;
+    Ok(Some(hold))
+}
+
+fn closed<E: crate::Context>(
+    answer: Response,
+    hold: Option<Hold<E>>,
+    ready: &Ready<E>,
+) -> std::result::Result<(Closing, Hold<E>), Refusal> {
+    let (head, hold) = match (answer, hold) {
+        (Response::Head(head), Some(hold)) => (head, hold),
+        (Response::Refused(refusal), _) => return Err(refusal),
+        (_, _) => {
+            let unheld = "this node holds no epoch close it can serve";
+            return Err(Refusal::new(reason::NOT_FOUND, unheld));
+        }
+    };
+    let closing = Closing {
+        head,
+        hold: hold.number(),
+        opening: ready.opening.clone(),
+        certificate: ready.certificate.clone(),
+    };
+    Ok((closing, hold))
+}
+
+async fn ops<E: crate::Context, S: AsyncWrite + Unpin>(
+    daemon: &Daemon<E>,
+    hold: u64,
+    program: &str,
+    from: u64,
+    stream: &mut S,
+) -> Result<()> {
+    let Some(serving) = daemon.holds.serving(hold, program) else {
+        let unheld = Refusal::new(
+            reason::NOT_FOUND,
+            "no hold of this node's serves the program; read the head again",
+        );
+        return write::<_, Piece>(&mut *stream, &Err(unheld)).await;
+    };
+    let batch = state::Tuning::default().sync_apply_batch;
+    serve_ops(&serving, from, batch, stream).await
+}
+
+async fn blobs<E: crate::Context, S: AsyncRead + AsyncWrite + Unpin>(
+    daemon: &Arc<Daemon<E>>,
+    stream: &mut S,
+) -> Result<()> {
+    let ids: Vec<BlobId> = read(&mut *stream).await?;
+    let ctx = Ctx::of(daemon)?;
+    for id in ids {
+        let blob = crate::server::served(&ctx, id).await?.framed();
+        write(&mut *stream, &Ok(blob)).await?;
+    }
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn unasked<S: AsyncWrite + Unpin>(error: io::Error, stream: &mut S) -> Result<()> {
+    let refusal = Refusal::new(
+        reason::PROTOCOL,
+        format!("a state stream's ask does not decode: {error}"),
+    );
+    write::<_, ()>(&mut *stream, &Err(refusal)).await
+}
+
 pub async fn write<W: AsyncWrite + Unpin, T: BorshSerialize>(
     writer: &mut W,
     answer: &std::result::Result<T, Refusal>,
@@ -188,6 +418,18 @@ pub async fn serve_ops<E: statesync::Context, W: AsyncWrite + Unpin>(
     batch: NonZeroU64,
     writer: &mut W,
 ) -> Result<()> {
+    match sent_ops(serving, from, batch, writer).await {
+        Err(Error::State(error)) => unread(error, writer).await,
+        sent => sent,
+    }
+}
+
+async fn sent_ops<E: statesync::Context, W: AsyncWrite + Unpin>(
+    serving: &state::Serving<E>,
+    from: u64,
+    batch: NonZeroU64,
+    writer: &mut W,
+) -> Result<()> {
     let nodes = serving
         .pinned()
         .await?
@@ -207,6 +449,13 @@ pub async fn serve_ops<E: statesync::Context, W: AsyncWrite + Unpin>(
     write(writer, &Ok(Piece::End)).await?;
     writer.shutdown().await?;
     Ok(())
+}
+
+async fn unread<W: AsyncWrite + Unpin>(error: state::Error, writer: &mut W) -> Result<()> {
+    let refusal = Refusal::new(reason::INVALID_INPUT, error.to_string());
+    write::<_, Piece>(writer, &Err(refusal)).await?;
+    writer.shutdown().await?;
+    Err(Error::State(error))
 }
 
 #[cfg(test)]

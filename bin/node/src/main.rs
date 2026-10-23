@@ -482,6 +482,16 @@ struct RunArgs {
     forward_lane_backlog: Option<NonZeroUsize>,
     #[arg(
         long,
+        value_parser = permits,
+        help = defaulted(
+            "the state lane streams joiners opened that wait for this node to take them",
+            "load.state_lane_backlog",
+            LoadConfig::default().state_lane_backlog
+        )
+    )]
+    state_lane_backlog: Option<NonZeroUsize>,
+    #[arg(
+        long,
         help = defaulted(
             "the fuel one query this node answers off the chain may burn, the queries it makes \
              included; past it the query is refused as out of fuel. Frames never take it",
@@ -545,6 +555,7 @@ impl RunArgs {
                 live_linger_ms: self.live_linger_ms,
                 egress_lane_backlog: self.egress_lane_backlog,
                 forward_lane_backlog: self.forward_lane_backlog,
+                state_lane_backlog: self.state_lane_backlog,
                 query_fuel: self.query_fuel,
             },
             consensus: ConsensusSettings {
@@ -2012,6 +2023,7 @@ mod tests {
                     live_linger_ms: NonZeroU64::new(700),
                     egress_lane_backlog: Some(count(2)),
                     forward_lane_backlog: None,
+                    state_lane_backlog: None,
                     query_fuel: NonZeroU64::new(5_000_000),
                 },
                 consensus: ConsensusSettings {

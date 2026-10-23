@@ -137,6 +137,7 @@ pub struct LoadConfig {
     pub live_linger: Duration,
     pub egress_lane_backlog: NonZeroUsize,
     pub forward_lane_backlog: NonZeroUsize,
+    pub state_lane_backlog: NonZeroUsize,
     pub rpc_cpus: Option<Vec<usize>>,
     pub rpc_blocking_threads: Option<NonZeroUsize>,
     pub query_fuel: Option<NonZeroU64>,
@@ -159,6 +160,7 @@ impl Default for LoadConfig {
             live_linger: live.linger,
             egress_lane_backlog: live.lane_backlog,
             forward_lane_backlog: live.lane_backlog,
+            state_lane_backlog: live.lane_backlog,
             rpc_cpus: None,
             rpc_blocking_threads: None,
             query_fuel: None,
@@ -708,6 +710,7 @@ async fn start<E: Context>(
         load.forward_lane_backlog,
         workspace.forward_offers(),
     )?;
+    let state_lane = crate::state_lane::Lane::bind(&halo, load.state_lane_backlog)?;
     let block_time = Duration::from_millis(descriptor.block_time_ms);
     let (solo_handle, driving) = match solo {
         true => {
@@ -759,6 +762,7 @@ async fn start<E: Context>(
         mesh: transport::loopback(p2p),
         halo_self,
         forward,
+        state_lane,
         solo: solo_handle,
         #[cfg(feature = "testkit")]
         retabling: Default::default(),
@@ -835,6 +839,7 @@ async fn start<E: Context>(
             rpc_cpus,
             unmarked: None,
             workspace: workspace.clone(),
+            closed: None,
         };
         move |_| write(writing, deliveries)
     });
@@ -861,6 +866,9 @@ async fn start<E: Context>(
     }
     if let Some(handle) = rpc.handle() {
         crate::forward::spawn(daemon.clone(), handle);
+    }
+    if let Some(handle) = rpc.handle() {
+        crate::state_lane::spawn(daemon.clone(), handle);
     }
     if let Some(handle) = rpc.handle() {
         crate::egress::lane::spawn(daemon.clone(), handle, load.egress_lane_backlog)?;
@@ -1201,6 +1209,7 @@ struct Writing<E: Context> {
     rpc_cpus: Vec<usize>,
     unmarked: Option<u64>,
     workspace: Workspace,
+    closed: Option<Arc<statesync::Published<E>>>,
 }
 
 struct Consensus<E: Context> {
@@ -1818,6 +1827,7 @@ async fn applied<E: Context>(
         node,
         consensus,
         tracker,
+        closed,
         ..
     } = writing;
     let daemon: &Daemon<E> = daemon;
@@ -1866,6 +1876,12 @@ async fn applied<E: Context>(
         .is_some_and(|last| daemon.network.closes_an_epoch(last));
     if opening && linked {
         record_opening(daemon, node, block, finalization.as_ref(), relays)?;
+    }
+    if opening {
+        serve_close(daemon, node, closed.take(), block, finalization.as_ref());
+    }
+    if closes {
+        *closed = closed_state(daemon, block.height, anchor.is_some());
     }
     let id = block.digest();
     daemon.votes.applied(id, block.height);
@@ -1993,6 +2009,42 @@ fn record_opening<E: Context>(
         return Ok(());
     }
     daemon.crosspond.forget_before(epoch)
+}
+
+fn closed_state<E: Context>(
+    daemon: &Daemon<E>,
+    height: u64,
+    anchored: bool,
+) -> Option<Arc<statesync::Published<E>>> {
+    let view = daemon.view().ok()?;
+    let published = view.sync();
+    let at_the_close = published.tip().height == height;
+    let servable = at_the_close && anchored;
+    servable.then(|| published.clone())
+}
+
+fn serve_close<E: Context>(
+    daemon: &Daemon<E>,
+    node: &Node<E>,
+    closed: Option<Arc<statesync::Published<E>>>,
+    block: &Block,
+    finalization: Option<&consensus::Certificate>,
+) {
+    let Some(published) = closed else {
+        return;
+    };
+    let Some(certificate) = finalization else {
+        return;
+    };
+    let at_the_tip = node.tip().is_ok_and(|tip| tip.height == block.height);
+    let opens_the_close = published.tip().height + 1 == block.height;
+    let servable = at_the_tip && opens_the_close;
+    if !servable {
+        return;
+    }
+    daemon
+        .state_lane
+        .opened(published, block.clone(), certificate.clone());
 }
 
 #[cfg(test)]

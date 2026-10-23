@@ -659,6 +659,7 @@ live_lane_per_sender = 256    # --live-lane-per-sender
 live_linger_ms = 5000         # --live-linger-ms
 egress_lane_backlog = 64      # --egress-lane-backlog
 forward_lane_backlog = 64     # --forward-lane-backlog
+state_lane_backlog = 64       # --state-lane-backlog
 query_fuel = 1000000000       # --query-fuel; default no cap: every query is metered and counted
 
 [consensus]
@@ -840,6 +841,19 @@ reads over it, so a vote that paused it would cut a node off from the very block
 the vote. A stream is served at the lower of the class it asks and its lane's cap. A stream
 already open when its lane is paused or closed runs on. Every node binds `ducktape/egress` at
 start, for egress boxes (above); it carries streams once a vote opens it.
+
+Every node also binds `ducktape/state` at start, and it carries streams once a vote opens it
+(`Open { name: "ducktape/state", cap: Member }`). When a node applies an epoch's first block at
+its tip, it keeps the state it published at the block before, the close, with that first block
+and its finalization. A `Head` stream answers the newest close it keeps (with `past`, the first
+one above that height, waiting for it): the tip, its anchor, every program's target, a hold
+number, the opening block and its certificate. With no `past`, a node that keeps no close yet,
+as after any restart until it applies the next close and the block after it, answers a `not_yet`
+refusal, which a joiner reads as passing and asks again. The hold pins that state until the stream closes.
+An `Ops` stream sends one held program's merkle boundary nodes, then its raw operations from
+`from` to the target's end in pages, then an end; an ask for a hold or range the node does not
+serve is answered with a framed refusal, not a cut. A `Blobs` stream reads one framed list of ids
+and answers each blob framed, or none, in order. Nothing in the node asks this lane yet.
 
 Every node also binds `ducktape/forward` at start, and it carries streams once a vote opens it
 (`Open { name: "ducktape/forward", cap: Client }`). It reaches a service on a member's machine
