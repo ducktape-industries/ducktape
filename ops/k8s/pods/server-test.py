@@ -6985,6 +6985,57 @@ class Manifest(unittest.TestCase):
         text = (HERE / "pods.yaml").read_text()
         return [document for document in text.split("\n---\n") if f"\n  name: {name}\n" in document]
 
+    def runner_paths(self):
+        return dict(word.split("=", 1) for word in self.env()["PODS_RUNNERS"].split())
+
+    def secret_mounts(self):
+        deployment, = [document for document in self.documents("pods") if "\nkind: Deployment\n" in document]
+        mounts = re.search(r"\n          volumeMounts:\n((?:            .*\n)*)", deployment).group(1)
+        fields = [dict(field.split(": ", 1) for field in line.strip()[3:-1].split(", ")) for line in mounts.splitlines()]
+        volumes = re.search(r"\n      volumes:\n((?:        .*(?:\n|$))*)", deployment).group(1)
+        secrets = dict(re.findall(r"^        - name: (\S+)\n          secret:\n(?:            .*\n)*?            secretName: (\S+)", volumes, re.M))
+        return {mount["mountPath"]: (mount.get("readOnly"), secrets.get(mount["name"])) for mount in fields}
+
+    def objects(self):
+        text = (HERE / "pods.yaml").read_text()
+        found = set()
+        for document in text.split("\n---\n"):
+            kind = re.search(r"^kind: (\S+)$", document, re.M).group(1)
+            name = re.search(r"^  name: (\S+)$", document, re.M).group(1)
+            namespace = re.search(r"^  namespace: (\S+)$", document, re.M)
+            found.add((kind, namespace and namespace.group(1), name))
+        return found
+
+    def test_the_builds_namespace_and_the_latitude_build_classes_are_written_down(self):
+        objects = self.objects()
+        for wanted in [
+            ("Namespace", None, "builds"),
+            ("PriorityClass", None, "builds"),
+            ("PriorityClass", None, "latitude-builds"),
+            ("Role", "builds", "pods-builds"),
+            ("RoleBinding", "builds", "pods-builds"),
+            ("ValidatingAdmissionPolicy", None, "builds-pods"),
+            ("ValidatingAdmissionPolicyBinding", None, "builds-pods"),
+            ("MutatingAdmissionPolicy", None, "latitude-builds-ci"),
+            ("MutatingAdmissionPolicyBinding", None, "latitude-builds-ci"),
+            ("NetworkPolicy", "builds", "isolated"),
+            ("NetworkPolicy", "builds", "to-duckpond-node"),
+        ]:
+            with self.subTest(object=wanted):
+                self.assertIn(wanted, objects)
+
+    def test_every_build_runner_reads_its_keys_from_a_secret_mounted_read_only_at_its_path(self):
+        mounts = self.secret_mounts()
+        for name, path in self.runner_paths().items():
+            with self.subTest(runner=name):
+                read_only, secret = mounts.get(path, (None, None))
+                self.assertEqual(read_only, "true")
+                self.assertIsNotNone(secret)
+
+    def test_every_secret_mounted_besides_the_signing_key_is_a_build_runner_s_keys(self):
+        mounted = {path for path, (_, secret) in self.secret_mounts().items() if secret is not None}
+        self.assertEqual(sorted(mounted - {self.env()["PODS_KEYS"]} - set(self.runner_paths().values())), [])
+
     def test_its_own_calls_reach_the_node_inside_the_cluster(self):
         self.assertEqual(self.env()["PODS_DUCKTAPE"], "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844")
 
@@ -7010,7 +7061,7 @@ class Manifest(unittest.TestCase):
             "      ports:",
             "        - {protocol: TCP, port: 8844}",
         ])
-        self.assertEqual(self.documents("to-duckpond-node"), [policy])
+        self.assertEqual([document for document in self.documents("to-duckpond-node") if "\n  namespace: agents\n" in document], [policy])
 
     def test_build_pods_fit_four_to_a_lat_node(self):
         env = self.env()

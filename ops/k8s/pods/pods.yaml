@@ -1,5 +1,5 @@
-# The pods service and the agents namespace it manages: priority, RBAC, the admission policies on the operator's quota hardcap and on every pod, hardcap itself and the LimitRange defaults, isolation, its Deployment and its fixed-address Service.
-# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @FORGE@, @AGENTS_CPU@, @AGENTS_MEMORY@, @PRESTOP@ and @GRACE@; the key it signs with is the Secret `blob-key`, and the desktop runner's ssh key the Secret `desktop-runner`.
+# The pods service and the namespaces it manages, agents and builds: priority classes, RBAC, the admission policies on the operator's quota hardcap and on every pod, hardcap itself and the LimitRange defaults, isolation, its Deployment and its fixed-address Service.
+# Applied by ops/k8s/pods/deploy, which substitutes @IMAGE@, @FORGE@, @AGENTS_CPU@, @AGENTS_MEMORY@, @PRESTOP@ and @GRACE@; the key it signs with is the Secret `blob-key`, and each build runner's ssh key the Secret mounted at the path PODS_RUNNERS names for it (`desktop-runner` for desktop, `runner-<name>` for every other).
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -13,6 +13,12 @@ metadata:
     pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/enforce-version: latest
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: builds
+  labels: {pod-security.kubernetes.io/enforce: privileged}
+---
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
@@ -21,6 +27,24 @@ value: -1
 preemptionPolicy: Never
 globalDefault: false
 description: Everything in namespace agents, below every other pod on the cluster, so the kubelet evicts it first.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: builds
+  labels: {purpose: j518-build-class}
+value: -1
+preemptionPolicy: Never
+description: J-518 build pods and actions-pods CI pods on the build-tainted Latitude VMs (nodeSelector and toleration ducktape.industries/builds=latitude), at the same priority as classes agents and latitude-builds.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: latitude-builds
+  labels: {purpose: latitude-builds}
+value: -1
+preemptionPolicy: Never
+description: actions-pods CI check pods sent to the Latitude build nodes, at the same priority as class agents.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -139,6 +163,33 @@ subjects:
     namespace: pods
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pods-builds
+  namespace: builds
+rules:
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [create, get, list, watch, delete, patch]
+  - apiGroups: ['']
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pods-builds
+  namespace: builds
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pods-builds
+subjects:
+  - kind: ServiceAccount
+    name: pods
+    namespace: pods
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: pods-stats
@@ -205,7 +256,7 @@ spec:
         operations: [CREATE]
         resources: [pods]
   validations:
-    - expression: "has(object.spec.priorityClassName) && object.spec.priorityClassName == 'agents'"
+    - expression: "has(object.spec.priorityClassName) && (object.spec.priorityClassName == 'agents' || (object.spec.priorityClassName in ['latitude-builds', 'builds'] && has(object.spec.nodeSelector) && object.spec.nodeSelector[?'ducktape.industries/builds'].orValue('') == 'latitude'))"
       reason: Forbidden
       message: every pod in namespace agents runs at priority class agents, below the rest of the cluster
     - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
@@ -217,6 +268,9 @@ spec:
     - expression: "([dyn(object.spec)] + object.spec.containers.map(container, dyn(container)) + (has(object.spec.initContainers) ? object.spec.initContainers.map(container, dyn(container)) : [])).all(holder, !has(holder.resources) || !has(holder.resources.limits) || !('cpu' in holder.resources.limits) || !quantity(holder.resources.limits.cpu).isGreaterThan(quantity('50')))"
       reason: Forbidden
       message: a pod in namespace agents uses at most 50 CPUs, so neither its pod-level cpu limit nor any container's may exceed 50; a pod that states no pod-level cpu limit gets 50
+    - expression: "!has(object.metadata.labels) || object.metadata.labels[?'ducktape.industries/program'].orValue('') != 'actions-pods' || (object.spec.priorityClassName in ['latitude-builds', 'builds'] && has(object.spec.nodeSelector) && object.spec.nodeSelector[?'ducktape.industries/builds'].orValue('') == 'latitude' && (!has(object.spec.volumes) || object.spec.volumes.all(volume, !has(volume.emptyDir) || !has(volume.emptyDir.medium) || volume.emptyDir.medium != 'Memory')))"
+      reason: Forbidden
+      message: an actions-pods pod in namespace agents runs only on the Latitude build VMs (priority class latitude-builds, nodeSelector ducktape.industries/builds=latitude) with its scratch on disk, never on fabrics-1
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -224,6 +278,77 @@ metadata:
   name: agents-pods
 spec:
   policyName: agents-pods
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: builds-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: builds}
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  variables:
+    - expression: 'object.spec.containers.map(c, dyn(c)) + (has(object.spec.initContainers) ? object.spec.initContainers.map(c, dyn(c)) : []) + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers.map(c, dyn(c)) : [])'
+      name: containers
+    - expression: 'has(object.spec.volumes) ? object.spec.volumes : []'
+      name: volumes
+  validations:
+    - expression: variables.containers.all(c, c.?securityContext.?runAsUser.orValue(object.spec.?securityContext.?runAsUser.orValue(-1)) == 10001)
+      message: 'builds-pods run-as-uid-10001: every container in namespace builds runs as uid 10001 (pod or container securityContext.runAsUser), the owner of /srv/build-jobs'
+    - expression: variables.containers.all(c, c.?securityContext.?runAsNonRoot.orValue(object.spec.?securityContext.?runAsNonRoot.orValue(false)) == true)
+      message: 'builds-pods run-as-non-root: every container in namespace builds sets runAsNonRoot true (pod or container)'
+    - expression: variables.containers.all(c, c.?securityContext.?allowPrivilegeEscalation.orValue(true) == false)
+      message: 'builds-pods no-privilege-escalation: every container in namespace builds sets securityContext.allowPrivilegeEscalation false'
+    - expression: variables.containers.all(c, 'ALL' in c.?securityContext.?capabilities.?drop.orValue([]))
+      message: 'builds-pods drop-all-capabilities: every container in namespace builds drops capability ALL'
+    - expression: variables.containers.all(c, size(c.?securityContext.?capabilities.?add.orValue([])) == 0)
+      message: 'builds-pods no-added-capabilities: no container in namespace builds adds a capability'
+    - expression: variables.containers.all(c, c.?securityContext.?privileged.orValue(false) == false)
+      message: 'builds-pods not-privileged: no container in namespace builds is privileged'
+    - expression: object.spec.?hostUsers.orValue(true) == false
+      message: 'builds-pods host-users-false: a pod in namespace builds sets hostUsers false (its own user namespace)'
+    - expression: variables.containers.all(c, c.?securityContext.?seccompProfile.?type.orValue(object.spec.?securityContext.?seccompProfile.?type.orValue('')) == 'RuntimeDefault')
+      message: 'builds-pods seccomp-runtime-default: every container in namespace builds runs under seccomp profile RuntimeDefault (pod or container)'
+    - expression: '!object.spec.?hostNetwork.orValue(false) && !object.spec.?hostPID.orValue(false) && !object.spec.?hostIPC.orValue(false)'
+      message: 'builds-pods no-host-namespaces: a pod in namespace builds uses no hostNetwork, hostPID or hostIPC'
+    - expression: variables.volumes.all(v, has(v.hostPath) || has(v.emptyDir))
+      message: 'builds-pods volume-types: every volume of a pod in namespace builds is hostPath or emptyDir'
+    - expression: variables.volumes.all(v, !has(v.hostPath) || (v.hostPath.path in ['/srv/build-jobs/cargo', '/srv/build-jobs/repos'] && v.hostPath.?type.orValue('') == 'Directory'))
+      message: 'builds-pods host-paths-exact: a hostPath volume in namespace builds is exactly /srv/build-jobs/cargo or /srv/build-jobs/repos, with type Directory'
+    - expression: variables.containers.all(c, c.?ports.orValue([]).all(p, p.?hostPort.orValue(0) == 0))
+      message: 'builds-pods no-host-ports: no container port in namespace builds sets hostPort'
+    - expression: variables.containers.all(c, c.?securityContext.?procMount.orValue('Default') == 'Default')
+      message: 'builds-pods proc-mount-default: every container in namespace builds leaves securityContext.procMount unset or Default'
+    - expression: size(object.spec.?securityContext.?sysctls.orValue([])) == 0
+      message: 'builds-pods no-sysctls: a pod in namespace builds sets no securityContext.sysctls'
+    - expression: object.spec.?securityContext.?appArmorProfile.?type.orValue('RuntimeDefault') == 'RuntimeDefault' && variables.containers.all(c, c.?securityContext.?appArmorProfile.?type.orValue('RuntimeDefault') == 'RuntimeDefault') && (!has(object.metadata.annotations) || object.metadata.annotations.all(k, !k.startsWith('container.apparmor.security.beta.kubernetes.io/') || object.metadata.annotations[k] == 'runtime/default'))
+      message: 'builds-pods apparmor-runtime-default: a pod in namespace builds leaves appArmorProfile (pod or container) unset or RuntimeDefault, and any container.apparmor.security.beta.kubernetes.io/ annotation is runtime/default'
+    - expression: (!has(object.spec.securityContext) || !has(object.spec.securityContext.seLinuxOptions)) && variables.containers.all(c, !has(c.securityContext) || !has(c.securityContext.seLinuxOptions))
+      message: 'builds-pods no-selinux-options: a pod in namespace builds sets no seLinuxOptions, on the pod or any container'
+    - expression: variables.containers.all(c, c.image.matches('^localhost:5000/toolchain[:@]'))
+      message: 'builds-pods image-toolchain: every container image in namespace builds is localhost:5000/toolchain (by tag or digest)'
+    - expression: object.spec.?priorityClassName.orValue('') == 'builds'
+      message: 'builds-pods priority-class-builds: a pod in namespace builds runs at priority class builds'
+    - expression: has(object.spec.nodeSelector) && object.spec.nodeSelector[?'builds.ducktape/pods'].orValue('') == 'true'
+      message: 'builds-pods node-selector-pods: a pod in namespace builds carries nodeSelector builds.ducktape/pods=true'
+    - expression: has(object.spec.tolerations) && object.spec.tolerations.exists(t, t.?key.orValue('') == 'ducktape.industries/builds' && t.?operator.orValue('Equal') == 'Equal' && t.?value.orValue('') == 'latitude' && t.?effect.orValue('') == 'NoSchedule')
+      message: 'builds-pods toleration-builds-taint: a pod in namespace builds tolerates the taint ducktape.industries/builds=latitude:NoSchedule'
+    - expression: object.spec.?automountServiceAccountToken.orValue(true) == false && variables.volumes.all(v, !has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(s, !has(s.serviceAccountToken)))
+      message: 'builds-pods no-service-account-token: a pod in namespace builds sets automountServiceAccountToken false and projects no service account token'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: builds-pods
+spec:
+  policyName: builds-pods
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -257,6 +382,50 @@ metadata:
   name: agents-pods-cpu
 spec:
   policyName: agents-pods-cpu
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: latitude-builds-ci
+  labels: {purpose: latitude-builds}
+spec:
+  failurePolicy: Ignore
+  reinvocationPolicy: Never
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: agents}
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+  matchConditions:
+    - expression: has(object.metadata.labels) && object.metadata.labels[?'ducktape.industries/program'].orValue('') == 'actions-pods'
+      name: actions-pods
+  mutations:
+    - jsonPatch:
+        expression: |-
+          [JSONPatch{op: "add", path: "/spec/priorityClassName", value: "latitude-builds"}] + (has(object.spec.nodeSelector)
+            ? [JSONPatch{op: "add", path: "/spec/nodeSelector/" + jsonpatch.escapeKey("ducktape.industries/builds"), value: "latitude"}]
+            : [JSONPatch{op: "add", path: "/spec/nodeSelector", value: {"ducktape.industries/builds": "latitude"}}]) +
+          (has(object.spec.tolerations)
+            ? [JSONPatch{op: "add", path: "/spec/tolerations/-", value: Object.spec.tolerations{key: "ducktape.industries/builds", operator: "Equal", value: "latitude", effect: "NoSchedule"}}]
+            : [JSONPatch{op: "add", path: "/spec/tolerations", value: [Object.spec.tolerations{key: "ducktape.industries/builds", operator: "Equal", value: "latitude", effect: "NoSchedule"}]}])
+      patchType: JSONPatch
+    - jsonPatch:
+        expression: |-
+          has(object.spec.volumes) && object.spec.volumes.exists(v, has(v.emptyDir) && has(v.emptyDir.medium) && v.emptyDir.medium == "Memory")
+            ? [JSONPatch{op: "replace", path: "/spec/volumes", value: object.spec.volumes.map(v, has(v.emptyDir) && has(v.emptyDir.medium) && v.emptyDir.medium == "Memory" ? Object.spec.volumes{name: v.name, emptyDir: Object.spec.volumes.emptyDir{?sizeLimit: v.emptyDir.?sizeLimit}} : v)}]
+            : []
+      patchType: JSONPatch
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: latitude-builds-ci
+  labels: {purpose: latitude-builds}
+spec:
+  policyName: latitude-builds-ci
 ---
 # hardcap caps what agents' pods are guaranteed, not what they burst to: AGENTS_CPU and AGENTS_MEMORY are the nodes'
 # allocatable cpu and memory minus the requests of every Running or Pending pod outside agents (`server.py hardcap`).
@@ -344,6 +513,47 @@ spec:
       ports:
         - {protocol: TCP, port: 8844}
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolated
+  namespace: builds
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - podSelector: {}
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+      to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: to-duckpond-node
+  namespace: builds
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {port: 8844, protocol: TCP}
+      to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: duckpond}
+          podSelector:
+            matchLabels: {app: node}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -373,12 +583,14 @@ spec:
             - {name: PODS_FORGE, value: "@FORGE@"}
             - {name: PODS_DUCKTAPE, value: "ducktape --workspace /home/pods --node http://node-http.duckpond.svc:8844"}
             - {name: PODS_KEYS, value: /keys}
-            - {name: PODS_RUNNERS, value: "desktop=/desktop zk-dev=/runners/zk-dev"}
-            - {name: PODS_WARM_POD, value: /shared/tools/warm-pod}
+            - {name: PODS_RUNNERS, value: "lat-4=/runners/lat-4 lat-7=/runners/lat-7 lat-2=/runners/lat-2 lat-5=/runners/lat-5 desktop=/desktop zk-dev=/runners/zk-dev"}
+            - {name: PODS_WARM_POD, value: ""}
             - {name: PODS_LANE_FIRST_LIMIT, value: "40"}
             - {name: PODS_BUILD_IMAGE, value: "localhost:5000/toolchain:70b103bd4da8@sha256:a71046e612592a00cc3034d9727fcbb9173c1729ea07f5b696c885694d2a84d0"}
             - {name: PODS_BUILD_CPU, value: "7"}
             - {name: PODS_BUILD_MEMORY, value: "28Gi"}
+          resources:
+            requests: {cpu: 653m}
           ports:
             - {name: http, containerPort: 8080}
           readinessProbe:
@@ -390,6 +602,10 @@ spec:
             - {name: keys, mountPath: /keys, readOnly: true}
             - {name: desktop, mountPath: /desktop, readOnly: true}
             - {name: runner-zk-dev, mountPath: /runners/zk-dev, readOnly: true}
+            - {name: runner-lat-2, mountPath: /runners/lat-2, readOnly: true}
+            - {name: runner-lat-5, mountPath: /runners/lat-5, readOnly: true}
+            - {name: runner-lat-4, mountPath: /runners/lat-4, readOnly: true}
+            - {name: runner-lat-7, mountPath: /runners/lat-7, readOnly: true}
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
@@ -408,6 +624,26 @@ spec:
         - name: runner-zk-dev
           secret:
             secretName: runner-zk-dev
+            optional: true
+            defaultMode: 0440
+        - name: runner-lat-2
+          secret:
+            secretName: runner-lat-2
+            optional: true
+            defaultMode: 0440
+        - name: runner-lat-5
+          secret:
+            secretName: runner-lat-5
+            optional: true
+            defaultMode: 0440
+        - name: runner-lat-4
+          secret:
+            secretName: runner-lat-4
+            optional: true
+            defaultMode: 0440
+        - name: runner-lat-7
+          secret:
+            secretName: runner-lat-7
             optional: true
             defaultMode: 0440
 ---

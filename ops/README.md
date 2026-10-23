@@ -203,9 +203,10 @@ one up for another network.
   by whitespace, in tie order; `desktop=/desktop` when unset) are machines,
   each a rootless podman container that runs the warm pod's `build.sh`,
   reserved as pods of their names (duckpond: `desktop`, orthory's desktop,
-  and `zk-dev`, eddy's dev box). The service reaches each by ssh with the
-  files in its keys path, a Secret in namespace `pods` (`desktop-runner` at
-  `/desktop`, `runner-zk-dev` at `/runners/zk-dev`; files `id_ed25519`,
+  `zk-dev`, eddy's dev box, and `lat-N`, the Latitude build VMs). The
+  service reaches each by ssh with the files in its keys path, a Secret in
+  namespace `pods` (`desktop-runner` at `/desktop`, and `runner-<name>` at
+  `/runners/<name>` for every other runner; files `id_ed25519`,
   `known_hosts`, `user`, and `hosts` or `forward`). `hosts` lists, split by
   any whitespace, the addresses to try in order, and the one that last
   answered is tried first. `forward` names a member node's key and a service
@@ -276,7 +277,7 @@ one up for another network.
   runs (a `sh -c` script on any other pod, say) goes as it came, so a pod's
   own output can name any account in a notify-for line, as a chat mention can
   name anyone.
-- When `PODS_WARM_POD` is unset, `builds` rotates through the configured
+- When `PODS_WARM_POD` is unset or empty, `builds` rotates through the configured
   runners in order instead of comparing finish times or clone contents.
   It skips unreachable runners and full slots, using `build.sh ahead` and
   the ping's `busy` and `heavy_runs` capacity. If all reachable runners are
@@ -294,8 +295,8 @@ one up for another network.
   times, or `-` while that machine has none to go by; an older build.sh
   says no finish) is 0 takes the run at once. Otherwise the run goes where
   its finish is soonest, among the runners that said one and the warm pod
-  (the warm pod the files path `PODS_WARM_POD` names, duckpond:
-  `/shared/tools/warm-pod`), ties going to the runner named first and the
+  (the warm pod the files path `PODS_WARM_POD` names; duckpond's is empty,
+  so it names none), ties going to the runner named first and the
   warm pod last (`pods_routed reason=sooner_end` when that is not the first
   runner that said one). While any of them says no finish, the counts
   decide instead (`reason=shorter_wait`). A runner that is down or can't be
@@ -717,8 +718,9 @@ one up for another network.
   Endpoints, EndpointSlices and CSIStorageCapacities, and no custom
   resource. The ValidatingAdmissionPolicy `hardcap` refuses it any write of
   `hardcap`, and `agents-pods` refuses every pod in `agents` that runs at a
-  priority class other than `agents` or mounts or projects a service
-  account token. A container that states no cpu or memory gets the
+  priority class other than `agents` (or `latitude-builds` or `builds` with
+  nodeSelector `ducktape.industries/builds=latitude`) or mounts or projects a
+  service account token. A container that states no cpu or memory gets the
   LimitRange `defaults`: a request of 0 and no limit, so `hardcap` admits
   it. `defaults` sets no default limit, since Kubernetes refuses a
   container limit above the pod-level limit a pod states. The PriorityClass
@@ -737,6 +739,11 @@ one up for another network.
   pod nor its containers state one. Both policies act on every pod created
   in `agents`, whether the service, a manifest or a controller creates it;
   a pod already running keeps the spec it started with.
+- A pod in `agents` labelled `ducktape.industries/program=actions-pods` runs on
+  the Latitude build VMs. The MutatingAdmissionPolicy `latitude-builds-ci`
+  gives it class `latitude-builds`, the nodeSelector and toleration
+  `ducktape.industries/builds=latitude`, and turns a memory-backed emptyDir
+  into one on disk; `agents-pods` refuses one placed otherwise.
 - The service signs blob puts, files commits and chat posts as the program
   account `pods`, whose key and password are the Secret `blob-key` (files
   `key` and `password`) in namespace `pods`:

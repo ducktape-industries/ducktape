@@ -188,15 +188,17 @@ or through a member node's halo forward.
 - **Optional: build pods.** `PODS_BUILD_IMAGE` (a `localhost:5000/toolchain` image),
   `PODS_BUILD_CPU` and `PODS_BUILD_MEMORY` (each build pod's fixed request, and its memory
   limit; duckpond's 7 and 28Gi fit four to a lat VM's 32 cpu and 121.8Gi allocatable), and
-  `PODS_BUILD_NAMESPACE` (`builds` when unset). Unset, `/v1/builds` answers 503. The operator's
-  Role `pods-builds` there lets the service create, read, watch, patch and delete pods and read their
+  `PODS_BUILD_NAMESPACE` (`builds` when unset). Unset, `/v1/builds` answers 503. `pods.yaml`
+  writes namespace `builds`: its Role `pods-builds` lets the service create, read, watch, patch and delete pods and read their
   logs; the policy `builds-pods` holds every pod there to what the service writes (uid 10001,
   non-root, no privilege or added capability, `hostUsers: false`, hostPath only
   `/srv/build-jobs/cargo` and `/srv/build-jobs/repos`, the toolchain image, class `builds`,
-  `builds.ducktape/pods=true` and the `ducktape.industries/builds` toleration). A node carries
+  `builds.ducktape/pods=true` and the `ducktape.industries/builds` toleration). Its policy
+  `isolated` admits no traffic in and lets its pods out only to their own namespace, DNS and
+  public addresses; `to-duckpond-node` adds TCP 8844 on duckpond's node pods. A node carries
   `builds.ducktape/pods=true` only once its SSH runner is out, so the two never share a VM. Build
   notices keep their open runs in the ConfigMap `build-runs`.
-- **Runner-only placement.** With `PODS_WARM_POD` unset, `builds` gives each eligible runner
+- **Runner-only placement.** With `PODS_WARM_POD` unset or empty, `builds` gives each eligible runner
   its next turn in configuration order, skipping unreachable runners and full slots. Capacity
   comes from `build.sh ahead` and the runner's ping (`busy`, `heavy_runs`), not predicted finish
   times. When every reachable runner is full, the next runner holds the queued call. This path
@@ -204,7 +206,8 @@ or through a member node's halo forward.
   `reroute` reads queues on every runner and moves queued calls in batches to runners with
   shorter waits; it needs no warm pod. Runs already started and pinned runs stay where they are.
 - **Optional: the warm pod for `builds`.** `PODS_WARM_POD`, a files path whose one line names
-  the warm pod `builds` falls back to. Unset, `builds` uses runner-only placement.
+  the warm pod `builds` falls back to. Unset or empty, `builds` uses runner-only placement;
+  duckpond's is empty.
 - **The lane's first bound.** `PODS_LANE_FIRST_LIMIT`, whole minutes, which each lane the service
   starts states as `FIRST_LIMIT=`: build.sh bounds a run by twice the longest green run of its
   kind on that machine, and a machine with none yet (a new warm pod) refuses a call that states
@@ -214,7 +217,8 @@ or through a member node's halo forward.
 - **Optional: the build runners.** `PODS_RUNNERS`, `<name>=<keys path>` words in tie order
   (`desktop=/desktop` when unset), each keys path a mounted Secret (files `id_ed25519`,
   `id_ed25519.pub`, `known_hosts`, `user`, and `hosts` or `forward`, optionally `kinds`):
-  duckpond's are `desktop-runner` at `/desktop` and `runner-zk-dev` at `/runners/zk-dev`. A
+  duckpond's are `desktop-runner` at `/desktop` and, for every other runner, `runner-<name>` at
+  `/runners/<name>` (`zk-dev`, eddy's dev box, and the Latitude build VMs `lat-N`). A
   runner with a `forward` file is reached through `ducktape forward` (from `PODS_DUCKTAPE`,
   signed with the service's key from `blob-key`), so the image's CLI must carry that verb and
   the serving node's `forward.toml` must list the service's key among that service's
