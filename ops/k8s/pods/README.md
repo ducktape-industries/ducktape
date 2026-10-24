@@ -113,33 +113,8 @@ or through a member node's halo forward.
 - A build.sh call sent to a pod by name (the warm pod, not `builds` or a build runner) goes with
   `PINNED=1` added to its settings, unless it names that itself. build.sh's `movable` then keeps
   the run, so `builds`' reroute never moves it to another machine.
-- A merge queue's lane starts by itself, once per selected Preview. With a train whose tip
-  contexts name this service's lane, only its last formed member is selected; otherwise it
-  is the queue front. With a key, a thread finds the account the key acts as (identity `OfKey`) and
-  follows `ducktape changes forge`. Each time the stream opens it reads forge `Repos` a page at
-  a time and settles every repository it lists (so any repository with a queue); then it
-  settles a repository once per block that writes its queue (`e/`), statuses (`s/`), Previews
-  (`m/`), required checks (`q/`), train configuration (`y/`) or formation (`z/`). A settle
-  reads forge `Required`, and for each branch whose contexts hold
-  `<the service's account>/build.sh#lane` its `Train`. When that lane is a tip context, it
-  selects the last formed member's Preview commit and change number; no formed members means
-  no lane. Otherwise it reads the `Queue` front and that change's `Preview`. It reads only
-  the selected commit's `Statuses`; a repository with such a branch also has the ConfigMap `runs`
-  read once. When the branch's reporter has that lane Pending or nothing there, and every other
-  required context Passed (a selected member whose review is Pending waits for it), it first keeps
-  `rerun-<sha256(repo, commit)>` in the ConfigMap `runs`, then calls build.sh
-  `JOB=forge:<repo>:<n> NOTIFY=forge:<repo>:<n> [FIRST_LIMIT=<minutes>] <repo> <commit> lane`
-  as a `builds` call goes (with no request behind it), records the run under the key and bumps
-  it to the front of that machine's check lane (`build.sh bump <run>`), since it holds back every
-  change behind it. A
-  lane that doesn't start is recorded with why, posted in the change's room once per distinct
-  reason, and asked again after one block time, then two, four and so on, while that Preview is
-  still selected; it stops as soon as the lane target moves. A restart never starts a second
-  lane for a Preview it kept (it takes up the retries of the ones that didn't start), a key whose
-  Preview is no longer selected is dropped and its run stopped (`build.sh stop <run>`,
-  followed to wherever build.sh moved it; a run that already ended counts as stopped, and only a
-  stop refused for another reason logs `pods_rerun_unbuilt`), and the lane's report reaches forge-reach
-  as any lane's does.
+- Builds run only when explicitly requested.
+  The service does not follow forge queues, choose Previews or start, bump, stop or retry checks on their behalf.
 
 ## What it needs
 
@@ -249,12 +224,6 @@ or through a member node's halo forward.
 - **Optional: the warm pod for `builds`.** `PODS_WARM_POD`, a files path whose one line names
   the warm pod `builds` falls back to. Unset or empty, `builds` uses runner-only placement;
   duckpond's is empty.
-- **The lane's first bound.** `PODS_LANE_FIRST_LIMIT`, whole minutes, which each lane the service
-  starts states as `FIRST_LIMIT=`: build.sh bounds a run by twice the longest green run of its
-  kind on that machine, and a machine with none yet (a new warm pod) refuses a call that states
-  no bound. duckpond's is 90, about 1.3 times the slowest repo's measured green lane: core's
-  ran 69.6 minutes (reviewer 56's measure, chief j-532:242). A lane on a merge train's tip that
-  runs out of its bound sends the whole train back. Unset, the service's lanes state none.
 - **Optional: the build runners.** `PODS_RUNNERS`, `<name>=<keys path>` words in tie order
   (`desktop=/desktop` when unset), each keys path a mounted Secret (files `id_ed25519`,
   `id_ed25519.pub`, `known_hosts`, `user`, and `hosts` or `forward`, optionally `kinds`):

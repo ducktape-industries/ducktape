@@ -624,31 +624,7 @@ one up for another network.
   machine's own files, so the check trusts anyone who can run commands on the
   build machines: it guards against mistakes, not against a forged run
   directory.
-- The lane a merge queue's front waits on runs by itself, once per Preview,
-  and only the front's: the service follows forge's changes, settles every
-  repository forge lists each time the stream opens, and on each block that
-  writes a repository's queue, statuses, Previews or required checks reads
-  that repository's branches that require `<the service's
-  account>/build.sh#lane`, each one's queue front and that front's Preview
-  statuses. When the lane there is Pending or missing and every other
-  required context passed (a front whose review is Pending waits for it), it
-  keeps a `rerun-` key in the ConfigMap `runs`, then starts the lane as a
-  `builds` call would, notifying the change's room `forge:<repo>:<n>`
-  (`pods_rerun run=`), and bumps it to the front of its machine's check lane;
-  a run whose Preview is no longer the front is stopped. A lane that doesn't start is posted in that room once
-  per reason (`pods_rerun_unstarted` with why) and asked again from one block
-  time, doubling, while that Preview is still the front. Its report then
-  lands as above and carries the Preview. The run's own end is what the
-  service watches, never a clock: when that run ends (its end notice comes
-  after any report it printed) or is lost with its pod, and the Preview is
-  still the front with its lane Pending, the lane is started once more
-  (`pods_rerun_missed`); a run called again elsewhere is followed under its
-  new id. A second such end reports `build.sh#lane errored` on the Preview,
-  naming both runs (`pods_rerun_errored`), so the queue takes the front out;
-  until that report lands the record says `erroring`, and each settle of
-  the repository files it again.
-  A lane stopped at its time bound reports errored itself and is not started
-  again.
+- Checks run only when explicitly requested; the pods service does not watch forge queues or choose, start, stop or retry Preview lanes.
 - Each line a followed pod (or a build runner) prints that reads
   `ducktape-files <run> <tar> <folder>` (build.sh's `shot` run with `TO`)
   names a tar the run made on that machine: the service reads it in one
@@ -1016,7 +992,7 @@ one up for another network.
 - `pods.toml` holds `image = "localhost:5000/pods:<tag>@sha256:<digest>"`,
   a digest already pushed (`k8s/pods/deploy` builds and pushes it), and an
   optional `[env]` table of the `pods` container's settings, each
-  `NAME = "string"` (`PODS_BUILD_IMAGE`, `PODS_LANE_FIRST_LIMIT`, ...).
+  `NAME = "string"` (`PODS_BUILD_IMAGE`, `PODS_BUILD_CPU`, ...).
   `PODS_OUT_IMAGE` is not one of them: reconcile sets it to the image. A
   setting reconcile patches only the entries `[env]` names, merged by name,
   so a name taken out of `[env]` keeps its live value, and a name the live
