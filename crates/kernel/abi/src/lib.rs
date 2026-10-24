@@ -1732,7 +1732,8 @@ pub mod role {
     pub mod reads {
         use crate::role::awaits::Ticket;
         use crate::{
-            BlobId, BorshDeserialize, BorshSchema, BorshSerialize, ProgramId, Refusal, reason,
+            BlobId, BorshDeserialize, BorshSchema, BorshSerialize, HashKind, ProgramId, Refusal,
+            reason,
         };
 
         pub const PROGRAM: &str = "$reads";
@@ -1762,6 +1763,55 @@ pub mod role {
             Ready {
                 id: Ticket,
             } = 2,
+            Prepare {
+                body: Vec<u8>,
+                hash: HashKind,
+                kind: String,
+                chunk_bytes: u64,
+            } = 3,
+            PreparedAnswer {
+                id: Ticket,
+                at: u64,
+                outcome: Result<Product, Refusal>,
+            } = 4,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Preparation {
+            pub body: Vec<u8>,
+            pub hash: HashKind,
+            pub kind: String,
+            pub chunk_bytes: u64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Prepared {
+            pub size: u64,
+            pub chunks: Vec<Entry>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct Product {
+            pub reply: Entry,
+            pub produced: Vec<Entry>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub enum PreparationState {
+            Asked,
+            Putting {
+                bundle: u64,
+                read: Read,
+                produced: Vec<Entry>,
+            },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+        pub struct PreparationRow {
+            pub requester: ProgramId,
+            pub preparation: Preparation,
+            pub made: u64,
+            pub state: PreparationState,
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]

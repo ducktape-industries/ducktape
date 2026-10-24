@@ -1,6 +1,8 @@
 //! Reads a program asks the kernel for (`$reads`): the call parks its frame, the member the epoch
 //! assigns runs the query off the block path and answers with the reply's blob entry, and once the
 //! blobs role holds that blob the kernel holds it for the caller and resumes the frame.
+mod preparation;
+
 use abi::role::awaits::{self, Ticket};
 use abi::role::reads::{self, Entry, Op, Read, Row, State};
 use abi::role::validators;
@@ -26,6 +28,7 @@ fn due_key(made: u64, id: Ticket) -> Vec<u8> {
 
 fn close(id: Ticket, made: u64, overlay: &mut Overlay) {
     overlay.delete(PARKED, row_key(id));
+    overlay.delete(PARKED, preparation::key(id));
     overlay.delete(PARKED, due_key(made, id));
 }
 
@@ -142,7 +145,21 @@ where
     ) -> Result<Run> {
         let (target, query) = match abi::decode::<Op>(payload) {
             Ok(Op::Read { target, query }) => (target, query),
-            Ok(Op::Answer { .. } | Op::Ready { .. }) => {
+            Ok(Op::Prepare {
+                body,
+                hash,
+                kind,
+                chunk_bytes,
+            }) => {
+                let preparation = reads::Preparation {
+                    body,
+                    hash,
+                    kind,
+                    chunk_bytes,
+                };
+                return self.prepare_call(program, ticket, preparation, height, overlay);
+            }
+            Ok(Op::Answer { .. } | Op::Ready { .. } | Op::PreparedAnswer { .. }) => {
                 let refusal = Refusal::new(
                     reason::UNSUPPORTED,
                     "a program asks $reads to read; only a member answers a read",
@@ -184,7 +201,7 @@ where
     ) -> Result<Receipt> {
         match abi::decode::<Op>(payload) {
             Err(refusal) => Ok(refused(refusal)),
-            Ok(Op::Read { .. }) => Ok(refused(Refusal::new(
+            Ok(Op::Read { .. } | Op::Prepare { .. }) => Ok(refused(Refusal::new(
                 reason::UNSUPPORTED,
                 "a read is a program's call to $reads, never a frame of its own",
             ))),
@@ -194,6 +211,10 @@ where
                     .await
             }
             Ok(Op::Ready { id }) => self.ready(id, height, time, overlay, stage).await,
+            Ok(Op::PreparedAnswer { id, at, outcome }) => {
+                self.prepared_answer(signer, id, at, outcome, height, time, overlay, stage)
+                    .await
+            }
         }
     }
 
@@ -311,7 +332,9 @@ where
             row(&view, id)?
         };
         let Some(open) = open else {
-            return Ok(refused(not_open(id)));
+            return self
+                .ready_preparation(id, height, time, overlay, stage)
+                .await;
         };
         let State::Putting { read, .. } = open.state else {
             let early = format!("read {id} is not answered yet");
@@ -378,6 +401,7 @@ where
             let id = due_id(&entry.key)?;
             overlay.delete(PARKED, entry.key);
             overlay.delete(PARKED, row_key(id));
+            overlay.delete(PARKED, preparation::key(id));
             let mut frame = self.open_frame(self.loaded.limits().fuel, None, overlay)?;
             let mut receipt = kernel(Outcome::Applied { output: Vec::new() });
             let awaited = self
@@ -438,6 +462,29 @@ where
         stage: &mut Stage,
         frame: &mut Frame,
     ) -> Result<Receipt> {
+        self.put_read_entries(
+            requester,
+            std::slice::from_ref(entry),
+            height,
+            time,
+            overlay,
+            stage,
+            frame,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_read_entries(
+        &self,
+        requester: &str,
+        entries: &[Entry],
+        height: u64,
+        time: u64,
+        overlay: &mut Overlay,
+        stage: &mut Stage,
+        frame: &mut Frame,
+    ) -> Result<Receipt> {
         let blobs = self.role(role::BLOBS)?.clone();
         let sender = match self
             .account_of(requester, height, time, overlay, stage, frame)
@@ -447,11 +494,14 @@ where
             Err(refusal) => return Ok(rejected(&blobs, refusal)),
         };
         let put = blob::contract::Op::Put {
-            blobs: vec![blob::contract::Entry {
-                id: entry.id,
-                len: entry.len,
-                kind: entry.kind.clone(),
-            }],
+            blobs: entries
+                .iter()
+                .map(|entry| blob::contract::Entry {
+                    id: entry.id,
+                    len: entry.len,
+                    kind: entry.kind.clone(),
+                })
+                .collect(),
         };
         let env = self.env(&blobs, requester, sender, Cause::Direct, height, time);
         let call = ProgramCall::Execute(abi::encode(&put));

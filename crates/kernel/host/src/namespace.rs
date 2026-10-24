@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "namespace/tests.rs"]
+mod tests;
+
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
@@ -26,13 +30,14 @@ pub const INDEXED_AT: &[u8] = b"indexed_at";
 pub const PLACES: &[u8] = b"place/";
 pub const PARENT: &[u8] = b"parent";
 pub const READ_ROWS: &[u8] = b"read/";
+pub const PREPARATION_ROWS: &[u8] = b"prepare/";
 pub const READS_DUE: &[u8] = b"read-due/";
 
 const UNANNOUNCED: Option<u64> = None;
 const LAYOUT_FROM: [(&[u8], Option<u64>); 2] =
     [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
 const READS_FROM: [(&[u8], Option<u64>); 2] =
-    [(b"duckpond", UNANNOUNCED), (b"sealpond", UNANNOUNCED)];
+    [(b"duckpond", Some(553015)), (b"sealpond", UNANNOUNCED)];
 const MEASURED_DEPTH_FROM: [(&[u8], Option<u64>); 2] =
     [(b"duckpond", Some(700000)), (b"sealpond", UNANNOUNCED)];
 const HEIGHT_BYTES: usize = size_of::<u64>();

@@ -1,6 +1,8 @@
 //! The node's reads worker: after each applied block it answers the `$reads` rows the epoch
 //! assigns to this node's key, each query run off the block path and its reply put as a blob, with
 //! `Answer`, then `Ready` once the blobs role holds that blob. Spawned by `run.rs`.
+mod preparation;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -19,7 +21,7 @@ const TARGET: &str = "ducktape::reads";
 type Answered = (u64, Option<(Op, Option<Framed>)>);
 
 struct Framed {
-    entry: blob::contract::Entry,
+    entries: Vec<blob::contract::Entry>,
     framed: Vec<u8>,
 }
 
@@ -103,8 +105,15 @@ async fn pass<E: Context>(
             mine.insert(id, row);
         }
     }
+    let mut preparations = BTreeMap::new();
+    for (id, row) in source.preparations()? {
+        let assigned = source.reader(id, next)?;
+        if assigned.as_deref() == Some(daemon.identity.as_slice()) {
+            preparations.insert(id, row);
+        }
+    }
     slots.retain(|id, slot| {
-        let open = mine.contains_key(id);
+        let open = mine.contains_key(id) || preparations.contains_key(id);
         if let (false, Some(asking)) = (open, &slot.asking) {
             asking.abort();
         }
@@ -124,6 +133,30 @@ async fn pass<E: Context>(
                 let readied = matches!(slot.op, Some(Op::Ready { .. }));
                 if !readied {
                     if !source.holds(&read.entry.id, now).await? {
+                        continue;
+                    }
+                    slot.op = Some(Op::Ready { id });
+                    slot.reply = None;
+                    slot.frame = None;
+                    slot.refused = false;
+                }
+            }
+        }
+        send(daemon, id, slot).await;
+    }
+    for (id, row) in preparations {
+        let slot = slots.entry(id).or_default();
+        match row.state.clone() {
+            abi::role::reads::PreparationState::Asked => {
+                let idle = slot.asking.is_none() && slot.op.is_none();
+                if idle {
+                    slot.asking = Some(preparation::ask(daemon, id, row, answers.clone()));
+                }
+            }
+            abi::role::reads::PreparationState::Putting { bundle, .. } => {
+                let readied = matches!(slot.op, Some(Op::Ready { .. }));
+                if !readied {
+                    if !source.preparation_held(bundle, now).await? {
                         continue;
                     }
                     slot.op = Some(Op::Ready { id });
@@ -211,7 +244,14 @@ async fn answer<E: Context>(
         len: entry.len,
         kind: entry.kind.clone(),
     };
-    Ok((at, Ok(read), Some(Framed { entry, framed })))
+    Ok((
+        at,
+        Ok(read),
+        Some(Framed {
+            entries: vec![entry],
+            framed,
+        }),
+    ))
 }
 
 fn sign<E: Context>(daemon: &Daemon<E>, op: &Op) -> Result<(Vec<u8>, u64)> {
@@ -234,16 +274,12 @@ async fn staged<E: Context>(
     reply: Option<&Framed>,
     last_landing: u64,
 ) -> std::result::Result<Option<blob::service::Staged>, Refusal> {
-    let Some(Framed { entry, framed }) = reply else {
+    let Some(Framed { entries, framed }) = reply else {
         return Ok(None);
     };
     let staged = daemon
         .blobs
-        .stage(
-            std::slice::from_ref(entry),
-            &mut framed.as_slice(),
-            last_landing,
-        )
+        .stage(entries, &mut framed.as_slice(), last_landing)
         .await?;
     Ok(Some(staged))
 }

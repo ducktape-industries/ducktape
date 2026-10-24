@@ -1,5 +1,8 @@
 //! Reads a program asks the kernel for: the call parks its frame, the member the epoch assigns
 //! answers with the reply's blob entry, and the frame resumes once the blobs role holds that blob.
+#[path = "answering/preparation.rs"]
+mod preparation;
+
 use std::path::Path;
 
 use abi::role::reads::{self, Entry, Op, Read, Row, State};

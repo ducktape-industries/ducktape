@@ -212,6 +212,27 @@ answers each waiter with a refusal. Each run between two waits is its own
 transaction, so a refusal undoes only the run it ends. Storing a frame and
 restoring it each cost `PAGE_FUEL` per stored page.
 
+A program can call the kernel's `$reads` target when its network's
+`READS_FROM` activation height is reached. `Read { target, query }` parks the
+caller while the assigned member runs the query outside block application.
+`Prepare { body, hash, kind, chunk_bytes }` uses the same ticket lifecycle for
+pure byte chunking, framing and hashing outside block application. The chunk
+size is nonzero and the kind follows the blob kind grammar. Preparation
+produces an ordered `Prepared { size, chunks }` reply and the chunk products;
+repeated chunks retain their order. `PreparedAnswer` registers reply and
+products in one blobs-role bundle as the requesting program. Preparation
+`Ready` waits for that recorded bundle's custody, even if its reply was
+already held elsewhere, then holds the reply for the caller and resolves
+the ticket with `Read { entry, at }`. Ordinary `Read`, `Answer`, `Ready` and
+its parked rows retain their wire shapes. The existing assigned-member and
+answer-height checks govern both kinds; the member does not receive target
+mutation authority. The reads lifecycle uses `reads::WAIT` for an unanswered
+ticket. Duckpond and its descendants activate `$reads` at block 553015,
+compiled in `host::namespace`; sealpond has no announced `READS_FROM` height.
+Every block applier must install these semantics before the activation block.
+Historical replay must retain that height after activation. The native worker
+is part of the node executable; installing program code does not install it.
+
 A program can schedule a run for a later block through the program bound to
 the scheduler role (`abi::role::scheduler`), an optional row. It sends that
 program `Schedule { height, target, payload }` (the program SDK's
