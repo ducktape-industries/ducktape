@@ -224,9 +224,15 @@ products in one blobs-role bundle as the requesting program. Preparation
 `Ready` waits for that recorded bundle's custody, even if its reply was
 already held elsewhere, then holds the reply for the caller and resolves
 the ticket with `Read { entry, at }`. Ordinary `Read`, `Answer`, `Ready` and
-its parked rows retain their wire shapes. The existing assigned-member and
-answer-height checks govern both kinds; the member does not receive target
-mutation authority. The reads lifecycle uses `reads::WAIT` for an unanswered
+its parked rows retain their wire shapes. Ordinary reads retain epoch election.
+Preparation admission, native dispatch and accepted signer use one responder
+policy. Rows made before a pin activates retain historical epoch election;
+new rows use only the pinned member while it belongs to the epoch, with no
+fallback to other members. Duckpond and its descendants activate this pin at
+block 563700 for member 75bf265d1e35103677d009f4fbba0401996c437f56e0481b3a9f9c1e53afe37d.
+Replay retains both this height and the earlier reads activation; a binary
+without the pin semantics cannot safely replay blocks at or after this height. Answer-height checks remain unchanged; the responder
+does not receive target mutation authority. The reads lifecycle uses `reads::WAIT` for an unanswered
 ticket. Duckpond and its descendants activate `$reads` at block 553015,
 compiled in `host::namespace`; sealpond has no announced `READS_FROM` height.
 Every block applier must install these semantics before the activation block.

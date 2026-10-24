@@ -1,7 +1,7 @@
 use super::*;
 use abi::role::reads::{PreparationRow, PreparationState, Product};
 
-fn prepare(body: &[u8], chunk_bytes: u64) -> Submission {
+pub(super) fn prepare(body: &[u8], chunk_bytes: u64) -> Submission {
     let asked = Op::Prepare {
         body: body.to_vec(),
         hash: abi::HashKind::Sha256,
@@ -19,7 +19,7 @@ fn prepare(body: &[u8], chunk_bytes: u64) -> Submission {
     signed(SIGNER, "awaiter", abi::encode(&plan))
 }
 
-fn one_preparation(host: &Host<Ctx>) -> (u64, PreparationRow) {
+pub(super) fn one_preparation(host: &Host<Ctx>) -> (u64, PreparationRow) {
     let prefix = b"prepare/";
     let rows = host
         .view(Layer::Confirmed)
@@ -32,7 +32,12 @@ fn one_preparation(host: &Host<Ctx>) -> (u64, PreparationRow) {
     (id, abi::decode(&row.value).unwrap())
 }
 
-fn prepared(signer: &[u8], id: u64, at: u64, outcome: Result<Product, Refusal>) -> Submission {
+pub(super) fn prepared(
+    signer: &[u8],
+    id: u64,
+    at: u64,
+    outcome: Result<Product, Refusal>,
+) -> Submission {
     signed(
         signer,
         reads::PROGRAM,

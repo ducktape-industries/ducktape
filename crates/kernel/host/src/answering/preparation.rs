@@ -15,6 +15,38 @@ impl<'a, E> Source<'a, E>
 where
     E: Context + Spawner,
 {
+    pub fn preparer(&self, id: Ticket, made: u64, height: u64) -> Result<Option<Vec<u8>>> {
+        self.preparation_responder(&self.committed.view(Vec::new()), id, made, height)
+    }
+
+    fn preparation_responder(
+        &self,
+        view: &View<'_>,
+        id: Ticket,
+        made: u64,
+        height: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let policy = self
+            .preparation_responder
+            .filter(|policy| made >= policy.from);
+        let Some(policy) = policy else {
+            return assignee(view, id, height);
+        };
+        let Some(length) = view.get(NETWORK, namespace::EPOCH_LENGTH)? else {
+            return Ok(None);
+        };
+        let length: u64 = abi::decode(&length).map_err(corrupt)?;
+        let epoch = height.checked_div(length).unwrap_or_default();
+        let Some(members) = view.get(NETWORK, &namespace::epoch(epoch))? else {
+            return Ok(None);
+        };
+        let members: Vec<validators::Member> = abi::decode(&members).map_err(corrupt)?;
+        Ok(members
+            .into_iter()
+            .find(|member| member.key == policy.key)
+            .map(|member| member.key))
+    }
+
     pub fn preparations(&self) -> Result<Vec<(Ticket, PreparationRow)>> {
         let view = self.committed.view(Vec::new());
         let mut open = Vec::new();
@@ -92,7 +124,10 @@ where
             return Ok(Run::finished(refused(refusal)));
         }
         let view = self.committed.view(vec![&*overlay]);
-        if assignee(&view, id, height)?.is_none() {
+        if self
+            .preparation_responder(&view, id, height, height)?
+            .is_none()
+        {
             return Ok(Run::finished(refused(reads::unserved())));
         }
         let row = PreparationRow {
@@ -123,7 +158,12 @@ where
     ) -> Result<Receipt> {
         let (open, member) = {
             let view = self.committed.view(vec![&*overlay]);
-            (preparation(&view, id)?, assignee(&view, id, height)?)
+            let open = preparation(&view, id)?;
+            let member = match &open {
+                Some(open) => self.preparation_responder(&view, id, open.made, height)?,
+                None => None,
+            };
+            (open, member)
         };
         let Some(mut open) = open else {
             return Ok(refused(not_open(id)));

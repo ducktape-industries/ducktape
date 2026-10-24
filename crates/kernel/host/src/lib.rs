@@ -24,6 +24,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_runtime::Spawner;
 use commonware_runtime::telemetry::metrics::{MetricsExt as _, histogram::Buckets};
 use commonware_storage::Context;
+pub use namespace::PreparationResponder;
 use runtime::{Fault, Suspended};
 use sha2::{Digest as _, Sha256};
 use state::{
@@ -280,6 +281,7 @@ where
     spent: Spent,
     layout_from: u64,
     reads_from: u64,
+    preparation_responder: Option<PreparationResponder>,
     measured_depth_from: u64,
 }
 
@@ -544,6 +546,7 @@ where
         let namespace::Activations {
             layout_from,
             reads_from,
+            preparation_responder,
             measured_depth_from,
         } = namespace::Activations::of(&genesis.network, None);
         let mut host = Host {
@@ -561,6 +564,7 @@ where
             spent: Spent::default(),
             layout_from,
             reads_from,
+            preparation_responder,
             measured_depth_from,
         };
         let mut receipts = Vec::new();
@@ -640,10 +644,12 @@ where
         let namespace::Activations {
             layout_from,
             reads_from,
+            preparation_responder,
             measured_depth_from,
         } = namespace::Activations::of(network.as_bytes(), Some(parent.as_slice()));
         host.layout_from = layout_from;
         host.reads_from = reads_from;
+        host.preparation_responder = preparation_responder;
         host.measured_depth_from = measured_depth_from;
         host.network = network.as_bytes().to_vec();
         host.parent = Some(parent);
@@ -724,6 +730,7 @@ where
         let namespace::Activations {
             layout_from,
             reads_from,
+            preparation_responder,
             measured_depth_from,
         } = namespace::Activations::of(&network, parent.as_deref());
         let tidier = tidier_of(&store, &blobs)?;
@@ -742,6 +749,7 @@ where
             spent: Spent::default(),
             layout_from,
             reads_from,
+            preparation_responder,
             measured_depth_from,
         };
         host.sync_code()?;
@@ -813,6 +821,7 @@ where
             preconfirmed: None,
             layout_from: self.layout_from,
             reads_from: self.reads_from,
+            preparation_responder: self.preparation_responder,
             measured_depth_from: self.measured_depth_from,
         }
     }
@@ -833,6 +842,10 @@ where
         self.reads_from = height;
     }
 
+    pub fn set_preparation_responder(&mut self, responder: Option<PreparationResponder>) {
+        self.preparation_responder = responder;
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot<E>> {
         Ok(Snapshot {
             pinned: self.store.pin()?,
@@ -843,6 +856,7 @@ where
             preconfirmed: Arc::default(),
             layout_from: self.layout_from,
             reads_from: self.reads_from,
+            preparation_responder: self.preparation_responder,
             measured_depth_from: self.measured_depth_from,
             context: std::marker::PhantomData,
         })

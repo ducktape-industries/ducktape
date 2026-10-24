@@ -44,9 +44,16 @@ const HEIGHT_BYTES: usize = size_of::<u64>();
 const ID_BYTES: usize = size_of::<SubmissionId>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparationResponder {
+    pub from: u64,
+    pub key: &'static [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Activations {
     pub layout_from: u64,
     pub reads_from: u64,
+    pub preparation_responder: Option<PreparationResponder>,
     pub measured_depth_from: u64,
 }
 
@@ -56,6 +63,17 @@ impl Activations {
         Activations {
             layout_from: announced(&LAYOUT_FROM, lineage),
             reads_from: announced(&READS_FROM, lineage),
+            preparation_responder: match lineage {
+                b"duckpond" => Some(PreparationResponder {
+                    from: 563700,
+                    key: &[
+                        0x75, 0xbf, 0x26, 0x5d, 0x1e, 0x35, 0x10, 0x36, 0x77, 0xd0, 0x09, 0xf4,
+                        0xfb, 0xba, 0x04, 0x01, 0x99, 0x6c, 0x43, 0x7f, 0x56, 0xe0, 0x48, 0x1b,
+                        0x3a, 0x9f, 0x9c, 0x1e, 0x53, 0xaf, 0xe3, 0x7d,
+                    ],
+                }),
+                _ => None,
+            },
             measured_depth_from: announced(&MEASURED_DEPTH_FROM, lineage),
         }
     }

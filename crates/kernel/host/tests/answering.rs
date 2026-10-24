@@ -2,6 +2,8 @@
 //! answers with the reply's blob entry, and the frame resumes once the blobs role holds that blob.
 #[path = "answering/preparation.rs"]
 mod preparation;
+#[path = "answering/preparation_pin.rs"]
+mod preparation_pin;
 
 use std::path::Path;
 

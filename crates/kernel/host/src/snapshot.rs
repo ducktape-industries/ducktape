@@ -33,6 +33,7 @@ where
     pub(crate) preconfirmed: Option<&'a Preconfirmed>,
     pub(crate) layout_from: u64,
     pub(crate) reads_from: u64,
+    pub(crate) preparation_responder: Option<crate::PreparationResponder>,
     pub(crate) measured_depth_from: u64,
 }
 
@@ -337,6 +338,7 @@ pub struct Snapshot<E> {
     pub(crate) preconfirmed: Arc<Preconfirmed>,
     pub(crate) layout_from: u64,
     pub(crate) reads_from: u64,
+    pub(crate) preparation_responder: Option<crate::PreparationResponder>,
     pub(crate) measured_depth_from: u64,
     pub(crate) context: PhantomData<fn() -> E>,
 }
@@ -352,6 +354,7 @@ impl<E> Clone for Snapshot<E> {
             preconfirmed: self.preconfirmed.clone(),
             layout_from: self.layout_from,
             reads_from: self.reads_from,
+            preparation_responder: self.preparation_responder,
             measured_depth_from: self.measured_depth_from,
             context: PhantomData,
         }
@@ -372,6 +375,7 @@ where
             preconfirmed: Some(&self.preconfirmed),
             layout_from: self.layout_from,
             reads_from: self.reads_from,
+            preparation_responder: self.preparation_responder,
             measured_depth_from: self.measured_depth_from,
         }
     }

@@ -107,7 +107,7 @@ async fn pass<E: Context>(
     }
     let mut preparations = BTreeMap::new();
     for (id, row) in source.preparations()? {
-        let assigned = source.reader(id, next)?;
+        let assigned = source.preparer(id, row.made, next)?;
         if assigned.as_deref() == Some(daemon.identity.as_slice()) {
             preparations.insert(id, row);
         }
